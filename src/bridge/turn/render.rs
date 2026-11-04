@@ -9629,7 +9629,7 @@ Index: /x/src/main.rs
         );
         assert!(
             text.lines()
-                .any(|line| line.contains("task") && line.contains("bash ")),
+                .any(|line| line.contains("子 Agent") && line.contains("bash ")),
             "the live panel carries the same fragment: {text}"
         );
     }

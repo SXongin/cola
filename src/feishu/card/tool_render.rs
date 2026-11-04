@@ -2895,6 +2895,12 @@ pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
         "codex/file_change" if is_codex_file_change(tool) => "文件修改",
         "codex/web_search" if web_search_shape(tool.input()) => "网页搜索",
         "codex/image" if image_shape(tool.input()) => "图片",
+        // The child-agent tool is the one concept cola renders on both
+        // surfaces: Codex's collaboration items call it 子 Agent, so the
+        // OpenCode built-in reads the same instead of its raw registry id
+        // (ADR-0042's 2026-11-04 amendment). The id stays the rendering key,
+        // so a third-party tool with another name is untouched.
+        "task" | "subagent" => "子 Agent",
         other => other,
     }
 }
@@ -5148,7 +5154,7 @@ mod tests {
                 ToolStatus::Completed,
                 Some(json!({"status": "running", "sessionID": "ses_1"}))
             )),
-            "🌙 subagent · 14:05"
+            "🌙 子 Agent · 14:05"
         );
         assert_eq!(BACKGROUNDED_MARKER, "🌙", "the pinned marker");
 
@@ -5173,7 +5179,7 @@ mod tests {
                 ToolStatus::Completed,
                 Some(json!({"sessionId": "ses_child"}))
             )),
-            "✅ task · 14:05"
+            "✅ 子 Agent · 14:05"
         );
         // A launch that has not returned its handle yet is still live: ⏳, not
         // the launch marker (it only holds once the call settled).
@@ -5241,7 +5247,7 @@ mod tests {
         let elements = card["body"]["elements"].as_array().unwrap();
         let title = elements[0]["header"]["title"]["content"].as_str().unwrap();
         assert!(
-            title.starts_with("⏳ task · ") && title.contains("bash 1") && title.contains("等待你的授权"),
+            title.starts_with("⏳ 子 Agent · ") && title.contains("bash 1") && title.contains("等待你的授权"),
             "the collapsed task title carries the child activity before its wait: {title}"
         );
     }
@@ -5263,7 +5269,7 @@ mod tests {
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(
             elements[0]["header"]["title"]["content"].as_str().unwrap(),
-            "✅ task"
+            "✅ 子 Agent"
         );
     }
 
@@ -8002,6 +8008,38 @@ Index: /a/one.rs
         assert_eq!(
             format_tool_input("skill", &json!({"name": "caveman"})),
             "🧩 caveman"
+        );
+    }
+
+    /// OpenCode's child-agent tool reads 子 Agent, the same word Codex's
+    /// collaboration items use (ADR-0042's 2026-11-04 amendment): the id stays
+    /// the rendering key, and a lookalike id keeps its own name.
+    #[test]
+    fn the_child_agent_tool_reads_the_same_on_both_backends() {
+        let title = |name: &str, input: serde_json::Value| {
+            let tool = ToolPanel::for_test(name, ToolStatus::Completed, Some(input), Some("ok"));
+            let card = CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_tool(tool)
+                .build();
+            card["body"]["elements"][0]["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            title("subagent", json!({"agent": "explore", "description": "review"})),
+            "✅ 子 Agent"
+        );
+        assert_eq!(
+            title("task", json!({"subagent_type": "build", "description": "review"})),
+            "✅ 子 Agent",
+            "V1's id reads the same word"
+        );
+        assert_eq!(
+            title("Task", json!({"description": "x"})),
+            "✅ Task",
+            "the mapping is an exact built-in id, never a fuzzy match"
         );
     }
 
