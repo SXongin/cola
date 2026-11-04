@@ -2728,7 +2728,7 @@ async fn an_in_flight_step_before_the_anchor_renders_live() {
 
     // The in-flight step renders on the live card while the prompt is still
     // held — no finalization has run yet.
-    wait_for_card_text(&platform, "⏳ task").await;
+    wait_for_card_text(&platform, "⏳ 子 Agent").await;
     assert!(
         app.inflight.lock().await.contains("ses_test"),
         "the prompt must still be in flight when the panel renders"

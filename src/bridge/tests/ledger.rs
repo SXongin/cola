@@ -620,7 +620,7 @@ async fn a_v1_task_part_is_never_a_ledger_row() {
 
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下"));
     wait_for_card_update(&platform, "the V1 panel", CardUpdates::Any, |card| {
-        card_text(card).contains("task")
+        card_text(card).contains("子 Agent")
     })
     .await;
 

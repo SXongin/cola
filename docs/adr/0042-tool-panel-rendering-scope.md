@@ -201,3 +201,14 @@ same boundary and the same id-plus-shape gate:
 
 `codex/image` stays unchanged, and a third-party tool that squats either id with
 a partial input shape still falls through to the opaque path.
+
+## Amendment (2026-11-04): the child-agent tool's display name
+
+OpenCode's `subagent` (V1: `task`) now reads **子 Agent** in a Tool Panel's
+folded title and in the live header, the same word the Codex collaboration
+items use for the same concept. The id stays the rendering key: the payload,
+the `TASK_TOOLS` child-liveness rule, the Background Task Ledger's type word
+(the tool's own name, like `shell`) and every shape gate are unchanged, so
+this is a display mapping, not a rename. A lookalike id (`Task`) keeps its own
+name, and the rest of OpenCode's built-ins keep theirs (`bash`, `read`, …) —
+only the one concept cola renders on two backends gets one word.
