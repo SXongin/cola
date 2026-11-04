@@ -2058,6 +2058,7 @@ pub(super) fn todo_panel_element(
     todo: &TodoPanel,
     at_ms: Option<i64>,
     element_id: Option<&str>,
+    session_id: Option<&str>,
     md: &mut CardMarkdown,
 ) -> serde_json::Value {
     match todo {
@@ -2068,14 +2069,20 @@ pub(super) fn todo_panel_element(
             let title = format!("📋 todowrite{} · {}", panel_time_suffix(at_ms), details);
             collapsible_panel(&title, &content, element_id)
         }
-        TodoPanel::Tool(panel) => tool_panel_element(panel, at_ms, element_id, None, md),
+        TodoPanel::Tool(panel) => tool_panel_element(panel, at_ms, element_id, session_id, md),
     }
 }
 
 /// The exact tail element's serialized size, used by the card splitter's
-/// tail reserve.
-pub(crate) fn todo_panel_estimate(todo: &TodoPanel) -> usize {
-    let element = todo_panel_element(todo, None, None, &mut CardMarkdown::new());
+/// tail reserve. It passes the same clock, identity and Session the build
+/// renders, so the estimate and the element cannot drift.
+pub(crate) fn todo_panel_estimate(
+    todo: &TodoPanel,
+    at_ms: Option<i64>,
+    element_id: Option<&str>,
+    session_id: Option<&str>,
+) -> usize {
+    let element = todo_panel_element(todo, at_ms, element_id, session_id, &mut CardMarkdown::new());
     serialized_len(&element.to_string())
 }
 
@@ -2388,6 +2395,9 @@ fn parse_todo_list(value: &serde_json::Value) -> Option<TodoList> {
         // whole: rendering the readable rows and silently dropping the rest
         // would lose content the model wrote.
         let content = v.get("content")?.as_str()?;
+        if content.is_empty() {
+            return None;
+        }
         let status = match v.get("status").and_then(|s| s.as_str()).unwrap_or("pending") {
             "pending" => TodoStatus::Pending,
             "in_progress" | "inProgress" => TodoStatus::InProgress,
