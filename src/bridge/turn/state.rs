@@ -700,6 +700,7 @@ fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
         + crate::feishu::card::tool_render::file_image_estimate(p)
         + crate::feishu::card::tool_render::file_header_marker_estimate(p)
         + crate::feishu::card::tool_render::panel_file_detail_estimate(p)
+        + crate::feishu::card::tool_render::panel_target_detail_estimate(p)
         + crate::feishu::card::tool_render::tool_open_button_estimate(p, session_id)
         + crate::feishu::card::tool_render::write_tail_estimate(p)
         + crate::feishu::card::tool_render::preview_truncation_note_estimate(p, session_id)
@@ -6151,6 +6152,37 @@ mod tests {
                 + crate::feishu::card::tool_render::file_image_estimate(&with_files)
                 + marker,
             "panel_estimate must charge the header marker's bytes"
+        );
+    }
+
+    /// A collaboration panel's folded title names its target agent (issue
+    /// #962): `panel_estimate` must charge that fragment too, or a card carrying
+    /// it could pass the size check and then be rejected by Feishu. The two
+    /// panels differ only in whether the id is an adapter arm, so the whole
+    /// difference is the fragment.
+    #[test]
+    fn panel_estimate_charges_the_collab_target_detail() {
+        let input = serde_json::json!({
+            "kind": "started",
+            "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
+            "agentPath": "/root/worker",
+            "model": null,
+            "reasoningEffort": null
+        });
+        let activity = ToolPanel::for_test(
+            "codex/sub_agent_activity",
+            ToolStatus::Completed,
+            Some(input.clone()),
+            None,
+        );
+        let plain = ToolPanel::for_test("tool", ToolStatus::Completed, Some(input), None);
+        let detail = crate::feishu::card::tool_render::panel_target_detail_estimate(&activity);
+        assert!(detail > 0, "an activity names its path while folded");
+
+        assert_eq!(
+            panel_estimate(&activity, None),
+            panel_estimate(&plain, None) + detail,
+            "panel_estimate must charge the folded title's target detail"
         );
     }
 

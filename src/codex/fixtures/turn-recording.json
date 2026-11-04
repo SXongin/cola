@@ -393,6 +393,128 @@
     }
   },
   {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000002000,
+      "item": {
+        "type": "collabAgentToolCall",
+        "id": "item-collab-spawn",
+        "tool": "spawnAgent",
+        "status": "inProgress",
+        "senderThreadId": "thread-1",
+        "receiverThreadIds": [],
+        "prompt": "Review the diff and report the blocking findings.",
+        "model": "gpt-5.1-codex",
+        "reasoningEffort": "high",
+        "agentsStates": {}
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000002100,
+      "item": {
+        "type": "collabAgentToolCall",
+        "id": "item-collab-spawn",
+        "tool": "spawnAgent",
+        "status": "completed",
+        "senderThreadId": "thread-1",
+        "receiverThreadIds": ["0192f0aa-0000-7000-8000-000000000001"],
+        "prompt": "Review the diff and report the blocking findings.",
+        "model": "gpt-5.1-codex",
+        "reasoningEffort": "high",
+        "agentsStates": {
+          "0192f0aa-0000-7000-8000-000000000001": { "status": "running", "message": null }
+        }
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000002200,
+      "item": {
+        "type": "collabAgentToolCall",
+        "id": "item-collab-wait",
+        "tool": "wait",
+        "status": "inProgress",
+        "senderThreadId": "thread-1",
+        "receiverThreadIds": ["0192f0aa-0000-7000-8000-000000000001", "0192f0bb-0000-7000-8000-000000000002"],
+        "prompt": null,
+        "model": null,
+        "reasoningEffort": null,
+        "agentsStates": {}
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000002300,
+      "item": {
+        "type": "collabAgentToolCall",
+        "id": "item-collab-wait",
+        "tool": "wait",
+        "status": "completed",
+        "senderThreadId": "thread-1",
+        "receiverThreadIds": ["0192f0aa-0000-7000-8000-000000000001", "0192f0bb-0000-7000-8000-000000000002"],
+        "prompt": null,
+        "model": null,
+        "reasoningEffort": null,
+        "agentsStates": {
+          "0192f0aa-0000-7000-8000-000000000001": { "status": "completed", "message": null },
+          "0192f0bb-0000-7000-8000-000000000002": {
+            "status": "errored",
+            "message": "the worker hit a compile error"
+          }
+        }
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000002400,
+      "item": {
+        "type": "subAgentActivity",
+        "id": "item-subagent-activity",
+        "model": "gpt-5.1-codex",
+        "reasoningEffort": "high",
+        "kind": "started",
+        "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
+        "agentPath": "/root/worker"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000002400,
+      "item": {
+        "type": "subAgentActivity",
+        "id": "item-subagent-activity",
+        "model": "gpt-5.1-codex",
+        "reasoningEffort": "high",
+        "kind": "started",
+        "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
+        "agentPath": "/root/worker"
+      }
+    }
+  },
+  {
     "method": "turn/diff/updated",
     "params": {
       "threadId": "thread-1",

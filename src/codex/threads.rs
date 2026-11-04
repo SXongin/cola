@@ -1154,6 +1154,34 @@ mod tests {
         assert_eq!(params[2]["cursor"], "4");
     }
 
+    /// Issue #962: a sub-agent thread is a thread's child, not a session the
+    /// session list offers. `thread/list` filters by `sourceKinds`, so this
+    /// pins the constant the request sends — the one place a future change
+    /// could quietly start listing sub-agent threads — against every
+    /// `subAgent*` kind the pinned app-server spells. It deliberately tests
+    /// unchanged list behavior (the ticket's acceptance 5); the rendering the
+    /// ticket adds is held by `cards::a_collab_call_and_a_child_activity_render_on_the_card`.
+    #[test]
+    fn the_interactive_source_filter_never_lists_a_sub_agent_thread() {
+        for kind in [
+            "subAgent",
+            "subAgentReview",
+            "subAgentCompact",
+            "subAgentThreadSpawn",
+            "subAgentOther",
+        ] {
+            assert!(
+                !INTERACTIVE_SOURCE_KINDS.contains(&kind),
+                "{kind} must stay out of cola's session list"
+            );
+        }
+        assert_eq!(
+            INTERACTIVE_SOURCE_KINDS,
+            &["cli", "vscode", "appServer"],
+            "the interactive set is pinned; widening it is a product decision"
+        );
+    }
+
     /// `thread/read` returns one thread with the same identity fields; a title
     /// falls back to the preview when the thread was never named.
     #[tokio::test]

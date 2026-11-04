@@ -201,3 +201,60 @@ same boundary and the same id-plus-shape gate:
 
 `codex/image` stays unchanged, and a third-party tool that squats either id with
 a partial input shape still falls through to the opaque path.
+
+## Amendment (2026-11-04): the Codex collaboration items
+
+Issue #962 adds the two V2 collaboration item kinds to the adapter's vocabulary,
+under the same rule — cola's own `codex/` id, shape-gated on the **whole**
+payload `src/codex/read_model.rs` writes:
+
+- `codex/collab_agent` — the adapter's `collabAgentToolCall`:
+  `{tool, status, senderThreadId, receiverThreadIds[], prompt, model,
+  reasoningEffort, agents: [{threadId, label, status, message}]}`. The optional
+  scalars are always present (written as `null` when the value is unknown),
+  the same device `webSearch`'s `action` uses. `agents` is written in the
+  wire's receiver order, then any state the receiver list did not name, sorted
+  by thread id — deterministic, so an unchanged call compares equal across
+  polls instead of repainting the card.
+- `codex/sub_agent_activity` — the adapter's `subAgentActivity`:
+  `{kind, agentThreadId, agentPath, model, reasoningEffort}`.
+
+Each arm renders one Tool Panel, one item per call (the wire gives every call
+its own id and lifecycle, and a `wait`/`close` targets threads that several
+`spawn` calls produced — folding them into one card would invent an N:M join
+and retro-patch an older card). The collaboration call's folded title names the
+call (`派生子 Agent`, `等待子 Agent`, …) and its first target thread; its
+Input line carries the prompt and the model/reasoning effort, and the target
+rows ride the **Output body** — one row per target's own state — because a
+`wait` may name many targets, more than the Input line's shared
+400-character budget could hold. That body is assembled from the adapter's
+payload like `codex/web_search`'s results, so it renders under the output
+budget and the card-size estimate charges it exactly. A call with more targets
+than that budget holds ends on an explicit `… 另有 N 个目标` line — every shown
+row is whole, and the folded title still counts them all. A call whose item
+carries no prompt, model or target row at all renders its own state plus
+`未上报目标状态` rather than an empty body: V2's `wait` always writes empty
+`receiverThreadIds`/`agentsStates`, and its result text is a tool-output
+response item the item stream does not carry, so the card states what it knows
+instead of reading as a rendering gap. An unknown `tool` or
+`status` keeps its raw string on the card rather than falling back to `Other` —
+the wire enums are upstream's to extend (an unknown status rides the Input line,
+since the icon alone could not name it). The activity is a one-line panel
+naming the kind, the child thread and its `agentPath` — clipped to the folded
+header's own short-line budget by keeping the path's tail, the same rule a long
+file name takes.
+
+The target label prefers the child's own `agentPath`, which the same child
+thread's `subAgentActivity` reports in the same read; without one it falls back
+to the thread id's first eight characters. The label is folded to one line and
+clipped to the folded header's budget, like a file name. No extra read is made
+for a nickname (`thread.agentNickname` is a `thread/read` fact, and a render
+pass performs no reads), so the card only shows a name the item stream already
+carries. Sub-agent threads
+stay out of the session list (`thread/list` filters the `subAgent*` source kinds,
+pinned by a regression test in `src/codex/threads.rs`): this amendment changes
+rendering only, creates no chat mapping, and opens no write path into a child
+thread.
+
+The boundary is otherwise unchanged: a third-party tool that squats either id
+with a partial payload stays raw, and no Codex-only vocabulary is renamed.
