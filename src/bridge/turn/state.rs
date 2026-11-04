@@ -1935,8 +1935,15 @@ impl StreamAccumulator {
     /// differs and re-renders.
     pub(super) fn tool_panel_current(&self, call: &ToolCall) -> bool {
         if call.identity.name == "todowrite" {
-            self.todo_panel.as_ref() == Some(&TodoPanel::from_tool(call.clone()))
-                && self.todo_shown_at == call.started_at
+            let panel = TodoPanel::from_tool(call.clone());
+            let current = match &panel {
+                // An empty list clears the rendered panel but still records
+                // its source clock, so the same clearing call is not consumed
+                // as new content on every poll.
+                TodoPanel::List { todo, .. } if todo.is_empty() => self.todo_panel.is_none(),
+                _ => self.todo_panel.as_ref() == Some(&panel),
+            };
+            current && self.todo_shown_at == call.started_at
         } else {
             self.tools
                 .get(&call.identity.call_id)
@@ -3957,7 +3964,8 @@ impl StreamAccumulator {
         live: bool,
     ) -> bool {
         if todo.is_empty() {
-            let changed = self.todo_panel.take().is_some() || self.todo_shown_at.take().is_some();
+            let changed = self.todo_panel.take().is_some();
+            self.todo_shown_at = shown_at;
             return changed;
         }
         let panel = TodoPanel::new(todo.clone(), live);

@@ -6792,6 +6792,21 @@ Index: /x/src/main.rs
         );
     }
 
+    /// An empty `todowrite` clears the tail, but it is still one immutable tool
+    /// revision. Re-reading the same call must not report new content forever,
+    /// or the drain can never settle.
+    #[test]
+    fn an_empty_todowrite_is_rendered_once() {
+        let mut acc = StreamAccumulator::new("test");
+        let empty = todowrite("call_empty", 1_000, serde_json::json!([]));
+        assert!(render_parts(&mut acc, std::slice::from_ref(&empty)));
+        assert!(acc.todo_panel().is_none(), "the empty list removes the panel");
+        assert!(
+            !render_parts(&mut acc, &[empty]),
+            "the same empty revision must be deduplicated"
+        );
+    }
+
     /// Every collapsible panel carries a stable `element_id`, derived from the
     /// thing it renders — a reasoning panel from its timeline item, a tool
     /// panel from its call (`tool_{call_id}`) — never from its position. The
