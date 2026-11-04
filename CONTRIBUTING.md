@@ -201,10 +201,11 @@ store). The V1 chains need the pinned OpenCode **1.18.31** binary (the one
 `PATH` and runs `cargo test --locked -- --ignored live_v1`. The V2 chains need a
 2.x binary, spawned directly with relocated XDG trees; point
 `COLA_LIVE_OPENCODE_V2_BIN` at one (`opencode2` on `PATH` is the fallback), and
-the `Live V2` job installs the exact-version + sha256 pin via
-`.github/actions/install-opencode-v2` (npm-based, version-keyed cache) and runs
-`cargo test --locked -- --ignored live_v2`; `Live V1` deliberately does not run
-it. `--list` names the chains:
+the same job's V2 steps install the exact-version + sha256 pin via
+`.github/actions/install-opencode-v2` (npm-based, version-keyed cache) and run
+`cargo test --locked -- --ignored live_v2`. The two installs expose different
+names — `opencode` and `opencode2` — so neither shadows the other and the V1
+step deliberately runs before V2 is installed. `--list` names the chains:
 
 ```bash
 COLA_LIVE_OPENCODE_BIN=/path/to/opencode cargo test --locked -- --ignored live_v1
@@ -283,10 +284,14 @@ the marker after the process exits.
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
    is the ADR-0033 exception).
 
-The `main: CI` ruleset requires seven checks: `Format`, `Check`,
-`Test (windows-latest)`, `Live V1`, `Live V2`,
+The `main: CI` ruleset requires six checks: `Format`, `Check`,
+`Test (windows-latest)`, `Live OpenCode`,
 `Dependency audit` and `Docs drift` — judge merge-readiness with `gh pr checks
 <branch> --required`, not by eyeballing every check.
+
+Both live contract suites run in the one `Live OpenCode` job: they need
+different pinned binaries but the same compiled test binary, so two jobs built
+the crate twice to run a handful of `#[ignore]` tests.
 
 The Test job's platform follows the event: a pull request runs
 `Test (windows-latest)`, and a push to `main` runs `Test (macos-latest)`

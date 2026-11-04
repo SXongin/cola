@@ -35,8 +35,8 @@ ignore:
   - "src/bridge/test_support.rs"
   # The opted-in live harnesses (ADR-0057, ticket #953): every test is
   # `#[ignore]`-gated and needs a pinned binary, so the instrumented hermetic
-  # `coverage` job can never execute these lines — the advisory
-  # `Live V1`/`Live V2`/`Live Codex (…)` jobs run them.
+  # `coverage` job can never execute these lines — the `Live OpenCode` and
+  # `Live Codex` jobs run them.
   - "src/opencode/live/**"
   - "src/codex/live/**"
   # The machine-local attach check (`#[ignore]`-gated, needs a live local
