@@ -275,6 +275,12 @@ created. OpenCode's real `todowrite` call continues to use the same neutral seam
 when its input parses as a list; a malformed call keeps its existing raw Tool
 Panel fallback.
 
+The Codex panel is display-only: it never drives the header's running-tool
+view, and it keeps the established `📋 todowrite` title so the two sources read
+as one card-tail section. Because the notification is not part of thread
+history, a freshly built projection shows no plan until the next
+`turn/plan/updated` arrives; a resync keeps the plan it already holds.
+
 The rest of this ADR is unchanged: Tool Panel rendering remains limited to the
 exact built-in or adapter-owned ids named above, together with their recorded
 shape gates.

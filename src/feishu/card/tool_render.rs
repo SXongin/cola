@@ -157,8 +157,8 @@ impl FileDelivery {
 pub(crate) const BACKGROUNDED_MARKER: &str = "🌙";
 
 /// The card's tail TODO section. It is deliberately separate from
-/// [`ToolPanel`]: the list comes from OpenCode's `todowrite` call or Codex's
-/// `turn/plan/updated` notification, and no synthetic tool call crosses the
+/// [`ToolPanel`]: the list comes from OpenCode's `todowrite` call or the Codex
+/// adapter's plan notifications, and no synthetic tool call crosses the
 /// adapter/card boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TodoPanel {
@@ -2075,7 +2075,8 @@ pub(super) fn todo_panel_element(
 
 /// The exact tail element's serialized size, used by the card splitter's
 /// tail reserve. It passes the same clock, identity and Session the build
-/// renders, so the estimate and the element cannot drift.
+/// renders, and includes a malformed fallback panel's embedded images, so the
+/// estimate and the built elements cannot drift.
 pub(crate) fn todo_panel_estimate(
     todo: &TodoPanel,
     at_ms: Option<i64>,
@@ -2083,7 +2084,13 @@ pub(crate) fn todo_panel_estimate(
     session_id: Option<&str>,
 ) -> usize {
     let element = todo_panel_element(todo, at_ms, element_id, session_id, &mut CardMarkdown::new());
-    serialized_len(&element.to_string())
+    let mut size = serialized_len(&element.to_string());
+    if let TodoPanel::Tool(panel) = todo {
+        for image in file_image_elements(panel) {
+            size += serialized_len(&image.to_string());
+        }
+    }
+    size
 }
 
 /// The meaningful parts of a unified file diff (a file-editing tool's recorded
@@ -2445,6 +2452,12 @@ const TODO_STATUSES: [(&str, &str, TodoMarkup); 4] = [
 ];
 
 fn todo_style(status: &TodoStatus) -> (&'static str, TodoMarkup) {
+    // An unseen wire status keeps its row and renders as pending — never as a
+    // known status whose spelling it happens to share (`cancelled` from a
+    // backend that does not document it, for example).
+    if matches!(status, TodoStatus::Other(_)) {
+        return ("⬜", TodoMarkup::Plain);
+    }
     let status = status.as_str();
     TODO_STATUSES
         .iter()
@@ -2462,8 +2475,12 @@ fn todo_counts(todos: &[TodoStep]) -> String {
             let n = todos
                 .iter()
                 .filter(|t| {
-                    t.status.as_str() == *status
-                        || (*status == "pending" && matches!(t.status, TodoStatus::Other(_)))
+                    // An unseen status counts under pending, matching the row
+                    // icon `todo_style` picks.
+                    match &t.status {
+                        TodoStatus::Other(_) => *status == "pending",
+                        known => known.as_str() == *status,
+                    }
                 })
                 .count();
             (n > 0).then(|| format!("{icon} {n}"))
@@ -7820,6 +7837,7 @@ LSP errors detected in a.rs, please fix:
             "[]",
             "",
             r#"[{"content":"ok","status":"pending"},{"status":"pending"}]"#,
+            r#"[{"content":"","status":"pending"}]"#,
         ] {
             let (header, style, body) = format_tool_output("todowrite", raw);
             assert_eq!(header, None, "no header for {raw:?}");

@@ -301,6 +301,12 @@ impl CardBuilder {
             session_id,
             &mut self.markdown,
         ));
+        // A malformed `todowrite` fallback is an ordinary Tool Panel: its
+        // embedded File Contents follow it, exactly as `with_tool_at` renders
+        // them (ADR-0076).
+        if let TodoPanel::Tool(panel) = &todo {
+            self.body.extend(file_image_elements(panel));
+        }
         self
     }
 
