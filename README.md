@@ -12,8 +12,10 @@
 edits code on your machine, and you watch, steer and approve every step without
 opening a terminal.
 
-cola bridges [Feishu](https://www.feishu.cn) and [OpenCode](https://opencode.ai):
-each DM is an OpenCode session, each turn streams onto one live card, and every
+cola bridges [Feishu](https://www.feishu.cn) and the coding agent on your machine
+— [OpenCode](https://opencode.ai) by default, or a
+[Codex Agent Client](docs/user-guide.md#connect-a-codex-client). Each DM is a
+session on that runtime, each turn streams onto one live card, and every
 permission request becomes a button.
 
 It is a bot for one person: you create the app, you claim it, and only you can
@@ -44,19 +46,24 @@ without dominating the page.
 >
 > **cola** · ✅ 改完了 · 2 个文件 · **+18 −6**　**［🔍 查看完整改动］**
 
-One card per turn, buttons for decisions, and `/cat` / `/diff` when you want to
-read the code or the diff yourself. That is the whole surface.
+One card per turn, buttons for decisions, and `/cat` / `/diff` / `/run` when you
+want to read the code, the diff or the shell's output yourself. That is the
+whole surface.
 
 ## Try it
 
 About **5 minutes**, and the Feishu side is free: you create a **self-built app**
-(企业自建应用) for yourself (model usage bills to whatever provider your OpenCode
-is configured with). You need:
+(企业自建应用) for yourself (model usage bills to whatever provider your agent is
+configured with). You need:
 
-- an `opencode` binary on `PATH` (see <https://opencode.ai>) — OpenCode
+- **either** an `opencode` binary on `PATH` (see <https://opencode.ai>) — OpenCode
   **1.18.x (V1) and 2.0.x (V2) both work**; cola attaches to the shared server,
   starting one when none is running, and detects which protocol it speaks (the
-  log records the choice)
+  log records the choice) — **or** the Codex CLI (`codex-cli 0.166.0`) on
+  `PATH`, signed in with `codex login`, plus a `[clients.<id>]` table with
+  `kind = "codex"` (step 3). See [Connect a Codex
+  client](docs/user-guide.md#connect-a-codex-client) for the app-server daemon
+  and the platform notes.
 - a Feishu account where you can create an app
 
 ### 1. Install
@@ -99,17 +106,20 @@ publish it yet — the event subscription in step 4 needs cola running first.
    - `im:message:send_as_bot` — send as the bot
    - `im:message.p2p_msg:readonly` — receive DMs
 
+   Add `im:message.group_at_msg:readonly` only if the bot should answer in
+   group chats — Feishu pushes a group message only when it @-mentions the bot.
    Real names and the optional Instant Reminder each need one more scope — see
    below.
 
 <details>
-<summary>Optional extras: names and Instant Reminder</summary>
+<summary>Optional extras: group chats, names and Instant Reminder</summary>
 
 | Scope | What cola uses it for | If missing |
 | --- | --- | --- |
 | `im:message` | send/reply to and update cards; read a message by id (quote context); download message images | cola cannot reply or update cards — unusable |
 | `im:message:send_as_bot` | send and reply to messages as the bot | card sending fails |
 | `im:message.p2p_msg:readonly` | receive DMs | DMs never reach cola |
+| `im:message.group_at_msg:readonly` | receive group messages that @ the bot | group messages never reach cola |
 | `im:chat:readonly` | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
 | `contact:contact.base:readonly` | authorizes the contact API call | user names unavailable |
 | `contact:user.base:readonly` | returns the user's `name` field | completion notices lose the @name |
@@ -134,8 +144,11 @@ app_secret = "your-app-secret"
 That is the minimum. Everything else is optional — for example
 `[bridge] instant_reminder = true` pins a chat while a permission waits, and
 `[bridge] long_task_notice = true` announces a p2p turn that ran 5+ minutes with
-a reply message (the card patch itself pushes no notification). See the [user
-guide](docs/user-guide.md#configuration).
+a reply message (the card patch itself pushes no notification). A second Agent
+Client is a `[clients.<id>]` table plus `[bridge] default_client`, never a second
+config file — the guide's [Connect a Codex
+client](docs/user-guide.md#connect-a-codex-client) has the exact shape. See the
+[user guide](docs/user-guide.md#configuration) for every key.
 
 ### 4. Start cola, then finish the app
 
@@ -165,10 +178,13 @@ itself is one-time — restarts and upgrades never ask again. DM the bot `/help`
 to see every command.
 
 Inspect and control it from the shell: `cola status` (run state, autostart,
-claim, server + generation; `--json` for scripts), `cola doctor` (the
-environment checks a support request needs), `cola logs [-f]`, `cola restart`,
-`cola config path|show|validate`, and `cola completions <shell>` (add
-`--install` to write the script into your shell's completion directory).
+claim, the active Agent Client — its endpoint, whether it is attached and what
+it advertises — the attached OpenCode server and its generation; `--json` for
+scripts), `cola doctor` (the environment checks a support request needs —
+including a real turn on a Codex app-server daemon, which may cost provider
+tokens and is skipped with `--no-turn-check`), `cola logs [-f]`, `cola restart`,
+`cola config path|show|validate`, and `cola completions <shell>` (add `--install`
+to write the script into your shell's completion directory).
 
 ### 6. Keep it running
 
@@ -188,12 +204,20 @@ takes effect at the next sign-in.
 
 `cola autostart disable` stops the instance and removes the registration;
 `cola stop` stops it but keeps it. Enable it **after** installing both cola and
-`opencode` — the registration snapshots the binary path and your `PATH`, so
-re-run `enable` if you move either. To detach from the terminal instead:
+its agent (`opencode`, or `codex` for a Codex Agent Client) — the registration
+snapshots the binary path and your `PATH`, so re-run `enable` if you move either.
+To detach from the terminal instead:
 `nohup cola >/dev/null 2>&1 &` on Linux/macOS, or `start /b cola` on Windows.
 
 ## What you get
 
+- **OpenCode or Codex, one bridge.** The default Agent Client is OpenCode; add a
+  `[clients.<id>]` table with `kind = "codex"` to drive the Codex app-server
+  instead. The same cards and Feishu commands carry over, but what each agent
+  surfaces differs: a Codex thread under `approval_policy = "never"` (or full
+  access) raises no permission card, its questions need the daemon's
+  `default_mode_request_user_input` flag, and `/restart-opencode` only restarts
+  an OpenCode server.
 - **One card per turn, updated live.** Reasoning, tool calls and the answer
   stream onto a single card with collapsible panels, a phase timer and a live
   todo panel, so a slow turn never looks like a dead one; images in a message or
@@ -207,11 +231,23 @@ re-run `enable` if you move either. To detach from the terminal instead:
   session diff). `/diff [--base <ref>]` does it for a branch, and `/cat <path>`
   previews any file on the host: paged, markdown/raw toggle, images and
   directory browsing, sendable as a file.
+- **The host's terminal, too.** `/run <cmd>` — or any message starting with `!`
+  — runs one shell command on the host and replies with a terminal card: the
+  cwd, the merged output, the exit code and the elapsed time. `/run` on its own
+  pulls that card back to the newest position.
 - **As many sessions as you have tasks.** `/new`, `/dir <path>`, `/switch` to
   adopt a session started elsewhere (with a snapshot of what is pending), `/sub`
-  for the subagents a turn spawned. The store is shared with the CLI and
-  OpenChamber, so a session begun anywhere continues here — and messages sent
-  from another client come back into Feishu.
+  for the subagents a turn spawned, and `/status` for the current model, the
+  next-message pick and a summary. With OpenCode the Shared Store is shared with
+  the CLI and OpenChamber; with Codex, a TUI attached to the same app-server
+  daemon shares its sessions. Either way a session begun elsewhere continues
+  here — and messages sent from another client come back into Feishu.
+- **A checkout per task, from your phone.** `/topic --worktree` or
+  `/new --worktree` starts the next conversation in its own `git worktree`:
+  name a branch and base if you want specific ones (both default), and the first
+  message creates the checkout and the session inside it. `/worktree` shows or
+  adjusts the pending intent, so an abandoned conversation leaves nothing
+  behind.
 - **Set it and forget it.** Private by default, autostart at boot, a singleton
   lock, restart and self-update — on Linux, macOS and Windows.
 
@@ -221,19 +257,29 @@ re-run `enable` if you move either. To detach from the terminal instead:
 flowchart LR
     you(["You · Feishu<br/>phone or desktop"])
     cola["cola"]
-    server["opencode server"]
-    store[("shared store")]
-    other["opencode CLI<br/>OpenChamber"]
+    opencode["OpenCode server"]
+    codex["Codex app-server"]
+    ocstore[("Shared Store")]
+    cxstore[("$CODEX_HOME<br/>thread store")]
+    other["OpenCode CLI<br/>OpenChamber"]
+    tui["Codex CLI / TUI"]
 
     you <-->|"messages · cards · buttons"| cola
-    cola <-->|"HTTP + event stream"| server
-    server --- store
-    other <--> server
+    cola <-->|"HTTP + event stream"| opencode
+    cola <-->|"JSON-RPC"| codex
+    opencode --- ocstore
+    codex --- cxstore
+    other <--> opencode
+    tui <--> codex
 ```
 
-cola attaches to a running `opencode serve` on the shared store and starts one
-when none is running. Because the store is shared, the same session can be
-driven from Feishu, the CLI or OpenChamber — whichever you have at hand.
+cola drives one Agent Client at a time. With OpenCode (the default) it attaches
+to a running `opencode serve` on the Shared Store and starts one when none is
+running; because that store is shared, the same session can be driven from
+Feishu, the OpenCode CLI or OpenChamber. With a Codex Agent Client it attaches
+to the app-server daemon and its thread store under `$CODEX_HOME`, which a Codex
+CLI or TUI pointed at that same daemon shares — the OpenCode store is not
+involved, and OpenChamber never sees those sessions.
 
 ## Docs
 
