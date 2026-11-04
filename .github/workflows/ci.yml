@@ -204,18 +204,27 @@ jobs:
         name: Live V2 suite
         run: cargo test --locked -- --ignored live_v2
 
-  live-codex-tier1:
-    # tier-1 of the Codex live contract (ticket #953): the real pinned 0.166.0
-    # binary starts `app-server --listen unix://<short path>` in an isolated
-    # `CODEX_HOME`, a scripted Responses provider answers the model protocol,
-    # and cola attaches through `codex app-server proxy`. Advisory at first
-    # (not part of the required ruleset). The docs-only and release/* skips
-    # gate the STEPS, not the job, so the check always reports under its
-    # matrix-expanded name.
-    name: Live Codex tier-1 (${{ matrix.os }})
+  live-codex:
+    # tier-1 and tier-2 of the Codex live contract (ticket #953) share one job
+    # per OS. Every live job pays a checkout, a `rust-cache` restore and a full
+    # compile of the crate before running a handful of `#[ignore]` tests, so
+    # running both tiers in one job builds the crate once instead of twice
+    # (measured 2026-11-04 on a green PR: the ubuntu job is 2.5 min and the
+    # windows one 6.2 min, almost none of which is the suite itself). It also
+    # leaves macOS one queued job instead of two, which is where the wall time
+    # actually goes.
+    #
+    # Windows runs tier-1 only: tier-2's managed daemon refuses an elevated
+    # token and hosted Windows runners are elevated, so tier-2's steps skip
+    # there. A step-level skip, never a job-level one, so the check still
+    # reports under its matrix-expanded name.
+    #
+    # Advisory (not part of the required ruleset); the docs-only and release/*
+    # skips gate the STEPS, like every other job here.
+    name: Live Codex (${{ matrix.os }})
     needs: classify
     if: always()
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -261,54 +270,21 @@ jobs:
         env:
           COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier1-pids.txt
         run: bash .github/scripts/check-live-codex-cleanup.sh tier-1
-
-  live-codex-tier2:
-    # tier-2 of the Codex live contract (ticket #953): the real managed daemon
-    # started by Codex itself — discovery through the control socket's symlink,
-    # the `daemon version` report, `start_server = "never"` refusing a start,
-    # `auto` starting one, and the restart refusal. Ubuntu and macOS only: the
-    # daemon refuses an elevated token, and hosted Windows runners are elevated.
-    # Advisory at first; the job name always reports, like Live V1/V2.
-    name: Live Codex tier-2 (${{ matrix.os }})
-    needs: classify
-    if: always()
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - if: >-
-          needs.classify.outputs.heavy != 'false' &&
-          !startsWith(github.head_ref || '', 'release/')
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - if: >-
-          needs.classify.outputs.heavy != 'false' &&
-          !startsWith(github.head_ref || '', 'release/')
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-      - if: >-
-          needs.classify.outputs.heavy != 'false' &&
-          !startsWith(github.head_ref || '', 'release/')
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - if: >-
-          needs.classify.outputs.heavy != 'false' &&
-          !startsWith(github.head_ref || '', 'release/')
-        uses: ./.github/actions/install-codex
       # The GitHub-release asset is a standalone CLI: `daemon bootstrap` fails
       # with "this CLI has no complete local package". The npm package ships
       # the managed package `daemon bootstrap` installs, so tier-2 runs the
       # npm shim while tier-1 keeps the release asset on PATH. The main npm
       # tarball is SHA-256-pinned (ADR-0057's exact version + artifact digest);
       # npm still resolves the platform package from the registry with its own
-      # integrity. `--prefix` installs no global bin entry, so it cannot shadow
-      # tier-1's `codex`.
+      # integrity. `--prefix` installs no global bin entry, and the shim is
+      # handed to tier-2's step as an output rather than through `$GITHUB_ENV`,
+      # so it cannot shadow the release asset `codex` that tier-1 just used.
       - if: >-
+          matrix.os != 'windows-latest' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Install the npm Codex package for tier-2
+        id: codex-npm
         shell: bash
         run: |
           set -euo pipefail
@@ -331,16 +307,19 @@ jobs:
             exit 1
           fi
           "$shim" --version
-          echo "COLA_LIVE_CODEX_BIN=$shim" >> "$GITHUB_ENV"
+          echo "bin=$shim" >> "$GITHUB_OUTPUT"
       - if: >-
+          matrix.os != 'windows-latest' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Live Codex tier-2 suite
         env:
           COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier2-pids.txt
+          COLA_LIVE_CODEX_BIN: ${{ steps.codex-npm.outputs.bin }}
         run: cargo test --locked -- --ignored live_codex_tier2
       - if: >-
           always() &&
+          matrix.os != 'windows-latest' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: No live Codex daemon or runtime path left behind
