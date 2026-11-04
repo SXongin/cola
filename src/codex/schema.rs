@@ -103,6 +103,7 @@ pub(crate) const REQUIRED_NOTIFICATIONS: &[&str] = &[
     "thread/tokenUsage/updated",
     "turn/completed",
     "turn/diff/updated",
+    "turn/plan/updated",
     "turn/started",
 ];
 

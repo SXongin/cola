@@ -1,4 +1,4 @@
-use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
+use crate::backend::{ContentBlock, FileContent, TodoList, TodoStatus, TodoStep, ToolCall, ToolStatus};
 
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::{CardMarkdown, serialized_len};
@@ -156,6 +156,57 @@ impl FileDelivery {
 /// before and after retirement.
 pub(crate) const BACKGROUNDED_MARKER: &str = "🌙";
 
+/// The card's tail TODO section. It is deliberately separate from
+/// [`ToolPanel`]: the list comes from OpenCode's `todowrite` call or Codex's
+/// `turn/plan/updated` notification, and no synthetic tool call crosses the
+/// adapter/card boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TodoPanel {
+    List {
+        todo: TodoList,
+        live: bool,
+    },
+    /// A malformed `todowrite` payload falls back to the existing raw tool
+    /// renderer. This is the adapter's real built-in call, never a synthetic
+    /// list carrier.
+    Tool(Box<ToolPanel>),
+}
+
+impl TodoPanel {
+    pub(crate) fn new(todo: TodoList, live: bool) -> Self {
+        Self::List { todo, live }
+    }
+
+    pub(crate) fn from_tool(call: ToolCall) -> Self {
+        let panel = ToolPanel::new(call);
+        match panel.todo_list() {
+            Some(todo) => Self::new(todo, panel.is_live()),
+            None => Self::Tool(Box::new(panel)),
+        }
+    }
+
+    pub(crate) fn todo(&self) -> Option<&TodoList> {
+        match self {
+            Self::List { todo, .. } => Some(todo),
+            Self::Tool(_) => None,
+        }
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        match self {
+            Self::List { live, .. } => *live,
+            Self::Tool(panel) => panel.is_live(),
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        match self {
+            Self::List { live, .. } => *live,
+            Self::Tool(panel) => panel.is_running(),
+        }
+    }
+}
+
 impl ToolPanel {
     pub fn new(call: ToolCall) -> Self {
         // The call's file blocks become the panel's File Content carriers, so
@@ -177,6 +228,20 @@ impl ToolPanel {
             liveness: None,
             files,
         }
+    }
+
+    /// The neutral list an OpenCode `todowrite` call carries.
+    pub(crate) fn todo_list(&self) -> Option<TodoList> {
+        if self.name() != "todowrite" {
+            return None;
+        }
+        self.input().and_then(parse_todo_list).or_else(|| {
+            self.output()?
+                .parse::<serde_json::Value>()
+                .ok()
+                .as_ref()
+                .and_then(parse_todo_list)
+        })
     }
 
     /// The File Contents this panel carries (ADR-0076), in decoder order.
@@ -1994,6 +2059,33 @@ pub(super) fn tool_panel_element(
     panel
 }
 
+/// The card-tail Todo Panel. Its neutral list is the whole presentation
+/// contract, so this renderer never depends on a synthetic ToolCall.
+pub(super) fn todo_panel_element(
+    todo: &TodoPanel,
+    at_ms: Option<i64>,
+    element_id: Option<&str>,
+    md: &mut CardMarkdown,
+) -> serde_json::Value {
+    match todo {
+        TodoPanel::List { todo, .. } => {
+            let details = format!("共 {} 项 · {}", todo.steps.len(), todo_counts(&todo.steps));
+            let body = truncate_md(&format_todo_list_with_explanation(todo), TOOL_OUTPUT_MAX_CHARS);
+            let content = md.element(&body);
+            let title = format!("📋 todowrite{} · {}", panel_time_suffix(at_ms), details);
+            collapsible_panel(&title, &content, element_id)
+        }
+        TodoPanel::Tool(panel) => tool_panel_element(panel, at_ms, element_id, None, md),
+    }
+}
+
+/// The exact tail element's serialized size, used by the card splitter's
+/// tail reserve.
+pub(crate) fn todo_panel_estimate(todo: &TodoPanel) -> usize {
+    let element = todo_panel_element(todo, None, None, &mut CardMarkdown::new());
+    serialized_len(&element.to_string())
+}
+
 /// The meaningful parts of a unified file diff (a file-editing tool's recorded
 /// diff, or an edit permission request's `diff`): the target path, the hunk
 /// lines the producer wrote (`@@`, context, `-`, `+`) and the counted change.
@@ -2286,50 +2378,50 @@ pub(crate) fn diff_language_for<'a>(paths: impl IntoIterator<Item = &'a str>) ->
     }
 }
 
-/// One item of a `todowrite` tool payload (OpenCode's `Todo.Info`). The
-/// payload's `priority` is dropped on purpose: it rarely varies within one
-/// list (agents mark nearly everything high), so showing it would add a marker
-/// to almost every row and buy no signal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TodoItem {
-    content: String,
-    status: String,
-}
-
-/// Parse a `todowrite` payload into its items. The tool's input is
-/// `{"todos":[…]}` and its output is that same array JSON-encoded, so both
-/// shapes are accepted. Anything else (an empty list, a running call's
-/// placeholder, an error text) returns `None`, and the caller falls back to
-/// showing the payload unchanged.
-fn parse_todos(value: &serde_json::Value) -> Option<Vec<TodoItem>> {
+/// Parse a todo payload into the neutral whole-list shape. OpenCode's input is
+/// `{"todos":[…]}` and its output is the same array JSON-encoded; Codex's
+/// adapter passes the same shape with an optional explanation. Priority is
+/// deliberately dropped: it rarely varies within one list and would mark almost
+/// every row without adding signal.
+fn parse_todo_list(value: &serde_json::Value) -> Option<TodoList> {
     let arr = match value {
         serde_json::Value::Array(arr) => arr,
         serde_json::Value::Object(obj) => obj.get("todos")?.as_array()?,
         _ => return None,
     };
-    let mut items = Vec::new();
+    let mut steps = Vec::new();
     for v in arr {
         // A list with one malformed row falls back to the raw payload as a
         // whole: rendering the readable rows and silently dropping the rest
         // would lose content the model wrote.
         let content = v.get("content")?.as_str()?;
-        if content.is_empty() {
-            return None;
-        }
-        // An unknown status renders as pending (`todo_style`'s fallback);
-        // normalize it here so the row and the counts line can't disagree.
-        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
-        let status = if TODO_STATUSES.iter().any(|(s, _, _)| *s == status) {
-            status
-        } else {
-            "pending"
+        let status = match v.get("status").and_then(|s| s.as_str()).unwrap_or("pending") {
+            "pending" => TodoStatus::Pending,
+            "in_progress" | "inProgress" => TodoStatus::InProgress,
+            "completed" => TodoStatus::Completed,
+            "cancelled" => TodoStatus::Cancelled,
+            other => TodoStatus::Other(other.to_string()),
         };
-        items.push(TodoItem {
-            content: content.to_string(),
-            status: status.to_string(),
+        steps.push(TodoStep {
+            text: content.to_string(),
+            status,
         });
     }
-    (!items.is_empty()).then_some(items)
+    Some(TodoList {
+        explanation: value
+            .get("explanation")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+        steps,
+    })
+}
+
+/// Parse a todo payload's non-empty item list. Anything malformed, empty or
+/// placeholder-shaped returns `None`, and the caller falls back to raw output.
+fn parse_todos(value: &serde_json::Value) -> Option<Vec<TodoStep>> {
+    let list = parse_todo_list(value)?;
+    (!list.steps.is_empty()).then_some(list.steps)
 }
 
 /// How one todo status renders — its icon and its row markup. The counts line
@@ -2349,7 +2441,8 @@ const TODO_STATUSES: [(&str, &str, TodoMarkup); 4] = [
     ("cancelled", "🚫", TodoMarkup::Strike),
 ];
 
-fn todo_style(status: &str) -> (&'static str, TodoMarkup) {
+fn todo_style(status: &TodoStatus) -> (&'static str, TodoMarkup) {
+    let status = status.as_str();
     TODO_STATUSES
         .iter()
         .find(|(s, _, _)| *s == status)
@@ -2359,11 +2452,17 @@ fn todo_style(status: &str) -> (&'static str, TodoMarkup) {
 
 /// The header of a todo panel: one `icon count` group per non-empty status, so
 /// the folded panel still answers "how far along is this?" without unfolding.
-fn todo_counts(todos: &[TodoItem]) -> String {
+fn todo_counts(todos: &[TodoStep]) -> String {
     TODO_STATUSES
         .iter()
         .filter_map(|(status, icon, _)| {
-            let n = todos.iter().filter(|t| t.status == *status).count();
+            let n = todos
+                .iter()
+                .filter(|t| {
+                    t.status.as_str() == *status
+                        || (*status == "pending" && matches!(t.status, TodoStatus::Other(_)))
+                })
+                .count();
             (n > 0).then(|| format!("{icon} {n}"))
         })
         .collect::<Vec<_>>()
@@ -2374,11 +2473,11 @@ fn todo_counts(todos: &[TodoItem]) -> String {
 /// in the order the agent wrote them (that order carries the plan's sequence).
 /// Finished and dropped items are struck through so the eye can skip them; the
 /// in-progress item is bolded — it is the only actionable row.
-fn format_todo_list(todos: &[TodoItem]) -> String {
+fn format_todo_list(todos: &[TodoStep]) -> String {
     todos
         .iter()
         .map(|t| {
-            let text = first_chunk(&t.content, 120);
+            let text = first_chunk(&t.text, 120);
             let (icon, markup) = todo_style(&t.status);
             match markup {
                 TodoMarkup::Bold => format!("- {icon} **{text}**"),
@@ -2388,6 +2487,14 @@ fn format_todo_list(todos: &[TodoItem]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_todo_list_with_explanation(todo: &TodoList) -> String {
+    let list = format_todo_list(&todo.steps);
+    match todo.explanation.as_deref() {
+        Some(explanation) if !explanation.is_empty() => format!("{explanation}\n\n{list}"),
+        _ => list,
+    }
 }
 
 /// Whether a `read` call's raw output is a DIRECTORY listing, by output shape
@@ -2471,16 +2578,22 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
         return (None, BodyStyle::Auto, body);
     }
     if name == "todowrite" {
-        // The output is the list itself, `JSON.stringify(todos, null, 2)`.
-        // Parse it back into a checklist; a payload that doesn't parse (a
-        // running call, an error, a truncated dump) falls through unchanged.
+        // OpenCode's output is the list itself and Codex's neutral panel
+        // carries the same shape. Parse it back into a checklist; a payload
+        // that doesn't parse (a running call, an error, a truncated dump) falls
+        // through unchanged.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
-            && let Some(todos) = parse_todos(&value)
+            && let Some(todo) = parse_todo_list(&value)
+            && !todo.is_empty()
         {
             return (
-                Some(format!("共 {} 项 · {}", todos.len(), todo_counts(&todos))),
+                Some(format!(
+                    "共 {} 项 · {}",
+                    todo.steps.len(),
+                    todo_counts(&todo.steps)
+                )),
                 BodyStyle::Markdown,
-                format_todo_list(&todos),
+                format_todo_list_with_explanation(&todo),
             );
         }
     }

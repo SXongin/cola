@@ -487,7 +487,7 @@ The reply cola sends to a **Turn**'s prompt message when the turn ends — its t
 _Avoid_: Done ping, completion message, notification card
 
 **Todo Panel** (待办面板):
-A **Turn**'s live task checklist, rendered as a card-TAIL status section instead of a timeline row: each `todowrite` call replaces it in place, so it rides the newest card of the **Card Chain** and a split never strands the reader on a stale list. Folded by default; its header carries the plan size and the non-empty status counts (`共 N 项 · 🔄 1 · ⬜ 2`) plus the last write's clock, so progress is readable without unfolding. An update arrives as a whole new list, never as an edit of the previous panel.
+A **Turn**'s live task checklist, rendered as a card-TAIL status section instead of a timeline row. OpenCode supplies it through each `todowrite` call; the Codex adapter supplies the same neutral whole list from the `update_plan` tool's `turn/plan/updated` notification. Each update replaces it in place, so it rides the newest card of the **Card Chain** and a split never strands the reader on a stale list. Folded by default; its header carries the plan size and the non-empty status counts (`共 N 项 · 🔄 1 · ⬜ 2`) plus the last write's clock when the source reports one, so progress is readable without unfolding. An update arrives as a whole new list, never as an edit of the previous panel; an empty list removes it.
 _Avoid_: Todo card, task list card, progress panel
 
 **Tool Panel** (工具面板):

@@ -7,7 +7,9 @@ use super::ledger::{
     task_ledger_text, task_ledger_title,
 };
 use super::sanitize::CardMarkdown;
-use super::tool_render::{ToolPanel, file_image_elements, tool_panel_element};
+use super::tool_render::{
+    TodoPanel, ToolPanel, file_image_elements, todo_panel_element, tool_display_name, tool_panel_element,
+};
 use super::{
     CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
 };
@@ -37,6 +39,26 @@ fn format_chars(n: usize) -> String {
     }
 }
 
+/// The header's rendering of the Turn's current running tool or Todo Panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningToolView {
+    icon: &'static str,
+    label: String,
+}
+
+impl RunningToolView {
+    pub(crate) fn new(icon: &'static str, label: impl Into<String>) -> Self {
+        Self {
+            icon,
+            label: label.into(),
+        }
+    }
+
+    fn from_tool(tool: &ToolPanel) -> Self {
+        Self::new(tool.status_icon(), tool_display_name(tool))
+    }
+}
+
 /// Builds Feishu interactive card JSON (v2 schema with collapsible panels).
 /// Body elements are appended in the order the builder methods are called, so
 /// text and tool panels can be interleaved chronologically.
@@ -49,7 +71,7 @@ pub struct CardBuilder {
     /// include the panel the Turn is still executing — the header describes
     /// the Turn's state, not just this card's contents). `None` keeps the
     /// slice-local selection.
-    header_running_tool: Option<ToolPanel>,
+    header_running_tool: Option<RunningToolView>,
     /// Body elements, in call order.
     body: Vec<serde_json::Value>,
     footer: Option<String>,
@@ -264,6 +286,18 @@ impl CardBuilder {
         self
     }
 
+    /// A card-tail Todo Panel with its last-write clock.
+    pub(crate) fn with_todo_at(
+        mut self,
+        todo: TodoPanel,
+        at_ms: Option<i64>,
+        element_id: Option<&str>,
+    ) -> Self {
+        self.body
+            .push(todo_panel_element(&todo, at_ms, element_id, &mut self.markdown));
+        self
+    }
+
     /// [`Self::with_tool_at`] for panels with no part time — tests only.
     #[cfg(test)]
     pub fn with_tool(self, tool: ToolPanel) -> Self {
@@ -324,11 +358,22 @@ impl CardBuilder {
     /// card's slice-local panels: a split continuation's slice may not carry
     /// the panel the Turn is still executing (`sleep 30` at split time), yet
     /// its header must keep saying "⏳ tool", not fall back to "回复中".
+    #[cfg(test)]
     pub fn with_header_running_tool(mut self, tool: Option<ToolPanel>) -> Self {
         // Self-defending: only a LIVE panel may drive the header. A stale
         // override (finished/failed) would both lie and suppress the
         // slice-local fallback, so it is treated as absent.
-        self.header_running_tool = tool.filter(|t| t.is_running());
+        self.header_running_tool = tool
+            .as_ref()
+            .filter(|tool| tool.is_running())
+            .map(RunningToolView::from_tool);
+        self
+    }
+
+    /// Set the header's running-tool view directly. Used when the live item is
+    /// a Todo Panel rather than a Tool Panel.
+    pub(crate) fn with_header_running_tool_view(mut self, tool: Option<RunningToolView>) -> Self {
+        self.header_running_tool = tool;
         self
     }
 
@@ -380,10 +425,12 @@ impl CardBuilder {
         // that never set the override. Both are first-match in insertion
         // order (`Vec`/`IndexMap`), so multiple running tools pick
         // deterministically: the one started first.
-        let running = self
-            .header_running_tool
-            .as_ref()
-            .or_else(|| self.tools.iter().find(|t| t.is_running()));
+        let slice_running = self
+            .tools
+            .iter()
+            .find(|tool| tool.is_running())
+            .map(RunningToolView::from_tool);
+        let running = self.header_running_tool.as_ref().or(slice_running.as_ref());
         let (header_title, template) = header_title_and_template(&self.state, running, &self.progress);
         let mut header = serde_json::json!({
             "title": { "tag": "plain_text", "content": header_title },
@@ -419,7 +466,7 @@ impl CardBuilder {
 /// (ADR-0059).
 pub(crate) fn header_title_and_template(
     state: &CardState,
-    running_tool: Option<&ToolPanel>,
+    running_tool: Option<&RunningToolView>,
     progress: &HeaderProgress,
 ) -> (String, &'static str) {
     if !state.overrides_awaiting()
@@ -437,14 +484,7 @@ pub(crate) fn header_title_and_template(
                 // (e.g. "🔧 ⏳ bench") on long-running tools. The name goes
                 // through the panel's display mapping, so a Codex item kind
                 // reads "命令" here too, never `codex/command_execution`.
-                (
-                    format!(
-                        "{} {}",
-                        tool.status_icon(),
-                        super::tool_render::tool_display_name(tool)
-                    ),
-                    "orange",
-                )
+                (format!("{} {}", tool.icon, tool.label), "orange")
             } else {
                 ("✍️ 回复中".to_string(), "blue")
             }

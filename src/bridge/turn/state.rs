@@ -18,8 +18,10 @@ use crate::bridge::tasks::TaskCell;
 use crate::bridge::tasks::model::TaskRunId;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow};
-use crate::feishu::card::shell::CardBuilder;
-use crate::feishu::card::tool_render::{FileDelivery, TaskLiveness, ToolPanel, is_task_tool};
+use crate::feishu::card::shell::{CardBuilder, RunningToolView};
+use crate::feishu::card::tool_render::{
+    FileDelivery, TaskLiveness, TodoPanel, ToolPanel, is_task_tool, todo_panel_estimate, tool_display_name,
+};
 use crate::feishu::card::{AwaitingAction, CardState, format_tokens};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -1367,7 +1369,7 @@ pub(super) struct StreamAccumulator {
     /// renderer's and the seed's one write; read through
     /// [`Self::tool_panel_current`], [`Self::has_live_tool`],
     /// [`Self::has_rendered_content`] and the card tail render.
-    todo_panel: Option<ToolPanel>,
+    todo_panel: Option<TodoPanel>,
     /// The server start time of the todowrite call that last refreshed
     /// [`Self::todo_panel`] — its panel header shows when the list was last
     /// written. Moves with the panel: private to this module, set only by
@@ -1933,7 +1935,7 @@ impl StreamAccumulator {
     /// differs and re-renders.
     pub(super) fn tool_panel_current(&self, call: &ToolCall) -> bool {
         if call.identity.name == "todowrite" {
-            self.todo_panel.as_ref().is_some_and(|panel| panel.call() == call)
+            self.todo_panel.as_ref() == Some(&TodoPanel::from_tool(call.clone()))
                 && self.todo_shown_at == call.started_at
         } else {
             self.tools
@@ -3388,11 +3390,17 @@ impl StreamAccumulator {
     /// "回复中". A tool that finished is not `running`, so it drops out.
     /// Selection is deterministic: `IndexMap` preserves insertion order, so
     /// the first running tool (the one the Turn started first) wins.
-    fn running_tool(&self) -> Option<&ToolPanel> {
+    fn running_tool(&self) -> Option<RunningToolView> {
         self.tools
             .values()
             .find(|t| t.is_running())
-            .or_else(|| self.todo_panel.as_ref().filter(|t| t.is_running()))
+            .map(|tool| RunningToolView::new(tool.status_icon(), tool_display_name(tool)))
+            .or_else(|| {
+                self.todo_panel
+                    .as_ref()
+                    .filter(|todo| todo.is_running())
+                    .map(|_| RunningToolView::new("⏳", "todowrite"))
+            })
     }
 
     /// The header (title, template) this accumulator's card should show: the
@@ -3401,9 +3409,10 @@ impl StreamAccumulator {
     /// in the same response — resolving the last live block must lift the
     /// "等待你的授权/回答" title immediately, not a poll later.
     pub(super) fn header_title_and_template(&self) -> (String, &'static str) {
+        let running = self.running_tool();
         crate::feishu::card::shell::header_title_and_template(
             &self.card_state,
-            self.running_tool(),
+            running.as_ref(),
             &self.header_progress(),
         )
     }
@@ -3937,20 +3946,43 @@ impl StreamAccumulator {
         self.refresh_phase();
     }
 
-    /// Record the latest `todowrite` panel and its write clock — the single
-    /// production write of the card-tail list: the renderer's `render_part`
-    /// and the seed's [`Self::mark_delivered_part`] both go through it. Both
-    /// move together: the clock is always reassigned, so a payload without a
-    /// server time shows no clock rather than the previous call's (which would
-    /// read as a write time this list never had).
-    pub(super) fn set_todo_panel(&mut self, panel: ToolPanel, shown_at: Option<i64>) {
+    /// Record the latest whole TODO list and its write clock. This is the one
+    /// neutral seam shared by OpenCode's `todowrite` and Codex's
+    /// `turn/plan/updated`. An empty list removes the panel. Returns whether
+    /// the card changed.
+    pub(super) fn set_todo_list(
+        &mut self,
+        todo: &crate::backend::TodoList,
+        shown_at: Option<i64>,
+        live: bool,
+    ) -> bool {
+        if todo.is_empty() {
+            let changed = self.todo_panel.take().is_some() || self.todo_shown_at.take().is_some();
+            return changed;
+        }
+        let panel = TodoPanel::new(todo.clone(), live);
+        let current = self
+            .todo_panel
+            .as_ref()
+            .is_some_and(|current| current == &panel && self.todo_shown_at == shown_at);
+        if current {
+            return false;
+        }
         self.todo_panel = Some(panel);
+        self.todo_shown_at = shown_at;
+        true
+    }
+
+    /// Record a raw `todowrite` panel for a malformed payload that cannot be
+    /// represented by the neutral list.
+    pub(super) fn set_todo_panel(&mut self, panel: ToolPanel, shown_at: Option<i64>) {
+        self.todo_panel = Some(TodoPanel::Tool(Box::new(panel)));
         self.todo_shown_at = shown_at;
     }
 
     /// The `todowrite` tail panel, if any — a test read of the card-tail list.
     #[cfg(test)]
-    pub(super) fn todo_panel(&self) -> Option<&ToolPanel> {
+    pub(super) fn todo_panel(&self) -> Option<&TodoPanel> {
         self.todo_panel.as_ref()
     }
 
@@ -4063,7 +4095,13 @@ impl StreamAccumulator {
             }
             Part::Tool(call) => {
                 if call.identity.name == "todowrite" {
-                    self.set_todo_panel(ToolPanel::new(call.clone()), call.started_at);
+                    let panel = TodoPanel::from_tool(call.clone());
+                    if let Some(todo) = panel.todo() {
+                        self.set_todo_list(todo, call.started_at, panel.is_live());
+                    } else {
+                        self.todo_panel = Some(panel);
+                        self.todo_shown_at = call.started_at;
+                    }
                 } else {
                     self.tools
                         .insert(call.identity.call_id.clone(), ToolPanel::new(call.clone()));
@@ -4581,10 +4619,9 @@ impl StreamAccumulator {
             // renderer owns, exactly as `build_card_inner` omits it
             // ([`Self::omitted_live_seeded`]): the reserve must not charge for
             // what the build will not render.
-            if let Some(panel) = &self.todo_panel {
-                let session = self.session_id.as_deref();
-                comps += 1 + panel.embedded_file_count() + panel.open_button_count(session);
-                size += panel_estimate(panel, session);
+            if let Some(todo) = &self.todo_panel {
+                comps += 1;
+                size += todo_panel_estimate(todo);
             }
             if !self.ledger.is_empty() {
                 comps += 1;
@@ -4741,7 +4778,7 @@ impl StreamAccumulator {
             .with_state(state.clone())
             .with_progress(self.header_progress())
             .with_fenced_markdown(self.card_fallback.fenced())
-            .with_header_running_tool(self.running_tool().cloned());
+            .with_header_running_tool_view(self.running_tool());
 
         // The card is a reply to the user's message, so the session/thread name
         // goes in the subtitle and the question is NOT echoed again. The date
@@ -4854,12 +4891,7 @@ impl StreamAccumulator {
             // on a finalized one). The block spans below are recorded from
             // `builder.body_len()`, so they stay correct with it in front.
             if let Some(todo) = &self.todo_panel {
-                builder = builder.with_tool_at(
-                    todo.clone(),
-                    self.todo_shown_at,
-                    Some("todo"),
-                    self.session_id.as_deref(),
-                );
+                builder = builder.with_todo_at(todo.clone(), self.todo_shown_at, Some("todo"));
             }
             // The Background Task Ledger follows the todo list (ADR-0060): the
             // Session's live tasks, kept on the newest card by the tail's own
@@ -7726,13 +7758,26 @@ mod tests {
         // still a running tool: it gets the Tool phase too, and a completed one
         // drops back. (Mutation audit, state.rs:548 — the todo_panel status
         // comparison survived the tools-only coverage.)
-        acc.todo_panel = Some(ToolPanel::for_test("todowrite", ToolStatus::Running, None, None));
+        acc.todo_panel = Some(TodoPanel::new(
+            crate::backend::TodoList {
+                explanation: None,
+                steps: vec![crate::backend::TodoStep {
+                    text: "working".to_string(),
+                    status: crate::backend::TodoStatus::InProgress,
+                }],
+            },
+            true,
+        ));
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Tool));
-        acc.todo_panel = Some(ToolPanel::for_test(
-            "todowrite",
-            ToolStatus::Completed,
-            None,
-            None,
+        acc.todo_panel = Some(TodoPanel::new(
+            crate::backend::TodoList {
+                explanation: None,
+                steps: vec![crate::backend::TodoStep {
+                    text: "done".to_string(),
+                    status: crate::backend::TodoStatus::Completed,
+                }],
+            },
+            false,
         ));
         assert_eq!(acc.active_phase(), Some(HeaderPhase::Streaming));
         // A resumed card (ADR-0066) works on like streaming — same phase, same
