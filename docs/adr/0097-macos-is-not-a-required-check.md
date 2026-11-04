@@ -71,3 +71,8 @@ a yellow check instead of blocking a merge.
   "Pull request rules" is the single source for it.
 - Nothing here reduces *what* macOS runs, only *when* it gates: the merge still
   gets the full workspace suite on macOS.
+- Because macOS gating moved behind the merge, the run that covers a merge must
+  not be cancellable by the next one: a `main` push gets a concurrency group of
+  its own (workflow + ref + the pushed sha), so two merges in flight run both
+  macOS legs instead of the later one cancelling the earlier. Pull requests keep
+  the superseded-run cancellation, which is what that policy is for.

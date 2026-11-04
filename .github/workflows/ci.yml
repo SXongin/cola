@@ -6,7 +6,12 @@ on:
   pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A pull request cancels its own superseded run: pushing a fix should not
+  # queue a run of the version it replaces. A push to `main` does not share a
+  # group with any other run — macOS runs only there (ADR-0097), so cancelling
+  # an older main run would drop the only macOS check for that commit, exactly
+  # when a second merge lands while the first is still running.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
   cancel-in-progress: true
 
 permissions:
