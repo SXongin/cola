@@ -231,11 +231,13 @@ missing: `codex` on `PATH` is the fallback, and a missing or unpinned binary is
 a failure. Tier-1 installs the 0.166.0 release asset with
 `.github/actions/install-codex`; tier-2 installs the 0.166.0 main npm tarball,
 whose SHA-256 is pinned in the workflow (ADR-0057's exact version + artifact
-digest), then runs its shim. The five advisory checks are, exactly as GitHub
-reports them:
-`Live Codex tier-1 (ubuntu-latest)`, `Live Codex tier-1 (macos-latest)`,
-`Live Codex tier-1 (windows-latest)`, `Live Codex tier-2 (ubuntu-latest)` and
-`Live Codex tier-2 (macos-latest)`. Each test asserts its daemon, listener,
+digest), then runs its shim. Both tiers share **one job per OS** — the job pays
+one compile of the crate instead of two — so the three advisory checks are,
+exactly as GitHub reports them:
+`Live Codex (ubuntu-latest)`, `Live Codex (macos-latest)` and
+`Live Codex (windows-latest)`. The Windows one runs tier-1 only: tier-2's
+managed daemon refuses an elevated token, and hosted Windows runners are
+elevated. Each test asserts its daemon, listener,
 proxy children and temp home are gone before it returns; the CI step re-checks
 the marker after the process exits.
 
