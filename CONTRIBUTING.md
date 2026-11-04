@@ -265,18 +265,28 @@ the marker after the process exits.
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
    is the ADR-0033 exception).
 
-The `main: CI` ruleset requires eight checks: `Format`, `Check`,
-`Test (macos-latest)`, `Test (windows-latest)`, `Live V1`, `Live V2`,
+The `main: CI` ruleset requires seven checks: `Format`, `Check`,
+`Test (windows-latest)`, `Live V1`, `Live V2`,
 `Dependency audit` and `Docs drift` — judge merge-readiness with `gh pr checks
 <branch> --required`, not by eyeballing every check.
+
+The Test job's platform follows the event: a pull request runs
+`Test (windows-latest)`, and a push to `main` runs `Test (macos-latest)`
+(Linux is `Coverage`). macOS is deliberately **not** required: hosted macOS
+arm64 capacity is scarce enough that GitHub cancels a queued job after ~15
+minutes ("The job was not acquired by Runner of type hosted"), and a required
+check that cannot acquire a runner blocks every PR — 2026-11-04 lost three
+macOS jobs that way, twice the required `Test (macos-latest)`. A macOS-only
+compile break is still caught by `release.yml`, which builds all three
+platforms.
 
 Release PRs (`release/*`) and docs-only PRs skip the code-dependent work
 (Format, Check, Coverage, the live suites, and the Test steps): a skipped job
 or step reports success, so the required checks still satisfy the `main: CI`
 ruleset and the PR stays mergeable without running the code-dependent gates.
-The Test matrix and all four live jobs still dispatch (idling for a few
+The Test job and all four live jobs still dispatch (idling for a few
 seconds) — a job-level skip leaves the matrix unexpanded or the required
-`Live V1`/`Live V2` checks unreported, and the advisory Codex tier checks
+`Live V1`/`Live V2` checks unreported, and the advisory Codex checks
 missing, so only their steps are gated.
 `Dependency audit` and `Docs drift` always run: the drift guard is not gated by
 `classify` precisely because a docs-only PR, which skips every code gate, is

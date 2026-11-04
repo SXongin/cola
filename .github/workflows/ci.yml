@@ -345,13 +345,25 @@ jobs:
         run: bash .github/scripts/check-live-codex-cleanup.sh tier-2
 
   test:
-    # Compile + test only on the other platforms: catches platform quirks
-    # cheaply. Full release builds still run on all three in release.yml.
+    # The platform matrix follows the event. A pull request runs Windows; a
+    # push to `main` runs macOS. Both are the "other platforms" whose quirks
+    # Linux cannot show — Linux itself is the `Coverage` job — and the split
+    # exists because macOS capacity is not: hosted macOS arm64 jobs queue
+    # behind scarcity and GitHub gives up on them with "The job was not
+    # acquired by Runner of type hosted" after ~15 minutes, which on a
+    # required check means no PR can merge (2026-11-04: three macOS jobs
+    # cancelled that way, `Test (macos-latest)` twice). macOS therefore
+    # reports on the merge instead of gating it, and `main: CI` requires only
+    # `Test (windows-latest)`.
+    #
+    # Full release builds still run on all three platforms in release.yml,
+    # which is the check that would catch a macOS-only compile break.
+    #
     # The docs-only and release/* skips gate the STEPS, not the job: a
     # job-level skip leaves the matrix unexpanded (`Test (${{ matrix.os }})`),
-    # so the two required `Test (…)` checks the ruleset waits for never report
-    # and the PR is blocked. A dispatched job with skipped steps reports
-    # success under the expanded names instead.
+    # so the required `Test (windows-latest)` check never reports and the PR
+    # is blocked. A dispatched job with skipped steps reports success under
+    # the expanded name instead.
     name: Test (${{ matrix.os }})
     needs: classify
     if: always()
@@ -366,7 +378,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["windows-latest"]' || '["macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - if: >-
