@@ -3,10 +3,17 @@
 #
 # Pre-commit mirrors CI (fmt + clippy) but only fires when staged files touch
 # Rust, so docs/.scratch-only commits stay fast. commit-msg enforces
-# Conventional Commits. pre-push runs a dependency audit. post-checkout keeps a
-# linked worktree's CodeGraph index local (see CONTRIBUTING.md, "Local
-# development").
+# Conventional Commits. pre-push runs the full clippy and a dependency audit.
+# post-checkout keeps a linked worktree's CodeGraph index local (see
+# CONTRIBUTING.md, "Local development").
 # See CONTRIBUTING.md's "Verification loop" and "Local development".
+#
+# The clippy split is measured, not stylistic (2026-11-04, warm target dir, one
+# touched `.rs`): `--all-targets` costs 101 s because it also lints the
+# `#[cfg(test)]` surface, and this crate's tests are compiled into the same bin
+# target as production code. The bin-target lint is 32 s. Commits are frequent
+# and pushes are not, so the 101 s variant sits on pre-push — and CI's `Check`
+# job still runs it on every push, so no lint reaches the remote unlinted.
 
 pre-commit:
   parallel: true
@@ -16,7 +23,7 @@ pre-commit:
       run: cargo fmt --all -- --check
     clippy:
       glob: "*.rs"
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: cargo clippy --workspace -- -D warnings
 
 commit-msg:
   commands:
@@ -24,7 +31,10 @@ commit-msg:
       run: cargo xtask check-commit-msg {1}
 
 pre-push:
+  parallel: true
   commands:
+    clippy-all-targets:
+      run: cargo clippy --workspace --all-targets -- -D warnings
     audit:
       run: cargo xtask audit
 
