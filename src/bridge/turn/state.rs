@@ -4636,9 +4636,16 @@ impl StreamAccumulator {
             // ([`Self::omitted_live_seeded`]): the reserve must not charge for
             // what the build will not render.
             if let Some(todo) = &self.todo_panel {
-                comps += 1;
-                size +=
-                    todo_panel_estimate(todo, self.todo_shown_at, Some("todo"), self.session_id.as_deref());
+                let session = self.session_id.as_deref();
+                comps += match todo {
+                    TodoPanel::List { .. } => 1,
+                    // A malformed `todowrite` fallback is an ordinary Tool
+                    // Panel, so it carries the same extras the build renders.
+                    TodoPanel::Tool(panel) => {
+                        1 + panel.embedded_file_count() + panel.open_button_count(session)
+                    }
+                };
+                size += todo_panel_estimate(todo, self.todo_shown_at, Some("todo"), session);
             }
             if !self.ledger.is_empty() {
                 comps += 1;
