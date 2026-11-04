@@ -249,14 +249,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 // always reassigned — a payload without a server time shows no
                 // clock rather than the previous call's, which would read as a
                 // write time this list never had.
-                match crate::feishu::card::tool_render::TodoPanel::from_tool(call.clone()) {
-                    crate::feishu::card::tool_render::TodoPanel::List { todo, live } => {
-                        acc.set_todo_list(&todo, call.started_at, live);
-                    }
-                    crate::feishu::card::tool_render::TodoPanel::Tool(panel) => {
-                        acc.set_todo_panel(*panel, call.started_at);
-                    }
-                }
+                acc.record_todo_call(call);
             } else {
                 // The panel is a view over the typed call; the Platform
                 // assembles the output text and status icon from it (ADR-0042,
@@ -1648,7 +1641,12 @@ pub(super) fn render_turn_parts(
     // committing it here or after the parts render is one card.
     let seed = acc.seed().cloned();
     let turn = transcript.turn_for_user(&anchor);
-    if let Some(todo) = turn.todo {
+    // A card rendering an unanswered free-text field must not consume this
+    // background update: otherwise the first pass removes it from "new" and
+    // the post-answer pass has nothing left to show (#917 / card-repaints).
+    if !acc.awaits_typed_answer()
+        && let Some(todo) = turn.todo
+    {
         rendered_any |= acc.set_todo_list(todo, None, false);
     }
     for message in turn.messages {
@@ -3061,7 +3059,9 @@ mod tests {
         realistic_parts, seed_cover_title, seed_entry, send_command_in, test_config, test_work_dir,
         text_part, turn_anchor, typed_message,
     };
-    use crate::bridge::turn::state::{CursorSeed, StreamAccumulator, file_content_hash};
+    use crate::bridge::turn::state::{
+        CursorSeed, InteractionBlock, PendingQuestion, StreamAccumulator, file_content_hash,
+    };
     use crate::feishu::card::CardState;
     use crate::feishu::card::tool_render::ToolPanel;
 
@@ -6609,6 +6609,68 @@ Index: /x/src/main.rs
         assert!(
             rest_text.contains("- 🔄 **Patch decoder**"),
             "the continuation carries the current plan: {rest_text}"
+        );
+    }
+
+    /// Issue #917's repaint freeze applies to the new plan source too: a plan
+    /// notification arriving while a free-text answer is open remains owed and
+    /// appears on the first render after that form closes.
+    #[test]
+    fn a_plan_update_waits_for_an_open_typed_answer() {
+        let mut acc = StreamAccumulator::new("test");
+        let anchor = TurnAnchor {
+            message_id: MessageId::new("msg_user_plan"),
+            created_ms: 1_000,
+        };
+        acc.repoint_turn_anchor(&anchor);
+        assert!(acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q_plan".to_string(),
+            session_id: "ses_plan".to_string(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "补充说明".to_string(),
+                header: "说明".to_string(),
+                kind: crate::backend::types::FormFieldKind::String,
+                options: Vec::new(),
+                custom: None,
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: String::new(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+        })));
+        let transcript = SessionTranscript::new(vec![typed_message(
+            "msg_user_plan",
+            MessageRole::User,
+            Some(1_000),
+            Vec::new(),
+        )])
+        .with_todo_list(
+            MessageId::new("msg_user_plan"),
+            TodoList {
+                explanation: None,
+                steps: vec![TodoStep {
+                    text: "Wait for the answer".to_string(),
+                    status: TodoStatus::Pending,
+                }],
+            },
+        );
+
+        assert!(acc.awaits_typed_answer());
+        assert!(!render_turn_parts(&mut acc, &transcript, None));
+        assert!(
+            acc.todo_panel().is_none(),
+            "the frozen pass must not consume the plan update"
+        );
+        assert!(acc.dismiss_interaction("q_plan"));
+        assert!(!acc.awaits_typed_answer());
+        assert!(render_turn_parts(&mut acc, &transcript, None));
+        assert!(
+            acc.todo_panel().is_some(),
+            "the next unfrozen pass renders the owed plan"
         );
     }
 

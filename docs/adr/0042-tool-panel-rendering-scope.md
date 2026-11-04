@@ -258,3 +258,23 @@ thread.
 
 The boundary is otherwise unchanged: a third-party tool that squats either id
 with a partial payload stays raw, and no Codex-only vocabulary is renamed.
+
+## Amendment (2026-11-04): Codex `update_plan` feeds the Todo Panel
+
+The 2026-10-01 amendment called the Todo Panel a V1-only OpenCode surface
+because OpenCode 2 removed `todowrite`. Codex now supplies the same card-tail
+status section from its `update_plan` tool's `turn/plan/updated` notification
+(#961). That notification is not a `ThreadItem` and does not become a Tool
+Panel.
+
+The Codex adapter decodes its shape-gated
+`{threadId, turnId, explanation?, plan: [{step, status}]}` payload into the
+neutral whole-list `TodoList`; the Bridge and Platform consume that list through
+`set_todo_list`. No synthetic `ToolCall`, `todowrite` id, or new timeline id is
+created. OpenCode's real `todowrite` call continues to use the same neutral seam
+when its input parses as a list; a malformed call keeps its existing raw Tool
+Panel fallback.
+
+The rest of this ADR is unchanged: Tool Panel rendering remains limited to the
+exact built-in or adapter-owned ids named above, together with their recorded
+shape gates.

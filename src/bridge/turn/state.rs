@@ -3973,6 +3973,20 @@ impl StreamAccumulator {
         true
     }
 
+    /// Fold a real `todowrite` call into the tail. Both the live render and the
+    /// seed-replay path call this one entry so their parse/fallback behavior
+    /// cannot drift.
+    pub(super) fn record_todo_call(&mut self, call: &ToolCall) {
+        match TodoPanel::from_tool(call.clone()) {
+            TodoPanel::List { todo, live } => {
+                self.set_todo_list(&todo, call.started_at, live);
+            }
+            TodoPanel::Tool(panel) => {
+                self.set_todo_panel(*panel, call.started_at);
+            }
+        }
+    }
+
     /// Record a raw `todowrite` panel for a malformed payload that cannot be
     /// represented by the neutral list.
     pub(super) fn set_todo_panel(&mut self, panel: ToolPanel, shown_at: Option<i64>) {
@@ -4095,13 +4109,7 @@ impl StreamAccumulator {
             }
             Part::Tool(call) => {
                 if call.identity.name == "todowrite" {
-                    let panel = TodoPanel::from_tool(call.clone());
-                    if let Some(todo) = panel.todo() {
-                        self.set_todo_list(todo, call.started_at, panel.is_live());
-                    } else {
-                        self.todo_panel = Some(panel);
-                        self.todo_shown_at = call.started_at;
-                    }
+                    self.record_todo_call(call);
                 } else {
                     self.tools
                         .insert(call.identity.call_id.clone(), ToolPanel::new(call.clone()));
