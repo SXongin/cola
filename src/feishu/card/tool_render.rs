@@ -185,13 +185,6 @@ impl TodoPanel {
         }
     }
 
-    pub(crate) fn todo(&self) -> Option<&TodoList> {
-        match self {
-            Self::List { todo, .. } => Some(todo),
-            Self::Tool(_) => None,
-        }
-    }
-
     pub(crate) fn is_live(&self) -> bool {
         match self {
             Self::List { live, .. } => *live,
