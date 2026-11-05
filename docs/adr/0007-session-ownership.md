@@ -10,6 +10,12 @@ How cola decides what identity a session has, and which session a thread may use
 
 > **Amended by ADR-0053**: `/api/session` is no longer the legacy path — upstream made `/api/...` the current protocol and the unprefixed routes the V1 compatibility surface. The "legacy `/api/session`" wording below describes the earlier generation and is superseded on this point.
 
+> **Amended by the 2026-11-05 ADR-0023 amendment (#997)**: `/switch forget`
+> is no longer classed as a session-selection command. It unbinds instead of
+> selecting, so it is allowed inside a topic that already owns a session —
+> the one form that topic needs, since the main conversation's `forget` unmaps
+> its own key. Every other form this ADR lists as rejected stays rejected.
+
 ## Context
 
 - cola's `SessionEntry` stores a per-thread `name` that duplicates the server's
