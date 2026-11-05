@@ -140,7 +140,19 @@ impl OpenCodeBackend {
     /// also WARNs once naming the canonical and every ignored server, so the
     /// choice is visible without attempting to sync two servers.
     async fn reconcile(&self, request: &EnsureAttached<'_>) -> crate::error::Result<AttachOutcome> {
-        let candidates = discovery::scan_processes();
+        let candidates = match discovery::scan_processes() {
+            Ok(candidates) => candidates,
+            // An unreadable process table is not "no server is running":
+            // starting one here could leave two servers on the same store and
+            // break ADR-0085's one-server premise. Stay serverless and let the
+            // next pass (or the reconnect loop) retry.
+            Err(e) => {
+                tracing::warn!(
+                    "cannot read the process table; not choosing or starting a server this pass: {e}"
+                );
+                return Ok(AttachOutcome::Serverless);
+            }
+        };
         let self_pid = discovery::self_spawned_pid(self.layout());
         let Some(server) = discovery::pick_server(&candidates, self.settings().preferred_port(), self_pid)
         else {
@@ -407,7 +419,7 @@ impl ServerLifecycle for OpenCodeBackend {
     }
 
     async fn attachment_status(&self) -> Option<AttachmentStatus> {
-        let candidates = discovery::scan_processes();
+        let candidates = discovery::scan_processes().ok()?;
         let candidate = discovery::pick_server(
             &candidates,
             self.settings().preferred_port(),

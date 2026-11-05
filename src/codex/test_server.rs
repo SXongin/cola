@@ -331,7 +331,7 @@ pub(crate) struct ProxyChildFinder {
 impl ProxyChildFinder {
     pub(crate) fn new() -> Self {
         Self {
-            system: System::new(),
+            system: System::new().expect("a process table"),
         }
     }
 

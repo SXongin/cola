@@ -1184,7 +1184,9 @@ fn first_line(stderr: &[u8]) -> String {
 /// what proves a `--remote` client shares this daemon; `None` means no daemon,
 /// so a TUI with no `--remote` fell back to its own embedded server.
 pub(crate) fn local_clients(daemon: Option<&Path>) -> LocalClients {
-    let mut system = System::new();
+    let Ok(mut system) = System::new() else {
+        return LocalClients::default();
+    };
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,

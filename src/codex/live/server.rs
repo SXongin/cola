@@ -461,7 +461,7 @@ async fn kill_processes_under(roots: &[PathBuf]) {
 #[cfg(windows)]
 fn system_with_cwd() -> sysinfo::System {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut system = System::new();
+    let mut system = System::new().expect("a process table");
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -806,7 +806,7 @@ fn cleanup_runtime(directory: &Path, before: Option<&BTreeSet<OsString>>) {
 #[cfg(unix)]
 fn system() -> sysinfo::System {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut system = System::new();
+    let mut system = System::new().expect("a process table");
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -895,7 +895,12 @@ fn daemon_processes_under(home: &Path) -> Vec<sysinfo::Pid> {
 /// is portable to the Windows tier-1 leg.
 pub fn process_alive(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessesToUpdate, System};
-    let mut system = System::new();
+    // A table that cannot be built verifies nothing, so count the child alive:
+    // the bounded cleanup below then keeps waiting instead of passing its
+    // liveness assertion on a read that never happened.
+    let Ok(mut system) = System::new() else {
+        return true;
+    };
     let pid = Pid::from_u32(pid);
     system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
     system.process(pid).is_some()
