@@ -3727,6 +3727,26 @@ mod tests {
         .expect("attach to the scripted app-server")
     }
 
+    /// Wait until the thread's subscriber has left `Adopting`.
+    ///
+    /// A read is bounded ([`INITIAL_READ_BOUND`], 100–150 ms) and returns the
+    /// cached projection — empty while adoption is still in flight — explicitly
+    /// truncated, by design. A test that asserts on the *contents* of the first
+    /// read must therefore wait for adoption to settle first, or it races a
+    /// loaded runner: on 2026-11-05 the macOS leg read an empty projection and
+    /// `a_repeated_turns_cursor_leaves_the_first_read_truncated` saw 0 messages
+    /// where its bounded resume page carried 1.
+    async fn settled(client: &CodexClient, thread_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while client.projections.is_adopting(thread_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the subscriber stayed in Adopting past the deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Wait until the projection has folded the live turn a prompt started.
     async fn wait_for_live_turn(client: &CodexClient, thread_id: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -4465,6 +4485,7 @@ mod tests {
         thread.read_turn_limit = Some(1);
         server.seed_thread(thread);
         let client = connect(&url).await;
+        settled(&client, "thread-1").await;
 
         let first = client.transcript("thread-1").await.expect("first read");
         assert_eq!(
@@ -4554,6 +4575,7 @@ mod tests {
         thread.malformed_turns_page = true;
         server.seed_thread(thread);
         let client = connect(&url).await;
+        settled(&client, "thread-1").await;
 
         let first = client.transcript("thread-1").await.expect("first read");
         assert_eq!(first.messages.len(), 1, "the bounded page is still shown");
@@ -4579,6 +4601,7 @@ mod tests {
         thread.repeat_turns_cursor = true;
         server.seed_thread(thread);
         let client = connect(&url).await;
+        settled(&client, "thread-1").await;
 
         let first = client.transcript("thread-1").await.expect("first read");
         assert_eq!(first.messages.len(), 1, "the bounded page is still shown");
@@ -4611,8 +4634,12 @@ mod tests {
         thread.read_turn_limit = Some(1);
         thread.turns_page_delay_ms = 150;
         server.seed_thread(thread);
-        let client = connect(&url).await;
+        // Armed before the attach so the *adoption* page is the one that
+        // fails; otherwise the page races the failure and the test reads a
+        // projection that may or may not carry the bounded page.
         server.fail_turns_pages(1);
+        let client = connect(&url).await;
+        settled(&client, "thread-1").await;
 
         let first = client.transcript("thread-1").await.expect("first read");
         assert!(first.truncated, "the first page failed");
