@@ -207,12 +207,20 @@ impl Command {
     ///   main conversation cannot do it: its `forget` unmaps its own key.
     /// - Every other command passes.
     pub(crate) fn topic_rejection(&self, has_session: bool) -> Option<&'static str> {
+        // The one `/switch` form that is NOT a selection: `forget` drops the
+        // mapping and leaves the server session alone, so a bound topic may
+        // always run it (#997). Stated ahead of the table so the exception is
+        // visible, and so a future `SwitchAction` variant is refused by
+        // default rather than silently allowed.
+        if matches!(self, Command::Switch(SwitchAction::Forget)) {
+            return None;
+        }
         match self {
             Command::Topic { .. } | Command::TopicWorktree { .. } => Some(TOPIC_NEST_REJECTION),
             Command::TopicAdopt { .. } | Command::TopicAdoptCard => Some(TOPIC_ADOPT_NEST_REJECTION),
             Command::Dir(_)
             | Command::DirCard
-            | Command::Switch(SwitchAction::Card | SwitchAction::Match(_) | SwitchAction::Attach { .. })
+            | Command::Switch(_)
             | Command::Sub(SubAction::Attach { .. })
             | Command::New(_)
             | Command::NewWorktree { .. }
