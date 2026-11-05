@@ -57,7 +57,7 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.23"
 async-trait = "0.1"
 indexmap = "2"
-sysinfo = "0.39"
+sysinfo = "0.40"
 semver = "1"
 sha2 = "0.11"
 tempfile = "3"
