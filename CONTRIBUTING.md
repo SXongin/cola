@@ -284,8 +284,8 @@ the marker after the process exits.
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
    is the ADR-0033 exception).
 
-The `main: CI` ruleset requires six checks: `Format`, `Check`,
-`Test (windows-latest)`, `Live OpenCode`,
+The `main: CI` ruleset requires seven checks: `Format`, `Check`,
+`Test (macos-latest)`, `Test (windows-latest)`, `Live OpenCode`,
 `Dependency audit` and `Docs drift` — judge merge-readiness with `gh pr checks
 <branch> --required`, not by eyeballing every check.
 
@@ -293,15 +293,13 @@ Both live contract suites run in the one `Live OpenCode` job: they need
 different pinned binaries but the same compiled test binary, so two jobs built
 the crate twice to run a handful of `#[ignore]` tests.
 
-The Test job's platform follows the event: a pull request runs
-`Test (windows-latest)`, and a push to `main` runs `Test (macos-latest)`
-(Linux is `Coverage`). macOS is deliberately **not** required: hosted macOS
-arm64 capacity is scarce enough that GitHub cancels a queued job after ~15
-minutes ("The job was not acquired by Runner of type hosted"), and a required
-check that cannot acquire a runner blocks every PR — 2026-11-04 lost three
-macOS jobs that way, twice the required `Test (macos-latest)`. A macOS-only
-compile break is still caught by `release.yml`, which builds all three
-platforms.
+A hosted runner pool can starve: GitHub queues the job, then gives up after ~15
+minutes with "The job was not acquired by Runner of type hosted" (2026-11-04,
+macOS arm64: 0 of 90 jobs before the window, 31 of 37 during it, 0 of 5 after).
+The answer is a **re-run**, never a platform dropped from the required set —
+the same rule has to hold for Windows and Linux, or the gate erodes one outage
+at a time (ADR-0099). Cutting the cost of a run is a separate, welcome
+question: fewer jobs, and less duplicated compile per job.
 
 Release PRs (`release/*`) and docs-only PRs skip the code-dependent work
 (Format, Check, Coverage, the live suites, and the Test steps): a skipped job
