@@ -783,6 +783,13 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             has_session: true,
             rejection: Some(TOPIC_SELECTION_REJECTION),
         },
+        // `--force` parses as `Attach`, not `Match` — the arm that takeover
+        // rides. Pinned separately so deleting it cannot pass unnoticed.
+        Case {
+            text: "/switch ses_x --force".to_string(),
+            has_session: true,
+            rejection: Some(TOPIC_SELECTION_REJECTION),
+        },
         Case {
             text: "/sub attach ses_x".to_string(),
             has_session: true,
@@ -1914,6 +1921,9 @@ async fn forget_drops_the_topic_anchors_so_the_root_injects_again() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
     let prompt_calls = backend.prompt_calls.clone();
+    // The id the mock's `create_session` returns: the plain reply after the
+    // unbind must materialise this session, never reuse the forgotten one.
+    let fresh_session = backend.session_id.clone();
     let platform = RecordingPlatform::new();
     platform.quoted_messages.lock().unwrap().insert(
         "om_root_cmd".into(),
@@ -1968,6 +1978,17 @@ async fn forget_drops_the_topic_anchors_so_the_root_injects_again() {
         *prompt_calls.lock().await,
         vec!["[引用消息]:\n📌 已创建会话 `api-refactor`\n\n普通回复".to_string()],
         "after an unbind the anchors are gone, so the root injects (ADR-0023 amendment)"
+    );
+    let active = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&topic_key)
+        .map(|e| e.session_id.clone());
+    assert_eq!(
+        active.as_deref(),
+        Some(fresh_session.as_str()),
+        "the reply must land on a freshly created session, not the forgotten one"
     );
 }
 
