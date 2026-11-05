@@ -76,3 +76,12 @@ a yellow check instead of blocking a merge.
   its own (workflow + ref + the pushed sha), so two merges in flight run both
   macOS legs instead of the later one cancelling the earlier. Pull requests keep
   the superseded-run cancellation, which is what that policy is for.
+
+## Amendment (2026-11-05): superseded by ADR-0099
+
+The measurement this decision lacked arrived the next day: the shortage was a
+**three-hour window** (2026-11-04 15:00–18:00 UTC — 31 of 37 macOS jobs starved
+inside it, against 0 of 90 before and 0 of 5 after). ADR-0099 restores
+`Test (macos-latest)` to the required set and records the rule this ADR
+violated: a capacity event is answered by a re-run, never by demoting a
+platform, because the same rule would remove Windows and Linux too.
