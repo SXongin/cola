@@ -3727,16 +3727,26 @@ mod tests {
         .expect("attach to the scripted app-server")
     }
 
-    /// Wait until the thread's subscriber has left `Adopting`.
+    /// Start the thread's adoption and wait until the subscriber has left
+    /// `Adopting`.
     ///
-    /// A read is bounded ([`INITIAL_READ_BOUND`], 100–150 ms) and returns the
-    /// cached projection — empty while adoption is still in flight — explicitly
-    /// truncated, by design. A test that asserts on the *contents* of the first
-    /// read must therefore wait for adoption to settle first, or it races a
-    /// loaded runner: on 2026-11-05 the macOS leg read an empty projection and
+    /// Nothing adopts a thread until a read asks for it, and that read is
+    /// bounded ([`INITIAL_READ_BOUND`], 100–150 ms): one that loses the race
+    /// returns the cached projection — empty while adoption is still paging —
+    /// explicitly truncated, by design. A test that asserts on the *contents*
+    /// of a read therefore has to start adoption and let it settle, or it races
+    /// a loaded runner: on 2026-11-05 the macOS leg read an empty projection and
     /// `a_repeated_turns_cursor_leaves_the_first_read_truncated` saw 0 messages
     /// where its bounded resume page carried 1.
+    ///
+    /// `ensure_subscription` is the read path's own entry point, so this primes
+    /// adoption without a transcript read whose side effects (a paging request,
+    /// submission reconciliation) would perturb what the test measures.
     async fn settled(client: &CodexClient, thread_id: &str) {
+        client
+            .ensure_subscription(thread_id)
+            .await
+            .expect("start the thread's adoption");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while client.projections.is_adopting(thread_id) {
             assert!(
@@ -3745,6 +3755,40 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// The four first-read tests lean on [`settled`], so pin what it promises:
+    /// a page slower than `INITIAL_READ_BOUND` leaves the projection empty
+    /// until adoption finishes, and the helper returns only after it has.
+    #[tokio::test]
+    async fn settled_waits_out_an_adoption_slower_than_the_read_bound() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.turns = vec![scripted_turn(
+            "turn-1",
+            "completed",
+            1_700_000_000,
+            "item-1",
+            "one",
+        )];
+        // Slower than the read bound, so an unpinned helper would return while
+        // adoption is still paging.
+        thread.turns_page_delay_ms = 400;
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        assert!(
+            client.projections.transcript("thread-1").messages.is_empty(),
+            "nothing adopts a thread until a read asks for it"
+        );
+
+        settled(&client, "thread-1").await;
+
+        assert_eq!(
+            client.projections.transcript("thread-1").messages.len(),
+            1,
+            "the helper returns only once adoption has settled"
+        );
     }
 
     /// Wait until the projection has folded the live turn a prompt started.
