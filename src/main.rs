@@ -1759,43 +1759,82 @@ start_server = "never"
         );
     }
 
-    /// Spawn a fake cola instance — a symlink named `cola` to the platform's
-    /// `sleep`, so `is_cola_process` accepts its argv[0] — and record its PID
-    /// in `lock` the way a real instance would. The caller must reap the child.
+    /// Spawn a fake cola instance and record its PID in `lock` the way a real
+    /// instance would. The caller must reap the child.
+    ///
+    /// The fake is an `sh` symlink named `cola`, the same shape as the fake
+    /// Codex TUI: the interpreter answers any argv[0], so the process is
+    /// genuinely alive under the fake name, and it needs no external command to
+    /// block on. Never alias a platform `sleep` instead — ubuntu-latest now
+    /// ships uutils coreutils, whose multi-call binary dispatches on argv[0] and
+    /// refuses a name it does not own ("Security violation: Requested utility
+    /// `cola` does not match executable name"), so the "instance" exited the
+    /// moment it exec'd and only the fork→exec window made the tests green
+    /// (#995).
+    ///
+    /// The shell writes the lock itself (`echo $$ > "$1"`), so the lock's
+    /// existence is also proof the fixture ran: a targeted sysinfo read can
+    /// catch the child before exec, carrying the parent image, which a plain
+    /// visibility wait cannot tell from the fixture.
     #[cfg(unix)]
     fn spawn_fake_cola(lock: &std::path::Path) -> std::process::Child {
         let link = lock.parent().unwrap().join("cola");
         let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink("/bin/sleep", &link).expect("symlink sleep");
-        let child = std::process::Command::new(&link)
-            .arg("30")
+        std::os::unix::fs::symlink("/bin/sh", &link).expect("symlink sh");
+        let mut child = std::process::Command::new(&link)
+            // `read` blocks on the piped stdin this test holds open, so the
+            // shell is the fixture — no external `sleep` to fork (and none for
+            // the platform to refuse), and dropping the `Child` closes the pipe
+            // and lets it exit.
+            .args(["-c", "echo $$ > \"$1\"; read _line"])
+            // $0 and $1 for the script above: the shell's own name, then the
+            // lock the fixture reports its pid in.
+            .arg("sh")
+            .arg(lock)
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("spawn fake cola");
-        std::fs::write(lock, child.id().to_string()).unwrap();
         // sysinfo may not have the just-spawned process in its table yet; wait
         // until the stop path can see it, like the identity settle waits above.
-        wait_until_fake_cola_visible(lock, &child);
+        wait_until_fake_cola_visible(lock, &mut child);
         child
     }
 
-    /// Wait until the stop decision can see the just-spawned fake instance. A
-    /// targeted sysinfo refresh can transiently miss a fresh process on a
+    /// Wait until the just-spawned fake instance has written its own PID into
+    /// `lock` and the stop decision can see it, failing with the child's exit
+    /// status when it never got that far.
+    ///
+    /// A targeted sysinfo refresh can transiently miss a fresh process on a
     /// loaded runner (llvm-cov on CI), so a silent deadline expiry would
-    /// surface later as a misleading `NotRunning`; fail here instead, naming
-    /// both identity signals.
+    /// surface later as a misleading `NotRunning`. The other failure — a
+    /// fixture that exits instead of running — is not a sysinfo problem at all
+    /// (#995), so report its status rather than blaming the process table.
     #[cfg(unix)]
-    fn wait_until_fake_cola_visible(lock: &std::path::Path, child: &std::process::Child) {
+    fn wait_until_fake_cola_visible(lock: &std::path::Path, child: &mut std::process::Child) {
         let pid = child.id() as i32;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if running_daemon_pid_at(lock).is_some() {
+            if running_daemon_pid_at(lock) == Some(pid) {
                 return;
+            }
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                panic!(
+                    "fake cola PID {pid} exited before it became visible ({status}); \
+                     the fixture is gone (lock={:?}, pid_alive={}, \
+                     is_cola_process={})",
+                    std::fs::read_to_string(lock)
+                        .ok()
+                        .map(|recorded| recorded.trim().to_owned()),
+                    pid_alive(pid),
+                    is_cola_process(pid)
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!(
             "fake cola PID {pid} never became visible to sysinfo \
-             (pid_alive={}, is_cola_process={})",
+             (still running={}, pid_alive={}, is_cola_process={})",
+            child.try_wait().expect("try_wait").is_none(),
             pid_alive(pid),
             is_cola_process(pid)
         );
@@ -1896,6 +1935,26 @@ start_server = "never"
             !status.success(),
             "a failed supervisor command must fall back to the PID path"
         );
+    }
+
+    /// A fixture that never ran must be reported by its own exit status, not as
+    /// a sysinfo miss: the refusal that broke #995 exits within milliseconds, so
+    /// a silent deadline made the log read as "the process table lost the
+    /// process" and sent the diagnosis to the wrong place.
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(expected = "exited before it became visible")]
+    fn an_exited_fake_cola_is_reported_by_its_exit_status() {
+        let home = tempfile::tempdir().unwrap();
+        let lock = home.path().join("cola.lock");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 1"])
+            .spawn()
+            .expect("spawn the stand-in");
+        let status = wait_for_exit(&mut child, "the stand-in");
+        assert_eq!(status.code(), Some(1));
+        // No lock: the refused fixture never got as far as writing one.
+        wait_until_fake_cola_visible(&lock, &mut child);
     }
 
     #[test]
