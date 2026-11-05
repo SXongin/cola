@@ -631,7 +631,7 @@ const RESTART_VERIFY_INTERVAL: std::time::Duration = std::time::Duration::from_m
 /// The absolute path of the executable the given process is running (`None`
 /// when the process is not visible or reports no exe).
 fn process_exe_path(pid: i32) -> Option<std::path::PathBuf> {
-    let mut system = sysinfo::System::new();
+    let mut system = sysinfo::System::new().ok()?;
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid as u32)]),
         false,

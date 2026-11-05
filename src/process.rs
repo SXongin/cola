@@ -11,7 +11,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// The command-line args of a process, from sysinfo (None if not visible).
 pub fn cmd(pid: i32) -> Option<Vec<String>> {
-    let mut system = System::new();
+    let mut system = System::new().ok()?;
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
         false,
@@ -27,7 +27,7 @@ pub fn cmd(pid: i32) -> Option<Vec<String>> {
 /// holder by its own absolute binary path rather than a possibly-relative
 /// argv[0] (ADR-0081).
 pub fn exe(pid: i32) -> Option<std::path::PathBuf> {
-    let mut system = System::new();
+    let mut system = System::new().ok()?;
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
         false,
@@ -44,7 +44,7 @@ pub fn exe(pid: i32) -> Option<std::path::PathBuf> {
 /// `XPC_SERVICE_NAME`. Reading another process's env is best-effort — it is
 /// limited to same-user processes on macOS/Windows.
 pub fn environ(pid: i32) -> Option<Vec<String>> {
-    let mut system = System::new();
+    let mut system = System::new().ok()?;
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
         false,
@@ -62,7 +62,7 @@ pub fn environ(pid: i32) -> Option<Vec<String>> {
 /// `cola restart` re-execs the replacement in the instance's own directory so a
 /// relative `--config` or a `./cola.toml` resolves exactly as it did.
 pub fn cwd(pid: i32) -> Option<std::path::PathBuf> {
-    let mut system = System::new();
+    let mut system = System::new().ok()?;
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
         false,
@@ -77,9 +77,21 @@ pub fn cwd(pid: i32) -> Option<std::path::PathBuf> {
 ///
 /// Conservative on platforms where sysinfo cannot determine zombie state: a
 /// process that exists but whose status is unknown is treated as alive, so a
-/// lock is never stolen from a process that might still be running.
+/// lock is never stolen from a process that might still be running. The same
+/// rule covers a process table that cannot be built at all: nothing can be
+/// verified, so the PID counts as alive (ADR-0005, "alive-but-unverifiable =
+/// alive").
 pub fn alive(pid: i32) -> bool {
-    let mut system = System::new();
+    alive_in(System::new(), pid)
+}
+
+/// The decision [`alive`] makes from one process-table construction. Split out
+/// so the ADR-0005 fallback — a table that cannot be built counts as alive — is
+/// testable: on Linux construction never actually fails.
+fn alive_in(table: Result<System, sysinfo::Error>, pid: i32) -> bool {
+    let Ok(mut system) = table else {
+        return true;
+    };
     system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]), false);
     match system.process(Pid::from_u32(pid as u32)) {
         Some(p) => p.status() != sysinfo::ProcessStatus::Zombie,
@@ -141,5 +153,39 @@ mod tests {
     fn cmd_reads_own_command_line() {
         let args = cmd(std::process::id() as i32).expect("the test process is visible");
         assert!(!args.is_empty(), "a live process has a command line: {args:?}");
+    }
+
+    #[test]
+    fn exe_reads_own_executable() {
+        let pid = std::process::id() as i32;
+        let exe = exe(pid).expect("the test process is visible");
+        let expected = std::env::current_exe().expect("the test binary has a path");
+        // The kernel reports the resolved spelling (`/proc/self/exe` follows the
+        // symlink), so compare canonically.
+        assert_eq!(
+            std::fs::canonicalize(exe).ok(),
+            std::fs::canonicalize(expected).ok()
+        );
+    }
+
+    #[test]
+    fn environ_reads_own_environment() {
+        let environ = environ(std::process::id() as i32).expect("the test process is visible");
+        assert!(!environ.is_empty(), "the test process's environment is not empty");
+    }
+
+    #[test]
+    fn cwd_reads_own_working_directory() {
+        // Other tests change the process cwd concurrently, so only the fact
+        // that a live process reports one is asserted here.
+        let cwd = cwd(std::process::id() as i32).expect("the test process is visible");
+        assert!(cwd.is_absolute(), "a cwd is absolute: {}", cwd.display());
+    }
+
+    #[test]
+    fn an_unbuildable_process_table_counts_as_alive() {
+        // Never steal a lock from a process the table cannot even be built to
+        // look for (ADR-0005: "alive-but-unverifiable = alive").
+        assert!(alive_in(Err(sysinfo::Error::Unsupported), i32::MAX - 1));
     }
 }

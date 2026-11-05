@@ -30,7 +30,7 @@ use crate::opencode::strategy::Generation;
 async fn detects_the_running_servers_generations() {
     let mut v1 = false;
     let mut v2 = false;
-    for candidate in scan_processes() {
+    for candidate in scan_processes().expect("a process table") {
         let Ok(resolved) = resolve_candidate(&candidate, GenerationOverride::Auto).await else {
             continue;
         };

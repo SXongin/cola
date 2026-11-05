@@ -399,13 +399,17 @@ fn env_uses_default_store(env: Option<&[String]>, default_store: &str) -> bool {
 /// Uses sysinfo so discovery works on every platform (there is no `/proc` on
 /// macOS/Windows). cmdline and environ are refreshed on every call (`Always`)
 /// so a restarted server's new port/password is picked up.
-pub fn scan_processes() -> Vec<ServerCandidate> {
+///
+/// `Err` means the process table could not be built at all, which is **not**
+/// "no server is running": a caller that would start a server must not read it
+/// as an empty scan, or it breaks ADR-0085's one-server premise.
+pub fn scan_processes() -> Result<Vec<ServerCandidate>, sysinfo::Error> {
     let default_store = default_data_home().to_string_lossy().into_owned();
-    let mut system = System::new();
+    let mut system = System::new()?;
     let refresh = server_scan_refresh();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
 
-    system
+    Ok(system
         .processes()
         .values()
         .filter_map(|proc_| {
@@ -438,7 +442,7 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
                 class: class_from_args(&args),
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Pick the server cola should attach to (ADR-0013, ADR-0085).
@@ -511,7 +515,9 @@ pub fn other_servers<'a>(
 /// would take the bot down at boot whenever a live service's probe was
 /// temporarily inconclusive.
 pub fn has_live_default_store_server() -> bool {
-    scan_processes().iter().any(is_eligible)
+    // An unreadable table is not evidence that none is live — and answering
+    // `false` here is what lets an unclassifiable start fail the boot.
+    scan_processes().map_or(true, |candidates| candidates.iter().any(is_eligible))
 }
 
 /// A child process command cola builds before spawning it: the `opencode serve`
@@ -1396,7 +1402,8 @@ impl<H: ServiceHost> ServerStarter for OpencodeStarter<H> {
         preferred_port: Option<u16>,
         generation_override: GenerationOverride,
     ) -> anyhow::Result<ResolvedServer> {
-        let candidates = scan_processes();
+        let candidates = scan_processes()
+            .map_err(|e| anyhow::anyhow!("cannot read the process table to choose a free port: {e}"))?;
         let mut port = preferred_port.unwrap_or(4096);
         // Skip ports already held by a custom-store server (someone else's data).
         while candidates.iter().any(|c| c.port == port) {
@@ -1652,7 +1659,7 @@ pub async fn restart_self_spawned_server(
     layout: &StateLayout,
     preferred_port: Option<u16>,
 ) -> anyhow::Result<RestartOutcome> {
-    let candidates = scan_processes();
+    let candidates = scan_processes()?;
     match restart_plan(&candidates, preferred_port, self_spawned_pid(layout)) {
         RestartPlan::NoServer => Ok(RestartOutcome::NoServer),
         RestartPlan::NotOwned => Ok(RestartOutcome::NotOwned),
@@ -1704,7 +1711,11 @@ impl ServiceRestartHost for RealServiceRestartHost {
     }
 
     async fn serving_service_pid(&self, port: u16) -> Option<i32> {
+        // A table that cannot be read proves nothing, so answer "not serving"
+        // and let the bounded wait report the restart as unconfirmed rather
+        // than declaring success.
         let live = scan_processes()
+            .ok()?
             .into_iter()
             .find(|c| c.is_service() && c.port == port)?;
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {

@@ -239,12 +239,19 @@ enum AcquireOutcome {
     HeldByInstance { pid: i32 },
 }
 
+/// The identity fields the singleton-lock checks compare.
+type ProcessIdentity = (Option<std::path::PathBuf>, Option<String>);
+
 /// A snapshot of one process's identity via sysinfo: its executable path and
 /// its argv[0] (None if the PID is not visible). Shared by the two identity
 /// checks below so the refresh shape — the sysinfo call that must run before
 /// `exe()`/`cmd()` are populated — lives in exactly one place.
-fn process_identity(pid: i32) -> Option<(Option<std::path::PathBuf>, Option<String>)> {
-    let mut system = sysinfo::System::new();
+///
+/// `Err` means the process table could not be built, which is *not* the same as
+/// a PID that is not in a table that was built: callers gating a destructive
+/// action must treat it as "cannot verify" rather than "not there".
+fn process_identity(pid: i32) -> Result<Option<ProcessIdentity>, sysinfo::Error> {
+    let mut system = sysinfo::System::new()?;
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid as u32)]),
         false,
@@ -252,11 +259,12 @@ fn process_identity(pid: i32) -> Option<(Option<std::path::PathBuf>, Option<Stri
             .with_exe(sysinfo::UpdateKind::Always)
             .with_cmd(sysinfo::UpdateKind::Always),
     );
-    let proc_ = system.process(sysinfo::Pid::from_u32(pid as u32))?;
-    Some((
-        proc_.exe().map(|p| p.to_path_buf()),
-        proc_.cmd().first().map(|s| s.to_string_lossy().into_owned()),
-    ))
+    Ok(system.process(sysinfo::Pid::from_u32(pid as u32)).map(|proc_| {
+        (
+            proc_.exe().map(|p| p.to_path_buf()),
+            proc_.cmd().first().map(|s| s.to_string_lossy().into_owned()),
+        )
+    }))
 }
 
 /// Whether a PID refers to a live process whose executable is named cola.
@@ -265,7 +273,7 @@ fn process_identity(pid: i32) -> Option<(Option<std::path::PathBuf>, Option<Stri
 /// executable name first (registered by the OS, not spoofable via argv), with
 /// the command-line argv as a fallback.
 fn is_cola_process(pid: i32) -> bool {
-    let Some((exe, argv0)) = process_identity(pid) else {
+    let Ok(Some((exe, argv0))) = process_identity(pid) else {
         return false;
     };
     if exe.as_ref().is_some_and(|e| e.to_string_lossy().contains("cola")) {
@@ -304,11 +312,21 @@ fn owner_functionally_alive(pid: i32) -> bool {
 /// Whether a process's identity (`/proc/<pid>/exe` or cmdline) is still
 /// readable. Unreadable means the kernel has already torn down the process's
 /// memory map: it is inside `do_exit`, alive per its status but unable to do
-/// anything further.
+/// anything further. A process table that cannot be built proves none of that,
+/// so it counts as readable: the owner is never declared stale on a failed
+/// read (ADR-0005, "alive-but-unverifiable = alive").
 fn identity_readable(pid: i32) -> bool {
-    process_identity(pid)
-        .map(|(exe, argv0)| exe.is_some() || argv0.is_some())
-        .unwrap_or(false)
+    identity_readable_in(process_identity(pid))
+}
+
+/// The decision [`identity_readable`] makes from one identity read, split out
+/// so the fallback is testable: on Linux the table construction never fails.
+fn identity_readable_in(read: Result<Option<ProcessIdentity>, sysinfo::Error>) -> bool {
+    match read {
+        Ok(Some((exe, argv0))) => exe.is_some() || argv0.is_some(),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 impl SingletonLock {
@@ -1306,6 +1324,16 @@ start_server = "never"
     #[test]
     fn pid_alive_sees_own_process_as_alive() {
         assert!(pid_alive(std::process::id() as i32));
+    }
+
+    #[test]
+    fn an_unbuildable_process_table_leaves_the_owner_verified() {
+        // ADR-0005: a table that cannot be built proves nothing, so the owner
+        // is never declared stale on a failed read (never reclaim a lock from
+        // a process we cannot see). A PID absent from a table that *was* built
+        // is still unreadable.
+        assert!(identity_readable_in(Err(sysinfo::Error::Unsupported)));
+        assert!(!identity_readable_in(Ok(None)));
     }
 
     #[test]
