@@ -4,13 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `ready_for_review` is what makes the draft split work: a draft run skips
+    # the heavy jobs (they gate on `classify`'s `draft`), and this event is the
+    # one that spends the whole suite, once, when the code is final.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   # A pull request cancels its own superseded run: pushing a fix should not
   # queue a run of the version it replaces. A push to `main` does not share a
-  # group with any other run — macOS runs only there (ADR-0097), so cancelling
-  # an older main run would drop the only macOS check for that commit, exactly
-  # when a second merge lands while the first is still running.
+  # group with any other run, so two merges in flight both get their run
+  # (ADR-0099) instead of the later one cancelling the earlier.
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
   cancel-in-progress: true
 
@@ -24,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       heavy: ${{ steps.diff.outputs.heavy }}
+      # `pull_request.draft` is absent on a push, where every job runs anyway.
+      draft: ${{ github.event.pull_request.draft || false }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,6 +72,7 @@ jobs:
     needs: classify
     if: >-
       always() &&
+      needs.classify.outputs.draft != 'true' &&
       needs.classify.outputs.heavy != 'false' &&
       !startsWith(github.head_ref || '', 'release/')
     runs-on: ubuntu-latest
@@ -103,6 +109,7 @@ jobs:
     needs: classify
     if: >-
       always() &&
+      needs.classify.outputs.draft != 'true' &&
       needs.classify.outputs.heavy != 'false' &&
       !startsWith(github.head_ref || '', 'release/')
     # Same bound as the `test` job for the same reason: it runs the same
@@ -144,7 +151,9 @@ jobs:
     # (the same shape as the Test matrix).
     name: Live OpenCode
     needs: classify
-    if: always()
+    if: >-
+      always() &&
+      needs.classify.outputs.draft != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -214,24 +223,29 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: ./.github/actions/install-codex
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Live Codex tier-1 suite
@@ -245,6 +259,7 @@ jobs:
       # before failing a pid or a path.
       - if: >-
           always() &&
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: No live Codex process or runtime path left behind
@@ -263,6 +278,7 @@ jobs:
       # so it cannot shadow the release asset `codex` that tier-1 just used.
       - if: >-
           matrix.os != 'windows-latest' &&
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Install the npm Codex package for tier-2
@@ -292,6 +308,7 @@ jobs:
           echo "bin=$shim" >> "$GITHUB_OUTPUT"
       - if: >-
           matrix.os != 'windows-latest' &&
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Live Codex tier-2 suite
@@ -302,6 +319,7 @@ jobs:
       - if: >-
           always() &&
           matrix.os != 'windows-latest' &&
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: No live Codex daemon or runtime path left behind
@@ -346,20 +364,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - if: >-
+          needs.classify.outputs.draft != 'true' &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         run: cargo test --workspace --locked

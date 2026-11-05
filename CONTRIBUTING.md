@@ -283,6 +283,19 @@ the marker after the process exits.
    green. Agent-authored PRs additionally wait for the user's own verification
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
    is the ADR-0033 exception).
+6. **Open it as a draft, and flip it to ready when the code is final.** A draft
+   PR runs only the cheap jobs — `Classify`, `Format`, `Dependency audit`,
+   `Docs drift`; `Check`, `Coverage`, the live suites and both `Test` legs skip
+   until the PR is marked **ready for review**, which is the event that spends
+   the full suite once instead of once per push. The local loop (see
+   *Verification loop*) already covers Linux, so the expensive half is exactly
+   the part CI adds: the other platforms, the instrumented run, the live
+   contracts and the dependency audit.
+
+   A skipped check reports success, so **a draft's green required set means
+   "nothing ran yet"**, not "it passed". Mark ready only when the local loop is
+   green and the code is final, and treat that run as the gate. Opening a PR
+   non-draft is still legal — it just pays the old cost.
 
 The `main: CI` ruleset requires seven checks: `Format`, `Check`,
 `Test (macos-latest)`, `Test (windows-latest)`, `Live OpenCode`,
