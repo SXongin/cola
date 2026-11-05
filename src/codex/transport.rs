@@ -1682,18 +1682,30 @@ mod tests {
             }
         });
 
-        let dial = {
+        // Resolve the fixture **before** the discovery clock starts. Its
+        // one-time `rustc -O` compile is 3–13 s on a loaded Windows runner and
+        // it holds one `OnceLock` for every other proxy test too, so a clock
+        // started before it finds nothing to see while the child does not yet
+        // exist — the "never started" failures in #993.
+        let helper = crate::codex::test_server::proxy_helper();
+        let mut dial = {
             let target = target.clone();
             tokio::spawn(async move {
-                RpcConnection::open_with_proxy(
-                    &Endpoint::Unix(target),
-                    Duration::from_secs(5),
-                    Some(&crate::codex::test_server::proxy_helper()),
-                )
-                .await
+                RpcConnection::open_with_proxy(&Endpoint::Unix(target), PROXY_DIAL_BUDGET, Some(&helper))
+                    .await
             })
         };
-        let pid = wait_for_proxy_child(&target).await;
+        let pid = tokio::select! {
+            pid = wait_for_proxy_child(&target) => pid,
+            // A dial that ends first carries the real reason (a broken fixture
+            // binary, a refused spawn); without this the test would spend the
+            // whole discovery deadline and report "never started".
+            ended = &mut dial => match ended {
+                Ok(Ok(_)) => panic!("the proxy dial completed before its fixture appeared"),
+                Ok(Err(error)) => panic!("the proxy dial failed before its fixture appeared: {error}"),
+                Err(error) => panic!("the proxy dial task ended before its fixture appeared: {error}"),
+            },
+        };
         assert!(crate::process::alive(pid as i32), "the proxy child runs");
 
         dial.abort();
@@ -1797,23 +1809,43 @@ mod tests {
         assert!(status.success(), "the fixture exits cleanly: {status}");
     }
 
+    /// How long the cancelled-handshake test's dial may run. The fake daemon
+    /// stays silent, so the handshake cannot complete and this budget only
+    /// bounds how long the test may spend proving the child is alive; it must
+    /// outlast [`PROXY_DISCOVERY_DEADLINE`], or the guard would reap the child
+    /// mid-search and turn a slow runner into the same failure (#993).
+    const PROXY_DIAL_BUDGET: Duration = Duration::from_secs(30);
+
+    /// How long the cancelled-handshake test waits for the fixture to appear in
+    /// the process table. Five seconds was too tight: a loaded Windows runner's
+    /// spawn plus its process-table refresh can exceed it (#993).
+    const PROXY_DISCOVERY_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// How long a test waits for a proxy child it has already found to be
+    /// reaped. Matched to the discovery deadline for the same reason: the wait
+    /// only ever runs to completion on a passing tree, and a loaded runner
+    /// should not turn a reaped child into a failure (#993).
+    const PROXY_REAP_DEADLINE: Duration = Duration::from_secs(20);
+
     async fn wait_for_proxy_child(target: &Path) -> u32 {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut finder = crate::codex::test_server::ProxyChildFinder::new();
+        let deadline = tokio::time::Instant::now() + PROXY_DISCOVERY_DEADLINE;
         loop {
-            if let Some(pid) = crate::codex::test_server::find_proxy_child(target) {
+            if let Some(pid) = finder.find(target) {
                 return pid as u32;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the proxy fixture never started for {}",
-                target.display()
+                "the proxy fixture never started for {} within {:?}",
+                target.display(),
+                PROXY_DISCOVERY_DEADLINE
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
     async fn wait_for_pid_to_disappear(pid: u32) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + PROXY_REAP_DEADLINE;
         while crate::process::alive(pid as i32) {
             assert!(
                 tokio::time::Instant::now() < deadline,

@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use sysinfo::System;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 #[cfg(unix)]
@@ -300,35 +301,68 @@ fn tcp_proxy_target(address: &str) -> crate::codex::transport::Endpoint {
     crate::codex::transport::Endpoint::Unix(PathBuf::from(format!("tcp://{address}")))
 }
 
-/// Find the live proxy fixture process dialling `target`, if any. The identity
-/// is the fixture's unique `--sock` argument, so a parallel test's child cannot
-/// be mistaken for it. Test-only, used to prove a child was reaped.
-pub(crate) fn find_proxy_child(target: &Path) -> Option<i32> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+/// Finds the live proxy fixture process dialling a target, if any, reusing one
+/// `System` across polls.
+///
+/// The identity is the fixture's unique `--sock` argument, so a parallel test's
+/// child cannot be mistaken for it. Test-only, used to prove a child was reaped.
+///
+/// **One `System`, refreshed as a delta.** A fresh `System` re-reads every
+/// process's command line on every call, and on a loaded Windows runner that
+/// refresh is slow enough to spend a polling loop's whole budget; the cancelled
+/// handshake then observed no child and failed with "never started" (#993).
+/// Keeping the map makes the command line a once-per-process read —
+/// `UpdateKind::OnlyIfNotSet` still reads it for a pid that appears after an
+/// earlier refresh, which is exactly a poll for a fresh spawn.
+///
+/// A once-only read can go stale only for a pid sampled between `fork` and
+/// `exec` (its `cmd` is still the parent's). That cannot happen to the child a
+/// caller polls for: the finder is polled from the same single-threaded runtime
+/// that spawns, and `Command::spawn` does not return — so the loop cannot
+/// sample — until the child has exec'd. A stray pre-exec child of another test
+/// carries the test binary's own argv, which never matches a `--sock` target.
+/// **That argument depends on the single-threaded runtime**: a finder polled
+/// from another thread, or a multi-threaded `#[tokio::test]`, could sample the
+/// pre-exec pid and would need `UpdateKind::Always`.
+pub(crate) struct ProxyChildFinder {
+    system: System,
+}
 
-    let wanted = target.display().to_string();
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::nothing()
-            .without_tasks()
-            .with_cmd(UpdateKind::Always),
-    );
-    system
-        .processes()
-        .values()
-        .find(|process| {
-            let arguments: Vec<String> = process
-                .cmd()
-                .iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect();
-            arguments
-                .windows(2)
-                .any(|pair| pair[0] == "--sock" && pair[1] == wanted)
-        })
-        .map(|process| process.pid().as_u32() as i32)
+impl ProxyChildFinder {
+    pub(crate) fn new() -> Self {
+        Self {
+            system: System::new(),
+        }
+    }
+
+    /// The pid of the fixture dialling `target`, if it is in the process table
+    /// as of this refresh.
+    pub(crate) fn find(&mut self, target: &Path) -> Option<i32> {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+
+        let wanted = target.display().to_string();
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .without_tasks()
+                .with_cmd(UpdateKind::OnlyIfNotSet),
+        );
+        self.system
+            .processes()
+            .values()
+            .find(|process| {
+                let arguments: Vec<String> = process
+                    .cmd()
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect();
+                arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--sock" && pair[1] == wanted)
+            })
+            .map(|process| process.pid().as_u32() as i32)
+    }
 }
 
 /// A scripted `codex` CLI for discovery and lifecycle tests.
@@ -2663,5 +2697,70 @@ mod tests {
             "{}",
             root.path().join(DEEPEST_FIXTURE_SOCKET).display()
         );
+    }
+}
+
+/// The finder runs on every platform — the Windows suite is where it matters —
+/// so it lives outside the unix-only module above, whose root helper does not
+/// exist there.
+#[cfg(test)]
+mod finder_tests {
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use tokio::process::Command;
+
+    use super::*;
+
+    /// A process that appears **after** the first refresh must still be found:
+    /// the reused `System` resolves the new pid's command line as a delta
+    /// (`UpdateKind::OnlyIfNotSet`). Refreshing only the pids an earlier call
+    /// already knew would make the finder blind to every fresh spawn — exactly
+    /// the discovery the cancelled-handshake test depends on (#993).
+    #[tokio::test]
+    async fn a_child_spawned_after_the_first_refresh_is_found() {
+        // Bound for the whole test but **never accepted**: a connect completes
+        // through the listen backlog, and the relay then blocks in its
+        // socket→stdout pump — a live child, which is all this test needs. An
+        // accept task would race the kill below, because the child is in the
+        // process table before it has dialled.
+        let daemon = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent daemon");
+        let address = daemon.local_addr().expect("address");
+        let target = PathBuf::from(format!("tcp://{address}"));
+
+        let mut finder = ProxyChildFinder::new();
+        // This refresh runs before the child exists, so only a later, delta
+        // refresh can ever see it.
+        assert_eq!(finder.find(&target), None, "no fixture dials this target yet");
+
+        let mut child = Command::new(proxy_helper())
+            .arg("app-server")
+            .arg("proxy")
+            .arg("--sock")
+            .arg(&target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the relay fixture");
+        let pid = child.id().expect("the fixture's pid") as i32;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if finder.find(&target) == Some(pid) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the finder never saw the fixture spawned after its first refresh"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 }
