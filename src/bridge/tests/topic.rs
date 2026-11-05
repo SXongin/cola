@@ -714,10 +714,11 @@ async fn topic_command_created_topic_routes_messages_to_its_session() {
 
 /// The topic command gate (ADR-0007, ADR-0023) is one rule table
 /// (`Command::topic_rejection`, called from `handle_command`): `/topic` and
-/// its adopt forms are rejected in ANY topic; `/dir`, `/switch`, `/sub attach`
-/// and `/new` only once the topic is bound. This table drives every class
-/// through the real dispatcher — a banned command gets exactly one rejection
-/// reply and nothing else, an allowed command is never intercepted.
+/// its adopt forms are rejected in ANY topic; `/dir`, the selecting `/switch`
+/// forms, `/sub attach` and `/new` only once the topic is bound. `/switch
+/// forget` is not a selection and is never gated (#997). This table drives
+/// every class through the real dispatcher — a banned command gets exactly one
+/// rejection reply and nothing else, an allowed command is never intercepted.
 #[tokio::test]
 async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
     use crate::bridge::command::{
@@ -749,7 +750,9 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             has_session: true,
             rejection: Some(TOPIC_ADOPT_NEST_REJECTION),
         },
-        // Selection commands: banned only once the topic is bound.
+        // Selection commands: banned only once the topic is bound. The gate
+        // covers the SELECTING `/switch` forms only; the bound `forget` cases
+        // sit with the allowed ones below (#997).
         Case {
             text: format!("/dir {dir}"),
             has_session: true,
@@ -773,7 +776,7 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
         Case {
             text: "/switch forget".to_string(),
             has_session: true,
-            rejection: Some(TOPIC_SELECTION_REJECTION),
+            rejection: None,
         },
         Case {
             text: "/switch ses_x".to_string(),
@@ -951,6 +954,85 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             }
         }
     }
+}
+
+/// #997: `/switch forget` is the one thing a bound topic must be able to do for
+/// itself. It drops the mapping rather than choosing a session, so the topic
+/// gate must not swallow it (it used to, because the whole `Command::Switch(_)`
+/// was classed as selection). Afterwards the topic is unbound again, which is
+/// what ADR-0007 lets the selection forms work on.
+#[tokio::test]
+async fn forget_in_a_bound_topic_unmaps_without_the_gate() {
+    use crate::bridge::command::TOPIC_SELECTION_REJECTION;
+
+    let _wd = test_work_dir();
+    let state_dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state_dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_bound_forget".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: topic_key.clone(),
+            session_id: "ses_owned".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: Some("om_anchor".into()),
+            topic_root: Some("om_root".into()),
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/switch forget",
+        topic_key.clone(),
+        "msg_forget",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    let replies = platform.texts().await;
+    assert!(
+        !replies.iter().any(|t| t == TOPIC_SELECTION_REJECTION),
+        "a bound topic's forget must not be gated, got {replies:?}"
+    );
+    assert_eq!(replies.len(), 1, "one confirmation and nothing else: {replies:?}");
+    assert!(
+        replies[0].contains("已解除") && replies[0].contains("服务器会话仍保留"),
+        "the confirmation reports the unmapping and that the server session stays: {replies:?}"
+    );
+    {
+        let store = app.sessions.lock().await;
+        // The mapping is gone, not merely inactive — and with it the Pending
+        // Session that `remove_thread` clears in the same write.
+        assert!(store.get_active(&topic_key).is_none(), "the mapping must be gone");
+        assert!(store.pending_for(&topic_key).is_none());
+        assert_eq!(store.all_entries().len(), 0);
+    }
+
+    // The topic is unbound now, so ADR-0007's selection forms bind it again.
+    send_command_in(
+        &app,
+        "/new 续上",
+        topic_key.clone(),
+        "msg_new_again",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+    let replies = platform.texts().await;
+    assert!(
+        !replies.iter().any(|t| t == TOPIC_SELECTION_REJECTION),
+        "the now-unbound topic must accept /new again, got {replies:?}"
+    );
+    assert!(
+        app.sessions.lock().await.pending_for(&topic_key).is_some(),
+        "the re-bind must declare a Pending Session"
+    );
 }
 
 /// A bound topic owns exactly one session (ADR-0007). `/cat <directory>` is a
@@ -1817,6 +1899,76 @@ async fn topic_plain_reply_skips_own_root_and_seed_injection() {
             "parent {pid} is the topic's own creation message — must not be injected"
         );
     }
+}
+
+/// ADR-0023 amendment (#997): a bound topic may `/switch forget` itself now,
+/// and `unmap_thread` removes the entry that carried `topic_root`/`topic_anchor`.
+/// The guard loses its evidence, so the topic falls back to the
+/// "manually-created topic" behaviour this ADR already describes: the thread
+/// root injects like any other quoted parent. Pinned so the degradation stays a
+/// decision rather than an accident.
+#[tokio::test]
+async fn forget_drops_the_topic_anchors_so_the_root_injects_again() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompt_calls = backend.prompt_calls.clone();
+    let platform = RecordingPlatform::new();
+    platform.quoted_messages.lock().unwrap().insert(
+        "om_root_cmd".into(),
+        crate::feishu::client::FeishuMessage {
+            msg_type: "text".into(),
+            content: r#"{"text":"📌 已创建会话 `api-refactor`"}"#.into(),
+            mentions: vec![],
+        },
+    );
+    let app = Arc::new(App::new(cfg, Arc::new(backend), Arc::new(platform)).unwrap());
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: topic_key.clone(),
+            session_id: "ses_topic".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: Some("om_seed".into()),
+            topic_root: Some("om_root_cmd".into()),
+            variant: None,
+        },
+    )
+    .await;
+    send_command_in(
+        &app,
+        "/switch forget",
+        topic_key.clone(),
+        "msg_forget",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    app.handle_message(crate::bridge::IncomingMessage {
+        message_id: "msg_after_forget".into(),
+        chat_id: "chat_1".into(),
+        chat_type: "group".into(),
+        thread_id: Some("omt_t_1".into()),
+        parent_id: Some("om_root_cmd".into()),
+        text: "普通回复".into(),
+        images: vec![],
+        files: vec![],
+        omitted: vec![],
+        requester_open_id: Some(TEST_HOST.into()),
+    })
+    .await;
+
+    assert_eq!(
+        *prompt_calls.lock().await,
+        vec!["[引用消息]:\n📌 已创建会话 `api-refactor`\n\n普通回复".to_string()],
+        "after an unbind the anchors are gone, so the root injects (ADR-0023 amendment)"
+    );
 }
 
 /// ADR-0023: a genuine quote of a real message inside a topic still injects

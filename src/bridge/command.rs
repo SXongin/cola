@@ -197,10 +197,14 @@ impl Command {
     ///
     /// - `/topic` and its adopt forms would nest a topic inside a topic: they
     ///   are rejected in ANY topic, whether or not it already has a session.
-    /// - Session selection/creation (`/dir`, the `/dir` card, `/switch`,
-    ///   `/sub attach`, `/new`) is allowed while the topic is unbound — the
-    ///   chosen session becomes the topic's one session — and rejected once the
-    ///   topic owns a session.
+    /// - Session selection/creation (`/dir`, the `/dir` card, the selecting
+    ///   `/switch` forms, `/sub attach`, `/new`) is allowed while the topic is
+    ///   unbound — the chosen session becomes the topic's one session — and
+    ///   rejected once the topic owns a session.
+    /// - `/switch forget` is NOT a selection: it only drops the mapping (the
+    ///   server session stays), which is the one thing a bound topic needs to
+    ///   do for itself — so it passes bound and unbound alike (#997). The
+    ///   main conversation cannot do it: its `forget` unmaps its own key.
     /// - Every other command passes.
     pub(crate) fn topic_rejection(&self, has_session: bool) -> Option<&'static str> {
         match self {
@@ -208,7 +212,7 @@ impl Command {
             Command::TopicAdopt { .. } | Command::TopicAdoptCard => Some(TOPIC_ADOPT_NEST_REJECTION),
             Command::Dir(_)
             | Command::DirCard
-            | Command::Switch(_)
+            | Command::Switch(SwitchAction::Card | SwitchAction::Match(_) | SwitchAction::Attach { .. })
             | Command::Sub(SubAction::Attach { .. })
             | Command::New(_)
             | Command::NewWorktree { .. }
@@ -221,9 +225,11 @@ impl Command {
     }
 }
 
-/// The rejection for `Dir`/`DirCard`/`Switch`/`New` inside a topic that
+/// The rejection for the session-selection forms — `Dir`/`DirCard`, `Switch`'s
+/// `Card`/`Match`/`Attach`, `Sub::Attach` and `New` — inside a topic that
 /// already owns a session (ADR-0007): a bound topic is a conversation of its
-/// own, so sessions are chosen from the main conversation.
+/// own, so sessions are chosen from the main conversation. `/switch forget` is
+/// deliberately not one of them (#997: it unbinds rather than selects).
 pub(crate) const TOPIC_SELECTION_REJECTION: &str = "⚠️ 话题已绑定会话，请回主对话操作。";
 
 /// The rejection for `/topic` inside any topic (ADR-0006, ADR-0023): a topic
@@ -813,7 +819,7 @@ pub fn help_text() -> String {
 `/status` · Show this conversation's current model/effort, next-turn pending, and session summary
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
-话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir`、`/sub attach` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
+话题规则：已绑定会话的话题里，`/switch`、`/switch <关键词>`、`/switch <id> --force`、`/new`、`/dir`、`/sub attach` 被拒绝，请回主对话操作；`/switch forget` 例外——它只解绑、不选会话，已绑定话题正是该用它丢掉自己映射的地方（服务器会话保留，之后话题回到未绑定状态）。从未绑定过会话的话题可以用上面那些命令绑定该话题的唯一会话。
     "
     .to_string()
 }
@@ -837,7 +843,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/worktree\nShow the pending checkout intent: the target directory, branch, the resolved base `ref @ sha`, and the source directory. It is only meaningful while a Pending Session declared by `/topic --worktree` or `/new --worktree` exists; the first message creates the checkout, so an abandoned pending creates nothing.\n- `/worktree --branch <branch>` — change the full branch (a repository-style `<type>/<slug>` is fine; the directory is its last segment)\n- `/worktree --base <ref>` — re-resolve the start ref to a SHA\nBoth are refused after the checkout exists (the directory is fixed). The old read-only inventory card is retired: list checkouts with `/run git worktree list`, and enter an existing one with `/dir <path>`.\nThe base ladder is `[worktree] base`, then `origin/HEAD`, `origin/main`, `origin/master`, `main`, `master`; an unresolvable explicit base is refused, never silently replaced.\nExamples: `/topic --worktree --name 修复登录 --branch feat/fix-login`, `/new --worktree --name Fix Login`, `/worktree --base origin/main`"
         }
         "switch" => {
-            "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch ses_abc --force`"
+            "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays); this is the one `/switch` form a bound topic accepts, because it unbinds instead of selecting\nExamples: `/switch backend`, `/switch ses_abc --force`"
         }
         "sub" => {
             "/sub [list [keyword]] | /sub attach <id|id-prefix|title> [--force]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\n- `/sub attach <id|id-prefix|title> [--force]` — take over one of the current session's DIRECT children into this chat (the child becomes the Active Session and gets the usual Session Snapshot receipt). The query resolves like `/switch` (exact id → unique id-prefix → title substring) but only among this session's direct children: an unknown or ambiguous query is reported, and a session that is not a direct child is refused. If the child is mapped to another chat, the owner is named and it is refused unless `--force` (which steals the mapping). Taking over a running child is allowed and the snapshot shows its live state; re-running it for the already-active child changes nothing. The parent stays mapped — `/switch` switches back to it.\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`, `/sub attach 1a2b3c4`, `/sub attach 渲染 --force`"

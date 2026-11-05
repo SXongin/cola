@@ -956,8 +956,15 @@ Notes:
 - `/restart-opencode` restarts an Owned Server or the V2 Shared Service
   (`opencode service restart`); a server launched by another tool is left alone
   (`NotOwned`).
-- Topic rule: inside a topic already bound to a session, `/switch`, `/new`,
-  `/dir` and `/sub attach` are rejected — go back to the main conversation. A
+- Topic rule: inside a topic already bound to a session, `/switch`, `/switch
+  <keyword>`, `/switch <id> --force`, `/new`, `/dir` and `/sub attach` are
+  rejected — go back to the main conversation. The one exception is `/switch
+  forget`: it unbinds instead of selecting, so a bound topic is exactly where it
+  is needed — and the only place that can drop that topic's own mapping — the
+  server session stays. Afterwards the topic is unbound, so the commands above
+  bind it again. Unbinding also removes the topic's anchor records, so from then
+  on the topic behaves like a manually-created one: a plain reply quotes the
+  thread root/cover card into the prompt (ADR-0023, amendment 2026-11-05). A
   topic that has never bound a session (including a `/topic`-opened topic still
   waiting for its first message) can use them to bind its single session.
 

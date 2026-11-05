@@ -94,3 +94,34 @@ genuine quote of a real message.
   hook keeps patching the cover card too.
 - **The brief renders the model** as `providerID/modelID@variant` when the
   adopted session carries one (fresh `/topic` sessions have none and omit it).
+
+## Amendment (2026-11-05): `/switch forget` inside a bound topic (#997)
+
+`/switch forget` is now allowed inside a topic that is bound to a session.
+It is not a session selection — it removes the mapping and leaves the server
+session alone — and the bound topic is the one place the main conversation
+cannot do it for you (the lobby's `forget` unmaps the lobby's key, not the
+topic's). ADR-0007's gate therefore no longer covers it, while every selecting
+`/switch` form still does. A topic that is unbound is unaffected: `forget`
+there has always passed and replies "当前没有映射的会话。"
+
+The mapping carried this ADR's whole topic identity: `topic_root` and
+`topic_anchor` live on `SessionEntry`, and `unmap_thread` removes the entry,
+anchors included. Until the topic is re-bound the guard has nothing to compare
+against, so it stops recognising the topic's own creation messages. The
+accepted consequence is the "manually-created topic" case this ADR already
+describes: a plain reply — whose `parent_id` is the thread root — quotes the
+cover card's brief into the prompt, and fallback card routing
+(`resolve_topic_anchor`) falls back to the Chat.
+
+Re-binding works (the now-unbound topic accepts `/switch <id>`, `/new` and
+`/dir` again) and records a fresh `topic_anchor` from the adopting card, so the
+guard resumes for that card; `topic_root` stays `None` because no pending cover
+exists to record one, so the original thread root keeps injecting until the
+topic is recreated. Two tests pin this: `forget_in_a_bound_topic_unmaps_without_the_gate`
+and `forget_drops_the_topic_anchors_so_the_root_injects_again`
+(`src/bridge/tests/topic.rs`).
+
+Rejected: lifting the anchors to a topic-level record that survives the
+mapping. It needs a new persisted structure plus a migration, for one explicit
+and rare operation whose only visible cost is one card's text in a quote.
