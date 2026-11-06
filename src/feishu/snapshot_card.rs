@@ -1,90 +1,8 @@
-use crate::backend::{MessageRole, TailEntry, TailMessage};
-use crate::bridge::snapshot::{ElsewherePending, PendingOverflow, SnapshotData};
-use crate::feishu::card::session::{BackToList, back_to_list_button};
+use crate::backend::TailEntry;
+use crate::bridge::snapshot::{PendingOverflow, SnapshotData};
+use crate::feishu::card::session::{BackToList, PendingFacts, back_to_list_button, session_card_body};
 use serde_json::json;
 
-/// The update promise both live-adoption chips carry (ADR-0028): the busy chip
-/// and the 等待后台任务 chip (#586) each say the snapshot keeps updating — the
-/// follow streams the in-flight turn into the card, or the wait is served in
-/// place and resumed by its completion Wake.
-pub(crate) const FOLLOW_HINT: &str = "有新进展会自动更新";
-
-/// The busy run-state chip (ADR-0028). Tests assert this constant so a copy
-/// tweak lives in one place.
-pub(crate) const BUSY_CHIP: &str = "⚙️ 运行中";
-
-/// The 等待后台任务 chip (#586, ADR-0059): the adopted Session's Execution has
-/// ended while Background Tasks are still live, so the snapshot follows the
-/// wait instead of reporting 空闲 — the card yields ⏳ with the ledger, and the
-/// completion Wake resumes it in place.
-pub(crate) const WAITING_BACKGROUND_CHIP: &str = "⏳ 等待后台任务";
-
-/// The retry run-state chip.
-pub(crate) const RETRY_CHIP: &str = "🔁 需要重试";
-
-/// The idle run-state chip.
-pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
-
-/// The 等待你的确认 chip, shown when the session has an adopt-time pending
-/// request — the operator's action beats the server's run state.
-pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
-
-/// The 等待你的确认 chip when the session's pendings are NOT embedded because
-/// they are already hosted by another card, and Message Pin is on: the pointer
-/// names the card and its pin (ADR-0028 update 2026-09-25).
-pub(crate) const WAITING_ELSEWHERE_PINNED_CHIP: &str = "⏳ 等待你的确认（见置顶的原卡片）";
-
-/// The pointer chip with Message Pin off: names the original card without
-/// promising a pin, since the opt-in gates the pin itself.
-pub(crate) const WAITING_ELSEWHERE_CHIP: &str = "⏳ 等待你的确认（见原卡片）";
-
-/// The status chip content for a session's state (ADR-0028 precedence
-/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲; the busy and waiting
-/// chips each carry one hint phrase). A pending already surfaced elsewhere
-/// keeps the operator action ahead of the state too, pointing at its hosting
-/// card instead. `waiting` is the gather's ADR-0059 fact (server-idle with
-/// live Background Tasks, #586) — it names the wait even though the server
-/// reads idle. `None` when there is no status to report — the chip is omitted
-/// rather than guessed.
-fn status_chip(
-    has_pending: bool,
-    pending_elsewhere: Option<ElsewherePending>,
-    waiting: bool,
-    status: Option<crate::backend::types::SessionStatus>,
-) -> Option<String> {
-    if has_pending {
-        return Some(WAITING_CHIP.to_string());
-    }
-    if let Some(elsewhere) = pending_elsewhere {
-        return Some(
-            match elsewhere {
-                ElsewherePending::Pinned => WAITING_ELSEWHERE_PINNED_CHIP,
-                ElsewherePending::Unpinned => WAITING_ELSEWHERE_CHIP,
-            }
-            .to_string(),
-        );
-    }
-    if waiting {
-        return Some(format!("{WAITING_BACKGROUND_CHIP}\n{FOLLOW_HINT}"));
-    }
-    match status {
-        Some(crate::backend::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{FOLLOW_HINT}")),
-        Some(crate::backend::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
-        Some(crate::backend::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
-        None => None,
-    }
-}
-
-/// Build the status chip as a body element, if the precedence says one shows.
-fn status_chip_element(
-    has_pending: bool,
-    pending_elsewhere: Option<ElsewherePending>,
-    waiting: bool,
-    status: Option<crate::backend::types::SessionStatus>,
-) -> Option<serde_json::Value> {
-    status_chip(has_pending, pending_elsewhere, waiting, status)
-        .map(|content| json!({ "tag": "markdown", "content": content }))
-}
 /// The live answer state of one claimed question block on the snapshot
 /// (ADR-0028): request_id → state. Rebuilds after a button interaction pass
 /// the flow's current state so the block mirrors the standalone question
@@ -106,107 +24,6 @@ pub struct QuestionBlockState {
 }
 
 pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlockState>;
-
-/// The 最近对话 panel: the last-four tail entries, each role-marked and shown
-/// folded — its header previews the entry briefly and expanding reveals the
-/// full verbatim text (chunked to cola's per-element budget) together with one
-/// `📎 name · mime · size` record line per File Content the message carried
-/// (ADR-0076). A **Compaction** marker (ADR-0082, ticket #723) is shown as the
-/// same folded row the live card's timeline renders, from the same builder, so
-/// an adopted session whose history looks oddly short has its explanation
-/// sitting where it happened. No tail → no panel.
-/// `md` is the card's markdown state: the entry texts share its one table budget
-/// and fenced fallback. A tail entry's attached skills are NOT rendered here
-/// (spec #652, ticket #655, acceptance reversal): the snapshot tail is text only.
-/// `omitted` counts the OLDEST entries the card's one-shot budget could not
-/// carry (issue #726) and renders as a visible line above them.
-fn tail_panels(
-    tail: &[TailEntry],
-    omitted: usize,
-    md: &mut crate::feishu::card::sanitize::CardMarkdown,
-) -> Vec<serde_json::Value> {
-    let mut panels = Vec::new();
-    if tail.is_empty() && omitted == 0 {
-        return panels;
-    }
-    panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
-    // The budget's degradation is deliberate and visible (#726): an entry the
-    // card could not carry is COUNTED here rather than silently disappearing.
-    // The line is unfurled text, outside every entry's fold, so a reader who
-    // scrolls the snapshot knows the preview is a window, not the whole tail.
-    if omitted > 0 {
-        panels.push(json!({
-            "tag": "markdown",
-            "content": format!("…更早的 {omitted} 条记录已省略（超出单卡容量）")
-        }));
-    }
-    for (i, entry) in tail.iter().enumerate() {
-        // The snapshot is sent once, but SnapshotClaims rebuilds it in place on
-        // a claim ack and on remote resolution — so its panels take stable ids
-        // too (the tail's order is fixed, so the entry index is stable). The
-        // index is the entry's position in the FULL tail, so an evicted prefix
-        // cannot renumber the panels that remain.
-        let element_id = format!("snap_{}", omitted + i);
-        let message = match entry {
-            // One Compaction marker: the live card's own row builder, so the two
-            // surfaces can never disagree on the copy or the fold.
-            TailEntry::Compaction(marker) => {
-                panels.extend(crate::feishu::card::compaction::compaction_elements(
-                    &marker.compaction,
-                    Some(&element_id),
-                    md,
-                ));
-                continue;
-            }
-            TailEntry::Message(message) => message,
-        };
-        let (role, preview) = tail_preview(message);
-        let title = if preview.is_empty() {
-            format!("{role} （空消息）")
-        } else {
-            format!("{role} {preview}…")
-        };
-        let body = message.body_text();
-        let chunks = crate::feishu::card::chunk_text(&body, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
-        let chunks = if chunks.is_empty() {
-            vec!["（空消息）".to_string()]
-        } else {
-            chunks
-        };
-        let chunks: Vec<String> = chunks.iter().map(|c| md.clean(c)).collect();
-        panels.push(crate::feishu::card::shell::collapsible_panel_chunks(
-            &title,
-            &chunks,
-            Some(&element_id),
-        ));
-    }
-    panels
-}
-
-/// The emoji marker for a tail entry's role. Shared by the static snapshot's
-/// collapsible panels and the busy-adopt follow's static text (ADR-0028), so
-/// the two presentations cannot disagree.
-pub(crate) fn role_marker(role: &MessageRole) -> &'static str {
-    match role {
-        MessageRole::User => "👤",
-        MessageRole::Assistant => "🤖",
-        _ => "💬",
-    }
-}
-
-/// One tail message's role marker + short preview, shared by the static
-/// snapshot's collapsible panels and the busy-adopt follow's static text
-/// (ADR-0028). A files-only entry previews its record line so the folded panel
-/// names the file (ADR-0076); a text-bearing entry previews its text, unchanged.
-pub(crate) fn tail_preview(message: &TailMessage) -> (&'static str, String) {
-    let source = if message.text.trim().is_empty() && !message.files.is_empty() {
-        message.body_text()
-    } else {
-        message.text.clone()
-    };
-    let preview: String = source.chars().take(40).collect::<String>().trim().to_string();
-    (role_marker(&message.role), preview)
-}
 
 /// The snapshot's display title: the cleaned session label, falling back to
 /// the id tail when the label is empty (shared by the full snapshot, the
@@ -563,20 +380,26 @@ impl SnapshotBuild<'_> {
         let data = self.data;
         // The card's markdown state (one table budget, one fenced fallback) for
         // the section that builds model-authored text — the 最近对话 tail's
-        // entry texts. Hoisted here, not built inside `tail_panels`, so every
+        // entry texts. Hoisted here, not built inside the body, so every
         // entry's chunks draw from the ONE card-wide table budget rather than a
         // fresh one per entry.
         let mut md = crate::feishu::card::sanitize::CardMarkdown::new();
 
-        let mut elements: Vec<serde_json::Value> = Vec::new();
-        if let Some(chip) = status_chip_element(
-            !pendings.is_empty() || pending_overflow.any(),
-            data.pending_elsewhere,
-            data.waiting,
-            data.status,
-        ) {
-            elements.push(chip);
-        }
+        // The status line, the count-only pending pointer and the tail come
+        // from the ONE body composition both drivers share (ADR-0100). The
+        // driver supplies what it does with the read's pendings: this card
+        // carries the fixed block split, so the pointer counts exactly the
+        // blocks it renders and the overflow fact names the rest.
+        let body = session_card_body(
+            data,
+            pass.tail,
+            pass.omitted_tail,
+            PendingFacts {
+                on_card: pendings.len(),
+                more: pending_overflow,
+            },
+        );
+        let mut elements: Vec<serde_json::Value> = body.lead_elements();
         for (i, req) in pendings.iter().enumerate() {
             if i > 0 {
                 elements.push(json!({ "tag": "hr" }));
@@ -619,11 +442,11 @@ impl SnapshotBuild<'_> {
         } else {
             elements.extend(receipts);
         }
-        let has_tail = pass.omitted_tail > 0 || !pass.tail.is_empty();
+        let has_tail = body.has_tail();
         if (!pendings.is_empty() || pending_overflow.any() || has_receipts) && has_tail {
             elements.push(json!({ "tag": "hr" }));
         }
-        elements.extend(tail_panels(pass.tail, pass.omitted_tail, &mut md));
+        elements.extend(body.tail_elements(&mut md));
 
         // The `/switch`-list adoption's way back to the page it came from
         // (ADR-0052), at the card's end where the list footer used to be.
@@ -693,10 +516,14 @@ pub fn build_switched_state_card(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::TailMarker;
     use crate::backend::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
+    use crate::backend::{MessageRole, TailMarker, TailMessage};
     use crate::bridge::request::kind::PendingRequest;
-    use crate::bridge::snapshot::SnapshotData;
+    use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
+    use crate::feishu::card::session::{
+        BUSY_CHIP, FOLLOW_HINT, IDLE_CHIP, RETRY_CHIP, WAITING_BACKGROUND_CHIP, WAITING_CHIP,
+        WAITING_ELSEWHERE_CHIP, WAITING_ELSEWHERE_PINNED_CHIP, status_chip,
+    };
 
     fn permission(req_id: &str, session_id: &str, action: &str) -> PermissionRequest {
         PermissionRequest {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
-use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TailEntry, TurnAnchor, TurnSettle};
+use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
     CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, ExternalCardLead,
@@ -749,54 +749,15 @@ impl ExternalFlow {
             .and_then(|e| e.variant.clone());
         // The snapshot's identity rides as static text (same choice as the
         // 👤 preview in `start_reply_render`): the header verb 已接管 stays
-        // visible while the turn streams, and the 最近对话 tail keeps the
-        // verbatim context the static layout showed (spec: tail verbatim).
-        // `push_text` chunks long text, and the card splitter breaks overflow
-        // into continuation cards, so no truncation happens here. A Waiting
-        // adoption (#586) names the wait instead of claiming a turn is being
-        // continued; a busy run that started after a waiting gather keeps the
-        // continuing copy.
-        let title = crate::feishu::snapshot_card::display_title(title, session_id);
-        let mut static_text = if data.waiting && !busy_now {
-            format!("已{verb} {title}（等待后台任务完成，有新进展会自动更新）")
-        } else {
-            format!("已{verb} {title}（正在继续该会话的回合，有新进展会自动更新）")
-        };
-        // A Compaction marker is deliberately NOT repeated here: this card is a
-        // live one, and its timeline renders the session's compaction rows itself
-        // (a session-scoped fact, ADR-0082), so copying the marker into the
-        // static prefix would show it twice. The one-shot snapshot — which has no
-        // timeline — is where the tail's marker is the only vehicle. A tail
-        // carrying only markers therefore renders no 最近对话 section at all: a
-        // header with nothing under it would read as an empty conversation.
-        let messages: Vec<_> = data.tail.iter().filter_map(TailEntry::message).collect();
-        if !messages.is_empty() {
-            static_text.push_str("\n\n**最近对话**");
-            for message in messages {
-                let role = crate::feishu::snapshot_card::role_marker(&message.role);
-                let body = message.body_text();
-                let text = if body.trim().is_empty() {
-                    "（空消息）".to_string()
-                } else {
-                    body
-                };
-                static_text.push_str(&format!("\n{role} {text}"));
-            }
-        }
-        // This card REPLACES the one-shot snapshot that named the requests its
-        // block cap left out (#842), so the fact is repeated here — otherwise
-        // the only place naming them is a card that no longer exists. It uses
-        // the UNCOUNTED form: arming happens a moment after the snapshot was
-        // sent, and a resolution can land in between, so the send-time count is
-        // no longer trustworthy (the same rule a claim-ack rebuild follows).
-        // The inline blocks follow this text, so the line reads immediately
-        // above the ones it is NOT about.
-        if let Some(notice) =
-            crate::feishu::snapshot_card::pending_overflow_notice(data.pending_overflow.uncounted())
-        {
-            static_text.push('\n');
-            static_text.push_str(&notice);
-        }
+        // visible while the turn streams, and the body below it is the ONE
+        // composition the idle Session Card renders (ADR-0100). The body is
+        // composed with `include_markers = false`: this card is a live one, and
+        // its timeline renders the session's compaction rows itself (a
+        // session-scoped fact, ADR-0082), so repeating the marker here would
+        // show it twice. `push_text` chunks long text, and the card splitter
+        // breaks overflow into continuation cards, so no truncation happens
+        // here.
+        let static_text = snapshot_follow_lead(verb, title, data, busy_now);
         // A NEW external run (the adoption follows it): a `/stop` from before
         // it is not this run's ending, same as the reply renderer's arm. A
         // stop landing after this point ends the follow promptly as
@@ -1318,6 +1279,59 @@ impl ExternalFlow {
             .instrument(span),
         );
     }
+}
+
+/// The busy follow's static lead (ADR-0100): the takeover identity line and the
+/// Session Card body this read composes. Both are static text at the top of the
+/// live card (the same representation choice as the 👤 preview in
+/// [`ExternalFlow::start_reply_render`]), above the run's streamed parts.
+///
+/// A Waiting adoption (#586) names the wait instead of claiming a turn is being
+/// continued; a busy run that started after a waiting gather keeps the
+/// continuing copy. The 最近对话 tail's Compaction markers are deliberately NOT
+/// repeated here: this card is a live one, and its timeline renders the
+/// session's compaction rows itself (a session-scoped fact, ADR-0082), so
+/// `include_markers = false` — a tail carrying only markers therefore renders no
+/// 最近对话 section at all, since a header with nothing under it would read as an
+/// empty conversation.
+///
+/// This card REPLACES the one-shot snapshot that named the requests its block
+/// cap left out (#842), so the overflow fact is repeated here — otherwise the
+/// only place naming them is a card that no longer exists. It uses the UNCOUNTED
+/// form: arming happens a moment after the snapshot was sent, and a resolution
+/// can land in between, so the send-time count is no longer trustworthy (the
+/// same rule a claim-ack rebuild follows). The inline blocks follow this text,
+/// so the line reads immediately above the ones it is NOT about.
+pub(crate) fn snapshot_follow_lead(
+    verb: &str,
+    title: &str,
+    data: &crate::bridge::snapshot::SnapshotData,
+    busy_now: bool,
+) -> String {
+    let title = crate::feishu::snapshot_card::display_title(title, &data.session_id);
+    let mut text = if data.waiting && !busy_now {
+        format!("已{verb} {title}（等待后台任务完成，有新进展会自动更新）")
+    } else {
+        format!("已{verb} {title}（正在继续该会话的回合，有新进展会自动更新）")
+    };
+    let body = crate::feishu::card::session::session_card_body(
+        data,
+        &data.tail,
+        0,
+        crate::feishu::card::session::PendingFacts::of_read(data),
+    )
+    .text(false);
+    if !body.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&body);
+    }
+    if let Some(notice) =
+        crate::feishu::snapshot_card::pending_overflow_notice(data.pending_overflow.uncounted())
+    {
+        text.push('\n');
+        text.push_str(&notice);
+    }
+    text
 }
 
 /// The full anchor of the session's armed renderer, if one is armed: the

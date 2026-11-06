@@ -387,7 +387,7 @@ async fn switch_reeswitch_snapshots_on_busy_status() {
         .expect("busy reports a snapshot")
         .to_string();
     assert!(
-        card.contains(crate::feishu::snapshot_card::BUSY_CHIP),
+        card.contains(crate::feishu::card::session::BUSY_CHIP),
         "busy chip: {card}"
     );
 }
@@ -421,7 +421,7 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
         .expect("a pending request reports a snapshot")
         .to_string();
     assert!(
-        card.contains(crate::feishu::snapshot_card::WAITING_CHIP),
+        card.contains(crate::feishu::card::session::WAITING_CHIP),
         "waiting chip: {card}"
     );
 }
@@ -433,8 +433,8 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
 #[tokio::test]
 async fn switch_reeswitch_points_at_a_pending_surfaced_elsewhere() {
     for (pins_enabled, expected_chip) in [
-        (false, crate::feishu::snapshot_card::WAITING_ELSEWHERE_CHIP),
-        (true, crate::feishu::snapshot_card::WAITING_ELSEWHERE_PINNED_CHIP),
+        (false, crate::feishu::card::session::WAITING_ELSEWHERE_CHIP),
+        (true, crate::feishu::card::session::WAITING_ELSEWHERE_PINNED_CHIP),
     ] {
         switch_reeswitch_elsewhere_case(pins_enabled, expected_chip).await;
     }
@@ -500,11 +500,11 @@ async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str
         "pin enabled = {pins_enabled}: the chip points at the hosting card: {text}"
     );
     assert!(
-        !text.contains(crate::feishu::snapshot_card::BUSY_CHIP),
+        !text.contains(crate::feishu::card::session::BUSY_CHIP),
         "the server run state is not shown: {text}"
     );
     assert!(
-        !text.contains(crate::feishu::snapshot_card::FOLLOW_HINT),
+        !text.contains(crate::feishu::card::session::FOLLOW_HINT),
         "no hint on a pending pointer: {text}"
     );
     assert!(
