@@ -2601,4 +2601,60 @@ mod tests {
             Some("om_idle")
         );
     }
+
+    /// `stamp_taken_over`'s failure arm: a card-view GET that FAILS must not
+    /// PATCH a bare 「已由新卡片接管」 header over the read. The older read is
+    /// already a valid message; a failed view read leaves its body and header
+    /// exactly as they are (ADR-0100).
+    #[tokio::test]
+    async fn a_failed_stamp_view_leaves_the_read_alone() {
+        use crate::bridge::test_support::{MockBackend, PlatformCall, build_app, test_config};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        // No card view is scripted: the mock answers like a missing `im:message`
+        // grant, the read-failure arm.
+        stamp_taken_over(&app.cards_handle(), "om_read", None).await;
+
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_read"
+            )),
+            "a failed view read never PATCHes a bare card: {calls:?}"
+        );
+        assert_eq!(
+            platform.card_view_reads.lock().unwrap().as_slice(),
+            ["om_read".to_string()],
+            "the stamp spent exactly its one view read"
+        );
+    }
+
+    /// The timeout half of the same arm: a view read that outlives the bound is
+    /// a failed read too, so it must not PATCH either.
+    #[tokio::test]
+    async fn a_timed_out_stamp_view_leaves_the_read_alone() {
+        use crate::bridge::test_support::{MockBackend, PlatformCall, build_app, test_config};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        app.cards_handle()
+            .preserved_view_timeout_ms
+            .store(25, std::sync::atomic::Ordering::Relaxed);
+        // Park the read: the bounded call gives up and the stamp is skipped.
+        let (_entered, _release) = platform.pause("card_view", "om_read");
+        stamp_taken_over(&app.cards_handle(), "om_read", None).await;
+
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_read"
+            )),
+            "a timed-out view read never PATCHes a bare card: {calls:?}"
+        );
+    }
 }

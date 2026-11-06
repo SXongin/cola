@@ -212,6 +212,9 @@ standing.
   carve-out. **Retired** with the claimed block.
 - ADR-0040 — the Session Snapshot tail's fold ids. **Retired** with the rebuild
   path.
+- ADR-0093 — the Session Snapshot's folded receipt log. **Retired** with the
+  snapshot card; the Session Card's folded tail and list forms keep that
+  layout rule.
 - ADR-0044 — "session snapshot cards never carry the Turn Footer." **Kept**: the
   Session Card's idle state carries no footer model either.
 - ADR-0043 — the claimed-snapshot pin arm. **Retired**; a request's Message Pin

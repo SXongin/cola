@@ -1437,10 +1437,10 @@ fn browse_entry_button(thread_key: &crate::config::ThreadKey) -> serde_json::Val
 // The Session Card body (ADR-0100)
 // ---------------------------------------------------------------------------
 
-/// The update promise both live-adoption chips carry (ADR-0028): the busy chip
-/// and the 等待后台任务 chip (#586) each say the read keeps updating — the follow
-/// streams the in-flight turn into the card, or the wait is served in place and
-/// resumed by its completion Wake.
+/// The update promise a FOLLOWED card's busy/waiting line carries (ADR-0028):
+/// the follow streams the in-flight turn into the card, or the wait is served
+/// in place and resumed by its completion Wake. A one-shot read renders the
+/// same chip without it — nothing would deliver on the promise.
 pub(crate) const FOLLOW_HINT: &str = "有新进展会自动更新";
 
 /// The busy run-state chip (ADR-0028). Tests assert this constant so a copy
@@ -1464,24 +1464,34 @@ pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
 pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
 
 /// The status line content for a session's state (ADR-0100 precedence
-/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲; the busy and waiting
-/// lines each carry one hint phrase). `waiting` is the gather's ADR-0059 fact
-/// (server-idle with live Background Tasks, #586) — it names the wait even
-/// though the server reads idle. `None` when there is no status to report — the
-/// line is omitted rather than guessed.
+/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲). `waiting` is the
+/// gather's ADR-0059 fact (server-idle with live Background Tasks, #586) — it
+/// names the wait even though the server reads idle. `follows` is the DRIVER
+/// fact: only a card that a renderer will keep updating may promise it (the
+/// busy/waiting follow), while a one-shot read must not — nothing would ever
+/// deliver on that promise. `None` when there is no status to report — the line
+/// is omitted rather than guessed.
 pub(crate) fn status_chip(
     has_pending: bool,
     waiting: bool,
     status: Option<crate::backend::types::SessionStatus>,
+    follows: bool,
 ) -> Option<String> {
     if has_pending {
         return Some(WAITING_CHIP.to_string());
     }
+    let hint = |chip: &str| {
+        if follows {
+            format!("{chip}\n{FOLLOW_HINT}")
+        } else {
+            chip.to_string()
+        }
+    };
     if waiting {
-        return Some(format!("{WAITING_BACKGROUND_CHIP}\n{FOLLOW_HINT}"));
+        return Some(hint(WAITING_BACKGROUND_CHIP));
     }
     match status {
-        Some(crate::backend::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{FOLLOW_HINT}")),
+        Some(crate::backend::types::SessionStatus::Busy) => Some(hint(BUSY_CHIP)),
         Some(crate::backend::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
         Some(crate::backend::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
         None => None,
@@ -1497,9 +1507,14 @@ pub(crate) fn status_chip(
 /// the wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingFacts {
-    /// The requests this card carries: a follow's seeded blocks, or the count
+    /// The requests this card counts: a follow's seeded blocks, or the count
     /// an idle read points at.
     pub(crate) on_card: usize,
+    /// Whether those requests' own blocks ride this card. A one-shot read
+    /// carries none, so its pointer must name where they do live
+    /// (「见原卡片」); a follow seeds the blocks it counts, so its pointer is
+    /// hint-free.
+    pub(crate) blocks_here: bool,
 }
 
 /// Whether the READ has a request waiting on the operator — the status line's
@@ -1554,15 +1569,24 @@ pub(crate) struct SessionCardBody<'a> {
 /// `omitted_tail` names the older entries it left out. `pending` says what the
 /// driver does with the read's requests; it is never inferred from `data`
 /// alone, because a one-shot card may carry fewer blocks than the read holds.
+/// `follows` is the driver fact [`status_chip`] needs: only a followed card
+/// promises more updates.
 pub(crate) fn session_card_body<'a>(
     data: &SnapshotData,
     tail: &'a [TailEntry],
     omitted_tail: usize,
     pending: PendingFacts,
+    follows: bool,
 ) -> SessionCardBody<'a> {
     SessionCardBody {
-        status: status_chip(read_has_pending(data), data.waiting, data.status),
-        pending: (pending.on_card > 0).then(|| format!("有 {} 个请求等待你处理", pending.on_card)),
+        status: status_chip(read_has_pending(data), data.waiting, data.status, follows),
+        pending: (pending.on_card > 0).then(|| {
+            if pending.blocks_here {
+                format!("有 {} 个请求等待你处理", pending.on_card)
+            } else {
+                format!("有 {} 个请求等待你处理（见原卡片）", pending.on_card)
+            }
+        }),
         tail,
         omitted_tail,
     }
@@ -1577,15 +1601,19 @@ pub(crate) fn session_card_body<'a>(
 /// me". `None` when the read has no status to report, so a failed status read
 /// is omitted rather than guessed.
 pub(crate) fn status_line(data: &SnapshotData) -> Option<String> {
-    let status = status_chip(read_has_pending(data), data.waiting, data.status)?;
+    // A one-line confirmation makes no update promise either, but it keeps
+    // only the chip line (the hint is dropped below), so the driver fact is
+    // irrelevant here.
+    let status = status_chip(read_has_pending(data), data.waiting, data.status, true)?;
     Some(status.lines().next().unwrap_or(status.as_str()).to_string())
 }
 
 /// Build the Session Card's read-only mode (ADR-0100): the one-shot read of a
 /// Session no renderer owns, posted by `/card`. The header is the state's
 /// static 「📄 会话」 (grey, no phase timer) and the body is the ONE composition
-/// — the status line, the count-only pending pointer and the 最近对话 tail —
-/// with every tail **Compaction** marker at its server position. There is
+/// — the status line, the count-only pending pointer (which names 「见原卡片」
+/// because this card carries no operable blocks) and the 最近对话 tail — with
+/// every tail **Compaction** marker at its server position. There is
 /// deliberately no operable element: no form, no button, no input and no
 /// recovery action, because an unanswered Permission/Question always lives on a
 /// live card or its own standalone card, never on a read.
@@ -1602,18 +1630,34 @@ pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
         .iter()
         .filter(|req| req.session_id() == data.session_id)
         .count();
-    build_idle_card_with_pending(data, on_card)
+    build_idle_card_with_pending(data, on_card, false)
 }
 
 /// [`build_idle_card`] with the pending count decided by the caller: the busy
 /// follow's initial post (ADR-0100) names exactly the requests it seeds on the
 /// card, which may be fewer than the read's — a request another card already
 /// hosts keeps its own surface and is not counted here. The status line still
-/// comes from the read.
-pub(crate) fn build_idle_card_with_pending(data: &SnapshotData, on_card: usize) -> serde_json::Value {
+/// comes from the read. `follows` says whether this post seeds the counted
+/// requests' blocks and keeps updating: the busy follow does, so its status and
+/// pointer are hint-free; a one-shot read does not, so its pointer names where
+/// the requests live (「见原卡片」) and its status line promises nothing.
+pub(crate) fn build_idle_card_with_pending(
+    data: &SnapshotData,
+    on_card: usize,
+    follows: bool,
+) -> serde_json::Value {
     let build = |omitted: usize| {
         let mut md = CardMarkdown::new();
-        let body = session_card_body(data, &data.tail[omitted..], omitted, PendingFacts { on_card });
+        let body = session_card_body(
+            data,
+            &data.tail[omitted..],
+            omitted,
+            PendingFacts {
+                on_card,
+                blocks_here: follows,
+            },
+            follows,
+        );
         let mut elements = body.lead_elements();
         elements.extend(body.tail_elements(&mut md));
         let mut builder = CardBuilder::new().with_state(CardState::Idle);
@@ -3315,10 +3359,11 @@ mod tests {
     }
 
     /// The facts a driver that carries everything the read does reports — the
-    /// shape #1003's idle read will use.
+    /// busy follow's shape: it seeds every pending block it counts.
     fn facts(read: &SnapshotData) -> PendingFacts {
         PendingFacts {
             on_card: read.pending.len(),
+            blocks_here: true,
         }
     }
 
@@ -3374,6 +3419,34 @@ mod tests {
             text: text.into(),
             files,
         })
+    }
+
+    /// The component ceiling binds too (#726's review): 160 title-only
+    /// Compaction rows are small in bytes but would cross Feishu's component
+    /// limit, so the one-shot card's eviction ladder must keep counting
+    /// components. The newest entry — the message after all the markers — is
+    /// the one that survives.
+    #[test]
+    fn a_tail_of_many_component_rows_is_evicted_by_component_count() {
+        let mut tail: Vec<TailEntry> = (0..160).map(|i| body_marker(i, "")).collect();
+        tail.push(body_message(MessageRole::User, 9_000, "最后一条消息"));
+        let read = body_read(Some(crate::backend::types::SessionStatus::Idle), false, tail);
+        let card = build_idle_card(&read);
+        let s = card.to_string();
+
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "byte budget: {}",
+            s.len()
+        );
+        assert!(
+            card_components(&card) <= crate::feishu::card::MAX_CARD_COMPONENTS,
+            "component budget: {} > {}",
+            card_components(&card),
+            crate::feishu::card::MAX_CARD_COMPONENTS
+        );
+        assert!(s.contains("条记录已省略"), "the eviction is named: {s}");
+        assert!(s.contains("最后一条消息"), "the newest entry survives: {s}");
     }
 
     /// ADR-0076: a files-only tail entry renders its `📎 name · mime · size`
@@ -3453,7 +3526,16 @@ mod tests {
             body_permission("req_1", "ses_body"),
             body_permission("req_2", "ses_body"),
         ];
-        let body = session_card_body(&read, &read.tail, 0, PendingFacts { on_card: 2 });
+        let body = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 2,
+                blocks_here: true,
+            },
+            true,
+        );
         assert_eq!(
             body.lead_text(),
             "⏳ 等待你的确认\n有 2 个请求等待你处理\n\n**最近对话**\n👤 问题一\n🤖 回答一"
@@ -3486,7 +3568,7 @@ mod tests {
                 body_message(MessageRole::Assistant, 4_000, "回答二"),
             ],
         );
-        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let body = session_card_body(&read, &read.tail, 0, facts(&read), true);
         let elements = body.tail_elements(&mut CardMarkdown::new());
         let titles: Vec<&str> = elements
             .iter()
@@ -3527,7 +3609,7 @@ mod tests {
             false,
             vec![body_marker(1_000, "保留了结论。")],
         );
-        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let body = session_card_body(&read, &read.tail, 0, facts(&read), true);
         let text = body.lead_text();
         assert_eq!(text, format!("{BUSY_CHIP}\n{FOLLOW_HINT}"), "{text}");
         assert!(!text.contains(TAIL_HEADING), "no empty header: {text}");
@@ -3540,10 +3622,90 @@ mod tests {
                 body_message(MessageRole::User, 1_000, "继续"),
             ],
         );
-        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let body = session_card_body(&read, &read.tail, 0, facts(&read), true);
         let text = body.lead_text();
         assert!(text.contains("继续"), "{text}");
         assert!(!text.contains("已压缩上下文"), "the marker stays out: {text}");
+    }
+
+    /// A one-shot read must not promise what nothing will deliver (ADR-0100):
+    /// the static Session Card's busy and waiting status lines carry the chip
+    /// alone, even for a cola-authored turn cola itself will never follow.
+    #[test]
+    fn a_static_reads_busy_status_line_promises_no_update() {
+        for (read, chip) in [
+            (
+                body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]),
+                BUSY_CHIP,
+            ),
+            (
+                body_read(Some(crate::backend::types::SessionStatus::Idle), true, vec![]),
+                WAITING_BACKGROUND_CHIP,
+            ),
+        ] {
+            let body = session_card_body(
+                &read,
+                &read.tail,
+                0,
+                PendingFacts {
+                    on_card: 0,
+                    blocks_here: false,
+                },
+                false,
+            );
+            assert_eq!(body.lead_text(), chip, "the static read carries no hint");
+            assert!(!body.lead_text().contains(FOLLOW_HINT), "{chip}");
+        }
+    }
+
+    /// The busy follow is the card the run streams onto, so its status line
+    /// keeps the one update promise — through the same source of truth.
+    #[test]
+    fn a_followed_busy_status_line_keeps_the_update_promise() {
+        let read = body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]);
+        let body = session_card_body(&read, &read.tail, 0, facts(&read), true);
+        assert_eq!(body.lead_text(), format!("{BUSY_CHIP}\n{FOLLOW_HINT}"));
+    }
+
+    /// The pending pointer names where a one-shot read's requests actually live:
+    /// the read carries no blocks, so it points at their own cards (ADR-0100's
+    /// 「见原卡片」), while a follow that seeds the counted blocks is hint-free.
+    #[test]
+    fn the_pending_pointer_names_another_card_only_when_the_blocks_are_not_here() {
+        let mut read = body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]);
+        read.pending = vec![body_permission("req_1", "ses_body")];
+
+        let static_read = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 1,
+                blocks_here: false,
+            },
+            false,
+        );
+        assert_eq!(
+            static_read.lead_text(),
+            format!("{WAITING_CHIP}\n有 1 个请求等待你处理（见原卡片）"),
+            "the read names where the request lives"
+        );
+
+        let follow = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 1,
+                blocks_here: true,
+            },
+            true,
+        );
+        assert_eq!(
+            follow.lead_text(),
+            format!("{WAITING_CHIP}\n有 1 个请求等待你处理"),
+            "the follow carries the block itself"
+        );
     }
 
     /// A read with nothing to report composes an empty body — no status line to
@@ -3551,7 +3713,7 @@ mod tests {
     #[test]
     fn an_unreadable_empty_session_composes_an_empty_body() {
         let read = body_read(None, false, vec![]);
-        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let body = session_card_body(&read, &read.tail, 0, facts(&read), true);
         assert_eq!(body.lead_text(), "");
         assert!(body.lead_elements().is_empty());
         assert!(!body.has_tail());
@@ -3567,7 +3729,16 @@ mod tests {
     fn a_waited_on_request_keeps_the_status_even_when_the_card_carries_none() {
         let mut read = body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]);
         read.pending = vec![body_permission("req_1", "ses_body")];
-        let body = session_card_body(&read, &read.tail, 0, PendingFacts { on_card: 0 });
+        let body = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 0,
+                blocks_here: true,
+            },
+            true,
+        );
         assert_eq!(body.lead_text(), WAITING_CHIP);
         assert_eq!(body.lead_elements().len(), 1, "the status line only, no pointer");
     }
@@ -3581,7 +3752,7 @@ mod tests {
             false,
             vec![body_message(MessageRole::User, 1_000, "保留")],
         );
-        let body = session_card_body(&read, &read.tail, 2, facts(&read));
+        let body = session_card_body(&read, &read.tail, 2, facts(&read), false);
         assert!(
             body.lead_text().contains("…更早的 2 条记录已省略"),
             "{}",

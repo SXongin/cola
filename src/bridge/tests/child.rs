@@ -707,7 +707,7 @@ async fn sub_attach_owned_child_is_refused_without_force() {
     );
     assert!(
         platform.replied_cards().await.is_empty(),
-        "a refused adoption sends no Session Snapshot"
+        "a refused adoption sends no card"
     );
     assert_eq!(
         app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -850,7 +850,7 @@ async fn sub_attach_naming_the_active_root_is_refused() {
         );
         assert!(
             platform.replied_cards().await.is_empty(),
-            "query {query}: no Session Snapshot"
+            "query {query}: no card"
         );
         assert_eq!(
             app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -907,7 +907,7 @@ async fn sub_attach_running_child_line_shows_its_live_state() {
 
 /// `/switch <child-id> --force` cannot adopt an unmapped child: the general
 /// command refuses with the `/sub attach` pointer before any mapping write or
-/// Session Snapshot (spec #344).
+/// card (spec #344).
 #[tokio::test]
 async fn switch_force_refuses_an_unmapped_child_and_points_at_sub_attach() {
     let _wd = test_work_dir();
@@ -940,7 +940,7 @@ async fn switch_force_refuses_an_unmapped_child_and_points_at_sub_attach() {
     );
     assert!(
         platform.replied_cards().await.is_empty(),
-        "a refused child gets no Session Snapshot"
+        "a refused child gets no card"
     );
     assert_eq!(
         app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -990,7 +990,7 @@ async fn switch_force_does_not_steal_a_child_mapped_to_another_chat() {
     );
     assert!(
         platform.replied_cards().await.is_empty(),
-        "a refused child gets no Session Snapshot"
+        "a refused child gets no card"
     );
     assert_eq!(
         app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -1150,10 +1150,7 @@ async fn switch_card_adopt_refuses_an_unmapped_child() {
             }))
             .await
             .expect("the op returns a result");
-        assert!(
-            result.card.is_none(),
-            "{op}: a refused child gets no Session Snapshot"
-        );
+        assert!(result.card.is_none(), "{op}: a refused child gets no card");
         let toast = result.toast.unwrap_or_default();
         assert!(
             toast.contains("/sub attach"),
