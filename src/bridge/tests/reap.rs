@@ -6903,6 +6903,97 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
     wait_for_announced(&app, "ses_test", 2_900).await;
 }
 
+/// An Idle Session Card in the map is a read, not a chain card (ADR-0100), so
+/// it must not refuse the reap's live-run projection the way a real chain card
+/// does. Before this rule `arm_projected_card` refused every pass: the
+/// restart-orphaned run was never adopted or followed, and each tick paid the
+/// projection's subtitle/status/transcript reads and its work-context git read
+/// for nothing. The read is never repainted, and the projection re-points the
+/// record and hands the successor to the follow.
+#[tokio::test]
+async fn an_idle_read_does_not_block_the_reaps_live_adoption() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    let missed = "后半段。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        assistant_in_flight(2_000, delivered),
+        assistant(3_100, missed),
+    ]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+    // `/card` left a one-shot read as the Session's current card.
+    assert!(
+        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_user").await,
+        "the read is installed over the card-less session"
+    );
+
+    spawn_sync(&app);
+    let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
+    assert!(
+        card_header(&successor).contains("回复中"),
+        "the adoption follows the live run: {successor}"
+    );
+    assert!(
+        successor_text.contains(missed),
+        "the missed delta lands on the successor: {successor}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        1,
+        "one successor create, never a refusal per pass: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The read is never a chain target and is never repainted.
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_read"
+        )),
+        "the read is never repainted: {calls:?}"
+    );
+    // The projection took the chain over: the record names the successor, not
+    // the orphan the read replaced.
+    let record = app
+        .cards_handle()
+        .chains
+        .get("ses_test")
+        .expect("a live run keeps its record");
+    assert_ne!(
+        record.card_message_id, "om_frozen",
+        "the projection re-pointed the record"
+    );
+
+    // The follow drives the run's next output onto the successor.
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "问题"),
+            assistant(2_000, &format!("{delivered}{missed}")),
+            assistant(4_000, "后续输出。"),
+        ])],
+    )
+    .await;
+    wait_for_update(&platform, "msg_reply", "the followed output", |card| {
+        card_text(card).contains("后续输出。")
+    })
+    .await;
+}
+
 /// The persisted interactive-surface record's raw JSON, or `None` when the
 /// file is gone (the surfaces test's own read).
 fn persisted_surfaces(session_file: &Path) -> Option<String> {
