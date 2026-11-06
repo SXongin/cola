@@ -1087,16 +1087,33 @@ async fn post_idle_card(
         .unwrap_or_default();
     let data = crate::bridge::snapshot::gather_snapshot(&handles.flow.backend, session_id, &directory).await;
     // The follow is decided from the read, before the write lock: the
-    // accumulator and the seed are built off the card map, so a cancellation
-    // up to the commit publishes nothing.
+    // accumulator is built off the card map, so a cancellation up to the
+    // commit publishes nothing. The seed filter waits for the lock.
     let mut follow = handles
         .external
-        .prepare_snapshot_follow(&handles.flow, "读取", "", &data)
+        .prepare_snapshot_follow(&handles.flow, &data)
         .await;
-    let card = match &follow {
-        Some(plan) => crate::feishu::card::session::build_idle_card_with_pending(&data, plan.seed_count()),
-        None => crate::feishu::card::session::build_idle_card(&data),
+    // The follow's identity line names the Session the same way an adoption
+    // does; the read itself never carried a title.
+    let title = if follow.is_some() {
+        handles
+            .external
+            .session_title(&handles.flow.backend, session_id, &directory)
+            .await
+    } else {
+        String::new()
     };
+    // A NEW external run (the follow follows it): a `/stop` from before it is
+    // not this run's ending, same as the reply renderer's arm.
+    if follow.is_some() {
+        handles
+            .flow
+            .waits
+            .stopped_sessions
+            .lock()
+            .await
+            .remove(session_id);
+    }
 
     let cards = &handles.flow.cards;
     let write_lock = cards.write_lock(session_id).await;
@@ -1115,50 +1132,63 @@ async fn post_idle_card(
         .await;
         return Ok(());
     }
-    // A NEW external run (the follow follows it): a `/stop` from before it is
-    // not this run's ending, same as the reply renderer's arm.
-    if follow.is_some() {
-        handles
-            .flow
-            .waits
-            .stopped_sessions
-            .lock()
-            .await
-            .remove(session_id);
-    }
     let previous = crate::bridge::turn::Turn::idle_card_to_supersede(cards, session_id).await;
+    // The pointer, the send, the arm and the seed are one critical section:
+    // the seed is filtered HERE (so no sweep can surface one between the
+    // decision and the attach), and the card's count names exactly that set.
+    let card = if let Some(plan) = &mut follow {
+        handles
+            .external
+            .resolve_snapshot_follow_seeds(&handles.flow, plan)
+            .await;
+        handles
+            .external
+            .compose_snapshot_follow_lead(plan, "读取", &title, &data);
+        crate::feishu::card::session::build_idle_card_with_pending(&data, plan.seed_count())
+    } else {
+        crate::feishu::card::session::build_idle_card(&data)
+    };
     let sent = handles.flow.platform.reply_card(message_id, &card).await?;
     if let Some(plan) = &mut follow {
         // The send awaited; a Turn may have installed itself meanwhile. The
         // arm's own compare-and-swap refuses a running card, so the read is not
         // recorded and the just-sent message is stamped taken over.
-        if handles
+        let armed = handles
             .external
             .arm_snapshot_follow_locked(&handles.flow, session_id, &sent, plan, true)
-            .await
-        {
+            .await;
+        if armed {
+            handles
+                .external
+                .seed_snapshot_follow_locked(&handles.flow, session_id, plan)
+                .await;
+        }
+        drop(guard);
+        if armed {
+            // The stamp is a card-view GET + PATCH on another message: keep it
+            // out of the card write lock.
             if let Some(previous) = previous {
                 crate::bridge::chain::stamp_taken_over(cards, &previous, None).await;
             }
-            drop(guard);
             handles
                 .external
-                .finish_snapshot_follow(&handles.flow, session_id, plan)
-                .await;
+                .spawn_snapshot_follow(&handles.flow, session_id, plan);
             tracing::info!("card read: session {session_id} follows the running turn on the posted card");
-            return Ok(());
+        } else {
+            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+            tracing::info!(
+                "card read: session {session_id} a Turn took the card during the follow read; the posted read is stamped"
+            );
         }
-        crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
-        tracing::info!(
-            "card read: session {session_id} a Turn took the card during the follow read; the posted read is stamped"
-        );
         return Ok(());
     }
     // The send awaited; a Turn may have installed itself meanwhile. The CAS in
     // `record_idle_card` refuses a running card, and the read then stays a
     // plain message marked superseded — never the Session's card, never a host
     // for a later flush.
-    if crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await {
+    let recorded = crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await;
+    drop(guard);
+    if recorded {
         if let Some(previous) = previous {
             crate::bridge::chain::stamp_taken_over(cards, &previous, None).await;
         }

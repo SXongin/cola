@@ -229,10 +229,11 @@ pub trait RequestKind: Send + Sync {
 
     /// Seed this kind's inline block on a NEW host card with the request's
     /// initial (adopt-time) state — the busy-follow host path, which
-    /// reproduces the static snapshot's blocks before the renderer takes over
-    /// and remembers the request right after. Defaults to [`Self::add_inline`]:
-    /// a kind with no remembered state has nothing to restore anyway.
-    async fn add_initial_inline(
+    /// reproduces the static read's blocks before the renderer takes over and
+    /// remembers the request right after. The caller holds the host's card
+    /// write lock: `/card`'s post, arm and seed are one critical section
+    /// (ADR-0100).
+    async fn add_initial_inline_locked(
         &self,
         flow: &RequestFlow,
         cards: &CardsHandle,
@@ -240,7 +241,7 @@ pub trait RequestKind: Send + Sync {
         req: &PendingRequest,
         dir: &str,
     ) -> bool {
-        self.add_inline(flow, cards, host, req, dir).await
+        self.add_inline_locked(flow, cards, host, req, dir).await
     }
 
     /// Build the standalone interactive card (used when no streaming card hosts
@@ -1195,7 +1196,7 @@ impl RequestKind for QuestionKind {
         Turn::add_question_locked(cards, host, q, dir, &paint).await
     }
 
-    async fn add_initial_inline(
+    async fn add_initial_inline_locked(
         &self,
         _flow: &RequestFlow,
         cards: &CardsHandle,
@@ -1206,11 +1207,8 @@ impl RequestKind for QuestionKind {
         let PendingRequest::Question(q) = req else {
             return false;
         };
-        // The follow seeds the adopt-time block before anything was
-        // remembered, so it starts open; the remembered state is recorded
-        // right after (`remember_surfaced`).
         let paint = crate::bridge::question::QuestionPaint::blank(q.questions.len());
-        Turn::add_question(cards, host, q, dir, &paint).await
+        Turn::add_question_locked(cards, host, q, dir, &paint).await
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {

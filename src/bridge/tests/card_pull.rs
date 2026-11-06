@@ -549,6 +549,169 @@ async fn a_card_read_cancelled_before_the_commit_publishes_nothing() {
     );
 }
 
+/// A sweep that starts BEFORE `/card` commits waits on the same card write
+/// lock and then sees the armed card, so it attaches the request there instead
+/// of posting a standalone duplicate (ADR-0100).
+#[tokio::test]
+async fn a_sweep_started_before_the_follow_commit_does_not_duplicate_the_pending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    // Park `/card` inside its send while it already holds the card write lock,
+    // then start the sweep: it reaches the same lock and cannot commit first.
+    let (entered, release) = platform.pause("reply", "msg_card");
+    let app2 = app.clone();
+    let send = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    let app3 = app.clone();
+    let sweep = tokio::spawn(async move {
+        let mut seen = std::collections::HashSet::new();
+        app3.permission.sweep(&app3.flow_handles(), &mut seen).await;
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    release.notify_one();
+    send.await.unwrap();
+    sweep.await.unwrap();
+
+    let cards = app.cards_handle();
+    assert!(
+        Turn::is_running(&cards, "ses_test").await,
+        "the read armed the follow before the sweep could surface"
+    );
+    assert!(
+        Turn::has_interaction_in(&cards, "ses_test", "per_1").await,
+        "the blocked sweep attaches the request to the follow card"
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "only the /card read is posted: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        platform.sent_cards().await.is_empty(),
+        "no standalone card for the follow's seeded pending: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.permission.sent_cards.lock().await.is_empty(),
+        "no standalone surface may be recorded for the follow's seeded pending"
+    );
+}
+
+/// A command cancelled AFTER its send has returned and INSIDE the commit
+/// publishes no card: the send landed as a static read, but the map insert and
+/// the Chain Record never happen. The commit is parked on the cards map so the
+/// abort lands in that exact window.
+#[tokio::test]
+async fn a_card_read_cancelled_inside_the_commit_publishes_no_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let (entered, release) = platform.pause("reply", "msg_card");
+    let app2 = app.clone();
+    let send = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    // The command is parked in its send; its earlier map reads are done. Hold
+    // the cards map so the commit's insert cannot run, release the send, then
+    // abort the future while it waits for the map.
+    let cards_handle = app.cards_handle();
+    let cards_guard = cards_handle.cards.lock().await;
+    release.notify_one();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    send.abort();
+    let _ = send.await;
+    drop(cards_guard);
+
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "the send landed as a static read: {:?}",
+        platform.calls.lock().await
+    );
+    let cards = app.cards_handle();
+    assert!(
+        Turn::card_message_id(&cards, "ses_test").await.is_none(),
+        "an aborted commit records no card"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "an aborted commit writes no Chain Record"
+    );
+}
+
+/// The follow's identity line names the Session by its real title, exactly as
+/// the adoption line does — never the bare id tail because `/card` passed no
+/// title. The renderer's first flush carries the lead.
+#[tokio::test]
+async fn a_follow_names_the_read_with_the_session_title() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.with_session_title("ses_test", "我的会话");
+    let (app, platform) = build_app(cfg, backend).await;
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    wait_for_card_update(
+        &platform,
+        "the follow lead names the session title",
+        CardUpdates::Any,
+        |card| card_text(card).contains("已读取 我的会话"),
+    )
+    .await;
+}
+
 /// A Turn that installs its accumulator while the follow's card is being sent
 /// wins the map (ADR-0100): the arm's commit is a compare-and-swap, so the
 /// just-sent read is stamped taken over and no follow chain record is written.
@@ -561,6 +724,10 @@ async fn a_turn_installed_during_the_follow_send_wins_the_map() {
     backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
+    // A follow clears a pre-run `/stop` marker; the idle read path does not.
+    // Its absence proves this command took the follow branch, not just that a
+    // running card kept the map.
+    app.stopped_sessions.lock().await.insert("ses_test".to_string());
 
     let (entered, release) = platform.pause("reply", "msg_card");
     let app2 = app.clone();
@@ -594,6 +761,10 @@ async fn a_turn_installed_during_the_follow_send_wins_the_map() {
     assert!(
         cards.chains.get("ses_test").is_none(),
         "the refused follow writes no Chain Record"
+    );
+    assert!(
+        !app.stopped_sessions.lock().await.contains("ses_test"),
+        "the follow branch cleared the pre-run stop marker, even though its arm lost"
     );
 
     let calls = platform.calls.lock().await.clone();

@@ -469,16 +469,20 @@ impl RequestFlow {
         self.kind.remember_surfaced(self, req, dir).await;
     }
 
-    /// Seed this kind's inline block on a new host card with its initial
-    /// state — the busy-follow host path (`start_snapshot_follow`).
-    pub(crate) async fn add_initial_inline(
+    /// Seed this kind's inline block on a NEW host card with its initial
+    /// state, for a caller that already holds the host's card write lock —
+    /// `/card`'s post, arm, seed and pointer are one critical section
+    /// (ADR-0100).
+    pub(crate) async fn add_initial_inline_locked(
         &self,
         cards: &CardsHandle,
         host: &str,
         req: &PendingRequest,
         dir: &str,
     ) -> bool {
-        self.kind.add_initial_inline(self, cards, host, req, dir).await
+        self.kind
+            .add_initial_inline_locked(self, cards, host, req, dir)
+            .await
     }
 
     /// The result for a click whose question state is gone (#130). It never
@@ -1154,6 +1158,12 @@ impl RequestFlow {
     /// it unmarked so the next sweep retries; marking it early would bury the
     /// request forever because every later sweep would treat it as surfaced and
     /// `rehost_block` has no card to re-host it on.
+    ///
+    /// The inline/standalone decision holds the OWNING Session's card write
+    /// lock from the host check through the send and its `sent_cards` record
+    /// (ADR-0100). `/card`'s post-and-arm takes the same lock, so the two
+    /// cannot both deliver one request: whichever runs second sees the first's
+    /// effect (a live card carrying the block, or a recorded standalone).
     async fn surface(
         &self,
         handles: &FlowHandles,
@@ -1289,22 +1299,35 @@ impl RequestFlow {
         // of the session that owns it — the session itself, or (sub-task
         // children) its nearest ancestor with a live card. Only a separate card
         // when there is no active card (e.g. external turns or restarts).
+        //
+        // The WHOLE decision — the inline check, the block insert/flush, and
+        // the standalone send with its `sent_cards` record — holds the owning
+        // Session's card write lock (ADR-0100). `/card`'s post-and-arm takes
+        // the same lock, so a sweep that read "no live card" just before the
+        // arm cannot then post a standalone card for the request the follow
+        // seeded: either it commits first (this sweep sees the live card and
+        // attaches there, or finds the block already carried) or it sends
+        // first (the follow's seed filter sees that surface and does not
+        // duplicate it).
+        let owning_lock = handles.cards.write_lock(req.session_id()).await;
+        let guard = owning_lock.lock().await;
         if let Some(host) =
             inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await
         {
-            // The prompt sweep's surfacing decision shares the Session's card
-            // write lock with `/card`'s post-and-arm (ADR-0100): the arm's
-            // insert cannot slip between "this card is live" and the block's
-            // arrival, so the request lands on the card the reader asked for.
-            let write_lock = handles.cards.write_lock(&host).await;
-            let guard = write_lock.lock().await;
             // Re-validate under the lock: the walk's card may have been
             // replaced by a terminal one while it ran.
             if Turn::is_running(&handles.cards, &host).await {
-                let pushed = self
-                    .kind
-                    .add_inline_locked(self, &handles.cards, &host, req, dir)
-                    .await;
+                // The common case — the request's own card — is already under
+                // this lock; a sub-task child hosted on an ancestor takes that
+                // card's own lock inside the add/flush (never both held in the
+                // reverse order).
+                let pushed = if host == req.session_id() {
+                    self.kind
+                        .add_inline_locked(self, &handles.cards, &host, req, dir)
+                        .await
+                } else {
+                    self.kind.add_inline(self, &handles.cards, &host, req, dir).await
+                };
                 if pushed {
                     // The block landed: this request is surfaced from now on.
                     seen.insert(req.id().to_string());
@@ -1317,7 +1340,11 @@ impl RequestFlow {
                     // Flush so the inline section appears NOW — the render loop
                     // only flushes on new parts, and a blocked prompt produces
                     // none.
-                    Turn::flush_card_locked(&handles.cards, &host).await;
+                    if host == req.session_id() {
+                        Turn::flush_card_locked(&handles.cards, &host).await;
+                    } else {
+                        Turn::flush_card(&handles.cards, &host).await;
+                    }
                     return false;
                 }
                 // `add_inline` false is ambiguous: the card session vanished,
@@ -1338,7 +1365,6 @@ impl RequestFlow {
                     return false;
                 }
             }
-            drop(guard);
             // The card vanished mid-pass: fall through to a standalone card,
             // still unmarked until that lands.
         }
@@ -1346,6 +1372,8 @@ impl RequestFlow {
         // Reply to the message that triggered the prompt for this session; fall
         // back to sending into the chat when the accumulator is gone (e.g.
         // after a cola restart). Sub-task sessions resolve up the parent chain.
+        // The send and the surface record stay under the owning Session's lock
+        // so no follow can commit between them.
         let sent_id = match resolve_card_target(
             &handles.sessions,
             &handles.cards,
@@ -1404,6 +1432,7 @@ impl RequestFlow {
                 req.session_id()
             );
         }
+        drop(guard);
         false
     }
 
