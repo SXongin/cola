@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::backend::{MessageId, MessageRole, SessionTranscript};
+use crate::backend::{FinishReason, MessageId, MessageRole, Part, SessionTranscript, StepFinish};
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 
@@ -47,6 +47,30 @@ async fn one_posted_card(platform: &RecordingPlatform) -> serde_json::Value {
         platform.calls.lock().await
     );
     cards.into_iter().next().unwrap()
+}
+
+/// Assert the card carries no interactive component at all: a read is not
+/// operable (ADR-0100).
+fn assert_no_operable_element(card: &serde_json::Value) {
+    let json = card.to_string();
+    for tag in [
+        "form",
+        "button",
+        "input",
+        "select_static",
+        "multi_select_static",
+        "select_person",
+        "multi_select_person",
+        "checker",
+        "overflow",
+        "action",
+        "actions",
+    ] {
+        assert!(
+            !json.contains(&format!("\"tag\":\"{tag}\"")),
+            "the read must render no {tag}: {json}"
+        );
+    }
 }
 
 /// A Turn that already finished leaves its card session in `cards` with a Done
@@ -163,6 +187,131 @@ async fn card_command_after_a_stopped_turn_posts_an_idle_read() {
             PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_live"
         )),
         "the stopped card must not be repainted: {calls:?}"
+    );
+}
+
+/// A `/card` read that finds the Session **busy** still posts ONE static idle
+/// Session Card in this slice: the status line names 运行中, the tail renders,
+/// nothing on the card is operable, and NO renderer is armed on it — the map
+/// entry stays the terminal read and no Chain Record appears. #1005 moves this
+/// boundary.
+#[tokio::test]
+async fn a_busy_read_posts_a_static_idle_card_and_arms_no_renderer() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let card = one_posted_card(&platform).await;
+    let text = card_text(&card);
+    assert!(text.contains("⚙️ 运行中"), "the status line names busy: {text}");
+    assert!(text.contains("**最近对话**"), "the tail renders: {text}");
+    assert!(text.contains("继续改登录"), "the tail carries the read: {text}");
+    assert_no_operable_element(&card);
+
+    // No renderer armed: the read is the terminal map entry, not a chain card,
+    // it owns no Chain Record, and no follow moved it out of Idle.
+    let cards = app.cards_handle();
+    assert!(
+        !Turn::is_running(&cards, "ses_test").await,
+        "a read is never live"
+    );
+    assert!(
+        !Turn::is_chain_card(&cards, "ses_test").await,
+        "no renderer replaced the read with a chain card"
+    );
+    assert!(
+        !Turn::card_is_live(&cards, "ses_test").await,
+        "the read is not the growing live card"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "no follow armed => no Chain Record"
+    );
+}
+
+/// A `/card` read that finds the Session **waiting on Background Tasks** posts
+/// the same static idle card in this slice: the status line names the wait, the
+/// tail renders, nothing is operable, and no follow/renderer is armed. #1005
+/// moves this boundary.
+#[tokio::test]
+async fn a_waiting_read_posts_a_static_idle_card_and_arms_no_renderer() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_test",
+        vec![
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_u1",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("跑一下 CI")],
+                ),
+                typed_message(
+                    "msg_a1",
+                    MessageRole::Assistant,
+                    Some(2_000),
+                    vec![Part::StepFinish(StepFinish {
+                        reason: FinishReason::Stop,
+                    })],
+                ),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_background_tasks(vec![background_shell(1_100)]),
+        ],
+    );
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let card = one_posted_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("⏳ 等待后台任务"),
+        "the status line names the wait: {text}"
+    );
+    assert!(text.contains("**最近对话**"), "the tail renders: {text}");
+    assert!(text.contains("跑一下 CI"), "the tail carries the read: {text}");
+    assert_no_operable_element(&card);
+
+    let cards = app.cards_handle();
+    assert!(
+        !Turn::is_running(&cards, "ses_test").await,
+        "a read is never live"
+    );
+    assert!(
+        !Turn::is_chain_card(&cards, "ses_test").await,
+        "no renderer replaced the read with a chain card"
+    );
+    assert!(!Turn::card_is_live(&cards, "ses_test").await);
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "no follow armed => no Chain Record"
     );
 }
 

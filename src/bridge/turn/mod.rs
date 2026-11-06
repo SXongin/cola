@@ -4837,14 +4837,16 @@ impl Turn {
             .map(|c| c.acc.render_from())
     }
 
-    /// Whether the card session is the growing live card.
+    /// Whether the card session is the growing live card. A read-only Session
+    /// Card answers false: `card_is_live` is only the finalized-slice bit, and a
+    /// read never grows or flushes (ADR-0100), so it is not a live chain card.
     pub(crate) async fn card_is_live(cards: &CardsHandle, session_id: &str) -> bool {
         cards
             .cards
             .lock()
             .await
             .get(session_id)
-            .is_some_and(|c| c.card_is_live)
+            .is_some_and(|c| c.card_is_live && c.is_chain_card())
     }
 
     /// Whether the session owes a split continuation.
