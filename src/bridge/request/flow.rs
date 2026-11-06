@@ -1309,6 +1309,20 @@ impl RequestFlow {
         // attaches there, or finds the block already carried) or it sends
         // first (the follow's seed filter sees that surface and does not
         // duplicate it).
+        // Resolve the standalone target BEFORE the lock: this walk reads the
+        // parent chain and the server's session metadata, which has no card
+        // state to serialize with. The inline check is re-run under the lock
+        // below, so a follow that committed in this window still hosts the
+        // request instead of a stale standalone.
+        let target = resolve_card_target(
+            &handles.sessions,
+            &handles.cards,
+            &handles.backend,
+            &handles.platform,
+            req.session_id(),
+            dir,
+        )
+        .await;
         let owning_lock = handles.cards.write_lock(req.session_id()).await;
         let guard = owning_lock.lock().await;
         if let Some(host) =
@@ -1371,19 +1385,11 @@ impl RequestFlow {
         let card = self.kind.build_card(req, dir);
         // Reply to the message that triggered the prompt for this session; fall
         // back to sending into the chat when the accumulator is gone (e.g.
-        // after a cola restart). Sub-task sessions resolve up the parent chain.
-        // The send and the surface record stay under the owning Session's lock
-        // so no follow can commit between them.
-        let sent_id = match resolve_card_target(
-            &handles.sessions,
-            &handles.cards,
-            &handles.backend,
-            &handles.platform,
-            req.session_id(),
-            dir,
-        )
-        .await
-        {
+        // after a cola restart). Sub-task sessions resolve up the parent chain;
+        // the target was resolved before the lock. The send and the surface
+        // record stay under the owning Session's lock so no follow can commit
+        // between them.
+        let sent_id = match target {
             Some(CardTarget::ReplyTo(msg_id)) => handles.platform.reply_card(&msg_id, &card).await.ok(),
             Some(CardTarget::Chat(chat_id)) => {
                 handles.platform.send_card("chat_id", &chat_id, &card).await.ok()

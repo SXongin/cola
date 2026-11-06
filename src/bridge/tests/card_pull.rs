@@ -785,6 +785,53 @@ async fn a_turn_installed_during_the_follow_send_wins_the_map() {
     );
 }
 
+/// A `/card` that resolves to the pull/split path must not clear a live
+/// `/stop` marker: only the branch that arms a follow adopts a new run and owns
+/// that reset. The marker is what lets the drain finalize ⏹ 已停止.
+#[tokio::test]
+async fn a_card_read_that_resolves_to_a_pull_keeps_the_stop_marker() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    app.stopped_sessions.lock().await.insert("ses_test".to_string());
+
+    // Hold the card lock so `/card` passes its outer pull check, then install a
+    // live card before it reaches the in-lock re-check: the command resolves to
+    // the pull/split branch.
+    let lock = app.cards_handle().write_lock("ses_test").await;
+    let held = lock.lock().await;
+    let handles = app.command_handles();
+    let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    let command = tokio::spawn(async move {
+        crate::bridge::command::handle_command(
+            &handles,
+            crate::bridge::command::Command::Card,
+            thread_key,
+            "msg_card",
+            crate::config::ConversationKind::P2p,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    seed_live_card(&app, "ses_test", "om_live").await;
+    drop(held);
+    command.await.unwrap();
+
+    assert!(
+        app.stopped_sessions.lock().await.contains("ses_test"),
+        "a pull/split never adopts the run, so it must leave the stop marker alone"
+    );
+}
+
 /// `/card` with no Session mapped to the conversation has nothing to read: one
 /// text line says so and no card is created. The 「当前没有正在运行的实时卡片」
 /// notice is retired (ADR-0100) — an existing Session always answers with a

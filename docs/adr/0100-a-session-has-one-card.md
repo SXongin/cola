@@ -95,23 +95,30 @@ this branch — it pulls — so the guard only covers a run cola lost its render
 for.
 
 The post and the arm are **one commit**, ordered so a cancellation can never
-publish a half-built card. The command reads, builds the follow's accumulator and
-seeds the read's pendings **off the card map**; then, under the session's card
-write lock, it sends the card and inserts the render-owned `CardSession` carrying
-the id the send returned, together with the chain record. Nothing reaches
-`cards.cards` before that insert, so a command cancelled earlier leaves no Idle
-card behind: the next sweep surfaces the requests normally, and the sent card —
-if the send had already returned — stays a static read, not a host.
-`RequestFlow::surface` takes the same lock for its whole decision, so it cannot
-observe the window either. The seed filters with `is_already_surfaced`, so a
+publish a half-built card. Before taking the lock, the command reads the Session
+and builds the follow's accumulator **off the card map**. Then, under the
+session's card write lock, it filters the read's pendings with
+`is_already_surfaced`, composes the static lead from that exact set (so the
+count-only pointer names what will be attached), sends the card, inserts the
+render-owned `CardSession` carrying the id the send returned, writes the chain
+record and seeds the filtered requests. Nothing reaches `cards.cards` before that
+insert, so a command cancelled earlier leaves no Idle card behind: the next sweep
+surfaces the requests normally, and the sent card — if the send had already
+returned — stays a static read, not a host. `RequestFlow::surface` takes the same
+lock for its whole decision (it resolves the standalone target before the lock,
+then re-checks the inline host and sends under it), so it cannot observe the
+window either. Because the filter runs inside that one critical section, a
 request the sweep had surfaced before `/card` began keeps its own card and is
-simply not seeded. A cancellation after the insert leaves an armed card with a
-live `CardSession` and no render loop; that is the ordinary wedge every renderer
+simply not seeded, and a request that lands during the command cannot be counted
+on a card that does not carry it. The render loop spawns after the lock is
+released. A cancellation after the insert leaves an armed card with a live
+`CardSession` and no seed/render loop; that is the ordinary wedge every renderer
 can leave, handled by the reap, not a second card.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and
-the busy follow hands it to `ExternalCardLead::Static`. A test renders the same
+the busy follow hands it to its prepared accumulator's static lead (set under the
+card write lock, where the seed count is final). A test renders the same
 `SnapshotData` through both and asserts the body text is equal, because today the
 two are separate compositions that can drift.
 
@@ -150,10 +157,11 @@ two are separate compositions that can drift.
 - An adopted session's pending requests surface through the ordinary sweep
   (`RequestFlow::sweep` lists every known directory's requests): inline on a live
   card, else their own. A **busy follow** seeds the read's pendings onto its own
-  card instead — from the same read, inside the post-and-arm critical section
-  above — so the acceptance is that they are on the follow card, not that a later
-  sweep lands them. No registry claims anything; only the `pending_overflow`
-  notice goes, because overflow is no longer a decision the card makes.
+  card instead — from the same read, filtered and attached inside the
+  post-and-arm critical section above — so the acceptance is that they are on the
+  follow card, not that a later sweep lands them. No registry claims anything;
+  only the `pending_overflow` notice goes, because overflow is no longer a
+  decision the card makes.
 - ADR-0028's suppression heuristic dies with the card: `/card` always answers.
 - `build_switched_state_card` moves to `feishu::card::session`; it carries
   ADR-0052's 返回列表 button, which must survive on the list card the switch-list
