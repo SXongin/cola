@@ -419,19 +419,16 @@ async fn collect_orphan_outcome(
 /// `known` is the card's own JSON when the caller just built it (the newer read
 /// that lost the map race): the body is right there, so no card read is spent.
 /// Without it the previous card's view is read first. When that read fails or
-/// outlives the bound, a **non-actionable** read is left alone (the read is
-/// already a valid message; a stale header is better than an empty one), but an
-/// **actionable** card (`bare_on_unreadable`) is stamped with the bare
-/// `TakenOver` header instead: its Retry/重新发起 control must never survive as
-/// a dead button, even if body preservation is lost. Returns whether the card
-/// was actually PATCHed; a failed write is logged (the stamp is not a durable
-/// fact and never enters the pending-update queue) and the caller can choose to
-/// keep the old card current.
+/// outlives the bound, the **bare** `TakenOver` header is PATCHed instead: the
+/// old card must always be marked, and an actionable card's Retry/重新发起
+/// control must never survive as a dead button. Returns whether the card was
+/// actually PATCHed; a failed write is logged (the stamp is not a durable fact
+/// and never enters the pending-update queue) and the caller keeps the old card
+/// current so a later `/card` can retry the stamp.
 pub(crate) async fn stamp_taken_over(
     cards: &CardsHandle,
     card_message_id: &str,
     known: Option<&serde_json::Value>,
-    bare_on_unreadable: bool,
 ) -> bool {
     let bare = ending_card(CardState::TakenOver, None, None);
     let card = match known {
@@ -445,29 +442,17 @@ pub(crate) async fn stamp_taken_over(
             .await;
             match read {
                 Some(Ok(view)) => restamped_keeping_body(&bare, &view),
-                Some(Err(e)) if bare_on_unreadable => {
-                    tracing::warn!(
-                        "idle card: card {card_message_id} view unreadable ({e}); stamping the bare header so its controls die"
-                    );
-                    bare.clone()
-                }
                 Some(Err(e)) => {
                     tracing::warn!(
-                        "idle card: card {card_message_id} view unreadable ({e}); leaving the read as it is"
-                    );
-                    return false;
-                }
-                None if bare_on_unreadable => {
-                    tracing::warn!(
-                        "idle card: card {card_message_id} view timed out; stamping the bare header so its controls die"
+                        "idle card: card {card_message_id} view unreadable ({e}); stamping the bare header"
                     );
                     bare.clone()
                 }
                 None => {
                     tracing::warn!(
-                        "idle card: card {card_message_id} view timed out; leaving the read as it is"
+                        "idle card: card {card_message_id} view timed out; stamping the bare header"
                     );
-                    return false;
+                    bare.clone()
                 }
             }
         }
@@ -2621,12 +2606,11 @@ mod tests {
         );
     }
 
-    /// `stamp_taken_over`'s failure arm: a card-view GET that FAILS must not
-    /// PATCH a bare 「已由新卡片接管」 header over the read. The older read is
-    /// already a valid message; a failed view read leaves its body and header
-    /// exactly as they are (ADR-0100).
+    /// A card-view GET that FAILS still marks the old card: the bare
+    /// 「已由新卡片接管」 header is PATCHed (no body, no controls), so a second
+    /// `/card` can never leave both reads unmarked (ADR-0100).
     #[tokio::test]
-    async fn a_failed_stamp_view_leaves_the_read_alone() {
+    async fn an_unreadable_stamp_view_writes_the_bare_header() {
         use crate::bridge::test_support::{MockBackend, PlatformCall, build_app, test_config};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2634,15 +2618,27 @@ mod tests {
         let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
         // No card view is scripted: the mock answers like a missing `im:message`
         // grant, the read-failure arm.
-        assert!(!stamp_taken_over(&app.cards_handle(), "om_read", None, false).await);
+        assert!(stamp_taken_over(&app.cards_handle(), "om_read", None).await);
 
         let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_read" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+            .expect("the unreadable read is stamped");
+        assert_eq!(
+            card["header"]["title"]["content"],
+            "⏳ 已由新卡片接管 · 已停止更新"
+        );
         assert!(
-            !calls.iter().any(|c| matches!(
-                c,
-                PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_read"
-            )),
-            "a failed view read never PATCHes a bare card: {calls:?}"
+            card["body"]["elements"]
+                .as_array()
+                .is_none_or(|elements| elements.is_empty()),
+            "the fallback is the bare header: {card}"
         );
         assert_eq!(
             platform.card_view_reads.lock().unwrap().as_slice(),
@@ -2651,10 +2647,10 @@ mod tests {
         );
     }
 
-    /// The timeout half of the same arm: a view read that outlives the bound is
-    /// a failed read too, so it must not PATCH either.
+    /// The timeout half of the same arm: a view read that outlives the bound
+    /// also writes the bare header.
     #[tokio::test]
-    async fn a_timed_out_stamp_view_leaves_the_read_alone() {
+    async fn a_timed_out_stamp_view_writes_the_bare_header() {
         use crate::bridge::test_support::{MockBackend, PlatformCall, build_app, test_config};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2663,17 +2659,23 @@ mod tests {
         app.cards_handle()
             .preserved_view_timeout_ms
             .store(25, std::sync::atomic::Ordering::Relaxed);
-        // Park the read: the bounded call gives up and the stamp is skipped.
+        // Park the read: the bounded call gives up and the bare stamp lands.
         let (_entered, _release) = platform.pause("card_view", "om_read");
-        assert!(!stamp_taken_over(&app.cards_handle(), "om_read", None, false).await);
+        assert!(stamp_taken_over(&app.cards_handle(), "om_read", None).await);
 
         let calls = platform.calls.lock().await.clone();
-        assert!(
-            !calls.iter().any(|c| matches!(
-                c,
-                PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_read"
-            )),
-            "a timed-out view read never PATCHes a bare card: {calls:?}"
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_read" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+            .expect("the timed-out read is stamped");
+        assert_eq!(
+            card["header"]["title"]["content"],
+            "⏳ 已由新卡片接管 · 已停止更新"
         );
     }
 }

@@ -299,16 +299,6 @@ pub(crate) struct PromptContext {
     pub(crate) advisory_live: bool,
 }
 
-/// The card `/card` is about to replace and should stamp `TakenOver`.
-pub(crate) struct SupersededCard {
-    /// The card's message id.
-    pub(crate) message_id: String,
-    /// Whether the card still owns a recovery action (`Error`/`Unreceived`):
-    /// its stamp must fall back to a bare header when the body cannot be read,
-    /// and a failed stamp must not let the read replace it.
-    pub(crate) actionable: bool,
-}
-
 /// One user→assistant exchange (GLOSSARY.md: Turn). Owns the per-turn state and
 /// carries it through the phases in [`Turn::run`]:
 ///
@@ -3824,19 +3814,14 @@ impl Turn {
     /// terminal card with no action (`Done`/`Stopped`): a Turn that ran in
     /// between already superseded the older card, so it is left alone rather
     /// than stamped for noise.
-    pub(crate) async fn card_to_supersede(cards: &CardsHandle, session_id: &str) -> Option<SupersededCard> {
+    pub(crate) async fn card_to_supersede(cards: &CardsHandle, session_id: &str) -> Option<String> {
         let live = cards.cards.lock().await;
         live.get(session_id)
             .filter(|card| {
                 let state = card.acc.card_state();
                 *state == crate::feishu::card::CardState::Idle || state.offers_recovery()
             })
-            .and_then(|card| {
-                card.card_message_id.clone().map(|message_id| SupersededCard {
-                    message_id,
-                    actionable: card.acc.card_state().offers_recovery(),
-                })
-            })
+            .and_then(|card| card.card_message_id.clone())
     }
 
     /// Record a posted read-only Session Card as the Session's card (ADR-0100):

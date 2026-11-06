@@ -835,11 +835,24 @@ impl ExternalFlow {
         // The read's identity rides as static text (same choice as the 👤
         // preview in `start_reply_render`): the header verb stays visible
         // while the turn streams, and the body below it is the ONE composition
-        // the idle Session Card renders (ADR-0100). Its text form drops
-        // Compaction markers: this card is a live one, and its timeline renders
-        // the session's compaction rows itself (a session-scoped fact,
-        // ADR-0082), so repeating the marker here would show it twice.
-        let static_text = snapshot_follow_lead(verb, title, data, &seed_refs, plan.busy_now);
+        // the idle Session Card renders (ADR-0100). Its text form keeps
+        // Compaction markers at their server position, exactly like the card
+        // presentation; the live timeline may render the same row again, which
+        // ADR-0082's 2026-11-07 amendment records as deliberate (the
+        // equal-body contract outranks its exactly-once note).
+        //
+        // The body follows the ARM-TIME status: a gather that read Idle can be
+        // followed by a prepare that read Busy (the run started in between).
+        // The identity already says "continuing"; the body must not still say
+        // 空闲. A Waiting read with a Busy arm-time read is the same window.
+        let adjusted = plan.busy_now.then(|| {
+            let mut read = (*data).clone();
+            read.status = Some(crate::backend::types::SessionStatus::Busy);
+            read.waiting = false;
+            read
+        });
+        let read = adjusted.as_ref().unwrap_or(data);
+        let static_text = snapshot_follow_lead(verb, title, read, &seed_refs, plan.busy_now);
         if let Some(prepared) = plan.prepared.as_mut() {
             prepared.set_static_lead(&static_text);
         }

@@ -1195,27 +1195,22 @@ async fn post_idle_card(
     }
     let sent = handles.flow.platform.reply_card(message_id, &card).await?;
     if let Some(plan) = &mut follow {
-        // The old card is neutralised BEFORE the arm switches the map: an
-        // actionable terminal would otherwise keep a Retry/重新发起 button whose
-        // click resolves against the follow card (or a later idle card) and
-        // silently does nothing. The stamp is under the lock for exactly that
-        // ordering; it is a bounded GET + PATCH on another message.
+        // The old card is neutralised BEFORE the arm switches the map: it
+        // must never stay the visible card while the follow (or a later idle
+        // read) becomes current. A failed stamp aborts the command and keeps
+        // the old card current, so exactly one card is current and the next
+        // `/card` retries. The stamp is under the lock for that ordering; it
+        // is a bounded GET + PATCH on another message.
         if let Some(previous) = &previous {
-            let stamped = crate::bridge::chain::stamp_taken_over(
-                cards,
-                &previous.message_id,
-                None,
-                previous.actionable,
-            )
-            .await;
-            if previous.actionable && !stamped {
-                // The Retry/重新发起 control could not be removed. Keep the
-                // old card current so the button stays live; the posted read
-                // stays untracked.
+            let stamped = crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+            if !stamped {
+                // The old card could not be marked. Keep it current so exactly
+                // one card is current; the posted read stays untracked and the
+                // next `/card` retries the stamp.
                 drop(guard);
                 tracing::warn!(
-                    "card read: session {session_id} could not stamp the actionable card {}; leaving it current",
-                    previous.message_id
+                    "card read: session {session_id} could not stamp the previous card {}; leaving it current",
+                    previous
                 );
                 return Ok(());
             }
@@ -1246,7 +1241,7 @@ async fn post_idle_card(
             // that point leaves a live card with a render loop.
             tracing::info!("card read: session {session_id} follows the running turn on the posted card");
         } else {
-            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card), false).await;
+            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
             tracing::info!(
                 "card read: session {session_id} a Turn took the card during the follow read; the posted read is stamped"
             );
@@ -1254,20 +1249,18 @@ async fn post_idle_card(
         return Ok(());
     }
     // Neutralise the old card BEFORE the map switch, for the same reason as the
-    // follow branch: an actionable terminal's Retry/重新发起 must not survive
-    // the insert that makes its click resolve against the read.
+    // follow branch: a failed stamp keeps the old read current instead of
+    // recording a second unmarked card.
     if let Some(previous) = &previous {
-        let stamped =
-            crate::bridge::chain::stamp_taken_over(cards, &previous.message_id, None, previous.actionable)
-                .await;
-        if previous.actionable && !stamped {
-            // The dead-control invariant outranks the read: leave the Error
-            // card current (its Retry still works) and the posted read
-            // untracked.
+        let stamped = crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+        if !stamped {
+            // No predecessor is ever left both unmarked and current: keep the
+            // old read current, leave the just-sent read untracked, and let the
+            // next `/card` retry the stamp.
             drop(guard);
             tracing::warn!(
-                "card read: session {session_id} could not stamp the actionable card {}; leaving it current",
-                previous.message_id
+                "card read: session {session_id} could not stamp the previous card {}; leaving it current",
+                previous
             );
             return Ok(());
         }
@@ -1281,7 +1274,7 @@ async fn post_idle_card(
     if recorded {
         tracing::info!("card read: session {session_id} idle Session Card posted");
     } else {
-        crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card), false).await;
+        crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
         tracing::info!(
             "card read: session {session_id} a Turn took the card during the read; the posted read is stamped"
         );

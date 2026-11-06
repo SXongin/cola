@@ -11,6 +11,7 @@ use crate::bridge::handles::SnapshotHandles;
 /// guess. Each source is best-effort: a read failure degrades that field
 /// (status → `None`, lists → empty) and is logged, so a read can never be
 /// blocked by the gather.
+#[derive(Clone)]
 pub struct SnapshotData {
     pub session_id: String,
     pub directory: String,
