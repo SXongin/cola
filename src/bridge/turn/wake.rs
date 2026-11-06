@@ -278,8 +278,11 @@ impl Turn {
     /// identity — takes the ledger and work context, applies `ending` when the
     /// run is over (the ended-while-down projection, ticket #563) and is
     /// inserted as the session's live card, ready for the caller's create.
-    /// `None` when the session already has a card (a chain appeared meanwhile)
-    /// — the caller must send nothing.
+    /// `None` when the session already has a **chain card** (one appeared
+    /// meanwhile) — the caller must send nothing. An Idle Session Card does not
+    /// refuse it: it is a one-shot read (ADR-0100) that joins no chain, so the
+    /// projection replaces it in the map while the read's message stays
+    /// untouched.
     ///
     /// With `ending: None` the successor follows a still-live run (ticket
     /// #564): it wears a working header from its first send — never an initial
@@ -341,15 +344,23 @@ impl Turn {
         }
         let mut plans = {
             let live = cards.cards.lock().await;
-            if live.contains_key(session_id) {
+            // A chain card that appeared meanwhile owns the session. An Idle
+            // Session Card does not: it is a one-shot read (ADR-0100) that
+            // joins no chain, so the projection replaces it in the map while
+            // the read's message stays untouched in the chat.
+            if live
+                .get(session_id)
+                .is_some_and(state::CardSession::is_chain_card)
+            {
                 return None;
             }
             // The durable seed is read HERE, in the same critical section that
-            // checks the session is still card-less (issue #671, ticket #672):
-            // `read_planned_outputs` below awaits outside the lock, so a seed
-            // read before it could miss a fact a landed body wrote meanwhile.
-            // Together with the check the two are one decision — no card, so no
-            // writer — and the second check guards the install.
+            // checks the session is still chain-card-less (issue #671, ticket
+            // #672): `read_planned_outputs` below awaits outside the lock, so a
+            // seed read before it could miss a fact a landed body wrote
+            // meanwhile. Together with the check the two are one decision — no
+            // chain card, so no chain writer — and the second check guards the
+            // install.
             Self::seed_durable_announcements(cards, session_id, &mut acc);
             render::plan_ledger_entries(
                 &acc,
@@ -360,7 +371,10 @@ impl Turn {
         };
         render::read_planned_outputs(backend, &mut plans).await;
         let mut live = cards.cards.lock().await;
-        if live.contains_key(session_id) {
+        if live
+            .get(session_id)
+            .is_some_and(state::CardSession::is_chain_card)
+        {
             return None;
         }
         // `read_planned_outputs` awaited outside the lock: a queued card update
@@ -612,8 +626,9 @@ impl Turn {
                 }
                 // A Wake continues the Session's Card Chain, so a terminal Turn
                 // card still takes one: its reply message is the chain's, not a
-                // liveness claim (ADR-0100). An Idle Session Card is not a chain
-                // card at all, and wake_reply_target refuses it.
+                // liveness claim (ADR-0100). An Idle Session Card was filtered
+                // out above: it joins no chain, so the Fresh arm owns a late
+                // Wake and this arm is never reached with one.
                 // An OPEN yielded card resumes IN PLACE (ADR-0066), so no second
                 // card ever opens on it (spec #602). Precedence matters:
                 //
