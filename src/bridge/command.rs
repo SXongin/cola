@@ -1103,18 +1103,6 @@ async fn post_idle_card(
     } else {
         String::new()
     };
-    // A NEW external run (the follow follows it): a `/stop` from before it is
-    // not this run's ending, same as the reply renderer's arm.
-    if follow.is_some() {
-        handles
-            .flow
-            .waits
-            .stopped_sessions
-            .lock()
-            .await
-            .remove(session_id);
-    }
-
     let cards = &handles.flow.cards;
     let write_lock = cards.write_lock(session_id).await;
     let guard = write_lock.lock().await;
@@ -1137,6 +1125,17 @@ async fn post_idle_card(
     // the seed is filtered HERE (so no sweep can surface one between the
     // decision and the attach), and the card's count names exactly that set.
     let card = if let Some(plan) = &mut follow {
+        // A NEW external run (this branch arms the follow): a `/stop` from
+        // before it is not this run's ending, same as the reply renderer's
+        // arm. Only a follow clears it — a pull/split above must keep the
+        // live stop so the drain can still finalize ⏹ 已停止.
+        handles
+            .flow
+            .waits
+            .stopped_sessions
+            .lock()
+            .await
+            .remove(session_id);
         handles
             .external
             .resolve_snapshot_follow_seeds(&handles.flow, plan)

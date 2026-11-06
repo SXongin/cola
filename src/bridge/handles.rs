@@ -2341,6 +2341,18 @@ impl CardsHandle {
     /// ledger handover), `refresh_yielded_ledger` (a yielded card's in-place
     /// ledger update and quiet true-end settle) and `resolve_blocks` are the
     /// holders.
+    ///
+    /// Two more holders joined for ADR-0100, and both take it across a
+    /// read-send-record sequence rather than one call: `/card`'s post-and-arm-seed
+    /// (`post_idle_card`: the seed filter, pointer, send, map insert, chain
+    /// record and seed) and the prompt sweep's whole surfacing decision
+    /// (`RequestFlow::surface`: the inline-host re-check, the block insert/flush
+    /// and the standalone send with its `sent_cards`/surface record). They take
+    /// the **owning Session's** lock, which is what lets them exclude each
+    /// other. A sub-task request whose inline host is an ancestor nests
+    /// **child → ancestor** (the child's lock is held while the host's own
+    /// add/flush takes the ancestor's); no path takes the reverse order, so a
+    /// cross-session cycle cannot form.
     pub(crate) async fn write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         self.write_locks
             .lock()
