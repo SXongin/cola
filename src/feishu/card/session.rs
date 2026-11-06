@@ -1463,48 +1463,85 @@ pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
 /// operator's action beats the server's run state.
 pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
 
-/// The status chip for a session's state (ADR-0100 precedence
-/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲), WITHOUT any update
-/// promise: a one-shot read and a text confirmation have no renderer to deliver
-/// one. `waiting` is the gather's ADR-0059 fact (server-idle with live
-/// Background Tasks, #586) — it names the wait even though the server reads
-/// idle. `None` when there is no status to report — the line is omitted rather
-/// than guessed.
+/// The status arm a read resolves to (ADR-0100 precedence
+/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲). One predicate, so every
+/// driver of the status line sees the same table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusArm {
+    Pending,
+    Waiting,
+    Busy,
+    Retry,
+    Idle,
+}
+
+impl StatusArm {
+    /// Resolve the read's facts once. `waiting` is the gather's ADR-0059 fact
+    /// (server-idle with live Background Tasks, #586) — it names the wait even
+    /// though the server reads idle. `None` when there is no status to report —
+    /// the line is omitted rather than guessed.
+    fn resolve(
+        has_pending: bool,
+        waiting: bool,
+        status: Option<crate::backend::types::SessionStatus>,
+    ) -> Option<Self> {
+        if has_pending {
+            return Some(Self::Pending);
+        }
+        if waiting {
+            return Some(Self::Waiting);
+        }
+        match status {
+            Some(crate::backend::types::SessionStatus::Busy) => Some(Self::Busy),
+            Some(crate::backend::types::SessionStatus::Retry) => Some(Self::Retry),
+            Some(crate::backend::types::SessionStatus::Idle) => Some(Self::Idle),
+            None => None,
+        }
+    }
+
+    fn chip(self) -> &'static str {
+        match self {
+            Self::Pending => WAITING_CHIP,
+            Self::Waiting => WAITING_BACKGROUND_CHIP,
+            Self::Busy => BUSY_CHIP,
+            Self::Retry => RETRY_CHIP,
+            Self::Idle => IDLE_CHIP,
+        }
+    }
+
+    /// Whether a renderer is actually driving this arm, so the line may promise
+    /// [`FOLLOW_HINT`]. A pending request's chip is the operator's action, not
+    /// a run, and no other arm follows.
+    fn promises_updates(self) -> bool {
+        matches!(self, Self::Waiting | Self::Busy)
+    }
+}
+
+/// The status chip for a session's state, WITHOUT any update promise: a
+/// one-shot read and a text confirmation have no renderer to deliver one.
 pub(crate) fn status_chip(
     has_pending: bool,
     waiting: bool,
     status: Option<crate::backend::types::SessionStatus>,
 ) -> Option<String> {
-    if has_pending {
-        return Some(WAITING_CHIP.to_string());
-    }
-    if waiting {
-        return Some(WAITING_BACKGROUND_CHIP.to_string());
-    }
-    match status {
-        Some(crate::backend::types::SessionStatus::Busy) => Some(BUSY_CHIP.to_string()),
-        Some(crate::backend::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
-        Some(crate::backend::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
-        None => None,
-    }
+    StatusArm::resolve(has_pending, waiting, status).map(|arm| arm.chip().to_string())
 }
 
 /// The status line a FOLLOWED card renders: [`status_chip`] plus the
-/// [`FOLLOW_HINT`] promise on the arms a renderer is actually driving (busy or
-/// waiting on background tasks). Every other arm, and a pending request's own
-/// chip, carries no promise — nobody would deliver on it.
+/// [`FOLLOW_HINT`] promise on the arms a renderer is actually driving. The arm
+/// table and the promise predicate are the shared [`StatusArm`] ones, so a new
+/// arm cannot make one driver promise an update the other does not.
 pub(crate) fn followed_status_chip(
     has_pending: bool,
     waiting: bool,
     status: Option<crate::backend::types::SessionStatus>,
 ) -> Option<String> {
-    let chip = status_chip(has_pending, waiting, status)?;
-    let promises =
-        !has_pending && (waiting || matches!(status, Some(crate::backend::types::SessionStatus::Busy)));
-    Some(if promises {
+    let arm = StatusArm::resolve(has_pending, waiting, status)?;
+    let chip = arm.chip();
+    Some(if arm.promises_updates() {
         format!("{chip}\n{FOLLOW_HINT}")
     } else {
-        chip
+        chip.to_string()
     })
 }
 
@@ -1634,8 +1671,8 @@ pub(crate) fn status_line(data: &SnapshotData) -> Option<String> {
 /// one-shot budget always has (issue #726).
 pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
     // The pointer counts the requests the READ waits on, not blocks this card
-    // carries: an idle card carries none, and its pointer is text pointing at
-    // their own cards (`PendingFacts::on_card`'s documented idle arm).
+    // carries: an idle card carries none, so `PendingFacts::blocks_here` is
+    // false and the pointer is text pointing at their own cards.
     let on_card = data
         .pending
         .iter()
@@ -1682,7 +1719,7 @@ fn build_session_card(data: &SnapshotData, on_card: usize, follows: bool) -> ser
     if fits_card(&full) {
         return full;
     }
-    // One-shot cards have no splitter, so an oversized tail degrades by dropping
+    // This builder has no splitter, so an oversized tail degrades by dropping
     // its OLDEST entries into the body's visible omission notice, exactly as
     // every one-shot card's budget always has (issue #726).
     let floor = build(data.tail.len());
@@ -1693,7 +1730,7 @@ fn build_session_card(data: &SnapshotData, on_card: usize, follows: bool) -> ser
     // field): send it anyway, so the reader still gets the status, but say so
     // rather than failing silently.
     tracing::warn!(
-        "idle Session Card is {} chars with every tail entry dropped (budget {}): the non-evictable shell exceeds one card",
+        "Session Card is {} chars with every tail entry dropped (budget {}): the non-evictable shell exceeds one card",
         floor.to_string().len(),
         crate::feishu::card::MAX_CARD_JSON_CHARS
     );
