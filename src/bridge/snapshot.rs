@@ -241,9 +241,11 @@ pub(crate) async fn gather_snapshot(
 /// build its card with the given takeover verb (接管/切换).
 ///
 /// **No adoption surface emits this card any more** (ADR-0100, #1004): they
-/// confirm in one text line ([`adoption_line`]). The function is retained for
-/// the follow suite until #1005 re-drives it from `/card`; #1006 deletes it.
-#[allow(dead_code)] // no emitter since #1004; the follow suite still pins it until #1005
+/// confirm in one text line ([`adoption_line`]). Batch closure: #1005 re-drives
+/// the follow from `/card` (the retained follow caller), and #1006 deletes this
+/// builder with the snapshot card and moves `display_title` +
+/// `build_switched_state_card` to `feishu::card::session`.
+#[allow(dead_code)] // no production caller since #1004; #1005 replaces the follow, #1006 deletes this
 pub(crate) async fn snapshot_card_for(
     handles: &SnapshotHandles,
     verb: &str,
@@ -261,8 +263,8 @@ pub(crate) async fn snapshot_card_for(
 }
 
 /// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
-/// gathered data to the claimable pendings and build the card. Retained with
-/// the card until #1005/#1006 (no adoption emits it since #1004).
+/// gathered data to the claimable pendings and build the card. Retained with the
+/// card; #1006 deletes it with the builder.
 pub(crate) async fn snapshot_card_from_data(
     handles: &SnapshotHandles,
     verb: &str,
@@ -335,6 +337,8 @@ pub(crate) async fn adoption_line(
 /// server label must not break the single-line contract. No status to report
 /// (an unreadable status read) omits the summary rather than guessing one.
 pub(crate) fn adoption_line_from_data(verb: &str, title: &str, data: &SnapshotData) -> String {
+    // #1006 moves `display_title` to `feishu::card::session` (with the body
+    // composition); this call site stays.
     let mut title = crate::feishu::snapshot_card::display_title(title, &data.session_id)
         .split_whitespace()
         .collect::<Vec<_>>()

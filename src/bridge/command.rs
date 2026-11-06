@@ -2714,9 +2714,10 @@ async fn handle_topic_adopt(
         // spec #405), so the other thread's waiting card never hangs.
         handles.flow.unmap(&info.id).await?;
     }
-    // Open the topic in one transaction (ADR-0016): the pre-mapping snapshot,
-    // cover card (ADR-0023), in-topic seed, Session Mapping and the snapshot
-    // claim all live in `bridge::topic`.
+    // Open the topic in one transaction (ADR-0016): the pre-mapping
+    // confirmation read, cover card (ADR-0023), in-topic text seed and Session
+    // Mapping all live in `bridge::topic`. The adopted session's pending
+    // requests are left to the ordinary sweep (ADR-0100).
     match crate::bridge::topic::open_topic(
         &handles.topic_handles(),
         &thread_key.chat_id,
