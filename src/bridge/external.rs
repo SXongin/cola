@@ -747,17 +747,22 @@ impl ExternalFlow {
             .await
             .entry_for_session(session_id)
             .and_then(|e| e.variant.clone());
+        // The requests this follow seeds onto its card, in order. The
+        // count-only pointer names exactly this set, so it is decided HERE and
+        // not inferred from the read: #1005 filters the seed with
+        // `is_already_surfaced`, and a request that keeps its own card must not
+        // be counted on this one.
+        let seeds: Vec<&crate::bridge::request::kind::PendingRequest> = data.pending.iter().collect();
         // The snapshot's identity rides as static text (same choice as the
         // 👤 preview in `start_reply_render`): the header verb 已接管 stays
         // visible while the turn streams, and the body below it is the ONE
-        // composition the idle Session Card renders (ADR-0100). The body is
-        // composed with `include_markers = false`: this card is a live one, and
-        // its timeline renders the session's compaction rows itself (a
-        // session-scoped fact, ADR-0082), so repeating the marker here would
-        // show it twice. `push_text` chunks long text, and the card splitter
-        // breaks overflow into continuation cards, so no truncation happens
-        // here.
-        let static_text = snapshot_follow_lead(verb, title, data, busy_now);
+        // composition the idle Session Card renders (ADR-0100). Its text form
+        // drops Compaction markers: this card is a live one, and its timeline
+        // renders the session's compaction rows itself (a session-scoped fact,
+        // ADR-0082), so repeating the marker here would show it twice.
+        // `push_text` chunks long text, and the card splitter breaks overflow
+        // into continuation cards, so no truncation happens here.
+        let static_text = snapshot_follow_lead(verb, title, data, &seeds, busy_now);
         // A NEW external run (the adoption follows it): a `/stop` from before
         // it is not this run's ending, same as the reply renderer's arm. A
         // stop landing after this point ends the follow promptly as
@@ -778,10 +783,21 @@ impl ExternalFlow {
         // inline dedupe (the block is already present on the accumulator)
         // prevents a duplicate, and clicking one takes the normal inline path —
         // resolved sections are stripped and the run resumes into the same card.
-        for req in &data.pending {
+        for req in &seeds {
             let flow = handles.requests.flow_for(req.claim_kind());
-            flow.add_initial_inline(&handles.cards, session_id, req, &data.directory)
-                .await;
+            // A refused add is the only way the blocks can differ from the
+            // count the pointer was written from (the card session vanished
+            // under the arm, or it already carries the request). Say so
+            // instead of leaving the card overstating what it shows.
+            if !flow
+                .add_initial_inline(&handles.cards, session_id, req, &data.directory)
+                .await
+            {
+                tracing::warn!(
+                    "snapshot follow: request {} was not seeded on the card for session {session_id}",
+                    req.id()
+                );
+            }
             // Remember the full request (like the static claim path): the poll
             // loop never sees follow-hosted requests, so `prepare()` never runs
             // for them and the block's buttons would resolve to nothing.
@@ -1288,12 +1304,16 @@ impl ExternalFlow {
 ///
 /// A Waiting adoption (#586) names the wait instead of claiming a turn is being
 /// continued; a busy run that started after a waiting gather keeps the
-/// continuing copy. The 最近对话 tail's Compaction markers are deliberately NOT
-/// repeated here: this card is a live one, and its timeline renders the
-/// session's compaction rows itself (a session-scoped fact, ADR-0082), so
-/// `include_markers = false` — a tail carrying only markers therefore renders no
-/// 最近对话 section at all, since a header with nothing under it would read as an
-/// empty conversation.
+/// continuing copy. `seeds` is the read's requests this follow puts on the card;
+/// the body's count-only pointer names exactly them, so the caller decides the
+/// set (and #1005 will filter it) rather than the composition inferring it.
+///
+/// The 最近对话 tail's Compaction markers are deliberately NOT repeated here:
+/// this card is a live one, and its timeline renders the session's compaction
+/// rows itself (a session-scoped fact, ADR-0082), so the body's text form drops
+/// them — a tail carrying only markers therefore renders no 最近对话 section at
+/// all, since a header with nothing under it would read as an empty
+/// conversation.
 ///
 /// This card REPLACES the one-shot snapshot that named the requests its block
 /// cap left out (#842), so the overflow fact is repeated here — otherwise the
@@ -1306,6 +1326,7 @@ pub(crate) fn snapshot_follow_lead(
     verb: &str,
     title: &str,
     data: &crate::bridge::snapshot::SnapshotData,
+    seeds: &[&crate::bridge::request::kind::PendingRequest],
     busy_now: bool,
 ) -> String {
     let title = crate::feishu::snapshot_card::display_title(title, &data.session_id);
@@ -1318,9 +1339,12 @@ pub(crate) fn snapshot_follow_lead(
         data,
         &data.tail,
         0,
-        crate::feishu::card::session::PendingFacts::of_read(data),
+        crate::feishu::card::session::PendingFacts {
+            on_card: seeds.len(),
+            overflow: data.pending_overflow,
+        },
     )
-    .text(false);
+    .lead_text();
     if !body.is_empty() {
         text.push_str("\n\n");
         text.push_str(&body);

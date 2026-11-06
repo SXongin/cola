@@ -1478,36 +1478,39 @@ pub(crate) struct PendingFacts {
     pub(crate) on_card: usize,
     /// The requests this card NAMES but does not carry — the one-shot card's
     /// block cap or byte budget left them out. [`PendingOverflow::None`] on the
-    /// common path.
-    pub(crate) more: PendingOverflow,
+    /// common path. Named for the read's own `pending_overflow` fact it mirrors.
+    pub(crate) overflow: PendingOverflow,
 }
 
 impl PendingFacts {
-    /// The read's own facts, for a driver that carries everything the read
-    /// does (`data.pending` plus its overflow fact).
-    pub(crate) fn of_read(data: &SnapshotData) -> Self {
-        Self {
-            on_card: data.pending.len(),
-            more: data.pending_overflow,
-        }
-    }
-
-    /// Whether the session waits on the operator at all — the status line's
-    /// top precedence.
-    fn waiting(self) -> bool {
-        self.on_card > 0 || self.more.any()
+    /// Whether the session waits on the operator at all — the status line's top
+    /// precedence. Deliberately not named `waiting`: that word is the read's
+    /// ADR-0059 background-wait fact ([`SnapshotData::waiting`]), a different
+    /// thing that reaches the same status line.
+    fn waits_on_operator(self) -> bool {
+        self.on_card > 0 || self.overflow.any()
     }
 }
 
 /// The 最近对话 section's heading.
 const TAIL_HEADING: &str = "**最近对话**";
 
+/// A tail message that carries nothing to show, in both presentations.
+const EMPTY_MESSAGE: &str = "（空消息）";
+
+/// The visible line naming the OLDEST tail entries a one-shot card's budget
+/// could not carry (issue #726). Shared by both presentations so the card and
+/// the live lead cannot word the degradation differently.
+fn omitted_tail_notice(omitted: usize) -> String {
+    format!("…更早的 {omitted} 条记录已省略（超出单卡容量）")
+}
+
 /// One Session Card body composed ONCE from a Session Snapshot read (ADR-0100):
 /// the status line, the count-only pending pointer, and the 最近对话 tail. The
 /// idle card renders it and the busy follow hands it to the external renderer's
 /// static lead, so the same read cannot render two ways; the two differ only in
 /// presentation ([`Self::lead_elements`]/[`Self::tail_elements`] versus
-/// [`Self::text`]).
+/// [`Self::lead_text`]).
 pub(crate) struct SessionCardBody<'a> {
     status: Option<String>,
     pending: Option<String>,
@@ -1528,7 +1531,7 @@ pub(crate) fn session_card_body<'a>(
 ) -> SessionCardBody<'a> {
     SessionCardBody {
         status: status_chip(
-            pending.waiting(),
+            pending.waits_on_operator(),
             data.pending_elsewhere,
             data.waiting,
             data.status,
@@ -1577,7 +1580,7 @@ impl SessionCardBody<'_> {
         if self.omitted_tail > 0 {
             panels.push(json!({
                 "tag": "markdown",
-                "content": format!("…更早的 {} 条记录已省略（超出单卡容量）", self.omitted_tail)
+                "content": omitted_tail_notice(self.omitted_tail)
             }));
         }
         for (i, entry) in self.tail.iter().enumerate() {
@@ -1600,14 +1603,14 @@ impl SessionCardBody<'_> {
             };
             let (role, preview) = tail_preview(message);
             let title = if preview.is_empty() {
-                format!("{role} （空消息）")
+                format!("{role} {EMPTY_MESSAGE}")
             } else {
                 format!("{role} {preview}…")
             };
             let body = message.body_text();
             let chunks = crate::feishu::card::chunk_text(&body, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
             let chunks = if chunks.is_empty() {
-                vec!["（空消息）".to_string()]
+                vec![EMPTY_MESSAGE.to_string()]
             } else {
                 chunks
             };
@@ -1621,12 +1624,15 @@ impl SessionCardBody<'_> {
         panels
     }
 
-    /// The body as plain text — the form a live card's static lead carries. The
-    /// tail is one `最近对话` section of `role body` lines; `include_markers`
-    /// says whether a Compaction's row rides in it, and a live card passes
-    /// `false` because its own timeline renders the session's compaction rows
-    /// (ADR-0082) — repeating one here would show it twice.
-    pub(crate) fn text(&self, include_markers: bool) -> String {
+    /// The body as the live lead's plain text: the status line, the pointer and
+    /// the tail as one `最近对话` section of `role body` lines. A **Compaction**
+    /// marker is deliberately absent: the card that carries this lead is live,
+    /// and its own timeline renders the session's compaction rows (ADR-0082), so
+    /// repeating one here would show it twice. The card-element presentation
+    /// ([`Self::tail_elements`]) keeps the marker; only this form drops it. A
+    /// tail carrying only markers therefore renders no 最近对话 heading at all —
+    /// a header with nothing under it would read as an empty conversation.
+    pub(crate) fn lead_text(&self) -> String {
         let mut text = String::new();
         if let Some(status) = &self.status {
             text.push_str(status);
@@ -1637,12 +1643,8 @@ impl SessionCardBody<'_> {
             }
             text.push_str(pending);
         }
-        let entries: Vec<&TailEntry> = self
-            .tail
-            .iter()
-            .filter(|entry| include_markers || entry.message().is_some())
-            .collect();
-        if self.omitted_tail == 0 && entries.is_empty() {
+        let messages: Vec<&TailMessage> = self.tail.iter().filter_map(TailEntry::message).collect();
+        if self.omitted_tail == 0 && messages.is_empty() {
             return text;
         }
         if !text.is_empty() {
@@ -1650,38 +1652,18 @@ impl SessionCardBody<'_> {
         }
         text.push_str(TAIL_HEADING);
         if self.omitted_tail > 0 {
-            text.push_str(&format!(
-                "\n…更早的 {} 条记录已省略（超出单卡容量）",
-                self.omitted_tail
-            ));
+            text.push('\n');
+            text.push_str(&omitted_tail_notice(self.omitted_tail));
         }
-        for entry in entries {
-            match entry {
-                TailEntry::Compaction(marker) => {
-                    text.push('\n');
-                    text.push_str(&crate::feishu::card::compaction::compaction_title(
-                        &marker.compaction,
-                    ));
-                    if let Some(chunks) =
-                        crate::feishu::card::compaction::compaction_fold_body(&marker.compaction)
-                    {
-                        for chunk in chunks {
-                            text.push('\n');
-                            text.push_str(&chunk);
-                        }
-                    }
-                }
-                TailEntry::Message(message) => {
-                    let role = role_marker(&message.role);
-                    let body = message.body_text();
-                    let body = if body.trim().is_empty() {
-                        "（空消息）".to_string()
-                    } else {
-                        body
-                    };
-                    text.push_str(&format!("\n{role} {body}"));
-                }
-            }
+        for message in messages {
+            let role = role_marker(&message.role);
+            let body = message.body_text();
+            let body = if body.trim().is_empty() {
+                EMPTY_MESSAGE.to_string()
+            } else {
+                body
+            };
+            text.push_str(&format!("\n{role} {body}"));
         }
         text
     }
@@ -3186,6 +3168,16 @@ mod tests {
         }
     }
 
+    /// The facts a driver that carries everything the read does reports
+    /// (`data.pending` plus its overflow fact) — the shape #1003's idle read
+    /// will use.
+    fn facts(read: &SnapshotData) -> PendingFacts {
+        PendingFacts {
+            on_card: read.pending.len(),
+            overflow: read.pending_overflow,
+        }
+    }
+
     fn body_message(role: MessageRole, created_ms: i64, text: &str) -> TailEntry {
         TailEntry::Message(TailMessage {
             role,
@@ -3229,11 +3221,11 @@ mod tests {
             0,
             PendingFacts {
                 on_card: 2,
-                more: PendingOverflow::None,
+                overflow: PendingOverflow::None,
             },
         );
         assert_eq!(
-            body.text(true),
+            body.lead_text(),
             "⏳ 等待你的确认\n有 2 个请求等待你处理\n\n**最近对话**\n👤 问题一\n🤖 回答一"
         );
         // The same composition as elements: the lead, then the tail section.
@@ -3247,10 +3239,12 @@ mod tests {
     }
 
     /// A **Compaction** marker keeps its server position among the tail's four
-    /// messages in the text form too (ADR-0082): it is a marker, not a message,
-    /// and it renders as its one-line row plus the summary it folded.
+    /// messages in the CARD presentation (ADR-0082): it is a marker, not a
+    /// message, and it renders as its one-line row plus the summary it folded.
+    /// The live lead's text form deliberately drops it — that card's timeline
+    /// renders the session's rows itself — while keeping all four messages.
     #[test]
-    fn the_body_text_keeps_a_compaction_at_its_server_position() {
+    fn the_body_keeps_a_compaction_at_its_server_position_in_the_card_form_only() {
         let read = body_read(
             Some(crate::backend::types::SessionStatus::Idle),
             false,
@@ -3262,26 +3256,34 @@ mod tests {
                 body_message(MessageRole::Assistant, 4_000, "回答二"),
             ],
         );
-        let body = session_card_body(&read, &read.tail, 0, PendingFacts::of_read(&read));
-        let text = body.text(true);
-        let lines: Vec<&str> = text.lines().collect();
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let elements = body.tail_elements(&mut CardMarkdown::new());
+        let titles: Vec<&str> = elements
+            .iter()
+            .filter(|element| element["tag"] == "collapsible_panel")
+            .map(|element| element["header"]["title"]["content"].as_str().unwrap())
+            .collect();
         assert_eq!(
-            lines,
+            titles,
             [
-                "✅ 空闲",
-                "",
-                TAIL_HEADING,
-                "👤 问题一",
-                "🤖 回答一",
+                "👤 问题一…",
+                "🤖 回答一…",
                 "已压缩上下文（自动）",
-                "保留了结论。",
-                "👤 问题二",
-                "🤖 回答二",
+                "👤 问题二…",
+                "🤖 回答二…",
             ],
-            "{text}"
+            "the marker sits at its server position: {elements:?}"
         );
         // The marker never consumes one of the tail's message slots.
-        assert_eq!(text.matches("👤").count() + text.matches("🤖").count(), 4);
+        let lead = body.lead_text();
+        assert_eq!(
+            lead,
+            "✅ 空闲\n\n**最近对话**\n👤 问题一\n🤖 回答一\n👤 问题二\n🤖 回答二"
+        );
+        assert!(
+            !lead.contains("已压缩上下文"),
+            "the live lead drops the marker (its timeline renders it): {lead}"
+        );
     }
 
     /// The live lead's text form omits Compaction markers: that card's timeline
@@ -3295,8 +3297,8 @@ mod tests {
             false,
             vec![body_marker(1_000, "保留了结论。")],
         );
-        let body = session_card_body(&read, &read.tail, 0, PendingFacts::of_read(&read));
-        let text = body.text(false);
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let text = body.lead_text();
         assert_eq!(text, format!("{BUSY_CHIP}\n{FOLLOW_HINT}"), "{text}");
         assert!(!text.contains(TAIL_HEADING), "no empty header: {text}");
         // A message-only tail still renders, markers or not.
@@ -3308,8 +3310,8 @@ mod tests {
                 body_message(MessageRole::User, 1_000, "继续"),
             ],
         );
-        let body = session_card_body(&read, &read.tail, 0, PendingFacts::of_read(&read));
-        let text = body.text(false);
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let text = body.lead_text();
         assert!(text.contains("继续"), "{text}");
         assert!(!text.contains("已压缩上下文"), "the marker stays out: {text}");
     }
@@ -3319,11 +3321,31 @@ mod tests {
     #[test]
     fn an_unreadable_empty_session_composes_an_empty_body() {
         let read = body_read(None, false, vec![]);
-        let body = session_card_body(&read, &read.tail, 0, PendingFacts::of_read(&read));
-        assert_eq!(body.text(true), "");
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        assert_eq!(body.lead_text(), "");
         assert!(body.lead_elements().is_empty());
         assert!(!body.has_tail());
         assert!(body.tail_elements(&mut CardMarkdown::new()).is_empty());
+    }
+
+    /// The pointer counts what THIS card carries, while the status line still
+    /// reports the wait when the card only NAMES requests (the one-shot card's
+    /// overflow): an overflow-only read shows 等待你的确认 with no pointer,
+    /// because there is no block on this card to count.
+    #[test]
+    fn an_overflow_only_read_waits_without_a_pointer() {
+        let read = body_read(Some(crate::backend::types::SessionStatus::Idle), false, vec![]);
+        let body = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 0,
+                overflow: PendingOverflow::Counted(2),
+            },
+        );
+        assert_eq!(body.lead_text(), WAITING_CHIP);
+        assert_eq!(body.lead_elements().len(), 1, "the status line only");
     }
 
     /// An omitted-entry fact renders as its own visible line, in both forms, so
@@ -3335,11 +3357,11 @@ mod tests {
             false,
             vec![body_message(MessageRole::User, 1_000, "保留")],
         );
-        let body = session_card_body(&read, &read.tail, 2, PendingFacts::of_read(&read));
+        let body = session_card_body(&read, &read.tail, 2, facts(&read));
         assert!(
-            body.text(true).contains("…更早的 2 条记录已省略"),
+            body.lead_text().contains("…更早的 2 条记录已省略"),
             "{}",
-            body.text(true)
+            body.lead_text()
         );
         let elements = body.tail_elements(&mut CardMarkdown::new());
         assert!(
