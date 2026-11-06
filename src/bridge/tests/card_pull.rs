@@ -13,6 +13,7 @@ use crate::backend::{FinishReason, MessageId, MessageRole, Part, SessionTranscri
 use crate::bridge::snapshot::SnapshotData;
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
+use crate::feishu::card::session::FOLLOW_HINT;
 
 /// A backend whose `ses_test` transcript carries one question and one answer,
 /// so an idle read has a 最近对话 tail to render.
@@ -180,6 +181,8 @@ async fn a_busy_read_follows_the_run_on_the_posted_card() {
     backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
+    // A committed follow adopts the new run, so it clears the pre-run marker.
+    app.stopped_sessions.lock().await.insert("ses_test".to_string());
 
     app.handle_message(incoming(
         "msg_card".into(),
@@ -197,8 +200,12 @@ async fn a_busy_read_follows_the_run_on_the_posted_card() {
     assert!(text.contains("**最近对话**"), "the tail renders: {text}");
     assert!(text.contains("继续改登录"), "the tail carries the read: {text}");
     assert!(
+        !text.contains(FOLLOW_HINT),
+        "the pre-arm send is the static read, not the follow copy: {text}"
+    );
+    assert!(
         !text.contains("超出单卡容量"),
-        "the follow card renders no overflow notice: {text}"
+        "the read renders no overflow notice: {text}"
     );
 
     // The posted card became the Session's live card, and the arm wrote the
@@ -226,6 +233,10 @@ async fn a_busy_read_follows_the_run_on_the_posted_card() {
         .get("ses_test")
         .expect("the follow takes the chain over");
     assert_eq!(record.card_message_id, "msg_reply");
+    assert!(
+        !app.stopped_sessions.lock().await.contains("ses_test"),
+        "the committed follow clears the pre-run stop marker"
+    );
 }
 
 /// A `/card` read that finds the Session **waiting on Background Tasks** with
@@ -337,10 +348,14 @@ async fn a_busy_follow_seeds_its_pending_and_the_sweep_does_not_duplicate_it() {
         "the read's pending rides on the follow card's accumulator"
     );
     let card = one_posted_card(&platform).await;
+    let text = card_text(&card);
     assert!(
-        card_text(&card).contains("有 1 个请求等待你处理"),
-        "the pointer names the seeded request: {}",
-        card_text(&card)
+        !text.contains(FOLLOW_HINT),
+        "the pre-arm send is the static read: {text}"
+    );
+    assert!(
+        text.contains("有 1 个请求等待你处理（见原卡片）"),
+        "the static read points the request at its own card: {text}"
     );
 
     // A fresh poller (its own `seen`) must recognise the block already on the
@@ -659,15 +674,18 @@ async fn a_follow_keeps_a_pending_the_sweep_already_surfaced() {
     );
     let cards_now = platform.replied_cards().await;
     assert_eq!(cards_now.len(), 1, "the read posts its own card");
+    let text = card_text(&cards_now[0]);
     assert!(
-        !card_text(&cards_now[0]).contains("有 1 个请求等待你处理"),
-        "the follow card does not count a request another card hosts: {}",
-        card_text(&cards_now[0])
+        !text.contains(FOLLOW_HINT),
+        "the pre-arm send is the static read: {text}"
     );
     assert!(
-        card_text(&cards_now[0]).contains("⏳ 等待你的确认"),
-        "the status still names the wait the read saw: {}",
-        card_text(&cards_now[0])
+        text.contains("有 1 个请求等待你处理（见原卡片）"),
+        "the static read points the pre-surfaced request at its own card: {text}"
+    );
+    assert!(
+        text.contains("⏳ 等待你的确认"),
+        "the status still names the wait the read saw: {text}"
     );
 
     // The poller still owns the standalone surface; its next pass must leave
@@ -879,6 +897,7 @@ async fn a_card_read_cancelled_inside_the_commit_publishes_no_card() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = idle_read_backend();
     backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
 
@@ -909,11 +928,21 @@ async fn a_card_read_cancelled_inside_the_commit_publishes_no_card() {
     let _ = send.await;
     drop(cards_guard);
 
+    let posted = platform.replied_cards().await;
     assert_eq!(
-        platform.replied_cards().await.len(),
+        posted.len(),
         1,
         "the send landed as a static read: {:?}",
         platform.calls.lock().await
+    );
+    let text = card_text(&posted[0]);
+    assert!(
+        !text.contains(FOLLOW_HINT),
+        "a card with no renderer must not promise updates: {text}"
+    );
+    assert!(
+        text.contains("有 1 个请求等待你处理（见原卡片）"),
+        "the static read points the pending at its own card: {text}"
     );
     let cards = app.cards_handle();
     assert!(
@@ -937,6 +966,7 @@ async fn a_follow_names_the_read_with_the_session_title() {
     let mut backend = idle_read_backend();
     backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
     backend.with_session_title("ses_test", "我的会话");
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
     app.core
         .external
@@ -954,11 +984,30 @@ async fn a_follow_names_the_read_with_the_session_title() {
     ))
     .await;
 
+    // The pre-arm send is the static read: it points at the request's own card
+    // and promises no updates.
+    let posted = platform.replied_cards().await;
+    assert_eq!(posted.len(), 1);
+    let posted_text = card_text(&posted[0]);
+    assert!(!posted_text.contains(FOLLOW_HINT), "{posted_text}");
+    assert!(
+        posted_text.contains("有 1 个请求等待你处理（见原卡片）"),
+        "the pre-arm card is a read: {posted_text}"
+    );
+
+    // The renderer's first flush paints the follow copy: the title, the update
+    // promise, and the pointer that counts the seeded block on THIS card.
     wait_for_card_update(
         &platform,
         "the follow lead names the session title",
         CardUpdates::Any,
-        |card| card_text(card).contains("已读取 我的会话"),
+        |card| {
+            let text = card_text(card);
+            text.contains("已读取 我的会话")
+                && text.contains(FOLLOW_HINT)
+                && text.contains("有 1 个请求等待你处理")
+                && !text.contains("见原卡片")
+        },
     )
     .await;
 }
@@ -973,11 +1022,11 @@ async fn a_turn_installed_during_the_follow_send_wins_the_map() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = idle_read_backend();
     backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
-    // A follow clears a pre-run `/stop` marker; the idle read path does not.
-    // Its absence proves this command took the follow branch, not just that a
-    // running card kept the map.
+    // A refused follow adopts nothing, so it must keep the pre-run `/stop`
+    // marker the run that still owns the card needs.
     app.stopped_sessions.lock().await.insert("ses_test".to_string());
 
     let (entered, release) = platform.pause("reply", "msg_card");
@@ -1014,8 +1063,8 @@ async fn a_turn_installed_during_the_follow_send_wins_the_map() {
         "the refused follow writes no Chain Record"
     );
     assert!(
-        !app.stopped_sessions.lock().await.contains("ses_test"),
-        "the follow branch cleared the pre-run stop marker, even though its arm lost"
+        app.stopped_sessions.lock().await.contains("ses_test"),
+        "a refused arm adopts no run, so it leaves the stop marker for the owner"
     );
 
     let calls = platform.calls.lock().await.clone();
@@ -1028,11 +1077,54 @@ async fn a_turn_installed_during_the_follow_send_wins_the_map() {
             }
             _ => None,
         })
-        .expect("the posted follow read is stamped taken over");
+        .expect("the posted read is stamped taken over");
+    let stamped_text = card_text(&stamped);
     assert!(
-        card_text(&stamped).contains("⏳ 已由新卡片接管 · 已停止更新"),
-        "the read that lost the race is not left unmarked: {}",
-        card_text(&stamped)
+        stamped_text.contains("⏳ 已由新卡片接管 · 已停止更新"),
+        "the read that lost the race is not left unmarked: {stamped_text}"
+    );
+    assert!(
+        !stamped_text.contains(FOLLOW_HINT),
+        "the stamp keeps the static body, never the follow promise: {stamped_text}"
+    );
+    assert!(
+        stamped_text.contains("有 1 个请求等待你处理（见原卡片）"),
+        "the static body still points the pending at its own card: {stamped_text}"
+    );
+}
+
+/// The follow's Chain Record write is guarded on the map still holding the
+/// card the arm inserted (ADR-0100): once a Turn's card has replaced it, the
+/// follow's takeover must neither re-point that card nor write a record naming
+/// the read. This simulates the post-insert window directly.
+#[tokio::test]
+async fn a_follow_record_never_lands_on_a_replaced_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, idle_read_backend()).await;
+    seed_live_card(&app, "ses_test", "一个回合").await;
+
+    let took = Turn::take_over_card_if_current(
+        &app.cards_handle(),
+        "ses_test",
+        "om_follow",
+        0, // not the planted Turn card's chain id
+        Some("/work"),
+    )
+    .await;
+
+    assert!(!took, "a replaced card is never taken over by the follow");
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_live"),
+        "the Turn's card identity is never re-pointed at the read"
+    );
+    assert!(
+        app.cards_handle().chains.get("ses_test").is_none(),
+        "no Chain Record may name the refused follow"
     );
 }
 

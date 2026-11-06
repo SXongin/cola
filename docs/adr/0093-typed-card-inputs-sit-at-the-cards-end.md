@@ -1,5 +1,10 @@
 # A typed card input sits at the card's end
 
+> **Retired by ADR-0100** (the Session Snapshot's folded receipt log): the
+> snapshot card and its claim/rebuild path are gone, so the receipt-log rule has
+> no surface. The layout rule itself lives on in the Session Card's folded tail
+> and in the list cards' folded forms.
+
 ## Context
 
 Feishu cards are the only place cola collects free text: `input` is the only
@@ -59,8 +64,9 @@ the card's bottom:
 - **List cards** (`/switch`, `/dir`, `/sub`, the `/skill` picker): the search
   form renders **after** the rows and the pager. `/switch` keeps only its
   ＋新建会话 footer below.
-- **Snapshot card**: a receipt log longer than two receipts folds into one
-  collapsed panel (✅ 处理回执（N 条）); the 最近对话 tail is already folded.
+- **Session Card** (ADR-0100): it carries no typed input, so the rule reaches it
+  only through its folded 最近对话 tail; the snapshot's receipt log and its
+  rebuild path no longer exist.
 
 ## Consequences
 
@@ -72,8 +78,8 @@ the card's bottom:
   and the rest as folded headers. Answering the open one opens the next, which
   is one tap per question but no longer a card taller than the phone. The reader
   may also pick the open question directly, which is the switch ADR-0094 adds.
-- A snapshot card's receipt log is folded whenever it grows past two lines; the
-  count is in the panel header.
+- A Session Card's 最近对话 tail folds; there is no receipt log left on the card
+  to fold.
 - Nothing here is observable in `cargo test` beyond element order. The layout
   assertions pin the structure; whether the keyboard jump is gone is a
   device observation, recorded on the issue.

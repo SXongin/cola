@@ -1678,23 +1678,15 @@ pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
         .iter()
         .filter(|req| req.session_id() == data.session_id)
         .count();
-    build_session_card(data, on_card, false)
+    build_session_card(data, on_card)
 }
 
-/// The busy follow's render-owned post (ADR-0100): a live card whose blocks ARE
-/// the requests it names, so its status line and pointer carry the follow's
-/// promises instead of pointing at another card. `on_card` is the set the
-/// caller seeds on it — a request another card already hosts keeps its own
-/// surface and is not counted here — and the status line still comes from the
-/// read.
-pub(crate) fn build_follow_card(data: &SnapshotData, on_card: usize) -> serde_json::Value {
-    build_session_card(data, on_card, true)
-}
-
-/// The one budgeted builder both Session Card drivers share: `follows` selects
-/// the status line and pointer presentation ([`build_idle_card`] versus
-/// [`build_follow_card`]) over the same composition and eviction ladder.
-fn build_session_card(data: &SnapshotData, on_card: usize, follows: bool) -> serde_json::Value {
+/// The one budgeted builder for the static read: hint-free status line and the
+/// pointer that names where the blocks actually live ([`build_idle_card`]).
+/// The follow's own presentation is composed by the external renderer's static
+/// lead ([`crate::bridge::external::snapshot_follow_lead`]), not here — the
+/// follow card is never the pre-arm send (ADR-0100).
+fn build_session_card(data: &SnapshotData, on_card: usize) -> serde_json::Value {
     let build = |omitted: usize| {
         let mut md = CardMarkdown::new();
         let body = session_card_body(
@@ -1703,9 +1695,9 @@ fn build_session_card(data: &SnapshotData, on_card: usize, follows: bool) -> ser
             omitted,
             PendingFacts {
                 on_card,
-                blocks_here: follows,
+                blocks_here: false,
             },
-            follows,
+            false,
         );
         let mut elements = body.lead_elements();
         elements.extend(body.tail_elements(&mut md));
@@ -1836,11 +1828,10 @@ impl SessionCardBody<'_> {
             }));
         }
         for (i, entry) in self.tail.iter().enumerate() {
-            // A one-shot card is sent once but rebuilt in place by the claim
-            // flow, so its panels take stable ids too (the tail's order is
-            // fixed, so the entry index is stable). The index is the entry's
-            // position in the FULL tail, so an evicted prefix cannot renumber
-            // the panels that remain.
+            // The static read is sent once; the tail's order is fixed, so the
+            // entry index is a stable element id (and a stable test target).
+            // The index is the entry's position in the FULL tail, so an
+            // evicted prefix cannot renumber the panels that remain.
             let element_id = format!("snap_{}", self.omitted_tail + i);
             let message = match entry {
                 TailEntry::Compaction(marker) => {

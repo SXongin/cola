@@ -2562,6 +2562,75 @@ impl Turn {
         .await
     }
 
+    /// [`Self::take_over_card`] for an arm that inserted `card_message_id`
+    /// itself (the `/card` follow, ADR-0100): the attach and the Chain Record
+    /// write happen only while the cards map still holds THAT card — `chain_id`
+    /// is the identity [`state::CardSession::new`] minted for it. A Turn that
+    /// replaced the entry gets neither its card id overwritten nor its record
+    /// replaced by a read that is no longer the Session's card; the map guard is
+    /// held across the (synchronous) record write, so the check cannot go stale
+    /// between it and the write. Returns whether the takeover happened.
+    pub(crate) async fn take_over_card_if_current(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_message_id: &str,
+        chain_id: u64,
+        directory: Option<&str>,
+    ) -> bool {
+        let mut live = cards.cards.lock().await;
+        let (message_id, created_ms, context_directory, reply_to) = {
+            let Some(card) = live.get_mut(session_id) else {
+                return false;
+            };
+            if card.chain_id() != chain_id {
+                return false;
+            }
+            card.card_message_id = Some(card_message_id.to_string());
+            (
+                card.acc
+                    .cola_message_id()
+                    .map(MessageId::new)
+                    .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
+                card.acc.turn_anchor().map(|anchor| anchor.created_ms),
+                card.acc.directory().map(str::to_string),
+                card.acc.reply_to_message_id().map(str::to_string),
+            )
+        };
+        // A card with no Turn message to scope a settle decision with cannot be
+        // reaped: no record, no reap attempt after a restart.
+        let Some(message_id) = message_id else {
+            return false;
+        };
+        let directory = directory
+            .map(str::to_string)
+            .filter(|directory| !directory.is_empty())
+            .or(context_directory);
+        // The record write stays under the SAME cards-map guard: a Turn cannot
+        // replace the entry between the identity check and the record naming
+        // it. `track_takeover` is synchronous and only touches the chain store.
+        let previous = cards.chains.track_takeover(
+            session_id,
+            card_message_id,
+            message_id,
+            created_ms,
+            directory.as_deref(),
+            reply_to.as_deref(),
+        );
+        // A re-point within the chain carries the Rendered Cursor (spec #561).
+        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone())
+            && let Some(card) = live.get_mut(session_id)
+        {
+            card.acc.seed_cursor_if_empty(cursor);
+        }
+        drop(live);
+        if let Some(previous) = previous
+            && previous.card_message_id != card_message_id
+        {
+            crate::bridge::chain::collect_orphan(cards, session_id, &previous.card_message_id).await;
+        }
+        true
+    }
+
     /// [`Self::take_over_card`] with the predecessor's collect **deferred** to
     /// the caller (spec #561, ticket #565): the fresh Turn takes the chain over
     /// first, then resolves the takeover seed, and only the seed's result can
