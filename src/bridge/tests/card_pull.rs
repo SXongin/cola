@@ -887,11 +887,11 @@ async fn a_sweep_started_before_the_follow_commit_does_not_duplicate_the_pending
 }
 
 /// A command cancelled AFTER its send has returned and INSIDE the commit
-/// publishes no card: the send landed as a static read, but the map insert and
-/// the Chain Record never happen. The commit is parked on the cards map so the
-/// abort lands in that exact window.
+/// publishes no map entry and no second card: the send landed as a static
+/// read, but the map insert and the Chain Record never happen. The commit is
+/// parked on the cards map so the abort lands in that exact window.
 #[tokio::test]
-async fn a_card_read_cancelled_inside_the_commit_publishes_no_card() {
+async fn a_card_read_cancelled_inside_the_commit_publishes_no_map_entry_or_second_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -994,11 +994,11 @@ async fn a_hanging_card_read_posts_a_best_effort_static_read() {
     );
 }
 
-/// The render loop is spawned BEFORE the previous card's stamp, so aborting the
-/// command inside that best-effort GET/PATCH still leaves the armed card with a
-/// renderer: the next content lands on it.
+/// The previous card's stamp runs BEFORE the arm, so aborting the command
+/// inside that bounded GET/PATCH leaves no armed card: the map stays the old
+/// idle read and no rendererless live card is created.
 #[tokio::test]
-async fn an_abort_during_the_old_card_stamp_still_leaves_the_follow_rendering() {
+async fn an_abort_during_the_old_card_stamp_never_arms_a_rendererless_follow() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1035,7 +1035,7 @@ async fn an_abort_during_the_old_card_stamp_still_leaves_the_follow_rendering() 
         .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy))
         .await;
 
-    // The follow arms and spawns, then parks in the previous card's stamp.
+    // The command parks in the previous card's stamp, before the arm.
     let (entered, release) = platform.pause("update", "om_idle");
     let app2 = app.clone();
     let second = tokio::spawn(async move {
@@ -1054,13 +1054,20 @@ async fn an_abort_during_the_old_card_stamp_still_leaves_the_follow_rendering() 
     let _ = second.await;
     release.notify_one();
 
-    wait_for_card_update(
-        &platform,
-        "the armed follow renders despite the aborted stamp",
-        CardUpdates::Any,
-        |card| card_text(card).contains(FOLLOW_HINT),
-    )
-    .await;
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_idle"),
+        "the aborted command never switched the map to the follow card"
+    );
+    assert!(
+        !Turn::is_running(&cards, "ses_test").await,
+        "no rendererless live card may be left behind"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "the aborted follow wrote no Chain Record"
+    );
 }
 
 /// A Turn install that is admitted before `/card` arms its follow now waits on
@@ -1610,6 +1617,96 @@ async fn a_second_card_marks_the_previous_read_taken_over() {
         app.cards_handle().chains.get("ses_test").is_none(),
         "the supersede writes no Chain Record either"
     );
+}
+
+/// A card view carrying a recovery control, as Feishu would return it.
+fn recovery_card_view(title: &str, label: &str, action: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": title },
+            "template": "red"
+        },
+        "body": {
+            "elements": [
+                { "tag": "markdown", "content": "失败内容" },
+                {
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": label },
+                    "type": "primary",
+                    "value": { "action": action, "session_id": "ses_test" }
+                }
+            ]
+        }
+    })
+}
+
+/// `/card` must stamp away a terminal card that still owns a recovery action:
+/// the old Error/Unreceived card would otherwise keep a Retry/重新发起 button
+/// whose click resolves against the new idle card and silently does nothing.
+#[tokio::test]
+async fn a_card_read_supersedes_an_actionable_terminal_card() {
+    let _wd = test_work_dir();
+    for (state, title, label, action) in [
+        (CardState::Error, "❌ 出错", "🔄 重试", "retry"),
+        (CardState::Unreceived, "⚠️ 这条消息未被接收", "重新发起", "resume"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, idle_read_backend()).await;
+        seed_session(&app, "ses_test", "/work").await;
+        seed_live_card(&app, "ses_test", "失败内容").await;
+        let cards = app.cards_handle();
+        Turn::set_card_state(&cards, "ses_test", state.clone()).await;
+        platform.given_card_view("om_live", recovery_card_view(title, label, action));
+
+        app.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+            Some("msg_reply"),
+            "the read is the Session's current card"
+        );
+        let calls = platform.calls.lock().await.clone();
+        let stamped = calls
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_live" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+            .expect("the actionable terminal card is stamped");
+        assert!(
+            card_header(&stamped).contains("已由新卡片接管"),
+            "the old card says it was superseded: {}",
+            card_header(&stamped)
+        );
+        let json = stamped.to_string();
+        assert!(
+            !json.contains("\"tag\":\"button\""),
+            "the dead recovery control is stripped: {json}"
+        );
+        assert!(!json.contains(label), "the label is gone: {json}");
+        assert!(
+            !json.contains(&format!("\"action\":\"{action}\"")),
+            "the callback value is gone: {json}"
+        );
+        assert!(
+            Turn::claim_recovery(&cards, "ses_test", state).await.is_none(),
+            "a click on the superseded card claims nothing (the button is gone)"
+        );
+    }
 }
 
 /// A Turn that ran between two `/card` commands has already superseded the

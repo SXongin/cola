@@ -162,6 +162,67 @@ async fn a_standalone_click_ignores_a_finished_card_in_the_map() {
     );
 }
 
+/// The idle Session Card is equally not an inline host (ADR-0100): a standalone
+/// click must still return its own replacement result card, never the empty ack
+/// the inline path would imply.
+#[tokio::test]
+async fn a_standalone_click_ignores_an_idle_card_in_the_map() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+
+    // No live card: the request is surfaced on its own card.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(platform.sent_cards().await.len(), 1, "one standalone card");
+    let standalone = app
+        .permission
+        .sent_cards
+        .lock()
+        .await
+        .get("per_1")
+        .expect("the standalone card is recorded")
+        .message_id
+        .clone();
+
+    // The idle read is terminal and carries no live block; a click must not be
+    // routed down its (non-existent) inline path.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_1", Some("om_idle")).await;
+    Turn::set_reply_target(&cards, "ses_1", "msg_1").await;
+    Turn::set_card_state(&cards, "ses_1", crate::feishu::card::CardState::Idle).await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": standalone,
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+    let ack = card_text(
+        result
+            .card
+            .as_ref()
+            .expect("a standalone click returns its replacement result card"),
+    );
+    assert!(ack.contains("✅ 已允许一次"), "receipt missing: {ack}");
+    assert!(
+        !ack.contains("🔐 **权限请求**"),
+        "the result card carries no live block: {ack}"
+    );
+}
+
 /// Resolving an INLINE permission updates the clicked card ATOMICALLY in the
 /// callback ack (ADR-0038, rule 3): the block becomes an Interaction Receipt
 /// on the returned card, so there is no toast-then-PATCH lag and no

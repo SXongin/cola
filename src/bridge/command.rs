@@ -1057,9 +1057,12 @@ pub(crate) fn is_reset_flag(name: &str) -> bool {
 /// the current-card update** then share the Session's card-write lock, so two
 /// near-simultaneous `/card`s serialize and the later one stamps the card the
 /// earlier one posted. The stamp applies only while the map still holds that
-/// previous **idle** card: a Turn that ran in between has already superseded it
-/// (the map holds the Turn's card), so the older read is left untouched. The
-/// idle card joins no Chain Record, so nothing here records one.
+/// previous card and it is either an **idle read** or an **actionable terminal**
+/// (`Error`/`Unreceived`, whose now-dead Retry/重新发起 control must be
+/// stripped): a Turn that ran in between has already superseded it (the map
+/// holds the Turn's card), and a `Done`/`Stopped` card carries no control, so
+/// both are left untouched. The idle card joins no Chain Record, so nothing
+/// here records one.
 ///
 /// A **Turn** installs its accumulator under this same lock now, so it cannot
 /// replace the card during the send. The map write is still a
@@ -1155,7 +1158,7 @@ async fn post_idle_card(
         .await;
         return Ok(());
     }
-    let previous = crate::bridge::turn::Turn::idle_card_to_supersede(cards, session_id).await;
+    let previous = crate::bridge::turn::Turn::card_to_supersede(cards, session_id).await;
     // The pointer, the send, the arm and the seed are one critical section:
     // the seed is filtered HERE (so no sweep can surface one between the
     // decision and the attach), and the card's count names exactly that set.
@@ -1176,6 +1179,14 @@ async fn post_idle_card(
     }
     let sent = handles.flow.platform.reply_card(message_id, &card).await?;
     if let Some(plan) = &mut follow {
+        // The old card is neutralised BEFORE the arm switches the map: an
+        // actionable terminal would otherwise keep a Retry/重新发起 button whose
+        // click resolves against the follow card (or a later idle card) and
+        // silently does nothing. The stamp is under the lock for exactly that
+        // ordering; it is a bounded GET + PATCH on another message.
+        if let Some(previous) = &previous {
+            crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+        }
         // The send awaited; a Turn may have installed itself meanwhile. The
         // arm's own compare-and-swap refuses a running card, so the read is not
         // recorded and the just-sent message is stamped taken over.
@@ -1201,16 +1212,13 @@ async fn post_idle_card(
         }
         drop(guard);
         if armed {
-            // Start the renderer BEFORE the previous card's stamp: the stamp is
-            // a best-effort GET + PATCH on another message, and an abort (or a
-            // stalled read) must never leave a live card with nothing flushing
-            // it. The arm and seed are already committed under the lock.
+            // Start the renderer as soon as the lock is released: an abort (or
+            // a stalled read) must never leave a live card with nothing
+            // flushing it. The arm and seed are already committed under the
+            // lock.
             handles
                 .external
                 .spawn_snapshot_follow(&handles.flow, session_id, plan);
-            if let Some(previous) = previous {
-                crate::bridge::chain::stamp_taken_over(cards, &previous, None).await;
-            }
             tracing::info!("card read: session {session_id} follows the running turn on the posted card");
         } else {
             crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
@@ -1220,6 +1228,12 @@ async fn post_idle_card(
         }
         return Ok(());
     }
+    // Neutralise the old card BEFORE the map switch, for the same reason as the
+    // follow branch: an actionable terminal's Retry/重新发起 must not survive
+    // the insert that makes its click resolve against the read.
+    if let Some(previous) = &previous {
+        crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+    }
     // The send awaited; a Turn may have installed itself meanwhile. The CAS in
     // `record_idle_card` refuses a running card, and the read then stays a
     // plain message marked superseded — never the Session's card, never a host
@@ -1227,9 +1241,6 @@ async fn post_idle_card(
     let recorded = crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await;
     drop(guard);
     if recorded {
-        if let Some(previous) = previous {
-            crate::bridge::chain::stamp_taken_over(cards, &previous, None).await;
-        }
         tracing::info!("card read: session {session_id} idle Session Card posted");
     } else {
         crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
