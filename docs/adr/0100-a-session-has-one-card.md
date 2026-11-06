@@ -64,7 +64,9 @@ block: a Permission/Question always lives on a live card (inline on the Turn it
 blocks) or on its own standalone card (ADR-0074). "Idle" and "interactive" are
 mutually exclusive — an unanswered request *is* a session state — so a card that
 renders one is not an idle card. This is what dissolves #945: there is no live
-block on this card to rebuild, claim, or protect from a repaint.
+block on this card to rebuild, claim, or protect from a repaint. Its header is a
+static 「📄 会话」 (grey, no phase timer), because it is a read with no run to
+describe; #1003 renders its body under that header.
 
 **Taking a session over no longer posts a card.** A first adoption confirms in
 one text line carrying the same status summary, and that line is the Topic
@@ -136,10 +138,11 @@ two are separate compositions that can drift.
   `!is_terminal()`, so `Waiting` still counts (it is the chain's newest card) and
   `Restarted` still counts (deliberately not terminal). One wake-specific
   exception: a Wake continues the Session's **Card Chain**, so a terminal chain
-  card still supplies its chain's reply target (`wake_reply_target` asks
-  `Turn::is_chain_card`); only an **Idle Session Card**, which joins no chain, is
-  refused. Without this, an idle card
-  in the map would take a stale permission click down the inline path — the ack
+  card still supplies that chain's reply target (`wake_reply_target` asks
+  `Turn::is_chain_card`); refusing it would drop a late Wake after a Done card
+  (pinned by `a_wake_after_a_done_card_continues_on_a_new_card`), and only an
+  **Idle Session Card**, which joins no chain, is refused. Without this, an idle
+  card in the map would take a stale permission click down the inline path — the ack
   returns no replacement card and the idle card never repaints the block, the
   empty-ack class of pitfall `codex-request-ids`.
 - An adopted session's pending requests surface through the ordinary sweep
