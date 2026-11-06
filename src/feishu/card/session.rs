@@ -3,8 +3,9 @@ use serde_json::json;
 use crate::backend::{MessageRole, TailEntry, TailMessage};
 use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
 
+use super::CardState;
 use super::sanitize::CardMarkdown;
-use super::shell::card_shell;
+use super::shell::{CardBuilder, card_shell};
 
 /// The `/switch` card's list scope (ADR-0022). `Directory` filters the list to
 /// the active session's directory (the card's default view); `All` shows the
@@ -1549,6 +1550,79 @@ pub(crate) fn session_card_body<'a>(
         tail,
         omitted_tail,
     }
+}
+
+/// Build the Session Card's read-only mode (ADR-0100): the one-shot read of a
+/// Session no renderer owns, posted by `/card`. The header is the state's
+/// static 「📄 会话」 (grey, no phase timer) and the body is the ONE composition
+/// — the status line, the count-only pending pointer and the 最近对话 tail —
+/// with every tail **Compaction** marker at its server position. There is
+/// deliberately no operable element: no form, no button, no input and no
+/// recovery action, because an unanswered Permission/Question always lives on a
+/// live card or its own standalone card, never on a read.
+///
+/// One-shot cards have no splitter, so an oversized tail degrades by dropping
+/// its OLDEST entries into the body's visible omission notice, exactly as the
+/// one-shot budget always has (issue #726).
+pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
+    // The pointer counts the requests the READ waits on, not blocks this card
+    // carries: an idle card carries none, and its pointer is text pointing at
+    // their own cards (`PendingFacts::on_card`'s documented idle arm).
+    let on_card = data
+        .pending
+        .iter()
+        .filter(|req| req.session_id() == data.session_id)
+        .count();
+    let mut omitted = 0;
+    loop {
+        let mut md = CardMarkdown::new();
+        let body = session_card_body(data, &data.tail[omitted..], omitted, PendingFacts { on_card });
+        let mut elements = body.lead_elements();
+        elements.extend(body.tail_elements(&mut md));
+        let mut builder = CardBuilder::new().with_state(CardState::Idle);
+        for element in elements {
+            builder = builder.with_element(element);
+        }
+        let card = builder.build();
+        if fits_card(&card) || omitted == data.tail.len() {
+            return card;
+        }
+        omitted += 1;
+    }
+}
+
+/// Whether an assembled one-shot card fits the platform's one-card budgets: the
+/// serialized size AND the component ceiling. Both bind independently — a tail
+/// of many title-only Compaction rows is small in bytes but can cross
+/// [`crate::feishu::card::MAX_CARD_COMPONENTS`] (issue #726's review). Shared
+/// with the Session Snapshot's one-shot builder (retired by #1006), so the two
+/// cannot disagree on what one card can carry.
+pub(crate) fn fits_card(card: &serde_json::Value) -> bool {
+    card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS
+        && card_components(card) <= crate::feishu::card::MAX_CARD_COMPONENTS
+}
+
+/// The card's component count as Feishu charges it: every body element, and
+/// every element nested inside a panel (a folded panel is a component AND its
+/// markdown chunks are components).
+pub(crate) fn card_components(card: &serde_json::Value) -> usize {
+    card["body"]["elements"]
+        .as_array()
+        .map(|elements| {
+            elements
+                .iter()
+                .map(|element| 1 + nested_components(element))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The components one element carries beyond itself.
+fn nested_components(element: &serde_json::Value) -> usize {
+    element["elements"]
+        .as_array()
+        .map(|children| children.iter().map(|child| 1 + nested_components(child)).sum())
+        .unwrap_or(0)
 }
 
 impl SessionCardBody<'_> {
@@ -3380,5 +3454,93 @@ mod tests {
                 .unwrap()
                 .contains("…更早的 2 条记录已省略")
         );
+    }
+
+    /// The idle Session Card (ADR-0100) is the ONE read composition under the
+    /// static 「📄 会话」 header: the status line, the count-only pending pointer
+    /// and the 最近对话 tail — with a Compaction marker at its server position.
+    /// It carries no operable element at all: no form, button, input, selector,
+    /// checker, action container or overflow control. The request it points at
+    /// is never hosted here.
+    #[test]
+    fn the_idle_card_is_read_only_and_names_the_read() {
+        let mut read = body_read(
+            Some(crate::backend::types::SessionStatus::Busy),
+            false,
+            vec![
+                body_message(MessageRole::User, 1_000, "继续改登录"),
+                body_marker(1_500, "旧上下文已压缩"),
+                body_message(MessageRole::Assistant, 2_000, "好的，已改完"),
+            ],
+        );
+        read.pending = vec![body_permission("per_idle", "ses_body")];
+
+        let card = build_idle_card(&read);
+
+        assert_eq!(card["header"]["title"]["content"], "📄 会话");
+        assert_eq!(card["header"]["template"], "grey");
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(
+            text.contains(WAITING_CHIP),
+            "the operator's request leads: {text}"
+        );
+        assert!(
+            text.contains("有 1 个请求等待你处理"),
+            "the pointer counts: {text}"
+        );
+        assert!(text.contains("**最近对话**"), "the tail renders: {text}");
+        assert!(
+            text.contains("继续改登录") && text.contains("好的，已改完"),
+            "{text}"
+        );
+        assert!(
+            text.contains("旧上下文已压缩"),
+            "the marker keeps its position: {text}"
+        );
+
+        let mut tags = Vec::new();
+        collect_tags(&card, &mut tags);
+        for tag in [
+            "form",
+            "button",
+            "input",
+            "select_static",
+            "multi_select_static",
+            "select_person",
+            "multi_select_person",
+            "checker",
+            "overflow",
+            "action",
+            "actions",
+        ] {
+            assert!(
+                !tags.iter().any(|found| found == tag),
+                "the idle card must render no {tag}: {card}"
+            );
+        }
+        assert!(
+            !text.contains("允许一次") && !text.contains("🔐 **权限请求**"),
+            "the pending request stays on its own card: {text}"
+        );
+    }
+
+    /// Every `tag` value anywhere on a card, nested elements included.
+    fn collect_tags(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(tag) = map.get("tag").and_then(|tag| tag.as_str()) {
+                    out.push(tag.to_string());
+                }
+                for value in map.values() {
+                    collect_tags(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for value in items {
+                    collect_tags(value, out);
+                }
+            }
+            _ => {}
+        }
     }
 }

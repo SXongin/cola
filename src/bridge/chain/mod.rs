@@ -13,7 +13,7 @@ mod records;
 pub(crate) use decision::{FreshDisposition, FreshReads, fresh};
 pub(crate) use reconcile::{
     AdoptedFollow, collect_orphan, collect_orphan_after_takeover, collect_orphan_after_takeover_detached,
-    reconcile,
+    reconcile, stamp_taken_over,
 };
 pub(crate) use records::{
     ChainRecord, ChainRecords, CursorFrontier, CursorPartKind, EndingFacts, EndingKey, PendingGap,

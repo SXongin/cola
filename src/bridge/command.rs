@@ -250,10 +250,11 @@ pub(crate) const TOPIC_NEST_REJECTION: &str =
 pub(crate) const TOPIC_ADOPT_NEST_REJECTION: &str =
     "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt <会话>。";
 
-/// `/card` with no live Card to pull down (ADR-0043, 2026-09-22 amendment):
-/// no Turn is rendering, so there is nothing to move — one text notice, no
-/// card.
-const NO_LIVE_CARD: &str = "当前没有正在运行的实时卡片。";
+/// `/card` with no Session mapped to this conversation: there is nothing to
+/// read, so one text line says so. The 「当前没有正在运行的实时卡片」 notice is
+/// retired (ADR-0100) — an existing Session always answers with a card, either
+/// the render-owned one pulled down or a one-shot read.
+const NO_SESSION_TO_READ: &str = "当前没有可读取的会话。";
 
 /// `/stop` with no live card to finalize (an idle session, or a card already
 /// at a terminal): nothing will render the stop, so the command itself says
@@ -813,7 +814,7 @@ pub fn help_text() -> String {
 `/name <name>` · Rename current session server-side (on a pending, set the creation title)
 `/stop` · Interrupt execution
 `/compact` · Compact context
-`/card` · Pull the live card back to the newest position (after command replies bury it)
+`/card` · Pull the live card back to the newest position, or read the Session when no Turn is rendering
 `/agent <name>` · Switch agent (takes effect next message)
 `/model <p/m>` · Switch model (takes effect next message)
 `/think [等级]` · Set/clear thinking level (per model; takes effect next message)
@@ -878,7 +879,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/compact\nCompact the current session's context: summarize older messages to free context window."
         }
         "card" => {
-            "/card\nPull the live card back to the newest position: split the Card Chain at this command, so a continuation card becomes the newest message and keeps receiving updates (ADR-0043). Use it after running commands mid-turn — their replies deliberately stay the newest messages, which buries the live card above them. Nothing happens without a running Turn: cola replies a notice. The previous card is finalized with the 部分完成，继续中 header and keeps everything streamed before the pull; the continuation carries the status line and only the content that arrives after it."
+            "/card\nBring this Session's card to the newest position, or read the Session when no Turn is rendering (ADR-0100).\n- With a live Turn (or an external follow) owning the card, it splits the Card Chain at this command: the previous card is finalized with the 部分完成，继续中 header and keeps everything streamed before the pull, and a continuation card replied to this message becomes the newest live card. Use it after command replies, which deliberately stay the newest messages and bury the card above them.\n- With nothing rendering the Session, it reads the Session once and posts one read-only 会话 card: the status line (等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲), how many requests are waiting for you (their own cards hold the buttons), and the last four messages with any Compaction marker. The read carries no button, no form and no Turn Footer; a later `/card` supersedes it (the previous card is marked 已由新卡片接管 · 已停止更新), while a Turn that ran in between leaves it alone.\nThe command always answers — the old 「当前没有正在运行的实时卡片」 notice is retired — except in a conversation with no Session at all."
         }
         "agent" => {
             "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint). Without an override the server's default agent applies; the card (`/agent` alone) shows the current one. `--reset` clears the override back to the server default. Persisted across restarts. On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the override is recorded on the pending and applies to the session the first message creates. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
@@ -1047,6 +1048,57 @@ impl<'a> crate::update::UpdateReporter for FeishuUpdateReporter<'a> {
 /// Defined once so the text handlers and their tests can't drift apart.
 pub(crate) fn is_reset_flag(name: &str) -> bool {
     name == "--reset"
+}
+
+/// `/card`'s second state (ADR-0100): with no renderer owning the Session, read
+/// it once and post exactly ONE read-only Session Card.
+///
+/// The read and the build happen off the card map; the **check, the send and
+/// the current-card update** then share the Session's card-write lock, so two
+/// near-simultaneous `/card`s serialize and the later one stamps the card the
+/// earlier one posted. The stamp applies only while the map still holds that
+/// previous **idle** card: a Turn that ran in between has already superseded it
+/// (the map holds the Turn's card), so the older read is left untouched. The
+/// idle card joins no Chain Record, so nothing here records one.
+async fn post_idle_card(
+    handles: &CommandHandles,
+    session_id: &str,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let directory = handles
+        .flow
+        .sessions
+        .directory_for_session(session_id)
+        .await
+        .unwrap_or_default();
+    let data = crate::bridge::snapshot::gather_snapshot(&handles.flow.backend, session_id, &directory).await;
+    let card = crate::feishu::card::session::build_idle_card(&data);
+
+    let cards = &handles.flow.cards;
+    let write_lock = cards.write_lock(session_id).await;
+    let guard = write_lock.lock().await;
+    // A renderer may have taken the Session over between the pull check and
+    // this critical section: the render-owned meaning wins, and the split is
+    // entered after the guard is released (it takes the same lock).
+    if crate::bridge::turn::Turn::is_running(cards, session_id).await {
+        drop(guard);
+        crate::bridge::turn::Turn::split_card_chain(
+            cards,
+            session_id,
+            message_id,
+            crate::bridge::turn::SplitKind::Pull,
+        )
+        .await;
+        return Ok(());
+    }
+    let previous = crate::bridge::turn::Turn::idle_card_to_supersede(cards, session_id).await;
+    let sent = handles.flow.platform.reply_card(message_id, &card).await?;
+    if let Some(previous) = previous {
+        crate::bridge::chain::stamp_taken_over(cards, &previous).await;
+    }
+    crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await;
+    tracing::info!("card read: session {session_id} idle Session Card posted");
+    Ok(())
 }
 
 /// Execute a parsed slash command against the shared handles. Unrecognized
@@ -1622,22 +1674,26 @@ pub(crate) async fn handle_command(
             // replies bury the live card above them, and this command moves
             // the chain's live continuation back to the newest message.
             let Some(session_id) = handles.flow.sessions.get_session_id(&thread_key).await else {
-                handles.flow.platform.reply_text(message_id, NO_LIVE_CARD).await?;
+                handles
+                    .flow
+                    .platform
+                    .reply_text(message_id, NO_SESSION_TO_READ)
+                    .await?;
                 return Ok(());
             };
             let running = crate::bridge::turn::Turn::is_running(&handles.flow.cards, &session_id).await;
-            if !running {
-                handles.flow.platform.reply_text(message_id, NO_LIVE_CARD).await?;
+            if running {
+                tracing::info!("card pull: session {session_id} live card split requested");
+                crate::bridge::turn::Turn::split_card_chain(
+                    &handles.flow.cards,
+                    &session_id,
+                    message_id,
+                    crate::bridge::turn::SplitKind::Pull,
+                )
+                .await;
                 return Ok(());
             }
-            tracing::info!("card pull: session {session_id} live card split requested");
-            crate::bridge::turn::Turn::split_card_chain(
-                &handles.flow.cards,
-                &session_id,
-                message_id,
-                crate::bridge::turn::SplitKind::Pull,
-            )
-            .await;
+            post_idle_card(handles, &session_id, message_id).await?;
         }
         Command::AgentCard => {
             crate::feishu::card::command::send_agent_card(handles, &thread_key, message_id).await?;
@@ -3738,6 +3794,26 @@ mod tests {
         assert!(
             run.contains("Windows"),
             "the Windows refusal is documented: {run}"
+        );
+    }
+
+    /// `/card`'s help describes BOTH states (ADR-0100): the pull, and the
+    /// one-shot read it falls back to — never the retired 「当前没有正在运行的实时
+    /// 卡片」 notice. The index line names the read too.
+    #[test]
+    fn help_documents_the_card_reads_second_state() {
+        let index = help_text();
+        assert!(
+            index.contains("read the Session when no Turn is rendering"),
+            "the index names the second state: {index}"
+        );
+        let card = command_help("card").expect("card has a help topic");
+        assert!(card.contains("部分完成"), "the pull is documented: {card}");
+        assert!(card.contains("read-only 会话 card"), "{card}");
+        assert!(card.contains("no button, no form"), "{card}");
+        assert!(
+            card.contains("已由新卡片接管"),
+            "the supersede is documented: {card}"
         );
     }
 

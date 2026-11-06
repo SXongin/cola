@@ -1,6 +1,8 @@
 use crate::backend::TailEntry;
 use crate::bridge::snapshot::{PendingOverflow, SnapshotData};
-use crate::feishu::card::session::{BackToList, PendingFacts, back_to_list_button, session_card_body};
+use crate::feishu::card::session::{
+    BackToList, PendingFacts, back_to_list_button, fits_card, session_card_body,
+};
 use serde_json::json;
 
 /// The live answer state of one claimed question block on the snapshot
@@ -301,38 +303,6 @@ fn largest_fitting(ceiling: usize, mut build: impl FnMut(usize) -> serde_json::V
     lo
 }
 
-/// Whether an assembled card fits the one-shot budgets Feishu accepts: the
-/// serialized size AND the component ceiling. Both bind independently — a tail
-/// of many title-only compaction rows is small in bytes but crosses
-/// [`crate::feishu::card::MAX_CARD_COMPONENTS`] (issue #726's review).
-fn fits_card(card: &serde_json::Value) -> bool {
-    card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS
-        && card_components(card) <= crate::feishu::card::MAX_CARD_COMPONENTS
-}
-
-/// The card's component count as Feishu charges it: every body element, and
-/// every element nested inside a panel (a folded panel is a component AND its
-/// markdown chunks are components).
-fn card_components(card: &serde_json::Value) -> usize {
-    card["body"]["elements"]
-        .as_array()
-        .map(|elements| {
-            elements
-                .iter()
-                .map(|element| 1 + nested_components(element))
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-/// The components one element carries beyond itself.
-fn nested_components(element: &serde_json::Value) -> usize {
-    element["elements"]
-        .as_array()
-        .map(|children| children.iter().map(|child| 1 + nested_components(child)).sum())
-        .unwrap_or(0)
-}
-
 /// The smallest prefix omission in `0..=len` whose card fits, given that the
 /// fully-evicted build (`len`) is already known to fit.
 ///
@@ -519,6 +489,7 @@ mod tests {
     use crate::backend::{MessageRole, TailMarker, TailMessage};
     use crate::bridge::request::kind::PendingRequest;
     use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
+    use crate::feishu::card::session::card_components;
     use crate::feishu::card::session::{
         BUSY_CHIP, FOLLOW_HINT, IDLE_CHIP, RETRY_CHIP, WAITING_BACKGROUND_CHIP, WAITING_CHIP,
         WAITING_ELSEWHERE_CHIP, WAITING_ELSEWHERE_PINNED_CHIP, status_chip,

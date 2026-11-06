@@ -111,7 +111,8 @@ pub(crate) enum ChainDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CardProbe {
     /// No card in this process owns the session: the restart orphan (or a
-    /// chain that vanished).
+    /// chain that vanished), or a map entry that is a one-shot idle Session
+    /// Card — a read, which owns no chain (ADR-0100).
     None,
     /// The record's own card is this process's card — its own lifecycle owns
     /// it.

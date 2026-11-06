@@ -802,7 +802,7 @@ detailed help for any of these.
 | `/name <name>` | Rename current session (server-side, visible to all clients; on a pending, set the creation title) |
 | `/stop` | Interrupt execution |
 | `/compact` | Compact context |
-| `/card` | Pull the live card down to the newest position after mid-turn command replies bury it (replies a notice when no turn is running) |
+| `/card` | Pull the live card down to the newest position after mid-turn command replies bury it; with nothing rendering the Session, read it once and post a read-only Session card (status, how many requests wait for you, the last four messages) |
 | `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
 | `/model <p/m>` | Switch model (OpenCode: takes effect next message, persisted; Codex: records a one-shot pick for a live thread's next new message, dropped on restart; a Pending Session keeps its creation pick) |
 | `/think [level]` | Set/clear thinking level, per model (OpenCode: next message, persisted; Codex: one-shot for a live thread's next new message, dropped on restart; a Pending Session keeps its creation level) |

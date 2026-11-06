@@ -142,6 +142,11 @@ pub(crate) struct CardOwnership {
     claim: Claim,
     card_class: CardClass,
     card_message_id: Option<String>,
+    /// Whether the map's card is a **Card Chain's** card rather than an idle
+    /// Session Card (ADR-0100) — the same question [`Turn::is_chain_card`]
+    /// answers, read in this verdict's own locked pass so a reap cannot see the
+    /// map change between the two reads.
+    chain_card: bool,
     turn_anchor: Option<TurnAnchor>,
     chain_id: Option<u64>,
 }
@@ -176,6 +181,7 @@ impl CardOwnership {
                 claim,
                 card_class: CardClass::Absent,
                 card_message_id: None,
+                chain_card: false,
                 turn_anchor: None,
                 chain_id: None,
             };
@@ -184,6 +190,7 @@ impl CardOwnership {
             claim,
             card_class: classify(card),
             card_message_id: card.card_message_id.clone(),
+            chain_card: card.is_chain_card(),
             turn_anchor: card.acc.turn_anchor().cloned(),
             chain_id: Some(card.chain_id()),
         }
@@ -205,6 +212,14 @@ impl CardOwnership {
     /// same card-map pass the claim classified.
     pub(crate) fn card_message_id(&self) -> Option<&str> {
         self.card_message_id.as_deref()
+    }
+
+    /// Whether the map's card joins the Session's **Card Chain** (ADR-0100): any
+    /// state except `Idle`, false when there is no card. An idle Session Card is
+    /// a one-shot read, never a chain successor, so the reap must not use it to
+    /// re-point a record or collect the card the record still names.
+    pub(crate) fn is_chain_card(&self) -> bool {
+        self.chain_card
     }
 
     /// The card's chain identity, when a card exists — the identity the Wake
@@ -688,6 +703,13 @@ mod tests {
                 false,
                 StopDisposition::Nothing,
             ),
+            (
+                Some(CardState::Idle),
+                CardClass::Ended,
+                None,
+                false,
+                StopDisposition::Nothing,
+            ),
         ];
 
         for (state, expected_class, expected_routing, expected_admission, expected_stop) in rows {
@@ -700,6 +722,11 @@ mod tests {
                     ownership.claim(),
                     claim,
                     "claim must be carried untouched for {state:?}"
+                );
+                assert_eq!(
+                    ownership.is_chain_card(),
+                    !matches!(state, None | Some(CardState::Idle)),
+                    "only an idle read joins no chain: {state:?}"
                 );
                 assert_eq!(
                     ownership.card_class(),

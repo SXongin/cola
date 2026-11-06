@@ -989,6 +989,16 @@ impl CardSession {
         !self.is_terminal()
     }
 
+    /// Whether this card joins the Session's **Card Chain** rather than being an
+    /// idle Session Card (ADR-0100): any state except `Idle`. This is the
+    /// Wake-side question, not a liveness predicate: a Wake continues a chain,
+    /// so a terminal chain card still names the message its chain answers; an
+    /// idle Session Card joins no chain and is never a Wake target. Live-card
+    /// readers ask [`Self::is_running`] instead.
+    pub(super) fn is_chain_card(&self) -> bool {
+        self.acc.card_state != crate::feishu::card::CardState::Idle
+    }
+
     /// Whether this card has reached a terminal ending — the card-state rule
     /// the Chain Record's release check reads off the locked card
     /// ([`crate::bridge::chain::release_spent`]).
@@ -2235,6 +2245,13 @@ impl StreamAccumulator {
     #[cfg(test)]
     pub(super) fn set_card_state(&mut self, state: CardState) {
         self.card_state = state;
+    }
+
+    /// Adopt the read-only Session Card state (ADR-0100): the accumulator backs
+    /// a one-shot read posted by `/card`, sent once and never flushed. Terminal,
+    /// so no renderer owns it, and neutral: no phase timer and no Turn Footer.
+    pub(super) fn mark_idle_read(&mut self) {
+        self.card_state = CardState::Idle;
     }
 
     /// Stamp the Turn's settled change-index counts: the one production writer,

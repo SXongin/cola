@@ -3697,7 +3697,7 @@ impl Turn {
             .lock()
             .await
             .get(session_id)
-            .is_some_and(|card| *card.acc.card_state() != crate::feishu::card::CardState::Idle)
+            .is_some_and(state::CardSession::is_chain_card)
     }
 
     /// The session's tracked card message id, if a card has been sent.
@@ -3708,6 +3708,46 @@ impl Turn {
             .await
             .get(session_id)
             .and_then(|c| c.card_message_id.clone())
+    }
+
+    /// The message id of the Session's CURRENT card when that card is the
+    /// previous one-shot read (ADR-0100) — the card a second `/card` stamps
+    /// `TakenOver`. `None` when the map holds no card, or a Turn's card: a Turn
+    /// that ran in between already superseded the older read, so it is left
+    /// alone rather than stamped for noise.
+    pub(crate) async fn idle_card_to_supersede(cards: &CardsHandle, session_id: &str) -> Option<String> {
+        let live = cards.cards.lock().await;
+        live.get(session_id)
+            .filter(|card| *card.acc.card_state() == crate::feishu::card::CardState::Idle)
+            .and_then(|card| card.card_message_id.clone())
+    }
+
+    /// Record a posted read-only Session Card as the Session's card (ADR-0100):
+    /// a real [`state::CardSession`] in `CardState::Idle`, carrying the message
+    /// id the send returned. It REPLACES whatever the map held — a previous
+    /// idle read or a terminal Turn card — so every live-card predicate refuses
+    /// it and the next `/card` can find the previous read to stamp.
+    ///
+    /// It deliberately writes **no Chain Record** and collects no predecessor:
+    /// the idle card joins no chain, so a restart's reap, a Wake and the
+    /// ownership verdict keep reading the record an earlier Turn wrote (an
+    /// existing record still names the chain's card) and never treat this read
+    /// as the chain.
+    pub(crate) async fn record_idle_card(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_message_id: &str,
+        reply_to: &str,
+    ) {
+        let mut acc = state::StreamAccumulator::new("");
+        acc.set_session(session_id);
+        acc.set_reply_target(Some(reply_to.to_string()));
+        acc.mark_idle_read();
+        let mut session = state::CardSession::new(acc, Some(card_message_id.to_string()));
+        // A read never grows in place: it is sent once and replaced by the next
+        // `/card`, never flushed.
+        session.card_is_live = false;
+        cards.cards.lock().await.insert(session_id.to_string(), session);
     }
 
     /// The message a card for this session replies to, when it has one: the
