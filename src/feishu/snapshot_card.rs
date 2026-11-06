@@ -396,7 +396,6 @@ impl SnapshotBuild<'_> {
             pass.omitted_tail,
             PendingFacts {
                 on_card: pendings.len(),
-                overflow: pending_overflow,
             },
         );
         let mut elements: Vec<serde_json::Value> = body.lead_elements();

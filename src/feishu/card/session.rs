@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use crate::backend::{MessageRole, TailEntry, TailMessage};
-use crate::bridge::snapshot::{ElsewherePending, PendingOverflow, SnapshotData};
+use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
 
 use super::sanitize::CardMarkdown;
 use super::shell::card_shell;
@@ -1467,29 +1467,26 @@ pub(crate) fn status_chip(
 }
 
 /// What a driver does with the pending requests a Session Snapshot read
-/// carries, as the body needs it (ADR-0100). Two facts, not one: the
-/// count-only pointer names what THIS card carries, while 等待你的确认 outranks
-/// every run state whenever any request waits at all — including the ones a
-/// one-shot card's block cap left to their own surface.
+/// carries, as the body needs it (ADR-0100). It carries ONE fact: the count of
+/// requests THIS card carries, which is all the count-only pointer names. The
+/// status line's 等待你的确认 is deliberately NOT derived from it — that asks the
+/// READ ([`read_has_pending`]), so a driver that leaves a request to its own
+/// card (the busy follow's `is_already_surfaced` filter, #1005) still reports
+/// the wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingFacts {
     /// The requests this card carries: their blocks (a snapshot or follow), or
     /// the count an idle read points at.
     pub(crate) on_card: usize,
-    /// The requests this card NAMES but does not carry — the one-shot card's
-    /// block cap or byte budget left them out. [`PendingOverflow::None`] on the
-    /// common path. Named for the read's own `pending_overflow` fact it mirrors.
-    pub(crate) overflow: PendingOverflow,
 }
 
-impl PendingFacts {
-    /// Whether the session waits on the operator at all — the status line's top
-    /// precedence. Deliberately not named `waiting`: that word is the read's
-    /// ADR-0059 background-wait fact ([`SnapshotData::waiting`]), a different
-    /// thing that reaches the same status line.
-    fn waits_on_operator(self) -> bool {
-        self.on_card > 0 || self.overflow.any()
-    }
+/// Whether the READ has a request waiting on the operator — the status line's
+/// top precedence, independent of what a driver carries (ADR-0100: the
+/// operator's request outranks the run state "including the ones a one-shot
+/// card's block cap left to their own surface"). Filtered to this session so a
+/// sibling's request can never make the card claim a wait it cannot show.
+fn read_has_pending(data: &SnapshotData) -> bool {
+    data.pending.iter().any(|req| req.session_id() == data.session_id) || data.pending_overflow.any()
 }
 
 /// The 最近对话 section's heading.
@@ -1497,6 +1494,18 @@ const TAIL_HEADING: &str = "**最近对话**";
 
 /// A tail message that carries nothing to show, in both presentations.
 const EMPTY_MESSAGE: &str = "（空消息）";
+
+/// One message's body as both presentations render it: a body with no
+/// non-whitespace content is the empty-message line, so the folded panel and the
+/// live lead cannot disagree on whether the entry is empty.
+fn tail_body(message: &TailMessage) -> String {
+    let body = message.body_text();
+    if body.trim().is_empty() {
+        EMPTY_MESSAGE.to_string()
+    } else {
+        body
+    }
+}
 
 /// The visible line naming the OLDEST tail entries a one-shot card's budget
 /// could not carry (issue #726). Shared by both presentations so the card and
@@ -1531,7 +1540,7 @@ pub(crate) fn session_card_body<'a>(
 ) -> SessionCardBody<'a> {
     SessionCardBody {
         status: status_chip(
-            pending.waits_on_operator(),
+            read_has_pending(data),
             data.pending_elsewhere,
             data.waiting,
             data.status,
@@ -1607,13 +1616,8 @@ impl SessionCardBody<'_> {
             } else {
                 format!("{role} {preview}…")
             };
-            let body = message.body_text();
+            let body = tail_body(message);
             let chunks = crate::feishu::card::chunk_text(&body, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
-            let chunks = if chunks.is_empty() {
-                vec![EMPTY_MESSAGE.to_string()]
-            } else {
-                chunks
-            };
             let chunks: Vec<String> = chunks.iter().map(|c| md.clean(c)).collect();
             panels.push(super::shell::collapsible_panel_chunks(
                 &title,
@@ -1657,13 +1661,7 @@ impl SessionCardBody<'_> {
         }
         for message in messages {
             let role = role_marker(&message.role);
-            let body = message.body_text();
-            let body = if body.trim().is_empty() {
-                EMPTY_MESSAGE.to_string()
-            } else {
-                body
-            };
-            text.push_str(&format!("\n{role} {body}"));
+            text.push_str(&format!("\n{role} {}", tail_body(message)));
         }
         text
     }
@@ -1696,6 +1694,7 @@ fn tail_preview(message: &TailMessage) -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::snapshot::PendingOverflow;
 
     /// ADR-0025: every Recent Directories row carries both gestures — the
     /// re-root pick and the 建话题 topic opener (each with the routing payload
@@ -3168,14 +3167,24 @@ mod tests {
         }
     }
 
-    /// The facts a driver that carries everything the read does reports
-    /// (`data.pending` plus its overflow fact) — the shape #1003's idle read
-    /// will use.
+    /// The facts a driver that carries everything the read does reports — the
+    /// shape #1003's idle read will use.
     fn facts(read: &SnapshotData) -> PendingFacts {
         PendingFacts {
             on_card: read.pending.len(),
-            overflow: read.pending_overflow,
         }
+    }
+
+    fn body_permission(request_id: &str, session_id: &str) -> crate::bridge::request::kind::PendingRequest {
+        crate::bridge::request::kind::PendingRequest::Permission(crate::backend::types::PermissionRequest {
+            request_id: request_id.into(),
+            session_id: Some(session_id.into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls".into()],
+            metadata: None,
+            always: vec![],
+            always_supported: true,
+        })
     }
 
     fn body_message(role: MessageRole, created_ms: i64, text: &str) -> TailEntry {
@@ -3207,7 +3216,7 @@ mod tests {
     /// puts the operator's request ahead of the server's run state.
     #[test]
     fn the_body_text_orders_the_status_line_the_pointer_and_the_tail() {
-        let read = body_read(
+        let mut read = body_read(
             Some(crate::backend::types::SessionStatus::Busy),
             false,
             vec![
@@ -3215,15 +3224,11 @@ mod tests {
                 body_message(MessageRole::Assistant, 2_000, "回答一"),
             ],
         );
-        let body = session_card_body(
-            &read,
-            &read.tail,
-            0,
-            PendingFacts {
-                on_card: 2,
-                overflow: PendingOverflow::None,
-            },
-        );
+        read.pending = vec![
+            body_permission("req_1", "ses_body"),
+            body_permission("req_2", "ses_body"),
+        ];
+        let body = session_card_body(&read, &read.tail, 0, PendingFacts { on_card: 2 });
         assert_eq!(
             body.lead_text(),
             "⏳ 等待你的确认\n有 2 个请求等待你处理\n\n**最近对话**\n👤 问题一\n🤖 回答一"
@@ -3328,22 +3333,27 @@ mod tests {
         assert!(body.tail_elements(&mut CardMarkdown::new()).is_empty());
     }
 
-    /// The pointer counts what THIS card carries, while the status line still
-    /// reports the wait when the card only NAMES requests (the one-shot card's
-    /// overflow): an overflow-only read shows 等待你的确认 with no pointer,
-    /// because there is no block on this card to count.
+    /// The status line asks the READ, not the seed set (ADR-0100): a read with
+    /// a request waiting on the operator keeps 等待你的确认 even when this card
+    /// carries none of them — the busy follow leaves an already-surfaced
+    /// request to its own card (#1005). The pointer counts zero, because there
+    /// is nothing here to go answer.
+    #[test]
+    fn a_waited_on_request_keeps_the_status_even_when_the_card_carries_none() {
+        let mut read = body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]);
+        read.pending = vec![body_permission("req_1", "ses_body")];
+        let body = session_card_body(&read, &read.tail, 0, PendingFacts { on_card: 0 });
+        assert_eq!(body.lead_text(), WAITING_CHIP);
+        assert_eq!(body.lead_elements().len(), 1, "the status line only, no pointer");
+    }
+
+    /// A read whose only waiting fact is its overflow still reports 等待你的确认,
+    /// while the pointer counts what the card carries (nothing).
     #[test]
     fn an_overflow_only_read_waits_without_a_pointer() {
-        let read = body_read(Some(crate::backend::types::SessionStatus::Idle), false, vec![]);
-        let body = session_card_body(
-            &read,
-            &read.tail,
-            0,
-            PendingFacts {
-                on_card: 0,
-                overflow: PendingOverflow::Counted(2),
-            },
-        );
+        let mut read = body_read(Some(crate::backend::types::SessionStatus::Idle), false, vec![]);
+        read.pending_overflow = PendingOverflow::Counted(2);
+        let body = session_card_body(&read, &read.tail, 0, PendingFacts { on_card: 0 });
         assert_eq!(body.lead_text(), WAITING_CHIP);
         assert_eq!(body.lead_elements().len(), 1, "the status line only");
     }
