@@ -1463,39 +1463,49 @@ pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
 /// operator's action beats the server's run state.
 pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
 
-/// The status line content for a session's state (ADR-0100 precedence
-/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲). `waiting` is the
-/// gather's ADR-0059 fact (server-idle with live Background Tasks, #586) — it
-/// names the wait even though the server reads idle. `follows` is the DRIVER
-/// fact: only a card that a renderer will keep updating may promise it (the
-/// busy/waiting follow), while a one-shot read must not — nothing would ever
-/// deliver on that promise. `None` when there is no status to report — the line
-/// is omitted rather than guessed.
+/// The status chip for a session's state (ADR-0100 precedence
+/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲), WITHOUT any update
+/// promise: a one-shot read and a text confirmation have no renderer to deliver
+/// one. `waiting` is the gather's ADR-0059 fact (server-idle with live
+/// Background Tasks, #586) — it names the wait even though the server reads
+/// idle. `None` when there is no status to report — the line is omitted rather
+/// than guessed.
 pub(crate) fn status_chip(
     has_pending: bool,
     waiting: bool,
     status: Option<crate::backend::types::SessionStatus>,
-    follows: bool,
 ) -> Option<String> {
     if has_pending {
         return Some(WAITING_CHIP.to_string());
     }
-    let hint = |chip: &str| {
-        if follows {
-            format!("{chip}\n{FOLLOW_HINT}")
-        } else {
-            chip.to_string()
-        }
-    };
     if waiting {
-        return Some(hint(WAITING_BACKGROUND_CHIP));
+        return Some(WAITING_BACKGROUND_CHIP.to_string());
     }
     match status {
-        Some(crate::backend::types::SessionStatus::Busy) => Some(hint(BUSY_CHIP)),
+        Some(crate::backend::types::SessionStatus::Busy) => Some(BUSY_CHIP.to_string()),
         Some(crate::backend::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
         Some(crate::backend::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
         None => None,
     }
+}
+
+/// The status line a FOLLOWED card renders: [`status_chip`] plus the
+/// [`FOLLOW_HINT`] promise on the arms a renderer is actually driving (busy or
+/// waiting on background tasks). Every other arm, and a pending request's own
+/// chip, carries no promise — nobody would deliver on it.
+pub(crate) fn followed_status_chip(
+    has_pending: bool,
+    waiting: bool,
+    status: Option<crate::backend::types::SessionStatus>,
+) -> Option<String> {
+    let chip = status_chip(has_pending, waiting, status)?;
+    let promises =
+        !has_pending && (waiting || matches!(status, Some(crate::backend::types::SessionStatus::Busy)));
+    Some(if promises {
+        format!("{chip}\n{FOLLOW_HINT}")
+    } else {
+        chip
+    })
 }
 
 /// What a driver does with the pending requests a Session Snapshot read
@@ -1569,8 +1579,8 @@ pub(crate) struct SessionCardBody<'a> {
 /// `omitted_tail` names the older entries it left out. `pending` says what the
 /// driver does with the read's requests; it is never inferred from `data`
 /// alone, because a one-shot card may carry fewer blocks than the read holds.
-/// `follows` is the driver fact [`status_chip`] needs: only a followed card
-/// promises more updates.
+/// `follows` selects the driver's status line: [`followed_status_chip`] promises
+/// more updates, [`status_chip`] does not.
 pub(crate) fn session_card_body<'a>(
     data: &SnapshotData,
     tail: &'a [TailEntry],
@@ -1578,8 +1588,14 @@ pub(crate) fn session_card_body<'a>(
     pending: PendingFacts,
     follows: bool,
 ) -> SessionCardBody<'a> {
+    let has_pending = read_has_pending(data);
+    let status = if follows {
+        followed_status_chip(has_pending, data.waiting, data.status)
+    } else {
+        status_chip(has_pending, data.waiting, data.status)
+    };
     SessionCardBody {
-        status: status_chip(read_has_pending(data), data.waiting, data.status, follows),
+        status,
         pending: (pending.on_card > 0).then(|| {
             if pending.blocks_here {
                 format!("有 {} 个请求等待你处理", pending.on_card)
@@ -1594,18 +1610,13 @@ pub(crate) fn session_card_body<'a>(
 
 /// The ONE-line status summary a text adoption confirms with (ADR-0100): the
 /// same [`status_chip`] precedence the Session Card's status line renders,
-/// compacted to a single line — the busy and waiting chips append
-/// [`FOLLOW_HINT`] on a second line, and a text confirmation keeps only the
-/// chip. Taking a Session over no longer posts a card, so this is how the
+/// hint-free because a text line has no renderer to deliver an update promise.
+/// Taking a Session over no longer posts a card, so this is how the
 /// confirmation still answers "is the last Turn done, is something blocking
 /// me". `None` when the read has no status to report, so a failed status read
 /// is omitted rather than guessed.
 pub(crate) fn status_line(data: &SnapshotData) -> Option<String> {
-    // A one-line confirmation makes no update promise either, but it keeps
-    // only the chip line (the hint is dropped below), so the driver fact is
-    // irrelevant here.
-    let status = status_chip(read_has_pending(data), data.waiting, data.status, true)?;
-    Some(status.lines().next().unwrap_or(status.as_str()).to_string())
+    status_chip(read_has_pending(data), data.waiting, data.status)
 }
 
 /// Build the Session Card's read-only mode (ADR-0100): the one-shot read of a
@@ -1630,22 +1641,23 @@ pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
         .iter()
         .filter(|req| req.session_id() == data.session_id)
         .count();
-    build_idle_card_with_pending(data, on_card, false)
+    build_session_card(data, on_card, false)
 }
 
-/// [`build_idle_card`] with the pending count decided by the caller: the busy
-/// follow's initial post (ADR-0100) names exactly the requests it seeds on the
-/// card, which may be fewer than the read's — a request another card already
-/// hosts keeps its own surface and is not counted here. The status line still
-/// comes from the read. `follows` says whether this post seeds the counted
-/// requests' blocks and keeps updating: the busy follow does, so its status and
-/// pointer are hint-free; a one-shot read does not, so its pointer names where
-/// the requests live (「见原卡片」) and its status line promises nothing.
-pub(crate) fn build_idle_card_with_pending(
-    data: &SnapshotData,
-    on_card: usize,
-    follows: bool,
-) -> serde_json::Value {
+/// The busy follow's render-owned post (ADR-0100): a live card whose blocks ARE
+/// the requests it names, so its status line and pointer carry the follow's
+/// promises instead of pointing at another card. `on_card` is the set the
+/// caller seeds on it — a request another card already hosts keeps its own
+/// surface and is not counted here — and the status line still comes from the
+/// read.
+pub(crate) fn build_follow_card(data: &SnapshotData, on_card: usize) -> serde_json::Value {
+    build_session_card(data, on_card, true)
+}
+
+/// The one budgeted builder both Session Card drivers share: `follows` selects
+/// the status line and pointer presentation ([`build_idle_card`] versus
+/// [`build_follow_card`]) over the same composition and eviction ladder.
+fn build_session_card(data: &SnapshotData, on_card: usize, follows: bool) -> serde_json::Value {
     let build = |omitted: usize| {
         let mut md = CardMarkdown::new();
         let body = session_card_body(
