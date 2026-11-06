@@ -814,7 +814,7 @@ pub fn help_text() -> String {
 `/name <name>` · Rename current session server-side (on a pending, set the creation title)
 `/stop` · Interrupt execution
 `/compact` · Compact context
-`/card` · Pull the live card back to the newest position, or read the Session when no Turn is rendering
+`/card` · Pull the live card back to the newest position, read the Session when no Turn is rendering, or follow a run cola did not start
 `/agent <name>` · Switch agent (takes effect next message)
 `/model <p/m>` · Switch model (takes effect next message)
 `/think [等级]` · Set/clear thinking level (per model; takes effect next message)
@@ -879,7 +879,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/compact\nCompact the current session's context: summarize older messages to free context window."
         }
         "card" => {
-            "/card\nBring this Session's card to the newest position, or read the Session when no Turn is rendering (ADR-0100).\n- With a live Turn (or an external follow) owning the card, it splits the Card Chain at this command: the previous card is finalized with the 部分完成，继续中 header and keeps everything streamed before the pull, and a continuation card replied to this message becomes the newest live card. Use it after command replies, which deliberately stay the newest messages and bury the card above them.\n- With nothing rendering the Session, it reads the Session once and posts one read-only 会话 card: the status line (等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲), how many requests are waiting for you (their own cards hold the buttons), and the last four messages with any Compaction marker. The read carries no button, no form and no Turn Footer; a later `/card` supersedes it (the previous card is marked 已由新卡片接管 · 已停止更新), while a Turn that ran in between leaves it alone.\nThe command always answers — the old 「当前没有正在运行的实时卡片」 notice is retired — except in a conversation with no Session at all."
+            "/card\nBring this Session's card to the newest position, read the Session when no Turn is rendering, or follow a run cola did not start (ADR-0100).\n- With a live Turn (or an external follow) owning the card, it splits the Card Chain at this command: the previous card is finalized with the 部分完成，继续中 header and keeps everything streamed before the pull, and a continuation card replied to this message becomes the newest live card. Use it after command replies, which deliberately stay the newest messages and bury the card above them.\n- With nothing rendering the Session, it reads the Session once. If the read says the Session is busy, or waiting on background tasks, AND the newest message was not written by cola, the posted card follows that run to its end instead of freezing: the run's continuation lands on the card you just asked for. A run cola itself started stays static, and a static read's status line never promises an update it cannot deliver.\n- Otherwise the read stays a one-shot read-only 会话 card: the status line (等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲), how many requests are waiting for you (their own cards hold the buttons; the pointer names 「见原卡片」), and the last four messages with any Compaction marker. The read carries no button, no form and no Turn Footer; a later `/card` supersedes it (the previous card is marked 已由新卡片接管 · 已停止更新), while a Turn that ran in between leaves it alone.\nThe command always answers — the old 「当前没有正在运行的实时卡片」 notice is retired — except in a conversation with no Session at all."
         }
         "agent" => {
             "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint). Without an override the server's default agent applies; the card (`/agent` alone) shows the current one. `--reset` clears the override back to the server default. Persisted across restarts. On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the override is recorded on the pending and applies to the session the first message creates. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
@@ -1143,7 +1143,7 @@ async fn post_idle_card(
         handles
             .external
             .compose_snapshot_follow_lead(plan, "读取", &title, &data);
-        crate::feishu::card::session::build_idle_card_with_pending(&data, plan.seed_count())
+        crate::feishu::card::session::build_idle_card_with_pending(&data, plan.seed_count(), true)
     } else {
         crate::feishu::card::session::build_idle_card(&data)
     };
@@ -3834,23 +3834,36 @@ mod tests {
         );
     }
 
-    /// `/card`'s help describes BOTH states (ADR-0100): the pull, and the
-    /// one-shot read it falls back to — never the retired 「当前没有正在运行的实时
-    /// 卡片」 notice. The index line names the read too.
+    /// `/card`'s help describes ALL THREE states (ADR-0100): the pull, the
+    /// busy/waiting follow, and the one-shot read it falls back to — never the
+    /// retired 「当前没有正在运行的实时卡片」 notice. The index line names them
+    /// too.
     #[test]
-    fn help_documents_the_card_reads_second_state() {
+    fn help_documents_the_card_reads_three_states() {
         let index = help_text();
         assert!(
             index.contains("read the Session when no Turn is rendering"),
-            "the index names the second state: {index}"
+            "the index names the read: {index}"
+        );
+        assert!(
+            index.contains("follow a run cola did not start"),
+            "the index names the follow: {index}"
         );
         let card = command_help("card").expect("card has a help topic");
         assert!(card.contains("部分完成"), "the pull is documented: {card}");
+        assert!(
+            card.contains("follows that run to its end"),
+            "the busy/waiting follow is documented: {card}"
+        );
         assert!(card.contains("read-only 会话 card"), "{card}");
         assert!(card.contains("no button, no form"), "{card}");
         assert!(
             card.contains("已由新卡片接管"),
             "the supersede is documented: {card}"
+        );
+        assert!(
+            card.contains("见原卡片"),
+            "the pending pointer's copy is documented: {card}"
         );
     }
 

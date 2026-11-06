@@ -409,9 +409,9 @@ async fn forgetting_a_session_collects_its_waiting_card() {
 }
 
 /// Acceptance 3: a Wake that lands while the Session is away renders nothing
-/// during the absence; after switching back the Session Snapshot reports the
-/// Session's current state, and Session Sync's Wake pass continues the
-/// collected chain on a new card — exactly one continuation, never re-posted
+/// during the absence; after switching back the takeover confirms in one line
+/// carrying the Session's current state (no card), and Session Sync's Wake pass
+/// continues the collected chain on a new card — exactly one continuation, never re-posted
 /// by a later pass. The collected card takes ONE more PATCH, the ledger
 /// handover (ADR-0060): the retired task's completion entry lands there, and
 /// nothing else follows — its collect state stays, and no live list is ever

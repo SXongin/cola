@@ -1502,7 +1502,11 @@ pub(crate) fn snapshot_follow_lead(
         data,
         &data.tail,
         0,
-        crate::feishu::card::session::PendingFacts { on_card: seeds.len() },
+        crate::feishu::card::session::PendingFacts {
+            on_card: seeds.len(),
+            blocks_here: true,
+        },
+        true,
     )
     .lead_text();
     if !body.is_empty() {

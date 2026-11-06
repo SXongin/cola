@@ -2014,8 +2014,9 @@ fn the_idle_card_and_the_busy_follow_render_the_same_body() {
 }
 
 /// The parity holds for the Waiting copy too: with `busy_now = false` the lead
-/// says the wait is in progress, while the body's status line stays the
-/// composition's 等待后台任务 arm on both drivers.
+/// says the wait is in progress, while the body's status chip stays the
+/// composition's 等待后台任务 arm on both drivers. The follow promise is the one
+/// deliberate difference: only the followed card will keep updating (ADR-0100).
 #[test]
 fn the_parity_holds_for_the_waiting_copy() {
     let read = parity_read(
@@ -2039,16 +2040,21 @@ fn the_parity_holds_for_the_waiting_copy() {
         let card_body = idle_card_body(&card);
         let lead_body = follow_lead_body(&lead);
         assert_eq!(
-            card_body.lead, lead_body.lead,
-            "same status line, busy_now={busy_now}"
+            card_body.lead,
+            vec![crate::feishu::card::session::WAITING_BACKGROUND_CHIP.to_string()],
+            "the static read carries the chip without an update promise, busy_now={busy_now}"
+        );
+        assert_eq!(
+            lead_body.lead,
+            vec![
+                crate::feishu::card::session::WAITING_BACKGROUND_CHIP.to_string(),
+                crate::feishu::card::session::FOLLOW_HINT.to_string(),
+            ],
+            "the followed card keeps the promise, busy_now={busy_now}"
         );
         assert_eq!(
             card_body.messages, lead_body.messages,
             "same tail, busy_now={busy_now}"
-        );
-        assert_eq!(
-            card_body.lead[0],
-            crate::feishu::card::session::WAITING_BACKGROUND_CHIP
         );
     }
 }
@@ -2086,7 +2092,20 @@ fn the_parity_keeps_the_marker_on_the_card_and_drops_it_from_the_lead() {
         card_body.messages, lead_body.messages,
         "dropping the marker does not drop a message"
     );
-    assert_eq!(card_body.lead, lead_body.lead, "same status line");
+    // The followed card says it keeps updating; the one-shot read does not.
+    assert_eq!(
+        card_body.lead,
+        vec![crate::feishu::card::session::BUSY_CHIP.to_string()],
+        "the static read carries no update promise"
+    );
+    assert_eq!(
+        lead_body.lead,
+        vec![
+            crate::feishu::card::session::BUSY_CHIP.to_string(),
+            crate::feishu::card::session::FOLLOW_HINT.to_string(),
+        ],
+        "the followed card keeps the promise"
+    );
 }
 
 /// The parity holds for a body that is not one tidy line: a multi-line message
@@ -2125,8 +2144,9 @@ fn the_parity_holds_for_multi_line_and_whitespace_only_bodies() {
 }
 
 /// The parity holds for the body's three parts: a pending read renders the same
-/// status line and the same count-only pointer on both drivers (the idle card
-/// carries no block at all — its pointer is text).
+/// status chip and count on both drivers, but the one-shot read carries no block
+/// at all — its pointer is text and names where the request lives (「见原卡片」),
+/// while the follow seeds the block and is hint-free.
 #[test]
 fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
     let mut read = parity_read(
@@ -2144,13 +2164,14 @@ fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
     let seeds = [&pending];
     let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &seeds, true);
 
-    // The read carries the block nowhere; the pointer is the body's whole
-    // pending statement, so the two bodies agree in full.
+    // The read carries the block nowhere, so its pointer names the card that
+    // does; the follow seeds the block it counts, so its pointer is hint-free.
     let card_body = idle_card_body(&card);
     let lead_body = follow_lead_body(&lead);
-    assert_eq!(card_body.lead, lead_body.lead, "same status + pointer: {card}");
     assert_eq!(card_body.lead[0], crate::feishu::card::session::WAITING_CHIP);
-    assert_eq!(card_body.lead[1], "有 1 个请求等待你处理");
+    assert_eq!(lead_body.lead[0], crate::feishu::card::session::WAITING_CHIP);
+    assert_eq!(card_body.lead[1], "有 1 个请求等待你处理（见原卡片）");
+    assert_eq!(lead_body.lead[1], "有 1 个请求等待你处理");
     assert_eq!(card_body.messages, lead_body.messages);
     assert!(
         !card.to_string().contains("\"tag\":\"button\""),
