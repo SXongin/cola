@@ -67,7 +67,7 @@ block on this card to rebuild, claim, or protect from a repaint.
 
 **Taking a session over no longer posts a card.** A first adoption confirms in
 one text line carrying the same status summary, and that line is the Topic
-Anchor. Only `/card` produces a card. The switch-list op is not a post: it
+Anchor. Only `/card` produces a Session Card. The switch-list op is not a post: it
 patches the clicked list card **in place** to the compact 已切换 state
 (`build_switched_state_card`), and ADR-0052's 返回列表 button rides that patch —
 a text adoption from any other surface has no list to return to.
