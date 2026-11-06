@@ -8,9 +8,10 @@
 > Topic Anchor), its claim semantics and its suppression heuristic no longer
 > apply. The read this ADR introduced — the status line, the 最近对话 tail, and
 > the busy follow through the external renderer (`start_snapshot_follow` →
-> `Turn::arm_external_render`) — survives: the follow keeps its renderer and its
-> `newest_user_is_cola_authored` guard, but no longer seeds adopt-time pendings
-> inline or prints the overflow notice; the ordinary sweep owns those now.
+> `Turn::arm_external_render`) — survives: the follow keeps its renderer, its
+> `newest_user_is_cola_authored` guard and its adopt-time seeding; only the
+> `pending_overflow` notice goes, with the embedding fields the claim registry
+> used.
 
 > **Amended by ADR-0052**: a snapshot (and the suppressed 已切换 state card)
 > built from the `/switch` list carries an optional 「返回列表」 button holding

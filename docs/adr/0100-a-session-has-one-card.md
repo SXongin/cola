@@ -48,7 +48,8 @@ A session has one card, the **Session Card**, with two driving modes:
   variant of `Turn::arm_external_render`: that seam ends by calling
   `Turn::take_over_card`, which writes the Chain Record, so reusing it verbatim
   would make cola the session's card owner and let a restart's reap or a Wake
-  treat the readout as a live card. The idle arm stops before the record write —
+  treat the Session Card as a live card. The idle arm stops before the record
+  write —
   including its predecessor collect, so a chain an earlier Turn still owns is
   left alone — and writes **no Chain Record**. No Wake, reap or ownership verdict
   may treat it as one, and an existing record still names the chain's card: the
@@ -81,14 +82,26 @@ every flush takes — so two near-simultaneous commands serialize and the later
 one stamps the card the earlier one posted.
 
 When the read says the session is busy, or waiting on Background Tasks, **and
-the newest user message is not cola-authored**, `/card` hands the posted card to
-the existing external renderer (the busy-follow path) instead of freezing it, so
-the run's continuation lands on the card the reader just asked for. Nothing new
+the newest user message is not cola-authored**, `/card` arms the existing external
+renderer on the posted card (the busy-follow path) instead of freezing it, so the
+run's continuation lands on the card the reader just asked for. Nothing new
 renders it. A **cola-authored** newest message keeps the card static even while
 the session reads busy: that run is cola's own, and its hand-off belongs to the
-Chain Record and Session Sync (ADR-0063, ADR-0071), never to a readout that would
-take the chain over. With cola's own renderer alive `/card` never reaches this
-branch — it pulls — so the guard only covers a run cola lost its renderer for.
+Chain Record and Session Sync (ADR-0063, ADR-0071), never to a Session Card that
+would take the chain over. With cola's own renderer alive `/card` never reaches
+this branch — it pulls — so the guard only covers a run cola lost its renderer
+for.
+
+The post and the arm are **one critical section** under the session's card write
+lock: the read, the send, the `CardSession` insert, the seed of the read's
+pendings and the arm all happen inside it. `RequestFlow::surface` takes that same
+lock for its whole decision — host lookup, insertion, standalone send — so the
+sweep can never observe the intermediate state (an Idle card about to become
+render-owned) and cannot post a second card for a request the follow is about to
+host. The insertion split the flush already uses (`flush_card_locked`) is the
+pattern: `add_inline` gains a lock-held variant instead of re-acquiring. The seed
+filters with `is_already_surfaced`, so a request the sweep had surfaced before
+`/card` began keeps its own card and is simply not seeded.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and
@@ -104,7 +117,8 @@ two are separate compositions that can drift.
   `SnapshotQuestionState`, `ClaimedSnapshot`, the claim registry's
   `claim`/`rebuild`/`resolve`/`drop_vanished` surface, tombstones, and
   `is_already_surfaced`'s snapshot arm. `pending` survives as the read's count
-  for the pointer — it is no longer embedded or claimed. The read survives as
+  for the pointer and as the follow's seed — it is no longer embedded in the card
+  by the builder or claimed. The read survives as
   **Session Snapshot**, and `display_title` plus the body composition
   (`session_card_body`: status line, pending pointer, tail) move to
   `feishu::card::session`. The busy follow's `static_text` becomes a call to that
@@ -122,9 +136,11 @@ two are separate compositions that can drift.
   empty-ack class of pitfall `codex-request-ids`.
 - An adopted session's pending requests surface through the ordinary sweep
   (`RequestFlow::sweep` lists every known directory's requests): inline on a live
-  card, else their own. Nothing is seeded into a host or claimed — including by
-  the busy follow, which today seeds `data.pending` inline and prints the
-  overflow notice. The card it arms is live, so the next sweep lands them.
+  card, else their own. A **busy follow** seeds the read's pendings onto its own
+  card instead — from the same read, inside the post-and-arm critical section
+  above — so the acceptance is that they are on the follow card, not that a later
+  sweep lands them. No registry claims anything; only the `pending_overflow`
+  notice goes, because overflow is no longer a decision the card makes.
 - ADR-0028's suppression heuristic dies with the card: `/card` always answers.
 - `build_switched_state_card` moves to `feishu::card::session`; it carries
   ADR-0052's 返回列表 button, which must survive on the list card the switch-list
@@ -149,7 +165,7 @@ two are separate compositions that can drift.
 ## Risks
 
 - `/card` becomes the only way to learn an inactive session's state. An adoption
-  used to answer it unprompted; now the operator must remember the command. The
+  used to answer it unprompted; now the Host must remember the command. The
   one-line confirmation carries the status summary to soften that.
 - The idle card does not refresh itself. If the session moves on elsewhere, the
   card is stale until the next `/card` — which then follows a live run when there
