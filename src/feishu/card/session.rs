@@ -1824,7 +1824,7 @@ impl SessionCardBody<'_> {
             // entry index is a stable element id (and a stable test target).
             // The index is the entry's position in the FULL tail, so an
             // evicted prefix cannot renumber the panels that remain.
-            let element_id = format!("snap_{}", self.omitted_tail + i);
+            let element_id = format!("tail_{}", self.omitted_tail + i);
             let message = match entry {
                 TailEntry::Compaction(marker) => {
                     panels.extend(crate::feishu::card::compaction::compaction_elements(
@@ -1860,7 +1860,8 @@ impl SessionCardBody<'_> {
     /// folded summary the card presentation ([`Self::tail_elements`]) renders.
     /// The live timeline may also render the compaction row, so the row appears
     /// twice on a followed card; that is the accepted cost of #1002's explicit
-    /// equal-body requirement, which supersedes ADR-0082's exactly-once note.
+    /// equal-body requirement, which narrows ADR-0082's exactly-once note to
+    /// the live timeline's own render.
     /// A marker-only tail therefore renders the heading and the marker.
     pub(crate) fn lead_text(&self) -> String {
         let mut text = String::new();

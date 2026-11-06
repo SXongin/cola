@@ -457,10 +457,22 @@ pub(crate) async fn stamp_taken_over(
             }
         }
     };
-    match cards.feishu.update_message(card_message_id, &card).await {
-        Ok(()) => true,
-        Err(e) => {
+    // Bound the PATCH: callers hold the Session's card write lock across this
+    // stamp, so a stalled Feishu write must fail the stamp rather than block
+    // every flush, sweep, install and `/card` for that Session.
+    let write = tokio::time::timeout(
+        std::time::Duration::from_millis(cards.preserved_view_timeout_ms()),
+        cards.feishu.update_message(card_message_id, &card),
+    )
+    .await;
+    match write {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
             tracing::warn!("idle card: could not stamp {card_message_id} taken over: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("idle card: stamping {card_message_id} taken over timed out");
             false
         }
     }

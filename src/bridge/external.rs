@@ -838,8 +838,9 @@ impl ExternalFlow {
         // the idle Session Card renders (ADR-0100). Its text form keeps
         // Compaction markers at their server position, exactly like the card
         // presentation; the live timeline may render the same row again, which
-        // ADR-0082's 2026-11-07 amendment records as deliberate (the
-        // equal-body contract outranks its exactly-once note).
+        // ADR-0082's 2026-11-07 amendment records as deliberate: the equal-body
+        // contract permits this lead's copy, while the cursor's exactly-once
+        // guarantee for the timeline's own render is unchanged.
         //
         // The body follows the ARM-TIME status: a gather that read Idle can be
         // followed by a prepare that read Busy (the run started in between).

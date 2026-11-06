@@ -2260,7 +2260,9 @@ pub(crate) struct CardsHandle {
     /// How long a **preserved-ending card-view read** is awaited before the
     /// ending degrades to the bare card (ms, spec #571 review): the read a
     /// collect or a settle makes to keep the card's body, which the reap pass
-    /// must never await unboundedly. The Session Sync pass's own request bound
+    /// must never await unboundedly. It also bounds the `TakenOver` stamp's
+    /// view read and PATCH, so a stalled Feishu write cannot hold the Session's
+    /// card write lock indefinitely. The Session Sync pass's own request bound
     /// by default; a test may shorten it through the handle.
     pub(crate) preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The process-local File Content image cache (ADR-0076): `content hash →

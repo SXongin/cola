@@ -3577,8 +3577,8 @@ impl App {
             back,
         );
         // In a topic the patched card lives INSIDE it, so persist its own
-        // message id as the fallback-card anchor (same anchor semantics as the
-        // text in-topic adopt, ADR-0028): later permission/question cards reply
+        // message id as the fallback-card anchor (the Topic Anchor semantics of
+        // ADR-0100 / ADR-0052): later permission/question cards reply
         // to it and stay in the topic. When the topic's session was still
         // pending (ADR-0041), carry its cover root too so the quote-injection
         // guard keeps excluding the topic's own root and the cover record can
