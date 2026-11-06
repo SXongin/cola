@@ -132,68 +132,6 @@ async fn an_inlined_waiting_card_pins_the_live_card() {
     assert_eq!(calls[1].0, "msg_card");
 }
 
-/// A pending request claimed by a Session Snapshot (ADR-0028) pins the
-/// snapshot card: whoever hosts the controls is the locator, whatever that
-/// card's lifecycle. Claiming moves the pin off the standalone card.
-#[tokio::test]
-async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform, backend) = pinned_permission_app(&mut cfg);
-    seed_session(&app, "ses_1", "/work").await;
-
-    let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.flow_handles(), &mut seen).await;
-    assert_eq!(
-        platform.message_pins().await,
-        vec![("msg_sent".to_string(), true)],
-        "the standalone card starts pinned"
-    );
-
-    app.core.snapshot_claims.lock().await.claim(
-        "mid_snap",
-        "已接管",
-        "接管",
-        &crate::bridge::snapshot::SnapshotData {
-            session_id: "ses_1".into(),
-            directory: "/work".into(),
-            status: None,
-            waiting: false,
-            pending: vec![crate::bridge::request::kind::PendingRequest::Permission(
-                permission("per_1", "ses_1"),
-            )],
-            pending_elsewhere: None,
-            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
-            tail: Vec::new(),
-            newest_user_anchor: None,
-            newest_user_is_cola_authored: false,
-        },
-        None,
-    );
-
-    app.permission.sweep(&app.flow_handles(), &mut seen).await;
-    let calls = platform.message_pins().await;
-    assert_eq!(
-        calls,
-        vec![
-            ("msg_sent".to_string(), true),
-            ("msg_sent".to_string(), false),
-            ("mid_snap".to_string(), true),
-        ],
-        "the claim moves the pin to the snapshot card: {calls:?}"
-    );
-
-    backend.permission_resolved_by_another("per_1").await;
-    app.permission.sweep(&app.flow_handles(), &mut seen).await;
-    let calls = platform.message_pins().await;
-    assert_eq!(
-        calls.last(),
-        Some(&("mid_snap".to_string(), false)),
-        "resolution unpins the snapshot card: {calls:?}"
-    );
-}
-
 /// `/autoaccept` sessions answer a permission inside the sweep itself: there
 /// is never a wait, so no card is pinned.
 #[tokio::test]

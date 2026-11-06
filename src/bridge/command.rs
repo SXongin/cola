@@ -2385,10 +2385,9 @@ async fn handle_switch(
         }
         // ADR-0100: a re-activation confirms in ONE text line carrying the
         // status summary, whether or not there is content to report — the
-        // snapshot card (and its suppression predicate) is retired from this
-        // path. Pending requests surface through the ordinary sweep, never
-        // claimed here. The gather runs inside the Session's `snapshot` span
-        // (ADR-0048).
+        // snapshot card is retired from this path. Pending requests surface
+        // through the ordinary sweep. The gather runs inside the Session's
+        // `snapshot` span (ADR-0048).
         let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "切换", hit).await;
         handles.flow.platform.reply_text(message_id, &line).await?;
         return Ok(());
@@ -2651,7 +2650,7 @@ async fn handle_sub_attach(
             // scope refusal, and a stale mapping absent from the fetched list
             // is not in scope either — fabricating a record would bypass the
             // scope gate. It goes through the same adoption path, whose
-            // already-active branch writes nothing and sends no snapshot.
+            // already-active branch writes nothing and sends no card.
             if let Some(active_info) = sessions.iter().find(|s| s.id == active_id && s.is_child())
                 && matches!(
                     resolve_session(std::slice::from_ref(active_info), query),

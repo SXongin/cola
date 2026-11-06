@@ -279,55 +279,6 @@ async fn aborted_turn_leaves_another_sessions_request() {
     );
 }
 
-/// A snapshot-claimed request belongs to the snapshot card's lifecycle
-/// (ADR-0038, rule 6): the aborted turn must not reject it.
-#[tokio::test]
-async fn aborted_turn_leaves_a_claimed_request() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.fail_prompt("Aborted");
-    backend.ask_permission(perm_request("per_claimed", "ses_test", "ls -la"));
-    let replies = backend.reply_permission_calls.clone();
-    let (app, _platform) = build_app(cfg, backend).await;
-    app.core.snapshot_claims.lock().await.claim(
-        "mid_snap",
-        "已接管",
-        "接管",
-        &crate::bridge::snapshot::SnapshotData {
-            session_id: "ses_test".into(),
-            directory: "/work".into(),
-            status: None,
-            waiting: false,
-            pending: vec![crate::bridge::request::kind::PendingRequest::Permission(
-                perm_request("per_claimed", "ses_test", "ls -la"),
-            )],
-            pending_elsewhere: None,
-            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
-            tail: Vec::new(),
-            newest_user_anchor: None,
-            newest_user_is_cola_authored: false,
-        },
-        None,
-    );
-
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "跑个命令".into(),
-        None,
-    ))
-    .await;
-
-    assert!(
-        replies.lock().await.is_empty(),
-        "a claimed request is the snapshot's to resolve"
-    );
-}
-
 /// A list call that fails or times out says nothing: the turn must not reject
 /// what it cannot see (#130/#144 — unknown is never read as resolved).
 #[tokio::test]

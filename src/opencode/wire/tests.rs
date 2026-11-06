@@ -2,7 +2,7 @@
 //! the production path — the real adapter, the generation's strategy, its
 //! decoder — mounted verbatim on that generation's fake route. These pin the
 //! upstream shapes the hermetic conformance payloads only approximate, and the
-//! turn projections the Session Snapshot tail, the external-message sync and
+//! turn projections the Session Card tail, the external-message sync and
 //! the follow renderers consume.
 
 use crate::backend::{ExecutionOutcome, MessageRole, Part, SessionTranscript, ToolStatus, WakeSource};
@@ -109,7 +109,7 @@ fn assert_completed_turn(transcript: &SessionTranscript) {
         "the recorded command output decodes into a text block: {tool:#?}"
     );
 
-    // The Session Snapshot tail ends on the final answer, once.
+    // The Session Card tail ends on the final answer, once.
     let tail = transcript.transcript_tail();
     let messages: Vec<&crate::backend::TailMessage> = tail
         .iter()

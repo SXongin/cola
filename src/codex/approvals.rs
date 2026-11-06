@@ -10,7 +10,7 @@
 //! a reconnect, so the wire id alone does not identify a request across
 //! connections. The bridge, however, keys its long-lived records by the neutral
 //! id for the whole process — the double-click guard, the surfaced set, the
-//! snapshot claims — so this module mints each neutral id with its connection's
+//! persisted card surfaces — so this module mints each neutral id with its connection's
 //! own tag (`Approvals::request_key`). Without it, a request from a new
 //! connection could be mistaken for one an earlier connection already answered,
 //! and its click would be re-served as "already answered" instead of answered
@@ -143,8 +143,8 @@ pub(crate) struct Approvals {
     /// numbers its JSON-RPC requests per **connection** and restarts the
     /// counter, so the wire id alone does not identify a request across a
     /// reconnect. The bridge keys several long-lived records by the neutral id
-    /// — the double-click guard, the surfaced set, snapshot claims — for the
-    /// life of the cola process, so two requests from two connections must
+    /// — the double-click guard, the surfaced set, the persisted card surfaces
+    /// — for the life of the cola process, so two requests from two connections must
     /// never share one (issue #896; the same collision as #893). The tag is
     /// random rather than a counter because a persisted card surface outlives
     /// the process: a fresh process must not re-adopt a dead connection's card
@@ -2037,7 +2037,7 @@ mod tests {
     /// The server owns its request ids and numbers them per **connection**, so
     /// two connections both number their first request `0`. The neutral id the
     /// card carries is the bridge's identity for the request — the answered
-    /// guard, the surfaced set and every snapshot claim are keyed by it — so it
+    /// guard, the surfaced set and the persisted card surfaces are keyed by it — so it
     /// must be unique to the connection. Otherwise a brand-new request is
     /// mistaken for one an earlier connection already answered, and its click
     /// is re-served as "already answered" instead of answered.

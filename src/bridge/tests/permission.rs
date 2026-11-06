@@ -668,7 +668,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
                 request_id: "per_1".into(),
                 start: 0,
                 end: 2,
-                kind: crate::bridge::snapshot_claims::ClaimKind::Permission,
+                kind: crate::bridge::request::kind::ClaimKind::Permission,
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 target: "⚡ 执行 Shell 命令 `ls -la`".into(),
@@ -1214,8 +1214,8 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
 }
 
 /// #144: a directory whose list call fails must not clear its live permission
-/// surfaces — the standalone card, the inline section and the snapshot claim
-/// all survive until a SUCCESSFUL list proves the request gone.
+/// surfaces — the standalone card and the inline section both survive until a
+/// SUCCESSFUL list proves the request gone.
 #[tokio::test]
 async fn failed_directory_list_keeps_permission_surfaces() {
     let _wd = test_work_dir();
@@ -1239,14 +1239,8 @@ async fn failed_directory_list_keeps_permission_surfaces() {
             card_id: "per_card",
             card_message_id: "om_card",
             inline_id: "per_inline",
-            snapshot_message_id: "om_snapshot",
             inline_request: crate::bridge::request::kind::PendingRequest::Permission(perm_request(
                 "per_inline",
-                "ses_1",
-                "ls -la",
-            )),
-            claim: crate::bridge::request::kind::PendingRequest::Permission(perm_request(
-                "per_claim",
                 "ses_1",
                 "ls -la",
             )),

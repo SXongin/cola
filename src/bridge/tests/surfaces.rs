@@ -816,7 +816,7 @@ fn over_budget_perm(request_id: &str, session_id: &str) -> crate::backend::types
 /// card exists, so it can no longer produce one. `inline` picks the shape: an
 /// inline block on a streaming card, or a standalone request card.
 fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: bool, message_id: &str) {
-    use crate::bridge::snapshot_claims::ClaimKind;
+    use crate::bridge::request::kind::ClaimKind;
     use crate::bridge::surfaces::{InlineSurface, StandaloneSurface, Surfaces};
 
     let surfaces = Surfaces::load(crate::state::StateLayout::beside(

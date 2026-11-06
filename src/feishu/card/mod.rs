@@ -92,8 +92,8 @@ pub enum CardState {
     /// A waiting card collected because its Session stopped being the thread's
     /// Active Session — `/switch` away, `/switch forget` (ADR-0059, spec
     /// #405): header 「⏳ 已切换会话 · 后台任务仍在运行」. Terminal, no
-    /// Completion Notice; switching back reports the Session through the
-    /// ADR-0028 snapshot, and the background work runs on.
+    /// Completion Notice; switching back reports the Session through `/card`,
+    /// and the background work runs on.
     SwitchedAway,
     /// A persisted live card collected because a new card took the chain over
     /// after a cola restart (ADR-0063): the Wake continuation the restart's

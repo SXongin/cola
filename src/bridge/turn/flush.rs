@@ -143,7 +143,7 @@ fn rendered_block(
     block: &super::state::InteractionBlock,
 ) -> Option<RenderedBlock> {
     use super::state::InteractionBlock;
-    use crate::bridge::snapshot_claims::ClaimKind;
+    use crate::bridge::request::kind::ClaimKind;
     let kind = match block {
         InteractionBlock::Permission(_) => ClaimKind::Permission,
         InteractionBlock::Question(_) => ClaimKind::Question,

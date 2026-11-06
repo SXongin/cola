@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::card_handles::BlockSpan;
+use crate::bridge::request::kind::ClaimKind;
 use crate::bridge::sidecar;
-use crate::bridge::snapshot_claims::ClaimKind;
 use crate::state::ClientScoped;
 
 /// One live interaction block and the card that renders it — the persisted

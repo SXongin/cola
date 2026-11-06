@@ -59,8 +59,7 @@ fn draft_max_chars(index: usize, request: &crate::backend::types::QuestionReques
 /// What a question block paints: the display selection per slot, which
 /// questions are finalized, which one is open and the unsubmitted draft in its
 /// box. The flow builds ONE of these per click and hands the same four facts to
-/// every render seam (standalone card, inline block, snapshot block, the clicked
-/// card's ack).
+/// every render seam (standalone card, inline block, the clicked card's ack).
 ///
 /// The seams take the slices, not this type: `feishu` renders the card and must
 /// not depend on `bridge` types (the dependency runs the other way), so the

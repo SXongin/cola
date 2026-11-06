@@ -542,12 +542,12 @@ pub struct CardActionResult {
     pub toast: Option<String>,
     /// Whether THIS callback changed the QUESTION state it was given.
     ///
-    /// A Session Snapshot repaints only for a click that changed something: a
-    /// rebuild replaces `body.elements`, which recreates every input and erases
-    /// text the client alone holds. A state diff cannot answer that — a click
-    /// that did nothing still sees the state another click just changed — so the
-    /// question handler reports it here, under the lock it mutated under. Every
-    /// other kind leaves it false: their settlements take the resolve branch.
+    /// A repaint replaces `body.elements`, which recreates every input and
+    /// erases text the client alone holds, so only a click that actually
+    /// changed something may rebuild the card. A state diff cannot answer that
+    /// — a click that did nothing still sees the state another click just
+    /// changed — so the question handler reports it here, under the lock it
+    /// mutated under. Every other kind leaves it false.
     pub mutated: bool,
 }
 
@@ -2030,8 +2030,8 @@ impl App {
     /// A resolved dispatch also replies the dedicated loaded-skill card under
     /// the user's message ([`crate::feishu::card::command::send_loaded_skill_card`]),
     /// one `🧩 已加载技能：<name>` fold per distinct skill — the ONLY place a
-    /// skill fold renders (the live Turn card, the Session Snapshot tail and
-    /// the External Message preview are text-only; ADR-0077's acceptance
+    /// skill fold renders (the live Turn card, the Session Card tail and the
+    /// External Message preview are text-only; ADR-0077's acceptance
     /// reversal). A dispatch that resolves SOME ids but not others still
     /// submits the resolved ones and leads the card with a `⚠️ 未找到技能：…`
     /// line naming the rest, so nothing is dropped silently (Q19).
@@ -3596,9 +3596,7 @@ impl App {
         open_message_id: Option<String>,
         back: Option<&crate::feishu::card::session::BackToList>,
     ) -> CardActionResult {
-        // #1006 moves `build_switched_state_card` next to the Session Card's
-        // own builders (`feishu::card::session`); the call site stays.
-        let card = crate::feishu::snapshot_card::build_switched_state_card(
+        let card = crate::feishu::card::session::build_switched_state_card(
             &target.title,
             &target.id,
             &target.directory,

@@ -571,55 +571,6 @@ async fn an_external_reply_render_carries_its_session() {
     );
 }
 
-/// A snapshot adoption's settle runs inside the adopted Session's `snapshot`
-/// span (ADR-0048): the follow decision is retrievable by the Session it
-/// looked at, even though the first adoption is not mapped to a thread yet.
-#[tokio::test]
-async fn a_snapshot_settle_carries_the_session() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    seed_session(&app, "ses_test", "/work/project").await;
-
-    // Gathered Busy, but the server reports the turn finished by arm time —
-    // the follow declines and keeps the static snapshot (ADR-0028).
-    let data = crate::bridge::snapshot::SnapshotData {
-        session_id: "ses_test".into(),
-        directory: "/work/project".into(),
-        status: Some(crate::backend::types::SessionStatus::Busy),
-        waiting: false,
-        pending: Vec::new(),
-        pending_elsewhere: None,
-        pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
-        tail: Vec::new(),
-        newest_user_anchor: Some(crate::backend::TurnAnchor {
-            message_id: crate::backend::MessageId::new("msg_user"),
-            created_ms: 1_000,
-        }),
-        newest_user_is_cola_authored: false,
-    };
-    let (_, logs) = capture_logs(async {
-        crate::bridge::external::settle_snapshot_after_send(
-            &app.external,
-            &app.flow_handles(),
-            "om_snap",
-            "接管",
-            "标题",
-            &data,
-            None,
-        )
-        .await
-    })
-    .await;
-
-    let declined = line_with(&logs, "snapshot follow");
-    assert!(
-        declined.contains("session=ses_test"),
-        "the follow decision carries the session: {declined}"
-    );
-}
-
 /// The topic cover sync runs inside the Session's `topic` span (ADR-0048): the
 /// line that records the retitle is retrievable by the Session whose card was
 /// updated, and by its Chat/Topic.
@@ -806,7 +757,7 @@ async fn prompt_routing_logs_the_ownership_verdict_without_the_message() {
     );
 
     // The other owned verdict: a render-owned card chain with a free guard
-    // (the snapshot-follow shape) is ownership too, and its name is its own.
+    // (the busy-follow shape) is ownership too, and its name is its own.
     app.inflight.lock().await.remove("ses_test");
     Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
     Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Streaming).await;

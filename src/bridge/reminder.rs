@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::bridge::failure_latch::FailureLatch;
-use crate::bridge::snapshot_claims::ClaimKind;
+use crate::bridge::request::kind::ClaimKind;
 use crate::feishu::Platform;
 use crate::feishu::client::INSTANT_REMINDER_SCOPE;
 

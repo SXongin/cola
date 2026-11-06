@@ -1753,10 +1753,6 @@ impl Platform for CardDelivery {
         self.inner.reply_text(message_id, text).await
     }
 
-    async fn reply_card_in_thread(&self, message_id: &str, card: &Value) -> Result<(String, Option<String>)> {
-        self.inner.reply_card_in_thread(message_id, card).await
-    }
-
     async fn reply_in_thread(&self, message_id: &str, text: &str) -> Result<(String, Option<String>)> {
         self.inner.reply_in_thread(message_id, text).await
     }
@@ -2125,13 +2121,6 @@ mod tests {
             unimplemented!("not used")
         }
         async fn reply_text(&self, _message_id: &str, _text: &str) -> Result<String> {
-            unimplemented!("not used")
-        }
-        async fn reply_card_in_thread(
-            &self,
-            _message_id: &str,
-            _card: &Value,
-        ) -> Result<(String, Option<String>)> {
             unimplemented!("not used")
         }
         async fn reply_in_thread(&self, _message_id: &str, _text: &str) -> Result<(String, Option<String>)> {

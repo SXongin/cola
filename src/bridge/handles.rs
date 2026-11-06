@@ -15,8 +15,8 @@
 //!
 //! - [`FlowHandles`] — the four per-concern handles plus the backend and the
 //!   platform: the request flow and the external-message flow run on it.
-//! - [`SnapshotHandles`] — the read-side subset a Session Snapshot gather and
-//!   its claim filter need.
+//! - [`SnapshotHandles`] — the read-side subset a Session Snapshot gather
+//!   needs.
 //! - [`TopicHandles`] — [`FlowHandles`] plus the external flow the topic
 //!   opening settles an adopted snapshot through.
 //! - [`CommandHandles`] — [`FlowHandles`] plus the turn config (the default
@@ -36,8 +36,8 @@ use crate::bridge::core::{CoverTitle, SESSION_INFO_TIMEOUT, SETTLING_CLAIM_TTL, 
 use crate::bridge::message_pins::MessagePins;
 use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::flow::RequestFlow;
+use crate::bridge::request::kind::ClaimKind;
 use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore, WorktreeAdjust};
-use crate::bridge::snapshot_claims::{ClaimKind, SnapshotClaims};
 use crate::bridge::turn::{CardSession, CollectReason, Turn};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
@@ -2366,13 +2366,11 @@ impl CardsHandle {
 /// The two request flows and the claim state their settlements use.
 ///
 /// **Locks owned:** the flows' own state (`sent_cards`, `question_state`,
-/// `answered_results`), the double-click guard `answered_requests`, the
-/// settlement claims `settling_requests`, and the ADR-0028 `snapshot_claims`
-/// registry. The claim sets are taken briefly and never held across a backend
-/// or Feishu call; the snapshot registry is released before the PATCH its
-/// rebuilt card produces. When a path needs both a flow's `sent_cards` and the
-/// card-handle registry it snapshots one, drops it, then takes the other (one
-/// lock order, no deadlock surface).
+/// `answered_results`), the double-click guard `answered_requests`, and the
+/// settlement claims `settling_requests`. The claim sets are taken briefly and
+/// never held across a backend or Feishu call. When a path needs both a flow's
+/// `sent_cards` and the card-handle registry it snapshots one, drops it, then
+/// takes the other (one lock order, no deadlock surface).
 #[derive(Clone)]
 pub(crate) struct RequestsHandle {
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
@@ -2391,14 +2389,11 @@ pub(crate) struct RequestsHandle {
     /// a claim older than [`SETTLING_CLAIM_TTL`] is abandoned and dropped by
     /// [`Self::claimed_requests`].
     pub(crate) settling_requests: Arc<Mutex<HashMap<String, std::time::Instant>>>,
-    /// ADR-0028 snapshot claim registry: which snapshot card hosts which
-    /// adopt-time pending block.
-    pub(crate) snapshot_claims: Arc<Mutex<SnapshotClaims>>,
 }
 
 impl RequestsHandle {
-    /// The flow that owns requests of `kind` — the registry pairing every
-    /// snapshot-claim kind with its poller and settlement state.
+    /// The flow that owns requests of `kind` — the pairing of every request
+    /// kind with its poller and settlement state.
     pub(crate) fn flow_for(&self, kind: ClaimKind) -> &Arc<RequestFlow> {
         match kind {
             ClaimKind::Permission => &self.permission,
@@ -2902,35 +2897,26 @@ impl FlowHandles {
     }
 }
 
-/// The read-side bundle a Session Snapshot gather and its claim filter need:
-/// no platform (the card is built as JSON and sent by the caller) and no wait
-/// state (nothing here blocks on a prompt).
+/// The read-side bundle a Session Snapshot gather needs: the session store
+/// (for the read's span) and the backend, with no platform and no wait state —
+/// nothing in a read blocks on a prompt.
 #[derive(Clone)]
 pub(crate) struct SnapshotHandles {
     pub(crate) sessions: SessionsHandle,
-    pub(crate) cards: CardsHandle,
-    pub(crate) requests: RequestsHandle,
     pub(crate) backend: Arc<dyn crate::backend::Backend>,
-    /// Whether Message Pin is on (`[bridge] instant_reminder`): the snapshot's
-    /// 等待你的确认 pointer may promise 置顶 only then (ADR-0028 update
-    /// 2026-09-25). Config, not wait state — nothing here blocks.
-    pub(crate) pins_enabled: bool,
 }
 
 impl SnapshotHandles {
-    /// The snapshot subset of a flow bundle.
+    /// The read-side subset of a flow bundle.
     pub(crate) fn from_flow(flow: &FlowHandles) -> Self {
         Self {
             sessions: flow.sessions.clone(),
-            cards: flow.cards.clone(),
-            requests: flow.requests.clone(),
             backend: Arc::clone(&flow.backend),
-            pins_enabled: flow.waits.message_pins.enabled(),
         }
     }
 }
 
-/// The topic-opening bundle: the flow handles plus the snapshot subset an
+/// The topic-opening bundle: the flow handles plus the read-side subset an
 /// adopted topic reads its one-line confirmation from.
 #[derive(Clone)]
 pub(crate) struct TopicHandles {
@@ -2938,7 +2924,7 @@ pub(crate) struct TopicHandles {
 }
 
 impl TopicHandles {
-    /// The snapshot subset of this bundle.
+    /// The read-side subset of this bundle.
     pub(crate) fn snapshot_handles(&self) -> SnapshotHandles {
         SnapshotHandles::from_flow(&self.flow)
     }
@@ -3052,7 +3038,7 @@ impl CommandHandles {
         }
     }
 
-    /// The snapshot subset of this bundle.
+    /// The read-side subset of this bundle.
     pub(crate) fn snapshot_handles(&self) -> SnapshotHandles {
         SnapshotHandles::from_flow(&self.flow)
     }

@@ -3880,18 +3880,6 @@ impl Turn {
             .is_some_and(|c| c.acc.has_live_tool())
     }
 
-    /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
-    /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
-    /// new card instead of the old one). The content is untouched. The durable
-    /// record follows the re-point: the new card is the session's live card now
-    /// (the old snapshot was already static, so nothing is collected).
-    pub(crate) async fn repoint_card(cards: &CardsHandle, session_id: &str, message_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.repoint(message_id);
-        }
-        Self::track_live_card(cards, session_id, message_id, PredecessorCollect::Never, None).await;
-    }
-
     /// Refresh the live card's work context at turn end (ADR-0019): re-read the
     /// session directory's git state so the final card shows where the turn
     /// landed.

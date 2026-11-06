@@ -2,7 +2,7 @@
 //! a card. A Session-scoped fact — it answers no prompt and is never a Turn
 //! anchor — so its row is owned by the card timeline, which places it at the
 //! compaction's own server time rather than at the card's end. The Session
-//! Snapshot's 最近对话 tail (ticket #723) renders the same row through
+//! Card's 最近对话 tail (ticket #723) renders the same row through
 //! [`compaction_elements`], so the two surfaces cannot disagree.
 //!
 //! Three shapes, one row: an in-flight compaction is a live line that updates in
@@ -22,7 +22,7 @@ use serde_json::json;
 /// The card elements one Compaction row is made of (ADR-0082), shared by every
 /// surface that shows a row — the live card's timeline
 /// ([`crate::feishu::card::shell::CardBuilder::with_compaction`]) and the Session
-/// Snapshot's 最近对话 tail (ticket #723) — so the two cannot disagree on the
+/// Card's 最近对话 tail (ticket #723) — so the two cannot disagree on the
 /// copy, the fold, or the session time they render.
 ///
 /// A completed compaction is one folded panel: `element_id` its stable identity

@@ -441,7 +441,7 @@ async fn session_info_exposes_parent_and_model_on_every_generation() {
 
 /// The run state has the same neutral outcome on both generations: Idle, Busy
 /// and Retry. V2 derives Retry from the newest assistant message's `retry`
-/// field where V1 reads it from the status map, but the Session Snapshot's
+/// field where V1 reads it from the status map, but the Session Card's
 /// status line cannot tell them apart.
 #[tokio::test]
 async fn session_status_maps_idle_busy_retry_on_every_generation() {
@@ -660,7 +660,7 @@ async fn transcript_reads_the_same_neutral_view_on_every_generation() {
             );
         }
 
-        // The Session Snapshot tail: the text-bearing conversation, newest
+        // The Session Card tail: the text-bearing conversation, newest
         // last, with the tool-only in-flight step excluded.
         let tail = transcript.transcript_tail();
         let messages: Vec<&crate::backend::TailMessage> = tail

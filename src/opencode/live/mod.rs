@@ -387,7 +387,7 @@ async fn live_v1_scripted_failure_and_retry_chain() {
 /// The V2 read chain against the pinned V2 server: prompt through the
 /// production adapter (the admit-then-return submit comes back while the turn
 /// streams), watch the transcript mid-turn and at rest, and assert the neutral
-/// projections the Session Snapshot tail, the external-message sync and the
+/// projections the Session Card tail, the external-message sync and the
 /// follow renderers consume — no duplicated text, correct turn anchoring.
 #[tokio::test]
 #[ignore = "live: needs a V2 binary (see the module docs)"]
@@ -497,7 +497,7 @@ async fn live_v2_scripted_transcript_read() {
         crate::backend::parsing::is_cola_message_id(user.id.as_str()),
         "V2 must persist the cola-chosen message id: {user:#?}"
     );
-    // The Session Snapshot tail: the newest text-bearing conversation, with the
+    // The Session Card tail: the newest text-bearing conversation, with the
     // tool/reasoning-only steps excluded and nothing duplicated.
     let tail = transcript.transcript_tail();
     let messages: Vec<&crate::backend::TailMessage> = tail
