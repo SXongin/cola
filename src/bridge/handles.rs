@@ -33,7 +33,6 @@ use tokio::sync::Mutex;
 
 use crate::bridge::card_handles::CardHandles;
 use crate::bridge::core::{CoverTitle, SESSION_INFO_TIMEOUT, SETTLING_CLAIM_TTL, SessionListCache};
-use crate::bridge::external::ExternalFlow;
 use crate::bridge::message_pins::MessagePins;
 use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::flow::RequestFlow;
@@ -2919,12 +2918,11 @@ impl SnapshotHandles {
     }
 }
 
-/// The topic-opening bundle: the flow handles plus the external flow whose
-/// snapshot-settle helper an adopted topic calls after its in-topic seed lands.
+/// The topic-opening bundle: the flow handles plus the snapshot subset an
+/// adopted topic reads its one-line confirmation from.
 #[derive(Clone)]
 pub(crate) struct TopicHandles {
     pub(crate) flow: FlowHandles,
-    pub(crate) external: Arc<ExternalFlow>,
 }
 
 impl TopicHandles {
@@ -2935,13 +2933,11 @@ impl TopicHandles {
 }
 
 /// The command bundle: the flow handles plus the turn config (the default
-/// session directory a bare `/topic`/`/new` falls back to) and the external
-/// flow the adoption tails settle a sent snapshot through.
+/// session directory a bare `/topic`/`/new` falls back to).
 #[derive(Clone)]
 pub(crate) struct CommandHandles {
     pub(crate) flow: FlowHandles,
     pub(crate) config: TurnConfig,
-    pub(crate) external: Arc<ExternalFlow>,
     /// `/diff`'s process-internal cooldown (spec #803): one entry per chat,
     /// claimed before any git/render/upload work. Shared with the rest of the
     /// process through the core, so two `/diff`s in one chat cannot both run
@@ -3037,7 +3033,6 @@ impl CommandHandles {
     pub(crate) fn topic_handles(&self) -> TopicHandles {
         TopicHandles {
             flow: self.flow.clone(),
-            external: Arc::clone(&self.external),
         }
     }
 

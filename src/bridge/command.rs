@@ -855,7 +855,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays); this is the one `/switch` form a bound topic accepts, because it unbinds instead of selecting\nExamples: `/switch backend`, `/switch ses_abc --force`"
         }
         "sub" => {
-            "/sub [list [keyword]] | /sub attach <id|id-prefix|title> [--force]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\n- `/sub attach <id|id-prefix|title> [--force]` — take over one of the current session's DIRECT children into this chat (the child becomes the Active Session and gets the usual Session Snapshot receipt). The query resolves like `/switch` (exact id → unique id-prefix → title substring) but only among this session's direct children: an unknown or ambiguous query is reported, and a session that is not a direct child is refused. If the child is mapped to another chat, the owner is named and it is refused unless `--force` (which steals the mapping). Taking over a running child is allowed and the snapshot shows its live state; re-running it for the already-active child changes nothing. The parent stays mapped — `/switch` switches back to it.\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`, `/sub attach 1a2b3c4`, `/sub attach 渲染 --force`"
+            "/sub [list [keyword]] | /sub attach <id|id-prefix|title> [--force]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\n- `/sub attach <id|id-prefix|title> [--force]` — take over one of the current session's DIRECT children into this chat (the child becomes the Active Session and the takeover confirms in ONE text line carrying its status — no card; pending permissions/questions surface as their own cards). The query resolves like `/switch` (exact id → unique id-prefix → title substring) but only among this session's direct children: an unknown or ambiguous query is reported, and a session that is not a direct child is refused. If the child is mapped to another chat, the owner is named and it is refused unless `--force` (which steals the mapping). Taking over a running child is allowed and the line shows its live state; re-running it for the already-active child changes nothing. The parent stays mapped — `/switch` switches back to it.\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`, `/sub attach 1a2b3c4`, `/sub attach 渲染 --force`"
         }
         "attach" => {
             "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
@@ -2253,9 +2253,8 @@ async fn handle_switch_action(
 /// `/switch <keyword>` — switch within the thread first, then adopt a unique
 /// global match (ADR-0008). Resolution order:
 /// 1. Current thread's mapped sessions (matched by title/directory/id);
-///    a unique hit switches without changing the mapping. The re-switch ack
-///    is a Session Snapshot card (已切换) unless the suppression predicate
-///    says there is nothing to report (ADR-0028).
+///    a unique hit switches without changing the mapping and confirms in one
+///    text line carrying the status summary (ADR-0100).
 /// 2. Global store search (sub-task children excluded); a unique hit adopts
 ///    into the current thread and becomes active.
 /// 3. Multiple hits: list up to 8 candidates and point at `/attach`.
@@ -2299,48 +2298,14 @@ async fn handle_switch(
         if let Some(entry) = entry {
             handles.flow.activate(entry).await?;
         }
-        // ADR-0028 suppression: re-activating a session already mapped to
-        // this thread reports a snapshot only when there is content to show —
-        // busy/retry, a pending request, or an external newest message. An
-        // idle, pending-free, cola-authored session keeps today's one-line
-        // text ack (its recent life is already visible in this thread). The
-        // `already_mapped` input is true by construction: the hit came from
-        // this thread's mapped-session list. The gather and the 切换 card's
-        // build run inside the Session's `snapshot` span (ADR-0048).
-        match crate::bridge::snapshot::re_switch_snapshot(
-            &handles.snapshot_handles(),
-            thread_key,
-            &hit.id,
-            &hit.directory,
-            &hit.title,
-            // The text form has no card list to return to.
-            None,
-        )
-        .await
-        {
-            crate::bridge::snapshot::ReSwitchSnapshot::Full { card, data } => {
-                // Claim the snapshot's embedded pendings against the sent card
-                // so the poll loop never duplicates them.
-                let mid = handles.flow.platform.reply_card(message_id, &card).await?;
-                crate::bridge::external::settle_snapshot_after_send(
-                    &handles.external,
-                    &handles.flow,
-                    &mid,
-                    "切换",
-                    &hit.title,
-                    &data,
-                    None,
-                )
-                .await;
-            }
-            crate::bridge::snapshot::ReSwitchSnapshot::Suppressed => {
-                handles
-                    .flow
-                    .platform
-                    .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
-                    .await?;
-            }
-        }
+        // ADR-0100: a re-activation confirms in ONE text line carrying the
+        // status summary, whether or not there is content to report — the
+        // snapshot card (and its suppression predicate) is retired from this
+        // path. Pending requests surface through the ordinary sweep, never
+        // claimed here. The gather runs inside the Session's `snapshot` span
+        // (ADR-0048).
+        let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "切换", hit).await;
+        handles.flow.platform.reply_text(message_id, &line).await?;
         return Ok(());
     }
     if thread_hits.len() > 1 {
@@ -2548,10 +2513,10 @@ async fn handle_attach(
 /// id-prefix → title substring); a session outside that scope is refused, never
 /// adopted — the child filter is this command's policy, not the shared
 /// resolver's (spec #344). Adoption then reuses [`adopt_session`] end to end:
-/// Session Mapping activation, the one Session Snapshot receipt with its
-/// claimable pendings, the owner check, and `--force` to steal a mapping owned
-/// by another chat. The parent stays mapped and switchable; no prompt is ever
-/// sent into the child (ADR-0054).
+/// Session Mapping activation, the ONE confirmation text line carrying the
+/// child's status (ADR-0100), the owner check, and `--force` to steal a mapping
+/// owned by another chat. The parent stays mapped and switchable; no prompt is
+/// ever sent into the child (ADR-0054).
 async fn handle_sub_attach(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -2790,10 +2755,13 @@ async fn handle_topic_adopt(
 /// → idempotent no-op. Mapped to another thread → rejected with an
 /// actionable card unless `--force` (which steals the mapping). Copies
 /// `directory` + `agent` from the server; `auto_accept` resets to false.
-/// The adoption confirmation is the Session Snapshot card (ADR-0028): in a
-/// never-had-a-session topic it is sent inside the topic and doubles as the
-/// fallback-card anchor (`reply_card_in_thread`, ADR-0006); in the lobby it
-/// is the reply replacing the old 「已接管…」 text.
+///
+/// ADR-0100: the adoption confirmation is ONE text line carrying the status
+/// summary the Session Snapshot used to show — no card. In a topic it is
+/// replied in-thread and its message id becomes the fallback-card anchor
+/// (`reply_in_thread`, ADR-0006), so permission/question cards still land
+/// inside the topic; in the lobby it is a plain reply. Pending requests surface
+/// through the ordinary sweep.
 ///
 /// `force_hint` is the command the owner refusal points the user at (with
 /// `--force` appended): `/switch` for the general adoption path, `/sub attach`
@@ -2866,27 +2834,20 @@ async fn adopt_session(
         handles.flow.unmap(&info.id).await?;
     }
 
-    // ADR-0028: every adoption ends in exactly ONE Session Snapshot card
-    // (replacing the old 「已接管…」 texts) — never a card plus a text, never
-    // nothing. Gathered BEFORE the mapping write below, so the card reflects
-    // the session's pre-adoption state; each field is best-effort, so a read
-    // failure degrades that field rather than blocking the adoption.
-    let (card, data) =
-        crate::bridge::snapshot::snapshot_card_for(&handles.snapshot_handles(), "接管", info, None).await;
+    // ADR-0100: the confirmation is ONE text line carrying the status summary
+    // (gathered before the mapping write below, so it reflects the session's
+    // pre-adoption state; each read field is best-effort). Pending requests are
+    // left to the ordinary sweep — nothing claims them here.
+    let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "接管", info).await;
 
     let anchor = if kind == ConversationKind::Topic {
-        // The snapshot is sent inside the topic and doubles as the fallback-card
+        // The line is sent inside the topic and doubles as the fallback-card
         // anchor (ADR-0023): permission/question cards reply to it and land
         // inside the topic. Its message id is persisted as `topic_anchor`.
-        match handles
-            .flow
-            .platform
-            .reply_card_in_thread(message_id, &card)
-            .await
-        {
+        match handles.flow.platform.reply_in_thread(message_id, &line).await {
             Ok((anchor, _)) => Some(anchor),
             Err(e) => {
-                tracing::warn!("attach: snapshot in-thread send failed: {}", e);
+                tracing::warn!("attach: in-thread confirmation send failed: {}", e);
                 None
             }
         }
@@ -2907,31 +2868,10 @@ async fn adopt_session(
     entry.topic_root = pending_topic_root;
     handles.flow.activate(entry).await?;
     crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
-    // In a topic the snapshot was already sent inside it (the in-thread send
+    // In a topic the line was already sent inside it (the in-thread send
     // above); don't reply twice.
     if kind != ConversationKind::Topic {
-        let mid = handles.flow.platform.reply_card(message_id, &card).await?;
-        crate::bridge::external::settle_snapshot_after_send(
-            &handles.external,
-            &handles.flow,
-            &mid,
-            "接管",
-            &info.title,
-            &data,
-            None,
-        )
-        .await;
-    } else if let Some(anchor) = &anchor {
-        crate::bridge::external::settle_snapshot_after_send(
-            &handles.external,
-            &handles.flow,
-            anchor,
-            "接管",
-            &info.title,
-            &data,
-            None,
-        )
-        .await;
+        handles.flow.platform.reply_text(message_id, &line).await?;
     }
     Ok(())
 }

@@ -37,9 +37,9 @@ pub(crate) enum TopicOpening {
         /// directory above stays the source for the pending window.
         worktree: Option<crate::bridge::session::WorktreeIntent>,
     },
-    /// Open the topic around an existing session (ADR-0016): the Session
-    /// Snapshot card (ADR-0028) becomes the topic's first in-topic message
-    /// and anchor, gathered before the mapping write.
+    /// Open the topic around an existing session (ADR-0016): the adoption's
+    /// ONE-line confirmation (ADR-0100) becomes the topic's first in-topic
+    /// message and anchor, gathered before the mapping write.
     Adopt { info: SessionListInfo },
 }
 
@@ -73,10 +73,11 @@ pub(crate) enum OpenTopicError {
 /// thread on it, falling back to `fallback_root` (the user's command message
 /// or the card's own message) when the cover send fails (ADR-0023); seed the
 /// first in-topic message and record the cover title. Adopt: additionally
-/// gather the Session Snapshot BEFORE the mapping write (so the card reflects
-/// the session's pre-adoption state), map the session to the new topic's
-/// `ThreadKey`, and claim its embedded pendings against the in-topic snapshot
-/// after the send (ADR-0028).
+/// gather the adoption's ONE-line confirmation BEFORE the mapping write (so it
+/// reflects the session's pre-adoption state) and map the session to the new
+/// topic's `ThreadKey`; the line is the topic's first in-topic message and
+/// anchor (ADR-0100), and the pending requests surface through the ordinary
+/// sweep.
 ///
 /// The whole transaction runs inside the opening's `topic` span (ADR-0048):
 /// the adopted Session — a fresh `/topic` has none yet — plus the Chat it is
@@ -115,7 +116,7 @@ async fn open_topic_inner(
 ) -> Result<OpenedTopic, OpenTopicError> {
     // Step one: the session side. Fresh records a Pending Session here (so no
     // caller can forget the ADR-0041 rule that nothing is created yet); Adopt
-    // gathers the snapshot while the mapping is still unwritten.
+    // gathers the confirmation while the mapping is still unwritten.
     let parts = match opening {
         TopicOpening::Fresh {
             directory,
@@ -131,24 +132,16 @@ async fn open_topic_inner(
                 seed: TopicSeed::ReplyHint,
                 side: OpeningSide::Pending { title: name },
                 worktree,
-                snapshot_claim: None,
             }
         }
         TopicOpening::Adopt { info } => {
-            // ADR-0028: every adoption ends in exactly ONE Session Snapshot
-            // card. Gathered BEFORE the mapping write below, so the card
-            // reflects the session's pre-adoption state; each field is
-            // best-effort, so a read failure degrades that field rather than
-            // blocking the adoption. The pendings are restricted to the
-            // claimable ones (the session's own, not already surfaced).
-            let (card, data) = crate::bridge::snapshot::snapshot_card_for(
-                &handles.snapshot_handles(),
-                "接管",
-                &info,
-                // The topic form has no switch card to return to.
-                None,
-            )
-            .await;
+            // ADR-0100: an adoption confirms in ONE text line carrying the
+            // status summary, not a card. Gathered BEFORE the mapping write
+            // below, so it reflects the session's pre-adoption state; each read
+            // field is best-effort, so a failure degrades the summary rather
+            // than blocking the adoption.
+            let line =
+                crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "接管", &info).await;
             OpeningParts {
                 directory: info.directory,
                 display_title: info.title.clone(),
@@ -157,13 +150,9 @@ async fn open_topic_inner(
                 // to the transcript seam (spec #332); `model_display` reads it
                 // here rather than after a neutral normalization.
                 model: model_display(info.model.as_ref()),
-                seed: TopicSeed::Snapshot(card),
+                seed: TopicSeed::AdoptionLine(line),
                 side: OpeningSide::Adopt { session_id: info.id },
                 worktree: None,
-                snapshot_claim: Some(SnapshotClaim {
-                    title: info.title,
-                    data,
-                }),
             }
         }
     };
@@ -251,22 +240,9 @@ async fn open_topic_inner(
             Some(session_id)
         }
     };
-    // ADR-0028: claim the snapshot's embedded pendings against the in-topic
-    // snapshot message (the topic's first message + anchor) so the poll loop
-    // never duplicates them. Not reached when the topic could not be opened
-    // (no thread_id) — the poller keeps today's standalone flow for them.
-    if let Some(claim) = parts.snapshot_claim {
-        crate::bridge::external::settle_snapshot_after_send(
-            &handles.external,
-            &handles.flow,
-            &anchor,
-            "接管",
-            &claim.title,
-            &claim.data,
-            None,
-        )
-        .await;
-    }
+    // The pending requests surface through the ordinary sweep (ADR-0100): an
+    // adoption no longer claims anything against a card, because it posts no
+    // card.
     Ok(OpenedTopic {
         session_id,
         thread_id,
@@ -285,10 +261,6 @@ struct OpeningParts {
     /// ADR-0095: a fresh topic's checkout intent; `None` for adoption and for
     /// a topic that starts in the source checkout.
     worktree: Option<crate::bridge::session::WorktreeIntent>,
-    /// ADR-0028: the adopt snapshot's title and claimable data, settled
-    /// against the in-topic seed after the mapping write. `None` for fresh
-    /// sessions.
-    snapshot_claim: Option<SnapshotClaim>,
 }
 
 /// Which of the two ADR-0041 session sides this opening writes: a Pending
@@ -298,19 +270,11 @@ enum OpeningSide {
     Adopt { session_id: String },
 }
 
-/// The snapshot claim (ADR-0028) an adopted topic settles after its in-topic
-/// seed is sent: the title for the claim bookkeeping plus the filtered
-/// snapshot data the poll loop must never duplicate.
-struct SnapshotClaim {
-    title: String,
-    data: crate::bridge::snapshot::SnapshotData,
-}
-
 /// The reply hint seeded as a fresh topic's first in-topic message
 /// (ADR-0023): it tells the user where to reply. Pending-session topics
 /// (`/topic`, the `/dir` card's 建话题 op — the session is created by the
 /// topic's first prompt, ADR-0041) seed with this text; adopted sessions seed
-/// with their Session Snapshot card instead (ADR-0028).
+/// with their ONE-line adoption confirmation (ADR-0100).
 const TOPIC_REPLY_HINT: &str = "请在本话题内回复，即可和这个会话对话。";
 
 /// What a newly created topic's FIRST in-topic message carries. That message
@@ -319,9 +283,9 @@ enum TopicSeed {
     /// The reply hint text — fresh (`/topic`) topics, pending or already
     /// materialised.
     ReplyHint,
-    /// The adopted session's Session Snapshot card (ADR-0028) — `/topic
+    /// The adopted session's one-line confirmation (ADR-0100) — `/topic
     /// --adopt` and the switch card's 建话题接管 op.
-    Snapshot(serde_json::Value),
+    AdoptionLine(String),
 }
 
 /// Build the topic cover card's text (ADR-0023): a session brief laid out for
@@ -410,10 +374,11 @@ async fn send_topic_cover(platform: &Arc<dyn feishu::Platform>, chat_id: &str, t
 /// brief sent to the chat's top level, so the chat-list topic entry shows it
 /// permanently. Best-effort: when the cover send fails, the thread anchors on
 /// `fallback_root` (the user's command message) instead. The topic's FIRST
-/// in-topic message is `seed` (the reply hint for fresh sessions, the Session
-/// Snapshot card for adopted ones, ADR-0028) and becomes the in-topic anchor.
-/// Returns the created reply's message id (the anchor), the new thread_id, the
-/// root message id (`topic_root`), and the cover id (`None` on fallback).
+/// in-topic message is `seed` (the reply hint for fresh sessions, the ONE-line
+/// adoption confirmation for adopted ones, ADR-0100) and becomes the in-topic
+/// anchor. Returns the created reply's message id (the anchor), the new
+/// thread_id, the root message id (`topic_root`), and the cover id (`None` on
+/// fallback).
 async fn open_cover_topic(
     platform: &Arc<dyn feishu::Platform>,
     chat_id: &str,
@@ -425,7 +390,7 @@ async fn open_cover_topic(
     let root = cover_id.clone().unwrap_or_else(|| fallback_root.to_string());
     let (anchor, thread_id) = match seed {
         TopicSeed::ReplyHint => platform.reply_in_thread(&root, TOPIC_REPLY_HINT).await?,
-        TopicSeed::Snapshot(card) => platform.reply_card_in_thread(&root, &card).await?,
+        TopicSeed::AdoptionLine(line) => platform.reply_in_thread(&root, &line).await?,
     };
     Ok((anchor, thread_id, root, cover_id))
 }

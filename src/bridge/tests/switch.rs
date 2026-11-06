@@ -1,4 +1,4 @@
-use crate::backend::Backend;
+use crate::backend::{Backend, FinishReason, MessageRole, Part, SessionTranscript, StepFinish};
 use crate::bridge::test_support::*;
 
 /// Repeated session-list reads through the `/switch` card within the 30 s
@@ -259,12 +259,12 @@ async fn switch_adopts_unique_foreign_session() {
     assert_eq!(entry.directory, "/work/ext");
 }
 
-/// ADR-0028: a lobby text adopt ends in EXACTLY ONE Session Snapshot card
-/// — never a card plus the old 「已接管…」 text, and never nothing for a
-/// first adopt, even when the session is idle and empty. The snapshot is
-/// the confirmation.
+/// ADR-0100: a lobby text adopt confirms in EXACTLY ONE text line carrying the
+/// status summary — it posts NO card, so a Session keeps its one Session Card
+/// for `/card`. The line is a single line even when the chip would render a
+/// follow hint on a card.
 #[tokio::test]
-async fn switch_lobby_adopt_ends_in_one_snapshot_card() {
+async fn switch_lobby_adopt_confirms_in_one_text_line() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -280,23 +280,9 @@ async fn switch_lobby_adopt_ends_in_one_snapshot_card() {
     send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
-    let cards: Vec<_> = calls
-        .iter()
-        .filter_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(cards.len(), 1, "exactly one confirmation card: {calls:?}");
     assert!(
-        cards[0].contains("已接管 唯一外部标题"),
-        "snapshot header carries the adopt verb + title: {}",
-        cards[0]
-    );
-    assert!(
-        !cards[0].contains("已接管会话"),
-        "the old text confirmation is gone: {}",
-        cards[0]
+        !calls.iter().any(|c| matches!(c, PlatformCall::ReplyCard { .. })),
+        "an adoption posts no card: {calls:?}"
     );
     let texts: Vec<_> = calls
         .iter()
@@ -305,45 +291,58 @@ async fn switch_lobby_adopt_ends_in_one_snapshot_card() {
             _ => None,
         })
         .collect();
+    assert_eq!(texts.len(), 1, "exactly one text confirmation: {calls:?}");
+    let line = &texts[0];
     assert!(
-        texts.iter().all(|t| !t.contains("已接管")),
-        "no text confirmation alongside the snapshot: {texts:?}"
+        line.contains("已接管「唯一外部标题」"),
+        "the line names the takeover and title: {line}"
     );
+    assert!(
+        line.contains(crate::feishu::card::session::IDLE_CHIP),
+        "the line carries the status summary: {line}"
+    );
+    assert_eq!(line.lines().count(), 1, "the confirmation is ONE line: {line}");
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
     assert_eq!(entry.session_id, "ses_alpha01");
     assert_eq!(entry.topic_anchor, None, "lobby adopts carry no topic anchor");
 }
 
-/// ADR-0028: the re-`/switch` mapped-hit branch applies the suppression
-/// predicate. An idle, pending-free session whose newest user message is
-/// cola-authored (its recent life is already visible in this thread) keeps
-/// today's one-line text ack and sends NO card.
+/// ADR-0100: a re-`/switch` to an already-mapped Session with nothing to
+/// report still answers ONE text line carrying the status summary — the
+/// suppression predicate and its card are gone, but the takeover never goes
+/// silent.
 #[tokio::test]
-async fn switch_reeswitch_suppressed_when_nothing_to_report() {
+async fn switch_reeswitch_with_nothing_to_report_answers_one_line() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
-    // Newest user message is cola-authored; status defaults to idle; no
-    // pending requests — the one suppressed cell of the matrix.
+    // Idle, no pending, newest user message cola-authored — the read has no
+    // content to report beyond its status.
     backend.cola_message("ses_own1", "上次的问题");
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
     send_command(&app, "/switch 本项目", "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
-    let text = platform.texts().await.join("\n");
-    assert!(text.contains("Switched to"), "one-line ack kept: {text}");
     assert!(
-        calls.iter().all(|c| !matches!(c, PlatformCall::ReplyCard { .. })),
-        "suppressed: no snapshot card: {calls:?}"
+        !calls.iter().any(|c| matches!(c, PlatformCall::ReplyCard { .. })),
+        "a re-switch posts no card: {calls:?}"
     );
+    let texts = platform.texts().await;
+    assert_eq!(texts.len(), 1, "exactly one line: {texts:?}");
+    assert!(
+        texts[0].contains("已切换「本项目会话」")
+            && texts[0].contains(crate::feishu::card::session::IDLE_CHIP),
+        "the line names the switch and its status: {texts:?}"
+    );
+    assert_eq!(texts[0].lines().count(), 1, "one line only: {:?}", texts[0]);
 }
 
-/// ADR-0028: the same re-switch reports a snapshot when the newest user
-/// message is EXTERNAL (invisible while the session was inactive, ADR-0017)
-/// — the tail is the one vehicle that surfaces it.
+/// ADR-0100: a re-switch whose newest user message is EXTERNAL still confirms
+/// in ONE text line and posts NO card — the external message is no longer
+/// surfaced by the takeover (a Session Card read is how you see it).
 #[tokio::test]
-async fn switch_reeswitch_snapshots_on_external_newest_message() {
+async fn switch_reeswitch_does_not_post_a_card_for_external_newness() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
     backend.external_message_for("ses_own1", "OpenChamber 里的问题");
@@ -352,51 +351,119 @@ async fn switch_reeswitch_snapshots_on_external_newest_message() {
     send_command(&app, "/switch 本项目", "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
-    let card = calls
-        .iter()
-        .find_map(|c| match c {
-            PlatformCall::ReplyCard { card, .. } => Some(card.to_string()),
-            _ => None,
-        })
-        .expect("external newness reports a snapshot: {calls:?}");
-    assert!(card.contains("已切换 本项目会话"), "re-switch verb: {card}");
     assert!(
-        card.contains("OpenChamber 里的问题"),
-        "the external message surfaces in the tail: {card}"
+        !calls.iter().any(|c| matches!(c, PlatformCall::ReplyCard { .. })),
+        "no snapshot card on a re-switch: {calls:?}"
     );
+    let texts = platform.texts().await;
+    assert_eq!(texts.len(), 1, "one line: {texts:?}");
+    assert!(
+        texts[0].contains("已切换「本项目会话」"),
+        "re-switch verb: {texts:?}"
+    );
+    assert_eq!(texts[0].lines().count(), 1, "one line only: {:?}", texts[0]);
 }
 
-/// ADR-0028: a busy re-switch reports a snapshot (运行中) — the in-flight
-/// external turn is invisible until the snapshot surfaces it.
+/// ADR-0100: the one-line confirmation carries the 运行中 status (and only the
+/// chip — the card's follow hint does not fit a single line). No card.
 #[tokio::test]
-async fn switch_reeswitch_snapshots_on_busy_status() {
+async fn switch_reeswitch_line_carries_the_busy_status() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_session_status("ses_own1", Some(crate::backend::types::SessionStatus::Busy));
-    // Cola-authored newest alone is NOT enough to suppress a busy session.
+    // Cola-authored newest alone is NOT enough to hide the run state.
     backend.cola_message("ses_own1", "上次的问题");
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
     send_command(&app, "/switch 本项目", "msg_switch").await;
 
-    let card = platform
-        .replied_cards()
-        .await
-        .into_iter()
-        .next()
-        .expect("busy reports a snapshot")
-        .to_string();
+    let calls = platform.calls.lock().await.clone();
     assert!(
-        card.contains(crate::feishu::card::session::BUSY_CHIP),
-        "busy chip: {card}"
+        !calls.iter().any(|c| matches!(c, PlatformCall::ReplyCard { .. })),
+        "no card: {calls:?}"
+    );
+    let texts = platform.texts().await;
+    let line = texts.first().expect("the re-switch answers a line");
+    assert!(
+        line.contains(crate::feishu::card::session::BUSY_CHIP),
+        "busy status: {line}"
+    );
+    assert!(
+        !line.contains(crate::feishu::card::session::FOLLOW_HINT),
+        "the card-only follow hint stays off the one-line form: {line}"
     );
 }
 
-/// ADR-0028: an adopt-time pending request on a re-switch reports a
-/// snapshot with the 等待你的确认 chip — the request is blocked on the
-/// operator, so the snapshot must surface it.
+/// ADR-0100: the one-line confirmation carries the 需要重试 status.
 #[tokio::test]
-async fn switch_reeswitch_snapshots_on_pending_permission() {
+async fn switch_reeswitch_line_carries_the_retry_status() {
+    let _wd = test_work_dir();
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_own1", Some(crate::backend::types::SessionStatus::Retry));
+    let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+    send_command(&app, "/switch 本项目", "msg_switch").await;
+
+    let texts = platform.texts().await;
+    let line = texts.first().expect("the re-switch answers a line");
+    assert!(
+        line.contains(crate::feishu::card::session::RETRY_CHIP),
+        "retry status: {line}"
+    );
+    assert_eq!(line.lines().count(), 1, "one line only: {line}");
+}
+
+/// ADR-0100: a Session in a Waiting turn (server-idle with a live Background
+/// Task, ADR-0059) confirms with 等待后台任务 on the one line — the card's
+/// follow hint is a second line and stays off this form.
+#[tokio::test]
+async fn switch_reeswitch_line_carries_the_background_wait() {
+    let _wd = test_work_dir();
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_own1",
+        vec![
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_u1",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("跑一下 CI")],
+                ),
+                typed_message(
+                    "msg_a1",
+                    MessageRole::Assistant,
+                    Some(2_000),
+                    vec![Part::StepFinish(StepFinish {
+                        reason: FinishReason::Stop,
+                    })],
+                ),
+            ])
+            .with_executions(vec![execution(2_500)])
+            .with_background_tasks(vec![background_shell(2_100)]),
+        ],
+    );
+    let (app, platform, _dir) = build_reeswitch_app(backend).await;
+
+    send_command(&app, "/switch 本项目", "msg_switch").await;
+
+    let texts = platform.texts().await;
+    let line = texts.first().expect("the re-switch answers a line");
+    assert!(
+        line.contains(crate::feishu::card::session::WAITING_BACKGROUND_CHIP),
+        "the wait is named: {line}"
+    );
+    assert!(
+        !line.contains(crate::feishu::card::session::FOLLOW_HINT),
+        "the card-only follow hint stays off the one-line form: {line}"
+    );
+    assert_eq!(line.lines().count(), 1, "one line only: {line}");
+}
+/// ADR-0100: an adopt-time pending request makes the line say 等待你的确认
+/// (the operator's action outranks the run state) — and the adoption posts no
+/// card; the request keeps its own card through the ordinary sweep.
+#[tokio::test]
+async fn switch_reeswitch_line_carries_the_pending_status() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
     backend.cola_message("ses_own1", "上次的问题");
@@ -413,40 +480,31 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
 
     send_command(&app, "/switch 本项目", "msg_switch").await;
 
-    let card = platform
-        .replied_cards()
-        .await
-        .into_iter()
-        .next()
-        .expect("a pending request reports a snapshot")
-        .to_string();
+    let calls = platform.calls.lock().await.clone();
     assert!(
-        card.contains(crate::feishu::card::session::WAITING_CHIP),
-        "waiting chip: {card}"
+        !calls.iter().any(|c| matches!(c, PlatformCall::ReplyCard { .. })),
+        "no card on a pending re-switch: {calls:?}"
     );
+    let texts = platform.texts().await;
+    let line = texts.first().expect("the re-switch answers a line");
+    assert!(
+        line.contains(crate::feishu::card::session::WAITING_CHIP),
+        "waiting status: {line}"
+    );
+    assert_eq!(line.lines().count(), 1, "one line only: {line}");
 }
 
-/// ADR-0028 update (2026-09-25): a re-switch whose pending is already hosted
-/// by a standalone card does not re-embed it. The status chip points at that
-/// card instead of falling back to 运行中 — the busy hint never renders — and
-/// the pointer promises 置顶 only when Message Pin is on.
+/// ADR-0100: a pending already hosted by a standalone card still makes the
+/// one-line confirmation say 等待你的确认 (with no elsewhere pointer — a line
+/// has no room for it), and the adoption posts no card, so the block is never
+/// duplicated.
 #[tokio::test]
-async fn switch_reeswitch_points_at_a_pending_surfaced_elsewhere() {
-    for (pins_enabled, expected_chip) in [
-        (false, crate::feishu::card::session::WAITING_ELSEWHERE_CHIP),
-        (true, crate::feishu::card::session::WAITING_ELSEWHERE_PINNED_CHIP),
-    ] {
-        switch_reeswitch_elsewhere_case(pins_enabled, expected_chip).await;
-    }
-}
-
-async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str) {
+async fn switch_reeswitch_line_reports_a_pending_surfaced_elsewhere() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.bridge.instant_reminder = pins_enabled;
+    let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    // Busy proves the pointer outranks the server run state.
+    // Busy proves the pending outranks the server run state.
     backend.with_session_status("ses_own1", Some(crate::backend::types::SessionStatus::Busy));
     backend.cola_message("ses_own1", "上次的问题");
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -485,31 +543,28 @@ async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str
         app.permission.sent_cards.lock().await.contains_key("req_own"),
         "precondition: the permission has a standalone card"
     );
+    let cards_before = platform.replied_cards().await.len();
 
     send_command(&app, "/switch 本项目", "msg_switch").await;
 
-    let card = platform
-        .replied_cards()
-        .await
-        .into_iter()
-        .last()
-        .expect("the re-switch replies with its snapshot");
-    let text = card_text(&card);
+    let texts = platform.texts().await;
+    let line = texts.first().expect("the re-switch answers a line");
     assert!(
-        text.contains(expected_chip),
-        "pin enabled = {pins_enabled}: the chip points at the hosting card: {text}"
+        line.contains(crate::feishu::card::session::WAITING_CHIP),
+        "the operator's pending outranks the run state: {line}"
     );
     assert!(
-        !text.contains(crate::feishu::card::session::BUSY_CHIP),
-        "the server run state is not shown: {text}"
+        !line.contains(crate::feishu::card::session::BUSY_CHIP),
+        "the server run state is not shown: {line}"
     );
     assert!(
-        !text.contains(crate::feishu::card::session::FOLLOW_HINT),
-        "no hint on a pending pointer: {text}"
+        !line.contains(crate::feishu::card::session::FOLLOW_HINT),
+        "no card-only hint on the line: {line}"
     );
-    assert!(
-        !text.contains("🔐 **权限请求**"),
-        "the already-surfaced block is not duplicated: {text}"
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        cards_before,
+        "the adoption posts no card and does not duplicate the surfaced block"
     );
 }
 
@@ -772,9 +827,9 @@ async fn switch_card_falls_back_to_global_without_active_session() {
 }
 
 /// A `/switch` card "adopt" action maps the session into the thread and
-/// patches the list card IN PLACE to the Session Snapshot (ADR-0028): the
-/// returned card is the snapshot — the list is no longer visible and no
-/// second message is sent.
+/// patches the clicked list card IN PLACE to the compact 已切换 state
+/// (ADR-0100): no second message is sent, the list is gone, and the card keeps
+/// the 返回列表 button for the list state it came from.
 #[tokio::test]
 async fn switch_card_adopt_action_maps_session() {
     let _wd = test_work_dir();
@@ -798,8 +853,12 @@ async fn switch_card_adopt_action_maps_session() {
     let card = result.card.clone().expect("adopt returns the patched card");
     let card_str = card.to_string();
     assert!(
-        card_str.contains("已接管 重写登录"),
-        "patched card is the snapshot: {card_str}"
+        card_str.contains("已切换 重写登录"),
+        "the patched card is the compact switched state: {card_str}"
+    );
+    assert!(
+        card_str.contains("返回列表"),
+        "the list state stays reachable from the patch: {card_str}"
     );
     assert!(
         !card_str.contains("会话管理"),
@@ -928,10 +987,13 @@ async fn switch_card_force_adopt_steals_owned_session() {
         "session_id": "ses_owned",
     });
     let result = app.host_action(value).await.expect("force_adopt result");
-    let card = result.card.clone().expect("force_adopt returns the snapshot");
+    let card = result
+        .card
+        .clone()
+        .expect("force_adopt patches the card in place");
     assert!(
-        card_text(&card).contains("已接管 被占用的会话"),
-        "snapshot header: {card}"
+        card_text(&card).contains("已切换 被占用的会话"),
+        "compact switched state: {card}"
     );
     let lobby = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     assert_eq!(
@@ -968,19 +1030,20 @@ async fn switch_card_back_rebuilds_list() {
     assert!(card_str.contains("重写登录"), "session row: {card_str}");
 }
 
-/// ADR-0028: a 切换 on a row of a session already mapped to this thread
-/// patches the card to a snapshot with the 已切换 verb — a mapped re-switch
-/// is an activation and reports content (external newness here).
+/// ADR-0100: a 切换 on a row of a session already mapped to this thread
+/// patches the card in place to the compact 已切换 state — no full snapshot
+/// and no new message — and the toast carries the 切换 verb. A re-switch with
+/// nothing to report behaves the same (the ticket's "still answers one line"
+/// applies to the text form; the card form is always this compact state).
 #[tokio::test]
-async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
+async fn switch_card_switch_on_mapped_session_patches_to_compact_state() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
-    // External newness → content to report → full snapshot, not suppressed.
-    backend.external_message_for("ses_own1", "OpenChamber 里的问题");
-    let (app, _platform) = build_app(cfg, backend).await;
+    backend.cola_message("ses_own1", "上次的问题");
+    let (app, platform) = build_app(cfg, backend).await;
     // The session is mapped to this thread but NOT active (a stacked
     // session) — the row shows 切换.
     seed_entry(
@@ -1027,20 +1090,26 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
         .host_action(value)
         .await
         .expect("switch on a mapped row should return a result");
+    let cards_before = platform.replied_cards().await.len();
     let card = result.card.expect("mapped re-switch patches the card");
     let card_str = card.to_string();
     assert!(
         card_str.contains("已切换 本项目会话"),
-        "re-switch verb: {card_str}"
+        "compact switched state header: {card_str}"
     );
     assert!(
-        card_str.contains("OpenChamber 里的问题"),
-        "external message surfaces in the tail: {card_str}"
+        !card_str.contains("最近对话"),
+        "the compact state carries no tail: {card_str}"
     );
     assert!(
         result.toast.clone().unwrap_or_default().contains("已切换"),
         "re-switch toasts the verb: {:?}",
         result.toast
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        cards_before,
+        "the card op sends no message; the ack patches the list card in place"
     );
     // The mapped session is now the thread's ACTIVE one.
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -1050,10 +1119,10 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
     );
 }
 
-/// ADR-0028: a 切换 on a fully-visible mapped session (idle, no pending,
-/// newest user message cola-authored) patches to the COMPACT 「已切换」 state
-/// card instead of a full snapshot — mirroring the text form's one-line
-/// ack under suppression.
+/// ADR-0100: a 切换 on a fully-visible mapped session (idle, no pending,
+/// newest user message cola-authored) — the case the old suppression predicate
+/// swallowed — still patches to the same compact 已切换 state, never to a full
+/// snapshot and never to silence.
 #[tokio::test]
 async fn switch_card_switch_suppressed_patches_to_compact_state() {
     let _wd = test_work_dir();
@@ -1126,11 +1195,11 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
     );
 }
 
-/// ADR-0028: when the switch card lives inside a topic (a never-bound
-/// topic adopting its single session), the patched card is the in-topic
-/// confirmation — its own message id (`open_message_id`) is persisted as
-/// the fallback-card anchor, so later permission/question cards keep
-/// routing inside the topic.
+/// ADR-0028 + ADR-0100: when the switch card lives inside a topic (a
+/// never-bound topic adopting its single session), the patched card is the
+/// compact in-topic confirmation — its own message id (`open_message_id`) is
+/// persisted as the fallback-card anchor, so later permission/question cards
+/// keep routing inside the topic.
 #[tokio::test]
 async fn switch_card_adopt_in_topic_persists_anchor() {
     let _wd = test_work_dir();
@@ -1154,8 +1223,8 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
         .expect("topic adopt should return a result");
     let card = result.card.expect("adopt patches the card in place");
     assert!(
-        card_text(&card).contains("已接管"),
-        "snapshot in the topic: {card}"
+        card_text(&card).contains("已切换"),
+        "compact switched state in the topic: {card}"
     );
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
     let entry = app
@@ -1880,9 +1949,9 @@ async fn switch_card_force_topic_adopt_preserves_the_filter() {
     );
 }
 
-/// ADR-0052: adopting from a filtered, paged `/switch` list patches the card
-/// to the Session Snapshot (ADR-0028), which carries a 「返回列表」 button
-/// holding that list's keyword/scope/page; clicking it rebuilds the same
+/// ADR-0052 + ADR-0100: adopting from a filtered, paged `/switch` list patches
+/// the card in place to the compact 已切换 state, which carries a 「返回列表」
+/// button holding that list's keyword/scope/page; clicking it rebuilds the same
 /// filtered window on the same page.
 #[tokio::test]
 async fn switch_card_adopt_round_trips_back_to_the_filtered_page() {
@@ -1933,18 +2002,18 @@ async fn switch_card_adopt_round_trips_back_to_the_filtered_page() {
         .find(|b| b["value"]["op"] == "adopt" && b["value"]["session_id"] == "ses_p1")
         .expect("page 2 lists ses_p1's adopt button")["value"]
         .clone();
-    let snapshot = app
+    let switched = app
         .host_action(adopt)
         .await
         .expect("adopt returns a result")
         .card
         .expect("adopt patches the card in place");
-    let text = card_text(&snapshot);
-    assert!(text.contains("已接管 项目1"), "snapshot header: {text}");
+    let text = card_text(&switched);
+    assert!(text.contains("已切换 项目1"), "compact switched state: {text}");
     assert!(!text.contains("会话管理"), "the list is gone: {text}");
 
-    // The snapshot carries the list's exact return target.
-    let back = card_buttons(&snapshot)
+    // The compact state carries the list's exact return target.
+    let back = card_buttons(&switched)
         .into_iter()
         .find(|b| b["value"]["op"] == "back")
         .expect("the list adoption carries a 返回列表 button");
@@ -1953,7 +2022,7 @@ async fn switch_card_adopt_round_trips_back_to_the_filtered_page() {
     assert_eq!(back["value"]["scope"], "all");
     assert_eq!(back["value"]["page"], 2);
 
-    let list = click_button_card(&app, &snapshot, "back").await;
+    let list = click_button_card(&app, &switched, "back").await;
     let text = card_text(&list);
     assert!(
         text.contains("项目2 ·") && text.contains("项目1 ·"),
@@ -1974,9 +2043,9 @@ async fn switch_card_adopt_round_trips_back_to_the_filtered_page() {
     );
 }
 
-/// ADR-0052: the suppressed compact 已切换 state card (a re-switch with
-/// nothing to report, ADR-0028) carries the same 「返回列表」 button, and it
-/// returns to the same filtered page.
+/// ADR-0052 + ADR-0100: a re-switch with nothing to report (idle, no pending,
+/// newest user message cola-authored) still patches to the compact 已切换
+/// state, and its 「返回列表」 button returns to the same filtered page.
 #[tokio::test]
 async fn switch_card_suppressed_round_trips_back_to_the_filtered_page() {
     let _wd = test_work_dir();
@@ -2086,11 +2155,11 @@ async fn switch_card_suppressed_round_trips_back_to_the_filtered_page() {
     );
 }
 
-/// ADR-0052: a snapshot from a non-list source (the text `/switch <kw>` form,
-/// the old `/attach`) carries no 「返回列表」 button — there is no filtered
-/// list to return to.
+/// ADR-0052 + ADR-0100: the text `/switch <kw>` adoption is a text line, not a
+/// card patch — so it carries no 「返回列表」 button (there is no list card to
+/// return to) and posts no card at all.
 #[tokio::test]
-async fn text_switch_snapshot_has_no_back_to_list_button() {
+async fn text_switch_adoption_posts_a_line_and_no_back_to_list_button() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2100,14 +2169,15 @@ async fn text_switch_snapshot_has_no_back_to_list_button() {
 
     send_command(&app, "/switch 重写登录", "msg_switch").await;
 
-    let card = platform
-        .replied_cards()
-        .await
-        .into_iter()
-        .next()
-        .expect("the text /switch replies with its snapshot card");
-    let text = card_text(&card);
-    assert!(text.contains("已接管 重写登录"), "snapshot header: {text}");
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "the text adoption posts no card"
+    );
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("已接管「重写登录」"),
+        "one-line confirmation: {text}"
+    );
     assert!(
         !text.contains("返回列表"),
         "a text adoption has no list to return to: {text}"

@@ -676,11 +676,12 @@ async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
     );
 }
 
-/// A re-switch — a session already mapped to this thread — runs its snapshot
-/// gather inside the Session's `snapshot` span (ADR-0048), so the gather's
-/// best-effort read warning is retrievable by the Session being re-activated.
+/// A re-switch — a session already mapped to this thread — runs its
+/// confirmation gather inside the Session's `snapshot` span (ADR-0048), so the
+/// gather's best-effort read warning is retrievable by the Session being
+/// re-activated.
 #[tokio::test]
-async fn a_re_switch_snapshot_gather_carries_the_session() {
+async fn a_re_switch_confirmation_gather_carries_the_session() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
