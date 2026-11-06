@@ -1780,24 +1780,46 @@ fn snapshot_card_body(card: &serde_json::Value) -> RenderedBody {
 
 /// The busy follow's static lead, with its takeover identity line dropped: the
 /// body begins after the blank line that separates the two.
+///
+/// A message body is MULTI-LINE, so the tail is parsed by its role prefix rather
+/// than line-by-line: a line that starts with a role marker opens an entry and
+/// every following line (blank ones included) belongs to that entry's body until
+/// the next marker. That keeps a body's interior line breaks — a line-splitting
+/// parser would read a second line as a marker row.
 fn follow_lead_body(lead: &str) -> RenderedBody {
     let (_, text) = lead.split_once("\n\n").expect("identity line, then the body");
     let mut body = RenderedBody::default();
     let mut in_tail = false;
-    for line in text.lines().filter(|line| !line.is_empty()) {
+    let mut open: Option<(String, String)> = None;
+    for line in text.lines() {
         if line == "**最近对话**" {
             in_tail = true;
-        } else if !in_tail {
-            body.lead.push(line.to_string());
-        } else if let Some((role, message)) = split_role_line(line) {
-            body.messages.push((role, message));
+            continue;
+        }
+        if !in_tail {
+            if !line.is_empty() {
+                body.lead.push(line.to_string());
+            }
+            continue;
+        }
+        if let Some((role, first)) = split_role_line(line) {
+            if let Some(entry) = open.take() {
+                body.messages.push(entry);
+            }
+            open = Some((role, first));
+        } else if let Some((_, message)) = open.as_mut() {
+            message.push('\n');
+            message.push_str(line);
         } else if line.starts_with("…更早的") {
             body.omitted = Some(line.to_string());
-        } else {
+        } else if !line.is_empty() {
             // The lead must not carry a commit marker: record it so the test
             // that asserts its absence can see one if it ever comes back.
             body.markers.push((line.to_string(), String::new()));
         }
+    }
+    if let Some(entry) = open.take() {
+        body.messages.push(entry);
     }
     body
 }
@@ -1949,6 +1971,41 @@ fn the_parity_keeps_the_marker_on_the_card_and_drops_it_from_the_lead() {
     assert_eq!(card_body.lead, lead_body.lead, "same status line");
 }
 
+/// The parity holds for a body that is not one tidy line: a multi-line message
+/// (blank interior line included) compared entry-by-entry in FULL, and a
+/// whitespace-only body rendered as the same `（空消息）` on both sides — the two
+/// presentations share one emptiness predicate.
+#[test]
+fn the_parity_holds_for_multi_line_and_whitespace_only_bodies() {
+    let read = parity_read(
+        crate::backend::types::SessionStatus::Idle,
+        false,
+        vec![
+            body_tail_message(MessageRole::User, 1_000, "第一行\n第二行\n\n第四行"),
+            body_tail_message(MessageRole::Assistant, 2_000, "   "),
+            body_tail_message(MessageRole::User, 3_000, "结尾"),
+        ],
+    );
+    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
+
+    let card_body = snapshot_card_body(&card);
+    let lead_body = follow_lead_body(&lead);
+    assert_eq!(card_body.lead, lead_body.lead, "same status line: {card}");
+    assert_eq!(
+        card_body.messages, lead_body.messages,
+        "same full bodies, interior line breaks included: {card}"
+    );
+    assert_eq!(
+        card_body.messages[0].1, "第一行\n第二行\n\n第四行",
+        "the multi-line body survives whole"
+    );
+    assert_eq!(
+        card_body.messages[1].1, "（空消息）",
+        "a whitespace-only body is the empty-message line, not a blank panel"
+    );
+}
+
 /// The parity holds for the body's three parts: a pending read renders the same
 /// status line and the same count-only pointer on both drivers (the snapshot
 /// card then carries the block itself, which the body does not).
@@ -1981,4 +2038,15 @@ fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
     assert_eq!(card_body.lead[0], crate::feishu::card::session::WAITING_CHIP);
     assert_eq!(card_body.lead[1], "有 1 个请求等待你处理");
     assert_eq!(card_body.messages, lead_body.messages);
+
+    // #1005's filter: a request another card already hosts is not seeded here,
+    // so this card carries none — but the READ still waits on the operator, so
+    // the status line keeps 等待你的确认 and only the pointer goes away.
+    let unseeded = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
+    let unseeded_body = follow_lead_body(&unseeded);
+    assert_eq!(
+        unseeded_body.lead,
+        vec![crate::feishu::card::session::WAITING_CHIP.to_string()],
+        "the status comes from the read, not the seed set: {unseeded}"
+    );
 }
