@@ -139,7 +139,7 @@ The bot's card that is the Topic Root of a cola-created topic. Sent to the main 
 _Avoid_: Cover message, topic stub, seed card
 
 **Topic Anchor**:
-The bot's confirmation message inside a topic, placed by `/topic` / `/topic --adopt` (the seed message) or by `/switch` / `/attach` inside an existing topic. Doubles as the reply target that keeps permission/question/external cards inside the topic (the create API rejects a `thread_id` as target). Persisted as `topic_anchor`. Distinct from Topic Root: the Anchor is inside the topic, the Root is the message the thread is built around. Never injected as prompt context (ADR-0023).
+The bot's confirmation message inside a topic, placed by `/topic` / `/topic --adopt` (the topic's first message) or by `/switch` / `/attach` inside an existing topic. Doubles as the reply target that keeps permission/question/external cards inside the topic (the create API rejects a `thread_id` as target). Persisted as `topic_anchor`. Distinct from Topic Root: the Anchor is inside the topic, the Root is the message the thread is built around. Never injected as prompt context (ADR-0023).
 _Avoid_: Root, seed message, confirmation card
 
 **Turn**:
