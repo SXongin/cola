@@ -1279,6 +1279,48 @@ async fn a_busy_arm_after_an_idle_gather_renders_a_busy_body() {
     .await;
 }
 
+/// A prepare timeout keeps the good gather: only the follow arm's own status
+/// read hangs, and the static read is still posted from the gathered data.
+#[tokio::test]
+async fn a_follow_prepare_timeout_keeps_the_gathered_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = idle_read_backend();
+    backend.hang_second_session_status();
+    let (app, platform) = build_app(cfg, backend).await;
+    app.core
+        .external
+        .request_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        app.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        )),
+    )
+    .await
+    .expect("/card must answer when the follow prepare hangs");
+
+    let card = one_posted_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("✅ 空闲") && text.contains("继续改登录"),
+        "the gathered status and tail survive the prepare timeout: {text}"
+    );
+    assert!(
+        !Turn::is_running(&app.cards_handle(), "ses_test").await,
+        "a prepare timeout posts the static read, not a follow"
+    );
+}
+
 /// The follow's identity line names the Session by its real title, exactly as
 /// the adoption line does — never the bare id tail because `/card` passed no
 /// title. The renderer's first flush carries the lead.
@@ -2061,6 +2103,53 @@ async fn a_failed_previous_read_stamp_keeps_the_old_read_current() {
     );
 }
 
+/// A stalled stamp PATCH is bounded: it times out as a failed stamp, so the
+/// old read stays current instead of holding the session write lock forever.
+#[tokio::test]
+async fn a_parked_stamp_patch_times_out_and_keeps_the_old_read_current() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    platform.given_reply_id("om_idle_1");
+    platform.given_reply_id("om_idle_2");
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    let first = platform.replied_cards().await[0].clone();
+    platform.given_card_view("om_idle_1", first);
+    app.cards_handle()
+        .preserved_view_timeout_ms
+        .store(25, std::sync::atomic::Ordering::Relaxed);
+    let (_entered, _release) = platform.pause("update", "om_idle_1");
+
+    app.handle_message(incoming(
+        "msg_card_2".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle_1"),
+        "a timed-out stamp leaves the old read current"
+    );
+}
+
 /// A Turn that ran between two `/card` commands has already superseded the
 /// older read: the map holds the Turn's card when the second read posts, so the
 /// older read is left untouched — no stale stamp collects in the chat.
@@ -2828,7 +2917,7 @@ fn the_idle_card_and_the_busy_follow_render_the_same_body() {
         .as_array()
         .expect("card body")
         .iter()
-        .find(|element| element["element_id"] == "snap_1")
+        .find(|element| element["element_id"] == "tail_1")
         .expect("the long message's panel");
     let title = long_panel["header"]["title"]["content"].as_str().expect("title");
     let folded = long_panel["elements"][0]["content"].as_str().expect("content");

@@ -1979,6 +1979,11 @@ pub struct MockBackend {
     pub status_idle_then_busy_once: std::sync::atomic::AtomicBool,
     /// The Busy half of [`Self::status_idle_then_busy_once`].
     pub status_busy_after_idle: std::sync::atomic::AtomicBool,
+    /// Arms [`Self::hang_second_session_status`]: the next status read serves,
+    /// the one after hangs forever.
+    pub hang_status_after_first: std::sync::atomic::AtomicBool,
+    /// The hanging second status read's own flag.
+    pub hang_status_next: std::sync::atomic::AtomicBool,
     /// Scenario state for [`MockBackend::given_prompt`]: `(needle, parts)`
     /// pairs matched against the prompt text, first match wins.
     prompt_scripts: Vec<(String, Vec<Part>)>,
@@ -2149,6 +2154,8 @@ impl MockBackend {
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
             status_idle_then_busy_once: std::sync::atomic::AtomicBool::new(false),
             status_busy_after_idle: std::sync::atomic::AtomicBool::new(false),
+            hang_status_after_first: std::sync::atomic::AtomicBool::new(false),
+            hang_status_next: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
             last_prompt_parts: std::sync::Mutex::new(None),
             fail_prompt_message: None,
@@ -2821,6 +2828,14 @@ impl MockBackend {
     /// read sees Busy (the run started in between), later reads serve the map.
     pub(crate) fn idle_then_busy_once(&self) -> &Self {
         self.status_idle_then_busy_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the first `session_status` read serves, the next hangs
+    /// forever (the gather succeeds, the follow prepare stalls).
+    pub(crate) fn hang_second_session_status(&self) -> &Self {
+        self.hang_status_after_first
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -3912,6 +3927,20 @@ impl crate::backend::Backend for MockBackend {
         }
         // Scripts the gather→arm idle→busy window: the gather reads Idle, the
         // follow's own status read sees Busy.
+        // Scripts the gather→prepare split: the first read serves, the second
+        // hangs so the prepare's outer bound is what ends it.
+        if self
+            .hang_status_after_first
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.hang_status_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        } else if self
+            .hang_status_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
         if self
             .status_idle_then_busy_once
             .swap(false, std::sync::atomic::Ordering::SeqCst)

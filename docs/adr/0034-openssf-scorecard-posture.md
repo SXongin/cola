@@ -428,10 +428,13 @@ supersedes the 2026-10-17 amendment's "swapping the provider is a workflow
 change" sentence only; its other rules (the provider is not an ADR pin, and the
 workflow's comment is the record) stand.
 
-A provider swap is now a repository-settings change with no workflow diff, and
-it still fails loudly: the credential preflight names the endpoint and the HTTP
-status, and the review step reads the same values, so a bad switch cannot
-silently produce a review from a different lane.
+A swap **among Responses providers that accept a bearer token** is now a
+repository-settings change with no workflow diff, and it still fails loudly: the
+credential preflight names the endpoint and the HTTP status, and the review step
+reads the same values, so a bad switch cannot silently produce a review from a
+different lane. A lane that needs an extra request header — the Go lane's
+`x-opencode-session`, removed from the preflight with the 2026-11-06 move — is
+not covered by the switch and still requires a workflow change.
 
 ## Amendment (2026-10-17): a repo-local skill may shadow its upstream
 

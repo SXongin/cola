@@ -20,8 +20,11 @@
 # without a review. The 2026-11-06 move is forced: the Go lane's **monthly**
 # allowance is spent and the preflight got `HTTP 429 GoUsageLimitError
 # (limitName: monthly)`. Setting the three repository values moves the gate to
-# another provider without a workflow commit — the reason this is a switch and
-# not a hard-coded lane again.
+# another provider THAT ACCEPTS A BEARER TOKEN AT A RESPONSES ENDPOINT without a
+# workflow commit — the reason this is a switch and not a hard-coded lane
+# again. It is not a universal provider switch: the Go lane additionally needs
+# its `x-opencode-session` header (removed from the preflight with the move), so
+# returning there is a workflow change.
 #
 # OpenCode's free tier is not a fallback: measured 2026-11-01, every free model
 # (`glm-5.3-flash-free`, `deepseek-v4.1-flash-free`, `mimo-v2.6-flash-free`)
@@ -150,10 +153,12 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
       # The provider is configuration (#776), and the switch is repository
       # settings: set `vars.GATE_ENDPOINT` / `vars.GATE_MODEL` and the
-      # `GATE_KEY` secret to move the gate without editing this file. The
-      # credential check and the Codex step read the same values, so a switch
-      # cannot leave the preflight probing a different endpoint than the review
-      # uses. The defaults are DeepSeek's native Responses API.
+      # `GATE_KEY` secret to move the gate to another Responses provider that
+      # accepts a bearer token, without editing this file. A provider needing an
+      # extra header (the Go lane's `x-opencode-session`) is a workflow change.
+      # The credential check and the Codex step read the same values, so a
+      # switch cannot leave the preflight probing a different endpoint than the
+      # review uses. The defaults are DeepSeek's native Responses API.
       GATE_ENDPOINT: ${{ vars.GATE_ENDPOINT || 'https://api.deepseek.com/responses' }}
       GATE_MODEL: ${{ vars.GATE_MODEL || 'deepseek-flash' }}
     steps:

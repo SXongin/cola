@@ -102,9 +102,11 @@ and builds the follow's accumulator **off the card map**. Then, under the
 session's card write lock, it filters the read's pendings with
 `is_already_surfaced`, composes the static lead from that exact set (so the
 count-only pointer names what will be attached), sends the card, inserts the
-render-owned `CardSession` carrying the id the send returned, writes the chain
-record and seeds the filtered requests. Nothing reaches `cards.cards` before that
-insert, so a command cancelled earlier leaves no Idle card behind: the next sweep
+render-owned `CardSession` carrying the id the send returned, **spawns the
+render loop** (a sync spawn, immediately after the insert and before any further
+await), seeds the filtered requests and writes the chain record. Nothing
+reaches `cards.cards` before that insert, so a command cancelled earlier leaves
+no Idle card behind: the next sweep
 surfaces the requests normally, and the sent card — if the send had already
 returned — stays a static read, not a host. `RequestFlow::surface` takes the same
 lock for its whole decision (it resolves the standalone target before the lock,
@@ -112,10 +114,12 @@ then re-checks the inline host and sends under it), so it cannot observe the
 window either. Because the filter runs inside that one critical section, a
 request the sweep had surfaced before `/card` began keeps its own card and is
 simply not seeded, and a request that lands during the command cannot be counted
-on a card that does not carry it. The render loop spawns after the lock is
-released. A cancellation after the insert leaves an armed card with a live
-`CardSession` and no seed/render loop; that is the ordinary wedge every renderer
-can leave, handled by the reap, not a second card.
+on a card that does not carry it. The loop waits on the same session write lock
+until the command releases it, so it cannot render before the seed and chain
+record are written; a cancellation at either of those later awaits drops the
+guard but leaves the already-spawned loop alive, which settles the card normally.
+An abort can therefore never leave a live `CardSession` with no render loop —
+the insert and the spawn are indivisible to cancellation.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and
