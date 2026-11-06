@@ -551,6 +551,70 @@ async fn a_busy_follow_question_click_resolves_the_block() {
     );
 }
 
+/// The busy→idle race across the arm: the gather reads Busy (so the card is
+/// built from a live turn), but the follow's fresh arm-time read sees the turn
+/// already finished. `/card` still posts the read; it arms no renderer, writes
+/// no Chain Record, and the card stays static.
+#[tokio::test]
+async fn a_busy_read_that_turns_idle_before_the_arm_stays_static() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = idle_read_backend();
+    backend.busy_then_idle_once();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let cards = app.cards_handle();
+    assert!(
+        !Turn::is_running(&cards, "ses_test").await,
+        "an idle arm-time read must not leave a renderer owning the card"
+    );
+    assert!(
+        !Turn::is_chain_card(&cards, "ses_test").await,
+        "the posted read joins no chain"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "the static read writes no Chain Record"
+    );
+
+    let card = one_posted_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("⚙️ 运行中"),
+        "the card is still the busy gather's static read: {text}"
+    );
+    assert!(
+        text.contains("继续改登录"),
+        "the read's tail rides the static card: {text}"
+    );
+
+    // With no renderer armed, even a full poll window leaves the card alone.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls
+            .iter()
+            .all(|call| !matches!(call, PlatformCall::UpdateMessage { .. })),
+        "the static read must never be re-rendered: {calls:?}"
+    );
+}
+
 /// A request the sweep had already surfaced on its own card stays there: `/card`
 /// runs while the Session is busy, follows the run, and does not seed a second
 /// copy or count it on the new card.
