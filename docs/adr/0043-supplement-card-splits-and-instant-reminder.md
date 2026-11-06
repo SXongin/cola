@@ -592,7 +592,10 @@ A second `/card` with nothing in between stamps the previous idle card
 between has superseded it and is left alone. When the read reports busy or a
 Waiting turn, `/card` posts the same card and hands it to the existing external
 renderer instead of freezing it, so the continuation streams into the card the
-reader just asked for. A pending request's **Message Pin** loses its
+reader just asked for. A **cola-authored** newest message is the exception: that
+run is cola's own, so the card stays static and the hand-off stays with the Chain
+Record and Session Sync (ADR-0063, ADR-0071). A pending request's **Message Pin**
+loses its
 claimed-snapshot host arm — ADR-0028's claim registry is deleted — and follows
 the live card or the standalone card like every other pending request.
 
