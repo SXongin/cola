@@ -199,10 +199,13 @@ two are separate compositions that can drift.
   the chat as a static message. That is the intended meaning of a read.
 - A **Wake-less** residual tail after `/card` has no anchor to scope it: it
   falls through to the Fresh gate with no Wake and decides nothing, so it is not
-  rendered immediately. The stale Chain Record and its Rendered Cursor survive
-  the read, so the next Turn's `seed_orphan_delta` renders the undelivered delta
-  on that Turn's card. The read is never repainted and no per-tick warning is
-  emitted while the tail waits.
+  rendered immediately. **While a Chain Record survives** — an owed ending, or a
+  run that ended while cola was down — its Rendered Cursor seeds the next Turn's
+  `seed_orphan_delta`, which renders the undelivered delta on that Turn's card.
+  `release_spent` releases the record once a terminal ending's write is
+  confirmed, so after a normal Done turn there is no record to seed the next
+  Turn: the common case defers the tail to a later `/card` read. The read is
+  never repainted and no per-tick warning is emitted while the tail waits.
 
 ## Reconciled references
 
