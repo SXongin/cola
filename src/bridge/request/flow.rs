@@ -1821,14 +1821,17 @@ impl RequestFlow {
             registry.claim_of(req_id).map(|(m, _)| m.to_string())
         };
         // Inline interaction: the session (or its sub-task parent chain) has a
-        // live streaming card, so the result is NOT returned as a replacement
+        // LIVE streaming card, so the result is NOT returned as a replacement
         // card — the streaming card re-renders itself on the next poll. The
-        // clicked card rendering the block through its handle counts too: a
-        // re-adopted card after a restart has no accumulator, but its cached
-        // JSON still carries the block and the ack can edit it in place.
+        // card map's key is not liveness (a finished card stays there, and an
+        // idle Session Card is terminal), so the decision asks
+        // `Turn::is_running` (ADR-0100). The clicked card rendering the block
+        // through its handle counts too: a re-adopted card after a restart has
+        // no accumulator, but its cached JSON still carries the block and the
+        // ack can edit it in place.
         let host = if claimed_message.is_some() {
             None
-        } else if Turn::has_card(&handles.cards, session_id).await {
+        } else if Turn::is_running(&handles.cards, session_id).await {
             Some(session_id.to_string())
         } else {
             inline_host_session(&handles.cards, &handles.backend, session_id, directory).await

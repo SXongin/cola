@@ -41,7 +41,8 @@ fn question_request(request_id: &str, session_id: &str) -> crate::backend::types
 async fn seed_live_card(app: &Arc<App>, session_id: &str, message_id: &str) {
     let cards = app.cards_handle();
     Turn::seed_card(&cards, session_id, Some(message_id)).await;
-    Turn::set_card_state(&cards, session_id, CardState::Done).await;
+    // A block rides a LIVE card (ADR-0100); the restart is what orphans it.
+    Turn::set_card_state(&cards, session_id, CardState::Streaming).await;
     Turn::push_text(&cards, session_id, "回合的内容。").await;
     Turn::set_reply_target(&cards, session_id, "msg_1").await;
 }

@@ -69,7 +69,9 @@ async fn seed_old_turn_card_with_permission(app: &Arc<App>) -> std::collections:
     let cards = app.cards_handle();
     Turn::seed_card(&cards, "ses_old", Some("om_old")).await;
     Turn::set_title(&cards, "ses_old", "旧回合").await;
-    Turn::set_card_state(&cards, "ses_old", CardState::Done).await;
+    // The old turn was LIVE when its card took the block; only a live card
+    // hosts one (ADR-0100). The new turn replaces it below.
+    Turn::set_card_state(&cards, "ses_old", CardState::Streaming).await;
     Turn::push_text(&cards, "ses_old", "旧回合的推理。").await;
     Turn::set_reply_target(&cards, "ses_old", "msg_1").await;
 
@@ -137,7 +139,7 @@ async fn click_with_open_message_id_acks_the_cached_card() {
     // The live card carries an inline permission (the poller path).
     let cards = app.cards_handle();
     Turn::seed_card(&cards, "ses_live", Some("om_live")).await;
-    Turn::set_card_state(&cards, "ses_live", CardState::Done).await;
+    Turn::set_card_state(&cards, "ses_live", CardState::Streaming).await;
     Turn::push_text(&cards, "ses_live", "回合的内容。").await;
     Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
     let mut seen = std::collections::HashSet::new();
@@ -185,8 +187,8 @@ async fn click_with_open_message_id_acks_the_cached_card() {
         "the ack must clear the awaiting title: {ack}"
     );
     assert!(
-        ack.contains("✅ 完成"),
-        "the ack header must show the accumulator's post-resolution state: {ack}"
+        ack.contains("✍️ 回复中"),
+        "the ack header must show the live accumulator's post-resolution state: {ack}"
     );
     assert_eq!(
         patches_of(&platform, "om_live").await,
@@ -972,7 +974,7 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
     // The live card carries the inline permission (the poller path).
     let cards = app.cards_handle();
     Turn::seed_card(&cards, "ses_live", Some("om_live")).await;
-    Turn::set_card_state(&cards, "ses_live", CardState::Done).await;
+    Turn::set_card_state(&cards, "ses_live", CardState::Streaming).await;
     Turn::push_text(&cards, "ses_live", "回合的内容。").await;
     Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
     let mut seen = std::collections::HashSet::new();

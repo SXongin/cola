@@ -1240,13 +1240,26 @@ impl ExternalFlow {
         sid: &str,
         thread_key: &crate::config::ThreadKey,
     ) -> Option<String> {
-        match Turn::reply_target(&handles.cards, sid).await {
-            Some(target) => Some(target),
-            None => {
-                crate::bridge::pollers::resolve_topic_anchor(&handles.sessions, &handles.platform, thread_key)
-                    .await
-            }
+        // The liveness decision is `Turn::is_running` (ADR-0100), never the
+        // map's presence. A terminal Turn card is still the chain's newest
+        // card, though, and a Wake continues that chain on a new card it
+        // replies under the same user message — so the chain target survives
+        // the ending. An Idle Session Card is not a chain card at all: it
+        // joins no Card Chain, so it is never a Wake target.
+        if Turn::is_running(&handles.cards, sid).await
+            && let Some(target) = Turn::reply_target(&handles.cards, sid).await
+        {
+            return Some(target);
         }
+        // A terminal Turn card is still the chain's newest card, and a Wake
+        // continues that chain under the same user message. An Idle Session
+        // Card is not a chain card, so it is never a Wake target.
+        if Turn::is_chain_card(&handles.cards, sid).await
+            && let Some(target) = Turn::reply_target(&handles.cards, sid).await
+        {
+            return Some(target);
+        }
+        crate::bridge::pollers::resolve_topic_anchor(&handles.sessions, &handles.platform, thread_key).await
     }
 
     /// Spawn the Wake continuation's out-of-turn settle loop with this flow's
@@ -1778,7 +1791,11 @@ mod tests {
     use crate::backend::{
         FileContent, MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage,
     };
-    use crate::bridge::test_support::{text_part, turn_anchor, typed_message};
+    use crate::bridge::test_support::{
+        MockBackend, build_app, realistic_parts, seed_entry, test_config, test_work_dir, text_part,
+        turn_anchor, typed_message,
+    };
+    use crate::feishu::card::CardState;
 
     fn user(id: &str, created: i64, parts: Vec<Part>) -> TranscriptMessage {
         typed_message(id, MessageRole::User, Some(created), parts)
@@ -1862,6 +1879,62 @@ mod tests {
                 "{}\n📎 shot.png · image/png · 3 B",
                 long.chars().take(80).collect::<String>()
             )
+        );
+    }
+
+    /// The Wake continuation's reply target asks whether the card is live
+    /// (ADR-0100): a running Turn, `Waiting` and `Restarted` keep the chain's
+    /// target, and a terminal Turn card still names the message its chain
+    /// answers because a Wake continues that chain. An **Idle** Session Card
+    /// joins no chain, so it is never a Wake target and the topic anchor wins.
+    #[tokio::test]
+    async fn an_idle_card_is_not_the_wake_reply_target() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+        let thread_key = crate::config::ThreadKey::new("chat_1".into(), "omt_topic".into());
+        let mut entry = crate::config::SessionEntry::new(thread_key.clone(), "ses_test", "/work");
+        entry.topic_anchor = Some("msg_anchor".into());
+        seed_entry(&app, entry).await;
+
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, "ses_test", Some("om_card")).await;
+        Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+
+        for live in [CardState::Streaming, CardState::Waiting, CardState::Restarted] {
+            Turn::set_card_state(&cards, "ses_test", live.clone()).await;
+            assert_eq!(
+                app.external
+                    .wake_reply_target(&app.flow_handles(), "ses_test", &thread_key)
+                    .await
+                    .as_deref(),
+                Some("msg_1"),
+                "{live:?} still owns the chain's reply target"
+            );
+        }
+        // A terminal Turn card is still the chain's newest card: a Wake after
+        // it continues that chain under the same user message.
+        Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
+        assert_eq!(
+            app.external
+                .wake_reply_target(&app.flow_handles(), "ses_test", &thread_key)
+                .await
+                .as_deref(),
+            Some("msg_1"),
+            "a terminal chain card still names the message the chain answers"
+        );
+
+        // An Idle Session Card joins no chain, so it must never be a target.
+        Turn::set_card_state(&cards, "ses_test", CardState::Idle).await;
+        assert_eq!(
+            app.external
+                .wake_reply_target(&app.flow_handles(), "ses_test", &thread_key)
+                .await
+                .as_deref(),
+            Some("msg_anchor"),
+            "an idle card must fall back to the topic anchor"
         );
     }
 }
