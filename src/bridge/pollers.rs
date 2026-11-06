@@ -290,7 +290,6 @@ pub(crate) async fn inline_host_session(
 /// Shared by the permission and question flows (and the retry action).
 pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardActionResult {
     CardActionResult {
-        mutated: false,
         card: Some(crate::feishu::card::shell::card_shell(
             title,
             template,

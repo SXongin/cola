@@ -862,7 +862,6 @@ async fn handle_binary_frame(
                         }
                     });
                     let pending = crate::bridge::handler::CardActionResult {
-                        mutated: false,
                         card: None,
                         toast: Some("处理中…".to_string()),
                     };
@@ -987,7 +986,6 @@ mod tests {
 
         let request = Frame::decode(&bytes).unwrap();
         let result = crate::bridge::handler::CardActionResult {
-            mutated: false,
             card: Some(serde_json::json!({
                 "schema": "2.0",
                 "header": { "title": { "tag": "plain_text", "content": "✅ 已允许一次" }, "template": "green" },
@@ -1945,7 +1943,6 @@ mod transport_tests {
         async fn handle_card_action(&self, value: serde_json::Value) -> Option<CardActionResult> {
             self.actions.lock().await.push(value);
             Some(CardActionResult {
-                mutated: false,
                 card: Some(serde_json::json!({ "schema": "2.0" })),
                 toast: Some("已处理".into()),
             })
@@ -1967,7 +1964,6 @@ mod transport_tests {
             self.started.notify_one();
             self.release.notified().await;
             Some(CardActionResult {
-                mutated: false,
                 card: Some(serde_json::json!({ "schema": "2.0", "late": true })),
                 toast: Some("late".into()),
             })

@@ -28,7 +28,7 @@ use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{
     ChainRecords, CursorFrontier, CursorPartKind, PendingGap, RenderedCursor, cursor_prefix_digest,
 };
-use crate::bridge::request::kind::ClaimKind;
+use crate::bridge::request::kind::InteractionKind;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};
@@ -2139,7 +2139,7 @@ async fn a_takeover_collect_releases_the_cache_only_when_its_write_lands() {
             request_id: "req_perm".into(),
             start: 0,
             end: 1,
-            kind: ClaimKind::Permission,
+            kind: InteractionKind::Permission,
             session_id: "ses_test".into(),
             directory: "/work".into(),
             target: "om_frozen".into(),
@@ -2197,7 +2197,7 @@ async fn a_recoverably_failed_collect_releases_the_cache() {
             request_id: "req_perm".into(),
             start: 0,
             end: 1,
-            kind: ClaimKind::Permission,
+            kind: InteractionKind::Permission,
             session_id: "ses_test".into(),
             directory: "/work".into(),
             target: "om_frozen".into(),

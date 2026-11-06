@@ -365,6 +365,192 @@ async fn a_busy_follow_seeds_its_pending_and_the_sweep_does_not_duplicate_it() {
     );
 }
 
+/// A permission seeded onto the `/card` follow is answerable through the normal
+/// inline path: the ack carries the updated follow card with the receipt and no
+/// live block, and the resumed external run finishes on that same card.
+#[tokio::test]
+async fn a_busy_follow_permission_click_resumes_the_run() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.external_message_for("ses_test", "帮我重构这个模块");
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    let reply_ready = backend.external_reply(realistic_parts());
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::live_permissions(&cards, "ses_test").await.len(),
+        1,
+        "the read's permission is seeded onto the follow card"
+    );
+
+    let value = serde_json::json!({
+        "action": "perm",
+        "reply": "once",
+        "session_id": "ses_test",
+        "request_id": "per_1",
+        "directory": "/work",
+        "perm_label": "✅ 已允许一次",
+        "perm_color": "green",
+        "perm_body": "bash",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("permission click returns a result");
+    let ack = result
+        .card
+        .as_ref()
+        .expect("an inline click carries the updated follow card in the ack")
+        .to_string();
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令 `ls -la`"),
+        "the receipt lands on the follow card: {ack}"
+    );
+    assert!(
+        !ack.contains("🔐 **权限请求**"),
+        "the approved block is gone: {ack}"
+    );
+    assert_eq!(result.toast.as_deref(), Some("已允许本次执行"));
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "the approved section is no longer live"
+    );
+
+    reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait_for_card_update(&platform, "the follow's Done card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    let final_card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the follow card streams the resume");
+    assert!(
+        final_card.contains("✅ 完成"),
+        "the resumed run finished on the follow card: {final_card}"
+    );
+}
+
+/// A question seeded onto the `/card` follow is remembered (the poll never saw
+/// it): clicking an option records the answer, strips the block, and returns the
+/// updated follow card rather than an empty ack.
+#[tokio::test]
+async fn a_busy_follow_question_click_resolves_the_block() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.external_message_for("ses_test", "帮我重构这个模块");
+    backend.ask_questions(vec![crate::backend::types::QuestionRequest {
+        id: "q_1".into(),
+        session_id: "ses_test".into(),
+        questions: vec![crate::backend::types::QuestionInfo {
+            question: "选择语言".into(),
+            header: "language".into(),
+            options: vec![crate::backend::types::QuestionOption {
+                label: "rust".into(),
+                description: String::new(),
+                ..Default::default()
+            }],
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: Some(false),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }]);
+    let (app, _platform) = build_app(cfg, backend).await;
+    app.core
+        .external
+        .render_poll_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::live_questions(&cards, "ses_test").await.len(),
+        1,
+        "the read's question is seeded onto the follow card"
+    );
+    assert!(
+        app.question.has_question("q_1").await,
+        "the follow remembered the full request"
+    );
+
+    let value = serde_json::json!({
+        "action": "question",
+        "reply": "answer",
+        "session_id": "ses_test",
+        "request_id": "q_1",
+        "directory": "/work",
+        "question_index": 0,
+        "answer": "rust",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("question click returns a result");
+    assert_eq!(result.toast.as_deref(), Some("已回答"));
+    let ack = result
+        .card
+        .expect("an inline click carries the updated follow card, not an empty ack");
+    assert!(
+        card_text(&ack).contains("✅ 已回答：选择语言 rust"),
+        "the follow card leaves the question's receipt: {}",
+        card_text(&ack)
+    );
+    assert!(
+        !ack.to_string().contains("\"action\":\"question\""),
+        "the answered block's controls are stripped from the follow card: {ack}"
+    );
+    assert!(
+        Turn::live_questions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "the answered question block is no longer live"
+    );
+}
+
 /// A request the sweep had already surfaced on its own card stays there: `/card`
 /// runs while the Session is busy, follows the run, and does not seed a second
 /// copy or count it on the new card.

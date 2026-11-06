@@ -258,11 +258,11 @@ impl RequestFlow {
         // cards it sent and the requests whose surfaces the next sweep must
         // re-adopt (both an inline block and a standalone card count).
         let state = surfaces.snapshot();
-        let claim_kind = kind.claim_kind();
+        let interaction_kind = kind.interaction_kind();
         let sent_cards: HashMap<String, SentCard> = state
             .standalone
             .iter()
-            .filter(|(_, s)| s.kind == claim_kind)
+            .filter(|(_, s)| s.kind == interaction_kind)
             .map(|(id, s)| {
                 (
                     id.clone(),
@@ -278,13 +278,13 @@ impl RequestFlow {
         let recovered: HashMap<String, String> = state
             .inline
             .iter()
-            .filter(|(_, s)| s.kind == claim_kind)
+            .filter(|(_, s)| s.kind == interaction_kind)
             .map(|(id, s)| (id.clone(), s.directory.clone()))
             .chain(
                 state
                     .standalone
                     .iter()
-                    .filter(|(_, s)| s.kind == claim_kind)
+                    .filter(|(_, s)| s.kind == interaction_kind)
                     .map(|(id, s)| (id.clone(), s.directory.clone())),
             )
             .collect();
@@ -882,7 +882,7 @@ impl RequestFlow {
             handles
                 .waits
                 .reminder
-                .sync(&handles.platform, self.kind.claim_kind(), &pin_targets)
+                .sync(&handles.platform, self.kind.interaction_kind(), &pin_targets)
                 .await;
         }
         // Requests cola itself is answering or has answered (a click's claim,
@@ -918,7 +918,7 @@ impl RequestFlow {
                 .or_insert(card.directory.clone());
         }
         for (session_id, directory) in handles.cards.card_handles.lock().await.vanished_sessions(
-            self.kind.claim_kind(),
+            self.kind.interaction_kind(),
             &pending,
             &failed_dirs,
             &cola_claimed,
@@ -928,7 +928,7 @@ impl RequestFlow {
         }
         for (session_id, directory) in Turn::vanished_block_sessions(
             &handles.cards,
-            self.kind.claim_kind(),
+            self.kind.interaction_kind(),
             &pending,
             &failed_dirs,
             &cola_claimed,
@@ -952,7 +952,7 @@ impl RequestFlow {
         )
         .await;
         let dropped = handles.cards.card_handles.lock().await.drop_vanished(
-            self.kind.claim_kind(),
+            self.kind.interaction_kind(),
             &pending,
             &failed_dirs,
             &cola_claimed,
@@ -1021,7 +1021,12 @@ impl RequestFlow {
             handles
                 .waits
                 .message_pins
-                .sync(&handles.platform, self.kind.claim_kind(), &waiting, &failed_dirs)
+                .sync(
+                    &handles.platform,
+                    self.kind.interaction_kind(),
+                    &waiting,
+                    &failed_dirs,
+                )
                 .await;
         }
         // #130: remember which directories listed successfully — with that
@@ -1352,7 +1357,7 @@ impl RequestFlow {
                 req.id(),
                 StandaloneSurface {
                     client_id: String::new(),
-                    kind: self.kind.claim_kind(),
+                    kind: self.kind.interaction_kind(),
                     message_id: mid,
                     summary,
                     directory: dir.to_string(),

@@ -1000,7 +1000,6 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
         r2.card.is_none(),
         "a click that changed nothing must not replace the card"
     );
-    assert!(!r2.mutated, "and reports no change");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Answer Q0 → both done → submits with 苹果 intact.
@@ -2350,8 +2349,8 @@ async fn a_late_switch_from_a_question_that_is_no_longer_open_is_dropped() {
     let first = app.host_action(switch(2, 0, "最新")).await.expect("a card");
     assert_eq!(first.toast.as_deref(), Some("已切到第 3 题"));
     assert!(
-        first.mutated,
-        "a switch that opened a question reports the change"
+        first.card.is_some(),
+        "a switch that opened a question repaints the card"
     );
     // The older tap (Q0 → Q2), still carrying Q0's box, lands late.
     let late = app.host_action(switch(1, 0, "旧的")).await.expect("a card");
@@ -2364,10 +2363,6 @@ async fn a_late_switch_from_a_question_that_is_no_longer_open_is_dropped() {
         late.card.is_none(),
         "a dropped switch must not replace the card: the reader may be typing \
          into the box that is open now"
-    );
-    assert!(
-        !late.mutated,
-        "a dropped switch changed nothing — the card must not repaint for it"
     );
     // The state itself is untouched: a fresh repaint still shows question 3.
     let repaint = app.host_action(switch(0, 2, "")).await.expect("a card");

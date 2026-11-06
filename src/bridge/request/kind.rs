@@ -24,11 +24,11 @@ use super::delivery::{
 };
 use super::flow::{RequestFlow, session_belongs_to};
 
-/// Which request kind a live interaction block belongs to (ADR-0038). One
+/// Which interaction-block kind a live card section belongs to (ADR-0038). One
 /// registry holds both kinds' blocks, and each flow's poll sweep only touches
 /// blocks of its own kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum ClaimKind {
+pub enum InteractionKind {
     Permission,
     Question,
 }
@@ -57,10 +57,10 @@ impl PendingRequest {
     }
 
     /// The interaction-block kind of this request.
-    pub fn claim_kind(&self) -> ClaimKind {
+    pub fn interaction_kind(&self) -> InteractionKind {
         match self {
-            PendingRequest::Permission(_) => ClaimKind::Permission,
-            PendingRequest::Question(_) => ClaimKind::Question,
+            PendingRequest::Permission(_) => InteractionKind::Permission,
+            PendingRequest::Question(_) => InteractionKind::Question,
         }
     }
 }
@@ -226,7 +226,7 @@ pub trait RequestKind: Send + Sync {
 
     /// The interaction-block kind of this flow's requests: each flow's poll
     /// sweep only touches blocks of its own kind.
-    fn claim_kind(&self) -> ClaimKind;
+    fn interaction_kind(&self) -> InteractionKind;
 
     /// Handle a card action click on this kind's card. `clicked` is the message
     /// id the click landed on (`open_message_id`), so the ack can update THAT
@@ -421,8 +421,8 @@ impl RequestKind for PermissionKind {
         Turn::resolve_vanished_permissions(cards, pending, failed_dirs, cola_claimed, dead).await
     }
 
-    fn claim_kind(&self) -> ClaimKind {
-        ClaimKind::Permission
+    fn interaction_kind(&self) -> InteractionKind {
+        InteractionKind::Permission
     }
 
     async fn handle_action(
@@ -1187,8 +1187,8 @@ impl RequestKind for QuestionKind {
         Turn::resolve_vanished_questions(cards, pending, failed_dirs, cola_claimed, dead).await
     }
 
-    fn claim_kind(&self) -> ClaimKind {
-        ClaimKind::Question
+    fn interaction_kind(&self) -> InteractionKind {
+        InteractionKind::Question
     }
 
     async fn handle_action(
@@ -1225,7 +1225,6 @@ impl RequestKind for QuestionKind {
                 if answer.is_empty() && reply != "confirm" {
                     if reply == "custom" {
                         return Some(CardActionResult {
-                            mutated: false,
                             card: None,
                             toast: Some("请输入自定义答案".to_string()),
                         });
@@ -1379,7 +1378,6 @@ impl RequestKind for QuestionKind {
                     // This click answered the last question: a claimed snapshot
                     // must repaint (or, when its liveness check is unknown, must
                     // not keep dead buttons).
-                    r.mutated = true;
                     r.toast = Some("已回答".to_string());
                     settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                     // Re-served verbatim to a losing double-click.
@@ -1391,7 +1389,6 @@ impl RequestKind for QuestionKind {
                     // must still answer — but only the settlement above needs
                     // to run for a click that DID change the state.
                     return Some(CardActionResult {
-                        mutated,
                         card: None,
                         toast: Some(action_toast(reply, n - answered_count, outcome)),
                     });
@@ -1421,7 +1418,6 @@ impl RequestKind for QuestionKind {
                         None => None,
                     };
                     let r = CardActionResult {
-                        mutated,
                         card: match card {
                             Some(card) => Some(card),
                             None => ack_inline_card(&handles.cards, host, session_id).await,
@@ -1449,7 +1445,6 @@ impl RequestKind for QuestionKind {
                         &paint.drafts,
                     );
                     let mut r = CardActionResult {
-                        mutated,
                         card: Some(card),
                         toast: None,
                     };
@@ -1479,7 +1474,6 @@ impl RequestKind for QuestionKind {
                 }
                 let switched = flow
                     .with_question_state(req_id, |state| {
-                        let revision = state.revision();
                         let drafts = draft_inputs(value);
                         // A switch rides the box it was submitted with, so it is
                         // honoured only while that box is still the open one: two
@@ -1511,7 +1505,7 @@ impl RequestKind for QuestionKind {
                             }),
                         };
                         if stale {
-                            return (SwitchApplied::Stale, false);
+                            return SwitchApplied::Stale;
                         }
                         // A submit that carries a form payload WITHOUT the box
                         // it rode had that box emptied: record the clear, or the
@@ -1529,18 +1523,14 @@ impl RequestKind for QuestionKind {
                         for (index, text) in drafts {
                             state.record_draft(index, text);
                         }
-                        // A dropped switch reports no mutation even when it
-                        // recorded its draft: the handler answers it without a
-                        // card (the open box must not be rebuilt), and the
-                        // snapshot wrapper must not rebuild behind that.
                         if state.switch_open(target) {
-                            (SwitchApplied::Opened, state.revision() != revision)
+                            SwitchApplied::Opened
                         } else {
-                            (SwitchApplied::Refused, false)
+                            SwitchApplied::Refused
                         }
                     })
                     .await;
-                let Some((switched, mutated)) = switched else {
+                let Some(switched) = switched else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
                 let Some(req) = flow.question_request(req_id).await else {
@@ -1567,7 +1557,6 @@ impl RequestKind for QuestionKind {
                 if matches!(switched, SwitchApplied::Refused | SwitchApplied::Stale) && typed_box_open {
                     return Some(CardActionResult {
                         // A refused switch may still have recorded its draft.
-                        mutated,
                         card: None,
                         toast: Some(toast),
                     });
@@ -1585,7 +1574,6 @@ impl RequestKind for QuestionKind {
                     )
                     .await;
                     return Some(CardActionResult {
-                        mutated,
                         card: match card {
                             Some(card) => Some(card),
                             None => ack_inline_card(&handles.cards, host, session_id).await,
@@ -1594,7 +1582,6 @@ impl RequestKind for QuestionKind {
                     });
                 }
                 Some(CardActionResult {
-                    mutated,
                     card: Some(crate::feishu::card::question::build_question_card(
                         &req.title,
                         req_id,
@@ -1681,7 +1668,6 @@ impl RequestKind for QuestionKind {
                     "green",
                     &qa_completion_body(&snapshot.fields, &snapshot.answers),
                 );
-                r.mutated = true;
                 r.toast = Some("已提交".to_string());
                 settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
@@ -1752,7 +1738,6 @@ impl RequestKind for QuestionKind {
                 )
                 .await;
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
-                r.mutated = true;
                 r.toast = Some("已拒绝回答".to_string());
                 settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.

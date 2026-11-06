@@ -92,7 +92,6 @@ pub(super) fn failed_result_card(inline: bool, body: &str, toast: &str) -> CardA
 /// elsewhere" paths look identical.
 pub(super) fn already_handled_result(kind: &str, inline: bool, toast: &str) -> CardActionResult {
     let mut r = CardActionResult {
-        mutated: false,
         card: Some(crate::feishu::card::notify::build_resolved_elsewhere_card(
             kind, "",
         )),
