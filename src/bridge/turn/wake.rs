@@ -113,9 +113,12 @@ pub(crate) enum WakeContinuation {
     /// "content is never dropped" half of #606, paired with [`Self::Residual`]'s
     /// "at most one such card per request" half.
     RenderResidualInPlace,
-    /// No chain in this process and no durable record (a cola restart that
-    /// left nothing behind): arm a fresh card, scoped at the newest Wake's own
-    /// anchor so the lost card's content is never replayed.
+    /// No chain this process holds — a cola restart that left nothing behind,
+    /// or a map entry that is a one-shot **Idle Session Card** (ADR-0100,
+    /// which joins no chain and is never continued or repainted): arm a fresh
+    /// card, scoped at the newest Wake's own anchor so the lost card's content
+    /// is never replayed. A durable record an idle read left behind is not a
+    /// chain this process holds either; the fresh card re-points it on take-over.
     Fresh { anchor: TurnAnchor },
 }
 
@@ -555,7 +558,15 @@ impl Turn {
     ///   card PAST its wait it is the RESIDUAL floor ([`WakeContinuation::Residual`],
     ///   spec #602/#606): it renders on one neutral card, never a 「已恢复执行」
     ///   receipt, and never a second one.
-    /// - **No chain in this process (a cola restart).** A durable Chain Record
+    /// - **No chain in this process (a cola restart, or an idle read).** A Wake
+    ///   continues the Session's Card Chain, but an **Idle Session Card** is a
+    ///   one-shot read that joins no chain (ADR-0100): it must never be
+    ///   continued, split or repainted, so the decision falls through to the
+    ///   Fresh arm — a late Wake (or a shell/subagent completion) opens a fresh
+    ///   continuation card instead of the work being dropped. The durable Chain
+    ///   Record an idle read leaves in place is bypassed here for the same
+    ///   reason: it still names the terminal card the read replaced, not a
+    ///   chain this process holds. For a real restart, a durable Chain Record
     ///   means the projection — or, cursorless, the reap's one-release
     ///   fallback — owns the chain's Wake, so the Fresh path owes nothing
     ///   (spec #561, ticket #566). Only a recordless post reaches the Fresh
@@ -576,9 +587,16 @@ impl Turn {
         // The diff is a sync read of the accumulator's dedup state, so the
         // cards lock is held only for its scan — no clone of the chain (whose
         // rendered content can be a card's worth) is built to run it off-lock.
+        //
+        // An Idle Session Card is filtered out of the chain arms below: it is a
+        // read, not the session's chain, so the Fresh path (not a continuation
+        // of that read) owns a later Wake.
+        let idle_read;
         {
             let live = cards.cards.lock().await;
-            if let Some(card) = live.get(session_id) {
+            let entry = live.get(session_id);
+            idle_read = entry.is_some_and(|card| !card.is_chain_card());
+            if let Some(card) = entry.filter(|card| card.is_chain_card()) {
                 // The probe judges the chain's OWN rendered scope, not the
                 // newest user message's: a restart continuation is anchored at
                 // the Wake (`arm_wake_continuation`), and the pre-Wake content
@@ -718,7 +736,13 @@ impl Turn {
             // A durable record owns this chain's Wake: the projection (or, for
             // a cursorless record, the reap's fallback) supersedes the Fresh
             // post (spec #561, ticket #566). Only a recordless post survives.
-            recorded: cards.chains.recorded(session_id),
+            //
+            // An Idle Session Card is the exception: `/card` deliberately
+            // wrote no Chain Record, so the one still present names the terminal
+            // card the read replaced — a chain this process no longer holds. A
+            // Wake after the read must open a fresh card (ADR-0100), never be
+            // dropped because that stale record "owns" it.
+            recorded: !idle_read && cards.chains.recorded(session_id),
             wake,
             stale,
             renders: false,
@@ -765,9 +789,12 @@ impl Turn {
     /// `anchor` — opens with the 承接 line, carries the session's work context,
     /// answers to `facts.reply_to` and is marked a continuation (it offers no
     /// Retry). Returns the card to send; the caller attaches its id with
-    /// [`Self::take_over_card`]. `None` when the session has a card after
-    /// all — the decision saw none, so a chain appeared meanwhile and owns the
-    /// session now; the caller must send nothing and the next poll re-decides.
+    /// [`Self::take_over_card`]. `None` when a **chain card** appeared while
+    /// the decision ran — it owns the session now, so the caller must send
+    /// nothing and the next poll re-decides. An **Idle Session Card** does not
+    /// block the arm: it is a one-shot read that joins no chain (ADR-0100), and
+    /// the fresh continuation simply replaces it in the map while the read's
+    /// message stays untouched in the chat.
     pub(crate) async fn arm_wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -776,7 +803,10 @@ impl Turn {
     ) -> Option<serde_json::Value> {
         let work_context = StreamAccumulator::capture_work_context(facts.directory).await;
         let mut live = cards.cards.lock().await;
-        if live.contains_key(session_id) {
+        if live
+            .get(session_id)
+            .is_some_and(state::CardSession::is_chain_card)
+        {
             return None;
         }
         let mut acc = StreamAccumulator::new(facts.subtitle);

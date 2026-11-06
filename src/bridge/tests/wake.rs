@@ -878,6 +878,164 @@ async fn a_wake_after_a_done_card_continues_on_a_new_card() {
     );
 }
 
+/// A `/card` read replaces the terminal chain card (ADR-0100) but joins no
+/// chain: a later Wake must not be read as continuing that read (its empty
+/// accumulator makes every part look unrendered, and the read must never be
+/// repainted). Instead the Fresh arm opens a continuation card in the main
+/// chat's top level and renders the new work — never a silent drop.
+#[tokio::test]
+async fn a_wake_after_a_card_read_opens_a_fresh_card_in_a_main_chat() {
+    let _wd = test_work_dir();
+    let done = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![done], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done)
+    );
+
+    // `/card`: the done chain card is replaced by the one-shot read.
+    assert!(
+        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        "the read replaces the spent chain card"
+    );
+
+    // A shell/subagent completion Wake lands after the read, with new work.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "后台合并完成。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("后台合并完成。"),
+    )
+    .await;
+
+    // The read is never continued or repainted.
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == "om_read"
+        )),
+        "the read is never repainted: {calls:?}"
+    );
+    // A main chat has no reply target, so the fresh card is sent top-level; the
+    // run's work then streams onto it (the assertion above).
+    assert!(
+        !platform.sent_cards().await.is_empty(),
+        "the fresh continuation reaches the chat top level: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("后台合并完成。")),
+        "the fresh continuation carries the late work: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// The same read-then-Wake after a `/card` in a **topic**: the Fresh arm's
+/// reply target is the topic anchor, so the continuation opens there instead of
+/// the split arm's silent `None`.
+#[tokio::test]
+async fn a_wake_after_a_card_read_opens_a_fresh_card_in_a_topic() {
+    let _wd = test_work_dir();
+    let done = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![done], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert!(
+        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        "the read replaces the spent chain card"
+    );
+
+    // The Session is mapped to a topic whose anchor is the takeover's line.
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_topic".into());
+    let mut entry = crate::config::SessionEntry::new(topic_key, "ses_test", "/work");
+    entry.topic_anchor = Some("msg_anchor".into());
+    seed_entry(&app, entry).await;
+
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "后台合并完成。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("后台合并完成。"),
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == "om_read"
+        )),
+        "the read is never repainted: {calls:?}"
+    );
+    assert!(
+        platform
+            .replied_cards_with_targets()
+            .await
+            .iter()
+            .any(|(target, _)| target == "msg_anchor"),
+        "the continuation opens on the topic anchor: {calls:?}"
+    );
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("后台合并完成。")),
+        "the continuation renders the late work: {calls:?}"
+    );
+}
+
 /// Acceptance 3, second half: after a simulated cola restart (no card chain in
 /// memory at all) a Wake still posts a continuation card — the path is scoped
 /// by the Wake's own server time, so the lost card's content is never replayed.
