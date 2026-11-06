@@ -3682,6 +3682,19 @@ impl Turn {
             .is_some_and(state::CardSession::is_running)
     }
 
+    /// Whether the session's map entry is a **Card Chain's** card rather than an
+    /// idle Session Card: any state except `Idle` (ADR-0100). A Wake continues
+    /// a chain, so a terminal chain card still names the message its chain
+    /// answers; an idle Session Card joins no chain and is never a Wake target.
+    pub(crate) async fn is_chain_card(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| *card.acc.card_state() != crate::feishu::card::CardState::Idle)
+    }
+
     /// The session's tracked card message id, if a card has been sent.
     pub(crate) async fn card_message_id(cards: &CardsHandle, session_id: &str) -> Option<String> {
         cards

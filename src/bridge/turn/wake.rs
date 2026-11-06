@@ -524,6 +524,10 @@ impl Turn {
                 if !render::renders_new_content(&card.acc, transcript, anchor, bound) {
                     return None;
                 }
+                // A Wake continues the Session's Card Chain, so a terminal Turn
+                // card still takes one: its reply message is the chain's, not a
+                // liveness claim (ADR-0100). An Idle Session Card is not a chain
+                // card at all, and wake_reply_target refuses it.
                 // An OPEN yielded card resumes IN PLACE (ADR-0066), so no second
                 // card ever opens on it (spec #602). Precedence matters:
                 //
