@@ -67,17 +67,34 @@ block on this card to rebuild, claim, or protect from a repaint.
 
 **Taking a session over no longer posts a card.** A first adoption confirms in
 one text line carrying the same status summary, and that line is the Topic
-Anchor. Only `/card` produces a card.
+Anchor. Only `/card` produces a card. The switch-list op is not a post: it
+patches the clicked list card **in place** to the compact 已切换 state
+(`build_switched_state_card`), and ADR-0052's 返回列表 button rides that patch —
+a text adoption from any other surface has no list to return to.
 
 A second `/card` with nothing in between stamps the previous idle card
 `TakenOver` — 「⏳ 已由新卡片接管 · 已停止更新」 — and only while that card is
 still the session's current card. A Turn that ran in between has already
-superseded it, so stamping it would only add noise.
+superseded it, so stamping it would only add noise. The check, the send and the
+current-card update run under the session's card **write lock** — the same lock
+every flush takes — so two near-simultaneous commands serialize and the later
+one stamps the card the earlier one posted.
 
-When the read says the session is busy, or waiting on Background Tasks, `/card`
-hands the posted card to the existing external renderer (the busy-follow path)
-instead of freezing it, so the run's continuation lands on the card the reader
-just asked for. Nothing new renders it.
+When the read says the session is busy, or waiting on Background Tasks, **and
+the newest user message is not cola-authored**, `/card` hands the posted card to
+the existing external renderer (the busy-follow path) instead of freezing it, so
+the run's continuation lands on the card the reader just asked for. Nothing new
+renders it. A **cola-authored** newest message keeps the card static even while
+the session reads busy: that run is cola's own, and its hand-off belongs to the
+Chain Record and Session Sync (ADR-0063, ADR-0071), never to a readout that would
+take the chain over. With cola's own renderer alive `/card` never reaches this
+branch — it pulls — so the guard only covers a run cola lost its renderer for.
+
+One composition function turns the read into the body — the status line, the
+pending pointer and the tail. Both drivers call it: the idle card renders it, and
+the busy follow hands it to `ExternalCardLead::Static`. A test renders the same
+`SnapshotData` through both and asserts the body text is equal, because today the
+two are separate compositions that can drift.
 
 ## Consequences
 
@@ -88,8 +105,11 @@ just asked for. Nothing new renders it.
   `claim`/`rebuild`/`resolve`/`drop_vanished` surface, tombstones, and
   `is_already_surfaced`'s snapshot arm. `pending` survives as the read's count
   for the pointer — it is no longer embedded or claimed. The read survives as
-  **Session Snapshot**, and `display_title` plus the status-line/tail composition
-  move to `feishu::card::session`, beside `build_switched_state_card`.
+  **Session Snapshot**, and `display_title` plus the body composition
+  (`session_card_body`: status line, pending pointer, tail) move to
+  `feishu::card::session`. The busy follow's `static_text` becomes a call to that
+  same function, so the idle card and the follow cannot render different bodies
+  for the same read.
 - Every reader of the in-memory card map that means *the session's live card*
   asks `Turn::is_running` instead of "the map has an entry": `inline_host_session`
   and `resolve_card_target`'s in-flight arm (`src/bridge/pollers.rs`),
@@ -107,7 +127,8 @@ just asked for. Nothing new renders it.
   overflow notice. The card it arms is live, so the next sweep lands them.
 - ADR-0028's suppression heuristic dies with the card: `/card` always answers.
 - `build_switched_state_card` moves to `feishu::card::session`; it carries
-  ADR-0052's 返回列表 button, which must survive for a switch-list adoption.
+  ADR-0052's 返回列表 button, which must survive on the list card the switch-list
+  op patches in place.
 - The **External Message**'s card is out of scope. `build_external_message_card`
   and its `Turn` arm are already the shared path; this decision neither changes
   them nor folds them into the idle state.
