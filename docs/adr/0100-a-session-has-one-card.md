@@ -131,10 +131,12 @@ two are separate compositions that can drift.
   same function, so the idle card and the follow cannot render different bodies
   for the same read.
 - Every reader of the in-memory card map that means *the session's live card*
-  asks `Turn::is_running` instead of "the map has an entry": `inline_host_session`
-  and `resolve_card_target`'s in-flight arm (`src/bridge/pollers.rs`),
-  `ExternalFlow::wake_reply_target`, and the click's inline-host decision
-  (`RequestFlow::handle_card_action`, `src/bridge/request/flow.rs`). `is_running` is
+  asks `Turn::is_running` instead of "the map has an entry":
+  `inline_host_session` and `resolve_card_target`'s in-flight arm
+  (`src/bridge/pollers.rs`), and the click's inline-host decision
+  (`RequestFlow::handle_card_action`, `src/bridge/request/flow.rs`).
+  `ExternalFlow::wake_reply_target` asks the chain-card predicate instead — the
+  Wake exception below. `is_running` is
   `!is_terminal()`, so `Waiting` still counts (it is the chain's newest card) and
   `Restarted` still counts (deliberately not terminal). One wake-specific
   exception: a Wake continues the Session's **Card Chain**, so a terminal chain
