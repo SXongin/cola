@@ -515,28 +515,14 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
         card_id: &str,
-        mut prepared: PreparedExternalRender,
+        prepared: PreparedExternalRender,
         refuse_if_running: bool,
     ) -> bool {
-        prepared.acc.set_reply_target(Some(card_id.to_string()));
-        let session_dir = prepared.session_dir.clone();
-        let chain_id = {
-            // The durable seed and the insert share ONE cards-map critical
-            // section (issue #671, ticket #672): a landed mark must not slip
-            // past a seed read taken before it, leaving this render to re-show
-            // the retirement.
-            let mut live = cards.cards.lock().await;
-            // The render-owned arm's commit is also a compare-and-swap for the
-            // `/card` post (ADR-0100): a Turn installed during the send owns
-            // the card, so this read must not overwrite it.
-            if refuse_if_running && live.get(session_id).is_some_and(state::CardSession::is_running) {
-                return false;
-            }
-            Self::seed_durable_announcements(cards, session_id, &mut prepared.acc);
-            let session = state::CardSession::new(prepared.acc, Some(card_id.to_string()));
-            let chain_id = session.chain_id();
-            live.insert(session_id.to_string(), session);
-            chain_id
+        let Some((chain_id, session_dir)) =
+            Self::insert_external_render_locked(cards, session_id, card_id, prepared, refuse_if_running)
+                .await
+        else {
+            return false;
         };
         // An adopted run's card is the session's live card: take the chain over
         // (the anchor is known here, so the record needs no transcript probe,
@@ -545,7 +531,49 @@ impl Turn {
         // that interleaved after the insert can never be re-pointed at — or
         // have its record replaced by — a read that is no longer the Session's
         // card.
-        Self::take_over_card_if_current(cards, session_id, card_id, chain_id, Some(&session_dir)).await
+        Self::record_external_render_locked(cards, session_id, card_id, chain_id, &session_dir).await
+    }
+
+    /// The insert half of [`Self::commit_external_render_locked`]: the durable
+    /// seed and the render-owned `CardSession` in one cards-map critical
+    /// section. Returns the card's chain identity and directory for the record
+    /// write, or `None` when the CAS refuses.
+    pub(crate) async fn insert_external_render_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_id: &str,
+        mut prepared: PreparedExternalRender,
+        refuse_if_running: bool,
+    ) -> Option<(u64, String)> {
+        prepared.acc.set_reply_target(Some(card_id.to_string()));
+        let session_dir = prepared.session_dir.clone();
+        // The durable seed and the insert share ONE cards-map critical section
+        // (issue #671, ticket #672): a landed mark must not slip past a seed
+        // read taken before it, leaving this render to re-show the retirement.
+        let mut live = cards.cards.lock().await;
+        // The render-owned arm's commit is also a compare-and-swap for the
+        // `/card` post (ADR-0100): a Turn installed during the send owns the
+        // card, so this read must not overwrite it.
+        if refuse_if_running && live.get(session_id).is_some_and(state::CardSession::is_running) {
+            return None;
+        }
+        Self::seed_durable_announcements(cards, session_id, &mut prepared.acc);
+        let session = state::CardSession::new(prepared.acc, Some(card_id.to_string()));
+        let chain_id = session.chain_id();
+        live.insert(session_id.to_string(), session);
+        Some((chain_id, session_dir))
+    }
+
+    /// The record half of [`Self::commit_external_render_locked`], split out so
+    /// the `/card` arm can spawn its render loop before this await.
+    pub(crate) async fn record_external_render_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_id: &str,
+        chain_id: u64,
+        session_dir: &str,
+    ) -> bool {
+        Self::take_over_card_if_current(cards, session_id, card_id, chain_id, Some(session_dir)).await
     }
 
     /// What Session Sync owes for this read: `None` when the chain has

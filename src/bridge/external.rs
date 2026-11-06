@@ -54,7 +54,17 @@ pub struct ExternalFlow {
     /// coordinator: this pass settles a yielded card's quiet true end (ADR-0060)
     /// and announces it with the same notice every other turn end sends.
     notice: NoticeRules,
+    /// Test-only: parks `/card`'s follow arm after its map insert and renderer
+    /// spawn, so a test can abort it before the seed/record awaits and prove
+    /// the renderer survives.
+    #[cfg(test)]
+    pub(crate) arm_after_spawn_gate: Arc<Mutex<Option<ArmAfterSpawnGate>>>,
 }
+
+/// Test-only gate pair: `entered` fires after the arm's map insert + spawn;
+/// `release` lets the arm continue to its seed and record.
+#[cfg(test)]
+pub(crate) type ArmAfterSpawnGate = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 /// A busy follow's prepared facts (ADR-0100): everything
 /// [`ExternalFlow::arm_snapshot_follow_locked`] needs except the card id, which
@@ -95,6 +105,8 @@ impl ExternalFlow {
             render_idle_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
             wake_settle_grace_ms: std::sync::atomic::AtomicU64::new(600_000),
             notice,
+            #[cfg(test)]
+            arm_after_spawn_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -848,8 +860,34 @@ impl ExternalFlow {
         refuse_if_running: bool,
     ) -> bool {
         let prepared = plan.prepared.take().expect("a follow plan is armed exactly once");
-        Turn::commit_external_render_locked(&handles.cards, session_id, card_id, prepared, refuse_if_running)
-            .await
+        let Some((chain_id, session_dir)) = Turn::insert_external_render_locked(
+            &handles.cards,
+            session_id,
+            card_id,
+            prepared,
+            refuse_if_running,
+        )
+        .await
+        else {
+            return false;
+        };
+        // The insert and the spawn are indivisible to cancellation: this is a
+        // SYNC spawn, with no await between the map insert returning and the
+        // renderer existing. The loop immediately waits on the session write
+        // lock the caller still holds, so it cannot run before the seed below;
+        // a cancellation at any later await (seed, chain record) drops the
+        // guard but leaves the renderer alive.
+        self.spawn_snapshot_follow(handles, session_id, plan);
+        #[cfg(test)]
+        {
+            let gate = self.arm_after_spawn_gate.lock().await.take();
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        self.seed_snapshot_follow_locked(handles, session_id, plan).await;
+        Turn::record_external_render_locked(&handles.cards, session_id, card_id, chain_id, &session_dir).await
     }
 
     /// Seed the resolved requests onto the armed card, under the caller's card
@@ -894,9 +932,11 @@ impl ExternalFlow {
         tracing::info!("busy follow armed for session {}", session_id);
     }
 
-    /// Spawn the follow's render loop. Runs AFTER the card write lock is
-    /// released: the loop takes its own locks, and holding the post-and-arm
-    /// lock while spawning would only widen the critical section.
+    /// Spawn the follow's render loop. Called while the arm still holds the
+    /// card write lock, immediately after the map insert — a sync spawn with no
+    /// await before it, so cancellation cannot leave a render-owned card with
+    /// nothing flushing it. The loop's own render pass waits on the same write
+    /// lock, so it starts only after the arm releases it.
     pub(crate) fn spawn_snapshot_follow(
         &self,
         handles: &FlowHandles,

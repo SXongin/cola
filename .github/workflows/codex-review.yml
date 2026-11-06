@@ -4,8 +4,9 @@
 # `main: review` ruleset needs (ADR-0034 item 6); it replaces the OpenCode
 # review workflow (trial: issue #516 / PR #517).
 #
-# The gate's provider, endpoint, model and secret are workflow configuration,
-# not an ADR pin (ADR-0034, 2026-10-17 amendment) — this comment is the record,
+# The gate's provider, endpoint, model and secret are repository configuration,
+# not an ADR pin (ADR-0034, 2026-11-07 amendment; it supersedes the 2026-10-17
+# amendment's workflow-diff rule) — this comment is the record of the defaults,
 # and the switch lives in repository settings rather than in this file:
 #
 #   vars.GATE_ENDPOINT   overrides the Responses endpoint

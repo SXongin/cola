@@ -2904,6 +2904,10 @@ impl FlowHandles {
 pub(crate) struct SnapshotHandles {
     pub(crate) sessions: SessionsHandle,
     pub(crate) backend: Arc<dyn crate::backend::Backend>,
+    /// How long the adoption read may take before it degrades to the
+    /// title-only line. Defaults to the same 30 s bound the gate and the
+    /// request flows use; tests may shorten it.
+    pub(crate) read_timeout_ms: u64,
 }
 
 impl SnapshotHandles {
@@ -2912,6 +2916,7 @@ impl SnapshotHandles {
         Self {
             sessions: flow.sessions.clone(),
             backend: Arc::clone(&flow.backend),
+            read_timeout_ms: 30_000,
         }
     }
 }

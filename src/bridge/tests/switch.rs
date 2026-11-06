@@ -460,7 +460,7 @@ async fn switch_reeswitch_line_carries_the_background_wait() {
     assert_eq!(line.lines().count(), 1, "one line only: {line}");
 }
 /// ADR-0100: an adopt-time pending request makes the line say 等待你的确认
-/// (the operator's action outranks the run state) — and the adoption posts no
+/// (the Host's action outranks the run state) — and the adoption posts no
 /// card; the request keeps its own card through the ordinary sweep.
 #[tokio::test]
 async fn switch_reeswitch_line_carries_the_pending_status() {

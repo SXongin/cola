@@ -1089,29 +1089,23 @@ async fn post_idle_card(
         .directory_for_session(session_id)
         .await
         .unwrap_or_default();
-    // `/card` always answers: every backend read in the gather and the follow
-    // prepare is bounded by the flow's request timeout. A server that accepts
-    // TCP but never replies must not hang the command; on timeout the
-    // best-effort static read (no status, no tail) is still posted.
-    let read = crate::bridge::bounded_call(
-        "card read",
-        handles
-            .external
-            .request_timeout_ms
-            .load(std::sync::atomic::Ordering::Relaxed),
-        async {
-            let data =
-                crate::bridge::snapshot::gather_snapshot(&handles.flow.backend, session_id, &directory).await;
-            let follow = handles
-                .external
-                .prepare_snapshot_follow(&handles.flow, &data)
-                .await;
-            Ok::<_, crate::error::BridgeError>((data, follow))
-        },
-    )
+    // `/card` always answers, and the two reads are bounded SEPARATELY: a
+    // gather timeout posts the best-effort static read (no status, no tail),
+    // while a prepare timeout keeps the good gather and posts the static read
+    // from it. A server that accepts TCP but never replies cannot hang the
+    // command.
+    let timeout_ms = handles
+        .external
+        .request_timeout_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let gathered = crate::bridge::bounded_call("card read", timeout_ms, async {
+        Ok::<_, crate::error::BridgeError>(
+            crate::bridge::snapshot::gather_snapshot(&handles.flow.backend, session_id, &directory).await,
+        )
+    })
     .await;
-    let (data, mut follow) = match read {
-        Some(Ok(pair)) => pair,
+    let (data, gathered_ok) = match gathered {
+        Some(Ok(data)) => (data, true),
         _ => {
             tracing::warn!(
                 "card read: session {session_id} read timed out; posting the best-effort static read"
@@ -1127,9 +1121,31 @@ async fn post_idle_card(
                     newest_user_anchor: None,
                     newest_user_is_cola_authored: false,
                 },
-                None,
+                false,
             )
         }
+    };
+    let mut follow = if gathered_ok {
+        let prepared = crate::bridge::bounded_call("card follow prepare", timeout_ms, async {
+            Ok::<_, crate::error::BridgeError>(
+                handles
+                    .external
+                    .prepare_snapshot_follow(&handles.flow, &data)
+                    .await,
+            )
+        })
+        .await;
+        match prepared {
+            Some(Ok(follow)) => follow,
+            _ => {
+                tracing::warn!(
+                    "card read: session {session_id} follow prepare timed out; posting the static read"
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
     // The follow's identity line names the Session the same way an adoption
     // does; the read itself never carried a title.
@@ -1185,7 +1201,24 @@ async fn post_idle_card(
         // silently does nothing. The stamp is under the lock for exactly that
         // ordering; it is a bounded GET + PATCH on another message.
         if let Some(previous) = &previous {
-            crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+            let stamped = crate::bridge::chain::stamp_taken_over(
+                cards,
+                &previous.message_id,
+                None,
+                previous.actionable,
+            )
+            .await;
+            if previous.actionable && !stamped {
+                // The Retry/重新发起 control could not be removed. Keep the
+                // old card current so the button stays live; the posted read
+                // stays untracked.
+                drop(guard);
+                tracing::warn!(
+                    "card read: session {session_id} could not stamp the actionable card {}; leaving it current",
+                    previous.message_id
+                );
+                return Ok(());
+            }
         }
         // The send awaited; a Turn may have installed itself meanwhile. The
         // arm's own compare-and-swap refuses a running card, so the read is not
@@ -1205,23 +1238,15 @@ async fn post_idle_card(
                 .lock()
                 .await
                 .remove(session_id);
-            handles
-                .external
-                .seed_snapshot_follow_locked(&handles.flow, session_id, plan)
-                .await;
         }
         drop(guard);
         if armed {
-            // Start the renderer as soon as the lock is released: an abort (or
-            // a stalled read) must never leave a live card with nothing
-            // flushing it. The arm and seed are already committed under the
-            // lock.
-            handles
-                .external
-                .spawn_snapshot_follow(&handles.flow, session_id, plan);
+            // The arm already spawned the renderer right after its map insert
+            // (before the seed/record awaits), so a cancellation anywhere after
+            // that point leaves a live card with a render loop.
             tracing::info!("card read: session {session_id} follows the running turn on the posted card");
         } else {
-            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card), false).await;
             tracing::info!(
                 "card read: session {session_id} a Turn took the card during the follow read; the posted read is stamped"
             );
@@ -1232,7 +1257,20 @@ async fn post_idle_card(
     // follow branch: an actionable terminal's Retry/重新发起 must not survive
     // the insert that makes its click resolve against the read.
     if let Some(previous) = &previous {
-        crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+        let stamped =
+            crate::bridge::chain::stamp_taken_over(cards, &previous.message_id, None, previous.actionable)
+                .await;
+        if previous.actionable && !stamped {
+            // The dead-control invariant outranks the read: leave the Error
+            // card current (its Retry still works) and the posted read
+            // untracked.
+            drop(guard);
+            tracing::warn!(
+                "card read: session {session_id} could not stamp the actionable card {}; leaving it current",
+                previous.message_id
+            );
+            return Ok(());
+        }
     }
     // The send awaited; a Turn may have installed itself meanwhile. The CAS in
     // `record_idle_card` refuses a running card, and the read then stays a
@@ -1243,7 +1281,7 @@ async fn post_idle_card(
     if recorded {
         tracing::info!("card read: session {session_id} idle Session Card posted");
     } else {
-        crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+        crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card), false).await;
         tracing::info!(
             "card read: session {session_id} a Turn took the card during the read; the posted read is stamped"
         );
