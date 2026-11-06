@@ -1036,6 +1036,55 @@ async fn a_wake_after_a_card_read_opens_a_fresh_card_in_a_topic() {
     );
 }
 
+/// A **Wake-less** residual tail after `/card` must not spin the residual
+/// floor (ADR-0100): the idle read joins no chain, so the Fresh gate sees no
+/// Wake and decides nothing. Nothing PATCHes the read, no card opens, and no
+/// per-tick WARN is emitted while the stale record (if any) waits for the next
+/// Turn's `seed_orphan_delta`.
+#[tokio::test]
+async fn a_wake_less_tail_after_a_card_read_is_silent() {
+    let _wd = test_work_dir();
+    let late = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+        assistant(3_100, "收尾时补上的一段。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![late], Some(SessionStatus::Idle)).await;
+    assert!(
+        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        "the read is installed"
+    );
+
+    let ((), logs) = capture_logs(async {
+        spawn_sync(&app);
+        // Several Sync ticks: the old residual arm warned on each one.
+        wait_for_transcript_reads(&backend, "ses_test", 3).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == "om_read"
+        )),
+        "the read is never repainted: {calls:?}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "a Wake-less tail opens no card: {calls:?}"
+    );
+    assert_eq!(
+        level_count(&logs, "wake continuation", "WARN"),
+        0,
+        "no per-tick wake WARN: {logs}"
+    );
+}
+
 /// Acceptance 3, second half: after a simulated cola restart (no card chain in
 /// memory at all) a Wake still posts a continuation card — the path is scoped
 /// by the Wake's own server time, so the lost card's content is never replayed.

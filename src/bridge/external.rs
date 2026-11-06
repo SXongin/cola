@@ -1341,12 +1341,13 @@ impl ExternalFlow {
     ) -> Option<String> {
         // A Wake continues the Session's Card Chain, so it asks whether the
         // map entry is a chain card — not whether it is live. A terminal chain
-        // card still supplies the user message its chain answers; only an Idle
-        // Session Card, which joins no chain, is refused (ADR-0100). A `/card`
-        // read replaces the terminal card, so from then on a Topic's anchor is
-        // the fallback; a main chat has none, and a late Wake after the read is
-        // the ADR-0100 exception — nothing may re-point the read at a chain it
-        // does not own.
+        // card still supplies the user message its chain answers; an Idle
+        // Session Card, which joins no chain, is never a target (ADR-0100). A
+        // `/card` read replaces the terminal card, and `wake_continuation`
+        // routes a late Wake to the Fresh arm: it opens a new continuation card,
+        // replying to a Topic's anchor when there is one and sending top-level
+        // in a main chat. Nothing re-points the read at a chain it does not
+        // own — the anchor below is only the Fresh card's delivery target.
         if Turn::is_chain_card(&handles.cards, sid).await
             && let Some(target) = Turn::reply_target(&handles.cards, sid).await
         {
@@ -1482,9 +1483,12 @@ async fn is_already_surfaced(
 /// all, since a header with nothing under it would read as an empty
 /// conversation.
 ///
-/// No overflow notice renders here (ADR-0100): overflow is no longer a decision
-/// the card makes, and a live card must not carry a send-time count a
-/// resolution can make stale.
+/// No overflow notice renders here (ADR-0100): overflow is no longer a
+/// decision the card makes, and that notice would name requests THIS card never
+/// carries (they live on their own cards). The count-only pointer above is a
+/// different fact: it is the exact seed set this card carries at send, so it
+/// may age as a block resolves — the blocks below carry their own receipts and
+/// stay truthful.
 pub(crate) fn snapshot_follow_lead(
     verb: &str,
     title: &str,

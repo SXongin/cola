@@ -197,6 +197,12 @@ two are separate compositions that can drift.
   ADR-0028's `pending_elsewhere` already carried.
 - An idle card joins no Chain Record, so a restart does not reap it: it stays in
   the chat as a static message. That is the intended meaning of a read.
+- A **Wake-less** residual tail after `/card` has no anchor to scope it: it
+  falls through to the Fresh gate with no Wake and decides nothing, so it is not
+  rendered immediately. The stale Chain Record and its Rendered Cursor survive
+  the read, so the next Turn's `seed_orphan_delta` renders the undelivered delta
+  on that Turn's card. The read is never repainted and no per-tick warning is
+  emitted while the tail waits.
 
 ## Reconciled references
 
