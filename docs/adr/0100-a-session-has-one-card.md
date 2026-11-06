@@ -92,16 +92,20 @@ would take the chain over. With cola's own renderer alive `/card` never reaches
 this branch — it pulls — so the guard only covers a run cola lost its renderer
 for.
 
-The post and the arm are **one critical section** under the session's card write
-lock: the read, the send, the `CardSession` insert, the seed of the read's
-pendings and the arm all happen inside it. `RequestFlow::surface` takes that same
-lock for its whole decision — host lookup, insertion, standalone send — so the
-sweep can never observe the intermediate state (an Idle card about to become
-render-owned) and cannot post a second card for a request the follow is about to
-host. The insertion split the flush already uses (`flush_card_locked`) is the
-pattern: `add_inline` gains a lock-held variant instead of re-acquiring. The seed
-filters with `is_already_surfaced`, so a request the sweep had surfaced before
-`/card` began keeps its own card and is simply not seeded.
+The post and the arm are **one commit**, ordered so a cancellation can never
+publish a half-built card. The command reads, builds the follow's accumulator and
+seeds the read's pendings **off the card map**; then, under the session's card
+write lock, it sends the card and inserts the render-owned `CardSession` carrying
+the id the send returned, together with the chain record. Nothing reaches
+`cards.cards` before that insert, so a command cancelled earlier leaves no Idle
+card behind: the next sweep surfaces the requests normally, and the sent card —
+if the send had already returned — stays a static read, not a host.
+`RequestFlow::surface` takes the same lock for its whole decision, so it cannot
+observe the window either. The seed filters with `is_already_surfaced`, so a
+request the sweep had surfaced before `/card` began keeps its own card and is
+simply not seeded. A cancellation after the insert leaves an armed card with a
+live `CardSession` and no render loop; that is the ordinary wedge every renderer
+can leave, handled by the reap, not a second card.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and
