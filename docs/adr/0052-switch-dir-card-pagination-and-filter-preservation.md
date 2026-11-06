@@ -102,3 +102,12 @@ visibility rule and match rule stand.
 - ADR-0051 and ADR-0046 carry amendment banners; ADR-0028 is amended for the
   返回列表 button; CONTEXT.md's Recent Directories entry notes pagination; #318
   closes with the preserve decision.
+
+## Amendment (2026-11-06): the button rides the patched list card
+
+ADR-0100 deletes the Session Snapshot card, so the full snapshot form of the
+返回列表 button no longer exists. The suppressed 已切换 state card is now its only
+home: the switch-list op patches the clicked list card **in place** to that
+compact state, button included, and sends no new message. A text adoption has no
+list card to return to and carries no button, exactly as before. The filter the
+button round-trips (keyword/scope/page) is unchanged.
