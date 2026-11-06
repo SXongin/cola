@@ -42,16 +42,17 @@ A session has one card, the **Session Card**, with two driving modes:
   continuing at the bottom.
 - **Nothing owns it**: `/card` reads the session once (`gather_snapshot`) and
   renders that read as a one-shot Session Card — a real `CardSession` in a new
-  **`CardState::Idle`** (terminal, so `CardSession::is_running` is false and no
-  live-card gate admits it), seeded with an `ExternalCardLead::Static` lead and
-  flushed once. The arm is a **non-recording** variant of
-  `Turn::arm_external_render`: that seam ends by calling `Turn::take_over_card`,
-  which writes the Chain Record, so reusing it verbatim would make cola the
-  session's card owner and let a restart's reap or a Wake treat the readout as a
-  live card. The idle arm stops before the record write; it writes **no Chain
-  Record**, so no Wake, reap or ownership verdict may treat it as one, and an
-  existing record still names the chain's card — the idle card is not the
-  session's chain.
+  **`CardState::Idle`** (terminal, so the card's own `CardSession::is_running` is
+  false and the handle-level `Turn::is_running` never admits it), seeded with an
+  `ExternalCardLead::Static` lead and flushed once. The arm is a **non-recording**
+  variant of `Turn::arm_external_render`: that seam ends by calling
+  `Turn::take_over_card`, which writes the Chain Record, so reusing it verbatim
+  would make cola the session's card owner and let a restart's reap or a Wake
+  treat the readout as a live card. The idle arm stops before the record write —
+  including its predecessor collect, so a chain an earlier Turn still owns is
+  left alone — and writes **no Chain Record**. No Wake, reap or ownership verdict
+  may treat it as one, and an existing record still names the chain's card: the
+  idle card is not the session's chain.
 
 The idle card — a Session Card in `CardState::Idle` — is **read-only**. It
 carries the status line (等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲),
@@ -93,7 +94,7 @@ just asked for. Nothing new renders it.
   asks `Turn::is_running` instead of "the map has an entry": `inline_host_session`
   and `resolve_card_target`'s in-flight arm (`src/bridge/pollers.rs`),
   `ExternalFlow::wake_reply_target`, and the click's inline-host decision
-  (`RequestFlow::handle_action`, `src/bridge/request/flow.rs`). `is_running` is
+  (`RequestFlow::handle_card_action`, `src/bridge/request/flow.rs`). `is_running` is
   `!is_terminal()`, so `Waiting` still counts (it is the chain's newest card) and
   `Restarted` still counts (deliberately not terminal). Without this, an idle card
   in the map would take a stale permission click down the inline path — the ack
@@ -141,8 +142,10 @@ just asked for. Nothing new renders it.
 
 ## Reconciled references
 
-Each ADR this decision touches carries its own banner; this is the index, so a
-reader finds the change from either end:
+Each ADR this decision touches carries its own banner or amendment; this is the
+index, so a reader finds the change from either end. One term per status:
+**superseded** retires an ADR, **retired** retires a rule, **kept** leaves a rule
+standing.
 
 - ADR-0038 rule 6 — the Session Snapshot's claimed blocks. **Retired**: the
   claim registry goes, so every Interaction Block lives on a live card or its own
