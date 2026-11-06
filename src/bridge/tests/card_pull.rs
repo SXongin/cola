@@ -13,7 +13,7 @@ use crate::backend::{FinishReason, MessageId, MessageRole, Part, SessionTranscri
 use crate::bridge::snapshot::SnapshotData;
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
-use crate::feishu::card::session::FOLLOW_HINT;
+use crate::feishu::card::session::{FOLLOW_HINT, LEAD_COMPACTION_PREFIX};
 
 /// A backend whose `ses_test` transcript carries one question and one answer,
 /// so an idle read has a 最近对话 tail to render.
@@ -953,6 +953,114 @@ async fn a_card_read_cancelled_inside_the_commit_publishes_no_card() {
         cards.chains.get("ses_test").is_none(),
         "an aborted commit writes no Chain Record"
     );
+}
+
+/// `/card` always answers: a backend that hangs its transcript read times out
+/// into the best-effort static read instead of hanging the command.
+#[tokio::test]
+async fn a_hanging_card_read_posts_a_best_effort_static_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = idle_read_backend();
+    backend.hang_transcript_for("ses_test").await;
+    let (app, platform) = build_app(cfg, backend).await;
+    app.core
+        .external
+        .request_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        app.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        )),
+    )
+    .await
+    .expect("/card must answer even when a backend read hangs");
+
+    let card = one_posted_card(&platform).await;
+    assert_eq!(card["header"]["title"]["content"], "📄 会话");
+    let text = card_text(&card);
+    assert!(
+        !text.contains("⚙️ 运行中") && !text.contains("**最近对话**"),
+        "the timed-out read posts an empty best-effort body: {text}"
+    );
+}
+
+/// The render loop is spawned BEFORE the previous card's stamp, so aborting the
+/// command inside that best-effort GET/PATCH still leaves the armed card with a
+/// renderer: the next content lands on it.
+#[tokio::test]
+async fn an_abort_during_the_old_card_stamp_still_leaves_the_follow_rendering() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(idle_read_backend());
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+    platform.given_reply_id("om_idle");
+    platform.given_reply_id("om_follow");
+
+    // First `/card`: an idle read becomes the current card.
+    app.handle_message(incoming(
+        "msg_card_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle")
+    );
+    let idle = platform.replied_cards().await[0].clone();
+    platform.given_card_view("om_idle", idle);
+    backend
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy))
+        .await;
+
+    // The follow arms and spawns, then parks in the previous card's stamp.
+    let (entered, release) = platform.pause("update", "om_idle");
+    let app2 = app.clone();
+    let second = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card_2".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    second.abort();
+    let _ = second.await;
+    release.notify_one();
+
+    wait_for_card_update(
+        &platform,
+        "the armed follow renders despite the aborted stamp",
+        CardUpdates::Any,
+        |card| card_text(card).contains(FOLLOW_HINT),
+    )
+    .await;
 }
 
 /// The follow's identity line names the Session by its real title, exactly as
@@ -1996,13 +2104,15 @@ fn idle_card_body(card: &serde_json::Value) -> RenderedBody {
 /// A message body is MULTI-LINE, so the tail is parsed by its role prefix rather
 /// than line-by-line: a line that starts with a role marker opens an entry and
 /// every following line (blank ones included) belongs to that entry's body until
-/// the next marker. That keeps a body's interior line breaks — a line-splitting
-/// parser would read a second line as a marker row.
+/// the next marker. A Compaction row opens with [`LEAD_COMPACTION_PREFIX`] and
+/// keeps its folded summary as following lines, so the marker's (title, body)
+/// pair can be compared with the card's panel.
 fn follow_lead_body(lead: &str) -> RenderedBody {
     let (_, text) = lead.split_once("\n\n").expect("identity line, then the body");
     let mut body = RenderedBody::default();
     let mut in_tail = false;
     let mut open: Option<(String, String)> = None;
+    let mut marker: Option<(String, String)> = None;
     for line in text.lines() {
         if line == "**最近对话**" {
             in_tail = true;
@@ -2014,24 +2124,43 @@ fn follow_lead_body(lead: &str) -> RenderedBody {
             }
             continue;
         }
-        if let Some((role, first)) = split_role_line(line) {
+        if let Some(title) = line.strip_prefix(LEAD_COMPACTION_PREFIX) {
             if let Some(entry) = open.take() {
                 body.messages.push(entry);
+            }
+            if let Some(entry) = marker.take() {
+                body.markers.push(entry);
+            }
+            marker = Some((title.to_string(), String::new()));
+        } else if let Some((role, first)) = split_role_line(line) {
+            if let Some(entry) = open.take() {
+                body.messages.push(entry);
+            }
+            if let Some(entry) = marker.take() {
+                body.markers.push(entry);
             }
             open = Some((role, first));
         } else if let Some((_, message)) = open.as_mut() {
             message.push('\n');
             message.push_str(line);
+        } else if let Some((_, marker_body)) = marker.as_mut() {
+            if !marker_body.is_empty() {
+                marker_body.push('\n');
+            }
+            marker_body.push_str(line);
         } else if line.starts_with("…更早的") {
             body.omitted = Some(line.to_string());
         } else if !line.is_empty() {
-            // The lead must not carry a commit marker: record it so the test
-            // that asserts its absence can see one if it ever comes back.
+            // The lead must not carry an unmatched commit marker: record it so
+            // the parity test can see one if it ever comes back.
             body.markers.push((line.to_string(), String::new()));
         }
     }
     if let Some(entry) = open.take() {
         body.messages.push(entry);
+    }
+    if let Some(entry) = marker.take() {
+        body.markers.push(entry);
     }
     body
 }
@@ -2105,10 +2234,10 @@ fn the_idle_card_and_the_busy_follow_render_the_same_body() {
     assert_eq!(card_body.omitted, lead_body.omitted);
 }
 
-/// The parity holds for the Waiting copy too: with `busy_now = false` the lead
-/// says the wait is in progress, while the body's status chip stays the
-/// composition's 等待后台任务 arm on both drivers. The follow promise is the one
-/// deliberate difference: only the followed card will keep updating (ADR-0100).
+/// The parity holds for the Waiting copy too: with `busy_now = false` the
+/// identity line says the wait is in progress, while the shared body is the
+/// 等待后台任务 chip on BOTH drivers — the update promise lives in the identity
+/// line, never in the body (#1002).
 #[test]
 fn the_parity_holds_for_the_waiting_copy() {
     let read = parity_read(
@@ -2132,31 +2261,27 @@ fn the_parity_holds_for_the_waiting_copy() {
         let card_body = idle_card_body(&card);
         let lead_body = follow_lead_body(&lead);
         assert_eq!(
+            card_body, lead_body,
+            "the same read renders the same body, busy_now={busy_now}: {lead}"
+        );
+        assert_eq!(
             card_body.lead,
             vec![crate::feishu::card::session::WAITING_BACKGROUND_CHIP.to_string()],
-            "the static read carries the chip without an update promise, busy_now={busy_now}"
+            "the body carries the chip without an update promise"
         );
-        assert_eq!(
-            lead_body.lead,
-            vec![
-                crate::feishu::card::session::WAITING_BACKGROUND_CHIP.to_string(),
-                crate::feishu::card::session::FOLLOW_HINT.to_string(),
-            ],
-            "the followed card keeps the promise, busy_now={busy_now}"
-        );
-        assert_eq!(
-            card_body.messages, lead_body.messages,
-            "same tail, busy_now={busy_now}"
+        assert!(
+            identity.contains(FOLLOW_HINT),
+            "the follow promise is on the identity line: {identity}"
         );
     }
 }
 
-/// A Compaction marker is the ONE deliberate difference: the card keeps it at
-/// its server position (its 最近对话 tail has no timeline), while the live
-/// lead drops it because the follow card's own timeline renders the session's
-/// compaction rows (ADR-0082) — repeating it would show the reader two.
+/// One Busy read with a Compaction marker renders the SAME body through both
+/// drivers (#999/#1002): the marker keeps its server position and the card and
+/// the follow lead agree on every field. The follow's promise is in its identity
+/// line, not the shared body.
 #[test]
-fn the_parity_keeps_the_marker_on_the_card_and_drops_it_from_the_lead() {
+fn the_parity_keeps_the_compaction_marker_on_both_drivers() {
     let read = parity_read(
         crate::backend::types::SessionStatus::Busy,
         false,
@@ -2176,27 +2301,20 @@ fn the_parity_keeps_the_marker_on_the_card_and_drops_it_from_the_lead() {
         vec![("已压缩上下文（自动）".to_string(), "保留了结论。".to_string())],
         "the card keeps the marker at its server position: {card}"
     );
-    assert!(
-        lead_body.markers.is_empty(),
-        "the live lead drops the marker: {lead:?}"
-    );
     assert_eq!(
-        card_body.messages, lead_body.messages,
-        "dropping the marker does not drop a message"
+        lead_body.markers, card_body.markers,
+        "the lead keeps the same marker at the same position: {lead}"
     );
-    // The followed card says it keeps updating; the one-shot read does not.
+    assert_eq!(card_body, lead_body, "same body through both drivers: {lead}");
     assert_eq!(
         card_body.lead,
         vec![crate::feishu::card::session::BUSY_CHIP.to_string()],
-        "the static read carries no update promise"
+        "the shared body carries no update promise"
     );
-    assert_eq!(
-        lead_body.lead,
-        vec![
-            crate::feishu::card::session::BUSY_CHIP.to_string(),
-            crate::feishu::card::session::FOLLOW_HINT.to_string(),
-        ],
-        "the followed card keeps the promise"
+    let identity = lead.split_once("\n\n").expect("identity, then body").0;
+    assert!(
+        identity.contains(FOLLOW_HINT),
+        "the follow promise is on the identity line: {identity}"
     );
 }
 

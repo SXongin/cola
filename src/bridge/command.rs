@@ -1085,14 +1085,48 @@ async fn post_idle_card(
         .directory_for_session(session_id)
         .await
         .unwrap_or_default();
-    let data = crate::bridge::snapshot::gather_snapshot(&handles.flow.backend, session_id, &directory).await;
-    // The follow is decided from the read, before the write lock: the
-    // accumulator is built off the card map, so a cancellation up to the
-    // commit publishes nothing. The seed filter waits for the lock.
-    let mut follow = handles
-        .external
-        .prepare_snapshot_follow(&handles.flow, &data)
-        .await;
+    // `/card` always answers: every backend read in the gather and the follow
+    // prepare is bounded by the flow's request timeout. A server that accepts
+    // TCP but never replies must not hang the command; on timeout the
+    // best-effort static read (no status, no tail) is still posted.
+    let read = crate::bridge::bounded_call(
+        "card read",
+        handles
+            .external
+            .request_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        async {
+            let data =
+                crate::bridge::snapshot::gather_snapshot(&handles.flow.backend, session_id, &directory).await;
+            let follow = handles
+                .external
+                .prepare_snapshot_follow(&handles.flow, &data)
+                .await;
+            Ok::<_, crate::error::BridgeError>((data, follow))
+        },
+    )
+    .await;
+    let (data, mut follow) = match read {
+        Some(Ok(pair)) => pair,
+        _ => {
+            tracing::warn!(
+                "card read: session {session_id} read timed out; posting the best-effort static read"
+            );
+            (
+                crate::bridge::snapshot::SnapshotData {
+                    session_id: session_id.to_string(),
+                    directory: directory.clone(),
+                    status: None,
+                    waiting: false,
+                    pending: Vec::new(),
+                    tail: Vec::new(),
+                    newest_user_anchor: None,
+                    newest_user_is_cola_authored: false,
+                },
+                None,
+            )
+        }
+    };
     // The follow's identity line names the Session the same way an adoption
     // does; the read itself never carried a title.
     let title = if follow.is_some() {
@@ -1166,14 +1200,16 @@ async fn post_idle_card(
         }
         drop(guard);
         if armed {
-            // The stamp is a card-view GET + PATCH on another message: keep it
-            // out of the card write lock.
-            if let Some(previous) = previous {
-                crate::bridge::chain::stamp_taken_over(cards, &previous, None).await;
-            }
+            // Start the renderer BEFORE the previous card's stamp: the stamp is
+            // a best-effort GET + PATCH on another message, and an abort (or a
+            // stalled read) must never leave a live card with nothing flushing
+            // it. The arm and seed are already committed under the lock.
             handles
                 .external
                 .spawn_snapshot_follow(&handles.flow, session_id, plan);
+            if let Some(previous) = previous {
+                crate::bridge::chain::stamp_taken_over(cards, &previous, None).await;
+            }
             tracing::info!("card read: session {session_id} follows the running turn on the posted card");
         } else {
             crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;

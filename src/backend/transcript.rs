@@ -1356,7 +1356,9 @@ impl TailEntry {
     }
 
     /// This entry as a conversation message — `None` for a Compaction marker,
-    /// which is a marker rather than a message.
+    /// which is a marker rather than a message. Test-only now that the live
+    /// lead keeps markers and iterates the entries themselves.
+    #[cfg(test)]
     pub fn message(&self) -> Option<&TailMessage> {
         match self {
             TailEntry::Message(message) => Some(message),

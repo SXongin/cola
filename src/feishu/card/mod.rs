@@ -779,7 +779,7 @@ mod tests {
         }
     }
 
-    /// The idle state (ADR-0100) is the Session Card's readout: terminal — no
+    /// The idle state (ADR-0100) is the Session Card's read: terminal — no
     /// renderer owns it, so `CardSession::is_running` is false and every
     /// live-card gate refuses it — and it carries no Turn furniture: the header
     /// shows no phase timer and the builder renders no Turn Footer. It owns no

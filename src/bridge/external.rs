@@ -739,6 +739,10 @@ impl ExternalFlow {
         busy_now: bool,
         data: &crate::bridge::snapshot::SnapshotData,
     ) -> Option<SnapshotFollowPlan> {
+        // Deliberate scope limit: the follow needs the run's anchor to scope
+        // what it streams. A newest user message the server reports without a
+        // `created_ms` has no anchor, so the read stays static rather than
+        // guessing a window for the renderer.
         let Some(anchor) = data.newest_user_anchor.clone() else {
             tracing::warn!(
                 "busy follow: session {} busy but has no user message to follow",
@@ -869,15 +873,18 @@ impl ExternalFlow {
             // A refused add is the only way the blocks can differ from the
             // count the pointer was written from (the card session vanished
             // under the arm, or it already carries the request). Say so
-            // instead of leaving the card overstating what it shows.
+            // instead of leaving the card overstating what it shows — and do
+            // NOT remember it: no card carries its block, so the sweep must
+            // still be free to surface it on its own.
             if !flow
                 .add_initial_inline_locked(&handles.cards, session_id, req, &plan.directory)
                 .await
             {
                 tracing::warn!(
-                    "busy follow: request {} was not seeded on the card for session {session_id}",
+                    "busy follow: request {} was not seeded on the card for session {session_id}; leaving it to the sweep",
                     req.id()
                 );
+                continue;
             }
             // Remember the full request (like the static claim path): the poll
             // loop never sees follow-hosted requests, so `prepare()` never runs
@@ -1468,12 +1475,11 @@ async fn is_already_surfaced(
 /// #1005 review; a cheap resolution-aware path was not found without forking
 /// the composition.)
 ///
-/// The 最近对话 tail's Compaction markers are deliberately NOT repeated here:
-/// this card is a live one, and its timeline renders the session's compaction
-/// rows itself (a session-scoped fact, ADR-0082), so the body's text form drops
-/// them — a tail carrying only markers therefore renders no 最近对话 section at
-/// all, since a header with nothing under it would read as an empty
-/// conversation.
+/// The 最近对话 tail's Compaction markers ride here at their server position,
+/// exactly as the static card's `tail_elements` renders them (#1002). ADR-0082's
+/// "the live timeline renders the marker itself" note yields to that explicit
+/// body-equality contract: the same read must not render two bodies, and the
+/// live timeline's own rows are not a licence to drop the read's marker.
 ///
 /// No overflow notice renders here (ADR-0100): overflow is no longer a
 /// decision the card makes, and that notice would name requests THIS card never
@@ -1489,10 +1495,11 @@ pub(crate) fn snapshot_follow_lead(
     busy_now: bool,
 ) -> String {
     let title = crate::feishu::card::session::display_title(title, &data.session_id);
+    let hint = crate::feishu::card::session::FOLLOW_HINT;
     let mut text = if data.waiting && !busy_now {
-        format!("已{verb} {title}（等待后台任务完成，有新进展会自动更新）")
+        format!("已{verb} {title}（等待后台任务完成，{hint}）")
     } else {
-        format!("已{verb} {title}（正在继续该会话的回合，有新进展会自动更新）")
+        format!("已{verb} {title}（正在继续该会话的回合，{hint}）")
     };
     let body = crate::feishu::card::session::session_card_body(
         data,
@@ -1502,7 +1509,6 @@ pub(crate) fn snapshot_follow_lead(
             on_card: seeds.len(),
             blocks_here: true,
         },
-        true,
     )
     .lead_text();
     if !body.is_empty() {
@@ -1925,8 +1931,8 @@ mod tests {
         FileContent, MessageRole, Part, ReasoningPart, SessionTranscript, TranscriptMessage,
     };
     use crate::bridge::test_support::{
-        MockBackend, build_app, realistic_parts, seed_entry, test_config, test_work_dir, text_part,
-        turn_anchor, typed_message,
+        MockBackend, build_app, realistic_parts, seed_entry, seed_live_card, test_config, test_work_dir,
+        text_part, turn_anchor, typed_message,
     };
     use crate::feishu::card::CardState;
 
@@ -2068,6 +2074,56 @@ mod tests {
                 .as_deref(),
             Some("msg_anchor"),
             "an idle card must fall back to the topic anchor"
+        );
+    }
+
+    /// A refused seed is left to the sweep: it must not be remembered as
+    /// hosted when no card carries its block, or the sweep can never surface it.
+    #[tokio::test]
+    async fn a_refused_follow_seed_is_not_remembered() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        seed_live_card(&app, "ses_test", "om_live").await;
+
+        let req =
+            crate::bridge::request::kind::PendingRequest::Question(crate::backend::types::QuestionRequest {
+                id: "q_1".into(),
+                session_id: "ses_test".into(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "继续？".into(),
+                    header: "继续".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        let plan = SnapshotFollowPlan {
+            anchor: turn_anchor(1_000),
+            session_thread_key: None,
+            directory: "/work".into(),
+            busy_now: false,
+            candidates: Vec::new(),
+            seeds: vec![req.clone()],
+            prepared: None,
+        };
+        let handles = app.flow_handles();
+        let flow = handles.requests.flow_for(req.interaction_kind());
+        let lock = handles.cards.write_lock("ses_test").await;
+        let guard = lock.lock().await;
+        // The card already carries the block, so the seed's add is refused.
+        assert!(
+            flow.add_initial_inline_locked(&handles.cards, "ses_test", &req, "/work")
+                .await
+        );
+        app.external
+            .seed_snapshot_follow_locked(&handles, "ses_test", &plan)
+            .await;
+        drop(guard);
+
+        assert!(
+            !app.question.has_question("q_1").await,
+            "a refused seed must not be remembered as hosted"
         );
     }
 }
