@@ -1840,6 +1840,56 @@ async fn fresh_topic_attach_adopts_with_in_topic_anchor() {
     assert_eq!(entry.topic_anchor.as_deref(), Some("msg_topic_reply"));
 }
 
+/// ADR-0100: a failed in-topic confirmation is propagated, not swallowed. The
+/// adoption stops before the mapping write, so a topic is never left mapped to
+/// a session with no line and a `None` anchor (which would strand its later
+/// permission/question cards at the chat top level).
+#[tokio::test]
+async fn a_failed_in_topic_confirmation_adopts_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_foreign123abc",
+        "外部会话",
+        "/work/ext",
+        100,
+    )]);
+    let mut platform = RecordingPlatform::new();
+    platform.fail_reply_in_thread = true;
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
+
+    send_command_in(
+        &app,
+        "/switch ses_foreign123abc",
+        topic_key.clone(),
+        "msg_topic_cmd",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    let store = app.sessions.lock().await;
+    assert!(
+        store.get_active(&topic_key).is_none(),
+        "a failed confirmation must not persist the topic mapping"
+    );
+    assert!(
+        store.thread_for_session("ses_foreign123abc").is_none(),
+        "the session stays unmapped"
+    );
+    drop(store);
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls
+            .iter()
+            .all(|c| !matches!(c, PlatformCall::ReplyText { .. } | PlatformCall::ReplyCard { .. })),
+        "no line is posted when the in-topic one failed: {calls:?}"
+    );
+}
+
 /// ADR-0023: a plain message in a cola-created topic carries `parent_id`
 /// pointing at the topic's own creation messages — the thread root (the
 /// user's `/topic` command) or the seed card (`topic_anchor`). Neither must

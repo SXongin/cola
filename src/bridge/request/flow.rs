@@ -1145,9 +1145,15 @@ impl RequestFlow {
     ///
     /// `seen` records the requests this process has surfaced: a re-host needs
     /// the record (`seen.contains`), a first surfacing inserts it — so the
-    /// poller never surfaces one request twice. A refusal inserts it only once
-    /// the server accepted the refusal; a failed one leaves it unmarked so the
-    /// next sweep retries.
+    /// poller never surfaces one request twice. The insertion happens only
+    /// where the request ACTUALLY reached a surface: a refusal only once the
+    /// server accepted it, an inline block only once it landed, a standalone
+    /// card only once the send returned an id. A failed send — including "no
+    /// reply target or chat yet", which is exactly an unmapped session the user
+    /// has not adopted (ADR-0100: nothing claims its pending any more) — leaves
+    /// it unmarked so the next sweep retries; marking it early would bury the
+    /// request forever because every later sweep would treat it as surfaced and
+    /// `rehost_block` has no card to re-host it on.
     async fn surface(
         &self,
         handles: &FlowHandles,
@@ -1253,7 +1259,6 @@ impl RequestFlow {
                 return false;
             }
         }
-        seen.insert(req.id().to_string());
         tracing::info!(
             "{} ({}): {} on session {}",
             self.kind.label(),
@@ -1271,11 +1276,13 @@ impl RequestFlow {
         if self.recovered.lock().await.remove(req.id()).is_some()
             && self.readopt_surface(handles, req, dir).await
         {
+            seen.insert(req.id().to_string());
             return false;
         }
         // Kind-specific pre-card handling (auto-accept / remember). true →
         // handled, no card needed.
         if self.kind.prepare(self, handles, req, dir).await {
+            seen.insert(req.id().to_string());
             return true;
         }
         // One-card-per-turn: surface the request INLINE on the streaming card
@@ -1287,6 +1294,8 @@ impl RequestFlow {
         {
             let pushed = self.kind.add_inline(self, &handles.cards, &host, req, dir).await;
             if pushed {
+                // The block landed: this request is surfaced from now on.
+                seen.insert(req.id().to_string());
                 tracing::info!(
                     "{} {} inlined on session {} card",
                     self.kind.label(),
@@ -1297,8 +1306,10 @@ impl RequestFlow {
                 // only flushes on new parts, and a blocked prompt produces
                 // none.
                 Turn::flush_card(&handles.cards, &host).await;
+                return false;
             }
-            return false;
+            // The add was refused (the card session vanished mid-pass): fall
+            // through to a standalone card, still unmarked until that lands.
         }
         let card = self.kind.build_card(req, dir);
         // Reply to the message that triggered the prompt for this session; fall
@@ -1328,6 +1339,10 @@ impl RequestFlow {
             }
         };
         if let Some(mid) = sent_id {
+            // The card landed: this request is surfaced from now on. A failed
+            // or impossible send (no mapping/reply target yet) stays unmarked
+            // so the next sweep retries it (ADR-0100).
+            seen.insert(req.id().to_string());
             let summary = self.kind.summary(req);
             self.sent_cards.lock().await.insert(
                 req.id().to_string(),

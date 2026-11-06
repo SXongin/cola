@@ -3263,11 +3263,12 @@ impl App {
 
     /// Handle a `/switch` card button (ADR-0012, issue 04): adopt a session,
     /// create a new one, re-search, or flip the page. The 接管/切换 ops patch
-    /// the clicked list card in place to the compact 已切换 state (ADR-0100) —
-    /// one message per activation, never a new one. page/scope/search/new/
-    /// topic_adopt return a refreshed list card carrying the active
-    /// keyword/scope/page (ADR-0052), except that a search or scope toggle
-    /// resets to page 1. Plus a Toast for instant feedback.
+    /// the clicked list card in place to the compact adoption state (ADR-0100,
+    /// header verb 接管 or 切换 matching the toast) — one message per
+    /// activation, never a new one. page/scope/search/new/topic_adopt return a
+    /// refreshed list card carrying the active keyword/scope/page (ADR-0052),
+    /// except that a search or scope toggle resets to page 1. Plus a Toast for
+    /// instant feedback.
     async fn handle_switch_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -3386,9 +3387,9 @@ impl App {
                 }
                 // ADR-0028 one-card rule: the switch card's OWN message becomes
                 // the confirmation — the ack patches the list card in place to
-                // the compact 已切换 state (ADR-0100). The list's filter rides
-                // along (ADR-0052): its 返回列表 button rebuilds exactly this
-                // window.
+                // the compact adoption state (ADR-0100), whose verb matches the
+                // toast. The list's filter rides along (ADR-0052): its 返回列表
+                // button rebuilds exactly this window.
                 let open_message_id = value
                     .get("open_message_id")
                     .and_then(|v| v.as_str())
@@ -3575,12 +3576,13 @@ impl App {
     }
 
     /// The adoption tail shared by the card's 接管/切换 and 强制接管 ops: patch
-    /// the clicked card in place to the compact 已切换 state (ADR-0100, which
+    /// the clicked card in place to the compact adoption state (ADR-0100, which
     /// retires the Session Snapshot from this op), then persist the new active
-    /// entry. The returned card IS the ack's replacement (ADR-0028 one-card
-    /// rule), so no second message is sent. `back` is the switch card's list
-    /// state the adoption came from (ADR-0052): the compact state carries its
-    /// 返回列表 button.
+    /// entry. The header carries the same verb as the toast (接管 for a first
+    /// adoption, 切换 for a re-switch). The returned card IS the ack's
+    /// replacement (ADR-0028 one-card rule), so no second message is sent.
+    /// `back` is the switch card's list state the adoption came from
+    /// (ADR-0052): the compact state carries its 返回列表 button.
     ///
     /// The steal is `set_active`'s: it removes any existing entry with this
     /// session id, so a `force_adopt` from another thread leaves that owner
@@ -3600,6 +3602,7 @@ impl App {
         };
         let verb = if mapped_to_this_thread { "切换" } else { "接管" };
         let card = crate::feishu::snapshot_card::build_switched_state_card(
+            verb,
             &target.title,
             &target.id,
             &target.directory,

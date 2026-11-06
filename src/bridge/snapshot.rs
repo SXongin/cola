@@ -304,7 +304,7 @@ pub(crate) async fn snapshot_card_from_data(
 
 /// ADR-0100: the ONE line a text adoption confirms in, replacing the Session
 /// Snapshot card. Carries the shared body's status summary
-/// ([`crate::feishu::card::session::adoption_status_line`]), so a takeover
+/// ([`crate::feishu::card::session::status_line`]), so a takeover
 /// still answers "did the last Turn end, is something blocking me". The whole
 /// gather runs inside the adopted Session's `snapshot` span (ADR-0048), so its
 /// best-effort read warnings are retrievable by that Session. The thread key is
@@ -326,15 +326,25 @@ pub(crate) async fn adoption_line(
     .await
 }
 
-/// [`adoption_line`]'s pure half: `已{verb}「{title}」` plus the shared body's
-/// status summary between ` · `, so the confirmation stays ONE line. The title
-/// goes through the same [`crate::feishu::snapshot_card::display_title`] the
-/// card uses, so an empty label falls back to the id tail either way. No status
-/// to report (an unreadable status read) omits the summary rather than guessing
-/// one.
+/// [`adoption_line`]'s pure half: `已{verb}「{title}」` plus the shared
+/// composition's ONE-line status summary between ` · `, so the confirmation
+/// stays ONE line. The title goes through the same
+/// [`crate::feishu::snapshot_card::display_title`] the card uses (so an empty
+/// label falls back to the id tail either way), then every whitespace run —
+/// including a title's embedded newline — collapses to one space: a multi-line
+/// server label must not break the single-line contract. No status to report
+/// (an unreadable status read) omits the summary rather than guessing one.
 pub(crate) fn adoption_line_from_data(verb: &str, title: &str, data: &SnapshotData) -> String {
-    let title = crate::feishu::snapshot_card::display_title(title, &data.session_id);
-    match crate::feishu::card::session::adoption_status_line(data) {
+    let mut title = crate::feishu::snapshot_card::display_title(title, &data.session_id)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        // A whitespace-only label collapses to nothing; keep the id tail the
+        // card would have named instead of an empty pair of brackets.
+        title = crate::bridge::display::id_tail(&data.session_id);
+    }
+    match crate::feishu::card::session::status_line(data) {
         Some(status) => format!("已{verb}「{title}」 · {status}"),
         None => format!("已{verb}「{title}」"),
     }
@@ -759,5 +769,33 @@ mod tests {
             !newer.waiting,
             "a newer unfinished turn is not the Waiting turn of the older one"
         );
+    }
+
+    /// ADR-0100: the confirmation is ONE line, so a server title carrying a
+    /// newline (or runs of whitespace) collapses to single spaces, and the
+    /// shared composition's chip rides after ` · `. The id-tail fallback is not
+    /// affected.
+    #[test]
+    fn the_adoption_line_sanitizes_a_multi_line_title() {
+        let data = SnapshotData {
+            session_id: "ses_adopted".into(),
+            directory: "/work".into(),
+            status: Some(crate::backend::types::SessionStatus::Idle),
+            waiting: false,
+            pending: Vec::new(),
+            pending_elsewhere: None,
+            pending_overflow: PendingOverflow::None,
+            tail: Vec::new(),
+            newest_user_anchor: None,
+            newest_user_is_cola_authored: false,
+        };
+        let line = adoption_line_from_data("接管", " 标题\n第二行\t尾巴 ", &data);
+        assert_eq!(line, "已接管「标题 第二行 尾巴」 · ✅ 空闲");
+        assert_eq!(line.lines().count(), 1, "the confirmation is ONE line: {line}");
+
+        // A whitespace-only label trims to nothing: fall back to the id tail
+        // rather than an empty pair of brackets.
+        let blank = adoption_line_from_data("接管", "   ", &data);
+        assert_eq!(blank, "已接管「adopted」 · ✅ 空闲");
     }
 }

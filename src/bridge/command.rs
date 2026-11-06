@@ -2843,14 +2843,11 @@ async fn adopt_session(
     let anchor = if kind == ConversationKind::Topic {
         // The line is sent inside the topic and doubles as the fallback-card
         // anchor (ADR-0023): permission/question cards reply to it and land
-        // inside the topic. Its message id is persisted as `topic_anchor`.
-        match handles.flow.platform.reply_in_thread(message_id, &line).await {
-            Ok((anchor, _)) => Some(anchor),
-            Err(e) => {
-                tracing::warn!("attach: in-thread confirmation send failed: {}", e);
-                None
-            }
-        }
+        // inside the topic. Its message id is persisted as `topic_anchor`. A
+        // failed send is PROPAGATED, never swallowed: carrying on would adopt
+        // with no line and a `None` anchor, so later cards could not land in
+        // the topic.
+        Some(handles.flow.platform.reply_in_thread(message_id, &line).await?.0)
     } else {
         None
     };

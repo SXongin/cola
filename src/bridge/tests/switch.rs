@@ -495,11 +495,11 @@ async fn switch_reeswitch_line_carries_the_pending_status() {
 }
 
 /// ADR-0100: a pending already hosted by a standalone card still makes the
-/// one-line confirmation say 等待你的确认 (with no elsewhere pointer — a line
-/// has no room for it), and the adoption posts no card, so the block is never
-/// duplicated.
+/// one-line confirmation say 等待你的确认 — accurate, with no elsewhere pointer
+/// (「见原卡片」 is a card-only nuance and the claim registry is retiring), and
+/// the adoption posts no card, so the block is never duplicated.
 #[tokio::test]
-async fn switch_reeswitch_line_reports_a_pending_surfaced_elsewhere() {
+async fn switch_reeswitch_line_reports_a_pending_already_on_its_own_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -827,9 +827,10 @@ async fn switch_card_falls_back_to_global_without_active_session() {
 }
 
 /// A `/switch` card "adopt" action maps the session into the thread and
-/// patches the clicked list card IN PLACE to the compact 已切换 state
-/// (ADR-0100): no second message is sent, the list is gone, and the card keeps
-/// the 返回列表 button for the list state it came from.
+/// patches the clicked list card IN PLACE to the compact adoption state
+/// (ADR-0100, header verb 已接管 matching the toast): no second message is
+/// sent, the list is gone, and the card keeps the 返回列表 button for the list
+/// state it came from.
 #[tokio::test]
 async fn switch_card_adopt_action_maps_session() {
     let _wd = test_work_dir();
@@ -853,8 +854,8 @@ async fn switch_card_adopt_action_maps_session() {
     let card = result.card.clone().expect("adopt returns the patched card");
     let card_str = card.to_string();
     assert!(
-        card_str.contains("已切换 重写登录"),
-        "the patched card is the compact switched state: {card_str}"
+        card_str.contains("已接管 重写登录"),
+        "the patched card is the compact adoption state: {card_str}"
     );
     assert!(
         card_str.contains("返回列表"),
@@ -992,8 +993,8 @@ async fn switch_card_force_adopt_steals_owned_session() {
         .clone()
         .expect("force_adopt patches the card in place");
     assert!(
-        card_text(&card).contains("已切换 被占用的会话"),
-        "compact switched state: {card}"
+        card_text(&card).contains("已接管 被占用的会话"),
+        "compact adoption state, 接管 verb: {card}"
     );
     let lobby = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     assert_eq!(
@@ -1119,6 +1120,87 @@ async fn switch_card_switch_on_mapped_session_patches_to_compact_state() {
     );
 }
 
+/// ADR-0100: a mapped re-switch whose Session DOES have content to report
+/// (busy, plus a pending permission) still patches the clicked list card in
+/// place to the compact 已切换 state — no snapshot card, no new message, and
+/// 返回列表 keeps the clicked list's filter. The status summary and the
+/// pending live on the text surfaces; the list patch cannot carry them.
+#[tokio::test]
+async fn switch_card_mapped_adopt_with_content_still_patches_compact() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
+    backend.with_session_status("ses_own1", Some(crate::backend::types::SessionStatus::Busy));
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "req_own".into(),
+        session_id: Some("ses_own1".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["ls".into()],
+        metadata: None,
+        always: vec![],
+        always_supported: true,
+    }]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_own1", "/work/cola"),
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_active", "/work/active"),
+    )
+    .await;
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_own1",
+        "keyword": "proj",
+        "scope": "all",
+        "page": 2,
+    });
+    let cards_before = platform.replied_cards().await.len();
+    let result = app
+        .host_action(value)
+        .await
+        .expect("mapped re-switch returns a result");
+    let card = result.card.expect("the re-switch patches the clicked card");
+    let card_str = card.to_string();
+    assert!(
+        card_str.contains("已切换 本项目会话"),
+        "the compact state header keeps the 切换 verb: {card_str}"
+    );
+    assert!(
+        !card_str.contains("最近对话")
+            && !card_str.contains("权限请求")
+            && !card_str.contains(crate::feishu::card::session::BUSY_CHIP)
+            && !card_str.contains(crate::feishu::card::session::WAITING_CHIP),
+        "no snapshot body on the patched list card: {card_str}"
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        cards_before,
+        "the card op sends no message"
+    );
+    let back = card_buttons(&card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "back")
+        .expect("the patched card keeps 返回列表");
+    assert_eq!(back["value"]["keyword"], "proj");
+    assert_eq!(back["value"]["scope"], "all");
+    assert_eq!(back["value"]["page"], 2);
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key).unwrap().session_id,
+        "ses_own1"
+    );
+}
+
 /// ADR-0100: a 切换 on a fully-visible mapped session (idle, no pending,
 /// newest user message cola-authored) — the case the old suppression predicate
 /// swallowed — still patches to the same compact 已切换 state, never to a full
@@ -1223,8 +1305,8 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
         .expect("topic adopt should return a result");
     let card = result.card.expect("adopt patches the card in place");
     assert!(
-        card_text(&card).contains("已切换"),
-        "compact switched state in the topic: {card}"
+        card_text(&card).contains("已接管"),
+        "compact adoption state in the topic: {card}"
     );
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
     let entry = app
@@ -2009,7 +2091,7 @@ async fn switch_card_adopt_round_trips_back_to_the_filtered_page() {
         .card
         .expect("adopt patches the card in place");
     let text = card_text(&switched);
-    assert!(text.contains("已切换 项目1"), "compact switched state: {text}");
+    assert!(text.contains("已接管 项目1"), "compact adoption state: {text}");
     assert!(!text.contains("会话管理"), "the list is gone: {text}");
 
     // The compact state carries the list's exact return target.

@@ -494,6 +494,77 @@ async fn a_fresh_app_surfaces_a_pending_request_standalone() {
     assert!(raw.contains("per_1"), "{raw}");
 }
 
+/// ADR-0100 regression: taking a session over no longer embeds/claims its
+/// pending requests, so the sweep is the ONLY surface for them. An unmapped
+/// session's request is listed (its directory is known through a mapped
+/// sibling) but has no reply target yet; the failed surface must stay
+/// UNMARKED, or every later sweep treats it as already surfaced and
+/// `rehost_block` has no card to re-host it on — the request would be
+/// invisible forever. Sweep → adopt → the same `seen` → the card appears.
+#[tokio::test]
+async fn an_unmapped_sessions_pending_survives_until_adoption() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_mapped", "本项目会话", "/work/proj", 100),
+        list_session("ses_foreign", "外部会话", "/work/proj", 200),
+    ]);
+    backend.ask_permission(perm_request("per_1", "ses_foreign", "ls -la"));
+    let (app, platform) = build_app(test_config(&session_file), backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "ses_mapped",
+            "/work/proj",
+        ),
+    )
+    .await;
+
+    // ONE seen set across both sweeps, exactly as `poll_loop` keeps it.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "an unmapped session has no reply target yet: nothing can be posted"
+    );
+    assert!(
+        !seen.contains("per_1"),
+        "a failed surface must not mark the request as seen"
+    );
+
+    // The user takes the foreign session over (ADR-0100: one text line, no
+    // card, nothing claimed).
+    send_command(&app, "/switch ses_foreign", "msg_switch").await;
+    assert!(
+        platform
+            .texts()
+            .await
+            .iter()
+            .any(|line| line.contains("已接管「外部会话」")
+                && line.contains(crate::feishu::card::session::WAITING_CHIP)),
+        "the confirmation names the wait: {:?}",
+        platform.texts().await
+    );
+
+    // The next sweep surfaces the still-pending request on its own card.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let posted = posted_cards(&platform).await;
+    assert_eq!(
+        posted.len(),
+        1,
+        "the adopted session's permission now has a card: {posted:?}"
+    );
+    assert!(
+        card_text(&posted[0]).contains("🔐 权限请求"),
+        "the standalone permission card: {}",
+        card_text(&posted[0])
+    );
+    assert!(seen.contains("per_1"), "the successful surface is marked");
+}
+
 /// A request resolved while cola was down is reconciled by the first sweep —
 /// the persisted inline block becomes its neutral receipt and no card is
 /// resurrected.
