@@ -9,10 +9,8 @@ use crate::bridge::handles::SnapshotHandles;
 /// a `/card` read reports — status, the pending requests, the transcript tail.
 /// Built purely from server reads, never from a prompt, a session write, or a
 /// guess. Each source is best-effort: a read failure degrades that field
-/// (status → `None`, lists → empty) and is logged, so an adoption can never be
-/// blocked by the gather. Clone: the claim registry keeps a copy of the
-/// adopt-time state to re-render the snapshot card when a claimed request
-/// resolves (#1006 retires it).
+/// (status → `None`, lists → empty) and is logged, so a read can never be
+/// blocked by the gather.
 #[derive(Clone)]
 pub struct SnapshotData {
     pub session_id: String,
@@ -24,38 +22,23 @@ pub struct SnapshotData {
     /// Whether the Session is in a Waiting turn (ADR-0059) at activation time:
     /// the newest user message's Turn has finished while the read's transcript
     /// still carries live Background Tasks, so the Turn will wake by itself.
-    /// An adoption of such a Session follows the wait — the card yields ⏳
+    /// A `/card` read of such a Session follows the wait — the card yields ⏳
     /// with the ledger and Session Sync serves the completion Wake in place
-    /// (#586) — instead of freezing the one-shot static card, and the status
-    /// chip names the wait instead of 空闲. Scoped to the newest Turn on
+    /// (#586) — instead of freezing the one-shot read, and the status chip
+    /// names the wait instead of 空闲. Scoped to the newest Turn on
     /// purpose: a NEWER user message whose own Turn has not finished (an
     /// external message just submitted, say) leaves the fact false — the
     /// older Turn's Wake belongs to the Session Sync continuation, never to a
     /// follow anchored at the newer message. Always `false` on a generation
     /// without Background Task facts (V1) and when the server reads anything
-    /// but idle (never guessed — the same rule the suppression predicate's
-    /// idle check uses).
+    /// but idle (never guessed).
     pub waiting: bool,
-    /// Pending permission/question requests this snapshot card EMBEDS — and
-    /// therefore the only ones it may claim (#841). The send path trims this to
-    /// the prefix the card can carry ([`PendingOverflow`]); a rebuild never
-    /// re-decides, it only re-renders what is left of this set. The gather fills
-    /// it with every request whose `sessionID` is the adopted session (never
+    /// The session's pending permission/question requests: the read's count
+    /// pointer, and the set a busy follow may seed onto its card. The gather
+    /// fills it with every request whose `sessionID` is the read session (never
     /// another session's in the same directory, and never a sub-task child's —
-    /// ADR-0028 keeps those on today's standalone flow).
+    /// those keep their standalone flow).
     pub pending: Vec<crate::bridge::request::kind::PendingRequest>,
-    /// The session's pendings that `claimable_pendings` kept OFF this snapshot
-    /// because they are already surfaced elsewhere (a live inline block, a
-    /// standalone card, or an earlier snapshot — ADR-0028 update 2026-09-25).
-    /// `None` when there were none. The status chip points at that card
-    /// instead of falling back to the server run state; see [`ElsewherePending`].
-    pub pending_elsewhere: Option<ElsewherePending>,
-    /// The requests this snapshot does NOT embed (#841): they stay UNCLAIMED,
-    /// the normal pending flow renders them (inline on a live card, otherwise a
-    /// standalone card), and the card names them instead of claiming what it
-    /// cannot show. Decided ONCE at send; a rebuild renders the stored fact and
-    /// never recomputes it — see [`PendingOverflow`].
-    pub pending_overflow: PendingOverflow,
     /// The 最近对话 tail: the last conversation user/assistant messages,
     /// newest last, with the **Compaction**s that happened inside that window
     /// interleaved at their server positions — a marker that never consumes one
@@ -70,77 +53,9 @@ pub struct SnapshotData {
     /// message: nothing to follow.
     pub newest_user_anchor: Option<TurnAnchor>,
     /// Whether the newest user message is a Cola-Authored Message (`msg_cola_`
-    /// id, ADR-0026) — one input to the suppression predicate.
+    /// id, ADR-0026) — the busy follow's guard: cola's own run hands off
+    /// through the Chain Record, never a Session Card (ADR-0100).
     pub newest_user_is_cola_authored: bool,
-}
-
-/// A pending request that is already hosted by another card, so the snapshot
-/// does not embed it (ADR-0028 update 2026-09-25). The status chip points at
-/// that card — and only promises a pin when Message Pin is on, since the pin
-/// sync is gated by the same `[bridge] instant_reminder` opt-in.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ElsewherePending {
-    /// Message Pin is on: the hosting card is pinned, so the pointer may say
-    /// 置顶.
-    Pinned,
-    /// Message Pin is off: the pointer names the original card without
-    /// promising a pin.
-    Unpinned,
-}
-
-/// What happened to the adopt-time pendings this snapshot did NOT embed (#841).
-///
-/// Decided ONCE, when the card is sent; a rebuild only re-renders the stored
-/// fact. The unclaimed requests are outside this snapshot's claim registry, so
-/// cola cannot observe whether they are still pending — which is exactly why
-/// the count is a send-time fact rather than something a rebuild re-derives.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PendingOverflow {
-    /// Every claimable pending fits: the common case, nothing to report.
-    None,
-    /// The sent card names the overflow count.
-    Counted(usize),
-    /// A rebuild of that card: the requests left over are still named, but the
-    /// count is gone — the snapshot cannot know how many survive.
-    Uncounted,
-}
-
-impl PendingOverflow {
-    /// The overflow fact for a send-time decision: `None` when nothing was left
-    /// out.
-    pub fn from_send(overflow: usize) -> PendingOverflow {
-        if overflow == 0 {
-            PendingOverflow::None
-        } else {
-            PendingOverflow::Counted(overflow)
-        }
-    }
-
-    /// Whether the session has pendings beyond what this card shows — true even
-    /// when the card embeds NONE of them, so the suppression predicate still
-    /// reports a waiting session.
-    pub fn any(self) -> bool {
-        !matches!(self, PendingOverflow::None)
-    }
-
-    /// This same fact as a rebuild renders it: the count cannot be kept
-    /// accurate, so the notice stops naming it.
-    pub fn uncounted(self) -> PendingOverflow {
-        match self {
-            PendingOverflow::None => PendingOverflow::None,
-            _ => PendingOverflow::Uncounted,
-        }
-    }
-}
-
-impl SnapshotData {
-    /// The pendings the snapshot card EMBEDS — and therefore the only ones it
-    /// may claim (#841). The send path trims [`Self::pending`] to the prefix the
-    /// card carries, so this is the stored claim set itself; a rebuild's
-    /// retain-to-live-claims filter is the same statement one step later.
-    pub fn embedded_pending(&self) -> &[crate::bridge::request::kind::PendingRequest] {
-        &self.pending
-    }
 }
 
 /// Gather everything a Session Card read needs for an adopted session
@@ -227,81 +142,10 @@ pub(crate) async fn gather_snapshot(
         status,
         waiting,
         pending,
-        pending_elsewhere: None,
-        pending_overflow: PendingOverflow::None,
         tail,
         newest_user_anchor,
         newest_user_is_cola_authored,
     }
-}
-
-/// ADR-0028: gather an adopted session's snapshot data (status, adopt-time
-/// pendings, transcript tail) from server reads, restrict the pendings to the
-/// claimable ones (the session's own, not already surfaced elsewhere), and
-/// build its card with the given takeover verb (接管/切换).
-///
-/// **No adoption surface emits this card any more** (ADR-0100, #1004): they
-/// confirm in one text line ([`adoption_line`]). Batch closure: #1005 re-drives
-/// the follow from `/card` (the retained follow caller), and #1006 deletes this
-/// builder with the snapshot card and moves `display_title` +
-/// `build_switched_state_card` to `feishu::card::session`.
-#[allow(dead_code)] // no production caller since #1004; #1005 replaces the follow, #1006 deletes this
-pub(crate) async fn snapshot_card_for(
-    handles: &SnapshotHandles,
-    verb: &str,
-    info: &crate::backend::types::SessionListInfo,
-    back: Option<&crate::feishu::card::session::BackToList>,
-) -> (serde_json::Value, SnapshotData) {
-    let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &info.id).await;
-    let span = crate::bridge::span::snapshot(&info.id, thread_key.as_ref());
-    async move {
-        let data = gather_snapshot(&handles.backend, &info.id, &info.directory).await;
-        snapshot_card_from_data(handles, verb, &info.title, data, back).await
-    }
-    .instrument(span)
-    .await
-}
-
-/// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
-/// gathered data to the claimable pendings and build the card. Retained with the
-/// card; #1006 deletes it with the builder.
-pub(crate) async fn snapshot_card_from_data(
-    handles: &SnapshotHandles,
-    verb: &str,
-    title: &str,
-    data: SnapshotData,
-    back: Option<&crate::feishu::card::session::BackToList>,
-) -> (serde_json::Value, SnapshotData) {
-    let mut data = crate::bridge::snapshot_claims::claimable_pendings(
-        &handles.requests,
-        &handles.cards,
-        handles.pins_enabled,
-        data,
-    )
-    .await;
-    // The builder decides which prefix of the pendings the one-shot card can
-    // carry; the rest stay UNCLAIMED (and unrendered) so the normal pending
-    // flow keeps them answerable (#841). The decision is nailed down here — the
-    // data's pending list becomes exactly what the card renders — so a claim-ack
-    // rebuild re-renders the same set instead of re-fitting a list it cannot see
-    // in full.
-    let built = crate::feishu::snapshot_card::build_snapshot_card_fitted(
-        verb,
-        title,
-        &data,
-        &crate::feishu::snapshot_card::SnapshotQuestionState::new(),
-        &[],
-        back,
-    );
-    // The builder counted `built.embedded` over the SAME own-session predicate,
-    // so this retain and the truncate below are a PAIR: truncating to that count
-    // against a differently filtered list would keep a foreign-session request
-    // and drop a real one — and both would then be claimed and rendered.
-    data.pending.retain(|req| req.session_id() == data.session_id);
-    debug_assert!(built.embedded <= data.pending.len());
-    data.pending.truncate(built.embedded);
-    data.pending_overflow = PendingOverflow::from_send(built.overflow);
-    (built.card, data)
 }
 
 /// ADR-0100: the ONE line a text adoption confirms in, replacing the Session
@@ -331,15 +175,13 @@ pub(crate) async fn adoption_line(
 /// [`adoption_line`]'s pure half: `已{verb}「{title}」` plus the shared
 /// composition's ONE-line status summary between ` · `, so the confirmation
 /// stays ONE line. The title goes through the same
-/// [`crate::feishu::snapshot_card::display_title`] the card uses (so an empty
+/// [`crate::feishu::card::session::display_title`] the card uses (so an empty
 /// label falls back to the id tail either way), then every whitespace run —
 /// including a title's embedded newline — collapses to one space: a multi-line
 /// server label must not break the single-line contract. No status to report
 /// (an unreadable status read) omits the summary rather than guessing one.
 pub(crate) fn adoption_line_from_data(verb: &str, title: &str, data: &SnapshotData) -> String {
-    // #1006 moves `display_title` to `feishu::card::session` (with the body
-    // composition); this call site stays.
-    let mut title = crate::feishu::snapshot_card::display_title(title, &data.session_id)
+    let mut title = crate::feishu::card::session::display_title(title, &data.session_id)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -424,13 +266,13 @@ mod tests {
         gather_snapshot(&backend, "ses_adopted", "/work/proj").await
     }
 
-    /// Whole-branch re-review #883: a permission whose target the card cannot
-    /// render in full is never embedded on a snapshot card. The snapshot claims
-    /// embedded pendings, and a claimed request is never surfaced by the
-    /// permission flow again — so embedding it would bypass the flow's decline
-    /// guard and offer a clipped command. The in-budget request still rides.
+    /// Whole-branch re-review #883: a permission whose target a card cannot
+    /// render in full never enters the read, so neither the idle pointer nor a
+    /// busy follow can surface it — the permission flow's decline guard keeps
+    /// it off a card that would offer a clipped command. The in-budget request
+    /// still rides.
     #[tokio::test]
-    async fn an_unshowable_permission_is_never_embedded_on_a_snapshot() {
+    async fn an_unshowable_permission_never_enters_the_read() {
         let mut backend = typed_backend(vec![
             user("msg_u1", 1_000, &["帮我改一下"]),
             assistant("msg_a1", 2_000, &["好的"]),
@@ -461,31 +303,12 @@ mod tests {
         ]);
 
         let data = gather_from_typed_backend(backend).await;
-        let ids: Vec<&str> = data.embedded_pending().iter().map(|req| req.id()).collect();
+        let ids: Vec<&str> = data.pending.iter().map(|req| req.id()).collect();
         assert_eq!(
             ids,
             vec!["per_ok"],
-            "only the fully showable pending may be claimed by the snapshot"
+            "only the fully showable pending may reach the read"
         );
-    }
-
-    /// The overflow fact is what keeps a cardless-but-waiting session honest
-    /// (#842): `None` is the only "nothing left over" state, and it is the only
-    /// one a rebuild must not invent.
-    #[test]
-    fn the_overflow_fact_survives_a_rebuild_without_a_count() {
-        assert!(!PendingOverflow::None.any());
-        assert!(PendingOverflow::Counted(2).any());
-        assert!(PendingOverflow::Uncounted.any());
-
-        assert_eq!(PendingOverflow::from_send(0), PendingOverflow::None);
-        assert_eq!(PendingOverflow::from_send(3), PendingOverflow::Counted(3));
-        assert_eq!(
-            PendingOverflow::Counted(3).uncounted(),
-            PendingOverflow::Uncounted
-        );
-        assert_eq!(PendingOverflow::Uncounted.uncounted(), PendingOverflow::Uncounted);
-        assert_eq!(PendingOverflow::None.uncounted(), PendingOverflow::None);
     }
 
     /// A file part that inlines no payload is not a File Content: it stays a raw
@@ -787,8 +610,6 @@ mod tests {
             status: Some(crate::backend::types::SessionStatus::Idle),
             waiting: false,
             pending: Vec::new(),
-            pending_elsewhere: None,
-            pending_overflow: PendingOverflow::None,
             tail: Vec::new(),
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,

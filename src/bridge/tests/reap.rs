@@ -28,7 +28,7 @@ use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{
     ChainRecords, CursorFrontier, CursorPartKind, PendingGap, RenderedCursor, cursor_prefix_digest,
 };
-use crate::bridge::snapshot_claims::ClaimKind;
+use crate::bridge::request::kind::ClaimKind;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};

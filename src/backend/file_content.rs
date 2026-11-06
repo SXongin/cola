@@ -114,7 +114,7 @@ impl FileContent {
 
     /// `text` then `records`, newline-joined — the one "message body" fragment
     /// wherever a message's text and its File Contents are shown together
-    /// (ADR-0076): the Session Snapshot「最近对话」tail and the External Message
+    /// (ADR-0076): the Session Card「最近对话」tail and the External Message
     /// 「有新消息」preview both compose it, so the two cannot drift. An empty
     /// `records` leaves `text` byte-for-byte; an empty `text` yields the
     /// records alone.

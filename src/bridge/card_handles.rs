@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::bridge::snapshot_claims::ClaimKind;
+use crate::bridge::request::kind::ClaimKind;
 use crate::bridge::surfaces::{InlineSurface, Surfaces};
 
 /// The body-element range one live interaction block occupies on a built card.
@@ -501,7 +501,7 @@ fn replace_elements(card: &mut CachedCard, span: &BlockSpan, replacement: Vec<se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::snapshot_claims::ClaimKind;
+    use crate::bridge::request::kind::ClaimKind;
 
     fn block(request_id: &str, start: usize, end: usize, kind: ClaimKind) -> RenderedBlock {
         RenderedBlock {

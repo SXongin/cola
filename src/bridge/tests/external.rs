@@ -3301,8 +3301,7 @@ async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
                 calls.iter().any(|call| match call {
                     PlatformCall::ReplyCard { card, .. }
                     | PlatformCall::SendCard { card, .. }
-                    | PlatformCall::UpdateMessage { card, .. }
-                    | PlatformCall::ReplyCardInThread { card, .. } => card_text(card).contains(needle),
+                    | PlatformCall::UpdateMessage { card, .. } => card_text(card).contains(needle),
                     _ => false,
                 })
             };

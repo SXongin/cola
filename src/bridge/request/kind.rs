@@ -11,7 +11,6 @@ use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
 use crate::bridge::pollers::result_card;
 use crate::bridge::question::{MultiOutcome, action_toast, qa_completion_body, question_replay_card};
-use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::turn::Turn;
 use crate::feishu::card::lang::language_for_path;
 use crate::feishu::card::tool_render::{
@@ -19,11 +18,20 @@ use crate::feishu::card::tool_render::{
 };
 
 use super::delivery::{
-    DENIED_PREFIX, HANDLED_ELSEWHERE_PREFIX, Origin, RECEIPT_MAX_CHARS, Residue, ack_inline_card,
-    already_handled_result, denied_receipt, failed_result_card, handled_elsewhere_receipt, receipt_line,
-    refresh_question_block, resolve_blocks, settle_ack, truncate,
+    DENIED_PREFIX, Origin, RECEIPT_MAX_CHARS, Residue, ack_inline_card, already_handled_result,
+    denied_receipt, failed_result_card, handled_elsewhere_receipt, receipt_line, refresh_question_block,
+    resolve_blocks, settle_ack, truncate,
 };
 use super::flow::{RequestFlow, session_belongs_to};
+
+/// Which request kind a live interaction block belongs to (ADR-0038). One
+/// registry holds both kinds' blocks, and each flow's poll sweep only touches
+/// blocks of its own kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ClaimKind {
+    Permission,
+    Question,
+}
 
 /// A pending request surfaced by a poll loop before it becomes a card. Carries
 /// whichever backend payload the kind produced — permission or question.
@@ -48,64 +56,11 @@ impl PendingRequest {
         }
     }
 
-    /// The snapshot-claim kind of this request (ADR-0028).
+    /// The interaction-block kind of this request.
     pub fn claim_kind(&self) -> ClaimKind {
         match self {
             PendingRequest::Permission(_) => ClaimKind::Permission,
             PendingRequest::Question(_) => ClaimKind::Question,
-        }
-    }
-
-    /// The inline block elements this request contributes to a Session
-    /// Snapshot (ADR-0028): the same controls the standalone card shows, so
-    /// the snapshot looks and behaves like today's inline sections. Lives with
-    /// the payload's adapters — a third kind adds one arm here, never a
-    /// variant branch in the card layer.
-    pub(crate) fn snapshot_block_elements(
-        &self,
-        directory: &str,
-        question_state: &crate::feishu::snapshot_card::SnapshotQuestionState,
-    ) -> Vec<serde_json::Value> {
-        match self {
-            PendingRequest::Permission(p) => {
-                let body = describe_permission(p);
-                let sid = p.session_id.as_deref().unwrap_or("");
-                let body = crate::feishu::card::sanitize::CardMarkdown::new().clean(&body);
-                let mut els = vec![
-                    serde_json::json!({ "tag": "markdown", "content": format!("🔐 **权限请求**\n{body}") }),
-                ];
-                els.extend(crate::feishu::card::question::permission_buttons(
-                    sid,
-                    &p.request_id,
-                    &body,
-                    directory,
-                    p.always_supported,
-                ));
-                els
-            }
-            PendingRequest::Question(q) => {
-                let n = q.questions.len();
-                let state = question_state.get(&q.id).cloned().unwrap_or(
-                    crate::feishu::snapshot_card::QuestionBlockState {
-                        display: vec![None; n],
-                        done: vec![false; n],
-                        open: 0,
-                        drafts: vec![String::new(); n],
-                    },
-                );
-                crate::feishu::card::question::question_elements(
-                    &q.title,
-                    q.uncollectable,
-                    &q.id,
-                    &q.session_id,
-                    &q.questions,
-                    directory,
-                    &state.display,
-                    &state.done,
-                    state.open,
-                    &state.drafts,
-                )
-            }
         }
     }
 }
@@ -177,9 +132,9 @@ pub trait RequestKind: Send + Sync {
     ) -> bool;
 
     /// Remember a request that reached a card WITHOUT the poll loop surfacing
-    /// it (a Session Snapshot claim, a busy-follow host), so its block's
-    /// buttons still resolve — `prepare` never runs for those. Defaults to
-    /// nothing: a kind with no in-flight state has nothing to remember.
+    /// it (a busy-follow host), so its block's buttons still resolve —
+    /// `prepare` never runs for those. Defaults to nothing: a kind with no
+    /// in-flight state has nothing to remember.
     async fn remember_surfaced(&self, _flow: &RequestFlow, _req: &PendingRequest, _dir: &str) {}
 
     /// The card JSON to repaint when the restart re-adoption re-hosts this
@@ -269,19 +224,8 @@ pub trait RequestKind: Send + Sync {
         dead: &std::collections::HashSet<String>,
     ) -> Vec<String>;
 
-    /// The live state this kind contributes to a Session Snapshot re-render
-    /// (ADR-0028). Defaults to nothing: only the question kind has snapshot
-    /// state (its 已选/✅ markers), which `rebuild`/`resolve` paint in place.
-    async fn snapshot_state(
-        &self,
-        _flow: &RequestFlow,
-        _pending: &[PendingRequest],
-    ) -> crate::feishu::snapshot_card::SnapshotQuestionState {
-        crate::feishu::snapshot_card::SnapshotQuestionState::new()
-    }
-
-    /// The snapshot-claim kind of this flow's requests (ADR-0028): each flow's
-    /// poll sweep only drops claims of its own kind.
+    /// The interaction-block kind of this flow's requests: each flow's poll
+    /// sweep only touches blocks of its own kind.
     fn claim_kind(&self) -> ClaimKind;
 
     /// Handle a card action click on this kind's card. `clicked` is the message
@@ -954,18 +898,6 @@ pub(crate) async fn approve_pending_for_session(
 pub(crate) const AUTOACCEPT_RECEIPT: &str =
     "🔄 已开启自动授权：后续权限请求将自动批准（卡片无法完整显示的仍会拒绝）";
 
-/// The Interaction Receipt for a Session Snapshot's claimed block resolved by
-/// another client (#175, ADR-0038 rule 4): the same neutral line an inline
-/// block leaves, derived from the adopt-time request — a snapshot keeps no
-/// `InteractionBlock` to read the target from.
-pub(crate) fn snapshot_handled_elsewhere_receipt(req: &PendingRequest) -> String {
-    let target = match req {
-        PendingRequest::Permission(p) => permission_target(p),
-        PendingRequest::Question(q) => crate::feishu::card::question::question_target(&q.questions),
-    };
-    receipt_line(HANDLED_ELSEWHERE_PREFIX, &target)
-}
-
 /// The Interaction Receipt for a permission decision (ADR-0038, rule 4):
 /// `✅ 已允许一次：⚡ 执行 Shell 命令 \`ls -la\``. The target comes from the
 /// block being resolved, so the residue always names what it resolved. It
@@ -1253,35 +1185,6 @@ impl RequestKind for QuestionKind {
         dead: &std::collections::HashSet<String>,
     ) -> Vec<String> {
         Turn::resolve_vanished_questions(cards, pending, failed_dirs, cola_claimed, dead).await
-    }
-
-    async fn snapshot_state(
-        &self,
-        flow: &RequestFlow,
-        pending: &[PendingRequest],
-    ) -> crate::feishu::snapshot_card::SnapshotQuestionState {
-        flow.with_question_states(|states| {
-            let mut out = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-            for req in pending {
-                if let PendingRequest::Question(q) = req {
-                    let paint = match states.get(&q.id) {
-                        Some(state) => state.paint(),
-                        None => crate::bridge::question::QuestionPaint::blank(q.questions.len()),
-                    };
-                    out.insert(
-                        q.id.clone(),
-                        crate::feishu::snapshot_card::QuestionBlockState {
-                            display: paint.display,
-                            done: paint.done,
-                            open: paint.open,
-                            drafts: paint.drafts,
-                        },
-                    );
-                }
-            }
-            out
-        })
-        .await
     }
 
     fn claim_kind(&self) -> ClaimKind {
@@ -2034,8 +1937,8 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
 }
 
 /// A friendly description of what a permission request asks to do, shown on the
-/// permission card (and reused verbatim by the snapshot card's pending block,
-/// ADR-0028 — the adopt-time block must look and behave like today's cards).
+/// permission card (and reused verbatim by its inline block, so the two look and
+/// behave alike).
 pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
@@ -2169,61 +2072,6 @@ mod tests {
             always: vec![],
             always_supported: true,
         }
-    }
-
-    /// Issue #917 part 3: the snapshot card re-renders a claimed request from
-    /// `SnapshotQuestionState`, so the open question and the drafts must travel
-    /// with it — a rebuild after a switch would otherwise reopen question 1 and
-    /// lose the text.
-    #[test]
-    fn a_snapshot_block_paints_the_switched_question_and_its_draft() {
-        let question = |n: usize| crate::backend::types::QuestionInfo {
-            question: format!("问题 {n}"),
-            header: format!("h{n}"),
-            options: vec![crate::backend::types::QuestionOption {
-                label: format!("/a{n}"),
-                ..Default::default()
-            }],
-            kind: crate::backend::types::FormFieldKind::String,
-            custom: None,
-            ..Default::default()
-        };
-        let req = PendingRequest::Question(crate::backend::types::QuestionRequest {
-            id: "que_snap".into(),
-            session_id: "ses_1".into(),
-            questions: vec![question(1), question(2)],
-            ..Default::default()
-        });
-        let mut state = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-        state.insert(
-            "que_snap".into(),
-            crate::feishu::snapshot_card::QuestionBlockState {
-                display: vec![None, None],
-                done: vec![false, false],
-                open: 1,
-                drafts: vec![String::new(), "草稿二".to_string()],
-            },
-        );
-        let elements = req.snapshot_block_elements("/w", &state);
-        let text = serde_json::to_string(&elements).expect("elements serialize");
-        let inputs: Vec<&serde_json::Value> = elements
-            .iter()
-            .flat_map(|e| e["elements"].as_array().into_iter().flatten())
-            .filter(|e| e["tag"] == "input")
-            .collect();
-        assert_eq!(inputs.len(), 1, "one box on the snapshot block: {text}");
-        assert_eq!(
-            inputs[0]["name"], "custom_1",
-            "the snapshot opens the switched question: {text}"
-        );
-        assert_eq!(
-            inputs[0]["default_value"], "草稿二",
-            "the snapshot seeds the open question's draft: {text}"
-        );
-        assert!(
-            text.contains("1. 问题 1"),
-            "the folded question keeps its panel: {text}"
-        );
     }
 
     /// A switch click's toast names what happened — including the arms a stale

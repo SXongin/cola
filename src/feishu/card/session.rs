@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use crate::backend::{MessageRole, TailEntry, TailMessage};
-use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
+use crate::bridge::snapshot::SnapshotData;
 
 use super::CardState;
 use super::sanitize::CardMarkdown;
@@ -35,12 +35,12 @@ impl SwitchScope {
     }
 }
 
-/// The list state a `/switch`-card adoption carries onto its Session Snapshot
-/// (ADR-0052): the list's thread plus its active keyword/scope/page. The
-/// snapshot's optional 「返回列表」 button rebuilds exactly this filtered
-/// window, so an adoption that turns out wrong returns to the page it came
-/// from. Every other snapshot source has no list to return to and passes
-/// `None`.
+/// The list state a `/switch`-card adoption carries onto its compact 已切换
+/// state card (ADR-0052, ADR-0100): the list's thread plus its active
+/// keyword/scope/page. The card's optional 「返回列表」 button rebuilds exactly
+/// this filtered window, so an adoption that turns out wrong returns to the
+/// page it came from. Every other adoption source has no list to return to and
+/// passes `None`.
 #[derive(Clone)]
 pub struct BackToList {
     pub thread_key: crate::config::ThreadKey,
@@ -50,7 +50,7 @@ pub struct BackToList {
 }
 
 /// The 「返回列表」 button (ADR-0052) shared by the force-confirm card and the
-/// adopt snapshot: a standalone schema-2.0-safe button whose `op: "back"`
+/// compact 已切换 card: a standalone schema-2.0-safe button whose `op: "back"`
 /// rebuilds the `/switch` list with this filter and page.
 pub(crate) fn back_to_list_button(back: &BackToList) -> serde_json::Value {
     json!({
@@ -67,6 +67,48 @@ pub(crate) fn back_to_list_button(back: &BackToList) -> serde_json::Value {
             "page": back.page,
         },
     })
+}
+
+/// The Session Card's display title: the cleaned session label, falling back to
+/// the id tail when the label is empty. Shared by the read-only Session Card's
+/// identity line, the compact switch-list state card, and a text adoption's
+/// one-line confirmation.
+pub(crate) fn display_title(title: &str, session_id: &str) -> String {
+    let label = crate::feishu::card::clean_session_label(title);
+    if label.is_empty() {
+        crate::bridge::display::id_tail(session_id)
+    } else {
+        label
+    }
+}
+
+/// Build the compact switch-list adoption state card (ADR-0100): every
+/// 接管/切换 click on the `/switch` card patches the clicked list card in place
+/// to this small 已切换 confirmation — no Session Snapshot is posted on an
+/// adoption, and the ack must not post a second message. The card and the
+/// toast carry the SAME 已切换 verb (ADR-0052 records this compact state), so
+/// the two never disagree.
+///
+/// It carries no status chip, no tail and no pending blocks: the list card has
+/// no room for them, and the text adoption surfaces are where a status summary
+/// lives (they have no list to return to). `back` is the `/switch`-list state
+/// the adoption came from: it renders the optional 「返回列表」 button
+/// (ADR-0052) with the same behavior as the force-confirm card's.
+pub fn build_switched_state_card(
+    title: &str,
+    session_id: &str,
+    directory: &str,
+    back: Option<&BackToList>,
+) -> serde_json::Value {
+    let title = display_title(title, session_id);
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": format!("已切换到该会话（目录 `{directory}`）。")
+    })];
+    if let Some(back) = back {
+        elements.push(back_to_list_button(back));
+    }
+    card_shell(&format!("已切换 {title}"), "blue", elements)
 }
 
 /// One session entry of the `/switch` card: a full-width text row followed by
@@ -1421,40 +1463,19 @@ pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
 /// operator's action beats the server's run state.
 pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
 
-/// The 等待你的确认 chip when the session's pendings are NOT carried by this
-/// card because they are already hosted by another one, and Message Pin is on:
-/// the pointer names the card and its pin (ADR-0028 update 2026-09-25).
-pub(crate) const WAITING_ELSEWHERE_PINNED_CHIP: &str = "⏳ 等待你的确认（见置顶的原卡片）";
-
-/// The pointer chip with Message Pin off: names the original card without
-/// promising a pin, since the opt-in gates the pin itself.
-pub(crate) const WAITING_ELSEWHERE_CHIP: &str = "⏳ 等待你的确认（见原卡片）";
-
-/// The status line content for a session's state (ADR-0028 precedence
+/// The status line content for a session's state (ADR-0100 precedence
 /// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲; the busy and waiting
-/// lines each carry one hint phrase). A pending already surfaced elsewhere
-/// keeps the operator action ahead of the state too, pointing at its hosting
-/// card instead. `waiting` is the gather's ADR-0059 fact (server-idle with
-/// live Background Tasks, #586) — it names the wait even though the server
-/// reads idle. `None` when there is no status to report — the line is omitted
-/// rather than guessed.
+/// lines each carry one hint phrase). `waiting` is the gather's ADR-0059 fact
+/// (server-idle with live Background Tasks, #586) — it names the wait even
+/// though the server reads idle. `None` when there is no status to report — the
+/// line is omitted rather than guessed.
 pub(crate) fn status_chip(
     has_pending: bool,
-    pending_elsewhere: Option<ElsewherePending>,
     waiting: bool,
     status: Option<crate::backend::types::SessionStatus>,
 ) -> Option<String> {
     if has_pending {
         return Some(WAITING_CHIP.to_string());
-    }
-    if let Some(elsewhere) = pending_elsewhere {
-        return Some(
-            match elsewhere {
-                ElsewherePending::Pinned => WAITING_ELSEWHERE_PINNED_CHIP,
-                ElsewherePending::Unpinned => WAITING_ELSEWHERE_CHIP,
-            }
-            .to_string(),
-        );
     }
     if waiting {
         return Some(format!("{WAITING_BACKGROUND_CHIP}\n{FOLLOW_HINT}"));
@@ -1476,8 +1497,8 @@ pub(crate) fn status_chip(
 /// the wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingFacts {
-    /// The requests this card carries: their blocks (a snapshot or follow), or
-    /// the count an idle read points at.
+    /// The requests this card carries: a follow's seeded blocks, or the count
+    /// an idle read points at.
     pub(crate) on_card: usize,
 }
 
@@ -1487,7 +1508,7 @@ pub(crate) struct PendingFacts {
 /// card's block cap left to their own surface"). Filtered to this session so a
 /// sibling's request can never make the card claim a wait it cannot show.
 fn read_has_pending(data: &SnapshotData) -> bool {
-    data.pending.iter().any(|req| req.session_id() == data.session_id) || data.pending_overflow.any()
+    data.pending.iter().any(|req| req.session_id() == data.session_id)
 }
 
 /// The 最近对话 section's heading.
@@ -1540,12 +1561,7 @@ pub(crate) fn session_card_body<'a>(
     pending: PendingFacts,
 ) -> SessionCardBody<'a> {
     SessionCardBody {
-        status: status_chip(
-            read_has_pending(data),
-            data.pending_elsewhere,
-            data.waiting,
-            data.status,
-        ),
+        status: status_chip(read_has_pending(data), data.waiting, data.status),
         pending: (pending.on_card > 0).then(|| format!("有 {} 个请求等待你处理", pending.on_card)),
         tail,
         omitted_tail,
@@ -1561,12 +1577,7 @@ pub(crate) fn session_card_body<'a>(
 /// me". `None` when the read has no status to report, so a failed status read
 /// is omitted rather than guessed.
 pub(crate) fn status_line(data: &SnapshotData) -> Option<String> {
-    let status = status_chip(
-        read_has_pending(data),
-        data.pending_elsewhere,
-        data.waiting,
-        data.status,
-    )?;
+    let status = status_chip(read_has_pending(data), data.waiting, data.status)?;
     Some(status.lines().next().unwrap_or(status.as_str()).to_string())
 }
 
@@ -1636,9 +1647,7 @@ pub(crate) fn build_idle_card_with_pending(data: &SnapshotData, on_card: usize) 
 /// Whether an assembled one-shot card fits the platform's one-card budgets: the
 /// serialized size AND the component ceiling. Both bind independently — a tail
 /// of many title-only Compaction rows is small in bytes but can cross
-/// [`crate::feishu::card::MAX_CARD_COMPONENTS`] (issue #726's review). Shared
-/// with the Session Snapshot's one-shot builder (retired by #1006), so the two
-/// cannot disagree on what one card can carry.
+/// [`crate::feishu::card::MAX_CARD_COMPONENTS`] (issue #726's review).
 pub(crate) fn fits_card(card: &serde_json::Value) -> bool {
     card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS
         && card_components(card) <= crate::feishu::card::MAX_CARD_COMPONENTS
@@ -1671,9 +1680,7 @@ fn nested_components(element: &serde_json::Value) -> usize {
 /// fully-evicted build (`len`) is already known to fit.
 ///
 /// The predicate is monotone: one more omitted entry removes its bytes and adds
-/// at most a character to the overflow line, so more omission never costs more.
-/// Shared by the one-shot Session Snapshot card and the idle Session Card, so
-/// the two budget ladders cannot disagree.
+/// at most a character to the omission line, so more omission never costs more.
 pub(crate) fn smallest_omission(
     len: usize,
     mut build: impl FnMut(usize) -> serde_json::Value,
@@ -1837,7 +1844,6 @@ fn tail_preview(message: &TailMessage) -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::snapshot::PendingOverflow;
 
     /// ADR-0025: every Recent Directories row carries both gestures — the
     /// re-root pick and the 建话题 topic opener (each with the routing payload
@@ -3302,8 +3308,6 @@ mod tests {
             status,
             waiting,
             pending: Vec::new(),
-            pending_elsewhere: None,
-            pending_overflow: PendingOverflow::None,
             tail,
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,
@@ -3490,17 +3494,6 @@ mod tests {
         assert_eq!(body.lead_elements().len(), 1, "the status line only, no pointer");
     }
 
-    /// A read whose only waiting fact is its overflow still reports 等待你的确认,
-    /// while the pointer counts what the card carries (nothing).
-    #[test]
-    fn an_overflow_only_read_waits_without_a_pointer() {
-        let mut read = body_read(Some(crate::backend::types::SessionStatus::Idle), false, vec![]);
-        read.pending_overflow = PendingOverflow::Counted(2);
-        let body = session_card_body(&read, &read.tail, 0, PendingFacts { on_card: 0 });
-        assert_eq!(body.lead_text(), WAITING_CHIP);
-        assert_eq!(body.lead_elements().len(), 1, "the status line only");
-    }
-
     /// An omitted-entry fact renders as its own visible line, in both forms, so
     /// a budgeted card's tail is a window rather than a silent truncation.
     #[test]
@@ -3615,8 +3608,7 @@ mod tests {
 
     /// An idle read taller than one card degrades visibly: the oldest tail entry
     /// is dropped into the shared omission notice and the card still fits the
-    /// one-card budget. This is the shared one-shot ladder the snapshot card
-    /// uses, not a silent truncation.
+    /// one-card budget. This is the one-shot ladder, not a silent truncation.
     #[test]
     fn an_idle_read_too_tall_for_one_card_names_what_it_left_out() {
         let huge = "长".repeat(12_000);

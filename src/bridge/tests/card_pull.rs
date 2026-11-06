@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use crate::backend::{FinishReason, MessageId, MessageRole, Part, SessionTranscript, StepFinish};
+use crate::bridge::snapshot::SnapshotData;
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 
@@ -1555,4 +1556,365 @@ async fn card_command_splits_the_chain_and_the_continuation_takes_over() {
         "later updates must target the continuation: {calls:?}"
     );
     assert!(has(&last_update.1, "后续进度。"));
+}
+// -- ADR-0100: one body composition, two drivers ----------------------------
+
+fn body_tail_message(role: MessageRole, created_ms: i64, text: &str) -> crate::backend::TailEntry {
+    crate::backend::TailEntry::Message(crate::backend::TailMessage {
+        role,
+        created_ms,
+        text: text.into(),
+        files: Vec::new(),
+    })
+}
+
+fn body_compaction(created_ms: i64, summary: &str) -> crate::backend::TailEntry {
+    crate::backend::TailEntry::Compaction(crate::backend::TailMarker {
+        created_ms,
+        compaction: crate::backend::Compaction {
+            status: crate::backend::CompactionStatus::Completed,
+            reason: crate::backend::CompactionReason::Auto,
+            summary: summary.into(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        },
+    })
+}
+
+/// One body as the two presentations carry it, for a real comparison rather
+/// than a preview-vs-preview one:
+/// - `lead` is the status line (and pointer) above the tail, as flat lines;
+/// - `messages` is every tail message with its FULL body — the card side reads
+///   the folded panel's content chunks, never its 40-char preview title;
+/// - `markers` is every Compaction row the card carries (title + folded
+///   summary). The live lead deliberately carries none.
+#[derive(Debug, Default, PartialEq)]
+struct RenderedBody {
+    lead: Vec<String>,
+    messages: Vec<(String, String)>,
+    markers: Vec<(String, String)>,
+    omitted: Option<String>,
+}
+
+fn split_role_line(line: &str) -> Option<(String, String)> {
+    for role in ["👤", "🤖", "💬"] {
+        if let Some(rest) = line.strip_prefix(role) {
+            return Some((role.to_string(), rest.trim_start().to_string()));
+        }
+    }
+    None
+}
+
+/// The one-shot card's body. Panels are compared by their CONTENT chunks (the
+/// full entry), which is what the reader sees when the fold opens; the title is
+/// only a preview and a parity check over it would not see a truncated body.
+fn idle_card_body(card: &serde_json::Value) -> RenderedBody {
+    let mut body = RenderedBody::default();
+    let mut in_tail = false;
+    for element in card["body"]["elements"].as_array().expect("card body") {
+        match element["tag"].as_str() {
+            Some("markdown") => {
+                let content = element["content"].as_str().expect("markdown content");
+                if content == "**最近对话**" {
+                    in_tail = true;
+                } else if !in_tail {
+                    body.lead.extend(content.lines().map(str::to_string));
+                } else if content.starts_with("…更早的") {
+                    body.omitted = Some(content.to_string());
+                } else {
+                    // A compaction row with nothing to fold is one markdown line.
+                    body.markers.push((content.to_string(), String::new()));
+                }
+            }
+            Some("collapsible_panel") => {
+                let title = element["header"]["title"]["content"]
+                    .as_str()
+                    .expect("panel title");
+                let folded: String = element["elements"]
+                    .as_array()
+                    .expect("panel elements")
+                    .iter()
+                    .filter_map(|chunk| chunk["content"].as_str())
+                    .collect();
+                match split_role_line(title) {
+                    Some((role, _preview)) => body.messages.push((role, folded)),
+                    None => body.markers.push((title.to_string(), folded)),
+                }
+            }
+            _ => {}
+        }
+    }
+    body
+}
+
+/// The busy follow's static lead, with its takeover identity line dropped: the
+/// body begins after the blank line that separates the two.
+///
+/// A message body is MULTI-LINE, so the tail is parsed by its role prefix rather
+/// than line-by-line: a line that starts with a role marker opens an entry and
+/// every following line (blank ones included) belongs to that entry's body until
+/// the next marker. That keeps a body's interior line breaks — a line-splitting
+/// parser would read a second line as a marker row.
+fn follow_lead_body(lead: &str) -> RenderedBody {
+    let (_, text) = lead.split_once("\n\n").expect("identity line, then the body");
+    let mut body = RenderedBody::default();
+    let mut in_tail = false;
+    let mut open: Option<(String, String)> = None;
+    for line in text.lines() {
+        if line == "**最近对话**" {
+            in_tail = true;
+            continue;
+        }
+        if !in_tail {
+            if !line.is_empty() {
+                body.lead.push(line.to_string());
+            }
+            continue;
+        }
+        if let Some((role, first)) = split_role_line(line) {
+            if let Some(entry) = open.take() {
+                body.messages.push(entry);
+            }
+            open = Some((role, first));
+        } else if let Some((_, message)) = open.as_mut() {
+            message.push('\n');
+            message.push_str(line);
+        } else if line.starts_with("…更早的") {
+            body.omitted = Some(line.to_string());
+        } else if !line.is_empty() {
+            // The lead must not carry a commit marker: record it so the test
+            // that asserts its absence can see one if it ever comes back.
+            body.markers.push((line.to_string(), String::new()));
+        }
+    }
+    if let Some(entry) = open.take() {
+        body.messages.push(entry);
+    }
+    body
+}
+
+fn parity_read(
+    status: crate::backend::types::SessionStatus,
+    waiting: bool,
+    tail: Vec<crate::backend::TailEntry>,
+) -> SnapshotData {
+    SnapshotData {
+        session_id: "ses_alpha01".into(),
+        directory: "/work/ext".into(),
+        status: Some(status),
+        waiting,
+        pending: Vec::new(),
+        tail,
+        newest_user_anchor: None,
+        newest_user_is_cola_authored: false,
+    }
+}
+
+/// ADR-0100 parity: the idle Session Card and the busy follow's static lead
+/// take the SAME read through the ONE body composition, so the same read cannot
+/// render two ways. Message bodies are compared in FULL (the card's folded
+/// content chunks against the lead's text), including one longer than the
+/// panel's 40-char preview — the case a title-only comparison cannot see.
+#[test]
+fn the_idle_card_and_the_busy_follow_render_the_same_body() {
+    let long =
+        "这是一条明显超过四十个字符的对话正文，用来证明对比的是完整内容而不是折叠面板的预览标题。".repeat(2);
+    let read = parity_read(
+        crate::backend::types::SessionStatus::Idle,
+        false,
+        vec![
+            body_tail_message(MessageRole::User, 1_000, "问题一"),
+            body_tail_message(MessageRole::Assistant, 2_000, &long),
+            body_tail_message(MessageRole::User, 3_000, "问题二"),
+            body_tail_message(MessageRole::Assistant, 4_000, "回答二"),
+        ],
+    );
+    // Driver A: the one-shot card the idle Session Card renders.
+    let card = crate::feishu::card::session::build_idle_card(&read);
+    // Driver B: the busy follow's static lead.
+    let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
+
+    // The fixture really is longer than a panel title, so the full-body
+    // comparison is doing work the old title comparison could not.
+    assert!(
+        long.chars().count() > 40,
+        "the fixture must exceed the panel preview budget"
+    );
+    let long_panel = card["body"]["elements"]
+        .as_array()
+        .expect("card body")
+        .iter()
+        .find(|element| element["element_id"] == "snap_1")
+        .expect("the long message's panel");
+    let title = long_panel["header"]["title"]["content"].as_str().expect("title");
+    let folded = long_panel["elements"][0]["content"].as_str().expect("content");
+    assert_eq!(folded, long, "the panel folds the FULL body");
+    assert!(
+        title.chars().count() < long.chars().count() && title.ends_with('…'),
+        "the panel title is only a preview: {title}"
+    );
+
+    let card_body = idle_card_body(&card);
+    let lead_body = follow_lead_body(&lead);
+    assert_eq!(card_body.lead, lead_body.lead, "same status/pointer: {card}");
+    assert_eq!(card_body.messages, lead_body.messages, "same full message bodies");
+    assert_eq!(card_body.markers, lead_body.markers, "same marker rows (none)");
+    assert_eq!(card_body.omitted, lead_body.omitted);
+}
+
+/// The parity holds for the Waiting copy too: with `busy_now = false` the lead
+/// says the wait is in progress, while the body's status line stays the
+/// composition's 等待后台任务 arm on both drivers.
+#[test]
+fn the_parity_holds_for_the_waiting_copy() {
+    let read = parity_read(
+        crate::backend::types::SessionStatus::Idle,
+        true,
+        vec![body_tail_message(MessageRole::User, 1_000, "问题一")],
+    );
+    let card = crate::feishu::card::session::build_idle_card(&read);
+
+    for busy_now in [false, true] {
+        let lead =
+            crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], busy_now);
+        let identity = lead.split_once("\n\n").expect("identity, then body").0;
+        // `busy_now = false` names the wait; a run that turned busy after a
+        // waiting gather keeps the continuing copy.
+        assert_eq!(
+            identity.contains("等待后台任务完成"),
+            !busy_now,
+            "identity copy for busy_now={busy_now}: {identity}"
+        );
+        let card_body = idle_card_body(&card);
+        let lead_body = follow_lead_body(&lead);
+        assert_eq!(
+            card_body.lead, lead_body.lead,
+            "same status line, busy_now={busy_now}"
+        );
+        assert_eq!(
+            card_body.messages, lead_body.messages,
+            "same tail, busy_now={busy_now}"
+        );
+        assert_eq!(
+            card_body.lead[0],
+            crate::feishu::card::session::WAITING_BACKGROUND_CHIP
+        );
+    }
+}
+
+/// A Compaction marker is the ONE deliberate difference: the card keeps it at
+/// its server position (its 最近对话 tail has no timeline), while the live
+/// lead drops it because the follow card's own timeline renders the session's
+/// compaction rows (ADR-0082) — repeating it would show the reader two.
+#[test]
+fn the_parity_keeps_the_marker_on_the_card_and_drops_it_from_the_lead() {
+    let read = parity_read(
+        crate::backend::types::SessionStatus::Busy,
+        false,
+        vec![
+            body_tail_message(MessageRole::User, 1_000, "问题一"),
+            body_compaction(1_500, "保留了结论。"),
+            body_tail_message(MessageRole::Assistant, 2_000, "回答一"),
+        ],
+    );
+    let card = crate::feishu::card::session::build_idle_card(&read);
+    let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
+
+    let card_body = idle_card_body(&card);
+    let lead_body = follow_lead_body(&lead);
+    assert_eq!(
+        card_body.markers,
+        vec![("已压缩上下文（自动）".to_string(), "保留了结论。".to_string())],
+        "the card keeps the marker at its server position: {card}"
+    );
+    assert!(
+        lead_body.markers.is_empty(),
+        "the live lead drops the marker: {lead:?}"
+    );
+    assert_eq!(
+        card_body.messages, lead_body.messages,
+        "dropping the marker does not drop a message"
+    );
+    assert_eq!(card_body.lead, lead_body.lead, "same status line");
+}
+
+/// The parity holds for a body that is not one tidy line: a multi-line message
+/// (blank interior line included) compared entry-by-entry in FULL, and a
+/// whitespace-only body rendered as the same `（空消息）` on both sides — the two
+/// presentations share one emptiness predicate.
+#[test]
+fn the_parity_holds_for_multi_line_and_whitespace_only_bodies() {
+    let read = parity_read(
+        crate::backend::types::SessionStatus::Idle,
+        false,
+        vec![
+            body_tail_message(MessageRole::User, 1_000, "第一行\n第二行\n\n第四行"),
+            body_tail_message(MessageRole::Assistant, 2_000, "   "),
+            body_tail_message(MessageRole::User, 3_000, "结尾"),
+        ],
+    );
+    let card = crate::feishu::card::session::build_idle_card(&read);
+    let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
+
+    let card_body = idle_card_body(&card);
+    let lead_body = follow_lead_body(&lead);
+    assert_eq!(card_body.lead, lead_body.lead, "same status line: {card}");
+    assert_eq!(
+        card_body.messages, lead_body.messages,
+        "same full bodies, interior line breaks included: {card}"
+    );
+    assert_eq!(
+        card_body.messages[0].1, "第一行\n第二行\n\n第四行",
+        "the multi-line body survives whole"
+    );
+    assert_eq!(
+        card_body.messages[1].1, "（空消息）",
+        "a whitespace-only body is the empty-message line, not a blank panel"
+    );
+}
+
+/// The parity holds for the body's three parts: a pending read renders the same
+/// status line and the same count-only pointer on both drivers (the idle card
+/// carries no block at all — its pointer is text).
+#[test]
+fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
+    let mut read = parity_read(
+        crate::backend::types::SessionStatus::Busy,
+        false,
+        vec![body_tail_message(MessageRole::User, 1_000, "问题一")],
+    );
+    let pending = crate::bridge::request::kind::PendingRequest::Permission(perm_request(
+        "per_1",
+        "ses_alpha01",
+        "ls -la",
+    ));
+    read.pending = vec![pending.clone()];
+    let card = crate::feishu::card::session::build_idle_card(&read);
+    let seeds = [&pending];
+    let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &seeds, true);
+
+    // The read carries the block nowhere; the pointer is the body's whole
+    // pending statement, so the two bodies agree in full.
+    let card_body = idle_card_body(&card);
+    let lead_body = follow_lead_body(&lead);
+    assert_eq!(card_body.lead, lead_body.lead, "same status + pointer: {card}");
+    assert_eq!(card_body.lead[0], crate::feishu::card::session::WAITING_CHIP);
+    assert_eq!(card_body.lead[1], "有 1 个请求等待你处理");
+    assert_eq!(card_body.messages, lead_body.messages);
+    assert!(
+        !card.to_string().contains("\"tag\":\"button\""),
+        "the read hosts no block: {card}"
+    );
+
+    // #1005's filter: a request another card already hosts is not seeded here,
+    // so this card carries none — but the READ still waits on the operator, so
+    // the status line keeps 等待你的确认 and only the pointer goes away.
+    let unseeded = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
+    let unseeded_body = follow_lead_body(&unseeded);
+    assert_eq!(
+        unseeded_body.lead,
+        vec![crate::feishu::card::session::WAITING_CHIP.to_string()],
+        "the status comes from the read, not the seed set: {unseeded}"
+    );
 }

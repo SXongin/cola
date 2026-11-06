@@ -15,7 +15,7 @@ use super::{InlineResidue, Turn, TurnPinSource, state};
 
 impl Turn {
     /// Whether ANY card session still carries a block for `request_id` (the
-    /// snapshot-claimability probe, ADR-0028).
+    /// already-surfaced probe, ADR-0038).
     pub(crate) async fn has_interaction(cards: &CardsHandle, request_id: &str) -> bool {
         cards
             .cards
@@ -169,7 +169,7 @@ impl Turn {
         dead: &HashSet<String>,
     ) -> Vec<String> {
         Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
-            state::block_of_kind(crate::bridge::snapshot_claims::ClaimKind::Permission, block)
+            state::block_of_kind(crate::bridge::request::kind::ClaimKind::Permission, block)
         })
         .await
     }
@@ -183,7 +183,7 @@ impl Turn {
         dead: &HashSet<String>,
     ) -> Vec<String> {
         Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
-            state::block_of_kind(crate::bridge::snapshot_claims::ClaimKind::Question, block)
+            state::block_of_kind(crate::bridge::request::kind::ClaimKind::Question, block)
         })
         .await
     }
@@ -194,7 +194,7 @@ impl Turn {
     /// classifier and the resolution can never disagree.
     pub(crate) async fn vanished_block_sessions(
         cards: &CardsHandle,
-        kind: crate::bridge::snapshot_claims::ClaimKind,
+        kind: crate::bridge::request::kind::ClaimKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,

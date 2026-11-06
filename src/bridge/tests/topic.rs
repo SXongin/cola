@@ -1208,12 +1208,6 @@ async fn topic_adopt_opens_topic_around_existing_session() {
         "the seed line names the takeover and the status: {seed}"
     );
     assert_eq!(seed.lines().count(), 1, "the confirmation is ONE line: {seed}");
-    assert!(
-        !calls
-            .iter()
-            .any(|c| matches!(c, PlatformCall::ReplyCardInThread { .. })),
-        "an adopted topic seeds with a text line, not a card: {calls:?}"
-    );
 
     // The new topic's thread_id maps to the ADOPTED session (not a new one),
     // with the confirmation line (the topic's first in-topic message) as the
@@ -1826,12 +1820,6 @@ async fn fresh_topic_attach_adopts_with_in_topic_anchor() {
         "the line names the takeover: {seed}"
     );
     assert_eq!(seed.lines().count(), 1, "one line: {seed}");
-    assert!(
-        !calls
-            .iter()
-            .any(|c| matches!(c, PlatformCall::ReplyCardInThread { .. })),
-        "no card anchor on the adoption: {calls:?}"
-    );
 
     // Adopted as the topic's single session, anchored to the confirmation line
     // (the mock's created topic-reply message id).

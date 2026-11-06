@@ -355,7 +355,7 @@ impl CardBuilder {
     /// terminal successor share one timeline entry, so the id keeps the reader's
     /// fold state across the in-place update. The compaction's own usage rides
     /// the title when the server reports one, never the Turn Footer's context
-    /// figure. The elements themselves are shared with the Session Snapshot's
+    /// figure. The elements themselves are shared with the Session Card's
     /// tail marker row (ticket #723), so the two surfaces cannot disagree — and
     /// the fold body is that module's capped, chunked body
     /// ([`crate::feishu::card::compaction::compaction_fold_body`]): one timeline
@@ -581,7 +581,7 @@ pub(super) fn panel_time_suffix(at_ms: Option<i64>) -> String {
 }
 
 /// Build a collapsible panel (v2) holding several markdown chunks, folded by
-/// default. Used when one logical section (e.g. a snapshot tail entry's full
+/// default. Used when one logical section (e.g. an idle card tail entry's full
 /// text) needs splitting across multiple markdown elements to stay within
 /// cola's per-element budget ([`MAX_ELEMENT_TEXT_CHARS`]) — Feishu does not
 /// truncate a long element itself; the budget keeps the card's total size and

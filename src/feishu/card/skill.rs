@@ -3,7 +3,7 @@
 //! `🧩 已加载技能：<name>` panel whose body is the skill's own markdown from the
 //! skill-list read's `content`. Its ONLY caller is the dedicated loaded-skill
 //! card that replies under the user's `/skill` message — the live Turn card,
-//! the Session Snapshot's 「最近对话」 tail and the External Message preview
+//! the Session Card's 「最近对话」 tail and the External Message preview
 //! render no skill fold (the acceptance reversal recorded in ADR-0077).
 
 use crate::backend::SkillInfo;

@@ -699,111 +699,6 @@ impl ExternalFlow {
         );
     }
 
-    /// ADR-0028 busy-adopt follow, re-driven from `/card` by ADR-0100: the
-    /// session's in-flight EXTERNAL turn streams into an already-sent card
-    /// instead of freezing a static "运行中" line. The card is the host (the
-    /// session's `CardSession` accumulator, like `start_reply_render`): its
-    /// message id is the live card, the read's identity + tail ride as acc
-    /// text (the same representation choice as the 👤 preview), and the
-    /// read's pending blocks are seeded as inline sections so a permission
-    /// approved from the card resumes the run inside the SAME card. The
-    /// renderer exits when a cola prompt or a newer external message replaces
-    /// the accumulator (the existing `external_render_loop` guards). `/card`'s
-    /// own post-and-arm shares this preparation through
-    /// [`Self::prepare_snapshot_follow`] but sends the card itself.
-    pub(crate) async fn start_snapshot_follow(
-        &self,
-        handles: &FlowHandles,
-        session_id: &str,
-        card_id: &str,
-        verb: &str,
-        title: &str,
-        data: &crate::bridge::snapshot::SnapshotData,
-    ) -> bool {
-        // Race (ADR-0028): busy at gather but idle by now → the turn already
-        // finished; keep the static snapshot and never arm a renderer. A
-        // gathered Waiting turn (server-idle with live Background Tasks,
-        // ADR-0059) needs no fresh busy read to stay follow-worthy: its
-        // Execution already ended, and the follow yields ⏳ on its first
-        // settle read (#586).
-        let busy_now = matches!(
-            handles
-                .backend
-                .session_status(session_id, Some(&data.directory))
-                .await,
-            Ok(Some(crate::backend::types::SessionStatus::Busy))
-        );
-        if !busy_now && !data.waiting {
-            tracing::info!(
-                "snapshot follow: session {} neither busy nor waiting; keeping static snapshot",
-                session_id
-            );
-            return false;
-        }
-        // The follow is only for an external run (ADR-0028/ADR-0100): the busy
-        // run answers the newest user message, so a cola-authored newest means
-        // the in-flight turn is cola's OWN and never gets a renderer here.
-        let Some(anchor) = data.newest_user_anchor.clone() else {
-            tracing::warn!(
-                "snapshot follow: session {} busy but has no user message to follow",
-                session_id
-            );
-            return false;
-        };
-        if data.newest_user_is_cola_authored {
-            tracing::info!(
-                "snapshot follow: session {} busy on a cola-authored turn; keeping static snapshot",
-                session_id
-            );
-            return false;
-        }
-        // Guard: a renderer for THIS turn is already armed (the accumulator
-        // still carries its full anchor — id + server time; two messages can
-        // share a millisecond). Re-point it at the new card — a re-adopt sent
-        // a fresh snapshot mid-turn — so one renderer keeps one live card,
-        // and never double-render.
-        if armed_turn_anchor(&handles.cards, session_id).await.as_ref() == Some(&anchor) {
-            Turn::repoint_card(&handles.cards, session_id, card_id).await;
-            tracing::info!(
-                "snapshot follow: re-pointing existing renderer at card {}",
-                card_id
-            );
-            return true;
-        }
-        let Some(mut plan) = self
-            .prepare_snapshot_follow_with_busy(handles, busy_now, data)
-            .await
-        else {
-            return false;
-        };
-        // A NEW external run (the adoption follows it): a `/stop` from before
-        // it is not this run's ending, same as the reply renderer's arm. A
-        // stop landing after this point ends the follow promptly as
-        // ⏹ 已停止 (the loop's own check).
-        handles.waits.stopped_sessions.lock().await.remove(session_id);
-        let armed = {
-            let write_lock = handles.cards.write_lock(session_id).await;
-            let _guard = write_lock.lock().await;
-            // The seed filter, the pointer it feeds and the blocks it attaches
-            // share this lock, so the card's count names exactly what it shows
-            // and no sweep can slip between the commit and the seed.
-            self.resolve_snapshot_follow_seeds(handles, &mut plan).await;
-            self.compose_snapshot_follow_lead(&mut plan, verb, title, data);
-            let armed = self
-                .arm_snapshot_follow_locked(handles, session_id, card_id, &mut plan, false)
-                .await;
-            if armed {
-                self.seed_snapshot_follow_locked(handles, session_id, &plan).await;
-            }
-            armed
-        };
-        if !armed {
-            return false;
-        }
-        self.spawn_snapshot_follow(handles, session_id, &plan);
-        true
-    }
-
     /// Decide and prepare a busy follow from a Session read (ADR-0028,
     /// ADR-0100), **without touching the card map**: the follow's anchor, the
     /// read's pending candidates and the accumulator. `None` when the read is
@@ -834,7 +729,7 @@ impl ExternalFlow {
         );
         if !busy_now && !data.waiting {
             tracing::info!(
-                "snapshot follow: session {} neither busy nor waiting; keeping static read",
+                "busy follow: session {} neither busy nor waiting; keeping static read",
                 data.session_id
             );
             return None;
@@ -854,14 +749,14 @@ impl ExternalFlow {
     ) -> Option<SnapshotFollowPlan> {
         let Some(anchor) = data.newest_user_anchor.clone() else {
             tracing::warn!(
-                "snapshot follow: session {} busy but has no user message to follow",
+                "busy follow: session {} busy but has no user message to follow",
                 data.session_id
             );
             return None;
         };
         if data.newest_user_is_cola_authored {
             tracing::info!(
-                "snapshot follow: session {} busy on a cola-authored turn; keeping static read",
+                "busy follow: session {} busy on a cola-authored turn; keeping static read",
                 data.session_id
             );
             return None;
@@ -907,11 +802,9 @@ impl ExternalFlow {
     ) {
         plan.seeds.clear();
         for req in &plan.candidates {
-            if crate::bridge::snapshot_claims::is_already_surfaced(&handles.requests, &handles.cards, req)
-                .await
-            {
+            if is_already_surfaced(handles, req).await {
                 tracing::info!(
-                    "snapshot follow: {} on session {} is already surfaced; not seeded",
+                    "busy follow: {} on session {} is already surfaced; not seeded",
                     req.id(),
                     req.session_id()
                 );
@@ -990,7 +883,7 @@ impl ExternalFlow {
                 .await
             {
                 tracing::warn!(
-                    "snapshot follow: request {} was not seeded on the card for session {session_id}",
+                    "busy follow: request {} was not seeded on the card for session {session_id}",
                     req.id()
                 );
             }
@@ -999,7 +892,7 @@ impl ExternalFlow {
             // for them and the block's buttons would resolve to nothing.
             flow.remember_surfaced(req, &plan.directory).await;
         }
-        tracing::info!("snapshot follow armed for session {}", session_id);
+        tracing::info!("busy follow armed for session {}", session_id);
     }
 
     /// Spawn the follow's render loop. Runs AFTER the card write lock is
@@ -1530,6 +1423,38 @@ impl ExternalFlow {
     }
 }
 
+/// Whether a pending request is already surfaced elsewhere — a standalone card
+/// in a flow's `sent_cards`, an inline section on a live streaming card (its
+/// accumulator, or the card handle that outlives it — e.g. a re-adopted card
+/// after a restart). Such a request must NOT be seeded onto a busy follow: the
+/// existing card stays authoritative (ADR-0038).
+async fn is_already_surfaced(
+    handles: &FlowHandles,
+    req: &crate::bridge::request::kind::PendingRequest,
+) -> bool {
+    if handles
+        .requests
+        .flow_for(req.claim_kind())
+        .sent_cards
+        .lock()
+        .await
+        .contains_key(req.id())
+    {
+        return true;
+    }
+    if handles
+        .cards
+        .card_handles
+        .lock()
+        .await
+        .message_of(req.id())
+        .is_some()
+    {
+        return true;
+    }
+    Turn::has_interaction(&handles.cards, req.id()).await
+}
+
 /// The busy follow's static lead (ADR-0100): the takeover identity line and the
 /// Session Card body this read composes. Both are static text at the top of the
 /// live card (the same representation choice as the 👤 preview in
@@ -1567,7 +1492,7 @@ pub(crate) fn snapshot_follow_lead(
     seeds: &[&crate::bridge::request::kind::PendingRequest],
     busy_now: bool,
 ) -> String {
-    let title = crate::feishu::snapshot_card::display_title(title, &data.session_id);
+    let title = crate::feishu::card::session::display_title(title, &data.session_id);
     let mut text = if data.waiting && !busy_now {
         format!("已{verb} {title}（等待后台任务完成，有新进展会自动更新）")
     } else {
@@ -1632,60 +1557,6 @@ pub(crate) async fn session_subtitle(
     } else {
         format!("{} · {}", clean, id_tail)
     }
-}
-
-/// ADR-0028: settle a snapshot card right after it was sent — arm the
-/// busy-adopt follow when the adopted session is mid-turn (the in-flight
-/// external run streams into the snapshot), otherwise keep the static
-/// snapshot and claim its embedded pendings. A follow that declines to arm
-/// (the busy→idle race: the turn already finished) falls back to the static
-/// claim path, so the embedded pendings are never left unclaimed. The settle
-/// runs inside the adopted Session's `snapshot` span (ADR-0048), so its
-/// follow/claim lines are retrievable by it; the follow's own render task is
-/// instrumented at its spawn with the `external` span.
-///
-/// **No adoption surface emits a snapshot card any more** (ADR-0100, #1004) —
-/// they confirm in one text line — so this has no production caller: the
-/// follow suite still pins it, #1005 re-drives the follow from `/card` (the
-/// retained caller), and #1006 deletes this settle with the snapshot card.
-/// `back` is the `/switch`-list state the card was adopted from, when it came
-/// from the list card (ADR-0052): the claim path keeps its 返回列表 button
-/// across rebuilds.
-#[allow(dead_code)] // no production caller since #1004; #1005 replaces the follow caller, #1006 deletes this
-pub(crate) async fn settle_snapshot_after_send(
-    external: &ExternalFlow,
-    handles: &FlowHandles,
-    snapshot_message_id: &str,
-    verb: &str,
-    title: &str,
-    data: &crate::bridge::snapshot::SnapshotData,
-    back: Option<&crate::feishu::card::session::BackToList>,
-) {
-    let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &data.session_id).await;
-    let span = crate::bridge::span::snapshot(&data.session_id, thread_key.as_ref());
-    async {
-        // Busy follows the in-flight Execution; waiting follows a Waiting turn
-        // (server-idle with live Background Tasks, ADR-0059) — the follow's
-        // first settle read then stamps the ⏳ yield in place and Session Sync
-        // serves the wait (#586). Anything else keeps the static snapshot.
-        let followed = (data.status == Some(crate::backend::types::SessionStatus::Busy) || data.waiting)
-            && external
-                .start_snapshot_follow(handles, &data.session_id, snapshot_message_id, verb, title, data)
-                .await;
-        if !followed {
-            crate::bridge::snapshot_claims::claim_snapshot_pendings(
-                &handles.requests,
-                snapshot_message_id,
-                verb,
-                title,
-                data,
-                back,
-            )
-            .await;
-        }
-    }
-    .instrument(span)
-    .await;
 }
 
 /// Incremental renderer for an external message's reply: poll the session,

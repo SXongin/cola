@@ -20,7 +20,6 @@ pub mod session;
 pub(crate) mod session_gates;
 pub(crate) mod sidecar;
 pub mod snapshot;
-pub mod snapshot_claims;
 pub mod span;
 pub(crate) mod store_writer;
 pub(crate) mod surfaces;

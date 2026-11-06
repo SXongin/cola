@@ -228,8 +228,8 @@ pub fn question_summary(questions: &[crate::backend::types::QuestionInfo]) -> St
 
 /// The card copy for a question cola cannot collect at all. The neutral model
 /// carries only [`UncollectableReason`]; the user-facing wording lives here,
-/// in the card copy table, and every rendering path (standalone, inline,
-/// snapshot) asks for it.
+/// in the card copy table, and every rendering path (standalone, inline) asks
+/// for it.
 pub(crate) fn uncollectable_note(reason: UncollectableReason) -> &'static str {
     match reason {
         UncollectableReason::SecretInput => {
@@ -332,7 +332,7 @@ pub(crate) const UNCOLLECTABLE_HEADER: &str = "❓ 无法在卡片上作答";
 ///
 /// `title` (an elicitation's message) and `uncollectable` render at the top of
 /// the block: the standalone card passes an empty title because its header
-/// carries it, while inline and snapshot blocks show both here. An
+/// carries it, while an inline block shows both here. An
 /// `uncollectable` request renders its reason and a decline control only —
 /// never a field an answer could be typed into.
 #[allow(clippy::too_many_arguments)] // title, reason, routing, fields, display state
@@ -359,7 +359,7 @@ pub fn question_elements(
 
     // The request's own title (an elicitation's message, for example) belongs
     // on every surface; the standalone card puts it in the header and passes
-    // an empty title here, while inline and snapshot blocks render it here.
+    // an empty title here, while an inline block renders it here.
     if !title.is_empty() {
         elements.push(json!({
             "tag": "markdown",

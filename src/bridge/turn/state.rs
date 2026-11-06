@@ -1013,9 +1013,11 @@ impl CardSession {
         self.card_message_id.as_deref()
     }
 
-    /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
-    /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
-    /// new card instead of the old one). The accumulator content is untouched.
+    /// Re-point the live card identity at a new message. The accumulator
+    /// content is untouched. Test-only since the Session Snapshot readopt path
+    /// was retired (#1006); the render test still proves the in-flight upload
+    /// uses the card's CURRENT id.
+    #[cfg(test)]
     pub(super) fn repoint(&mut self, message_id: &str) {
         self.card_message_id = Some(message_id.to_string());
         self.acc.reply_to_message_id = Some(message_id.to_string());
@@ -5457,11 +5459,8 @@ impl StreamAccumulator {
 
 /// Whether `block` belongs to `kind` — the one ClaimKind → block-family
 /// predicate the kind wrappers, the session collector and the resolver share.
-pub(super) fn block_of_kind(
-    kind: crate::bridge::snapshot_claims::ClaimKind,
-    block: &InteractionBlock,
-) -> bool {
-    use crate::bridge::snapshot_claims::ClaimKind;
+pub(super) fn block_of_kind(kind: crate::bridge::request::kind::ClaimKind, block: &InteractionBlock) -> bool {
+    use crate::bridge::request::kind::ClaimKind;
     match kind {
         ClaimKind::Permission => matches!(block, InteractionBlock::Permission(_)),
         ClaimKind::Question => matches!(block, InteractionBlock::Question(_)),

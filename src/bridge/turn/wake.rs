@@ -20,11 +20,11 @@ use super::{Disposition, SettleTiming, Turn, WAKE_RECEIPT, ownership, render, se
 
 /// What an armed external card opens with, above the Turn's parts (ADR-0028):
 /// the External Message is the user's own text and reads as a user block. A
-/// snapshot follow's static prefix (its identity line plus the 最近对话 tail)
+/// busy follow's static prefix (its identity line plus the 最近对话 tail)
 /// is cola's own composition and is set later, once its seed count is final.
 pub(crate) enum ExternalCardLead<'a> {
     /// The External Message the run answers: rendered as a distinct, quoted
-    /// user block ([`crate::feishu::card::user_message_block`]). A snapshot
+    /// user block ([`crate::feishu::card::user_message_block`]). A busy
     /// follow's static lead is set later, under its write lock, through
     /// [`PreparedExternalRender::set_static_lead`].
     UserMessage(&'a str),

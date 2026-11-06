@@ -295,11 +295,6 @@ pub enum PlatformCall {
         text: String,
         thread_id: Option<String>,
     },
-    ReplyCardInThread {
-        message_id: String,
-        card: serde_json::Value,
-        thread_id: Option<String>,
-    },
     CompletionNotice {
         reply_to: String,
         open_id: String,
@@ -673,17 +668,6 @@ impl RecordingPlatform {
         .await
     }
 
-    /// Every card replied into a thread — the shape a continuation uses when
-    /// the conversation is a Topic. Kept separate from [`Self::replied_cards`]
-    /// because its call carries a thread id too.
-    pub(crate) async fn replied_in_thread_cards(&self) -> Vec<serde_json::Value> {
-        self.cards_of(|c| match c {
-            PlatformCall::ReplyCardInThread { card, .. } => Some(card),
-            _ => None,
-        })
-        .await
-    }
-
     /// Every replied card paired with the message id it replied under, in call
     /// order (asserts a reply lands under the right message).
     pub(crate) async fn replied_cards_with_targets(&self) -> Vec<(String, serde_json::Value)> {
@@ -792,8 +776,7 @@ impl RecordingPlatform {
             match call {
                 PlatformCall::ReplyCard { card, .. }
                 | PlatformCall::SendCard { card, .. }
-                | PlatformCall::UpdateMessage { card, .. }
-                | PlatformCall::ReplyCardInThread { card, .. } => {
+                | PlatformCall::UpdateMessage { card, .. } => {
                     collect_button_values(card, &mut out);
                 }
                 _ => {}
@@ -1138,23 +1121,6 @@ impl feishu::Platform for RecordingPlatform {
             thread_id: thread_id.clone(),
         });
         // The mock's created topic-reply message id becomes the anchor.
-        Ok(("msg_topic_reply".into(), thread_id))
-    }
-
-    async fn reply_card_in_thread(
-        &self,
-        message_id: &str,
-        card: &serde_json::Value,
-    ) -> crate::error::Result<(String, Option<String>)> {
-        let thread_id = self.reply_in_thread_thread_id.clone();
-        self.calls.lock().await.push(PlatformCall::ReplyCardInThread {
-            message_id: message_id.into(),
-            card: card.clone(),
-            thread_id: thread_id.clone(),
-        });
-        // The mock's created topic-reply message id becomes the anchor (same
-        // id as the text reply_in_thread, so topic-adopt tests asserting the
-        // anchor id pass for both seed kinds).
         Ok(("msg_topic_reply".into(), thread_id))
     }
 
@@ -1594,9 +1560,6 @@ pub struct MockBackend {
     /// When true, `reply_question`/`reject_question` report the request as
     /// already gone (404), like a question resolved elsewhere.
     pub reply_question_not_found: bool,
-    /// Requests a test adds AFTER the app is built (simulating a request that
-    /// arrives after the snapshot was sent, ADR-0028).
-    pub extra_permissions: Arc<tokio::sync::Mutex<Vec<crate::backend::types::PermissionRequest>>>,
     /// session_id → server title (simulates OpenChamber's session title).
     /// `std::sync::Mutex` for interior mutability: `update_session_title`
     /// writes it through `&self` (the trait requires `&self`).
@@ -2062,7 +2025,6 @@ impl MockBackend {
             fail_reply_permission_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_reply_question_count: std::sync::atomic::AtomicUsize::new(0).into(),
             reply_question_not_found: false,
-            extra_permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2848,16 +2810,6 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: `request` arrives AFTER the app was built (the snapshot was
-    /// already sent, ADR-0028).
-    pub(crate) fn ask_permission_later(&self, request: crate::backend::types::PermissionRequest) -> &Self {
-        self.extra_permissions
-            .try_lock()
-            .expect("ask_permission_later before the app is built")
-            .push(request);
-        self
-    }
-
     /// Scenario: the model answers the external message with `parts`. Returns
     /// the gate the test flips once the notification card has been sent.
     pub(crate) fn external_reply(&mut self, parts: Vec<Part>) -> Arc<std::sync::atomic::AtomicBool> {
@@ -3548,15 +3500,12 @@ impl crate::backend::Backend for MockBackend {
             ));
         }
         let replied = self.replied_permissions.lock().await;
-        let mut out: Vec<_> = self
+        let out: Vec<_> = self
             .permissions
             .iter()
             .filter(|p| !replied.contains(&p.request_id))
             .cloned()
             .collect();
-        // Post-build scripting: a test may add requests AFTER the app is built
-        // (simulating a request arriving after the snapshot was sent).
-        out.extend(self.extra_permissions.lock().await.iter().cloned());
         Ok(out)
     }
 
@@ -4564,7 +4513,6 @@ pub(crate) async fn wait_for_recorded_card(
     loop {
         let mut cards = platform.updated_cards().await;
         cards.extend(platform.replied_cards().await);
-        cards.extend(platform.replied_in_thread_cards().await);
         if cards.iter().any(&check) {
             return;
         }
@@ -4877,21 +4825,17 @@ pub(crate) fn core_with(
     )
 }
 
-/// #144 rig: the three live surfaces a pending request may own. The caller
-/// seeds the one session (`ses_1`, `/work`) before passing these to
+/// #144 rig: the two live surfaces a pending request may own. The caller seeds
+/// the one session (`ses_1`, `/work`) before passing these to
 /// [`assert_failed_dir_keeps_surfaces`].
 pub(crate) struct FailedDirSurfaces {
     /// The standalone card's request id and Message id.
     pub card_id: &'static str,
     pub card_message_id: &'static str,
-    /// The inline request id, already seeded onto `inline_acc`.
+    /// The inline request id, seeded onto the streaming card by the rig.
     pub inline_id: &'static str,
-    /// The snapshot host's Message id; the claim rides `claim`.
-    pub snapshot_message_id: &'static str,
     /// The request inlined on the streaming card, seeded onto it by the rig.
     pub inline_request: crate::bridge::request::kind::PendingRequest,
-    /// The request embedded (and claimed) by the snapshot card.
-    pub claim: crate::bridge::request::kind::PendingRequest,
 }
 
 /// Seed `request` as an inline block on `session_id`'s card, kind-agnostically —
@@ -4921,9 +4865,9 @@ async fn seed_inline_request(
 }
 
 /// #144: drive one hanging-list sweep and one successful-list sweep over the
-/// three surfaces: the first must keep them all ("unknown must never be read
-/// as resolved"), the second must still fire every cleanup. `flow` and `hang`
-/// pick the kind; `surfaces` carries its kind-specific fixtures.
+/// two surfaces: the first must keep them both ("unknown must never be read as
+/// resolved"), the second must still fire every cleanup. `flow` and `hang` pick
+/// the kind; `surfaces` carries its kind-specific fixtures.
 pub(crate) async fn assert_failed_dir_keeps_surfaces(
     app: &Arc<App>,
     flow: &crate::bridge::request::flow::RequestFlow,
@@ -4933,7 +4877,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
 ) {
     flow.list_timeout_ms
         .store(30, std::sync::atomic::Ordering::Relaxed);
-    let claim_id = surfaces.claim.id().to_string();
 
     // One live surface per request, all owned by the failing directory /work.
     flow.sent_cards.lock().await.insert(
@@ -4948,24 +4891,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
     let cards = app.core.cards_handle();
     Turn::seed_card(&cards, "ses_1", None).await;
     seed_inline_request(&cards, "ses_1", &surfaces.inline_request, "/work").await;
-    app.core.snapshot_claims.lock().await.claim(
-        surfaces.snapshot_message_id,
-        "已接管",
-        "标题",
-        &crate::bridge::snapshot::SnapshotData {
-            session_id: "ses_1".into(),
-            directory: "/work".into(),
-            status: None,
-            waiting: false,
-            pending: vec![surfaces.claim],
-            pending_elsewhere: None,
-            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
-            tail: vec![],
-            newest_user_anchor: None,
-            newest_user_is_cola_authored: false,
-        },
-        None,
-    );
 
     // The list call hangs: /work said nothing this sweep.
     hang.store(1, std::sync::atomic::Ordering::SeqCst);
@@ -4980,17 +4905,12 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
         inline_surface_live(app, surfaces.inline_id).await,
         "a failed list must not drop the inline section"
     );
-    assert!(
-        app.core.snapshot_claims.lock().await.contains(&claim_id),
-        "a failed list must not drop the snapshot claim"
-    );
     let first_calls = platform.calls.lock().await.clone();
     assert!(
         first_calls.iter().all(|c| !matches!(
             c,
             PlatformCall::UpdateMessage { message_id, .. }
                 if message_id == surfaces.card_message_id
-                    || message_id == surfaces.snapshot_message_id
         )),
         "a failed list must not re-render any surface: {first_calls:?}"
     );
@@ -5011,10 +4931,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
         inline_handled_elsewhere_receipt_present(app).await,
         "a successful list must leave the gone inline block's receipt (#175)"
     );
-    assert!(
-        !app.core.snapshot_claims.lock().await.contains(&claim_id),
-        "a successful list must still drop the gone claim"
-    );
     let calls = platform.calls.lock().await.clone();
     assert!(
         calls.iter().any(|c| matches!(
@@ -5023,14 +4939,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
                 if message_id == surfaces.card_message_id && card.to_string().contains("已处理")
         )),
         "the standalone card is marked stale: {calls:?}"
-    );
-    assert!(
-        calls.iter().any(|c| matches!(
-            c,
-            PlatformCall::UpdateMessage { message_id, .. }
-                if message_id == surfaces.snapshot_message_id
-        )),
-        "the snapshot is re-rendered without the block: {calls:?}"
     );
 }
 

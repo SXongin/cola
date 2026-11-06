@@ -6,7 +6,6 @@ pub(crate) mod file;
 pub(crate) mod image;
 pub(crate) mod message;
 pub(crate) mod pbbp2;
-pub mod snapshot_card;
 pub mod ws;
 
 use crate::backend::FileContent;
@@ -148,20 +147,6 @@ pub trait Platform: Send + Sync {
     }
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String>;
-
-    /// Reply to a message in thread form (`reply_in_thread: true`) with an
-    /// interactive card, creating a topic around a non-topic seed message.
-    /// Returns the created reply's `message_id` (an anchor inside the topic)
-    /// and the topic's `thread_id` (or `None` if the chat does not support
-    /// topic replies).
-    ///
-    /// Its last caller was the Session Snapshot card as a topic's first
-    /// message; adoption confirms in one text line now (ADR-0100, #1004). Kept
-    /// on the trait — the client's own method still backs `reply_in_thread` —
-    /// and #1006 retires the remaining card-in-thread surface with the snapshot
-    /// card.
-    #[allow(dead_code)] // no caller since #1004; #1006 retires it with the snapshot card
-    async fn reply_card_in_thread(&self, message_id: &str, card: &Value) -> Result<(String, Option<String>)>;
 
     /// Reply to a message in thread form (`reply_in_thread: true`), creating a
     /// topic. Returns the created reply's `message_id` (an anchor inside the
@@ -407,10 +392,6 @@ impl Platform for Client {
 
     async fn reply_text(&self, message_id: &str, text: &str) -> Result<String> {
         Client::reply_text(self, message_id, text).await
-    }
-
-    async fn reply_card_in_thread(&self, message_id: &str, card: &Value) -> Result<(String, Option<String>)> {
-        Client::reply_card_in_thread(self, message_id, card).await
     }
 
     async fn reply_in_thread(&self, message_id: &str, text: &str) -> Result<(String, Option<String>)> {
