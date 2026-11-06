@@ -884,7 +884,7 @@ async fn sub_attach_running_child_snapshot_shows_its_live_state() {
     let card = first_card(&platform).await;
     let text = card_text(&card);
     assert!(
-        text.contains(crate::feishu::snapshot_card::BUSY_CHIP),
+        text.contains(crate::feishu::card::session::BUSY_CHIP),
         "the snapshot shows the child's live run state: {text}"
     );
     assert_eq!(

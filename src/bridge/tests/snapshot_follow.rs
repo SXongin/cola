@@ -1326,15 +1326,15 @@ async fn waiting_adopt_yields_and_resumes_in_place() {
         })
         .expect("the snapshot was sent");
     assert!(
-        snapshot.contains(crate::feishu::snapshot_card::WAITING_BACKGROUND_CHIP),
+        snapshot.contains(crate::feishu::card::session::WAITING_BACKGROUND_CHIP),
         "the waiting chip names the wait: {snapshot}"
     );
     assert!(
-        snapshot.contains(crate::feishu::snapshot_card::FOLLOW_HINT),
+        snapshot.contains(crate::feishu::card::session::FOLLOW_HINT),
         "the waiting chip carries the follow hint: {snapshot}"
     );
     assert!(
-        !snapshot.contains(crate::feishu::snapshot_card::IDLE_CHIP),
+        !snapshot.contains(crate::feishu::card::session::IDLE_CHIP),
         "the static 空闲 chip must not render: {snapshot}"
     );
     assert!(
@@ -1685,4 +1685,118 @@ async fn busy_follow_renders_no_empty_tail_header_for_a_marker_only_tail() {
         1,
         "the live timeline is where the marker shows: {follow_card}"
     );
+}
+
+// -- ADR-0100: one body composition, two drivers ----------------------------
+
+fn body_tail_message(role: MessageRole, created_ms: i64, text: &str) -> crate::backend::TailEntry {
+    crate::backend::TailEntry::Message(crate::backend::TailMessage {
+        role,
+        created_ms,
+        text: text.into(),
+        files: Vec::new(),
+    })
+}
+
+/// The one-shot card's visible body as flat lines: every markdown line, and
+/// each folded tail panel's title (its role marker plus the entry's preview —
+/// the same text the panel folds below). Headers and button payloads are not
+/// body text.
+fn snapshot_card_body_lines(card: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for element in card["body"]["elements"].as_array().expect("card body") {
+        match element["tag"].as_str() {
+            Some("markdown") => {
+                let content = element["content"].as_str().expect("markdown content");
+                lines.extend(content.lines().map(str::to_string));
+            }
+            Some("collapsible_panel") => {
+                let title = element["header"]["title"]["content"]
+                    .as_str()
+                    .expect("panel title");
+                lines.push(title.trim_end_matches('…').to_string());
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+/// The busy follow's static lead without its takeover identity line: the body
+/// begins after the blank line that separates it from the identity.
+fn follow_lead_body_lines(lead: &str) -> Vec<String> {
+    let (_, body) = lead.split_once("\n\n").expect("identity line, then the body");
+    body.lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// ADR-0100 parity: the one-shot Session Card and the busy follow's static lead
+/// take the SAME read through the ONE body composition, so the same read cannot
+/// render two ways. A read with no pending request is the clean case — the
+/// snapshot's body is exactly the shared body, because its extra elements are
+/// pending blocks.
+#[test]
+fn the_snapshot_card_and_the_busy_follow_render_the_same_body() {
+    let read = SnapshotData {
+        session_id: "ses_alpha01".into(),
+        directory: "/work/ext".into(),
+        status: Some(crate::backend::types::SessionStatus::Idle),
+        waiting: false,
+        pending: Vec::new(),
+        pending_elsewhere: None,
+        pending_overflow: PendingOverflow::None,
+        tail: vec![
+            body_tail_message(MessageRole::User, 1_000, "问题一"),
+            body_tail_message(MessageRole::Assistant, 2_000, "回答一"),
+            body_tail_message(MessageRole::User, 3_000, "问题二"),
+            body_tail_message(MessageRole::Assistant, 4_000, "回答二"),
+        ],
+        newest_user_anchor: None,
+        newest_user_is_cola_authored: false,
+    };
+    // Driver A: the one-shot card the idle Session Card renders.
+    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    // Driver B: the busy follow's static lead.
+    let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, true);
+
+    assert_eq!(
+        snapshot_card_body_lines(&card),
+        follow_lead_body_lines(&lead),
+        "one read, one body: card {card}, lead {lead:?}"
+    );
+}
+
+/// The parity holds for the body's three parts: a pending read renders the same
+/// status line and the same count-only pointer on both drivers (the snapshot
+/// card then carries the block itself, which the body does not).
+#[test]
+fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
+    let read = SnapshotData {
+        session_id: "ses_alpha01".into(),
+        directory: "/work/ext".into(),
+        status: Some(crate::backend::types::SessionStatus::Busy),
+        waiting: false,
+        pending: vec![crate::bridge::request::kind::PendingRequest::Permission(
+            perm_request("per_1", "ses_alpha01", "ls -la"),
+        )],
+        pending_elsewhere: None,
+        pending_overflow: PendingOverflow::None,
+        tail: vec![body_tail_message(MessageRole::User, 1_000, "问题一")],
+        newest_user_anchor: None,
+        newest_user_is_cola_authored: false,
+    };
+    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, true);
+
+    let card_body = snapshot_card_body_lines(&card);
+    let follow_body = follow_lead_body_lines(&lead);
+    assert_eq!(
+        card_body[..2],
+        follow_body[..2],
+        "same lead: card {card_body:?}, lead {follow_body:?}"
+    );
+    assert_eq!(card_body[0], crate::feishu::card::session::WAITING_CHIP);
+    assert_eq!(card_body[1], "有 1 个请求等待你处理");
 }
