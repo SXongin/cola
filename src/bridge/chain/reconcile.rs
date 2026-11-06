@@ -412,21 +412,51 @@ async fn collect_orphan_outcome(
 ///
 /// This is **not** a collect: an idle Session Card joins no Chain Record, so
 /// there is no chain generation to submit under, no record to release and no
-/// predecessor to reap. The card's current body is kept (the same bounded
-/// whole-card-read merge every ending uses) and every control is stripped; the
-/// header becomes 「⏳ 已由新卡片接管 · 已停止更新」. A failed write is logged and
-/// left alone: the stale card is only a read, and the next `/card` posts a new
-/// one.
-pub(crate) async fn stamp_taken_over(cards: &CardsHandle, card_message_id: &str) {
+/// predecessor to reap. The card's current body is kept (the same whole-card
+/// merge every ending uses) and every control is stripped; the header becomes
+/// 「⏳ 已由新卡片接管 · 已停止更新」.
+///
+/// `known` is the card's own JSON when the caller just built it (the newer read
+/// that lost the map race): the body is right there, so no card read is spent.
+/// Without it the previous read's view is read first — and when that read fails
+/// or outlives the bound the write is **skipped**, leaving the card alone rather
+/// than wiping its body down to a bare header (the read is already a valid
+/// message; a stale header is better than an empty one). The stamp is a
+/// best-effort convenience, not a durable fact, so it goes straight to
+/// `update_message` and never enters the pending-update queue: a failed stamp
+/// is logged, and the next `/card` posts a fresh read regardless.
+pub(crate) async fn stamp_taken_over(
+    cards: &CardsHandle,
+    card_message_id: &str,
+    known: Option<&serde_json::Value>,
+) {
     let bare = ending_card(CardState::TakenOver, None, None);
-    let card = preserved_ending(
-        cards.feishu.as_ref(),
-        card_message_id,
-        &bare,
-        KeepBody::Everything,
-        cards.preserved_view_timeout_ms(),
-    )
-    .await;
+    let card = match known {
+        Some(known) => restamped_keeping_body(&bare, known),
+        None => {
+            let read = crate::bridge::bounded_call(
+                "idle card stamp view",
+                cards.preserved_view_timeout_ms(),
+                cards.feishu.get_card_view(card_message_id),
+            )
+            .await;
+            match read {
+                Some(Ok(view)) => restamped_keeping_body(&bare, &view),
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        "idle card: card {card_message_id} view unreadable ({e}); leaving the read as it is"
+                    );
+                    return;
+                }
+                None => {
+                    tracing::warn!(
+                        "idle card: card {card_message_id} view timed out; leaving the read as it is"
+                    );
+                    return;
+                }
+            }
+        }
+    };
     if let Err(e) = cards.feishu.update_message(card_message_id, &card).await {
         tracing::warn!("idle card: could not stamp {card_message_id} taken over: {e}");
     }
@@ -2470,19 +2500,28 @@ mod tests {
     /// An idle Session Card is a one-shot read, not a chain card (ADR-0100): the
     /// reap must not take it for the record's successor, so it neither re-points
     /// the record nor collects the card the record still names. A chain card in
-    /// the same slot is still read as the record's card — the positive control.
+    /// the same slot is still read as the record's card — the positive control —
+    /// and the record's own orphan lifecycle may still settle its card
+    /// (`Unreceived` here), which the last assertions pin so the read's `None`
+    /// is not confused with "nothing happened".
     #[tokio::test]
     async fn an_idle_session_card_is_never_the_records_successor() {
-        use crate::bridge::test_support::{MockBackend, core_with, test_config};
+        use crate::bridge::test_support::{MockBackend, build_app, seed_session, test_config};
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let handles = core_with(&cfg, MockBackend::new(Vec::new())).flow_handles();
-        let record = ChainRecord::new(
+        let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        seed_session(&app, "ses_test", "/work").await;
+        let handles = app.flow_handles();
+        handles.cards.chains.track(
+            "ses_test",
             "om_chain",
             crate::backend::MessageId::new("msg_turn"),
             Some(1_000),
+            Some("/work"),
+            Some("msg_1"),
         );
+        let record = handles.cards.chains.get("ses_test").expect("a live record");
 
         // A chain card in the map is the record's card.
         Turn::seed_card(&handles.cards, "ses_test", Some("om_chain")).await;
@@ -2498,8 +2537,14 @@ mod tests {
                 .is_chain_card()
         );
 
-        // The read replaces it and owns no chain: `None`, never `Successor`.
-        Turn::record_idle_card(&handles.cards, "ses_test", "om_idle", "msg_card").await;
+        // The read replaces a SPENT chain card (a finished Turn) and owns no
+        // chain: `None`, never `Successor`. A live card would instead win the
+        // compare-and-swap and is covered by `card_pull`'s race test.
+        Turn::set_card_state(&handles.cards, "ses_test", CardState::Done).await;
+        assert!(
+            Turn::record_idle_card(&handles.cards, "ses_test", "om_idle", "msg_card").await,
+            "the terminal chain card is replaced by the read"
+        );
         let reads = gather_reads(&handles, "ses_test", &record, Some("/work"), None).await;
         assert_eq!(
             reads.card,
@@ -2511,6 +2556,49 @@ mod tests {
                 .await
                 .is_chain_card(),
             "the ownership verdict sees no chain card either"
+        );
+
+        // The full reap: with no successor in the process, the record's own
+        // orphan lifecycle runs (an empty transcript settles it Unreceived and
+        // releases it). The read is never the record, never collected, and no
+        // successor re-points the record at it.
+        reconcile(&handles, "ses_test", Some("/work"), None, &record, 50).await;
+        if let Some(after) = handles.cards.chains.get("ses_test") {
+            assert_eq!(
+                after.card_message_id, "om_chain",
+                "the record never names the read"
+            );
+        }
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                    if message_id == "om_idle"
+            )),
+            "the reap never touches the read: {calls:?}"
+        );
+        for card in calls.iter().filter_map(|c| match c {
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, card }
+                if message_id == "om_chain" =>
+            {
+                Some(card)
+            }
+            _ => None,
+        }) {
+            let text = crate::bridge::test_support::card_text(card);
+            assert!(
+                !text.contains("已由新卡片接管"),
+                "the record's card is settled by its own lifecycle, not collected as a successor: {text}"
+            );
+        }
+
+        // The read remains the Session's current card: a failed `record_idle_card`
+        // would have left the chain card here, so this reads the same fact from
+        // the map side too.
+        assert_eq!(
+            Turn::card_message_id(&handles.cards, "ses_test").await.as_deref(),
+            Some("om_idle")
         );
     }
 }

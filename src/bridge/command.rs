@@ -1060,6 +1060,11 @@ pub(crate) fn is_reset_flag(name: &str) -> bool {
 /// previous **idle** card: a Turn that ran in between has already superseded it
 /// (the map holds the Turn's card), so the older read is left untouched. The
 /// idle card joins no Chain Record, so nothing here records one.
+///
+/// A **Turn** can install its accumulator during the send without taking this
+/// lock (`install_fresh_session` takes only the card map), so the map write is
+/// a compare-and-swap: a running card wins, the read is not recorded, and the
+/// just-sent message is stamped taken over so it never looks current.
 async fn post_idle_card(
     handles: &CommandHandles,
     session_id: &str,
@@ -1093,11 +1098,21 @@ async fn post_idle_card(
     }
     let previous = crate::bridge::turn::Turn::idle_card_to_supersede(cards, session_id).await;
     let sent = handles.flow.platform.reply_card(message_id, &card).await?;
-    if let Some(previous) = previous {
-        crate::bridge::chain::stamp_taken_over(cards, &previous).await;
+    // The send awaited; a Turn may have installed itself meanwhile. The CAS in
+    // `record_idle_card` refuses a running card, and the read then stays a
+    // plain message marked superseded — never the Session's card, never a host
+    // for a later flush.
+    if crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await {
+        if let Some(previous) = previous {
+            crate::bridge::chain::stamp_taken_over(cards, &previous, None).await;
+        }
+        tracing::info!("card read: session {session_id} idle Session Card posted");
+    } else {
+        crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+        tracing::info!(
+            "card read: session {session_id} a Turn took the card during the read; the posted read is stamped"
+        );
     }
-    crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await;
-    tracing::info!("card read: session {session_id} idle Session Card posted");
     Ok(())
 }
 

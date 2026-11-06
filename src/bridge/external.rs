@@ -1220,7 +1220,11 @@ impl ExternalFlow {
         // A Wake continues the Session's Card Chain, so it asks whether the
         // map entry is a chain card — not whether it is live. A terminal chain
         // card still supplies the user message its chain answers; only an Idle
-        // Session Card, which joins no chain, is refused (ADR-0100).
+        // Session Card, which joins no chain, is refused (ADR-0100). A `/card`
+        // read replaces the terminal card, so from then on a Topic's anchor is
+        // the fallback; a main chat has none, and a late Wake after the read is
+        // the ADR-0100 exception — nothing may re-point the read at a chain it
+        // does not own.
         if Turn::is_chain_card(&handles.cards, sid).await
             && let Some(target) = Turn::reply_target(&handles.cards, sid).await
         {

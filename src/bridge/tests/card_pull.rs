@@ -255,24 +255,43 @@ async fn a_second_card_marks_the_previous_read_taken_over() {
     platform.given_reply_id("om_idle_2");
     seed_session(&app, "ses_test", "/work").await;
 
-    for (message, id) in [("msg_card_1", "om_idle_1"), ("msg_card_2", "om_idle_2")] {
-        app.handle_message(incoming(
-            message.into(),
-            "chat_1".into(),
-            "p2p".into(),
-            None,
-            "/card".into(),
-            None,
-        ))
-        .await;
-        assert_eq!(
-            Turn::card_message_id(&app.cards_handle(), "ses_test")
-                .await
-                .as_deref(),
-            Some(id),
-            "the read becomes the Session's current card"
-        );
-    }
+    app.handle_message(incoming(
+        "msg_card_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle_1"),
+        "the first read becomes the Session's current card"
+    );
+    // The second read stamps the first by reading its body back first (the
+    // real platform serves the card view).
+    let first_card = platform.replied_cards().await[0].clone();
+    platform.given_card_view("om_idle_1", first_card);
+
+    app.handle_message(incoming(
+        "msg_card_2".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle_2"),
+        "the second read becomes the Session's current card"
+    );
 
     assert_eq!(platform.replied_cards().await.len(), 2, "two reads in sequence");
     assert_eq!(
@@ -382,6 +401,20 @@ async fn racing_card_commands_stamp_the_later_over_the_earlier() {
     let (app, platform) = build_app(cfg, idle_read_backend()).await;
     platform.given_reply_id("om_idle_1");
     platform.given_reply_id("om_idle_2");
+    // The later command stamps the earlier by reading its body back first; both
+    // possible ids are scripted so the test observes the stamp, not the
+    // unreadable-view degradation.
+    let read_view = serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "title": { "tag": "plain_text", "content": "📄 会话" },
+            "template": "grey"
+        },
+        "body": { "elements": [{ "tag": "markdown", "content": "✅ 空闲" }] }
+    });
+    platform.given_card_view("om_idle_1", read_view.clone());
+    platform.given_card_view("om_idle_2", read_view);
     seed_session(&app, "ses_test", "/work").await;
 
     let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -438,6 +471,148 @@ async fn racing_card_commands_stamp_the_later_over_the_earlier() {
     assert!(
         ["om_idle_1", "om_idle_2"].contains(&stamps[0].as_str()),
         "the stamp targets one of the posted reads: {stamps:?}"
+    );
+}
+
+/// A Turn installs its accumulator through the card map only
+/// (`install_fresh_session` does not take the session write lock), so it can
+/// win while `/card`'s send is in flight. The read must not overwrite it: the
+/// live Turn stays the Session's current card and the just-sent read is stamped
+/// taken over so it never looks current.
+#[tokio::test]
+async fn a_turn_installed_during_the_read_wins_the_map() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    // Park the idle card's send so a Turn can be installed between the
+    // admission check and the map write.
+    let (entered, release) = platform.pause("reply", "msg_card");
+    let app2 = app.clone();
+    let send = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    // The user's next prompt starts while the read's send is in flight.
+    seed_live_card(&app, "ses_test", "om_live").await;
+    release.notify_one();
+    send.await.unwrap();
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the live Turn keeps the session"
+    );
+    assert!(
+        Turn::is_running(&cards, "ses_test").await,
+        "the read must not replace a running card"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "the refused read writes no Chain Record"
+    );
+
+    let calls = platform.calls.lock().await.clone();
+    let stamped = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("the posted read is stamped taken over");
+    let text = card_text(&stamped);
+    assert!(
+        text.contains("⏳ 已由新卡片接管 · 已停止更新"),
+        "the read that lost the race is not left unmarked: {text}"
+    );
+    assert!(
+        text.contains("✅ 空闲") && text.contains("最近对话"),
+        "the stamp keeps the read's body: {text}"
+    );
+}
+
+/// A read-only Session Card is terminal, so `is_render_owned` alone would admit
+/// it as the chain's residual card or a Wake continuation. Neither path may
+/// repurpose it, and no Chain Record may appear: the read is sent once and only
+/// the next `/card` replaces it.
+#[tokio::test]
+async fn an_idle_read_is_never_admitted_as_a_residual_or_wake_chain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    seed_session(&app, "ses_test", "/work").await;
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    let idle_id = Turn::card_message_id(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the read is current");
+
+    let handles = app.flow_handles();
+    let transcript = SessionTranscript::default();
+    let residual = Turn::render_residual_in_place(
+        &handles.cards,
+        &handles.sessions,
+        &handles.backend,
+        &handles.requests,
+        "ses_test",
+        &transcript,
+    )
+    .await;
+    assert!(!residual, "an idle read is no residual card");
+
+    let split = Turn::split_chain_for_continuation(
+        &handles.cards,
+        &handles.backend,
+        "ses_test",
+        "msg_card",
+        crate::bridge::turn::ContinuationLine {
+            at: 1_000,
+            wake: None,
+        },
+        &transcript,
+        1_000,
+    )
+    .await;
+    assert_eq!(split, None, "an idle read is no Wake chain");
+
+    assert!(
+        handles.cards.chains.get("ses_test").is_none(),
+        "no Chain Record may be written for the read"
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "neither path posts another card"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. } if message_id == &idle_id
+        )),
+        "the read is not repainted as a chain card: {calls:?}"
     );
 }
 
