@@ -1061,10 +1061,11 @@ pub(crate) fn is_reset_flag(name: &str) -> bool {
 /// (the map holds the Turn's card), so the older read is left untouched. The
 /// idle card joins no Chain Record, so nothing here records one.
 ///
-/// A **Turn** can install its accumulator during the send without taking this
-/// lock (`install_fresh_session` takes only the card map), so the map write is
-/// a compare-and-swap: a running card wins, the read is not recorded, and the
-/// just-sent message is stamped taken over so it never looks current.
+/// A **Turn** installs its accumulator under this same lock now, so it cannot
+/// replace the card during the send. The map write is still a
+/// compare-and-swap: a running card that was already installed before this
+/// command took the lock wins, the read is not recorded, and the just-sent
+/// message is stamped taken over so it never looks current.
 ///
 /// A read that says **busy** or **waiting** and whose newest user message is not
 /// cola-authored follows the run instead (ADR-0100): the prepared follow — its

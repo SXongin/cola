@@ -1063,6 +1063,124 @@ async fn an_abort_during_the_old_card_stamp_still_leaves_the_follow_rendering() 
     .await;
 }
 
+/// A Turn install that is admitted before `/card` arms its follow now waits on
+/// the session write lock: it cannot replace the follow card between the arm
+/// and the seed. When it does land, the seeded request is re-surfaced on the
+/// new Turn's card by the sweep, with a card handle — never a dead
+/// 「等待你的确认」.
+#[tokio::test]
+async fn a_turn_install_after_the_follow_arm_keeps_the_seeded_request_answerable() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    let cards = app.cards_handle();
+
+    // `/card` holds the write lock across its send/arm/seed. A Turn install
+    // spawned in that window must park instead of replacing the card.
+    let (entered, release) = platform.pause("reply", "msg_card");
+    let app2 = app.clone();
+    let send = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    let app3 = app.clone();
+    let install = tokio::spawn(async move {
+        Turn::install_fresh_session_for_test(&app3.cards_handle(), "ses_test").await;
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !install.is_finished(),
+        "a Turn install must wait behind /card's arm+seed"
+    );
+    release.notify_one();
+    send.await.unwrap();
+    install.await.unwrap();
+
+    // The arm ran first: its Chain Record names the follow card.
+    assert_eq!(
+        cards
+            .chains
+            .get("ses_test")
+            .expect("the follow armed")
+            .card_message_id,
+        "msg_reply"
+    );
+    // Give the installed loading card the id a real Turn would send next.
+    Turn::set_card_message_id(&cards, "ses_test", "om_turn").await;
+
+    // The seed lived on the replaced follow card; the sweep must put the
+    // request on the new Turn card and record its handle.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        Turn::has_interaction_in(&cards, "ses_test", "per_1").await,
+        "the request is answerable on the new Turn card"
+    );
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_1"),
+        Some("om_turn"),
+        "the sweep records a handle so the block is not a dead end"
+    );
+}
+
+/// The sweep's insert and flush are one lock section: a Turn install cannot
+/// replace the card between them. While the flush is parked, the install stays
+/// un-finished; after release the block has a card handle.
+#[tokio::test]
+async fn a_turn_install_cannot_split_the_sweeps_insert_and_flush() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    seed_live_card(&app, "ses_test", "回合的内容。").await;
+
+    let (entered, release) = platform.pause("update", "om_live");
+    let app2 = app.clone();
+    let sweep = tokio::spawn(async move {
+        let mut seen = std::collections::HashSet::new();
+        app2.permission.sweep(&app2.flow_handles(), &mut seen).await;
+    });
+    entered.notified().await;
+    let app3 = app.clone();
+    let install = tokio::spawn(async move {
+        Turn::install_fresh_session_for_test(&app3.cards_handle(), "ses_test").await;
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !install.is_finished(),
+        "the install must wait through the sweep's insert+flush"
+    );
+    release.notify_one();
+    sweep.await.unwrap();
+    install.await.unwrap();
+
+    assert_eq!(
+        app.card_handles.lock().await.message_of("per_1"),
+        Some("om_live"),
+        "the flushed block kept a card handle before the install replaced the map"
+    );
+}
+
 /// The follow's identity line names the Session by its real title, exactly as
 /// the adoption line does — never the bare id tail because `/card` passed no
 /// title. The renderer's first flush carries the lead.
@@ -1233,6 +1351,49 @@ async fn a_follow_record_never_lands_on_a_replaced_card() {
     assert!(
         app.cards_handle().chains.get("ses_test").is_none(),
         "no Chain Record may name the refused follow"
+    );
+}
+
+/// The positive side of the guarded takeover: while the map still holds the
+/// armed card, the Chain Record is re-pointed and the previous card is
+/// collected. A stub that always returns false would fail this test.
+#[tokio::test]
+async fn a_follow_record_lands_on_the_armed_card_and_collects_its_predecessor() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_arm")).await;
+    Turn::set_turn_anchor(&cards, "ses_test", &turn_anchor(1_000)).await;
+    cards.chains.track(
+        "ses_test",
+        "om_prev",
+        MessageId::new("msg_prev"),
+        Some(500),
+        Some("/work"),
+        Some("msg_prev_reply"),
+    );
+
+    let chain_id = Turn::card_chain_id(&cards, "ses_test")
+        .await
+        .expect("the armed card's chain id");
+    assert!(
+        Turn::take_over_card_if_current(&cards, "ses_test", "om_arm", chain_id, Some("/work")).await,
+        "the current armed card is taken over"
+    );
+
+    assert_eq!(
+        cards.chains.get("ses_test").expect("the record").card_message_id,
+        "om_arm",
+        "the Chain Record names the armed card"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_prev")),
+        "the predecessor is collected: {calls:?}"
     );
 }
 
@@ -1591,11 +1752,11 @@ async fn racing_card_commands_stamp_the_later_over_the_earlier() {
     );
 }
 
-/// A Turn installs its accumulator through the card map only
-/// (`install_fresh_session` does not take the session write lock), so it can
-/// win while `/card`'s send is in flight. The read must not overwrite it: the
-/// live Turn stays the Session's current card and the just-sent read is stamped
-/// taken over so it never looks current.
+/// The map write is a compare-and-swap: a card already installed while
+/// `/card`'s send is in flight (the test seam writes it directly; a real
+/// `install_fresh_session` now waits on the write lock) wins. The read must not
+/// overwrite it: the live Turn stays the Session's current card and the
+/// just-sent read is stamped taken over so it never looks current.
 #[tokio::test]
 async fn a_turn_installed_during_the_read_wins_the_map() {
     let _wd = test_work_dir();

@@ -3821,12 +3821,13 @@ impl Turn {
     /// read and the next `/card` can find the previous read to stamp.
     ///
     /// The insert is a **compare-and-swap**, not an overwrite: a card that is
-    /// still running (a Turn installed during the send, a waiting or
-    /// restart-stamped chain) wins, and the read is NOT recorded. The caller
-    /// must then stamp the just-sent read as taken over, because it is a real
-    /// message in the chat that is not the Session's card. No caller's write
-    /// lock excludes a Turn (`install_fresh_session` takes only the cards map),
-    /// so the CAS is the only guard.
+    /// still running (a Turn installed before the caller took the lock, a
+    /// waiting or restart-stamped chain) wins, and the read is NOT recorded.
+    /// The caller must then stamp the just-sent read as taken over, because it
+    /// is a real message in the chat that is not the Session's card.
+    /// `install_fresh_session` now takes the same write lock, so a Turn cannot
+    /// slip in during a caller's post; the CAS remains the guard for a card
+    /// that was already running when the caller entered.
     ///
     /// It deliberately writes **no Chain Record** and collects no predecessor:
     /// the idle card joins no chain, so a restart's reap, a Wake and the
@@ -3898,9 +3899,39 @@ impl Turn {
     /// session (`Lost`) and reaches its gate through `record_landed_rendered` —
     /// the `4acd184` half of the same fix.
     async fn install_fresh_session(cards: &CardsHandle, session_id: &str, mut acc: state::StreamAccumulator) {
+        // A Turn's install is a card write like any other and takes the
+        // Session's write lock FIRST (the established order), so it serializes
+        // with `/card`'s post-and-seed and the sweep's whole surfacing
+        // decision. Without it, an admitted Turn could replace the map between
+        // either path's block insert and its flush/seed, leaving a seeded
+        // request on a card nothing flushes (or on the new card with no
+        // handle). `Turn::start` is the only production caller and holds no
+        // lock here.
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
         let mut live = cards.cards.lock().await;
         Self::seed_durable_announcements(cards, session_id, &mut acc);
         live.insert(session_id.to_string(), state::CardSession::new(acc, None));
+    }
+
+    /// Test seam: run the same write-lock-first install a real `Turn::start`
+    /// uses, so a test can prove an admitted Turn waits behind `/card` and the
+    /// sweep instead of replacing their card mid-decision.
+    #[cfg(test)]
+    pub(crate) async fn install_fresh_session_for_test(cards: &CardsHandle, session_id: &str) {
+        Self::install_fresh_session(cards, session_id, state::StreamAccumulator::new("test")).await;
+    }
+
+    /// Test seam: the armed card's chain identity, for a test that needs to
+    /// pass it to [`Self::take_over_card_if_current`].
+    #[cfg(test)]
+    pub(crate) async fn card_chain_id(cards: &CardsHandle, session_id: &str) -> Option<u64> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|card| card.chain_id())
     }
 
     /// Whether the session's card has rendered any part — the external
