@@ -652,7 +652,7 @@ pub(super) async fn flush_card_locked(
     // Both survive the flush — a chain that exhausted the size bound, or died
     // between a finalize and its continuation, must be picked up where it
     // stopped, never restarted by overwriting the finalized slice.
-    let (pending_split, mut card_is_live, suspended, idle) = {
+    let (pending_split, mut card_is_live, suspended, is_read) = {
         let cards = cards.cards.lock().await;
         let Some(card) = cards.get(session_id) else {
             return FlushOutcome::Unwritten;
@@ -661,7 +661,9 @@ pub(super) async fn flush_card_locked(
             card.pending_split.clone(),
             card.card_is_live,
             card.acc.card_fallback() == CardFallback::Suspended,
-            *card.acc.card_state() == crate::feishu::card::CardState::Idle,
+            // The one "read is not a chain" predicate (ADR-0100): an idle
+            // Session Card is the only non-chain entry.
+            !card.is_chain_card(),
         )
     };
     // A read-only Session Card is sent once and never flushed (ADR-0100): a
@@ -669,7 +671,7 @@ pub(super) async fn flush_card_locked(
     // could even continue it onto a new card and write a Chain Record. The
     // admission paths refuse it first; this is the last line so no caller can
     // repurpose the read as the chain.
-    if idle {
+    if is_read {
         return FlushOutcome::Unwritten;
     }
     if suspended {
