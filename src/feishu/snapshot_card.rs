@@ -1,7 +1,7 @@
 use crate::backend::TailEntry;
 use crate::bridge::snapshot::{PendingOverflow, SnapshotData};
 use crate::feishu::card::session::{
-    BackToList, PendingFacts, back_to_list_button, fits_card, session_card_body,
+    BackToList, PendingFacts, back_to_list_button, fits_card, session_card_body, smallest_omission,
 };
 use serde_json::json;
 
@@ -301,31 +301,6 @@ fn largest_fitting(ceiling: usize, mut build: impl FnMut(usize) -> serde_json::V
         }
     }
     lo
-}
-
-/// The smallest prefix omission in `0..=len` whose card fits, given that the
-/// fully-evicted build (`len`) is already known to fit.
-///
-/// The predicate is monotone: one more omitted entry removes its bytes and adds
-/// at most a character to the overflow line, so more omission never costs more.
-fn smallest_omission(
-    len: usize,
-    mut build: impl FnMut(usize) -> serde_json::Value,
-    known_fit: serde_json::Value,
-) -> serde_json::Value {
-    let (mut lo, mut hi) = (0, len);
-    let mut best = None;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let card = build(mid);
-        if fits_card(&card) {
-            best = Some(card);
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    best.unwrap_or(known_fit)
 }
 
 /// The fixed inputs of every build pass: the card's header plus the data

@@ -1843,13 +1843,13 @@ fn parity_read(
     }
 }
 
-/// ADR-0100 parity: the one-shot Session Card and the busy follow's static lead
+/// ADR-0100 parity: the idle Session Card and the busy follow's static lead
 /// take the SAME read through the ONE body composition, so the same read cannot
 /// render two ways. Message bodies are compared in FULL (the card's folded
 /// content chunks against the lead's text), including one longer than the
 /// panel's 40-char preview — the case a title-only comparison cannot see.
 #[test]
-fn the_snapshot_card_and_the_busy_follow_render_the_same_body() {
+fn the_idle_card_and_the_busy_follow_render_the_same_body() {
     let long =
         "这是一条明显超过四十个字符的对话正文，用来证明对比的是完整内容而不是折叠面板的预览标题。".repeat(2);
     let read = parity_read(
@@ -1863,7 +1863,7 @@ fn the_snapshot_card_and_the_busy_follow_render_the_same_body() {
         ],
     );
     // Driver A: the one-shot card the idle Session Card renders.
-    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    let card = crate::feishu::card::session::build_idle_card(&read);
     // Driver B: the busy follow's static lead.
     let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
 
@@ -1905,7 +1905,7 @@ fn the_parity_holds_for_the_waiting_copy() {
         true,
         vec![body_tail_message(MessageRole::User, 1_000, "问题一")],
     );
-    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    let card = crate::feishu::card::session::build_idle_card(&read);
 
     for busy_now in [false, true] {
         let lead =
@@ -1950,7 +1950,7 @@ fn the_parity_keeps_the_marker_on_the_card_and_drops_it_from_the_lead() {
             body_tail_message(MessageRole::Assistant, 2_000, "回答一"),
         ],
     );
-    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    let card = crate::feishu::card::session::build_idle_card(&read);
     let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
 
     let card_body = snapshot_card_body(&card);
@@ -1986,7 +1986,7 @@ fn the_parity_holds_for_multi_line_and_whitespace_only_bodies() {
             body_tail_message(MessageRole::User, 3_000, "结尾"),
         ],
     );
-    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    let card = crate::feishu::card::session::build_idle_card(&read);
     let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
 
     let card_body = snapshot_card_body(&card);
@@ -2007,8 +2007,8 @@ fn the_parity_holds_for_multi_line_and_whitespace_only_bodies() {
 }
 
 /// The parity holds for the body's three parts: a pending read renders the same
-/// status line and the same count-only pointer on both drivers (the snapshot
-/// card then carries the block itself, which the body does not).
+/// status line and the same count-only pointer on both drivers (the idle card
+/// carries no block at all — its pointer is text).
 #[test]
 fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
     let mut read = parity_read(
@@ -2022,22 +2022,22 @@ fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
         "ls -la",
     ));
     read.pending = vec![pending.clone()];
-    let card = crate::feishu::snapshot_card::build_snapshot_card("接管", "唯一外部标题", &read, None);
+    let card = crate::feishu::card::session::build_idle_card(&read);
     let seeds = [&pending];
     let lead = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &seeds, true);
 
-    // The pending block is the CARD's own extra element (the body carries
-    // none), so the shared lead is what precedes it.
+    // The read carries the block nowhere; the pointer is the body's whole
+    // pending statement, so the two bodies agree in full.
     let card_body = snapshot_card_body(&card);
     let lead_body = follow_lead_body(&lead);
-    assert_eq!(
-        card_body.lead[..2],
-        lead_body.lead[..],
-        "same status + pointer: {card}"
-    );
+    assert_eq!(card_body.lead, lead_body.lead, "same status + pointer: {card}");
     assert_eq!(card_body.lead[0], crate::feishu::card::session::WAITING_CHIP);
     assert_eq!(card_body.lead[1], "有 1 个请求等待你处理");
     assert_eq!(card_body.messages, lead_body.messages);
+    assert!(
+        !card.to_string().contains("\"tag\":\"button\""),
+        "the read hosts no block: {card}"
+    );
 
     // #1005's filter: a request another card already hosts is not seeded here,
     // so this card carries none — but the READ still waits on the operator, so

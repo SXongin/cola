@@ -1573,8 +1573,7 @@ pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
         .iter()
         .filter(|req| req.session_id() == data.session_id)
         .count();
-    let mut omitted = 0;
-    loop {
+    let build = |omitted: usize| {
         let mut md = CardMarkdown::new();
         let body = session_card_body(data, &data.tail[omitted..], omitted, PendingFacts { on_card });
         let mut elements = body.lead_elements();
@@ -1583,12 +1582,28 @@ pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
         for element in elements {
             builder = builder.with_element(element);
         }
-        let card = builder.build();
-        if fits_card(&card) || omitted == data.tail.len() {
-            return card;
-        }
-        omitted += 1;
+        builder.build()
+    };
+    let full = build(0);
+    if fits_card(&full) {
+        return full;
     }
+    // One-shot cards have no splitter, so an oversized tail degrades by dropping
+    // its OLDEST entries into the body's visible omission notice, exactly as
+    // every one-shot card's budget always has (issue #726).
+    let floor = build(data.tail.len());
+    if fits_card(&floor) {
+        return smallest_omission(data.tail.len(), build, floor);
+    }
+    // Even the bare status/pointer shell is over budget (a pathological flush
+    // field): send it anyway, so the reader still gets the status, but say so
+    // rather than failing silently.
+    tracing::warn!(
+        "idle Session Card is {} chars with every tail entry dropped (budget {}): the non-evictable shell exceeds one card",
+        floor.to_string().len(),
+        crate::feishu::card::MAX_CARD_JSON_CHARS
+    );
+    floor
 }
 
 /// Whether an assembled one-shot card fits the platform's one-card budgets: the
@@ -1623,6 +1638,33 @@ fn nested_components(element: &serde_json::Value) -> usize {
         .as_array()
         .map(|children| children.iter().map(|child| 1 + nested_components(child)).sum())
         .unwrap_or(0)
+}
+
+/// The smallest prefix omission in `0..=len` whose card fits, given that the
+/// fully-evicted build (`len`) is already known to fit.
+///
+/// The predicate is monotone: one more omitted entry removes its bytes and adds
+/// at most a character to the overflow line, so more omission never costs more.
+/// Shared by the one-shot Session Snapshot card and the idle Session Card, so
+/// the two budget ladders cannot disagree.
+pub(crate) fn smallest_omission(
+    len: usize,
+    mut build: impl FnMut(usize) -> serde_json::Value,
+    known_fit: serde_json::Value,
+) -> serde_json::Value {
+    let (mut lo, mut hi) = (0, len);
+    let mut best = None;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let card = build(mid);
+        if fits_card(&card) {
+            best = Some(card);
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    best.unwrap_or(known_fit)
 }
 
 impl SessionCardBody<'_> {
@@ -3542,5 +3584,33 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    /// An idle read taller than one card degrades visibly: the oldest tail entry
+    /// is dropped into the shared omission notice and the card still fits the
+    /// one-card budget. This is the shared one-shot ladder the snapshot card
+    /// uses, not a silent truncation.
+    #[test]
+    fn an_idle_read_too_tall_for_one_card_names_what_it_left_out() {
+        let huge = "长".repeat(12_000);
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![
+                body_message(MessageRole::User, 1_000, &huge),
+                body_message(MessageRole::Assistant, 2_000, "最新的回答"),
+            ],
+        );
+
+        let card = build_idle_card(&read);
+
+        assert!(fits_card(&card), "the degraded card fits one card");
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains("最新的回答"), "the newest entry survives: {text}");
+        assert!(
+            text.contains("…更早的 1 条记录已省略"),
+            "the dropped entry is named: {text}"
+        );
+        assert!(!text.contains(&huge), "the oversized old entry is gone");
     }
 }

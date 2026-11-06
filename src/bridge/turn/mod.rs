@@ -2808,6 +2808,12 @@ impl Turn {
             let Some(card) = live.get_mut(session_id) else {
                 return;
             };
+            // An idle Session Card is a one-shot read (ADR-0100), never the
+            // chain a pull splits. A pull whose admission raced the read's
+            // commit becomes a no-op rather than queueing a split on the read.
+            if !card.is_chain_card() {
+                return;
+            }
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
                 kind,
@@ -2910,12 +2916,18 @@ impl Turn {
         let mut plans = {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
-                Some(card) if !card.acc.card_state().is_render_owned() => render::plan_ledger_entries(
-                    &card.acc,
-                    transcript,
-                    card.acc.turn_anchor(),
-                    render::Endings::of(cards, session_id),
-                ),
+                // A chain card only: an idle Session Card is a one-shot read
+                // (ADR-0100) and must never be handed a continuation or have a
+                // Chain Record written for it. It is terminal, so
+                // `is_render_owned` alone would admit it.
+                Some(card) if card.is_chain_card() && !card.acc.card_state().is_render_owned() => {
+                    render::plan_ledger_entries(
+                        &card.acc,
+                        transcript,
+                        card.acc.turn_anchor(),
+                        render::Endings::of(cards, session_id),
+                    )
+                }
                 _ => return None,
             }
         };
@@ -2923,7 +2935,7 @@ impl Turn {
         let handover = {
             let mut live = cards.cards.lock().await;
             let card = live.get_mut(session_id)?;
-            if card.acc.card_state().is_render_owned() {
+            if !card.is_chain_card() || card.acc.card_state().is_render_owned() {
                 return None;
             }
             // A card with no Turn anchor to scope the entries with owes no
@@ -3103,7 +3115,10 @@ impl Turn {
         let Some((ending_state, ending_error)) = ({
             let live = cards.cards.lock().await;
             live.get(session_id)
-                .filter(|card| !card.acc.card_state().is_render_owned())
+                // A chain card only: an idle Session Card is a one-shot read
+                // (ADR-0100), never the chain's residual card. It is terminal,
+                // so `is_render_owned` alone would admit it.
+                .filter(|card| card.is_chain_card() && !card.acc.card_state().is_render_owned())
                 .map(|card| {
                     (
                         card.acc.card_state().clone(),
@@ -3724,30 +3739,40 @@ impl Turn {
 
     /// Record a posted read-only Session Card as the Session's card (ADR-0100):
     /// a real [`state::CardSession`] in `CardState::Idle`, carrying the message
-    /// id the send returned. It REPLACES whatever the map held — a previous
-    /// idle read or a terminal Turn card — so every live-card predicate refuses
-    /// it and the next `/card` can find the previous read to stamp.
+    /// id the send returned. It replaces a previous idle read or a **terminal**
+    /// Turn card — a spent chain — so every live-card predicate refuses the
+    /// read and the next `/card` can find the previous read to stamp.
+    ///
+    /// The insert is a **compare-and-swap**, not an overwrite: a card that is
+    /// still running (a Turn installed during the send, a waiting or
+    /// restart-stamped chain) wins, and the read is NOT recorded. The caller
+    /// must then stamp the just-sent read as taken over, because it is a real
+    /// message in the chat that is not the Session's card. No caller's write
+    /// lock excludes a Turn (`install_fresh_session` takes only the cards map),
+    /// so the CAS is the only guard.
     ///
     /// It deliberately writes **no Chain Record** and collects no predecessor:
     /// the idle card joins no chain, so a restart's reap, a Wake and the
     /// ownership verdict keep reading the record an earlier Turn wrote (an
     /// existing record still names the chain's card) and never treat this read
-    /// as the chain.
+    /// as the chain. Returns whether the read became the Session's card.
     pub(crate) async fn record_idle_card(
         cards: &CardsHandle,
         session_id: &str,
         card_message_id: &str,
         reply_to: &str,
-    ) {
+    ) -> bool {
         let mut acc = state::StreamAccumulator::new("");
         acc.set_session(session_id);
         acc.set_reply_target(Some(reply_to.to_string()));
         acc.mark_idle_read();
-        let mut session = state::CardSession::new(acc, Some(card_message_id.to_string()));
-        // A read never grows in place: it is sent once and replaced by the next
-        // `/card`, never flushed.
-        session.card_is_live = false;
-        cards.cards.lock().await.insert(session_id.to_string(), session);
+        let session = state::CardSession::new(acc, Some(card_message_id.to_string()));
+        let mut live = cards.cards.lock().await;
+        if live.get(session_id).is_some_and(state::CardSession::is_running) {
+            return false;
+        }
+        live.insert(session_id.to_string(), session);
+        true
     }
 
     /// The message a card for this session replies to, when it has one: the
