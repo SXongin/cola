@@ -41,12 +41,18 @@ A session has one card, the **Session Card**, with two driving modes:
   streams, and `/card` keeps its ADR-0043 meaning of splitting the chain and
   continuing at the bottom.
 - **Nothing owns it**: `/card` reads the session once (`gather_snapshot`) and
-  renders that read as a one-shot Session Card — a real `CardSession` in
-  `CardState::Idle`, seeded with an `ExternalCardLead::Static` lead and flushed
-  once. It writes **no Chain Record**, so it never makes cola the session's card
-  owner, and no Wake, reap or ownership verdict may treat it as one.
+  renders that read as a one-shot Session Card — a real `CardSession` in a new
+  **`CardState::Idle`** (terminal, so `CardSession::is_running` is false and no
+  live-card gate admits it), seeded with an `ExternalCardLead::Static` lead and
+  flushed once. The arm is a **non-recording** variant of
+  `Turn::arm_external_render`: that seam ends by calling `Turn::take_over_card`,
+  which writes the Chain Record, so reusing it verbatim would make cola the
+  session's card owner and let a restart's reap or a Wake treat the readout as a
+  live card. The idle arm stops before the record write; it writes **no Chain
+  Record**, so no Wake, reap or ownership verdict may treat it as one.
 
-The idle card is **read-only**. It carries the status line (等待你的确认 >
+The idle card — a Session Card in `CardState::Idle` — is **read-only**. It
+carries the status line (等待你的确认 >
 等待后台任务 > 运行中 > 需要重试 > 空闲), a count-only pointer naming how many
 requests wait on the user, and the 最近对话 tail (four messages; a Compaction's
 marker sits at its server position and consumes no slot). It renders no operable
@@ -61,9 +67,9 @@ one text line carrying the same status summary, and that line is the Topic
 Anchor. Only `/card` produces a card.
 
 A second `/card` with nothing in between stamps the previous idle card
-`TakenOver` — and only while that card is still the session's current card. A
-Turn that ran in between has already superseded it, so stamping it would only add
-noise.
+`TakenOver` — 「⏳ 已由新卡片接管 · 已停止更新」 — and only while that card is
+still the session's current card. A Turn that ran in between has already
+superseded it, so stamping it would only add noise.
 
 When the read says the session is busy, or waiting on Background Tasks, `/card`
 hands the posted card to the existing external renderer (the busy-follow path)
@@ -73,21 +79,28 @@ just asked for. Nothing new renders it.
 ## Consequences
 
 - `src/feishu/snapshot_card.rs`, `src/bridge/snapshot.rs`'s build half and
-  `src/bridge/snapshot_claims.rs` go, along with `claimable_pendings`,
-  `pending_overflow`, `pending_elsewhere`, `SnapshotQuestionState`,
-  `ClaimedSnapshot`, `claim`/`rebuild`/`resolve`/`drop_vanished`, tombstones, and
-  `is_already_surfaced`'s snapshot arm. The read survives as **Session Snapshot**.
-- `inline_host_session` and `resolve_card_target`'s in-flight arm
-  (`src/bridge/pollers.rs`) key on a **live** card, not `Turn::has_card`.
-  `has_card` is key presence, and a terminal card stays in `cards` until the next
-  Turn replaces it, so an ended card could host a new block today; the idle card
-  would have made that the common case.
+  `src/bridge/snapshot_claims.rs` go, along with `SnapshotData`'s build-side
+  fields (`pending`, `pending_overflow`, `pending_elsewhere`),
+  `claimable_pendings`, `SnapshotQuestionState`, `ClaimedSnapshot`, the claim
+  registry's `claim`/`rebuild`/`resolve`/`drop_vanished` surface, tombstones, and
+  `is_already_surfaced`'s snapshot arm. The read survives as **Session
+  Snapshot**, and so do `display_title` and the status/tail composition it feeds.
+- `inline_host_session` stops asking `Turn::has_card` and `resolve_card_target`'s
+  in-flight arm stops asking `Turn::reply_target` (`src/bridge/pollers.rs`); both
+  ask whether the card is **live** (`Turn::is_running`). `has_card` is key
+  presence and `reply_target` reads any map entry, terminal included, while a
+  terminal card stays in `cards.cards` until the next Turn replaces it — so an
+  ended card could host a new block today, and the idle card would have made that
+  the common case.
 - An adopted session's pending requests surface through the ordinary sweep
   (`RequestFlow::sweep` lists every known directory's requests): inline on a live
   card, else their own. Nothing is seeded into a host or claimed.
 - ADR-0028's suppression heuristic dies with the card: `/card` always answers.
 - `build_switched_state_card` moves to `feishu::card::session`; it carries
   ADR-0052's 返回列表 button, which must survive for a switch-list adoption.
+- The **External Message**'s card is out of scope. `build_external_message_card`
+  and its `Turn` arm are already the shared path; this decision neither changes
+  them nor folds them into the idle state.
 
 ## Considered options
 
@@ -116,3 +129,26 @@ just asked for. Nothing new renders it.
   ADR-0028's `pending_elsewhere` already carried.
 - An idle card joins no Chain Record, so a restart does not reap it: it stays in
   the chat as a static message. That is the intended meaning of a read.
+
+## Reconciled references
+
+Several ADRs describe the machinery this decision deletes. Where the change
+overturns a decision, that ADR carries a banner (ADR-0028); these are descriptive
+references whose subject no longer exists, kept only so the history reads:
+
+- ADR-0038 rule 6 — "A Session Snapshot's claimed blocks ARE Interaction Blocks
+  … the claim registry itself is unchanged." **Superseded**: ADR-0100 deletes
+  the claim registry, so every Interaction Block lives on a live card or its own
+  standalone card.
+- ADR-0094 — "A Session Snapshot can carry several pending blocks" and "A
+  claimed Session Snapshot does not [repaint]." **Retired**: no card carries
+  several pending blocks across an idle read, and a claimed snapshot has no
+  repaint path because it no longer exists.
+- ADR-0040 — the Session Snapshot tail's fold ids (`SnapshotClaims::rebuild`).
+  **Retired** with the rebuild path; the tail renders once, per `/card`.
+- ADR-0044 — "session snapshot cards never carry the Turn Footer." Still true of
+  the **Session Card**'s idle state, which carries no footer model either.
+- ADR-0043 — the claimed-snapshot pin arm. **Retired**; a request's Message Pin
+  follows the live card or the standalone card.
+
+Source: #945, #999.
