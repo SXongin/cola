@@ -412,7 +412,12 @@ impl CardBuilder {
     pub fn build(&self) -> serde_json::Value {
         let mut elements = self.body.clone();
 
-        if let Some(ref footer) = self.footer {
+        // The Turn Footer describes the Turn that ran. An idle Session Card is
+        // a read with no Turn behind it, so it never carries one even when a
+        // caller hands the builder one (ADR-0044, kept by ADR-0100).
+        if let Some(ref footer) = self.footer
+            && self.state.carries_turn_footer()
+        {
             elements.push(json!({"tag": "hr"}));
             elements.push(json!({ "tag": "markdown", "content": footer }));
         }
@@ -539,20 +544,21 @@ pub(crate) fn header_title_and_template(
         // waiting on the run — and this header is the whole point of the
         // one-time stamp.
         CardState::Restarted => ("⏳ 已重启，等待运行结束".to_string(), "grey"),
+        // The Session Card's idle state (ADR-0100): a one-shot read with no
+        // renderer and no Turn behind it. Neutral grey, no phase timer and no
+        // footer — the body is the whole read.
+        CardState::Idle => ("📄 会话".to_string(), "grey"),
     };
     let mut title = label;
-    match state {
-        CardState::Loading | CardState::Reasoning | CardState::Streaming | CardState::Resuming => {
-            if let Some(e) = progress.elapsed {
-                title.push_str(&format!(" {}", fmt_elapsed(e)));
-            }
-            // Reasoning is streamed incrementally by OpenCode, so its length is
-            // real progress during the thinking phase.
-            if *state == CardState::Reasoning && progress.reasoning_chars > 0 {
-                title.push_str(&format!(" · {}", format_chars(progress.reasoning_chars)));
-            }
+    if state.shows_phase_timer() {
+        if let Some(e) = progress.elapsed {
+            title.push_str(&format!(" {}", fmt_elapsed(e)));
         }
-        _ => {}
+        // Reasoning is streamed incrementally by OpenCode, so its length is
+        // real progress during the thinking phase.
+        if *state == CardState::Reasoning && progress.reasoning_chars > 0 {
+            title.push_str(&format!(" · {}", format_chars(progress.reasoning_chars)));
+        }
     }
     (title, template)
 }
@@ -1306,6 +1312,7 @@ mod tests {
             CardState::SwitchedAway,
             CardState::TakenOver,
             CardState::Restarted,
+            CardState::Idle,
         ] {
             let card = CardBuilder::new()
                 .with_state(state.clone())
@@ -1499,6 +1506,44 @@ mod tests {
             ),
             "waiting must change the header"
         );
+    }
+
+    /// The idle Session Card is a one-shot read (ADR-0100): its header never
+    /// appends the live phase timer, even when the progress read carries an
+    /// elapsed value, and it beats a stale awaiting flag — the wait is over,
+    /// because an unanswered request always lives on another card.
+    #[test]
+    fn the_idle_header_has_no_phase_timer() {
+        let progress = HeaderProgress {
+            awaiting: AwaitingAction::Permission,
+            elapsed: Some(83),
+            ..Default::default()
+        };
+        let (title, template) = header_title_and_template(&CardState::Idle, None, &progress);
+        assert_eq!(title, "📄 会话");
+        assert_eq!(template, "grey");
+    }
+
+    /// ADR-0044, kept by ADR-0100: an idle Session Card carries no Turn
+    /// Footer — no Turn owns the read — while a Turn-owned card renders it as
+    /// before.
+    #[test]
+    fn an_idle_card_never_renders_the_turn_footer() {
+        let idle = CardBuilder::new()
+            .with_state(CardState::Idle)
+            .with_footer("📁 proj · main")
+            .build()
+            .to_string();
+        assert!(
+            !idle.contains("📁 proj"),
+            "the idle card carries no footer: {idle}"
+        );
+        let done = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_footer("📁 proj · main")
+            .build()
+            .to_string();
+        assert!(done.contains("📁 proj"), "a Turn card keeps its footer: {done}");
     }
 
     #[test]
