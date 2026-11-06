@@ -36,7 +36,7 @@ use crate::bridge::core::{CoverTitle, SESSION_INFO_TIMEOUT, SETTLING_CLAIM_TTL, 
 use crate::bridge::message_pins::MessagePins;
 use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::flow::RequestFlow;
-use crate::bridge::request::kind::ClaimKind;
+use crate::bridge::request::kind::InteractionKind;
 use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore, WorktreeAdjust};
 use crate::bridge::turn::{CardSession, CollectReason, Turn};
 use crate::config::{SessionEntry, ThreadKey};
@@ -2394,10 +2394,10 @@ pub(crate) struct RequestsHandle {
 impl RequestsHandle {
     /// The flow that owns requests of `kind` — the pairing of every request
     /// kind with its poller and settlement state.
-    pub(crate) fn flow_for(&self, kind: ClaimKind) -> &Arc<RequestFlow> {
+    pub(crate) fn flow_for(&self, kind: InteractionKind) -> &Arc<RequestFlow> {
         match kind {
-            ClaimKind::Permission => &self.permission,
-            ClaimKind::Question => &self.question,
+            InteractionKind::Permission => &self.permission,
+            InteractionKind::Question => &self.question,
         }
     }
 

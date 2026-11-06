@@ -739,8 +739,8 @@ impl ExternalFlow {
     }
 
     /// [`Self::prepare_snapshot_follow`] for a caller that already took the
-    /// busy/waiting decision (the settle's own race check): the external-run
-    /// guard, the anchor, the pending candidates and the accumulator.
+    /// busy/waiting decision: the external-run guard, the anchor, the pending
+    /// candidates and the accumulator.
     async fn prepare_snapshot_follow_with_busy(
         &self,
         handles: &FlowHandles,
@@ -873,7 +873,7 @@ impl ExternalFlow {
         // duplicate, and clicking one takes the normal inline path — resolved
         // sections are stripped and the run resumes into the same card.
         for req in &plan.seeds {
-            let flow = handles.requests.flow_for(req.claim_kind());
+            let flow = handles.requests.flow_for(req.interaction_kind());
             // A refused add is the only way the blocks can differ from the
             // count the pointer was written from (the card session vanished
             // under the arm, or it already carries the request). Say so
@@ -1434,7 +1434,7 @@ async fn is_already_surfaced(
 ) -> bool {
     if handles
         .requests
-        .flow_for(req.claim_kind())
+        .flow_for(req.interaction_kind())
         .sent_cards
         .lock()
         .await

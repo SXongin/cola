@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::bridge::request::kind::ClaimKind;
+use crate::bridge::request::kind::InteractionKind;
 use crate::bridge::surfaces::{InlineSurface, Surfaces};
 
 /// The body-element range one live interaction block occupies on a built card.
@@ -22,7 +22,7 @@ pub struct RenderedBlock {
     pub request_id: String,
     pub start: usize,
     pub end: usize,
-    pub kind: ClaimKind,
+    pub kind: InteractionKind,
     pub session_id: String,
     pub directory: String,
     /// Compact one-line receipt target, recorded from the block at render time.
@@ -33,7 +33,7 @@ pub struct RenderedBlock {
 /// when no accumulator carries it anymore.
 struct BlockHandle {
     message_id: String,
-    kind: ClaimKind,
+    kind: InteractionKind,
     session_id: String,
     directory: String,
     target: String,
@@ -356,7 +356,7 @@ impl CardHandles {
     fn is_vanished(
         id: &str,
         h: &BlockHandle,
-        kind: ClaimKind,
+        kind: InteractionKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,
@@ -375,7 +375,7 @@ impl CardHandles {
     /// be classified without being resolved or vice versa.
     pub fn vanished_sessions(
         &self,
-        kind: ClaimKind,
+        kind: InteractionKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,
@@ -405,7 +405,7 @@ impl CardHandles {
     /// affected card for the caller to patch.
     pub fn drop_vanished(
         &mut self,
-        kind: ClaimKind,
+        kind: InteractionKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,
@@ -501,9 +501,9 @@ fn replace_elements(card: &mut CachedCard, span: &BlockSpan, replacement: Vec<se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::request::kind::ClaimKind;
+    use crate::bridge::request::kind::InteractionKind;
 
-    fn block(request_id: &str, start: usize, end: usize, kind: ClaimKind) -> RenderedBlock {
+    fn block(request_id: &str, start: usize, end: usize, kind: InteractionKind) -> RenderedBlock {
         RenderedBlock {
             request_id: request_id.into(),
             start,
@@ -538,8 +538,8 @@ mod tests {
     fn cards_rendering_names_every_cached_copy() {
         let mut handles = CardHandles::default();
         let c = card(vec![text("body"), text("button")]);
-        handles.record("om_old", &c, vec![block("p1", 0, 2, ClaimKind::Permission)]);
-        handles.record("om_new", &c, vec![block("p1", 0, 2, ClaimKind::Permission)]);
+        handles.record("om_old", &c, vec![block("p1", 0, 2, InteractionKind::Permission)]);
+        handles.record("om_new", &c, vec![block("p1", 0, 2, InteractionKind::Permission)]);
 
         let mut found = handles.cards_rendering("p1");
         found.sort();
@@ -564,8 +564,8 @@ mod tests {
             "om_1",
             &c,
             vec![
-                block("p1", 1, 3, ClaimKind::Permission),
-                block("p2", 3, 5, ClaimKind::Permission),
+                block("p1", 1, 3, InteractionKind::Permission),
+                block("p2", 3, 5, InteractionKind::Permission),
             ],
         );
 
@@ -601,8 +601,8 @@ mod tests {
             "om_1",
             &c,
             vec![
-                block("q", 0, 2, ClaimKind::Question),
-                block("p", 2, 3, ClaimKind::Permission),
+                block("q", 0, 2, InteractionKind::Question),
+                block("p", 2, 3, InteractionKind::Permission),
             ],
         );
 
@@ -625,7 +625,7 @@ mod tests {
         handles.record(
             "om_1",
             &card(vec![text("x")]),
-            vec![block("p", 0, 1, ClaimKind::Permission)],
+            vec![block("p", 0, 1, InteractionKind::Permission)],
         );
         assert_eq!(handles.cached_count(), 1);
 
@@ -649,20 +649,20 @@ mod tests {
             text("e"),
             text("f"),
         ]);
-        let mut failed = block("p_failed", 1, 2, ClaimKind::Permission);
+        let mut failed = block("p_failed", 1, 2, InteractionKind::Permission);
         failed.directory = "/failed".into();
-        let mut stale = block("p_stale", 2, 3, ClaimKind::Permission);
+        let mut stale = block("p_stale", 2, 3, InteractionKind::Permission);
         stale.directory = "/stale".into();
         handles.record(
             "om_1",
             &c,
             vec![
-                block("p_gone", 0, 1, ClaimKind::Permission),
+                block("p_gone", 0, 1, InteractionKind::Permission),
                 failed,
                 stale,
-                block("q_other", 3, 4, ClaimKind::Question),
-                block("p_pending", 4, 5, ClaimKind::Permission),
-                block("p_claimed", 5, 6, ClaimKind::Permission),
+                block("q_other", 3, 4, InteractionKind::Question),
+                block("p_pending", 4, 5, InteractionKind::Permission),
+                block("p_claimed", 5, 6, InteractionKind::Permission),
             ],
         );
         // The accumulator owns p_stale, but its flush repaints `om_other`, not
@@ -670,7 +670,7 @@ mod tests {
         handles.record(
             "om_other",
             &card(vec![text("new")]),
-            vec![block("p_owned", 0, 1, ClaimKind::Permission)],
+            vec![block("p_owned", 0, 1, InteractionKind::Permission)],
         );
 
         let pending: HashSet<String> = ["p_pending".to_string()].into();
@@ -682,7 +682,7 @@ mod tests {
         ]
         .into();
         let dropped = handles.drop_vanished(
-            ClaimKind::Permission,
+            InteractionKind::Permission,
             &pending,
             &failed_dirs,
             &cola_claimed,
@@ -719,7 +719,7 @@ mod tests {
         handles.record(
             "om_1",
             &card(vec![text("a")]),
-            vec![block("p", 0, 1, ClaimKind::Permission)],
+            vec![block("p", 0, 1, InteractionKind::Permission)],
         );
         assert!(handles.resolve_on("om_1", "other", "receipt").is_none());
         assert!(handles.resolve_on("om_missing", "p", "receipt").is_none());

@@ -816,7 +816,7 @@ fn over_budget_perm(request_id: &str, session_id: &str) -> crate::backend::types
 /// card exists, so it can no longer produce one. `inline` picks the shape: an
 /// inline block on a streaming card, or a standalone request card.
 fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: bool, message_id: &str) {
-    use crate::bridge::request::kind::ClaimKind;
+    use crate::bridge::request::kind::InteractionKind;
     use crate::bridge::surfaces::{InlineSurface, StandaloneSurface, Surfaces};
 
     let surfaces = Surfaces::load(crate::state::StateLayout::beside(
@@ -845,7 +845,7 @@ fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: 
             InlineSurface {
                 client_id: String::new(),
                 message_id: message_id.into(),
-                kind: ClaimKind::Permission,
+                kind: InteractionKind::Permission,
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 target: "per_long".into(),
@@ -856,7 +856,7 @@ fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: 
             request_id,
             StandaloneSurface {
                 client_id: String::new(),
-                kind: ClaimKind::Permission,
+                kind: InteractionKind::Permission,
                 message_id: message_id.into(),
                 summary: "⚡ **执行 Shell 命令**\n**对象**:\n- `echo …`".into(),
                 directory: "/work".into(),

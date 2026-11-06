@@ -5457,13 +5457,16 @@ impl StreamAccumulator {
     }
 }
 
-/// Whether `block` belongs to `kind` — the one ClaimKind → block-family
+/// Whether `block` belongs to `kind` — the one InteractionKind → block-family
 /// predicate the kind wrappers, the session collector and the resolver share.
-pub(super) fn block_of_kind(kind: crate::bridge::request::kind::ClaimKind, block: &InteractionBlock) -> bool {
-    use crate::bridge::request::kind::ClaimKind;
+pub(super) fn block_of_kind(
+    kind: crate::bridge::request::kind::InteractionKind,
+    block: &InteractionBlock,
+) -> bool {
+    use crate::bridge::request::kind::InteractionKind;
     match kind {
-        ClaimKind::Permission => matches!(block, InteractionBlock::Permission(_)),
-        ClaimKind::Question => matches!(block, InteractionBlock::Question(_)),
+        InteractionKind::Permission => matches!(block, InteractionBlock::Permission(_)),
+        InteractionKind::Question => matches!(block, InteractionBlock::Question(_)),
     }
 }
 

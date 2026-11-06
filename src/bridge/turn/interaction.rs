@@ -169,7 +169,7 @@ impl Turn {
         dead: &HashSet<String>,
     ) -> Vec<String> {
         Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
-            state::block_of_kind(crate::bridge::request::kind::ClaimKind::Permission, block)
+            state::block_of_kind(crate::bridge::request::kind::InteractionKind::Permission, block)
         })
         .await
     }
@@ -183,7 +183,7 @@ impl Turn {
         dead: &HashSet<String>,
     ) -> Vec<String> {
         Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
-            state::block_of_kind(crate::bridge::request::kind::ClaimKind::Question, block)
+            state::block_of_kind(crate::bridge::request::kind::InteractionKind::Question, block)
         })
         .await
     }
@@ -194,7 +194,7 @@ impl Turn {
     /// classifier and the resolution can never disagree.
     pub(crate) async fn vanished_block_sessions(
         cards: &CardsHandle,
-        kind: crate::bridge::request::kind::ClaimKind,
+        kind: crate::bridge::request::kind::InteractionKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,

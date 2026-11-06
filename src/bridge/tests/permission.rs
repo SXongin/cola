@@ -668,7 +668,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
                 request_id: "per_1".into(),
                 start: 0,
                 end: 2,
-                kind: crate::bridge::request::kind::ClaimKind::Permission,
+                kind: crate::bridge::request::kind::InteractionKind::Permission,
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 target: "⚡ 执行 Shell 命令 `ls -la`".into(),

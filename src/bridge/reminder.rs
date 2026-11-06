@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::bridge::failure_latch::FailureLatch;
-use crate::bridge::request::kind::ClaimKind;
+use crate::bridge::request::kind::InteractionKind;
 use crate::feishu::Platform;
 use crate::feishu::client::INSTANT_REMINDER_SCOPE;
 
@@ -162,7 +162,7 @@ struct Inner {
     /// each carrying the best (newest) target **this** kind's last complete
     /// sweep saw. Both flows update their own kind; the union selects the one
     /// deterministic owner (ADR-0043 amendment 2026-09-21, #247).
-    pending: HashMap<String, HashMap<ClaimKind, ReminderTarget>>,
+    pending: HashMap<String, HashMap<InteractionKind, ReminderTarget>>,
     /// The warn-once policy for this state machine's best-effort calls, keyed
     /// by Chat/Topic (ADR-0048).
     latch: FailureLatch,
@@ -440,7 +440,12 @@ impl ReminderState {
     /// permission resolving never unpins a Chat/Topic that still has a
     /// question pending, and when the owning wait resolves the next pending —
     /// either kind — takes the pin in this same sweep).
-    pub(crate) async fn sync(&self, feishu: &Arc<dyn Platform>, kind: ClaimKind, targets: &[ReminderTarget]) {
+    pub(crate) async fn sync(
+        &self,
+        feishu: &Arc<dyn Platform>,
+        kind: InteractionKind,
+        targets: &[ReminderTarget],
+    ) {
         if !self.enabled {
             return;
         }
@@ -953,10 +958,18 @@ mod tests {
         let pin_target = target("chat_1", 1);
 
         let (_, logs) = capture_logs(async {
-            pins.sync(&feishu, ClaimKind::Permission, std::slice::from_ref(&pin_target))
-                .await;
-            pins.sync(&feishu, ClaimKind::Permission, std::slice::from_ref(&pin_target))
-                .await;
+            pins.sync(
+                &feishu,
+                InteractionKind::Permission,
+                std::slice::from_ref(&pin_target),
+            )
+            .await;
+            pins.sync(
+                &feishu,
+                InteractionKind::Permission,
+                std::slice::from_ref(&pin_target),
+            )
+            .await;
         })
         .await;
 
@@ -990,8 +1003,12 @@ mod tests {
             .fail_instant_reminder
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let (_, logs) = capture_logs(async {
-            pins.sync(&feishu, ClaimKind::Permission, std::slice::from_ref(&pin_target))
-                .await;
+            pins.sync(
+                &feishu,
+                InteractionKind::Permission,
+                std::slice::from_ref(&pin_target),
+            )
+            .await;
         })
         .await;
         assert_eq!(reminder_calls(&platform).await.len(), 3);
@@ -1025,7 +1042,7 @@ mod tests {
         let feishu: Arc<dyn Platform> = platform.clone();
         let (_, logs) = capture_logs(async {
             let pins = ReminderState::new(true, Some(path.clone()));
-            pins.sync(&feishu, ClaimKind::Permission, &[target("chat_1", 1)])
+            pins.sync(&feishu, InteractionKind::Permission, &[target("chat_1", 1)])
                 .await;
             pins.clear_orphans(&feishu).await;
         })
@@ -1062,7 +1079,7 @@ mod tests {
         let platform = Arc::new(RecordingPlatform::new());
         let feishu: Arc<dyn Platform> = platform.clone();
         let pins = ReminderState::new(true, Some(path.clone()));
-        pins.sync(&feishu, ClaimKind::Permission, &[target("chat_1", 1)])
+        pins.sync(&feishu, InteractionKind::Permission, &[target("chat_1", 1)])
             .await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
     }

@@ -69,10 +69,10 @@ pub(crate) fn back_to_list_button(back: &BackToList) -> serde_json::Value {
     })
 }
 
-/// The Session Card's display title: the cleaned session label, falling back to
-/// the id tail when the label is empty. Shared by the read-only Session Card's
-/// identity line, the compact switch-list state card, and a text adoption's
-/// one-line confirmation.
+/// A session's display title: the cleaned session label, falling back to the
+/// id tail when the label is empty. Shared by the compact switch-list state
+/// card, a text adoption's one-line confirmation, and the busy follow's static
+/// identity line.
 pub(crate) fn display_title(title: &str, session_id: &str) -> String {
     let label = crate::feishu::card::clean_session_label(title);
     if label.is_empty() {
@@ -1504,9 +1504,9 @@ pub(crate) struct PendingFacts {
 
 /// Whether the READ has a request waiting on the operator — the status line's
 /// top precedence, independent of what a driver carries (ADR-0100: the
-/// operator's request outranks the run state "including the ones a one-shot
-/// card's block cap left to their own surface"). Filtered to this session so a
-/// sibling's request can never make the card claim a wait it cannot show.
+/// operator's request outranks the run state, even when the driver leaves that
+/// request to its own surface). Filtered to this session so a sibling's request
+/// can never make the card claim a wait it cannot show.
 fn read_has_pending(data: &SnapshotData) -> bool {
     data.pending.iter().any(|req| req.session_id() == data.session_id)
 }
@@ -3355,6 +3355,84 @@ mod tests {
                 recent: String::new(),
             },
         })
+    }
+
+    fn body_file(name: &str) -> crate::backend::FileContent {
+        crate::backend::FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some(name))
+            .expect("an inline payload is a File Content")
+    }
+
+    fn body_tail_message(
+        role: MessageRole,
+        created_ms: i64,
+        text: &str,
+        files: Vec<crate::backend::FileContent>,
+    ) -> TailEntry {
+        TailEntry::Message(TailMessage {
+            role,
+            created_ms,
+            text: text.into(),
+            files,
+        })
+    }
+
+    /// ADR-0076: a files-only tail entry renders its `📎 name · mime · size`
+    /// record line instead of the empty-message stand-in, and a text-bearing
+    /// entry keeps its text preview — the file line never replaces the text.
+    #[test]
+    fn a_file_bearing_tail_entry_records_the_file_line() {
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![
+                body_tail_message(MessageRole::User, 1_000, "", vec![body_file("only.png")]),
+                body_tail_message(MessageRole::User, 2_000, "看看这个", vec![body_file("and.png")]),
+            ],
+        );
+
+        let card = build_idle_card(&read);
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(
+            text.contains("📎 only.png · image/png · 3 B"),
+            "the files-only entry records its line: {text}"
+        );
+        assert!(
+            text.contains("📎 and.png · image/png · 3 B"),
+            "each file records its own line: {text}"
+        );
+        assert!(
+            !text.contains("（空消息）"),
+            "a files-only entry is not an empty message: {text}"
+        );
+        assert!(
+            text.contains("👤 看看这个…"),
+            "the text-bearing entry keeps its preview: {text}"
+        );
+    }
+
+    /// The preview derivation keeps a text-bearing entry's text: the file
+    /// record line belongs to the folded body, not to the title.
+    #[test]
+    fn tail_preview_keeps_a_text_bearing_entry_text() {
+        let text_bearing = TailMessage {
+            role: MessageRole::User,
+            created_ms: 1_000,
+            text: "看看这个".into(),
+            files: vec![body_file("and.png")],
+        };
+        assert_eq!(tail_preview(&text_bearing), ("👤", "看看这个".to_string()));
+
+        let files_only = TailMessage {
+            role: MessageRole::User,
+            created_ms: 2_000,
+            text: String::new(),
+            files: vec![body_file("only.png")],
+        };
+        assert_eq!(
+            tail_preview(&files_only),
+            ("👤", "📎 only.png · image/png · 3 B".to_string()),
+            "a files-only entry previews its record line"
+        );
     }
 
     /// The body's text form is the status line, then the count-only pointer,
