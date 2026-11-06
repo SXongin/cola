@@ -18,26 +18,42 @@ use crate::bridge::turn::state::StreamAccumulator;
 
 use super::{Disposition, SettleTiming, Turn, WAKE_RECEIPT, ownership, render, settle, state};
 
-/// What an armed external card opens with, above the Turn's parts (ADR-0028).
-/// The two shapes are not interchangeable: the External Message is the user's
-/// own text and must read as a user block, while the snapshot's static prefix
-/// (its identity line plus the 最近对话 tail) is cola's own composition.
+/// What an armed external card opens with, above the Turn's parts (ADR-0028):
+/// the External Message is the user's own text and reads as a user block. A
+/// snapshot follow's static prefix (its identity line plus the 最近对话 tail)
+/// is cola's own composition and is set later, once its seed count is final.
 pub(crate) enum ExternalCardLead<'a> {
     /// The External Message the run answers: rendered as a distinct, quoted
-    /// user block ([`crate::feishu::card::user_message_block`]).
+    /// user block ([`crate::feishu::card::user_message_block`]). A snapshot
+    /// follow's static lead is set later, under its write lock, through
+    /// [`PreparedExternalRender::set_static_lead`].
     UserMessage(&'a str),
-    /// A static prefix the arm itself composed: plain card text.
-    Static(&'a str),
 }
 
 /// An external renderer's accumulator built off the card map (ADR-0100): the
-/// turn anchor, work context, variant and lead are all in place, and only the
-/// card id a send returns and the durable seed are missing. The `/card`
-/// post-and-arm holds it across its send and consumes it under the write lock.
+/// turn anchor, work context and variant are all in place, and only the card
+/// id a send returns, the durable seed and (for `/card`) the static lead —
+/// whose pointer names the seed set decided under the write lock — are
+/// missing. The post-and-arm holds it across its send and consumes it under
+/// that lock.
 pub(crate) struct PreparedExternalRender {
     acc: StreamAccumulator,
     /// The Session's directory, for the chain record's read routing.
     session_dir: String,
+    /// The turn's server time: a lead is pushed just before it so the run's
+    /// parts always insert below.
+    anchor_ms: i64,
+}
+
+impl PreparedExternalRender {
+    /// Push the static lead a caller only knows after it has the write lock —
+    /// `/card`'s seed filter decides the pointer's count there, so the lead is
+    /// composed at the same moment.
+    pub(crate) fn set_static_lead(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.acc.push_text_at(Some(self.anchor_ms - 1), text);
+        }
+    }
 }
 
 /// What Session Sync owes for one read (ADR-0059): the decision carries
@@ -461,20 +477,13 @@ impl Turn {
         acc.set_session(session_id);
         acc.attach_work_context(session_dir).await;
         acc.set_variant(variant);
-        if let Some(lead) = lead {
-            match lead {
-                ExternalCardLead::UserMessage(text) => {
-                    acc.push_user_message(Some(anchor.created_ms - 1), text)
-                }
-                ExternalCardLead::Static(text) if !text.is_empty() => {
-                    acc.push_text_at(Some(anchor.created_ms - 1), text)
-                }
-                ExternalCardLead::Static(_) => {}
-            }
+        if let Some(ExternalCardLead::UserMessage(text)) = lead {
+            acc.push_user_message(Some(anchor.created_ms - 1), text);
         }
         PreparedExternalRender {
             acc,
             session_dir: session_dir.to_string(),
+            anchor_ms: anchor.created_ms,
         }
     }
 

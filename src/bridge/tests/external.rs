@@ -2024,7 +2024,7 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
         "sub",
         "/tmp/ext",
         None,
-        Some(ExternalCardLead::Static("👤 新消息")),
+        Some(ExternalCardLead::UserMessage("👤 新消息")),
     )
     .await;
     {
