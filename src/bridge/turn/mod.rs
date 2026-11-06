@@ -13,7 +13,8 @@ mod wake;
 /// every external `turn::…` path — `bridge/external.rs`, `chain/reconcile.rs`,
 /// `turn/state.rs`'s card session — is unchanged by the module split.
 pub(crate) use wake::{
-    ArmedTakeover, ContinuationFacts, ContinuationLine, ExternalCardLead, ProjectedSlice, WakeContinuation,
+    ArmedTakeover, ContinuationFacts, ContinuationLine, ExternalCardLead, PreparedExternalRender,
+    ProjectedSlice, WakeContinuation,
 };
 
 /// `ProjectedCard` (spec #561) carried the `turn::ProjectedCard` path before the
@@ -2310,6 +2311,13 @@ impl Turn {
     pub(crate) async fn flush_card(cards: &CardsHandle, session_id: &str) -> FlushOutcome {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
+        Self::flush_card_locked(cards, session_id).await
+    }
+
+    /// [`Self::flush_card`] for a caller that already holds the Session's card
+    /// write lock — the sweep's one surfacing decision keeps the block insert
+    /// and its flush inside the same critical section (ADR-0100).
+    pub(crate) async fn flush_card_locked(cards: &CardsHandle, session_id: &str) -> FlushOutcome {
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await
     }
 

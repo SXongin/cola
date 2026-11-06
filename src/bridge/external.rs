@@ -7,7 +7,7 @@ use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TurnAnch
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
     CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, ExternalCardLead,
-    SettleTiming, Turn, WakeContinuation, YieldedUpdate,
+    PreparedExternalRender, SettleTiming, Turn, WakeContinuation, YieldedUpdate,
 };
 
 /// The external-message flow: watches for user messages that were NOT sent by
@@ -54,6 +54,35 @@ pub struct ExternalFlow {
     /// coordinator: this pass settles a yielded card's quiet true end (ADR-0060)
     /// and announces it with the same notice every other turn end sends.
     notice: NoticeRules,
+}
+
+/// A busy follow's prepared facts (ADR-0100): everything
+/// [`ExternalFlow::arm_snapshot_follow_locked`] needs except the card id, which
+/// only the send knows. `/card` builds this **off the card map** before its
+/// post, so a command cancelled earlier leaves no card behind; the map insert
+/// carrying the sent id is the commit.
+pub(crate) struct SnapshotFollowPlan {
+    /// The turn the follow streams, and the identity every renderer guard
+    /// compares.
+    anchor: TurnAnchor,
+    /// The Session's thread, for the `external` span on its render task.
+    session_thread_key: Option<crate::config::ThreadKey>,
+    /// The directory the seeded requests route under.
+    directory: String,
+    /// The read's requests this follow puts on its card, already filtered by
+    /// `is_already_surfaced`.
+    seeds: Vec<crate::bridge::request::kind::PendingRequest>,
+    /// The accumulator built off the map: the anchor, work context, variant
+    /// and static lead. The commit consumes it when it has the sent card id.
+    prepared: Option<PreparedExternalRender>,
+}
+
+impl SnapshotFollowPlan {
+    /// How many requests this follow seeds, and therefore how many its card's
+    /// count-only pointer names.
+    pub(crate) fn seed_count(&self) -> usize {
+        self.seeds.len()
+    }
 }
 
 impl ExternalFlow {
@@ -662,16 +691,18 @@ impl ExternalFlow {
         );
     }
 
-    /// ADR-0028 busy-adopt follow: the adopted session's in-flight EXTERNAL
-    /// turn streams into the snapshot card instead of freezing a static
-    /// "运行中" line. The snapshot card is the host (the session's
-    /// `CardSession` accumulator, like `start_reply_render`): its message id
-    /// is the live card, the static 已接管 prefix + tail ride as acc text (the
-    /// same representation choice as the 👤 preview), and the adopt-time
-    /// pending blocks are pre-seeded as inline sections so a permission
-    /// approved from the snapshot resumes the run inside the SAME card. The
+    /// ADR-0028 busy-adopt follow, re-driven from `/card` by ADR-0100: the
+    /// session's in-flight EXTERNAL turn streams into an already-sent card
+    /// instead of freezing a static "运行中" line. The card is the host (the
+    /// session's `CardSession` accumulator, like `start_reply_render`): its
+    /// message id is the live card, the read's identity + tail ride as acc
+    /// text (the same representation choice as the 👤 preview), and the
+    /// read's pending blocks are seeded as inline sections so a permission
+    /// approved from the card resumes the run inside the SAME card. The
     /// renderer exits when a cola prompt or a newer external message replaces
-    /// the accumulator (the existing `external_render_loop` guards).
+    /// the accumulator (the existing `external_render_loop` guards). `/card`'s
+    /// own post-and-arm shares this preparation through
+    /// [`Self::prepare_snapshot_follow`] but sends the card itself.
     pub(crate) async fn start_snapshot_follow(
         &self,
         handles: &FlowHandles,
@@ -701,6 +732,9 @@ impl ExternalFlow {
             );
             return false;
         }
+        // The follow is only for an external run (ADR-0028/ADR-0100): the busy
+        // run answers the newest user message, so a cola-authored newest means
+        // the in-flight turn is cola's OWN and never gets a renderer here.
         let Some(anchor) = data.newest_user_anchor.clone() else {
             tracing::warn!(
                 "snapshot follow: session {} busy but has no user message to follow",
@@ -708,11 +742,6 @@ impl ExternalFlow {
             );
             return false;
         };
-        // The follow is scoped to EXTERNAL turns (ADR-0028): the busy run
-        // answers the newest user message, so a cola-authored newest means the
-        // in-flight turn is cola's OWN (this thread, another thread, or a
-        // re-/switch mid-answer) — keep the static snapshot and never touch
-        // cola's live accumulator.
         if data.newest_user_is_cola_authored {
             tracing::info!(
                 "snapshot follow: session {} busy on a cola-authored turn; keeping static snapshot",
@@ -733,9 +762,101 @@ impl ExternalFlow {
             );
             return true;
         }
+        let Some(mut plan) = self
+            .prepare_snapshot_follow_with_busy(handles, busy_now, verb, title, data)
+            .await
+        else {
+            return false;
+        };
+        // A NEW external run (the adoption follows it): a `/stop` from before
+        // it is not this run's ending, same as the reply renderer's arm. A
+        // stop landing after this point ends the follow promptly as
+        // ⏹ 已停止 (the loop's own check).
+        handles.waits.stopped_sessions.lock().await.remove(session_id);
+        let armed = {
+            let write_lock = handles.cards.write_lock(session_id).await;
+            let _guard = write_lock.lock().await;
+            self.arm_snapshot_follow_locked(handles, session_id, card_id, &mut plan, false)
+                .await
+        };
+        if !armed {
+            return false;
+        }
+        self.finish_snapshot_follow(handles, session_id, &plan).await;
+        true
+    }
+
+    /// Decide and prepare a busy follow from a Session read (ADR-0028,
+    /// ADR-0100), **without touching the card map**: the follow's anchor, its
+    /// static lead and the requests it will seed. `None` when the read is not
+    /// follow-worthy — not busy/waiting, no user message to follow, or a
+    /// cola-authored newest message (that run's hand-off belongs to the Chain
+    /// Record and Session Sync, never to a Session Card).
+    ///
+    /// The seed is filtered with `is_already_surfaced`, so a request the sweep
+    /// (or a live card) already put somewhere keeps its own surface and is not
+    /// counted on this card. `/card`'s post builds the accumulator and this
+    /// seed before it takes the write lock; only the map insert is the commit.
+    pub(crate) async fn prepare_snapshot_follow(
+        &self,
+        handles: &FlowHandles,
+        verb: &str,
+        title: &str,
+        data: &crate::bridge::snapshot::SnapshotData,
+    ) -> Option<SnapshotFollowPlan> {
+        // Race (ADR-0028): busy at gather but idle by now → the turn already
+        // finished; keep the static read and never arm a renderer. A gathered
+        // Waiting turn (server-idle with live Background Tasks, ADR-0059)
+        // needs no fresh busy read to stay follow-worthy: its Execution
+        // already ended, and the follow yields ⏳ on its first settle read
+        // (#586).
+        let busy_now = matches!(
+            handles
+                .backend
+                .session_status(&data.session_id, Some(&data.directory))
+                .await,
+            Ok(Some(crate::backend::types::SessionStatus::Busy))
+        );
+        if !busy_now && !data.waiting {
+            tracing::info!(
+                "snapshot follow: session {} neither busy nor waiting; keeping static read",
+                data.session_id
+            );
+            return None;
+        }
+        self.prepare_snapshot_follow_with_busy(handles, busy_now, verb, title, data)
+            .await
+    }
+
+    /// [`Self::prepare_snapshot_follow`] for a caller that already took the
+    /// busy/waiting decision (the settle's own race check): the rest of the
+    /// preparation — the external-run guard, the anchor, the filtered seed and
+    /// the static lead.
+    async fn prepare_snapshot_follow_with_busy(
+        &self,
+        handles: &FlowHandles,
+        busy_now: bool,
+        verb: &str,
+        title: &str,
+        data: &crate::bridge::snapshot::SnapshotData,
+    ) -> Option<SnapshotFollowPlan> {
+        let Some(anchor) = data.newest_user_anchor.clone() else {
+            tracing::warn!(
+                "snapshot follow: session {} busy but has no user message to follow",
+                data.session_id
+            );
+            return None;
+        };
+        if data.newest_user_is_cola_authored {
+            tracing::info!(
+                "snapshot follow: session {} busy on a cola-authored turn; keeping static read",
+                data.session_id
+            );
+            return None;
+        }
         let (session_dir, session_thread_key) = {
             let store = handles.sessions.store.lock().await;
-            match store.entry_for_session(session_id) {
+            match store.entry_for_session(&data.session_id) {
                 Some(e) => (e.directory.clone(), Some(e.thread_key.clone())),
                 None => (String::new(), None),
             }
@@ -745,33 +866,40 @@ impl ExternalFlow {
             .store
             .lock()
             .await
-            .entry_for_session(session_id)
+            .entry_for_session(&data.session_id)
             .and_then(|e| e.variant.clone());
         // The requests this follow seeds onto its card, in order. The
         // count-only pointer names exactly this set, so it is decided HERE and
-        // not inferred from the read: #1005 filters the seed with
-        // `is_already_surfaced`, and a request that keeps its own card must not
-        // be counted on this one.
-        let seeds: Vec<&crate::bridge::request::kind::PendingRequest> = data.pending.iter().collect();
-        // The snapshot's identity rides as static text (same choice as the
-        // 👤 preview in `start_reply_render`): the header verb 已接管 stays
-        // visible while the turn streams, and the body below it is the ONE
-        // composition the idle Session Card renders (ADR-0100). Its text form
-        // drops Compaction markers: this card is a live one, and its timeline
-        // renders the session's compaction rows itself (a session-scoped fact,
+        // not inferred from the read: a request that already keeps its own card
+        // must not be counted on this one.
+        let mut seeds = Vec::new();
+        for req in &data.pending {
+            if crate::bridge::snapshot_claims::is_already_surfaced(&handles.requests, &handles.cards, req)
+                .await
+            {
+                tracing::info!(
+                    "snapshot follow: {} on session {} is already surfaced; not seeded",
+                    req.id(),
+                    data.session_id
+                );
+                continue;
+            }
+            seeds.push(req.clone());
+        }
+        let seed_refs: Vec<&crate::bridge::request::kind::PendingRequest> = seeds.iter().collect();
+        // The read's identity rides as static text (same choice as the 👤
+        // preview in `start_reply_render`): the header verb stays visible
+        // while the turn streams, and the body below it is the ONE composition
+        // the idle Session Card renders (ADR-0100). Its text form drops
+        // Compaction markers: this card is a live one, and its timeline renders
+        // the session's compaction rows itself (a session-scoped fact,
         // ADR-0082), so repeating the marker here would show it twice.
-        // `push_text` chunks long text, and the card splitter breaks overflow
-        // into continuation cards, so no truncation happens here.
-        let static_text = snapshot_follow_lead(verb, title, data, &seeds, busy_now);
-        // A NEW external run (the adoption follows it): a `/stop` from before
-        // it is not this run's ending, same as the reply renderer's arm. A
-        // stop landing after this point ends the follow promptly as
-        // ⏹ 已停止 (the loop's own check).
-        handles.waits.stopped_sessions.lock().await.remove(session_id);
-        Turn::arm_external_render(
-            &handles.cards,
-            session_id,
-            card_id,
+        let static_text = snapshot_follow_lead(verb, title, data, &seed_refs, busy_now);
+        // Build the accumulator OFF the card map (ADR-0100): the work-context
+        // read happens here, before any write lock, so the post-and-arm's
+        // critical section is only the send, the insert and the chain record.
+        let prepared = Turn::prepare_external_render(
+            &data.session_id,
             &anchor,
             "",
             &session_dir,
@@ -779,18 +907,66 @@ impl ExternalFlow {
             Some(ExternalCardLead::Static(&static_text)),
         )
         .await;
-        // The adopt-time pending blocks ride as inline sections: the poll's
-        // inline dedupe (the block is already present on the accumulator)
-        // prevents a duplicate, and clicking one takes the normal inline path —
-        // resolved sections are stripped and the run resumes into the same card.
-        for req in &seeds {
+        Some(SnapshotFollowPlan {
+            anchor,
+            session_thread_key,
+            directory: data.directory.clone(),
+            seeds,
+            prepared: Some(prepared),
+        })
+    }
+
+    /// The post-and-arm's commit (ADR-0100): insert the render-owned
+    /// `CardSession` carrying the id the send returned and write the chain
+    /// record, in one write-lock critical section. The caller holds the
+    /// Session's card write lock across its send, this insert and (for a Turn
+    /// that won the race) the stamp. With `refuse_if_running`, a live card that
+    /// appeared during the send wins and nothing is inserted.
+    pub(crate) async fn arm_snapshot_follow_locked(
+        &self,
+        handles: &FlowHandles,
+        session_id: &str,
+        card_id: &str,
+        plan: &mut SnapshotFollowPlan,
+        refuse_if_running: bool,
+    ) -> bool {
+        let prepared = plan.prepared.take().expect("a follow plan is armed exactly once");
+        Turn::commit_external_render_locked(&handles.cards, session_id, card_id, prepared, refuse_if_running)
+            .await
+    }
+
+    /// Seed the prepared requests onto the armed card and spawn its render
+    /// loop. Runs after the commit (the seed must attach to a card that
+    /// exists), so the request flow's own surfacing can race it: an add that
+    /// finds the block already present is the sweep's, and the re-filter keeps
+    /// the two from producing a second block.
+    pub(crate) async fn finish_snapshot_follow(
+        &self,
+        handles: &FlowHandles,
+        session_id: &str,
+        plan: &SnapshotFollowPlan,
+    ) {
+        // The read's pending blocks ride as inline sections: the poll's inline
+        // dedupe (the block is already present on the accumulator) prevents a
+        // duplicate, and clicking one takes the normal inline path — resolved
+        // sections are stripped and the run resumes into the same card.
+        for req in &plan.seeds {
+            if crate::bridge::snapshot_claims::is_already_surfaced(&handles.requests, &handles.cards, req)
+                .await
+            {
+                tracing::info!(
+                    "snapshot follow: request {} was surfaced before the seed; keeping that card",
+                    req.id()
+                );
+                continue;
+            }
             let flow = handles.requests.flow_for(req.claim_kind());
             // A refused add is the only way the blocks can differ from the
             // count the pointer was written from (the card session vanished
             // under the arm, or it already carries the request). Say so
             // instead of leaving the card overstating what it shows.
             if !flow
-                .add_initial_inline(&handles.cards, session_id, req, &data.directory)
+                .add_initial_inline(&handles.cards, session_id, req, &plan.directory)
                 .await
             {
                 tracing::warn!(
@@ -801,12 +977,13 @@ impl ExternalFlow {
             // Remember the full request (like the static claim path): the poll
             // loop never sees follow-hosted requests, so `prepare()` never runs
             // for them and the block's buttons would resolve to nothing.
-            flow.remember_surfaced(req, &data.directory).await;
+            flow.remember_surfaced(req, &plan.directory).await;
         }
         tracing::info!("snapshot follow armed for session {}", session_id);
 
         let handles = handles.clone();
         let sid = session_id.to_string();
+        let anchor = plan.anchor.clone();
         let poll_ms = self.render_poll_ms.load(std::sync::atomic::Ordering::Relaxed);
         let read_timeout_ms = self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         let idle_timeout_ms = self
@@ -815,14 +992,13 @@ impl ExternalFlow {
         // The follow's render loop is its own task, so it is instrumented
         // explicitly with the adopted Session's `external` span (ADR-0048),
         // rooted like the plain reply renderer's.
-        let span = crate::bridge::span::external(session_id, session_thread_key.as_ref());
+        let span = crate::bridge::span::external(session_id, plan.session_thread_key.as_ref());
         tokio::spawn(
             async move {
                 external_render_loop(&handles, sid, anchor, poll_ms, read_timeout_ms, idle_timeout_ms).await;
             }
             .instrument(span),
         );
-        true
     }
 
     /// The card subtitle a continuation carries: the server's live session
@@ -1308,9 +1484,10 @@ impl ExternalFlow {
 ///
 /// A Waiting adoption (#586) names the wait instead of claiming a turn is being
 /// continued; a busy run that started after a waiting gather keeps the
-/// continuing copy. `seeds` is the read's requests this follow puts on the card;
-/// the body's count-only pointer names exactly them, so the caller decides the
-/// set (and #1005 will filter it) rather than the composition inferring it.
+/// continuing copy. `seeds` is the read's requests this follow puts on the card
+/// (already filtered by `is_already_surfaced`); the body's count-only pointer
+/// names exactly them, so the caller decides the set rather than the
+/// composition inferring it.
 ///
 /// The 最近对话 tail's Compaction markers are deliberately NOT repeated here:
 /// this card is a live one, and its timeline renders the session's compaction
@@ -1319,13 +1496,9 @@ impl ExternalFlow {
 /// all, since a header with nothing under it would read as an empty
 /// conversation.
 ///
-/// This card REPLACES the one-shot snapshot that named the requests its block
-/// cap left out (#842), so the overflow fact is repeated here — otherwise the
-/// only place naming them is a card that no longer exists. It uses the UNCOUNTED
-/// form: arming happens a moment after the snapshot was sent, and a resolution
-/// can land in between, so the send-time count is no longer trustworthy (the
-/// same rule a claim-ack rebuild follows). The inline blocks follow this text,
-/// so the line reads immediately above the ones it is NOT about.
+/// No overflow notice renders here (ADR-0100): overflow is no longer a decision
+/// the card makes, and a live card must not carry a send-time count a
+/// resolution can make stale.
 pub(crate) fn snapshot_follow_lead(
     verb: &str,
     title: &str,
@@ -1349,12 +1522,6 @@ pub(crate) fn snapshot_follow_lead(
     if !body.is_empty() {
         text.push_str("\n\n");
         text.push_str(&body);
-    }
-    if let Some(notice) =
-        crate::feishu::snapshot_card::pending_overflow_notice(data.pending_overflow.uncounted())
-    {
-        text.push('\n');
-        text.push_str(&notice);
     }
     text
 }

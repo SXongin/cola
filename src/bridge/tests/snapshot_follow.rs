@@ -732,11 +732,11 @@ async fn busy_adopt_streams_turn_into_snapshot() {
     );
 }
 
-/// The busy/waiting follow card REPLACES the one-shot snapshot, so it repeats
-/// the overflow line (#842): otherwise the requests the block cap left out are
-/// named only on a card the follow has already overwritten.
+/// The busy/waiting follow card renders NO overflow notice (ADR-0100, #1005):
+/// overflow is no longer a decision the card makes, and a live card must not
+/// repeat a send-time count a resolution can make stale.
 #[tokio::test]
-async fn a_busy_follow_repeats_the_pending_overflow_line() {
+async fn a_busy_follow_renders_no_pending_overflow_line() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -781,12 +781,8 @@ async fn a_busy_follow_repeats_the_pending_overflow_line() {
         })
         .expect("the follow re-renders the snapshot message");
     assert!(
-        follow_card.contains("另有待处理请求超出单卡容量"),
-        "the replacing card still names the leftover: {follow_card}"
-    );
-    assert!(
-        !follow_card.contains("1 个待处理请求"),
-        "a replacement drops the count a resolution may have made stale: {follow_card}"
+        !follow_card.contains("另有待处理请求超出单卡容量"),
+        "the follow card renders no overflow notice: {follow_card}"
     );
     assert!(
         follow_card.contains("已接管 唯一外部标题"),

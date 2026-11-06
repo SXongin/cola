@@ -514,6 +514,7 @@ impl SharedCore {
         crate::bridge::handles::CommandHandles {
             flow: self.flow_handles(),
             config: self.turn_config(),
+            external: Arc::clone(&self.external),
             diff_cooldown: Arc::clone(&self.diff_cooldown),
             terminal_runs: Arc::clone(&self.terminal_runs),
             terminal_records: Arc::clone(&self.terminal_records),

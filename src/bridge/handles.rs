@@ -2938,6 +2938,10 @@ impl TopicHandles {
 pub(crate) struct CommandHandles {
     pub(crate) flow: FlowHandles,
     pub(crate) config: TurnConfig,
+    /// The external flow, which owns the busy follow `/card` arms on a read
+    /// whose Session is still running (ADR-0100): its renderer cadences and
+    /// the existing follow machinery.
+    pub(crate) external: Arc<crate::bridge::external::ExternalFlow>,
     /// `/diff`'s process-internal cooldown (spec #803): one entry per chat,
     /// claimed before any git/render/upload work. Shared with the rest of the
     /// process through the core, so two `/diff`s in one chat cannot both run

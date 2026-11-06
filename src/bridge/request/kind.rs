@@ -216,6 +216,17 @@ pub trait RequestKind: Send + Sync {
         dir: &str,
     ) -> bool;
 
+    /// [`Self::add_inline`] for a caller that already holds the host's card
+    /// write lock — the sweep's one surfacing decision (ADR-0100).
+    async fn add_inline_locked(
+        &self,
+        flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> bool;
+
     /// Seed this kind's inline block on a NEW host card with the request's
     /// initial (adopt-time) state — the busy-follow host path, which
     /// reproduces the static snapshot's blocks before the renderer takes over
@@ -417,6 +428,20 @@ impl RequestKind for PermissionKind {
             return false;
         };
         Turn::add_permission(cards, host, p, dir).await
+    }
+
+    async fn add_inline_locked(
+        &self,
+        _flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> bool {
+        let PendingRequest::Permission(p) = req else {
+            return false;
+        };
+        Turn::add_permission_locked(cards, host, p, dir).await
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -1150,6 +1175,24 @@ impl RequestKind for QuestionKind {
             .await
             .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
         Turn::add_question(cards, host, q, dir, &paint).await
+    }
+
+    async fn add_inline_locked(
+        &self,
+        flow: &RequestFlow,
+        cards: &CardsHandle,
+        host: &str,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> bool {
+        let PendingRequest::Question(q) = req else {
+            return false;
+        };
+        let paint = flow
+            .with_question_state(&q.id, |state| state.paint())
+            .await
+            .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
+        Turn::add_question_locked(cards, host, q, dir, &paint).await
     }
 
     async fn add_initial_inline(

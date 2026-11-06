@@ -30,6 +30,16 @@ pub(crate) enum ExternalCardLead<'a> {
     Static(&'a str),
 }
 
+/// An external renderer's accumulator built off the card map (ADR-0100): the
+/// turn anchor, work context, variant and lead are all in place, and only the
+/// card id a send returns and the durable seed are missing. The `/card`
+/// post-and-arm holds it across its send and consumes it under the write lock.
+pub(crate) struct PreparedExternalRender {
+    acc: StreamAccumulator,
+    /// The Session's directory, for the chain record's read routing.
+    session_dir: String,
+}
+
 /// What Session Sync owes for one read (ADR-0059): the decision carries
 /// everything the caller needs to act on it, so the same lock acquisition
 /// that found the chain also says which handoff to use — nothing is
@@ -421,6 +431,27 @@ impl Turn {
         variant: Option<String>,
         lead: Option<ExternalCardLead<'_>>,
     ) {
+        let prepared =
+            Self::prepare_external_render(session_id, anchor, subtitle, session_dir, variant, lead).await;
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        Self::commit_external_render_locked(cards, session_id, card_id, prepared, false).await;
+    }
+
+    /// Build an external renderer's accumulator OFF the card map (ADR-0100):
+    /// the anchor, work context, variant and lead are ready, and only the card
+    /// id (which the send returns) and the durable seed are missing. The
+    /// work-context read runs here, before any write lock, so `/card`'s
+    /// post-and-arm critical section is only the send, the insert and the
+    /// chain record.
+    pub(crate) async fn prepare_external_render(
+        session_id: &str,
+        anchor: &TurnAnchor,
+        subtitle: &str,
+        session_dir: &str,
+        variant: Option<String>,
+        lead: Option<ExternalCardLead<'_>>,
+    ) -> PreparedExternalRender {
         let mut acc = state::StreamAccumulator::new(subtitle);
         // The external message's anchor — identity plus server time — is the
         // turn's anchor: header date, turn filter and renderer replacement
@@ -428,7 +459,6 @@ impl Turn {
         // (#183, #190).
         acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
-        acc.set_reply_target(Some(card_id.to_string()));
         acc.attach_work_context(session_dir).await;
         acc.set_variant(variant);
         if let Some(lead) = lead {
@@ -442,16 +472,44 @@ impl Turn {
                 ExternalCardLead::Static(_) => {}
             }
         }
+        PreparedExternalRender {
+            acc,
+            session_dir: session_dir.to_string(),
+        }
+    }
+
+    /// The post-and-arm's commit (ADR-0100): the caller holds the Session's
+    /// card write lock across its send and this insert, so the two are one
+    /// critical section. `prepared` was built off the map; its reply target is
+    /// the sent card id. With `refuse_if_running`, a live card that appeared
+    /// while the caller was sending wins — nothing is inserted, no chain
+    /// record is written, and the caller keeps its just-sent card as a static
+    /// read. Returns whether the arm committed.
+    pub(crate) async fn commit_external_render_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_id: &str,
+        mut prepared: PreparedExternalRender,
+        refuse_if_running: bool,
+    ) -> bool {
+        prepared.acc.set_reply_target(Some(card_id.to_string()));
+        let session_dir = prepared.session_dir.clone();
         {
             // The durable seed and the insert share ONE cards-map critical
-            // section (issue #671, ticket #672): the `attach_work_context`
-            // await above is where a landed mark could slip past a seed read
-            // taken before it, leaving this render to re-show the retirement.
+            // section (issue #671, ticket #672): a landed mark must not slip
+            // past a seed read taken before it, leaving this render to re-show
+            // the retirement.
             let mut live = cards.cards.lock().await;
-            Self::seed_durable_announcements(cards, session_id, &mut acc);
+            // The render-owned arm's commit is also a compare-and-swap for the
+            // `/card` post (ADR-0100): a Turn installed during the send owns
+            // the card, so this read must not overwrite it.
+            if refuse_if_running && live.get(session_id).is_some_and(state::CardSession::is_running) {
+                return false;
+            }
+            Self::seed_durable_announcements(cards, session_id, &mut prepared.acc);
             live.insert(
                 session_id.to_string(),
-                state::CardSession::new(acc, Some(card_id.to_string())),
+                state::CardSession::new(prepared.acc, Some(card_id.to_string())),
             );
         }
         // An adopted run's card is the session's live card: take the chain over
@@ -459,7 +517,8 @@ impl Turn {
         // and the arm carries the directory its reads route under). A different
         // previously recorded card was orphaned by this arm and is collected
         // as taken over.
-        Self::take_over_card(cards, session_id, card_id, Some(session_dir)).await;
+        Self::take_over_card(cards, session_id, card_id, Some(&session_dir)).await;
+        true
     }
 
     /// What Session Sync owes for this read: `None` when the chain has
