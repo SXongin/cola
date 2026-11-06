@@ -3554,7 +3554,7 @@ impl App {
     /// which retires the Session Snapshot from this op), then persist the new
     /// active entry. The card and the toast carry the SAME 已切换 verb whether
     /// this is a first adoption or a re-switch. The returned card IS the ack's
-    /// replacement (ADR-0028 one-card rule), so no second message is sent.
+    /// replacement (ADR-0100's one-card rule), so no second message is sent.
     /// `back` is the switch card's list state the adoption came from
     /// (ADR-0052): the compact state carries its 返回列表 button.
     ///
