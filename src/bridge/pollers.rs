@@ -375,7 +375,7 @@ pub(crate) async fn mark_stale_cards(
 mod tests {
     use super::*;
     use crate::bridge::core::SharedCore;
-    use crate::bridge::test_support::{MockBackend, RecordingPlatform, test_config};
+    use crate::bridge::test_support::{MockBackend, RecordingPlatform, core_with, test_config};
     use std::sync::Arc;
 
     /// The poll loop's seam, driven by a client with no lifecycle of its own:
@@ -404,11 +404,7 @@ mod tests {
     async fn the_busy_probe_is_conservative_under_contention() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let layout = crate::state::StateLayout::from_config(&cfg);
-        let platform = Arc::new(RecordingPlatform::new());
-        let core = Arc::new(
-            SharedCore::new(&cfg, layout, Arc::new(MockBackend::new(Vec::new())), platform).unwrap(),
-        );
+        let core = core_with(&cfg, MockBackend::new(Vec::new()));
         let waits = core.waits_handle();
         let probe = busy_probe(&waits);
 
@@ -429,11 +425,7 @@ mod tests {
     async fn the_inline_host_is_a_live_card_not_a_map_entry() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let layout = crate::state::StateLayout::from_config(&cfg);
-        let platform = Arc::new(RecordingPlatform::new());
-        let core = Arc::new(
-            SharedCore::new(&cfg, layout, Arc::new(MockBackend::new(Vec::new())), platform).unwrap(),
-        );
+        let core = core_with(&cfg, MockBackend::new(Vec::new()));
         let handles = core.flow_handles();
         let cards = &handles.cards;
         Turn::seed_card(cards, "ses_test", Some("om_card")).await;
@@ -473,11 +465,7 @@ mod tests {
     async fn a_finished_card_is_not_a_reply_target() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let layout = crate::state::StateLayout::from_config(&cfg);
-        let platform = Arc::new(RecordingPlatform::new());
-        let core = Arc::new(
-            SharedCore::new(&cfg, layout, Arc::new(MockBackend::new(Vec::new())), platform).unwrap(),
-        );
+        let core = core_with(&cfg, MockBackend::new(Vec::new()));
         let handles = core.flow_handles();
         handles
             .sessions

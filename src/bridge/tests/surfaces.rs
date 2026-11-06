@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use crate::bridge::test_support::*;
-use crate::feishu::card::CardState;
 
 /// A two-question request the question flow can replay and reply to.
 fn question_request(request_id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
@@ -34,17 +33,6 @@ fn question_request(request_id: &str, session_id: &str) -> crate::backend::types
         ],
         ..Default::default()
     }
-}
-
-/// Seed the live streaming card a Turn would have: an accumulator with a card
-/// message id, finished content and a reply target.
-async fn seed_live_card(app: &Arc<App>, session_id: &str, message_id: &str) {
-    let cards = app.cards_handle();
-    Turn::seed_card(&cards, session_id, Some(message_id)).await;
-    // A block rides a LIVE card (ADR-0100); the restart is what orphans it.
-    Turn::set_card_state(&cards, session_id, CardState::Streaming).await;
-    Turn::push_text(&cards, session_id, "回合的内容。").await;
-    Turn::set_reply_target(&cards, session_id, "msg_1").await;
 }
 
 /// One deterministic sweep (tests drive the poll loop's pass directly).
@@ -120,8 +108,8 @@ async fn restart_readopts_a_pending_inline_permission() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
-    seed_session(&app, "ses_1", "/work").await;
     seed_live_card(&app, "ses_1", "om_live").await;
+    Turn::push_text(&app.cards_handle(), "ses_1", "回合的内容。").await;
     sweep(&app.permission, &app).await;
     assert_eq!(
         app.card_handles.lock().await.message_of("per_1"),
@@ -229,8 +217,8 @@ async fn restart_readopts_a_pending_inline_question() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
-    seed_session(&app, "ses_1", "/work").await;
     seed_live_card(&app, "ses_1", "om_live").await;
+    Turn::push_text(&app.cards_handle(), "ses_1", "回合的内容。").await;
     sweep(&app.question, &app).await;
     assert_eq!(app.card_handles.lock().await.message_of("que_1"), Some("om_live"));
     assert!(persisted(&session_file).is_some());
@@ -520,8 +508,8 @@ async fn restart_reconciles_an_inline_block_resolved_while_down() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
-    seed_session(&app, "ses_1", "/work").await;
     seed_live_card(&app, "ses_1", "om_live").await;
+    Turn::push_text(&app.cards_handle(), "ses_1", "回合的内容。").await;
     sweep(&app.permission, &app).await;
     assert!(persisted(&session_file).is_some());
 
