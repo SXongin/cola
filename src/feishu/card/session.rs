@@ -1856,12 +1856,12 @@ impl SessionCardBody<'_> {
 
     /// The body as the live lead's plain text: the status line, the pointer and
     /// the tail as one `最近对话` section of `role body` lines. A **Compaction**
-    /// marker is deliberately absent: the card that carries this lead is live,
-    /// and its own timeline renders the session's compaction rows (ADR-0082), so
-    /// repeating one here would show it twice. The card-element presentation
-    /// ([`Self::tail_elements`]) keeps the marker; only this form drops it. A
-    /// tail carrying only markers therefore renders no 最近对话 heading at all —
-    /// a header with nothing under it would read as an empty conversation.
+    /// marker keeps its server position here too, with the same title and
+    /// folded summary the card presentation ([`Self::tail_elements`]) renders.
+    /// The live timeline may also render the compaction row, so the row appears
+    /// twice on a followed card; that is the accepted cost of #1002's explicit
+    /// equal-body requirement, which supersedes ADR-0082's exactly-once note.
+    /// A marker-only tail therefore renders the heading and the marker.
     pub(crate) fn lead_text(&self) -> String {
         let mut text = String::new();
         if let Some(status) = &self.status {
