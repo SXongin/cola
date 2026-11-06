@@ -391,6 +391,9 @@ pub struct RecordingPlatform {
     pub fail_send_card: bool,
     /// When true, `reply_card` fails (tests the restart-announce fallback).
     pub fail_reply_card: bool,
+    /// When true, `reply_in_thread` fails (tests that a failed in-topic
+    /// confirmation is propagated instead of adopting with no anchor).
+    pub fail_reply_in_thread: bool,
     /// The next N `reply_card` calls fail (a CONTINUATION send that must be
     /// retried without duplicating receipts, while the loading card's own
     /// reply — if any — succeeds).
@@ -522,6 +525,7 @@ impl RecordingPlatform {
             chat_names: std::collections::HashMap::new(),
             fail_send_card: false,
             fail_reply_card: false,
+            fail_reply_in_thread: false,
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1122,6 +1126,11 @@ impl feishu::Platform for RecordingPlatform {
         message_id: &str,
         text: &str,
     ) -> crate::error::Result<(String, Option<String>)> {
+        if self.fail_reply_in_thread {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated reply_in_thread failure".into(),
+            ));
+        }
         let thread_id = self.reply_in_thread_thread_id.clone();
         self.calls.lock().await.push(PlatformCall::ReplyInThread {
             message_id: message_id.into(),

@@ -431,30 +431,35 @@ struct SnapshotPass<'a> {
     omitted_tail: usize,
 }
 
-/// Build the compact suppressed-切换 state card (ADR-0028): when a re-switch
-/// to a session already mapped to this thread has nothing to report (idle, no
-/// pending, newest user message cola-authored), the switch card patches to
-/// this small confirmation instead of a full snapshot — the card-form mirror
-/// of the text form's one-line ack. No status chip, no tail, no pending
-/// blocks: there is deliberately nothing to report. `back` is the
-/// `/switch`-list state the adoption came from, when it came from the list
-/// card: it renders the optional 「返回列表」 button (ADR-0052) with the same
-/// behavior as the full snapshot's.
+/// Build the compact switch-list adoption state card (ADR-0100): every
+/// 接管/切换 click on the `/switch` card patches the clicked list card in place
+/// to this small confirmation — there is no Session Snapshot on an adoption any
+/// more, and the ack must not post a second message. `verb` is the takeover verb
+/// (接管 for a first adoption, 切换 for a re-switch) and rides the header and
+/// body exactly as the toast carries it, so the two never disagree.
+///
+/// It carries no status chip, no tail and no pending blocks: the list card has
+/// no room for them, and the text adoption surfaces are where a status summary
+/// lives (they have no list to return to). `back` is the `/switch`-list state
+/// the adoption came from: it renders the optional 「返回列表」 button
+/// (ADR-0052) with the same behavior as the full snapshot's.
 pub fn build_switched_state_card(
+    verb: &str,
     title: &str,
     session_id: &str,
     directory: &str,
     back: Option<&BackToList>,
 ) -> serde_json::Value {
+    let verb = verb.strip_prefix("已").unwrap_or(verb);
     let title = display_title(title, session_id);
     let mut elements = vec![json!({
         "tag": "markdown",
-        "content": format!("已切换到该会话（目录 `{directory}`）。")
+        "content": format!("已{verb}该会话（目录 `{directory}`）。")
     })];
     if let Some(back) = back {
         elements.push(back_to_list_button(back));
     }
-    crate::feishu::card::shell::card_shell(&format!("已切换 {title}"), "blue", elements)
+    crate::feishu::card::shell::card_shell(&format!("已{verb} {title}"), "blue", elements)
 }
 
 #[cfg(test)]
@@ -1691,8 +1696,8 @@ mod tests {
         assert!(!card.to_string().contains("返回列表"), "{card}");
     }
 
-    /// ADR-0052: the suppressed compact 已切换 state card carries the same
-    /// back button when the adoption came from the list.
+    /// ADR-0052/ADR-0100: the compact switch-list adoption state carries the
+    /// list's back button, and its header verb is the same one the toast uses.
     #[test]
     fn switched_state_back_button_renders_only_with_the_list_state() {
         let back = BackToList {
@@ -1702,17 +1707,36 @@ mod tests {
             page: 3,
         };
 
-        let card = build_switched_state_card("t", "ses_adopted", "/work/proj", Some(&back));
+        let card = build_switched_state_card("切换", "t", "ses_adopted", "/work/proj", Some(&back));
         let button = elements(&card)
             .iter()
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "返回列表")
-            .expect("the suppressed 已切换 card renders the back button");
+            .expect("the compact state card renders the back button");
         assert_eq!(button["value"]["op"], "back");
         assert_eq!(button["value"]["keyword"], "proj");
         assert_eq!(button["value"]["scope"], "dir");
         assert_eq!(button["value"]["page"], 3);
+        assert!(
+            card["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("已切换"),
+            "{card}"
+        );
 
-        let card = build_switched_state_card("t", "ses_adopted", "/work/proj", None);
+        let card = build_switched_state_card("切换", "t", "ses_adopted", "/work/proj", None);
         assert!(!card.to_string().contains("返回列表"), "{card}");
+
+        // A first adoption keeps the 接管 verb in the header, matching its
+        // toast — the patch is the same compact state either way.
+        let card = build_switched_state_card("接管", "t", "ses_adopted", "/work/proj", None);
+        assert!(
+            card["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("已接管"),
+            "{card}"
+        );
+        assert!(!card.to_string().contains("已切换"), "{card}");
     }
 }
