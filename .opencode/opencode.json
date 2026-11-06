@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // ── Pipeline model switch ────────────────────────────────────────────
+  // The model every /implement-spec sub-agent runs on: implementers, the
+  // merger, and the two-axis + adversarial reviewers. Change the value below
+  // (one place, three entries) to move the whole pipeline to another
+  // provider/model — e.g. when a provider's quota runs out.
+  "agents": {
+    "implementer": {
+      "model": "deepseek/deepseek-flash#high"
+    },
+    "merger": {
+      "model": "deepseek/deepseek-flash#high"
+    },
+    "code-reviewer": {
+      "model": "deepseek/deepseek-flash#high"
+    }
+  }
+}
