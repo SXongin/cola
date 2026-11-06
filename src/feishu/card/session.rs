@@ -1591,6 +1591,15 @@ pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
         .iter()
         .filter(|req| req.session_id() == data.session_id)
         .count();
+    build_idle_card_with_pending(data, on_card)
+}
+
+/// [`build_idle_card`] with the pending count decided by the caller: the busy
+/// follow's initial post (ADR-0100) names exactly the requests it seeds on the
+/// card, which may be fewer than the read's — a request another card already
+/// hosts keeps its own surface and is not counted here. The status line still
+/// comes from the read.
+pub(crate) fn build_idle_card_with_pending(data: &SnapshotData, on_card: usize) -> serde_json::Value {
     let build = |omitted: usize| {
         let mut md = CardMarkdown::new();
         let body = session_card_body(data, &data.tail[omitted..], omitted, PendingFacts { on_card });

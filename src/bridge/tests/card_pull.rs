@@ -49,30 +49,6 @@ async fn one_posted_card(platform: &RecordingPlatform) -> serde_json::Value {
     cards.into_iter().next().unwrap()
 }
 
-/// Assert the card carries no interactive component at all: a read is not
-/// operable (ADR-0100).
-fn assert_no_operable_element(card: &serde_json::Value) {
-    let json = card.to_string();
-    for tag in [
-        "form",
-        "button",
-        "input",
-        "select_static",
-        "multi_select_static",
-        "select_person",
-        "multi_select_person",
-        "checker",
-        "overflow",
-        "action",
-        "actions",
-    ] {
-        assert!(
-            !json.contains(&format!("\"tag\":\"{tag}\"")),
-            "the read must render no {tag}: {json}"
-        );
-    }
-}
-
 /// A Turn that already finished leaves its card session in `cards` with a Done
 /// state until the next Turn replaces it. `/card` must not treat that as a live
 /// card to pull — it reads the Session once and posts a read-only Session Card
@@ -190,13 +166,12 @@ async fn card_command_after_a_stopped_turn_posts_an_idle_read() {
     );
 }
 
-/// A `/card` read that finds the Session **busy** still posts ONE static idle
-/// Session Card in this slice: the status line names 运行中, the tail renders,
-/// nothing on the card is operable, and NO renderer is armed on it — the map
-/// entry stays the terminal read and no Chain Record appears. #1005 moves this
-/// boundary.
+/// A `/card` read that finds the Session **busy** and its newest user message
+/// external follows the run (ADR-0100, #1005): the posted card is the Session's
+/// live card, the existing external renderer is armed on it, and a Chain Record
+/// now names it. The card still opens with the read's status and tail.
 #[tokio::test]
-async fn a_busy_read_posts_a_static_idle_card_and_arms_no_renderer() {
+async fn a_busy_read_follows_the_run_on_the_posted_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -220,35 +195,43 @@ async fn a_busy_read_posts_a_static_idle_card_and_arms_no_renderer() {
     assert!(text.contains("⚙️ 运行中"), "the status line names busy: {text}");
     assert!(text.contains("**最近对话**"), "the tail renders: {text}");
     assert!(text.contains("继续改登录"), "the tail carries the read: {text}");
-    assert_no_operable_element(&card);
+    assert!(
+        !text.contains("超出单卡容量"),
+        "the follow card renders no overflow notice: {text}"
+    );
 
-    // No renderer armed: the read is the terminal map entry, not a chain card,
-    // it owns no Chain Record, and no follow moved it out of Idle.
+    // The posted card became the Session's live card, and the arm wrote the
+    // Chain Record that makes a restart reap it.
     let cards = app.cards_handle();
     assert!(
-        !Turn::is_running(&cards, "ses_test").await,
-        "a read is never live"
+        Turn::is_running(&cards, "ses_test").await,
+        "the follow is render-owned"
     );
     assert!(
-        !Turn::is_chain_card(&cards, "ses_test").await,
-        "no renderer replaced the read with a chain card"
+        Turn::is_chain_card(&cards, "ses_test").await,
+        "a follow is a chain card"
     );
     assert!(
-        !Turn::card_is_live(&cards, "ses_test").await,
-        "the read is not the growing live card"
+        Turn::card_is_live(&cards, "ses_test").await,
+        "the follow is the growing live card"
     );
-    assert!(
-        cards.chains.get("ses_test").is_none(),
-        "no follow armed => no Chain Record"
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("msg_reply"),
+        "the sent id is the card's identity"
     );
+    let record = cards
+        .chains
+        .get("ses_test")
+        .expect("the follow takes the chain over");
+    assert_eq!(record.card_message_id, "msg_reply");
 }
 
-/// A `/card` read that finds the Session **waiting on Background Tasks** posts
-/// the same static idle card in this slice: the status line names the wait, the
-/// tail renders, nothing is operable, and no follow/renderer is armed. #1005
-/// moves this boundary.
+/// A `/card` read that finds the Session **waiting on Background Tasks** with
+/// an external newest message follows the wait (ADR-0059, ADR-0100): the
+/// posted card is the live card and the renderer yields in place.
 #[tokio::test]
-async fn a_waiting_read_posts_a_static_idle_card_and_arms_no_renderer() {
+async fn a_waiting_read_follows_the_run_on_the_posted_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -297,21 +280,337 @@ async fn a_waiting_read_posts_a_static_idle_card_and_arms_no_renderer() {
     );
     assert!(text.contains("**最近对话**"), "the tail renders: {text}");
     assert!(text.contains("跑一下 CI"), "the tail carries the read: {text}");
-    assert_no_operable_element(&card);
+    assert!(
+        !text.contains("超出单卡容量"),
+        "the follow card renders no overflow notice: {text}"
+    );
 
     let cards = app.cards_handle();
     assert!(
+        Turn::is_running(&cards, "ses_test").await,
+        "a waiting run is followed"
+    );
+    assert!(
+        Turn::is_chain_card(&cards, "ses_test").await,
+        "the follow replaced the read with a chain card"
+    );
+    assert!(Turn::card_is_live(&cards, "ses_test").await);
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("msg_reply")
+    );
+    let record = cards
+        .chains
+        .get("ses_test")
+        .expect("the wait follow takes the chain over");
+    assert_eq!(record.card_message_id, "msg_reply");
+}
+
+/// The read's pending request is seeded onto the follow card, and the next
+/// sweep — which does not share the follow's `seen` set — must not post a
+/// duplicate standalone card for it (ADR-0100, #1005; the #1004 blocker).
+#[tokio::test]
+async fn a_busy_follow_seeds_its_pending_and_the_sweep_does_not_duplicate_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let cards = app.cards_handle();
+    assert!(
+        Turn::has_interaction_in(&cards, "ses_test", "per_1").await,
+        "the read's pending rides on the follow card's accumulator"
+    );
+    let card = one_posted_card(&platform).await;
+    assert!(
+        card_text(&card).contains("有 1 个请求等待你处理"),
+        "the pointer names the seeded request: {}",
+        card_text(&card)
+    );
+
+    // A fresh poller (its own `seen`) must recognise the block already on the
+    // card instead of posting a standalone duplicate for it.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "no second card for a request the follow already carries: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        !platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .any(|c| matches!(c, PlatformCall::SendCard { .. })),
+        "no standalone permission card: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// A request the sweep had already surfaced on its own card stays there: `/card`
+/// runs while the Session is busy, follows the run, and does not seed a second
+/// copy or count it on the new card.
+#[tokio::test]
+async fn a_follow_keeps_a_pending_the_sweep_already_surfaced() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    // The sweep surfaces the request on its own card before `/card` begins.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        platform.sent_cards().await.len(),
+        1,
+        "the standalone card lands first"
+    );
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let cards = app.cards_handle();
+    assert!(
+        Turn::is_running(&cards, "ses_test").await,
+        "the busy read follows the run"
+    );
+    assert!(
+        !Turn::has_interaction_in(&cards, "ses_test", "per_1").await,
+        "the already-surfaced request keeps its own card"
+    );
+    let cards_now = platform.replied_cards().await;
+    assert_eq!(cards_now.len(), 1, "the read posts its own card");
+    assert!(
+        !card_text(&cards_now[0]).contains("有 1 个请求等待你处理"),
+        "the follow card does not count a request another card hosts: {}",
+        card_text(&cards_now[0])
+    );
+    assert!(
+        card_text(&cards_now[0]).contains("⏳ 等待你的确认"),
+        "the status still names the wait the read saw: {}",
+        card_text(&cards_now[0])
+    );
+
+    // The poller still owns the standalone surface; its next pass must leave
+    // the follow card alone.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        platform.sent_cards().await.len(),
+        1,
+        "no duplicate standalone card after the follow: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "the follow card is not reposted either: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// A **cola-authored** newest message keeps the busy read static (ADR-0100):
+/// that run's hand-off belongs to the Chain Record and Session Sync, so no
+/// renderer is armed and no chain record appears.
+#[tokio::test]
+async fn a_busy_read_of_a_cola_authored_turn_stays_static() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![typed_message(
+            "msg_cola_turn",
+            MessageRole::User,
+            Some(1_000),
+            vec![text_part("cola 自己发起的回合")],
+        )])],
+    );
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let card = one_posted_card(&platform).await;
+    assert!(
+        card_text(&card).contains("⚙️ 运行中"),
+        "the read still names the busy state: {}",
+        card_text(&card)
+    );
+    let cards = app.cards_handle();
+    assert!(
         !Turn::is_running(&cards, "ses_test").await,
-        "a read is never live"
+        "a cola-authored turn is never followed"
     );
     assert!(
         !Turn::is_chain_card(&cards, "ses_test").await,
-        "no renderer replaced the read with a chain card"
+        "the card stays a read"
     );
-    assert!(!Turn::card_is_live(&cards, "ses_test").await);
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("msg_reply"),
+        "the static read is still the Session's current card"
+    );
     assert!(
         cards.chains.get("ses_test").is_none(),
-        "no follow armed => no Chain Record"
+        "no renderer armed => no Chain Record"
+    );
+}
+
+/// A command cancelled before the commit publishes nothing: the read and its
+/// follow are prepared off the card map, and the send/insert are one critical
+/// section. Dropping the future while it waits for that lock leaves no card in
+/// the map and posts nothing.
+#[tokio::test]
+async fn a_card_read_cancelled_before_the_commit_publishes_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    // Hold the Session's card write lock so the command parks before its send.
+    let lock = app.cards_handle().write_lock("ses_test").await;
+    let held = lock.lock().await;
+    let handles = app.command_handles();
+    let thread_key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    let command = tokio::spawn(async move {
+        crate::bridge::command::handle_command(
+            &handles,
+            crate::bridge::command::Command::Card,
+            thread_key,
+            "msg_card",
+            crate::config::ConversationKind::P2p,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    command.abort();
+    let _ = command.await;
+    drop(held);
+
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "a command cancelled before its commit posts nothing: {:?}",
+        platform.calls.lock().await
+    );
+    let cards = app.cards_handle();
+    assert!(
+        Turn::card_message_id(&cards, "ses_test").await.is_none(),
+        "no card may be recorded"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "no Chain Record may be written"
+    );
+}
+
+/// A Turn that installs its accumulator while the follow's card is being sent
+/// wins the map (ADR-0100): the arm's commit is a compare-and-swap, so the
+/// just-sent read is stamped taken over and no follow chain record is written.
+#[tokio::test]
+async fn a_turn_installed_during_the_follow_send_wins_the_map() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let (entered, release) = platform.pause("reply", "msg_card");
+    let app2 = app.clone();
+    let send = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    // The user's next prompt starts while the follow's send is in flight.
+    seed_live_card(&app, "ses_test", "om_live").await;
+    release.notify_one();
+    send.await.unwrap();
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the live Turn keeps the session"
+    );
+    assert!(
+        Turn::is_running(&cards, "ses_test").await,
+        "the follow must not replace a running card"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "the refused follow writes no Chain Record"
+    );
+
+    let calls = platform.calls.lock().await.clone();
+    let stamped = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("the posted follow read is stamped taken over");
+    assert!(
+        card_text(&stamped).contains("⏳ 已由新卡片接管 · 已停止更新"),
+        "the read that lost the race is not left unmarked: {}",
+        card_text(&stamped)
     );
 }
 

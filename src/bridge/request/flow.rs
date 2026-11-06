@@ -1292,24 +1292,55 @@ impl RequestFlow {
         if let Some(host) =
             inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await
         {
-            let pushed = self.kind.add_inline(self, &handles.cards, &host, req, dir).await;
-            if pushed {
-                // The block landed: this request is surfaced from now on.
-                seen.insert(req.id().to_string());
-                tracing::info!(
-                    "{} {} inlined on session {} card",
-                    self.kind.label(),
-                    req.id(),
-                    host
-                );
-                // Flush so the inline section appears NOW — the render loop
-                // only flushes on new parts, and a blocked prompt produces
-                // none.
-                Turn::flush_card(&handles.cards, &host).await;
-                return false;
+            // The prompt sweep's surfacing decision shares the Session's card
+            // write lock with `/card`'s post-and-arm (ADR-0100): the arm's
+            // insert cannot slip between "this card is live" and the block's
+            // arrival, so the request lands on the card the reader asked for.
+            let write_lock = handles.cards.write_lock(&host).await;
+            let guard = write_lock.lock().await;
+            // Re-validate under the lock: the walk's card may have been
+            // replaced by a terminal one while it ran.
+            if Turn::is_running(&handles.cards, &host).await {
+                let pushed = self
+                    .kind
+                    .add_inline_locked(self, &handles.cards, &host, req, dir)
+                    .await;
+                if pushed {
+                    // The block landed: this request is surfaced from now on.
+                    seen.insert(req.id().to_string());
+                    tracing::info!(
+                        "{} {} inlined on session {} card",
+                        self.kind.label(),
+                        req.id(),
+                        host
+                    );
+                    // Flush so the inline section appears NOW — the render loop
+                    // only flushes on new parts, and a blocked prompt produces
+                    // none.
+                    Turn::flush_card_locked(&handles.cards, &host).await;
+                    return false;
+                }
+                // `add_inline` false is ambiguous: the card session vanished,
+                // OR it already carries the block. A busy follow seeds its
+                // read's pendings without the sweep's `seen`, so the latter is
+                // the normal case for a request `/card` just put on the card —
+                // falling through here would post a duplicate standalone card.
+                // Only a card that still carries the request is "already
+                // surfaced"; a vanished one still needs its own card.
+                if Turn::has_interaction_in(&handles.cards, &host, req.id()).await {
+                    seen.insert(req.id().to_string());
+                    tracing::info!(
+                        "{} {} already carried by session {} card",
+                        self.kind.label(),
+                        req.id(),
+                        host
+                    );
+                    return false;
+                }
             }
-            // The add was refused (the card session vanished mid-pass): fall
-            // through to a standalone card, still unmarked until that lands.
+            drop(guard);
+            // The card vanished mid-pass: fall through to a standalone card,
+            // still unmarked until that lands.
         }
         let card = self.kind.build_card(req, dir);
         // Reply to the message that triggered the prompt for this session; fall
