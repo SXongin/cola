@@ -85,14 +85,6 @@ pub(crate) struct SnapshotFollowPlan {
     prepared: Option<PreparedExternalRender>,
 }
 
-impl SnapshotFollowPlan {
-    /// How many requests this follow seeds, and therefore how many its card's
-    /// count-only pointer names.
-    pub(crate) fn seed_count(&self) -> usize {
-        self.seeds.len()
-    }
-}
-
 impl ExternalFlow {
     pub fn new(notice: NoticeRules) -> Self {
         Self {

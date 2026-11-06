@@ -520,7 +520,7 @@ impl Turn {
     ) -> bool {
         prepared.acc.set_reply_target(Some(card_id.to_string()));
         let session_dir = prepared.session_dir.clone();
-        {
+        let chain_id = {
             // The durable seed and the insert share ONE cards-map critical
             // section (issue #671, ticket #672): a landed mark must not slip
             // past a seed read taken before it, leaving this render to re-show
@@ -533,18 +533,19 @@ impl Turn {
                 return false;
             }
             Self::seed_durable_announcements(cards, session_id, &mut prepared.acc);
-            live.insert(
-                session_id.to_string(),
-                state::CardSession::new(prepared.acc, Some(card_id.to_string())),
-            );
-        }
+            let session = state::CardSession::new(prepared.acc, Some(card_id.to_string()));
+            let chain_id = session.chain_id();
+            live.insert(session_id.to_string(), session);
+            chain_id
+        };
         // An adopted run's card is the session's live card: take the chain over
         // (the anchor is known here, so the record needs no transcript probe,
-        // and the arm carries the directory its reads route under). A different
-        // previously recorded card was orphaned by this arm and is collected
-        // as taken over.
-        Self::take_over_card(cards, session_id, card_id, Some(&session_dir)).await;
-        true
+        // and the arm carries the directory its reads route under). The guarded
+        // takeover only records while the map still holds THIS card, so a Turn
+        // that interleaved after the insert can never be re-pointed at — or
+        // have its record replaced by — a read that is no longer the Session's
+        // card.
+        Self::take_over_card_if_current(cards, session_id, card_id, chain_id, Some(&session_dir)).await
     }
 
     /// What Session Sync owes for this read: `None` when the chain has

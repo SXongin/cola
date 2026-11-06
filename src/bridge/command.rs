@@ -1124,18 +1124,13 @@ async fn post_idle_card(
     // The pointer, the send, the arm and the seed are one critical section:
     // the seed is filtered HERE (so no sweep can surface one between the
     // decision and the attach), and the card's count names exactly that set.
-    let card = if let Some(plan) = &mut follow {
-        // A NEW external run (this branch arms the follow): a `/stop` from
-        // before it is not this run's ending, same as the reply renderer's
-        // arm. Only a follow clears it — a pull/split above must keep the
-        // live stop so the drain can still finalize ⏹ 已停止.
-        handles
-            .flow
-            .waits
-            .stopped_sessions
-            .lock()
-            .await
-            .remove(session_id);
+    //
+    // The card SENT is always the static idle read (ADR-0100): if this command
+    // dies before the arm, or the arm refuses, what stays in the chat must not
+    // promise updates or claim the pendings ride it. The renderer's first flush
+    // paints the follow lead afterwards, once a renderer actually exists.
+    let card = crate::feishu::card::session::build_idle_card(&data);
+    if let Some(plan) = &mut follow {
         handles
             .external
             .resolve_snapshot_follow_seeds(&handles.flow, plan)
@@ -1143,10 +1138,7 @@ async fn post_idle_card(
         handles
             .external
             .compose_snapshot_follow_lead(plan, "读取", &title, &data);
-        crate::feishu::card::session::build_follow_card(&data, plan.seed_count())
-    } else {
-        crate::feishu::card::session::build_idle_card(&data)
-    };
+    }
     let sent = handles.flow.platform.reply_card(message_id, &card).await?;
     if let Some(plan) = &mut follow {
         // The send awaited; a Turn may have installed itself meanwhile. The
@@ -1157,6 +1149,16 @@ async fn post_idle_card(
             .arm_snapshot_follow_locked(&handles.flow, session_id, &sent, plan, true)
             .await;
         if armed {
+            // Only a committed follow adopts a new run, so that is the only
+            // branch that may drop a pre-run `/stop`; a refused arm leaves the
+            // marker for the run that actually owns the card.
+            handles
+                .flow
+                .waits
+                .stopped_sessions
+                .lock()
+                .await
+                .remove(session_id);
             handles
                 .external
                 .seed_snapshot_follow_locked(&handles.flow, session_id, plan)

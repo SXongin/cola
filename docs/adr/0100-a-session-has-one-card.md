@@ -25,10 +25,10 @@ card renders an operable question.
 **The snapshot is the only separate card path left.** An External Message's card
 is a Turn: `start_reply_render` calls `Turn::arm_external_render`, and the
 external loop runs `render_and_flush` — the same pass a cola prompt uses
-(ADR-0059). Even the snapshot's busy-follow renders through it, as
-`ExternalCardLead::Static`. So the same `SnapshotData` is assembled into card
-JSON twice, once by `snapshot_card.rs` when idle and once as a static lead when
-busy, and the two can drift.
+(ADR-0059). Even the snapshot's busy-follow renders through it, as the static
+lead the follow sets on its prepared accumulator. So the same `SnapshotData` is
+assembled into card JSON twice, once by `snapshot_card.rs` when idle and once as
+a static lead when busy, and the two can drift.
 
 The premise to reject is that a session needs a second card type to report its
 state. It needs a *read*. The card is the session's card.
@@ -43,17 +43,12 @@ A session has one card, the **Session Card**, with two driving modes:
 - **Nothing owns it**: `/card` reads the session once (`gather_snapshot`) and
   renders that read as a one-shot Session Card — a real `CardSession` in a new
   **`CardState::Idle`** (terminal, so the card's own `CardSession::is_running` is
-  false and the handle-level `Turn::is_running` never admits it), seeded with an
-  `ExternalCardLead::Static` lead and flushed once. The arm is a **non-recording**
-  variant of `Turn::arm_external_render`: that seam ends by calling
-  `Turn::take_over_card`, which writes the Chain Record, so reusing it verbatim
-  would make cola the session's card owner and let a restart's reap or a Wake
-  treat the Session Card as a live card. The idle arm stops before the record
-  write —
-  including its predecessor collect, so a chain an earlier Turn still owns is
-  left alone — and writes **no Chain Record**. No Wake, reap or ownership verdict
-  may treat it as one, and an existing record still names the chain's card: the
-  idle card is not the session's chain.
+  false and the handle-level `Turn::is_running` never admits it), built directly
+  by `build_idle_card` and inserted by `record_idle_card`; no external arm runs
+  for it. That insert writes **no Chain Record** and collects no predecessor, so
+  a chain an earlier Turn still owns is left alone. No Wake, reap or ownership
+  verdict may treat it as one, and an existing record still names the chain's
+  card: the idle card is not the session's chain.
 
 The idle card — a Session Card in `CardState::Idle` — is **read-only**. It
 carries the status line (等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲),
