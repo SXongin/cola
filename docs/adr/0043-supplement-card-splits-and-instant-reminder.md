@@ -580,7 +580,7 @@ The 2026-09-22 amendment gave `/card` one meaning: pull the live card down, and
 answer a text notice when no Turn is rendering. ADR-0100 adds the second state
 that notice was covering for: with no renderer owning the card, `/card` reads the
 session once and posts a read-only **Session Card** in `CardState::Idle`, which
-joins no Card Chain. **The 「当前没有正在运行的实时卡片」 notice is superseded** —
+joins no Card Chain. **The 「当前没有正在运行的实时卡片」 notice is retired** —
 the 2026-09-22 rule that answered one text line and created nothing: `/card`
 always answers now, by pulling a render-owned card or by reading the session. The
 pull itself is unchanged — same `split_card_chain`, same `PendingSplit`, same

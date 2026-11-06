@@ -1,7 +1,7 @@
 # Switching a question card keeps the draft
 
-> **Amended by ADR-0100**: the claimed Session Snapshot no longer exists. No card
-> carries several pending blocks across an idle read, and the "a claimed Session
+> **Retired by ADR-0100** (the claimed-snapshot paragraphs): no card carries
+> several pending blocks across an idle read, and the "a claimed Session
 > Snapshot does not repaint" carve-out goes with the claim registry.
 
 ## Context

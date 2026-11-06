@@ -1,5 +1,9 @@
 # Turn Footer: live context usage on streaming cards, standalone interaction cards excluded
 
+> **Kept by ADR-0100**: "session snapshot cards never carry the Turn Footer" still
+> holds — the **Session Card**'s idle state carries no footer model either; only
+> the wording moves from "session snapshot cards" to "idle Session Cards".
+
 ADR-0019 made the 📊 context-window segment final-card-only, and its
 2026-09-12 amendment repeated the premise that usage "is genuinely computed
 only at turn end". That premise is wrong: OpenCode writes token usage at every
