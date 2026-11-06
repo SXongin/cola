@@ -73,10 +73,17 @@ a text adoption from any other surface has no list to return to.
 A second `/card` with nothing in between stamps the previous idle card
 `TakenOver` — 「⏳ 已由新卡片接管 · 已停止更新」 — and only while that card is
 still the session's current card. A Turn that ran in between has already
-superseded it, so stamping it would only add noise. The check, the send and the
-current-card update run under the session's card **write lock** — the same lock
-every flush takes — so two near-simultaneous commands serialize and the later
-one stamps the card the earlier one posted.
+superseded it, so stamping it would only add noise. The stamp also covers an
+**actionable terminal** (`Error`/`Unreceived`): the read replaces it in the
+map, so its Retry/重新发起 control would otherwise stay visible while
+`claim_recovery` could no longer find the card — the stamp strips the control
+and says the card is superseded. If the card's view cannot be read, the bare
+`TakenOver` header is stamped instead (the dead control outranks body
+preservation); if the PATCH itself fails, the old card is left current so its
+recovery action still works and the posted read stays untracked. The check, the
+send and the current-card update run under the session's card **write lock** —
+the same lock every flush takes — so two near-simultaneous commands serialize
+and the later one stamps the card the earlier one posted.
 
 When the read says the session is busy, or waiting on Background Tasks, **and
 the newest user message is not cola-authored**, `/card` arms the existing external
@@ -219,6 +226,11 @@ standing.
 - ADR-0093 — the Session Snapshot's folded receipt log. **Retired** with the
   snapshot card; the Session Card's folded tail and list forms keep that
   layout rule.
+- ADR-0082 §3 — session-scoped exactly-once. **Narrowed** (2026-11-07): the
+  live timeline still renders a compaction once, but the busy follow's static
+  lead keeps the read tail's markers for #1002's equal-body contract, so a
+  followed card may show the same marker twice — in the lead and in the
+  timeline.
 - ADR-0044 — "session snapshot cards never carry the Turn Footer." **Kept**: the
   Session Card's idle state carries no footer model either.
 - ADR-0043 — the claimed-snapshot pin arm. **Retired**; a request's Message Pin

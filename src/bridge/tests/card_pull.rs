@@ -994,6 +994,58 @@ async fn a_hanging_card_read_posts_a_best_effort_static_read() {
     );
 }
 
+/// The arm spawns its renderer immediately after the map insert, before the
+/// seed/record awaits. Aborting it after the insert therefore leaves a live card
+/// with a working render loop, not a rendererless `is_running` entry.
+#[tokio::test]
+async fn an_abort_after_the_arm_insert_leaves_the_follow_rendering() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+    let (entered, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    *app.core.external.arm_after_spawn_gate.lock().await = Some((entered.clone(), release.clone()));
+
+    let app2 = app.clone();
+    let send = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    send.abort();
+    let _ = send.await;
+    release.notify_one();
+
+    wait_for_card_update(
+        &platform,
+        "the spawned follow renders after the abort",
+        CardUpdates::Any,
+        |card| card_text(card).contains(FOLLOW_HINT),
+    )
+    .await;
+    assert!(
+        Turn::is_running(&app.cards_handle(), "ses_test").await,
+        "the card is render-owned, not a rendererless entry"
+    );
+}
+
 /// The previous card's stamp runs BEFORE the arm, so aborting the command
 /// inside that bounded GET/PATCH leaves no armed card: the map stays the old
 /// idle read and no rendererless live card is created.
@@ -1707,6 +1759,125 @@ async fn a_card_read_supersedes_an_actionable_terminal_card() {
             "a click on the superseded card claims nothing (the button is gone)"
         );
     }
+}
+
+/// When an actionable card's view cannot be read, the stamp falls back to the
+/// BARE `TakenOver` header rather than skipping: the dead Retry/重新发起 control
+/// outranks body preservation. The read is still recorded.
+#[tokio::test]
+async fn an_unreadable_actionable_card_is_stamped_bare() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    seed_session(&app, "ses_test", "/work").await;
+    seed_live_card(&app, "ses_test", "失败内容").await;
+    let cards = app.cards_handle();
+    Turn::set_card_state(&cards, "ses_test", CardState::Error).await;
+    // No card view is scripted: the read fails.
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("msg_reply"),
+        "the read is recorded: the bare stamp landed"
+    );
+    let calls = platform.calls.lock().await.clone();
+    let stamped = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "om_live" => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the unreadable card gets the bare TakenOver PATCH");
+    assert!(card_header(&stamped).contains("已由新卡片接管"));
+    let json = stamped.to_string();
+    assert!(
+        !json.contains("\"tag\":\"button\""),
+        "the bare stamp carries no control: {json}"
+    );
+    assert!(
+        !json.contains("失败内容"),
+        "the bare stamp drops the unreadable body: {json}"
+    );
+}
+
+/// A failed stamp PATCH must not replace the Error card: keeping it current is
+/// what keeps its Retry live.
+#[tokio::test]
+async fn a_failed_actionable_stamp_keeps_the_error_card_current() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.fail_prompts(1, "simulated failure");
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    platform.given_reply_id("om_error");
+
+    app.handle_message(incoming(
+        "msg_user".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    wait_for_card_update(&platform, "the Error card", CardUpdates::Latest, |card| {
+        card_header(card) == "❌ 出错"
+    })
+    .await;
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_error")
+    );
+    let error_card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the Error card");
+    platform.given_card_view("om_error", error_card);
+    platform.given_reply_id("om_read");
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_error"),
+        "a failed stamp leaves the Error card current"
+    );
+    assert_eq!(Turn::card_state(&cards, "ses_test").await, Some(CardState::Error));
+    assert!(
+        Turn::claim_recovery(&cards, "ses_test", CardState::Error)
+            .await
+            .is_some(),
+        "the Retry still claims"
+    );
 }
 
 /// A Turn that ran between two `/card` commands has already superseded the

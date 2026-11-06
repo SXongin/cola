@@ -164,7 +164,29 @@ pub(crate) async fn adoption_line(
     let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &info.id).await;
     let span = crate::bridge::span::snapshot(&info.id, thread_key.as_ref());
     async move {
-        let data = gather_snapshot(&handles.backend, &info.id, &info.directory).await;
+        // Unlike the old adoption card, this line is the adoption's only
+        // answer: a server that accepts TCP but never replies must not hang
+        // `/switch`, `/attach` or `/topic --adopt`. Bound the whole gather and
+        // degrade to the title-only line on timeout (no status is omitted, not
+        // guessed).
+        let read = crate::bridge::bounded_call("adoption read", handles.read_timeout_ms, async {
+            Ok::<_, crate::error::BridgeError>(
+                gather_snapshot(&handles.backend, &info.id, &info.directory).await,
+            )
+        })
+        .await;
+        let data = read
+            .and_then(|result| result.ok())
+            .unwrap_or_else(|| SnapshotData {
+                session_id: info.id.clone(),
+                directory: info.directory.clone(),
+                status: None,
+                waiting: false,
+                pending: Vec::new(),
+                tail: Vec::new(),
+                newest_user_anchor: None,
+                newest_user_is_cola_authored: false,
+            });
         adoption_line_from_data(verb, &info.title, &data)
     }
     .instrument(span)
@@ -202,7 +224,10 @@ mod tests {
         BackgroundTask, FinishReason, MessageRole, OtherPart, Part, ReasoningPart, StepFinish, StepStart,
         TailMessage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
     };
-    use crate::bridge::test_support::{MockBackend, background_shell, execution, text_part, typed_message};
+    use crate::bridge::test_support::{
+        MockBackend, background_shell, execution, list_session, realistic_parts, test_config, test_work_dir,
+        text_part, typed_message,
+    };
 
     fn user(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
         typed_message(
@@ -621,5 +646,23 @@ mod tests {
         // rather than an empty pair of brackets.
         let blank = adoption_line_from_data("接管", "   ", &data);
         assert_eq!(blank, "已接管「adopted」 · ✅ 空闲");
+    }
+
+    /// The adoption line is bounded: a transcript read that never answers
+    /// degrades to the title-only line instead of hanging `/switch`, `/attach`
+    /// or `/topic --adopt`.
+    #[tokio::test]
+    async fn the_adoption_line_bounds_a_hanging_read() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        backend.hang_transcript_for("ses_test").await;
+        let (app, _platform) = crate::bridge::test_support::build_app(cfg, backend).await;
+        let mut handles = SnapshotHandles::from_flow(&app.flow_handles());
+        handles.read_timeout_ms = 50;
+
+        let line = adoption_line(&handles, "接管", &list_session("ses_test", "标题", "/work", 1)).await;
+        assert_eq!(line, "已接管「标题」", "a timed-out gather omits the status");
     }
 }

@@ -3,6 +3,12 @@
 > **Amended (2026-10-15)**: §3's exactly-once held only within a chain — the
 > bound it leaned on was chain-scoped, while the fact is the Session's. See the
 > amendment at the end.
+>
+> **Amended (2026-11-07)**: §3's exactly-once is a promise about the live
+> timeline's own render. The busy follow's static lead repeats the read tail's
+> Compaction markers for #1002's equal-body contract, so a followed card may
+> show the same compaction twice — once in the lead, once in the timeline. See
+> the amendment at the end.
 
 V2 persists a compaction as a first-class message (`status` running/completed/failed,
 `reason` auto|manual, `summary`, `recent`, and the compaction request's own usage), and
@@ -195,3 +201,25 @@ Consequences:
 - The `Compaction` frontier kind (#722) is unchanged: it still consumes a chain
   whose newest fact is a compaction for the restart projection. It is just no
   longer the only thing standing between a compaction and a re-render.
+
+## Amendment (2026-11-07): the follow's static lead repeats the read's tail markers
+
+§3's session-scoped **exactly-once** is a promise about the live timeline's own
+render: a compaction consumes the Rendered Cursor once and is never replayed
+onto a later card. It was not a promise that the same compaction can appear at
+most once anywhere on one card.
+
+The busy follow (ADR-0100) composes the Session Card body from the same
+`SnapshotData` read the idle card renders, and #1002's equal-body contract
+requires the two drivers to produce the same text — including the 最近对话 tail's
+**Compaction** markers at their server positions. The live lead is static text
+inside that card, so when the followed run's own timeline also renders a
+compaction row, the same marker can appear twice on the card: once in the static
+lead and once in the streamed timeline. That duplication is deliberate and
+accepted here; the alternative — dropping markers from the lead — broke the
+equal-body contract and was the reason for this amendment.
+
+The cursor's exactly-once guarantee is unchanged: a marker surfaced by the live
+timeline still advances the Rendered Cursor once, and no later card or restart
+projection replays it. The static lead's copy is presentation of the same read,
+not a second delivery.
