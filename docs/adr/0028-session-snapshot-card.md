@@ -2,12 +2,13 @@
 
 > **Superseded by ADR-0100**: the Session Snapshot becomes a **read**, not a
 > card. Taking a session over confirms in one text line, and `/card` is the only
-> thing that posts a Session Card — read-only, in `CardState::Idle`, joining no
-> Card Chain. The snapshot's claim registry and its rebuild path are deleted, so
-> this ADR's emission rules (the snapshot as the adopt confirmation and Topic
-> Anchor), its claim semantics and its suppression heuristic no longer apply. The
-> read this ADR introduced — the status line, the 最近对话 tail, the busy follow
-> through `start_reply_render` — survives unchanged.
+> thing that posts a Session Card — read-only, in its idle state, joining no
+> Card Chain. ADR-0100 deletes the snapshot's claim registry and its rebuild
+> path, so this ADR's emission rules (the snapshot as the adopt confirmation and
+> Topic Anchor), its claim semantics and its suppression heuristic no longer
+> apply. The read this ADR introduced — the status line, the 最近对话 tail, and
+> the busy follow through the external renderer (`start_snapshot_follow` →
+> `Turn::arm_external_render`) — survives unchanged.
 
 > **Amended by ADR-0052**: a snapshot (and the suppressed 已切换 state card)
 > built from the `/switch` list carries an optional 「返回列表」 button holding
