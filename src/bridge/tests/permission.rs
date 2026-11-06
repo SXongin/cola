@@ -1,6 +1,5 @@
 use crate::backend::ToolStatus;
 use crate::bridge::test_support::*;
-use crate::feishu::card::CardState;
 
 #[tokio::test]
 async fn permission_poller_sends_card_and_card_action_replies() {
@@ -20,7 +19,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     // Run the permission poller briefly.
     tokio::spawn({
@@ -134,7 +133,7 @@ async fn a_standalone_click_ignores_a_finished_card_in_the_map() {
     let cards = app.cards_handle();
     Turn::seed_card(&cards, "ses_1", Some("om_finished")).await;
     Turn::set_reply_target(&cards, "ses_1", "msg_1").await;
-    Turn::set_card_state(&cards, "ses_1", CardState::Done).await;
+    Turn::set_card_state(&cards, "ses_1", crate::feishu::card::CardState::Done).await;
 
     let result = app
         .host_action(serde_json::json!({
@@ -185,7 +184,7 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
     }]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -451,7 +450,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -522,7 +521,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
 
     // Seed a session (auto_accept defaults to false) + a live streaming card
     // so the poller surfaces the permission INLINE.
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -1384,17 +1383,6 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
 
 // ===== Interaction Receipts (ADR-0038) =====
 
-/// Seed a live card host for the poll/click fixtures. `handle_message` runs its
-/// scripted prompt to the end here, and a finished card is no inline host
-/// (ADR-0100), so the fixture seeds a running accumulator directly.
-async fn seed_live_host(app: &Arc<App>, session_id: &str) {
-    seed_session(app, session_id, "/work").await;
-    let cards = app.cards_handle();
-    Turn::seed_card(&cards, session_id, Some("om_live")).await;
-    Turn::set_card_state(&cards, session_id, CardState::Streaming).await;
-    Turn::set_reply_target(&cards, session_id, "msg_1").await;
-}
-
 fn perm_req(id: &str, session: &str, pattern: &str) -> crate::backend::types::PermissionRequest {
     crate::backend::types::PermissionRequest {
         request_id: id.into(),
@@ -1442,7 +1430,7 @@ async fn permission_click_variants_leave_their_receipts() {
     ]);
     let perm_calls = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
     tokio::spawn({
         let app = app.clone();
         async move {
@@ -1604,7 +1592,7 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
     backend.ask_permission(perm_req("per_1", "ses_test", "ls -la"));
     backend.permission_resolved_elsewhere();
     let (app, _platform) = build_app(cfg, backend).await;
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
     tokio::spawn({
         let app = app.clone();
         async move {
@@ -2191,7 +2179,7 @@ async fn an_over_budget_permission_is_declined_and_never_offered() {
     let (app, platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();

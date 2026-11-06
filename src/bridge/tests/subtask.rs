@@ -1,5 +1,4 @@
 use crate::bridge::test_support::*;
-use crate::feishu::card::CardState;
 
 #[tokio::test]
 async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory() {
@@ -28,11 +27,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     // Seed the parent session so it maps child → parent → chat, with a LIVE
     // card so the child's permission has an inline host (ADR-0100). The
     // scripted prompt would finish before the poller runs.
-    seed_session(&app, &parent_id, "/work").await;
-    let cards = app.cards_handle();
-    Turn::seed_card(&cards, &parent_id, Some("om_live")).await;
-    Turn::set_card_state(&cards, &parent_id, CardState::Streaming).await;
-    Turn::set_reply_target(&cards, &parent_id, "msg_1").await;
+    seed_live_card(&app, &parent_id, "om_live").await;
 
     tokio::spawn({
         let app = app.clone();

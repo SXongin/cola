@@ -1,16 +1,4 @@
 use crate::bridge::test_support::*;
-use crate::feishu::card::CardState;
-
-/// Seed a live card host for the poll/click fixtures. `handle_message` runs its
-/// scripted prompt to the end here, and a finished card is no inline host
-/// (ADR-0100), so the fixture seeds a running accumulator directly.
-async fn seed_live_host(app: &Arc<App>, session_id: &str) {
-    seed_session(app, session_id, "/work").await;
-    let cards = app.cards_handle();
-    Turn::seed_card(&cards, session_id, Some("om_live")).await;
-    Turn::set_card_state(&cards, session_id, CardState::Streaming).await;
-    Turn::set_reply_target(&cards, session_id, "msg_1").await;
-}
 
 /// A minimal one-question request for the state-lifecycle tests (#130).
 fn question_request(id: &str) -> crate::backend::types::QuestionRequest {
@@ -85,7 +73,7 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -1294,7 +1282,7 @@ async fn inline_question_answered_on_streaming_card() {
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
 
     // Seed a session + active accumulator (an in-flight turn).
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
     assert!(
         Turn::has_card(&app.cards_handle(), "ses_test").await,
         "accumulator expected"
@@ -1899,7 +1887,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
     tokio::spawn({
         let app = app.clone();
         async move {
@@ -2042,7 +2030,7 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
-    seed_live_host(&app, "ses_test").await;
+    seed_live_card(&app, "ses_test", "om_live").await;
     tokio::spawn({
         let app = app.clone();
         async move {

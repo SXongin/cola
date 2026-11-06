@@ -186,6 +186,10 @@ async fn click_with_open_message_id_acks_the_cached_card() {
         !ack.contains("等待你的"),
         "the ack must clear the awaiting title: {ack}"
     );
+    // This fixture seeds a LIVE card (ADR-0100: a Done card can no longer host a
+    // block), so the ack's post-resolution header is the live one. A terminal
+    // card's own header is pinned by
+    // `feishu::card::shell::tests::a_terminal_state_wins_over_a_pending_wait`.
     assert!(
         ack.contains("✍️ 回复中"),
         "the ack header must show the live accumulator's post-resolution state: {ack}"

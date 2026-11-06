@@ -4840,6 +4840,34 @@ pub(crate) async fn seed_session(app: &Arc<App>, session_id: &str, directory: &s
     .await;
 }
 
+/// Seed a LIVE card host for poll/click fixtures: map the Session to `chat_1`
+/// at `/work`, install its card (with `message_id`), mark it `Streaming`, and
+/// give it a reply target. A finished card is no inline host (ADR-0100), and
+/// `handle_message` runs its scripted prompt to the end, so a test that needs
+/// an in-flight card seeds one directly.
+pub(crate) async fn seed_live_card(app: &Arc<App>, session_id: &str, message_id: &str) {
+    seed_session(app, session_id, "/work").await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some(message_id)).await;
+    Turn::set_card_state(&cards, session_id, crate::feishu::card::CardState::Streaming).await;
+    Turn::set_reply_target(&cards, session_id, "msg_1").await;
+}
+
+/// A bare [`SharedCore`](crate::bridge::core::SharedCore) over a fresh config
+/// with a recording platform and the given Backend — the handle-level seam for
+/// tests that drive `FlowHandles` without building an `App`.
+pub(crate) fn core_with(
+    cfg: &crate::config::Config,
+    backend: MockBackend,
+) -> Arc<crate::bridge::core::SharedCore> {
+    let layout = crate::state::StateLayout::from_config(cfg);
+    let platform = Arc::new(RecordingPlatform::new());
+    Arc::new(
+        crate::bridge::core::SharedCore::new(cfg, layout, Arc::new(backend), platform)
+            .expect("the test core builds"),
+    )
+}
+
 /// #144 rig: the three live surfaces a pending request may own. The caller
 /// seeds the one session (`ses_1`, `/work`) before passing these to
 /// [`assert_failed_dir_keeps_surfaces`].
