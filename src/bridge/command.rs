@@ -1143,7 +1143,7 @@ async fn post_idle_card(
         handles
             .external
             .compose_snapshot_follow_lead(plan, "读取", &title, &data);
-        crate::feishu::card::session::build_idle_card_with_pending(&data, plan.seed_count(), true)
+        crate::feishu::card::session::build_follow_card(&data, plan.seed_count())
     } else {
         crate::feishu::card::session::build_idle_card(&data)
     };
