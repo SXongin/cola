@@ -3664,7 +3664,10 @@ type CardRearm = fn(&mut state::CardSession, Option<String>) -> Option<(Option<T
 /// outside the Turn reads their fields, and every card update below is the
 /// only path to the state behind them.
 impl Turn {
-    /// Whether the session currently has a card session at all.
+    /// Whether the session currently has a card-map entry at all. Test-only:
+    /// production's readers mean "the live card" and ask [`Self::is_running`]
+    /// (ADR-0100), while assertions often need the raw map fact.
+    #[cfg(test)]
     pub(crate) async fn has_card(cards: &CardsHandle, session_id: &str) -> bool {
         cards.cards.lock().await.contains_key(session_id)
     }
@@ -3683,9 +3686,11 @@ impl Turn {
     }
 
     /// Whether the session's map entry is a **Card Chain's** card rather than an
-    /// idle Session Card: any state except `Idle` (ADR-0100). A Wake continues
-    /// a chain, so a terminal chain card still names the message its chain
-    /// answers; an idle Session Card joins no chain and is never a Wake target.
+    /// idle Session Card: any state except `Idle` (ADR-0100). This is the
+    /// Wake-side question, not a liveness predicate: a Wake continues a chain,
+    /// so a terminal chain card still names the message its chain answers; an
+    /// idle Session Card joins no chain and is never a Wake target. Live-card
+    /// readers ask [`Self::is_running`] instead.
     pub(crate) async fn is_chain_card(cards: &CardsHandle, session_id: &str) -> bool {
         cards
             .cards
@@ -3705,8 +3710,11 @@ impl Turn {
             .and_then(|c| c.card_message_id.clone())
     }
 
-    /// The message a card for this session should reply to, if a live turn owns
-    /// one.
+    /// The message a card for this session replies to, when it has one: the
+    /// chain's reply message, not a liveness claim. A live Turn and a terminal
+    /// chain card both keep it — a Wake continues the chain past its ending —
+    /// so callers that mean "is the session's card live" ask
+    /// [`Self::is_running`] instead (ADR-0100).
     pub(crate) async fn reply_target(cards: &CardsHandle, session_id: &str) -> Option<String> {
         cards
             .cards

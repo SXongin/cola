@@ -1387,7 +1387,9 @@ impl RequestFlow {
         else {
             return;
         };
-        if !Turn::has_card(&handles.cards, &host).await {
+        // Re-validate under this second await: the host must still be running,
+        // not merely present in the map (ADR-0100).
+        if !Turn::is_running(&handles.cards, &host).await {
             return;
         }
         // The accumulator still carries the block (its own flush owns the

@@ -134,7 +134,11 @@ two are separate compositions that can drift.
   `ExternalFlow::wake_reply_target`, and the click's inline-host decision
   (`RequestFlow::handle_card_action`, `src/bridge/request/flow.rs`). `is_running` is
   `!is_terminal()`, so `Waiting` still counts (it is the chain's newest card) and
-  `Restarted` still counts (deliberately not terminal). Without this, an idle card
+  `Restarted` still counts (deliberately not terminal). One wake-specific
+  exception: a Wake continues the Session's **Card Chain**, so a terminal chain
+  card still supplies its chain's reply target (`wake_reply_target` asks
+  `Turn::is_chain_card`); only an **Idle Session Card**, which joins no chain, is
+  refused. Without this, an idle card
   in the map would take a stale permission click down the inline path — the ack
   returns no replacement card and the idle card never repaints the block, the
   empty-ack class of pitfall `codex-request-ids`.

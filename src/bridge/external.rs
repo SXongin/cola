@@ -1240,20 +1240,10 @@ impl ExternalFlow {
         sid: &str,
         thread_key: &crate::config::ThreadKey,
     ) -> Option<String> {
-        // The liveness decision is `Turn::is_running` (ADR-0100), never the
-        // map's presence. A terminal Turn card is still the chain's newest
-        // card, though, and a Wake continues that chain on a new card it
-        // replies under the same user message — so the chain target survives
-        // the ending. An Idle Session Card is not a chain card at all: it
-        // joins no Card Chain, so it is never a Wake target.
-        if Turn::is_running(&handles.cards, sid).await
-            && let Some(target) = Turn::reply_target(&handles.cards, sid).await
-        {
-            return Some(target);
-        }
-        // A terminal Turn card is still the chain's newest card, and a Wake
-        // continues that chain under the same user message. An Idle Session
-        // Card is not a chain card, so it is never a Wake target.
+        // A Wake continues the Session's Card Chain, so it asks whether the
+        // map entry is a chain card — not whether it is live. A terminal chain
+        // card still supplies the user message its chain answers; only an Idle
+        // Session Card, which joins no chain, is refused (ADR-0100).
         if Turn::is_chain_card(&handles.cards, sid).await
             && let Some(target) = Turn::reply_target(&handles.cards, sid).await
         {
@@ -1882,10 +1872,10 @@ mod tests {
         );
     }
 
-    /// The Wake continuation's reply target asks whether the card is live
-    /// (ADR-0100): a running Turn, `Waiting` and `Restarted` keep the chain's
-    /// target, and a terminal Turn card still names the message its chain
-    /// answers because a Wake continues that chain. An **Idle** Session Card
+    /// The Wake continuation asks whether the map entry is a **chain card**
+    /// (ADR-0100's Wake exception), not whether it is live: a running Turn,
+    /// `Waiting`, `Restarted` and a terminal Turn card all keep the chain's
+    /// target because a Wake continues that chain. An **Idle** Session Card
     /// joins no chain, so it is never a Wake target and the topic anchor wins.
     #[tokio::test]
     async fn an_idle_card_is_not_the_wake_reply_target() {
