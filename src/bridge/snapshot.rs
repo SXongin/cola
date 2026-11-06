@@ -5,13 +5,14 @@ use tracing::Instrument;
 use crate::backend::{SessionTranscript, TailEntry, TurnAnchor};
 use crate::bridge::handles::SnapshotHandles;
 
-/// Read-side state for the Session Snapshot card (ADR-0028). Built purely from
-/// server reads at the moment a Chat/Topic activates a session — never from a
-/// prompt, a session write, or a guess. Each source is best-effort: a read
-/// failure degrades that field (status → `None`, lists → empty) and is logged,
-/// so an adoption can never be blocked by the snapshot gather. Clone: the
-/// claim registry keeps a copy of the adopt-time state to re-render the card
-/// when a claimed request resolves.
+/// The **Session Snapshot** read (ADR-0028, ADR-0100): the state a takeover or
+/// a `/card` read reports — status, the pending requests, the transcript tail.
+/// Built purely from server reads, never from a prompt, a session write, or a
+/// guess. Each source is best-effort: a read failure degrades that field
+/// (status → `None`, lists → empty) and is logged, so an adoption can never be
+/// blocked by the gather. Clone: the claim registry keeps a copy of the
+/// adopt-time state to re-render the snapshot card when a claimed request
+/// resolves (#1006 retires it).
 #[derive(Clone)]
 pub struct SnapshotData {
     pub session_id: String,
@@ -133,13 +134,6 @@ impl PendingOverflow {
 }
 
 impl SnapshotData {
-    /// Whether the adopted session is waiting on the operator, whether or not
-    /// this card can show the block: an overflow-only set still counts, so the
-    /// snapshot is emitted and the chip reports the wait (#841).
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty() || self.pending_overflow.any()
-    }
-
     /// The pendings the snapshot card EMBEDS — and therefore the only ones it
     /// may claim (#841). The send path trims [`Self::pending`] to the prefix the
     /// card carries, so this is the stored claim set itself; a rebuild's
@@ -147,68 +141,9 @@ impl SnapshotData {
     pub fn embedded_pending(&self) -> &[crate::bridge::request::kind::PendingRequest] {
         &self.pending
     }
-
-    /// ADR-0028 suppression predicate, reading this snapshot's gathered state.
-    /// `already_mapped_to_this_thread` marks a re-activation (the only case
-    /// where suppression can fire); first-time adoption always emits.
-    pub fn should_emit(&self, already_mapped_to_this_thread: bool) -> bool {
-        should_emit_snapshot(
-            already_mapped_to_this_thread,
-            self.status,
-            self.has_pending(),
-            self.newest_user_is_cola_authored,
-        )
-    }
 }
 
-/// The emit decision for RE-activating a session already mapped to this
-/// thread (ADR-0028 suppression). First-time adoptions always emit the full
-/// snapshot and never consult this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SnapshotEmit {
-    /// Content to report (busy/retry, a pending request, or an external
-    /// newest message) → the full snapshot card.
-    Full,
-    /// Nothing to report (idle, no pending, newest user cola-authored — the
-    /// session's recent life is already visible in this thread) → a compact
-    /// state instead of the full snapshot.
-    Suppressed,
-}
-
-/// ADR-0028: decide whether a re-switch to a session already mapped to this
-/// thread reports the full snapshot. Shared by the text `/switch` mapped-hit
-/// branch and the switch card's 切换 op so the predicate cannot drift between
-/// the two surfaces.
-pub(crate) fn re_switch_emit(data: &SnapshotData) -> SnapshotEmit {
-    if data.should_emit(true) {
-        SnapshotEmit::Full
-    } else {
-        SnapshotEmit::Suppressed
-    }
-}
-
-/// Whether an activation should emit a snapshot card (ADR-0028 suppression).
-///
-/// The card is omitted only when ALL hold: the session is already mapped to
-/// this thread (a re-activation, not a first adopt), the server reports it
-/// idle, there is no pending request for it, and the newest user message is
-/// cola-authored (its recent life is already visible in this thread). A status
-/// that is unknown (`None`) is NOT idle, so a failed status read never
-/// suppresses — first-time adoption always emits.
-pub fn should_emit_snapshot(
-    already_mapped_to_this_thread: bool,
-    status: Option<crate::backend::types::SessionStatus>,
-    has_pending: bool,
-    newest_user_is_cola_authored: bool,
-) -> bool {
-    let suppressed = already_mapped_to_this_thread
-        && status == Some(crate::backend::types::SessionStatus::Idle)
-        && !has_pending
-        && newest_user_is_cola_authored;
-    !suppressed
-}
-
-/// Gather everything the snapshot card needs for an adopted session
+/// Gather everything a Session Card read needs for an adopted session
 /// `(session_id, directory)` — status, adopt-time pendings for THIS session,
 /// and the Session Transcript's newest user + tail — from server reads alone.
 /// Best-effort per source.
@@ -303,14 +238,12 @@ pub(crate) async fn gather_snapshot(
 /// ADR-0028: gather an adopted session's snapshot data (status, adopt-time
 /// pendings, transcript tail) from server reads, restrict the pendings to the
 /// claimable ones (the session's own, not already surfaced elsewhere), and
-/// build its card with the given takeover verb (接管/切换). Shared by every
-/// adoption surface so the gather-before-mapping sequence cannot drift between
-/// them. The whole gather+build runs inside the adopted Session's `snapshot`
-/// span (ADR-0048), so its best-effort read warnings are retrievable by it.
-/// Returns the card together with the filtered data — the caller sends
-/// the card and then claims the pendings with its message id. `back` is the
-/// `/switch`-list state when the adoption came from the list card (ADR-0052);
-/// every other adoption surface passes `None`.
+/// build its card with the given takeover verb (接管/切换).
+///
+/// **No adoption surface emits this card any more** (ADR-0100, #1004): they
+/// confirm in one text line ([`adoption_line`]). The function is retained for
+/// the follow suite until #1005 re-drives it from `/card`; #1006 deletes it.
+#[allow(dead_code)] // no emitter since #1004; the follow suite still pins it until #1005
 pub(crate) async fn snapshot_card_for(
     handles: &SnapshotHandles,
     verb: &str,
@@ -328,9 +261,8 @@ pub(crate) async fn snapshot_card_for(
 }
 
 /// ADR-0028: the filter+build half of [`snapshot_card_for`] — restrict the
-/// gathered data to the claimable pendings and build the card. Shared by
-/// [`re_switch_snapshot`], which gathers first (the suppression decision needs
-/// the raw data) and then filters, so the two surfaces cannot drift.
+/// gathered data to the claimable pendings and build the card. Retained with
+/// the card until #1005/#1006 (no adoption emits it since #1004).
 pub(crate) async fn snapshot_card_from_data(
     handles: &SnapshotHandles,
     verb: &str,
@@ -370,50 +302,42 @@ pub(crate) async fn snapshot_card_from_data(
     (built.card, data)
 }
 
-/// What a re-activation's snapshot produced (ADR-0028).
-pub(crate) enum ReSwitchSnapshot {
-    /// Content to report: the full 切换 card plus the filtered data the caller
-    /// claims against the message it sends.
-    Full {
-        card: serde_json::Value,
-        data: SnapshotData,
-    },
-    /// Nothing to report (the suppression predicate fired): the caller renders
-    /// its own compact state instead.
-    Suppressed,
-}
-
-/// ADR-0028: a re-activation's snapshot — a session already mapped to this
-/// thread, so the `thread_key` is known at the call site rather than resolved
-/// from the store. Gathers the session's data, decides the emit, and on `Full`
-/// restricts the pendings and builds the 切换 card. The whole gather+decide+
-/// build sequence runs inside the Session's `snapshot` span (ADR-0048), so the
-/// gather's best-effort read warnings are retrievable by the Session being
-/// re-activated. Shared by the text `/switch` mapped-hit path and the switch
-/// card's 切换 op so the span and the sequence cannot drift. `back` is the
-/// `/switch`-list state when the re-switch came from the list card
-/// (ADR-0052); the text path passes `None`.
-pub(crate) async fn re_switch_snapshot(
+/// ADR-0100: the ONE line a text adoption confirms in, replacing the Session
+/// Snapshot card. Carries the shared body's status summary
+/// ([`crate::feishu::card::session::adoption_status_line`]), so a takeover
+/// still answers "did the last Turn end, is something blocking me". The whole
+/// gather runs inside the adopted Session's `snapshot` span (ADR-0048), so its
+/// best-effort read warnings are retrievable by that Session. The thread key is
+/// resolved from the store: a re-switch already has one, a first adoption does
+/// not (the mapping is written after this, so the line reflects the session's
+/// pre-adoption state).
+pub(crate) async fn adoption_line(
     handles: &SnapshotHandles,
-    thread_key: &crate::config::ThreadKey,
-    session_id: &str,
-    directory: &str,
-    title: &str,
-    back: Option<&crate::feishu::card::session::BackToList>,
-) -> ReSwitchSnapshot {
-    let span = crate::bridge::span::snapshot(session_id, Some(thread_key));
+    verb: &str,
+    info: &crate::backend::types::SessionListInfo,
+) -> String {
+    let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &info.id).await;
+    let span = crate::bridge::span::snapshot(&info.id, thread_key.as_ref());
     async move {
-        let data = gather_snapshot(&handles.backend, session_id, directory).await;
-        match re_switch_emit(&data) {
-            SnapshotEmit::Full => {
-                let (card, data) = snapshot_card_from_data(handles, "切换", title, data, back).await;
-                ReSwitchSnapshot::Full { card, data }
-            }
-            SnapshotEmit::Suppressed => ReSwitchSnapshot::Suppressed,
-        }
+        let data = gather_snapshot(&handles.backend, &info.id, &info.directory).await;
+        adoption_line_from_data(verb, &info.title, &data)
     }
     .instrument(span)
     .await
+}
+
+/// [`adoption_line`]'s pure half: `已{verb}「{title}」` plus the shared body's
+/// status summary between ` · `, so the confirmation stays ONE line. The title
+/// goes through the same [`crate::feishu::snapshot_card::display_title`] the
+/// card uses, so an empty label falls back to the id tail either way. No status
+/// to report (an unreadable status read) omits the summary rather than guessing
+/// one.
+pub(crate) fn adoption_line_from_data(verb: &str, title: &str, data: &SnapshotData) -> String {
+    let title = crate::feishu::snapshot_card::display_title(title, &data.session_id);
+    match crate::feishu::card::session::adoption_status_line(data) {
+        Some(status) => format!("已{verb}「{title}」 · {status}"),
+        None => format!("已{verb}「{title}」"),
+    }
 }
 
 #[cfg(test)]
@@ -548,55 +472,6 @@ mod tests {
         );
         assert_eq!(PendingOverflow::Uncounted.uncounted(), PendingOverflow::Uncounted);
         assert_eq!(PendingOverflow::None.uncounted(), PendingOverflow::None);
-    }
-
-    /// A session whose pendings ALL overflowed is still a waiting session: the
-    /// snapshot must be emitted (suppression reads `has_pending`), even though
-    /// the card carries no block to click (#842).
-    #[tokio::test]
-    async fn an_overflow_only_session_still_counts_as_pending() {
-        let mut data = gather_from_typed_backend(typed_backend(vec![
-            user("msg_u1", 1_000, &["帮我改一下"]),
-            assistant("msg_a1", 2_000, &["好的"]),
-        ]))
-        .await;
-        assert!(!data.has_pending(), "the fixture carries no request");
-
-        data.pending_overflow = PendingOverflow::Counted(6);
-        assert!(
-            data.has_pending(),
-            "the session is waiting even though the card shows no block"
-        );
-        assert!(data.embedded_pending().is_empty());
-    }
-
-    #[test]
-    fn suppression_matrix() {
-        // Full matrix: adopt/re-switch × idle/busy/retry/unknown × pending/none ×
-        // external/cola newest user. The ONLY suppressed cell is re-activation +
-        // idle + no pending + cola-authored newest (ADR-0028): a first adoption
-        // always snapshots, and an unknown status is never treated as idle.
-        let statuses = [
-            ("idle", Some(crate::backend::types::SessionStatus::Idle)),
-            ("busy", Some(crate::backend::types::SessionStatus::Busy)),
-            ("retry", Some(crate::backend::types::SessionStatus::Retry)),
-            ("unknown", None),
-        ];
-        for (sname, status) in statuses {
-            for has_pending in [false, true] {
-                for cola in [false, true] {
-                    for already_mapped in [false, true] {
-                        let emits = should_emit_snapshot(already_mapped, status, has_pending, cola);
-                        let expect_suppressed = already_mapped && sname == "idle" && !has_pending && cola;
-                        assert_eq!(
-                            emits, !expect_suppressed,
-                            "matrix cell: mapped={already_mapped} status={sname} \
-                             pending={has_pending} cola={cola}"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     /// A file part that inlines no payload is not a File Content: it stays a raw
@@ -794,7 +669,7 @@ mod tests {
         let snap = gather_from_typed_backend(mock).await;
 
         assert_eq!(snap.status, Some(crate::backend::types::SessionStatus::Busy));
-        assert!(snap.has_pending());
+        assert!(!snap.pending.is_empty());
         let ids: Vec<_> = snap.pending.iter().map(|p| p.id().to_string()).collect();
         assert_eq!(
             ids,

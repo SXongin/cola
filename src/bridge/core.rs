@@ -90,9 +90,8 @@ pub struct SharedCore {
     pub question: Arc<crate::bridge::request::flow::RequestFlow>,
     /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
     /// another shared-store client posts while cola is idle, and arms the
-    /// external-reply renderers (including the busy-adopt follow, ADR-0028).
-    /// Shared (`Arc`) because the topic/command bundles carry it to settle a
-    /// sent snapshot through `ExternalFlow::settle_snapshot_after_send`.
+    /// external-reply renderers — including the follow a busy Session Card read
+    /// hands its run to (ADR-0100).
     pub external: Arc<crate::bridge::external::ExternalFlow>,
     /// ADR-0028 snapshot claim registry: which snapshot card hosts which
     /// adopt-time pending block, what each snapshot was built from, and the
@@ -503,16 +502,10 @@ impl SharedCore {
         }
     }
 
-    /// The read-side bundle a Session Snapshot gather needs.
-    pub(crate) fn snapshot_handles(&self) -> crate::bridge::handles::SnapshotHandles {
-        crate::bridge::handles::SnapshotHandles::from_flow(&self.flow_handles())
-    }
-
     /// The topic-opening bundle.
     pub(crate) fn topic_handles(&self) -> crate::bridge::handles::TopicHandles {
         crate::bridge::handles::TopicHandles {
             flow: self.flow_handles(),
-            external: Arc::clone(&self.external),
         }
     }
 
@@ -521,7 +514,6 @@ impl SharedCore {
         crate::bridge::handles::CommandHandles {
             flow: self.flow_handles(),
             config: self.turn_config(),
-            external: Arc::clone(&self.external),
             diff_cooldown: Arc::clone(&self.diff_cooldown),
             terminal_runs: Arc::clone(&self.terminal_runs),
             terminal_records: Arc::clone(&self.terminal_records),

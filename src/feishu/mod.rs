@@ -153,8 +153,13 @@ pub trait Platform: Send + Sync {
     /// interactive card, creating a topic around a non-topic seed message.
     /// Returns the created reply's `message_id` (an anchor inside the topic)
     /// and the topic's `thread_id` (or `None` if the chat does not support
-    /// topic replies). Used by `/topic --adopt` to place the Session Snapshot
-    /// card as the topic's first message and anchor (ADR-0028).
+    /// topic replies).
+    ///
+    /// Its last caller was the Session Snapshot card as a topic's first
+    /// message; adoption confirms in one text line now (ADR-0100, #1004). Kept
+    /// on the trait — the client's own method still backs `reply_in_thread` —
+    /// until #1006 settles what the card-in-thread capability keeps.
+    #[allow(dead_code)] // no caller since #1004; retained as a platform capability
     async fn reply_card_in_thread(&self, message_id: &str, card: &Value) -> Result<(String, Option<String>)>;
 
     /// Reply to a message in thread form (`reply_in_thread: true`), creating a

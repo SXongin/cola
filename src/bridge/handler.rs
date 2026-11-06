@@ -3262,13 +3262,12 @@ impl App {
     }
 
     /// Handle a `/switch` card button (ADR-0012, issue 04): adopt a session,
-    /// create a new one, re-search, or flip the page. The 接管/切换 ops return
-    /// the Session Snapshot (or the compact suppressed-切换 state, ADR-0028) as
-    /// the card so the ack patches the switch card in place — one message per
-    /// activation; page/scope/search/new/topic_adopt return a refreshed list
-    /// card carrying the active keyword/scope/page (ADR-0052), except that a
-    /// search or scope toggle resets to page 1. Plus a Toast for instant
-    /// feedback.
+    /// create a new one, re-search, or flip the page. The 接管/切换 ops patch
+    /// the clicked list card in place to the compact 已切换 state (ADR-0100) —
+    /// one message per activation, never a new one. page/scope/search/new/
+    /// topic_adopt return a refreshed list card carrying the active
+    /// keyword/scope/page (ADR-0052), except that a search or scope toggle
+    /// resets to page 1. Plus a Toast for instant feedback.
     async fn handle_switch_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -3387,8 +3386,9 @@ impl App {
                 }
                 // ADR-0028 one-card rule: the switch card's OWN message becomes
                 // the confirmation — the ack patches the list card in place to
-                // the snapshot. The list's filter rides along (ADR-0052): the
-                // snapshot's 返回列表 button rebuilds exactly this window.
+                // the compact 已切换 state (ADR-0100). The list's filter rides
+                // along (ADR-0052): its 返回列表 button rebuilds exactly this
+                // window.
                 let open_message_id = value
                     .get("open_message_id")
                     .and_then(|v| v.as_str())
@@ -3574,18 +3574,17 @@ impl App {
         )
     }
 
-    /// The adoption tail shared by the card's 接管/切换 and 强制接管 ops: build
-    /// the Session Snapshot (or the compact suppressed-切换 state card,
-    /// ADR-0028), persist the new active entry, and settle the snapshot's
-    /// claimed pendings. The returned card patches the clicked card in place
-    /// (ADR-0028 one-card rule), so no second message is sent. `back` is the
-    /// switch card's list state the adoption came from (ADR-0052): both
-    /// snapshot forms carry its 返回列表 button, and the claim registry keeps it
-    /// across rebuilds.
+    /// The adoption tail shared by the card's 接管/切换 and 强制接管 ops: patch
+    /// the clicked card in place to the compact 已切换 state (ADR-0100, which
+    /// retires the Session Snapshot from this op), then persist the new active
+    /// entry. The returned card IS the ack's replacement (ADR-0028 one-card
+    /// rule), so no second message is sent. `back` is the switch card's list
+    /// state the adoption came from (ADR-0052): the compact state carries its
+    /// 返回列表 button.
     ///
     /// The steal is `set_active`'s: it removes any existing entry with this
     /// session id, so a `force_adopt` from another thread leaves that owner
-    /// sessionless there. No pre-remove — if the snapshot work failed, the old
+    /// sessionless there. No pre-remove — if the adoption work failed, the old
     /// mapping would otherwise be lost for nothing.
     async fn apply_card_adoption(
         &self,
@@ -3600,40 +3599,12 @@ impl App {
             store.thread_for_session(&target.id).as_ref() == Some(thread_key)
         };
         let verb = if mapped_to_this_thread { "切换" } else { "接管" };
-        // `claim_data` is the snapshot's claimable pendings: claimed against
-        // the patched card once the ack result is assembled, so the poll loop
-        // never duplicates the embedded blocks.
-        let (card, claim_data) = if mapped_to_this_thread {
-            // A re-activation: the session is already mapped to this thread, so
-            // its snapshot runs inside the Session's `snapshot` span with the
-            // thread key known here (ADR-0048).
-            match crate::bridge::snapshot::re_switch_snapshot(
-                &core.snapshot_handles(),
-                thread_key,
-                &target.id,
-                &target.directory,
-                &target.title,
-                back,
-            )
-            .await
-            {
-                crate::bridge::snapshot::ReSwitchSnapshot::Full { card, data } => (card, Some(data)),
-                crate::bridge::snapshot::ReSwitchSnapshot::Suppressed => (
-                    crate::feishu::snapshot_card::build_switched_state_card(
-                        &target.title,
-                        &target.id,
-                        &target.directory,
-                        back,
-                    ),
-                    None,
-                ),
-            }
-        } else {
-            let (card, data) =
-                crate::bridge::snapshot::snapshot_card_for(&core.snapshot_handles(), "接管", target, back)
-                    .await;
-            (card, Some(data))
-        };
+        let card = crate::feishu::snapshot_card::build_switched_state_card(
+            &target.title,
+            &target.id,
+            &target.directory,
+            back,
+        );
         // In a topic the patched card lives INSIDE it, so persist its own
         // message id as the fallback-card anchor (same anchor semantics as the
         // text in-topic adopt, ADR-0028): later permission/question cards reply
@@ -3659,18 +3630,6 @@ impl App {
             tracing::warn!("switch card adopt: persist failed: {}", e);
         }
         crate::bridge::topic::claim_pending_cover(&core.topic_handles(), thread_key, &target.id).await;
-        if let (Some(message_id), Some(data)) = (&open_message_id, &claim_data) {
-            crate::bridge::external::settle_snapshot_after_send(
-                &core.external,
-                &core.flow_handles(),
-                message_id,
-                verb,
-                &target.title,
-                data,
-                back,
-            )
-            .await;
-        }
         CardActionResult {
             mutated: false,
             card: Some(card),

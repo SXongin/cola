@@ -1411,14 +1411,18 @@ pub(crate) async fn session_subtitle(
 /// external run streams into the snapshot), otherwise keep the static
 /// snapshot and claim its embedded pendings. A follow that declines to arm
 /// (the busy→idle race: the turn already finished) falls back to the static
-/// claim path, so the embedded pendings are never left unclaimed. Shared by
-/// every adoption surface so the busy/static decision cannot drift between
-/// them. The settle runs inside the adopted Session's `snapshot` span
-/// (ADR-0048), so its follow/claim lines are retrievable by it; the follow's
-/// own render task is instrumented at its spawn with the `external` span.
-/// `back` is the `/switch`-list state the card was adopted from, when it came
-/// from the list card (ADR-0052): the claim path keeps its 返回列表 button
-/// across rebuilds.
+/// claim path, so the embedded pendings are never left unclaimed. The settle
+/// runs inside the adopted Session's `snapshot` span (ADR-0048), so its
+/// follow/claim lines are retrievable by it; the follow's own render task is
+/// instrumented at its spawn with the `external` span.
+///
+/// **No adoption surface emits a snapshot card any more** (ADR-0100, #1004) —
+/// they confirm in one text line — so this has no production caller: the
+/// follow suite still pins it, and #1005 re-drives the same follow from
+/// `/card` before #1006 deletes it. `back` is the `/switch`-list state the card
+/// was adopted from, when it came from the list card (ADR-0052): the claim
+/// path keeps its 返回列表 button across rebuilds.
+#[allow(dead_code)] // no emitter since #1004; retained for the follow suite until #1005
 pub(crate) async fn settle_snapshot_after_send(
     external: &ExternalFlow,
     handles: &FlowHandles,

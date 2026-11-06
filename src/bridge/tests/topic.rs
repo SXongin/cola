@@ -1189,38 +1189,34 @@ async fn topic_adopt_opens_topic_around_existing_session() {
 
     send_command(&app, "/topic --adopt 重写登录", "msg_topic_adopt").await;
 
-    // The topic is created via a cover card sent to the chat, then the
-    // Session Snapshot card replied in-thread on that card (ADR-0023 +
-    // ADR-0028): the cover stays the chat-list root, the snapshot is the
-    // topic's first in-topic message and its anchor. The mock cover
-    // returns "msg_sent".
+    // The topic is created via a cover card sent to the chat, then the ONE-line
+    // adoption confirmation (ADR-0100) replied in-thread on that card: the
+    // cover stays the chat-list root, the line is the topic's first in-topic
+    // message and its anchor. The mock cover returns "msg_sent".
     let calls = platform.calls.lock().await.clone();
-    let seed_card = calls
+    let seed = calls
         .iter()
         .find_map(|c| match c {
-            PlatformCall::ReplyCardInThread { message_id, card, .. } if message_id == "msg_sent" => {
-                Some(card.to_string())
+            PlatformCall::ReplyInThread { message_id, text, .. } if message_id == "msg_sent" => {
+                Some(text.clone())
             }
             _ => None,
         })
-        .expect("expected the snapshot card replied in-thread on the cover card, got {calls:?}");
+        .expect("expected the confirmation line replied in-thread on the cover card, got {calls:?}");
     assert!(
-        seed_card.contains("已接管 重写登录模块"),
-        "snapshot seed carries the adopt verb and title: {seed_card}"
+        seed.contains("已接管「重写登录模块」") && seed.contains(crate::feishu::card::session::IDLE_CHIP),
+        "the seed line names the takeover and the status: {seed}"
     );
-    assert!(
-        !seed_card.contains("返回列表"),
-        "a topic adoption has no session list to return to: {seed_card}"
-    );
+    assert_eq!(seed.lines().count(), 1, "the confirmation is ONE line: {seed}");
     assert!(
         !calls
             .iter()
-            .any(|c| matches!(c, PlatformCall::ReplyInThread { .. })),
-        "an adopted topic seeds with the snapshot card, not the reply hint: {calls:?}"
+            .any(|c| matches!(c, PlatformCall::ReplyCardInThread { .. })),
+        "an adopted topic seeds with a text line, not a card: {calls:?}"
     );
 
     // The new topic's thread_id maps to the ADOPTED session (not a new one),
-    // with the snapshot card (the topic's first in-topic message) as the
+    // with the confirmation line (the topic's first in-topic message) as the
     // fallback-card anchor.
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
     let entry = app
@@ -1812,27 +1808,32 @@ async fn fresh_topic_attach_adopts_with_in_topic_anchor() {
     )
     .await;
 
-    // ADR-0028: the in-topic adoption confirmation is the Session Snapshot
-    // card, sent inside the topic — no 「📎 已接管…」 text anchor anymore.
+    // ADR-0100: the in-topic adoption confirmation is ONE text line, sent
+    // inside the topic, and its message id is the topic anchor so later
+    // permission/question cards stay in-thread.
     let calls = platform.calls.lock().await.clone();
     let seed = calls
         .iter()
         .find_map(|c| match c {
-            PlatformCall::ReplyCardInThread { message_id, card, .. } if message_id == "msg_topic_cmd" => {
-                Some(card.to_string())
+            PlatformCall::ReplyInThread { message_id, text, .. } if message_id == "msg_topic_cmd" => {
+                Some(text.clone())
             }
             _ => None,
         })
-        .expect("snapshot replied in-thread on the command: {calls:?}");
-    assert!(seed.contains("已接管 外部会话"), "snapshot header: {seed}");
+        .expect("confirmation line replied in-thread on the command: {calls:?}");
+    assert!(
+        seed.contains("已接管「外部会话」"),
+        "the line names the takeover: {seed}"
+    );
+    assert_eq!(seed.lines().count(), 1, "one line: {seed}");
     assert!(
         !calls
             .iter()
-            .any(|c| matches!(c, PlatformCall::ReplyInThread { .. })),
-        "no text anchor alongside the snapshot: {calls:?}"
+            .any(|c| matches!(c, PlatformCall::ReplyCardInThread { .. })),
+        "no card anchor on the adoption: {calls:?}"
     );
 
-    // Adopted as the topic's single session, anchored to the snapshot card
+    // Adopted as the topic's single session, anchored to the confirmation line
     // (the mock's created topic-reply message id).
     let entry = app.sessions.lock().await.get_active(&topic_key).cloned().unwrap();
     assert_eq!(entry.session_id, "ses_foreign123abc");

@@ -1552,6 +1552,16 @@ pub(crate) fn session_card_body<'a>(
     }
 }
 
+/// The ONE-line status summary a text adoption confirms with (ADR-0100): the
+/// shared body's status line, compacted to a single line. Taking a Session over
+/// no longer posts a card, so this is how the confirmation still answers "is
+/// the last Turn done, is something blocking me" — through the same
+/// [`read_has_pending`]/[`status_chip`] precedence the Session Card renders, so
+/// there is no second copy to drift.
+pub(crate) fn adoption_status_line(data: &SnapshotData) -> Option<String> {
+    session_card_body(data, &[], 0, PendingFacts { on_card: 0 }).status_one_line()
+}
+
 /// Build the Session Card's read-only mode (ADR-0100): the one-shot read of a
 /// Session no renderer owns, posted by `/card`. The header is the state's
 /// static 「📄 会话」 (grey, no phase timer) and the body is the ONE composition
@@ -1668,6 +1678,17 @@ pub(crate) fn smallest_omission(
 }
 
 impl SessionCardBody<'_> {
+    /// The status line as ONE line, for the text confirmation an adoption posts
+    /// instead of a card (ADR-0100). The busy and waiting chips append
+    /// [`FOLLOW_HINT`] on a second line; a one-line confirmation keeps only the
+    /// chip, so the copy and its precedence still come from [`status_chip`].
+    /// `None` when the read has no status to report.
+    pub(crate) fn status_one_line(&self) -> Option<String> {
+        self.status
+            .as_deref()
+            .map(|status| status.lines().next().unwrap_or(status).to_string())
+    }
+
     /// The body's lead as card elements: the status line, then the count-only
     /// pending pointer. A one-shot card inserts its pending blocks between this
     /// lead and [`Self::tail_elements`]; an idle card has no blocks at all.

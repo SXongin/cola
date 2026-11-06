@@ -27,6 +27,49 @@ fn claim_question(request_id: &str, session_id: &str) -> crate::backend::types::
     }
 }
 
+/// Test-only (#1004): post the RETAINED Session Snapshot card for this suite's
+/// `ses_alpha01` fixture and settle it, reproducing exactly what the pre-#1004
+/// `/switch` adoption did (gather, map, send the card, arm/claim). Adoption now
+/// confirms in one text line and posts no card (ADR-0100); the follow and claim
+/// contracts this file pins are re-driven from `/card` by #1005, which can point
+/// this helper at the new path.
+async fn adopt_via_snapshot(app: &Arc<App>, message_id: &str) {
+    let info = list_session("ses_alpha01", "唯一外部标题", "/work/ext", 100);
+    let handles = app.flow_handles();
+    let (card, data) = crate::bridge::snapshot::snapshot_card_for(
+        &crate::bridge::handles::SnapshotHandles::from_flow(&handles),
+        "接管",
+        &info,
+        None,
+    )
+    .await;
+    let mut entry = crate::config::SessionEntry::new(
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        info.id.clone(),
+        info.directory.clone(),
+    );
+    entry.agent = info.agent.clone();
+    handles
+        .activate(entry)
+        .await
+        .expect("the fixture session activates");
+    let mid = handles
+        .platform
+        .reply_card(message_id, &card)
+        .await
+        .expect("the snapshot card is posted");
+    crate::bridge::external::settle_snapshot_after_send(
+        &app.external,
+        &app.flow_handles(),
+        &mid,
+        "接管",
+        &info.title,
+        &data,
+        None,
+    )
+    .await;
+}
+
 /// A lobby adopt of a session that carries a pending permission ends in ONE
 /// card — the snapshot embeds the block — and the poll loop does NOT pop a
 /// duplicate standalone card for the claimed request (ADR-0028).
@@ -45,7 +88,7 @@ async fn snapshot_claim_prevents_poller_duplicate() {
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, platform) = build_app(cfg, backend).await;
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The adopt claimed the embedded pending against the sent snapshot.
     let claims = app.core.snapshot_claims.lock().await;
@@ -159,7 +202,7 @@ async fn a_pending_set_past_the_cap_splits_between_snapshot_and_poller() {
     }
     let (app, platform) = build_app(cfg, backend).await;
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     let snapshot = platform
         .calls
@@ -236,7 +279,7 @@ async fn snapshot_block_answer_patches_snapshot() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // Click 允许一次 on the snapshot's embedded block.
     let value = serde_json::json!({
@@ -295,7 +338,7 @@ async fn snapshot_block_resolved_elsewhere_leaves_a_receipt() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
     // Another client answers the request server-side.
     backend.permission_resolved_by_another("per_1").await;
 
@@ -358,7 +401,7 @@ async fn post_adopt_requests_keep_standalone_flow() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
     // …and a SECOND request arriving after the snapshot was sent.
     backend.ask_permission_later(perm_request("per_2", "ses_alpha01", "rm -rf /tmp/x"));
 
@@ -423,7 +466,7 @@ async fn adopt_skips_already_surfaced_pending() {
         },
     );
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -463,10 +506,10 @@ async fn reeswitch_does_not_reclaim_snapshot_pending() {
     let (app, platform) = build_app(cfg, backend).await;
 
     // First adopt: the snapshot claims the pending block.
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // Re-`/switch` to the now-mapped session (mapped-hit branch).
-    send_command(&app, "/switch 唯一外部标题", "msg_switch_2").await;
+    adopt_via_snapshot(&app, "msg_switch_2").await;
 
     let calls = platform.calls.lock().await.clone();
     let cards: Vec<String> = calls
@@ -548,7 +591,7 @@ async fn snapshot_question_block_answers_and_patches() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The claim remembered the full question request (the poll loop never
     // saw it, so prepare() never ran).
@@ -637,7 +680,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The follow armed: the snapshot card hosts a live accumulator for the
     // external turn (epoch = the newest user message's created time).
@@ -722,7 +765,7 @@ async fn a_busy_follow_repeats_the_pending_overflow_line() {
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
     reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
@@ -777,7 +820,7 @@ async fn a_completed_external_follow_stops_reading() {
         .render_poll_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
     assert!(
         Turn::armed_turn_anchor(&app.core.cards_handle(), "ses_alpha01")
             .await
@@ -835,7 +878,7 @@ async fn busy_follow_permission_approved_resumes() {
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The adopt-time pending block is pre-seeded as the host's inline
     // section (not claimed — the inline dedupe prevents duplicates).
@@ -919,7 +962,7 @@ async fn idle_adopt_does_not_arm_follow() {
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, _platform) = build_app(cfg, backend).await;
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     assert!(
         !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
@@ -951,7 +994,7 @@ async fn busy_then_idle_race_stays_static() {
     backend.busy_then_idle_once();
     let (app, platform) = build_app(cfg, backend).await;
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     assert!(
         !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
@@ -993,7 +1036,7 @@ async fn busy_follow_skips_cola_authored_turn() {
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let (app, _platform) = build_app(cfg, backend).await;
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     assert!(
         !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
@@ -1045,7 +1088,7 @@ async fn busy_follow_question_block_resolves() {
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The follow pre-seeded the inline section AND remembered the request.
     let cards = app.core.cards_handle();
@@ -1105,7 +1148,7 @@ async fn user_prompt_during_follow_merges_as_a_supplement() {
         .render_poll_ms
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
     let follow_anchor = Turn::armed_turn_anchor(&app.cards_handle(), "ses_alpha01").await;
     assert!(follow_anchor.is_some(), "follow armed");
 
@@ -1226,7 +1269,7 @@ async fn busy_snapshot_follow_yields_and_resumes_in_place() {
         .render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The followed turn idles with a live Background Task: the snapshot card
     // yields ⏳ in place.
@@ -1314,7 +1357,7 @@ async fn waiting_adopt_yields_and_resumes_in_place() {
         .render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The snapshot names the wait instead of 空闲, and the follow is armed.
     let calls = platform.calls.lock().await.clone();
@@ -1441,7 +1484,7 @@ async fn waiting_adopt_cola_authored_turn_stays_static() {
     );
     let (app, _platform) = build_app(cfg, backend).await;
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     assert!(
         !Turn::has_card(&app.cards_handle(), "ses_alpha01").await,
@@ -1498,7 +1541,7 @@ async fn busy_follow_static_tail_records_a_file_line() {
         .render_poll_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     // The follow re-renders the snapshot card and finalizes it Done.
     wait_for_card_update(&platform, "the follow card", CardUpdates::Latest, |card| {
@@ -1583,7 +1626,7 @@ async fn busy_follow_shows_a_compaction_once() {
         .render_poll_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     wait_for_card_update(&platform, "the follow card", CardUpdates::Latest, |card| {
         card_header(card).contains("✅")
@@ -1658,7 +1701,7 @@ async fn busy_follow_renders_no_empty_tail_header_for_a_marker_only_tail() {
         .render_poll_ms
         .store(20, std::sync::atomic::Ordering::Relaxed);
 
-    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    adopt_via_snapshot(&app, "msg_switch").await;
 
     wait_for_card_update(&platform, "the follow card", CardUpdates::Latest, |card| {
         card_header(card).contains("✅")

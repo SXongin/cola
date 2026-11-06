@@ -62,18 +62,6 @@ fn resumed_transcript() -> SessionTranscript {
     .with_wakes(vec![shell_wake(2_900)])
 }
 
-/// A transcript whose newest user message is EXTERNAL: the switch-back
-/// snapshot is not suppressed by ADR-0028's idle + cola-authored cell.
-fn external_newest_transcript() -> SessionTranscript {
-    SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-        user("msg_ext_user", 5_000, "外部客户端的新消息"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)])
-}
-
 /// The first card the platform replied to `reply_to` satisfying `check`, or
 /// `None` — the recorded calls under one lock.
 async fn replied_card_where(
@@ -456,19 +444,14 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         platform.calls.lock().await
     );
 
-    // Switching back reports the Session: an external newest user makes the
-    // ADR-0028 re-switch snapshot emit its full 切换 card rather than the
-    // suppressed one-line state.
-    script_transcript(&backend, vec![external_newest_transcript()]).await;
+    // Switching back confirms in ONE text line (ADR-0100) — no card; the
+    // collected chain is gone either way, and the Wake below resumes on a new
+    // card via Session Sync, never on the confirmation.
     send_command(&app, "/switch ses_test", "msg_switch_back").await;
-    let snapshot = replied_card_where(&platform, "msg_switch_back", |card| {
-        card_header(card).contains("已切换")
-    })
-    .await
-    .expect("switching back must report the Session Snapshot");
+    let texts = platform.texts().await;
     assert!(
-        card_header(&snapshot).contains("等待会话"),
-        "the snapshot names the session: {snapshot}"
+        texts.iter().any(|line| line.contains("已切换「")),
+        "switching back confirms in one line: {texts:?}"
     );
 
     // The Wake resumes the Session: its continuation is a new card below the
