@@ -1,5 +1,8 @@
 # Collapsible panel fold state rides a stable element_id
 
+> **Retired by ADR-0100** (the Session Snapshot tail's fold ids): the snapshot
+> card and its rebuild path are gone, so the `snap_{i}` example no longer exists.
+
 Every flush PATCHes the whole card JSON (`update_message`), and a collapsible
 panel's open/closed state lives in the client: toggling a panel fires no
 callback (折叠面板 has no 回传交互), so the server can never learn or restore the

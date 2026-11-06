@@ -1,8 +1,8 @@
 # Interaction blocks: inline on the live card, repainted through a card handle
 
-> **Amended by ADR-0100**: rule 6's snapshot-claim path is deleted with the
-> Session Snapshot card. Every **Interaction Block** lives on a live card or its
-> own standalone card, and `SnapshotClaims` no longer exists.
+> **Retired by ADR-0100** (rule 6's snapshot claim): the claim registry goes
+> with the Session Snapshot card, so every **Interaction Block** lives on a live
+> card or its own standalone card, and `SnapshotClaims` no longer exists.
 
 A pending Permission/Question is rendered inline on the card the Host is already reading (an **Interaction Block**). Its updates were ad-hoc: discovery and first render came from the 3 s request poller; a click mostly repainted "the accumulator's current card" through a PATCH; a request resolved by another client was stripped from memory but never repainted; and a card that stopped being the accumulator's current card had no repaint path at all. Observed: a block clicked on an older card only toasted; a remotely-resolved block lingered on a finished turn's card forever; permission/answer disappearance lagged the click by one PATCH; a block whose turn ended froze in place. This ADR fixes the lifecycle: blocks stay inline and follow the live card, and every card showing a live block carries a handle that lets cola repaint it — cached last-rendered JSON plus a `request_id → message_id` registry — so a click updates the clicked card atomically in the callback ack and a remote resolution repaints within one sweep.
 
