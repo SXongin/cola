@@ -1418,11 +1418,12 @@ pub(crate) async fn session_subtitle(
 ///
 /// **No adoption surface emits a snapshot card any more** (ADR-0100, #1004) —
 /// they confirm in one text line — so this has no production caller: the
-/// follow suite still pins it, and #1005 re-drives the same follow from
-/// `/card` before #1006 deletes it. `back` is the `/switch`-list state the card
-/// was adopted from, when it came from the list card (ADR-0052): the claim
-/// path keeps its 返回列表 button across rebuilds.
-#[allow(dead_code)] // no emitter since #1004; retained for the follow suite until #1005
+/// follow suite still pins it, #1005 re-drives the follow from `/card` (the
+/// retained caller), and #1006 deletes this settle with the snapshot card.
+/// `back` is the `/switch`-list state the card was adopted from, when it came
+/// from the list card (ADR-0052): the claim path keeps its 返回列表 button
+/// across rebuilds.
+#[allow(dead_code)] // no production caller since #1004; #1005 replaces the follow caller, #1006 deletes this
 pub(crate) async fn settle_snapshot_after_send(
     external: &ExternalFlow,
     handles: &FlowHandles,

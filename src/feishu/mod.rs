@@ -158,8 +158,9 @@ pub trait Platform: Send + Sync {
     /// Its last caller was the Session Snapshot card as a topic's first
     /// message; adoption confirms in one text line now (ADR-0100, #1004). Kept
     /// on the trait — the client's own method still backs `reply_in_thread` —
-    /// until #1006 settles what the card-in-thread capability keeps.
-    #[allow(dead_code)] // no caller since #1004; retained as a platform capability
+    /// and #1006 retires the remaining card-in-thread surface with the snapshot
+    /// card.
+    #[allow(dead_code)] // no caller since #1004; #1006 retires it with the snapshot card
     async fn reply_card_in_thread(&self, message_id: &str, card: &Value) -> Result<(String, Option<String>)>;
 
     /// Reply to a message in thread form (`reply_in_thread: true`), creating a

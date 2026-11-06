@@ -827,10 +827,10 @@ async fn switch_card_falls_back_to_global_without_active_session() {
 }
 
 /// A `/switch` card "adopt" action maps the session into the thread and
-/// patches the clicked list card IN PLACE to the compact adoption state
-/// (ADR-0100, header verb 已接管 matching the toast): no second message is
-/// sent, the list is gone, and the card keeps the 返回列表 button for the list
-/// state it came from.
+/// patches the clicked list card IN PLACE to the compact 已切换 state
+/// (ADR-0100/ADR-0052, the toast carries the same verb): no second message is
+/// sent, the list is gone, the compact body replaces the old snapshot body, and
+/// the card keeps the 返回列表 button for the list state it came from.
 #[tokio::test]
 async fn switch_card_adopt_action_maps_session() {
     let _wd = test_work_dir();
@@ -854,8 +854,16 @@ async fn switch_card_adopt_action_maps_session() {
     let card = result.card.clone().expect("adopt returns the patched card");
     let card_str = card.to_string();
     assert!(
-        card_str.contains("已接管 重写登录"),
-        "the patched card is the compact adoption state: {card_str}"
+        card_str.contains("已切换 重写登录"),
+        "the patched card is the compact 已切换 state: {card_str}"
+    );
+    assert!(
+        card_str.contains("已切换到该会话"),
+        "the compact body names the state: {card_str}"
+    );
+    assert!(
+        !card_str.contains("最近对话") && !card_str.contains("权限请求"),
+        "the retired full snapshot body is gone: {card_str}"
     );
     assert!(
         card_str.contains("返回列表"),
@@ -870,8 +878,8 @@ async fn switch_card_adopt_action_maps_session() {
         "the search form is gone from the patched card: {card_str}"
     );
     assert!(
-        result.toast.clone().unwrap_or_default().contains("接管"),
-        "adopt toasts: {:?}",
+        result.toast.clone().unwrap_or_default().contains("已切换"),
+        "adopt toasts the unified 已切换 verb: {:?}",
         result.toast
     );
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -993,8 +1001,8 @@ async fn switch_card_force_adopt_steals_owned_session() {
         .clone()
         .expect("force_adopt patches the card in place");
     assert!(
-        card_text(&card).contains("已接管 被占用的会话"),
-        "compact adoption state, 接管 verb: {card}"
+        card_text(&card).contains("已切换 被占用的会话"),
+        "compact 已切换 state: {card}"
     );
     let lobby = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     assert_eq!(
@@ -1305,8 +1313,8 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
         .expect("topic adopt should return a result");
     let card = result.card.expect("adopt patches the card in place");
     assert!(
-        card_text(&card).contains("已接管"),
-        "compact adoption state in the topic: {card}"
+        card_text(&card).contains("已切换"),
+        "compact 已切换 state in the topic: {card}"
     );
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
     let entry = app
@@ -2091,7 +2099,7 @@ async fn switch_card_adopt_round_trips_back_to_the_filtered_page() {
         .card
         .expect("adopt patches the card in place");
     let text = card_text(&switched);
-    assert!(text.contains("已接管 项目1"), "compact adoption state: {text}");
+    assert!(text.contains("已切换 项目1"), "compact 已切换 state: {text}");
     assert!(!text.contains("会话管理"), "the list is gone: {text}");
 
     // The compact state carries the list's exact return target.
