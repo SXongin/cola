@@ -5,21 +5,22 @@
 # review workflow (trial: issue #516 / PR #517).
 #
 # The gate's provider, endpoint, model and secret are workflow configuration,
-# not an ADR pin (ADR-0034, 2026-10-17 amendment) — this comment is the record.
-# Codex reaches the model through OpenCode Go's Responses-compatible endpoint
-# (`https://opencode.ai/zen/go/v1/responses`; `gpt-6-luna` is the Go lane's only
-# Responses model) on the workspace's own Go key (repo secret
-# `OPENCODE_API_KEY`), so the gate's usage is attributed to `opencode-go` in the
-# Go usage report.
+# not an ADR pin (ADR-0034, 2026-10-17 amendment) — this comment is the record,
+# and the switch lives in repository settings rather than in this file:
 #
-# This reverses the 2026-11-01 DeepSeek stand-in, deliberately. That move was
-# forced: the Go lane's **weekly** allowance was spent, and the credential
-# preflight got `HTTP 429 GoUsageLimitError (limitName: weekly)` — a spent
-# allowance produces no review at all. The weekly allowance is available again
-# (2026-11-03), so the gate returns to the one plan that also serves the
-# author-side `/code-review` pair. The trade-off is taken knowingly: the gate
-# shares that plan, and an exhausted allowance fails the gate loudly (a `429`
-# reaches no output, so the post step exits) rather than silently.
+#   vars.GATE_ENDPOINT   overrides the Responses endpoint
+#   vars.GATE_MODEL      overrides the model
+#   secrets.GATE_KEY     the provider key (falls back to DEEPSEEK_API_KEY)
+#
+# Unset, the defaults are DeepSeek's own Responses API
+# (`https://api.deepseek.com/responses`, `deepseek-flash`), which speaks the
+# protocol natively (their Codex integration sets `wire_api = "responses"`) and
+# bills per token on its own key, so no plan allowance can leave the repo
+# without a review. The 2026-11-06 move is forced: the Go lane's **monthly**
+# allowance is spent and the preflight got `HTTP 429 GoUsageLimitError
+# (limitName: monthly)`. Setting the three repository values moves the gate to
+# another provider without a workflow commit — the reason this is a switch and
+# not a hard-coded lane again.
 #
 # OpenCode's free tier is not a fallback: measured 2026-11-01, every free model
 # (`glm-5.3-flash-free`, `deepseek-v4.1-flash-free`, `mimo-v2.6-flash-free`)
@@ -35,8 +36,9 @@
 #
 # The credential preflight (#776) is the one other consumer of the key: it
 # hands it to curl through a 0600 config file rather than argv, and its step
-# carries no GH_TOKEN and no untrusted input. The Go lane requires the
-# `x-opencode-session` header, which the preflight sends.
+# carries no GH_TOKEN and no untrusted input. The probe sends only what the
+# endpoint needs (a bearer token); a lane-specific header is a per-provider
+# detail and must not be hard-coded into the shared check.
 #
 # Approval contract: this workflow posts the review itself and records the new
 # comment's ID as a step output; the approve step fetches exactly that comment
@@ -80,10 +82,9 @@
 # carries the credential's own status, and any non-200 fails with the endpoint,
 # the status and the body. The endpoint's `/v1/models` is unauthenticated
 # (measured 2026-10-18: 200 without a key), so only a real inference request
-# answers the question. The Go lane also needs an `x-opencode-session` header
-# (measured: 400 `MissingSessionID` without one). `GATE_ENDPOINT`/`GATE_MODEL`
-# sit in the job env so the check and the action share one definition; the
-# wiring is guarded by `cargo test -p xtask codex_gate`.
+# answers the question. `GATE_ENDPOINT`/`GATE_MODEL` sit in the job env so the
+# check and the action share one definition; the wiring is guarded by
+# `cargo test -p xtask codex_gate`.
 #
 # Publication and approval are two tiers: a review whose last line ends with
 # the verdict is published, while approval requires the marker to stand on its
@@ -122,7 +123,7 @@ jobs:
   review:
     # Fork PRs never see secrets, so the model would have no API key to run
     # with. Dependabot PRs are skipped for the same reason: their runs get no
-    # repository secrets, so `OPENCODE_API_KEY` would be empty. Drafts wait for
+    # repository secrets, so `GATE_KEY`/`DEEPSEEK_API_KEY` would be empty. Drafts wait for
     # ready_for_review. Release PRs are skipped: their diff is a version bump
     # of code already reviewed on main, and the cut merges with the admin
     # bypass.
@@ -146,11 +147,14 @@ jobs:
       pull-requests: write
     env:
       PR: ${{ github.event.pull_request.number }}
-      # The provider is workflow configuration (#776): the credential check and
-      # the Codex step read the same two values, so a switch cannot leave the
-      # preflight probing a different endpoint than the review uses.
-      GATE_ENDPOINT: https://opencode.ai/zen/go/v1/responses
-      GATE_MODEL: gpt-6-luna
+      # The provider is configuration (#776), and the switch is repository
+      # settings: set `vars.GATE_ENDPOINT` / `vars.GATE_MODEL` and the
+      # `GATE_KEY` secret to move the gate without editing this file. The
+      # credential check and the Codex step read the same values, so a switch
+      # cannot leave the preflight probing a different endpoint than the review
+      # uses. The defaults are DeepSeek's native Responses API.
+      GATE_ENDPOINT: ${{ vars.GATE_ENDPOINT || 'https://api.deepseek.com/responses' }}
+      GATE_MODEL: ${{ vars.GATE_MODEL || 'deepseek-flash' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -342,11 +346,11 @@ jobs:
       # status but 200 names the endpoint, the status and the body.
       - name: Check the gate credential
         env:
-          GATE_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GATE_KEY: ${{ secrets.GATE_KEY || secrets.DEEPSEEK_API_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${GATE_KEY:-}" ]; then
-            echo "::error title=Review gate credential::OPENCODE_API_KEY is empty; set the repository secret."
+            echo "::error title=Review gate credential::GATE_KEY (or DEEPSEEK_API_KEY) is empty; set the repository secret."
             exit 1
           fi
           body=$(jq -nc --arg model "$GATE_MODEL" '{model: $model, input: "ping", max_output_tokens: 16}')
@@ -365,7 +369,6 @@ jobs:
             -X POST "$GATE_ENDPOINT" \
             -K "$curl_config" \
             -H 'Content-Type: application/json' \
-            -H 'x-opencode-session: cola-codex-gate-preflight' \
             -d "$body") || curl_status=$?
           rm -f "$curl_config"
           # `--write-out` prints the status even when the transfer then breaks,
@@ -394,7 +397,7 @@ jobs:
         timeout-minutes: 30
         uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         with:
-          openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          openai-api-key: ${{ secrets.GATE_KEY || secrets.DEEPSEEK_API_KEY }}
           responses-api-endpoint: ${{ env.GATE_ENDPOINT }}
           model: ${{ env.GATE_MODEL }}
           codex-version: 0.160.0
