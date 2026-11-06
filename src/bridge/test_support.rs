@@ -1974,6 +1974,11 @@ pub struct MockBackend {
     /// Scripts the ADR-0028 busy→idle race: the first `session_status` read
     /// returns Busy (and clears the flag), later reads serve the map.
     pub status_busy_once: std::sync::atomic::AtomicBool,
+    /// Scripts the gather→arm idle→busy window: the first `session_status`
+    /// read returns Idle, the next Busy, later reads serve the map.
+    pub status_idle_then_busy_once: std::sync::atomic::AtomicBool,
+    /// The Busy half of [`Self::status_idle_then_busy_once`].
+    pub status_busy_after_idle: std::sync::atomic::AtomicBool,
     /// Scenario state for [`MockBackend::given_prompt`]: `(needle, parts)`
     /// pairs matched against the prompt text, first match wins.
     prompt_scripts: Vec<(String, Vec<Part>)>,
@@ -2142,6 +2147,8 @@ impl MockBackend {
             delay_reads_with_tail: std::sync::Mutex::new(None),
             on_transcript_read: std::sync::Mutex::new(None),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
+            status_idle_then_busy_once: std::sync::atomic::AtomicBool::new(false),
+            status_busy_after_idle: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
             last_prompt_parts: std::sync::Mutex::new(None),
             fail_prompt_message: None,
@@ -2806,6 +2813,14 @@ impl MockBackend {
     /// serve the map (the ADR-0028 busy→idle race).
     pub(crate) fn busy_then_idle_once(&self) -> &Self {
         self.status_busy_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the gather's `session_status` reads Idle, the follow's arm-time
+    /// read sees Busy (the run started in between), later reads serve the map.
+    pub(crate) fn idle_then_busy_once(&self) -> &Self {
+        self.status_idle_then_busy_once
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -3891,6 +3906,22 @@ impl crate::backend::Backend for MockBackend {
         // map (the follow's arm-time check sees the turn already finished).
         if self
             .status_busy_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(Some(crate::backend::types::SessionStatus::Busy));
+        }
+        // Scripts the gather→arm idle→busy window: the gather reads Idle, the
+        // follow's own status read sees Busy.
+        if self
+            .status_idle_then_busy_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.status_busy_after_idle
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(Some(crate::backend::types::SessionStatus::Idle));
+        }
+        if self
+            .status_busy_after_idle
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             return Ok(Some(crate::backend::types::SessionStatus::Busy));

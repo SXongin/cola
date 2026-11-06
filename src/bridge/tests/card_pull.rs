@@ -13,7 +13,7 @@ use crate::backend::{FinishReason, MessageId, MessageRole, Part, SessionTranscri
 use crate::bridge::snapshot::SnapshotData;
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
-use crate::feishu::card::session::{FOLLOW_HINT, LEAD_COMPACTION_PREFIX};
+use crate::feishu::card::session::{BUSY_CHIP, FOLLOW_HINT, IDLE_CHIP, LEAD_COMPACTION_PREFIX};
 
 /// A backend whose `ses_test` transcript carries one question and one answer,
 /// so an idle read has a 最近对话 tail to render.
@@ -1240,6 +1240,45 @@ async fn a_turn_install_cannot_split_the_sweeps_insert_and_flush() {
     );
 }
 
+/// A gather that read Idle followed by an arm-time read of Busy must not leave
+/// the lead's identity saying "continuing" over a 空闲 body: the body follows
+/// the arm-time status.
+#[tokio::test]
+async fn a_busy_arm_after_an_idle_gather_renders_a_busy_body() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = idle_read_backend();
+    backend.idle_then_busy_once();
+    let (app, platform) = build_app(cfg, backend).await;
+    app.core
+        .external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    wait_for_card_update(
+        &platform,
+        "the arm-time Busy status reaches the lead body",
+        CardUpdates::Any,
+        |card| {
+            let text = card_text(card);
+            text.contains("正在继续该会话的回合") && text.contains(BUSY_CHIP) && !text.contains(IDLE_CHIP)
+        },
+    )
+    .await;
+}
+
 /// The follow's identity line names the Session by its real title, exactly as
 /// the adoption line does — never the bare id tail because `/card` passed no
 /// title. The renderer's first flush carries the lead.
@@ -1880,6 +1919,148 @@ async fn a_failed_actionable_stamp_keeps_the_error_card_current() {
     );
 }
 
+/// A second `/card` with an UNREADABLE old read view still marks the old card:
+/// the bare TakeOver header is PATCHed, so exactly one read is current and none
+/// is left both unmarked and behind.
+#[tokio::test]
+async fn a_second_card_stamps_an_unreadable_previous_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    platform.given_reply_id("om_idle_1");
+    platform.given_reply_id("om_idle_2");
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    // No view is scripted for om_idle_1: the second stamp's read fails.
+    app.handle_message(incoming(
+        "msg_card_2".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle_2"),
+        "the new read is current"
+    );
+    let calls = platform.calls.lock().await.clone();
+    let stamped = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_1" => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("the unreadable old read is still stamped");
+    assert_eq!(
+        stamped["header"]["title"]["content"],
+        "⏳ 已由新卡片接管 · 已停止更新"
+    );
+    assert!(
+        stamped["body"]["elements"]
+            .as_array()
+            .is_none_or(|elements| elements.is_empty()),
+        "the fallback is the bare header: {stamped}"
+    );
+}
+
+/// If the old read's stamp PATCH fails, the new read must NOT become current:
+/// the old map entry stays, the posted read stays untracked, and the next
+/// `/card` retries and marks it.
+#[tokio::test]
+async fn a_failed_previous_read_stamp_keeps_the_old_read_current() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    platform.given_reply_id("om_idle_1");
+    platform.given_reply_id("om_idle_2");
+    platform.given_reply_id("om_idle_3");
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    let first = platform.replied_cards().await[0].clone();
+    platform.given_card_view("om_idle_1", first);
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    app.handle_message(incoming(
+        "msg_card_2".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle_1"),
+        "the old read stays current when its stamp PATCH fails"
+    );
+
+    // The next `/card` retries the stamp and becomes current.
+    app.handle_message(incoming(
+        "msg_card_3".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle_3"),
+        "the retried stamp lets the next read become current"
+    );
+    let calls = platform.calls.lock().await.clone();
+    let stamps: Vec<&serde_json::Value> = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_1" => Some(card),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        stamps
+            .last()
+            .is_some_and(|card| card["header"]["title"]["content"] == "⏳ 已由新卡片接管 · 已停止更新"),
+        "the later `/card` marks the old read: {calls:?}"
+    );
+}
+
 /// A Turn that ran between two `/card` commands has already superseded the
 /// older read: the map holds the Turn's card when the second read posts, so the
 /// older read is left untouched — no stale stamp collects in the chat.
@@ -2467,7 +2648,9 @@ fn body_compaction(created_ms: i64, summary: &str) -> crate::backend::TailEntry 
 /// - `messages` is every tail message with its FULL body — the card side reads
 ///   the folded panel's content chunks, never its 40-char preview title;
 /// - `markers` is every Compaction row the card carries (title + folded
-///   summary). The live lead deliberately carries none.
+///   summary). Both drivers keep the same rows at their server positions
+///   (#1002); a live timeline may additionally render its own row, which
+///   ADR-0082's 2026-11-07 amendment records as deliberate.
 #[derive(Debug, Default, PartialEq)]
 struct RenderedBody {
     lead: Vec<String>,
