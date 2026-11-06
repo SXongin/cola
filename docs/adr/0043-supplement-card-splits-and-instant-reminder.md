@@ -573,3 +573,22 @@ See ADR-0074 for the three one-card-per-request invariants this concluded (one
 unbounded path, exactly one Card per resumption, the notice gated on delivery).
 
 Source: #602, #603.
+
+## Amendment (2026-11-06): `/card` reads a session no renderer owns
+
+The 2026-09-22 amendment gave `/card` one meaning: pull the live card down, and
+answer a text notice when no Turn is rendering. ADR-0100 adds the second state
+that notice was covering for: with no renderer owning the card, `/card` reads the
+session once and posts a read-only **Session Card** in `CardState::Idle`, which
+joins no Card Chain. The pull itself is unchanged — same `split_card_chain`, same
+`PendingSplit`, same `⏬ 实时卡片已移到底部` receipt, same migration of a live
+Interaction Block to the continuation.
+
+A second `/card` with nothing in between stamps the previous idle card
+`TakenOver` while it is still the session's current card; a Turn that ran in
+between has superseded it and is left alone. When the read reports busy or a
+Waiting turn, `/card` posts the same card and hands it to the existing external
+renderer instead of freezing it, so the continuation streams into the card the
+reader just asked for.
+
+Source: #945, #999.
