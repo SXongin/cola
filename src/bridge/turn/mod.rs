@@ -3802,23 +3802,35 @@ impl Turn {
             .and_then(|c| c.card_message_id.clone())
     }
 
-    /// The message id of the Session's CURRENT card when that card is the
-    /// previous one-shot read (ADR-0100) — the card a second `/card` stamps
-    /// `TakenOver`. `None` when the map holds no card, or a Turn's card: a Turn
-    /// that ran in between already superseded the older read, so it is left
-    /// alone rather than stamped for noise.
-    pub(crate) async fn idle_card_to_supersede(cards: &CardsHandle, session_id: &str) -> Option<String> {
+    /// The message id of the Session's CURRENT card when `/card` is about to
+    /// replace it and should stamp it `TakenOver` (ADR-0100): a previous
+    /// one-shot read (`Idle`), or a terminal card that still owns a recovery
+    /// action (`Error`/`Unreceived`). The latter would otherwise keep a
+    /// visible 「🔄 重试」/「重新发起」 button whose click resolves against the
+    /// new `Idle` card and does nothing — the stamp strips that dead control
+    /// and says the card is superseded.
+    ///
+    /// `None` when the map holds no card, or a running Turn's card, or a
+    /// terminal card with no action (`Done`/`Stopped`): a Turn that ran in
+    /// between already superseded the older card, so it is left alone rather
+    /// than stamped for noise.
+    pub(crate) async fn card_to_supersede(cards: &CardsHandle, session_id: &str) -> Option<String> {
         let live = cards.cards.lock().await;
         live.get(session_id)
-            .filter(|card| *card.acc.card_state() == crate::feishu::card::CardState::Idle)
+            .filter(|card| {
+                let state = card.acc.card_state();
+                *state == crate::feishu::card::CardState::Idle || state.offers_recovery()
+            })
             .and_then(|card| card.card_message_id.clone())
     }
 
     /// Record a posted read-only Session Card as the Session's card (ADR-0100):
     /// a real [`state::CardSession`] in `CardState::Idle`, carrying the message
     /// id the send returned. It replaces a previous idle read or a **terminal**
-    /// Turn card — a spent chain — so every live-card predicate refuses the
-    /// read and the next `/card` can find the previous read to stamp.
+    /// Turn card (a spent chain, or an actionable `Error`/`Unreceived` whose
+    /// dead recovery control the caller stamps away) so every live-card
+    /// predicate refuses the read and the next `/card` can find the previous
+    /// card to stamp.
     ///
     /// The insert is a **compare-and-swap**, not an overwrite: a card that is
     /// still running (a Turn installed before the caller took the lock, a
