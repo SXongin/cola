@@ -118,7 +118,6 @@ pub enum CardState {
     /// predicate refuses it — and neutral: no phase timer and no Turn Footer.
     /// Read-only by construction, so an unanswered Permission/Question never
     /// rides it (it always lives on a live card or its own standalone card).
-    #[allow(dead_code)] // posted by `/card` in #1003; the state lands first (ADR-0100)
     Idle,
 }
 
