@@ -619,13 +619,15 @@ mod tests {
         //
         // The step cap was raised from 12 to 30 minutes so a large diff plus
         // its embedded linked issues can finish (a 44-commit PR timed out at
-        // 12m15s); it stays well inside the job's own cap, which is what
-        // keeps a hang from burning the job.
+        // 12m15s), then to 45 for an 18k-line spec branch whose review needed
+        // more than 30 (2026-11-07: a run produced no output at the old cap);
+        // it stays well inside the job's own cap, which is what keeps a hang
+        // from burning the job.
         let codex = step(&workflow, "Run Codex (read-only)");
         for needle in [
             "bdf19a4a223ec2549a3e2274a0cf61556bc07675", // v1.13: bounds #150/#169's stdio hang
             "continue-on-error: true",
-            "timeout-minutes: 30",
+            "timeout-minutes: 45",
         ] {
             assert!(codex.contains(needle), "the Codex step must keep {needle}");
         }
