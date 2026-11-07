@@ -111,11 +111,3 @@ decisions. It stands aside wherever no card is rendered:
   surface again until #1012's companion lane surfaces it with the full target in
   a companion message; that handoff is the reason the refused class is accepted
   here rather than expanded.
-
-## Amendment (2026-11-08, #1012): the interactive half is superseded
-
-ADR-0102 removes the interactive refusal this ADR left in place: an over-budget
-permission is no longer declined before a card. The sweep surfaces a summary and
-delivers the full target in a companion message, and the click guard trusts that
-delivery. Auto-Accept's decision here is unchanged — it still renders no card,
-sends no companion, and approves unseen with the same INFO line.
