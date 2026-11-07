@@ -320,7 +320,7 @@ impl RequestKind for PermissionKind {
 
     async fn refuse(
         &self,
-        _flow: &RequestFlow,
+        flow: &RequestFlow,
         handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
@@ -341,7 +341,7 @@ impl RequestKind for PermissionKind {
         // denials (#892). The check runs only past the budget, so the ordinary
         // path pays no extra session lookup.
         let sid = p.session_id.clone().unwrap_or_default();
-        match should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await {
+        match should_auto_accept(flow, &handles.sessions, &handles.backend, &sid, dir).await {
             Some(true) => return Refusal::NotApplicable,
             // Unknown: the flag read failed, so neither decline (irreversible
             // for a request the session may have delegated) nor surface (the
@@ -373,7 +373,7 @@ impl RequestKind for PermissionKind {
         // aside for these sessions. A target past the card budget is approved
         // unseen, and the log line names its length — that record is what keeps
         // the decision auditable without a card (#892).
-        match should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await {
+        match should_auto_accept(flow, &handles.sessions, &handles.backend, &sid, dir).await {
             Some(true) => {}
             Some(false) => return Prepared::NotHandled,
             // Unknown: retry rather than surface a card the toggle may have
@@ -511,7 +511,7 @@ impl RequestKind for PermissionKind {
             };
             let mut cached = None;
             if flow.try_mark_answered(&handles.requests, req_id).await {
-                let mut approved = set_auto_accept(
+                let Some(mut approved) = set_auto_accept(
                     &handles.sessions,
                     &handles.requests,
                     &handles.backend,
@@ -519,7 +519,19 @@ impl RequestKind for PermissionKind {
                     &dir,
                     true,
                 )
-                .await;
+                .await
+                else {
+                    // The flag did not persist, so nothing was approved and
+                    // the mode did not change. Release the click's claim: the
+                    // request is still pending and must be offered again (a
+                    // success card here would claim a decision nobody made).
+                    flow.unmark_answered(&handles.requests, req_id).await;
+                    return Some(failed_result_card(
+                        inline,
+                        "自动授权状态保存失败，请重试。",
+                        "保存失败，请重试",
+                    ));
+                };
                 // The clicked request is always resolved by the toggle, even
                 // if the backend list raced past it.
                 if !approved.iter().any(|id| id == req_id) {
@@ -742,6 +754,7 @@ impl RequestKind for PermissionKind {
 /// is unknown. Callers must retry an unknown instead of reading it as off:
 /// declining on a guess is the irreversible outcome #892 is about.
 async fn should_auto_accept(
+    flow: &RequestFlow,
     sessions: &SessionsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
@@ -761,12 +774,15 @@ async fn should_auto_accept(
         })
         .await;
     match found {
-        Ok(flag) => Some(flag.unwrap_or(false)),
+        Ok(flag) => {
+            flow.note_autoaccept_read_success(session_id).await;
+            Some(flag.unwrap_or(false))
+        }
         Err(e) => {
-            // DEBUG: a sweep retries this path every tick until the read
-            // heals, and ADR-0048 keeps a repeating best-effort failure out of
-            // WARN. The request is never declined on the unknown.
-            tracing::debug!("auto-accept: resolving session {session_id}'s flag failed: {e}");
+            // ADR-0048: the sweep retries this read every tick, so the latch
+            // WARNs the first failure and DEBUGs identical repeats. The request
+            // is never declined on the unknown.
+            flow.note_autoaccept_read_failure(session_id, &e).await;
             None
         }
     }
@@ -776,8 +792,10 @@ async fn should_auto_accept(
 /// (which may be a parent of a sub-task child) and approving any already-pending
 /// permissions when turning on. Mirrors `/autoaccept` and is shared by the
 /// permission-card toggle and the coordinator's wrapper so both paths stay in
-/// lockstep. Returns the ids of the pending requests that were approved (empty
-/// when `on` is false), so the caller can drop their inline card sections.
+/// lockstep. Returns `None` when the flag could not be persisted (nothing was
+/// approved: the mode did not change), else the ids of the pending requests that
+/// were approved (empty when `on` is false), so the caller can drop their inline
+/// card sections.
 pub(crate) async fn set_auto_accept(
     sessions: &SessionsHandle,
     requests: &RequestsHandle,
@@ -785,7 +803,7 @@ pub(crate) async fn set_auto_accept(
     session_id: &str,
     directory: &str,
     on: bool,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     // Persist the flag BEFORE approving the pending requests: a sweep landing
     // in the approval window must already read the session as auto-accept, or
     // its `refuse` declines an over-budget request this very call is about to
@@ -819,13 +837,13 @@ pub(crate) async fn set_auto_accept(
     // record: the next sweep reads it as off, and an over-budget request would
     // be approved unseen under a session that never opted in (#892).
     if !persisted {
-        return Vec::new();
+        return None;
     }
-    if on {
+    Some(if on {
         approve_pending_for_session(sessions, requests, backend, session_id, directory).await
     } else {
         Vec::new()
-    }
+    })
 }
 
 /// Decline a permission whose target the card cannot render in full.

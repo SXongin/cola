@@ -2429,6 +2429,11 @@ async fn auto_accept_approves_an_unshowable_permission() {
         line.contains("its target is 1005 characters, past the card's 1000 character budget"),
         "the unseen approval names the numbers it crossed: {line}"
     );
+    let expected_first_line = format!("first line: echo {}…", "x".repeat(115));
+    assert!(
+        line.contains(&expected_first_line),
+        "the first line is bounded at 120 characters with its cut marker: {line}"
+    );
 }
 
 /// #892: turning Auto-Accept on approves the requests that are ALREADY pending,
@@ -2612,6 +2617,115 @@ async fn an_unknown_auto_accept_flag_never_declines_an_unshowable_permission() {
         replies.lock().await.as_slice(),
         &[("per_long".to_string(), "once".to_string())],
         "the retry reads the inherited flag and approves"
+    );
+}
+
+/// The unknown flag must also retry on a SHOWABLE target, where `refuse` does
+/// not consult the flag at all: `prepare` is the only reader, and it must not
+/// surface a card the session's Auto-Accept may have replaced.
+#[tokio::test]
+async fn an_unknown_auto_accept_flag_retries_a_showable_permission() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_parent("ses_child", "ses_parent");
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_short".into(),
+        session_id: Some("ses_child".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["ls".into()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    backend.fail_session_infos(1);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_parent".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: true,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let mut seen = std::collections::HashSet::new();
+    let (_, first) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+
+    assert!(replies.lock().await.is_empty(), "nothing answered while unknown");
+    assert!(!seen.contains("per_short"), "the request must stay retryable");
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.is_empty(),
+        "a possibly-auto-accepted session must not get a card during the unknown"
+    );
+    // ADR-0048: the first failed read WARNs with its cause.
+    assert_line_level(&first, "auto-accept flag read ses_child failed", "WARN");
+
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_short".to_string(), "once".to_string())],
+        "the healed read approves through the inherited flag"
+    );
+}
+
+/// A toggle click that cannot persist the flag must claim nothing: no approval,
+/// no mode receipt, and the click's claim released so the request is offered
+/// again. The old code returned an empty approval list the caller could not tell
+/// from "nothing pending", then reported success.
+#[tokio::test]
+async fn a_permission_toggle_that_cannot_persist_claims_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let perm_calls = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    // The session is not in the store, so the flag has nowhere to persist.
+    let value = serde_json::json!({
+        "action": "perm",
+        "reply": "autoaccept",
+        "session_id": "ses_ghost",
+        "request_id": "per_ghost",
+        "directory": "/work",
+        "perm_label": "✅ 已开启自动授权",
+        "perm_color": "blue",
+        "perm_body": "bash",
+    });
+    let result = app.host_action(value).await.expect("failure result card");
+
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("保存失败，请重试"),
+        "the failure is reported, not sold as success"
+    );
+    assert!(
+        perm_calls.lock().await.is_empty(),
+        "nothing was approved without a persisted flag"
+    );
+    assert!(
+        !app.requests_handle()
+            .answered_requests
+            .lock()
+            .await
+            .contains("per_ghost"),
+        "the click's claim must be released so the request can be offered again"
     );
 }
 
