@@ -132,17 +132,24 @@ not wrapped in a request timeout**: Feishu's create carries no idempotency key,
 so abandoning a create whose response is slow can orphan a card that did land,
 and a retry would post a second one. The bounded reads and the bounded stamp
 PATCH are the lock's long awaits; the create is one platform call, and a real
-send error takes the existing failure path.
+send error takes the existing failure path. Because the create holds the
+Session's card write lock, a half-open Feishu response blocks that Session's
+flush, sweep, install and next `/card` until it returns — accepted, because a
+timeout could orphan a create that did land and the retry would duplicate it.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and
 the busy follow hands it to its prepared accumulator's static lead (set under the
 card write lock, where the seed count is final). A test renders the same
 `SnapshotData` through both and asserts the body text is equal, because today the
-two are separate compositions that can drift. An **oversized read tail** is the
-one presentation difference: the one-shot card must evict its oldest entries to
-fit one card and names the omission, while the live lead renders all four (its
-card can split). The equality contract is asserted on a fitting tail.
+two are separate compositions that can drift. Two deliberate driver facts are
+outside that equality: the **pending pointer** — an idle read names
+「见原卡片」 because it carries no blocks, while a follow that seeds the counted
+blocks is hint-free — and an **oversized read tail** — the one-shot card must
+evict its oldest entries to fit one card and names the omission, while the live
+lead renders all four (its card can split). The equality contract is asserted on
+a fitting tail with `on_card == 0`; the pointer difference is the documented
+driver fact for carried blocks.
 
 ## Consequences
 

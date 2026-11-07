@@ -137,10 +137,17 @@ pub(crate) async fn gather_snapshot(
     // busy arm; a retry, an unread status, or a newer user message whose Turn
     // has not finished is never guessed into a wait.
     let waiting = status == Some(crate::backend::types::SessionStatus::Idle)
-        && newest_user_anchor.as_ref().is_some_and(|anchor| {
+        && (newest_user_anchor.as_ref().is_some_and(|anchor| {
             transcript.turn_for_user(anchor).complete
                 && transcript.settle(Some(anchor)) == crate::backend::TurnSettle::Waiting
-        });
+        })
+            // An UNTIMED newest user message has no anchor to settle, but an
+            // Idle read with live Background Tasks is the same Waiting fact:
+            // the run may wake by itself, so the status must not say 空闲
+            // (#999 US2). This is a status fact only; the follow still needs
+            // an anchor and stays static (the #1005 carve-out above).
+            || (newest_user.is_some_and(|message| message.time.is_none())
+                && !transcript.background_tasks.is_empty()));
 
     SnapshotData {
         session_id: session_id.to_string(),
