@@ -77,14 +77,16 @@ impl CompanionLane {
 
 /// One companion message that carried a permission request's full content —
 /// the persisted proof the click guard trusts (ADR-0102). The record is
-/// client-scoped like every other surface, written only after a send that
-/// landed or may have landed, and read back after a restart without re-sending.
+/// client-scoped like every other surface and read back after a restart without
+/// re-sending. A confirmed send carries its message id; an ambiguous send
+/// persists a marker with an empty id that only prevents a duplicate send —
+/// it is **not** a completeness proof.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompanionDelivery {
     /// The message the companion landed as. Empty when the send outcome was
     /// ambiguous (a timeout or a 5xx after the request went out): the message
     /// may exist, so it must not be retried into a duplicate, but no id came
-    /// back. The summary says the outcome is unknown.
+    /// back. The marker never permits an approval.
     pub message_id: String,
     pub lane: CompanionLane,
     /// The digest of the exact content that was delivered. The click guard
@@ -94,9 +96,15 @@ pub struct CompanionDelivery {
 }
 
 impl CompanionDelivery {
-    /// Whether the send may have landed but returned no message id.
+    /// Whether the send may have landed but returned no message id. Such a
+    /// record is only a "do not re-send" marker, not a delivery proof.
     pub(crate) fn is_uncertain(&self) -> bool {
         self.message_id.is_empty()
+    }
+
+    /// Whether the companion is a confirmed delivery the click guard may trust.
+    pub(crate) fn is_confirmed(&self) -> bool {
+        !self.is_uncertain()
     }
 }
 
@@ -412,6 +420,14 @@ impl Surfaces {
     pub fn matching_companion(&self, request_id: &str, target_digest: u64) -> Option<CompanionDelivery> {
         self.companion(request_id)
             .filter(|delivery| delivery.target_digest == target_digest)
+    }
+
+    /// The record for `request_id` only when it is a **confirmed** delivery
+    /// (a message id came back) and its digest matches. An uncertain marker is
+    /// never a completeness proof (ADR-0102).
+    pub fn delivered_companion(&self, request_id: &str, target_digest: u64) -> Option<CompanionDelivery> {
+        self.matching_companion(request_id, target_digest)
+            .filter(CompanionDelivery::is_confirmed)
     }
 
     /// Forget a companion record — its request resolved (or was refused).

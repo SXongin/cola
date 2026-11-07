@@ -46,32 +46,36 @@ is allowed only when the full content was delivered for that request.
   (`post` with an `md` tag); a body past the 30 KB `post` cap, or a send that
   definitely did not land, falls to one File Message (an uploaded `.txt` whose
   name and preceding caption name the request). An ambiguous send is terminal:
-  it is never retried into a duplicate, and it is recorded as uncertain rather
-  than rejected as if nothing arrived.
+  it is never retried into a duplicate, but it is **not** a delivery. It leaves
+  a non-proof marker and the request follows the refusal path; the copy names
+  the unknown outcome instead of claiming either delivery or a definite failure.
 - **Delivered before interactive.** The companion is sent from the sweep's
   surfacing path before the inline block or standalone card is created, so there
   is no window in which a button approves text the user never saw. It is sent
   once per request, whichever surface hosts it. Auto-Accept returns before this
   step: it renders no card and sends no companion (ADR-0101 unchanged).
-- **The delivery is persisted.** A client-scoped
+- **Delivery is persisted; uncertainty is only a marker.** A client-scoped
   `request_id → CompanionDelivery { message_id, lane, target digest }` record
-  rides beside the existing surface records (ADR-0038). It is written after a
-  send that landed (or may have landed, for an ambiguous outcome), removed when
-  the request resolves, and hydrated at startup. Readoption trusts a record
-  whose digest matches and never re-sends.
+  rides beside the existing surface records (ADR-0038). A **confirmed** send
+  writes the record; an ambiguous send writes the same shape with an empty
+  message id, which only prevents a second send. The record is removed when the
+  request resolves and hydrated at startup. Readoption trusts a confirmed record
+  whose digest matches and never re-sends; a marker never proves anything.
 - **The click guard checks it.** An `once`/`always` click re-reads the pending
-  request and accepts an over-budget approval only when a companion record
-  exists whose digest matches that request. A stale record is replaced at
-  surfacing time, never trusted. Without a match the click is refused and the
-  result card names the missing delivery. This covers **any**
+  request and accepts an over-budget approval only when a **confirmed** companion
+  record exists whose digest matches that request. A stale record is replaced at
+  surfacing time, never trusted; an uncertain marker is refused like a missing
+  record, with copy that names the unknown outcome. This covers **any**
   `PermissionOverflow` — the summed target budget and the rendered-body ceiling
   alike.
 - **A recovered card without proof is withdrawn.** Readoption does not trust a
-  persisted over-budget card that has no matching companion record: it follows
-  the refusal path and the card becomes non-interactive. If the session is in
-  Auto-Accept, the request is approved unseen and the card is withdrawn, because
-  Auto-Accept renders no decision surface (ADR-0101). A card from an older build
-  therefore cannot approve text a newer build never delivered.
+  persisted over-budget card that has no matching confirmed companion record
+  (including one whose only record is an uncertain marker): the card becomes
+  non-interactive and the request follows the matching refusal path. If the
+  session is in Auto-Accept, the request is approved unseen and the card is
+  withdrawn, because Auto-Accept renders no decision surface (ADR-0101). A card
+  from an older build therefore cannot approve text a newer build never
+  delivered.
 - **Fallback is out of scope here.** If neither lane delivers, this ticket keeps
   the existing refusal path. A fallback card is a later ticket and this ADR does
   not pre-decide its controls or confirmation steps.
@@ -87,11 +91,13 @@ is allowed only when the full content was delivered for that request.
   overflow, the raw targets; for a rendered-body overflow, the full rendered
   description including its non-diff chrome. A request whose text changed while
   its record stayed behind cannot borrow the old delivery.
-- An ambiguous send is recorded as uncertain (empty message id) and never
-  retried into a second message. The summary says so; the click guard still
-  requires the matching digest.
-- The refusal copy, the reason card and the retry behaviour stay in use, but
-  only for a failed companion delivery and a legacy card without a record.
+- An ambiguous send is recorded only as a no-duplicate marker (empty message
+  id) and never retried. It is not a completeness proof: no interactive
+  approval is offered, the request follows the refusal path, and the copy names
+  the unknown outcome.
+- The refusal copy, the reason card and the retry behaviour stay in use for a
+  failed companion delivery, an uncertain one, and a legacy card without a
+  record.
 - A target with only a chat reply target (no message to reply under) cannot take
   either companion lane, so it follows the refusal path. This is safer than
   offering an approval for an undelivered target.

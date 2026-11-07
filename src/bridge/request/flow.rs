@@ -199,7 +199,7 @@ enum RefusalApplied {
 }
 
 /// What one over-budget refusal did.
-struct OverBudgetRefusal {
+struct SettledRefusal {
     /// The request settled and the caller may mark it seen.
     handled: bool,
     /// The server decline itself failed, so the next sweep must retry it.
@@ -216,6 +216,11 @@ enum ReadoptDecision {
     /// with this bound — Auto-Accept approves it unseen, otherwise it follows
     /// the refusal path.
     Refused(PermissionOverflow),
+    /// An over-budget request whose only record is an uncertain send marker
+    /// (the companion may or may not have landed). It is not a proof, so the
+    /// card must not be re-adopted and the request follows the uncertain
+    /// refusal path.
+    RefusedUncertain,
     /// The persisted card is gone or unusable: surface the request anew.
     NotAdopted,
 }
@@ -231,8 +236,40 @@ async fn post_unshowable_notice(
     directory: &str,
     overflow: PermissionOverflow,
 ) {
+    post_refusal_card(
+        handles,
+        p,
+        directory,
+        crate::feishu::card::question::build_unshowable_permission_card(overflow.budget()),
+    )
+    .await;
+}
+
+/// Tell the chat that a companion's delivery outcome is unknown, so no
+/// interactive approval is offered (ADR-0102).
+async fn post_uncertain_notice(
+    handles: &FlowHandles,
+    p: &crate::backend::types::PermissionRequest,
+    directory: &str,
+) {
+    post_refusal_card(
+        handles,
+        p,
+        directory,
+        crate::feishu::card::question::build_uncertain_permission_card(),
+    )
+    .await;
+}
+
+/// Route one non-interactive refusal card exactly like a permission card: the
+/// reply target of the session's prompt, or the chat.
+async fn post_refusal_card(
+    handles: &FlowHandles,
+    p: &crate::backend::types::PermissionRequest,
+    directory: &str,
+    card: serde_json::Value,
+) {
     let session_id = p.session_id.as_deref().unwrap_or("");
-    let card = crate::feishu::card::question::build_unshowable_permission_card(overflow.budget());
     match resolve_card_target(
         &handles.sessions,
         &handles.cards,
@@ -245,16 +282,16 @@ async fn post_unshowable_notice(
     {
         Some(CardTarget::ReplyTo(message_id)) => {
             if let Err(e) = handles.platform.reply_card(&message_id, &card).await {
-                tracing::warn!("unshowable permission notice reply failed: {e}");
+                tracing::warn!("permission notice reply failed: {e}");
             }
         }
         Some(CardTarget::Chat(chat_id)) => {
             if let Err(e) = handles.platform.send_card("chat_id", &chat_id, &card).await {
-                tracing::warn!("unshowable permission notice send failed: {e}");
+                tracing::warn!("permission notice send failed: {e}");
             }
         }
         None => tracing::warn!(
-            "unshowable permission {} on session {session_id}: no reply target for the notice",
+            "permission {} on session {session_id}: no reply target for the notice",
             p.request_id
         ),
     }
@@ -272,6 +309,10 @@ enum Withdrawal {
     /// An Auto-Accept session approved it unseen: the card that could not show
     /// it is replaced by a non-interactive auto-accept notice.
     AutoAccepted,
+    /// The companion outcome is unknown (it may or may not have landed): the
+    /// card is withdrawn and the request declined, because an unconfirmed
+    /// delivery is not a completeness proof (ADR-0102).
+    CompanionUncertain,
     /// cola could not land its refusal and will retry: a "will retry" surface
     /// that claims nothing.
     Retrying,
@@ -1323,51 +1364,23 @@ impl RequestFlow {
                 // Auto-Accept session approves it unseen and withdraws the
                 // card (ADR-0101); otherwise follow the refusal path.
                 ReadoptDecision::Refused(overflow) => {
-                    let PendingRequest::Permission(p) = req else {
-                        return false;
-                    };
-                    let sid = p.session_id.clone().unwrap_or_default();
-                    match should_auto_accept(self, &handles.sessions, &handles.backend, &sid, dir).await {
-                        AutoAcceptFlag::On => {
-                            let handled = self.approve_recovered_unseen(handles, req, p, dir).await;
-                            if handled {
-                                seen.insert(req.id().to_string());
-                            }
-                            return handled;
-                        }
-                        // Unknown: retry the flag read next sweep rather than
-                        // decline a request the session may have delegated.
-                        // Neutralize the stored card in the meantime (it must
-                        // not keep clickable controls while nothing can prove
-                        // the delivery), then remember the request for the
-                        // retry.
-                        AutoAcceptFlag::Unknown => {
-                            self.withdraw_stored_surface(handles, req, Withdrawal::Retrying)
-                                .await;
-                            self.recovered
-                                .lock()
-                                .await
-                                .insert(req.id().to_string(), dir.to_string());
-                            return false;
-                        }
-                        AutoAcceptFlag::Off | AutoAcceptFlag::Capped => {
-                            let refused = self.decline_over_budget(handles, req, p, dir, overflow).await;
-                            if refused.decline_failed {
-                                // Keep the recovered marker so the next sweep
-                                // retries the decline instead of delivering a
-                                // new companion for a card that is still the
-                                // user's surface.
-                                self.recovered
-                                    .lock()
-                                    .await
-                                    .insert(req.id().to_string(), dir.to_string());
-                            }
-                            if refused.handled {
-                                seen.insert(req.id().to_string());
-                            }
-                            return refused.handled;
-                        }
+                    let handled = self
+                        .handle_recovered_refusal(handles, req, dir, Some(overflow))
+                        .await;
+                    if handled {
+                        seen.insert(req.id().to_string());
                     }
+                    return handled;
+                }
+                // An uncertain marker is not a proof: the card is withdrawn and
+                // the request follows the uncertain refusal path (or is
+                // approved unseen on Auto-Accept, which needs no proof).
+                ReadoptDecision::RefusedUncertain => {
+                    let handled = self.handle_recovered_refusal(handles, req, dir, None).await;
+                    if handled {
+                        seen.insert(req.id().to_string());
+                    }
+                    return handled;
                 }
                 ReadoptDecision::NotAdopted => {}
             }
@@ -1389,15 +1402,22 @@ impl RequestFlow {
         // block or standalone card becomes interactive (ADR-0102). Auto-Accept
         // returned above, so a delegated session still renders nothing. A
         // failed companion follows the refusal path: no approval is offered for
-        // content that was not delivered. An uncertain send is terminal — its
-        // record is written and the summary says the outcome is unknown — so a
-        // duplicate is never attempted.
+        // content that was not delivered. An UNCERTAIN send is not a proof: it
+        // is kept only as a no-duplicate marker, no interactive approval is
+        // offered, and the request follows the uncertain refusal path.
         if let PendingRequest::Permission(p) = req
             && let Some(overflow) = permission_overflow(p)
             && self.companion_for(req).is_none()
         {
             match ensure_permission_companion(handles, &self.surfaces, p, dir).await {
-                CompanionOutcome::Delivered | CompanionOutcome::Uncertain => {}
+                CompanionOutcome::Delivered => {}
+                CompanionOutcome::Uncertain => {
+                    let refused = self.decline_uncertain_companion(handles, req, p, dir).await;
+                    if refused.handled {
+                        seen.insert(req.id().to_string());
+                    }
+                    return refused.handled;
+                }
                 CompanionOutcome::Failed => {
                     let refused = self.decline_over_budget(handles, req, p, dir, overflow).await;
                     if refused.handled {
@@ -1738,16 +1758,135 @@ impl RequestFlow {
         p: &crate::backend::types::PermissionRequest,
         dir: &str,
         overflow: PermissionOverflow,
-    ) -> OverBudgetRefusal {
+    ) -> SettledRefusal {
         let refusal = decline_unshowable(handles, p, dir, overflow).await;
         let decline_failed = matches!(refusal, Refusal::Failed);
         let handled = matches!(
             self.apply_refusal(handles, req, dir, refusal).await,
             RefusalApplied::Handled
         );
-        OverBudgetRefusal {
+        SettledRefusal {
             handled,
             decline_failed,
+        }
+    }
+
+    /// The recovered-card refusal path, shared by an absent companion record
+    /// and an uncertain marker: Auto-Accept approves unseen, an unknown flag
+    /// read neutralizes and retries, and anything else settles the request
+    /// with the matching refusal copy.
+    async fn handle_recovered_refusal(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+        overflow: Option<PermissionOverflow>,
+    ) -> bool {
+        let PendingRequest::Permission(p) = req else {
+            return false;
+        };
+        let sid = p.session_id.clone().unwrap_or_default();
+        match should_auto_accept(self, &handles.sessions, &handles.backend, &sid, dir).await {
+            AutoAcceptFlag::On => self.approve_recovered_unseen(handles, req, p, dir).await,
+            // Unknown: retry the flag read next sweep rather than decline a
+            // request the session may have delegated. Neutralize the stored
+            // card in the meantime, then remember the request for the retry.
+            AutoAcceptFlag::Unknown => {
+                self.withdraw_stored_surface(handles, req, Withdrawal::Retrying)
+                    .await;
+                self.recovered
+                    .lock()
+                    .await
+                    .insert(req.id().to_string(), dir.to_string());
+                false
+            }
+            AutoAcceptFlag::Off | AutoAcceptFlag::Capped => {
+                let refused = match overflow {
+                    Some(overflow) => self.decline_over_budget(handles, req, p, dir, overflow).await,
+                    None => self.decline_uncertain_companion(handles, req, p, dir).await,
+                };
+                if refused.decline_failed {
+                    // Keep the recovered marker so the next sweep retries the
+                    // decline instead of delivering a new companion for a card
+                    // that is still the user's surface.
+                    self.recovered
+                        .lock()
+                        .await
+                        .insert(req.id().to_string(), dir.to_string());
+                }
+                refused.handled
+            }
+        }
+    }
+
+    /// Decline a permission whose companion send is unconfirmed. It is not a
+    /// delivery proof, so no interactive approval may be offered; the copy
+    /// names the unknown outcome rather than claiming a definite failure.
+    async fn decline_uncertain_companion(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        p: &crate::backend::types::PermissionRequest,
+        dir: &str,
+    ) -> SettledRefusal {
+        let sid = p.session_id.clone().unwrap_or_default();
+        match handles
+            .backend
+            .clone()
+            .for_directory(dir)
+            .reply_permission(&sid, &p.request_id, "reject")
+            .await
+        {
+            Ok(()) => {
+                tracing::warn!(
+                    "declined permission {} on session {sid}: its companion delivery outcome is unknown; \
+                     no interactive approval is offered",
+                    p.request_id
+                );
+                match self
+                    .withdraw_stored_surface(handles, req, Withdrawal::CompanionUncertain)
+                    .await
+                {
+                    WithdrawalOutcome::Failed => SettledRefusal {
+                        handled: false,
+                        decline_failed: false,
+                    },
+                    WithdrawalOutcome::None => {
+                        post_uncertain_notice(handles, p, dir).await;
+                        SettledRefusal {
+                            handled: true,
+                            decline_failed: false,
+                        }
+                    }
+                    WithdrawalOutcome::Updated => SettledRefusal {
+                        handled: true,
+                        decline_failed: false,
+                    },
+                }
+            }
+            // Another client settled it: the card is withdrawn neutrally, not
+            // as cola's refusal.
+            Err(e) if e.is_not_found() => SettledRefusal {
+                handled: !matches!(
+                    self.withdraw_stored_surface(handles, req, Withdrawal::ResolvedElsewhere)
+                        .await,
+                    WithdrawalOutcome::Failed
+                ),
+                decline_failed: false,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "declining permission {} on session {sid} failed: {e}; it will be retried on \
+                     the next sweep and is never offered in the meantime",
+                    p.request_id
+                );
+                self.withdraw_stored_surface(handles, req, Withdrawal::Retrying)
+                    .await;
+                SettledRefusal {
+                    handled: false,
+                    decline_failed: true,
+                }
+            }
         }
     }
 
@@ -1808,7 +1947,7 @@ impl RequestFlow {
         };
         permission_overflow(p)?;
         self.surfaces
-            .matching_companion(req.id(), companion_target_digest(p))
+            .delivered_companion(req.id(), companion_target_digest(p))
     }
 
     /// Withdraw whatever surface a previous process persisted for a request
@@ -1837,6 +1976,9 @@ impl RequestFlow {
             Withdrawal::AutoAccepted => {
                 crate::feishu::card::question::AUTOACCEPTED_PERMISSION_RECEIPT.to_string()
             }
+            Withdrawal::CompanionUncertain => {
+                crate::feishu::card::question::UNCERTAIN_PERMISSION_RECEIPT.to_string()
+            }
             Withdrawal::Retrying => {
                 crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT.to_string()
             }
@@ -1854,6 +1996,9 @@ impl RequestFlow {
             (Withdrawal::ResolvedElsewhere, None) => serde_json::Value::Null,
             (Withdrawal::AutoAccepted, _) => {
                 crate::feishu::card::question::build_autoaccepted_permission_card()
+            }
+            (Withdrawal::CompanionUncertain, _) => {
+                crate::feishu::card::question::build_uncertain_permission_card()
             }
             (Withdrawal::Retrying, _) => {
                 crate::feishu::card::question::build_unshowable_permission_retry_card()
@@ -2106,17 +2251,24 @@ impl RequestFlow {
         if let PendingRequest::Permission(p) = req
             && let Some(overflow) = permission_overflow(p)
         {
-            let matching = self
-                .surfaces
-                .matching_companion(id, companion_target_digest(p))
-                .is_some();
-            if !matching {
-                tracing::warn!(
-                    "{} {}: recovered card has no matching companion; refusing to re-adopt it",
-                    self.kind.label(),
-                    id
-                );
-                return ReadoptDecision::Refused(overflow);
+            match self.surfaces.matching_companion(id, companion_target_digest(p)) {
+                Some(delivery) if delivery.is_confirmed() => {}
+                Some(_) => {
+                    tracing::warn!(
+                        "{} {}: recovered card has only an uncertain companion marker; refusing to re-adopt it",
+                        self.kind.label(),
+                        id
+                    );
+                    return ReadoptDecision::RefusedUncertain;
+                }
+                None => {
+                    tracing::warn!(
+                        "{} {}: recovered card has no matching companion; refusing to re-adopt it",
+                        self.kind.label(),
+                        id
+                    );
+                    return ReadoptDecision::Refused(overflow);
+                }
             }
         }
         // Remembering the kind's state is what makes the card's buttons resolve
