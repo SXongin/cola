@@ -344,13 +344,17 @@ impl RequestKind for PermissionKind {
         // path pays no extra session lookup.
         let sid = p.session_id.clone().unwrap_or_default();
         match should_auto_accept(flow, &handles.sessions, &handles.backend, &sid, dir).await {
-            Some(true) => return Refusal::NotApplicable,
+            AutoAcceptFlag::On => return Refusal::NotApplicable,
             // Unknown: the flag read failed, so neither decline (irreversible
             // for a request the session may have delegated) nor surface (the
             // card may be clipped). Failed keeps it pending and unmarked, and
             // the next sweep retries.
-            None => return Refusal::Failed,
-            Some(false) => {}
+            AutoAcceptFlag::Unknown => return Refusal::Failed,
+            // Off, and Capped: a chain too deep to read leaves no Auto-Accept
+            // decision to honour, and no card can approve an unshowable target;
+            // waiting forever on the structural cap would hang the turn. Take
+            // the pre-#892 decline.
+            AutoAcceptFlag::Off | AutoAcceptFlag::Capped => {}
         }
         decline_unshowable(handles, p, dir).await
     }
@@ -376,11 +380,11 @@ impl RequestKind for PermissionKind {
         // unseen, and the log line names its length — that record is what keeps
         // the decision auditable without a card (#892).
         match should_auto_accept(flow, &handles.sessions, &handles.backend, &sid, dir).await {
-            Some(true) => {}
-            Some(false) => return Prepared::NotHandled,
+            AutoAcceptFlag::On => {}
+            AutoAcceptFlag::Off | AutoAcceptFlag::Capped => return Prepared::NotHandled,
             // Unknown: retry rather than surface a card the toggle may have
             // replaced (see `should_auto_accept`).
-            None => return Prepared::Retry,
+            AutoAcceptFlag::Unknown => return Prepared::Retry,
         }
         match handles
             .backend
@@ -524,15 +528,16 @@ impl RequestKind for PermissionKind {
                 .await
                 else {
                     // The flag did not persist, so nothing was approved and
-                    // the mode did not change. Release the click's claim: the
-                    // request is still pending and must be offered again (a
-                    // success card here would claim a decision nobody made).
+                    // the mode did not change. Release the click's claim and
+                    // leave the CARD ALONE: replacing a standalone permission
+                    // card with a buttonless result would strand a still-pending
+                    // request (the sweep's `seen` set will not re-surface it),
+                    // and the user must be able to retry either decision.
                     flow.unmark_answered(&handles.requests, req_id).await;
-                    return Some(failed_result_card(
-                        inline,
-                        "自动授权状态保存失败，请重试。",
-                        "保存失败，请重试",
-                    ));
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some("自动授权状态保存失败，请重试。".to_string()),
+                    });
                 };
                 // The clicked request is always resolved by the toggle, even
                 // if the backend list raced past it.
@@ -751,17 +756,31 @@ impl RequestKind for PermissionKind {
 /// direct lookup misses it and it would surface a card even though its parent
 /// session has autoaccept on. Walking the parent chain makes the child inherit
 /// the parent's flag, consistent with `approve_pending_for_session`.
-/// `Some(true)` — the session (or an ancestor) has Auto-Accept on; `Some(false)`
-/// — it has it off; `None` — the parent chain could not be read, so the answer
-/// is unknown. Callers must retry an unknown instead of reading it as off:
-/// declining on a guess is the irreversible outcome #892 is about.
+/// What the parent-chain read says about a session's Auto-Accept flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoAcceptFlag {
+    /// The session, or an ancestor, has it on.
+    On,
+    /// The chain was walked to its end and nothing mapped has it on.
+    Off,
+    /// A hop failed transiently: retrying can succeed.
+    Unknown,
+    /// The chain is deeper than the walk cap, so its end was never reached.
+    /// Retrying cannot fix a structural bound; the surface decides instead.
+    Capped,
+}
+
+/// `On` / `Off` for a resolved flag, `Unknown` when a hop failed (callers must
+/// retry an unknown instead of reading it as off — declining on a guess is the
+/// irreversible outcome #892 is about), and `Capped` when a too-deep chain left
+/// the answer unreachable (a retry loop would hang the turn forever).
 async fn should_auto_accept(
     flow: &RequestFlow,
     sessions: &SessionsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: &str,
-) -> Option<bool> {
+) -> AutoAcceptFlag {
     let found =
         crate::bridge::pollers::walk_parent_chain_result(backend, session_id, Some(directory), |current| {
             let current = current.to_string();
@@ -776,16 +795,29 @@ async fn should_auto_accept(
         })
         .await;
     match found {
-        Ok(flag) => {
+        Ok(Some(true)) => {
             flow.note_autoaccept_read_success(session_id).await;
-            Some(flag.unwrap_or(false))
+            AutoAcceptFlag::On
         }
-        Err(e) => {
+        Ok(_) => {
+            flow.note_autoaccept_read_success(session_id).await;
+            AutoAcceptFlag::Off
+        }
+        Err(crate::bridge::pollers::WalkFailure::Transient(e)) => {
             // ADR-0048: the sweep retries this read every tick, so the latch
             // WARNs the first failure and DEBUGs identical repeats. The request
             // is never declined on the unknown.
             flow.note_autoaccept_read_failure(session_id, &e).await;
-            None
+            AutoAcceptFlag::Unknown
+        }
+        Err(crate::bridge::pollers::WalkFailure::Capped) => {
+            // Rare and permanent: log once per sweep at DEBUG and let the
+            // ordinary surface rule decide rather than wait forever.
+            tracing::debug!(
+                "auto-accept: {session_id}'s parent chain exceeds the walk cap; \
+                 deciding on the surface instead"
+            );
+            AutoAcceptFlag::Capped
         }
     }
 }
