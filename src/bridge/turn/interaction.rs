@@ -56,11 +56,27 @@ impl Turn {
 
     /// Add a permission's inline block to `session_id`'s card. Returns false
     /// when the card already carries the request, or the card session is gone.
+    /// The ordinary (in-budget) insert, kept for tests and callers with no
+    /// companion lane.
+    #[cfg(test)]
     pub(crate) async fn add_permission(
         cards: &CardsHandle,
         session_id: &str,
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
+    ) -> bool {
+        Self::add_permission_with_companion(cards, session_id, p, directory, None).await
+    }
+
+    /// [`Self::add_permission`] for an over-budget request whose full target a
+    /// companion delivered: the block renders the summary naming that lane
+    /// (ADR-0102).
+    pub(crate) async fn add_permission_with_companion(
+        cards: &CardsHandle,
+        session_id: &str,
+        p: &crate::backend::types::PermissionRequest,
+        directory: &str,
+        companion: Option<crate::bridge::surfaces::CompanionLane>,
     ) -> bool {
         // Inserting a block is a card-surface mutation that must not interleave
         // with a flush: a background write that already passed its typed-answer
@@ -69,22 +85,24 @@ impl Turn {
         // #917). The write lock is the flush's own, so the pair is ordered.
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        Self::add_permission_locked(cards, session_id, p, directory).await
+        Self::add_permission_with_companion_locked(cards, session_id, p, directory, companion).await
     }
 
-    /// [`Self::add_permission`] for a caller that already holds the Session's
-    /// card write lock: the sweep's surfacing decision takes it across the
-    /// inline-host check, the block insert and the flush (ADR-0100).
-    pub(crate) async fn add_permission_locked(
+    /// [`Self::add_permission_with_companion`] for a caller that already holds
+    /// the Session's card write lock: the sweep's surfacing decision takes it
+    /// across the inline-host check, the block insert and the flush
+    /// (ADR-0100).
+    pub(crate) async fn add_permission_with_companion_locked(
         cards: &CardsHandle,
         session_id: &str,
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
+        companion: Option<crate::bridge::surfaces::CompanionLane>,
     ) -> bool {
         let block = state::InteractionBlock::Permission(state::PendingPermission {
             session_id: p.session_id.clone().unwrap_or_default(),
             request_id: p.request_id.clone(),
-            body: crate::bridge::request::kind::describe_permission(p),
+            body: crate::bridge::request::kind::describe_permission_for(p, companion),
             target: crate::bridge::request::kind::permission_target(p),
             directory: directory.to_string(),
             always_supported: p.always_supported,

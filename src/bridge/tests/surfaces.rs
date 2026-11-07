@@ -202,6 +202,89 @@ async fn restart_readopts_a_pending_inline_permission() {
     assert_eq!(app.card_handles.lock().await.live_count(), 0);
 }
 
+/// ADR-0102: an over-budget permission's companion record survives a restart.
+/// The new process re-adopts the persisted card WITHOUT re-sending the full
+/// target, and the click guard still approves because the loaded record matches
+/// the pending request.
+#[tokio::test]
+async fn restart_readopts_an_over_budget_permission_without_resending_its_companion() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let request = || {
+        let command = format!("echo {}", "x".repeat(5_000));
+        perm_request("per_long", "ses_1", &command)
+    };
+
+    // The pre-restart process: the companion lands, then the summary card.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(request());
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
+    seed_live_card(&app, "ses_1", "om_live").await;
+    Turn::push_text(&app.cards_handle(), "ses_1", "回合的内容。").await;
+    sweep(&app.permission, &app).await;
+    assert!(
+        platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "post"
+        )),
+        "the companion is delivered before the card"
+    );
+    let raw = persisted(&session_file).expect("the surface record is persisted");
+    assert!(
+        raw.contains("companion") && raw.contains("per_long"),
+        "the delivery record is persisted: {raw}"
+    );
+
+    // The restarted process: same store, same pending request, fresh platform.
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(request());
+    })
+    .await;
+
+    sweep(&app.permission, &app).await;
+
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "readoption trusts the record and never re-sends the companion"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "and posts no second card"
+    );
+
+    // The re-adopted card's Allow click still approves: the persisted digest
+    // matches the pending request it re-read.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_long",
+            "open_message_id": "om_live",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+        }))
+        .await
+        .expect("a card-action result");
+    let ack = card_text(result.card.as_ref().expect("the ack carries the card"));
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令"),
+        "the receipt lands on the re-adopted card: {ack}"
+    );
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "a click in the restarted process still approves"
+    );
+}
+
 /// A pending question inlined on the live card re-adopts the same way: the
 /// repaint is re-rendered from this process's state, a partial answer refreshes
 /// the card in place, and the final answer leaves the receipt on it.
@@ -910,6 +993,13 @@ async fn restart_declines_an_over_budget_inline_permission_instead_of_readopting
         "no second card may be posted for the request"
     );
     assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "and no companion is sent for a card that is being withdrawn"
+    );
+    assert!(
         app.cards_handle()
             .card_handles
             .lock()
@@ -969,6 +1059,13 @@ async fn restart_declines_an_over_budget_standalone_permission_instead_of_readop
     assert!(
         posted_cards(&platform).await.is_empty(),
         "no second card may be posted for the request"
+    );
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "a withdrawn recovered card gets no companion"
     );
     assert!(
         !app.permission.sent_cards.lock().await.contains_key("per_long"),
@@ -1610,13 +1707,17 @@ async fn a_click_on_a_stale_allow_card_declines_an_unshowable_target() {
     );
     assert_eq!(
         result.toast.as_deref(),
-        Some("已自动拒绝：目标无法完整显示"),
+        Some("已拒绝：完整目标未送达"),
         "the toast names the refusal"
     );
     let text = card_text(result.card.as_ref().expect("the result card"));
     assert!(
         text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_DECLINED_LABEL),
         "the result explains the forced refusal: {text}"
+    );
+    assert!(
+        text.contains("完整目标没有成功送达"),
+        "the result names the missing companion as the reason: {text}"
     );
     assert!(
         !text.contains("已允许"),

@@ -411,6 +411,7 @@ pub(crate) async fn mark_stale_cards(
     for (rid, card) in stale {
         sent.lock().await.remove(&rid);
         surfaces.remove_standalone(&rid);
+        surfaces.remove_companion(&rid);
         let over = !card.session_id.is_empty() && dead.contains(&card.session_id);
         let card_json = if over {
             crate::feishu::card::notify::build_interrupted_card(kind, &card.summary)

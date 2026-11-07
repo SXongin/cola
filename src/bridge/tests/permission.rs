@@ -2345,13 +2345,494 @@ async fn sweep_lists_once_per_directory_not_per_session() {
     );
 }
 
-/// Whole-branch re-review #883: the completeness proof runs on the bridge, not
-/// in an adapter, so an **OpenCode** permission whose command is longer than the
-/// card can show is never offered for approval. The request is rejected on the
-/// server (freeing the turn) and the chat gets the named reason; no surface
-/// carries the clipped command with Allow buttons.
+/// ADR-0102 (parent spec #1010): an over-budget permission is no longer
+/// refused. The sweep delivers the full target as a Rich Text Message
+/// companion FIRST, then surfaces the request with a summary; the click guard
+/// trusts the delivered record. The companion lands before the card, so there
+/// is no window where a button approves text the user never saw.
 #[tokio::test]
-async fn an_over_budget_permission_is_declined_and_never_offered() {
+async fn an_over_budget_permission_surfaces_with_a_post_companion_and_approves() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let cfg = test_config(&session_file);
+    let command = format!("echo {}", "x".repeat(5_000));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command.clone()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    // A live card is the reply target the companion rides under.
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    // One companion, delivered as a `post` with an `md` tag carrying the full
+    // target — not one per surface.
+    let posts: Vec<serde_json::Value> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::SendMessageReply {
+                msg_type, content, ..
+            } if msg_type == "post" => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(posts.len(), 1, "the companion is sent once per request");
+    let md = posts[0]["zh_cn"]["content"][0][0]["text"]
+        .as_str()
+        .expect("the companion carries a markdown element");
+    assert!(
+        md.contains(&command),
+        "the companion carries the full target: {md}"
+    );
+    assert!(
+        md.contains("执行 Shell 命令"),
+        "the companion names the action: {md}"
+    );
+
+    // The card is a summary: action, total count, the first 120 characters and
+    // where the full target went — never the full command.
+    assert_eq!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .len(),
+        1,
+        "the request is offered for approval"
+    );
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let text = card_text(&card);
+    assert!(text.contains("执行 Shell 命令"), "action missing: {text}");
+    assert!(
+        text.contains(&format!("{} 字符", command.chars().count())),
+        "the summary names the total length: {text}"
+    );
+    let excerpt: String = command.chars().take(120).collect();
+    assert!(
+        text.contains(&excerpt),
+        "the summary carries the first 120 characters: {text}"
+    );
+    assert!(
+        text.contains("富文本消息（Rich Text Message）"),
+        "the summary names the Rich Text Message lane: {text}"
+    );
+    assert!(
+        !text.contains(&command),
+        "the card must not carry the full target: {text}"
+    );
+
+    // The delivery record is persisted beside the surface records.
+    let raw = std::fs::read_to_string(crate::state::StateLayout::beside(
+        &session_file,
+        "interactive_surfaces.json",
+    ))
+    .expect("the delivery is persisted");
+    assert!(
+        raw.contains("companion") && raw.contains("per_long") && raw.contains("RichText"),
+        "the companion record is persisted: {raw}"
+    );
+
+    // Clicking 允许一次 approves exactly the request the companion carried; the
+    // Interaction Receipt still names the target.
+    let ack = click_perm(&app, "once", "per_long", "✅ 已允许一次").await;
+    assert!(
+        ack.contains("✅ 已允许一次：⚡ 执行 Shell 命令"),
+        "the receipt names the decision: {ack}"
+    );
+    assert!(ack.contains("echo"), "and the target it approved: {ack}");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the click replies once, not a forced rejection"
+    );
+
+    // Resolution removes the companion record (the cached card JSON may remain
+    // until its own lifecycle releases it, but the delivery proof is gone).
+    let record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(crate::state::StateLayout::beside(
+            &session_file,
+            "interactive_surfaces.json",
+        ))
+        .unwrap_or_default(),
+    )
+    .unwrap_or(serde_json::Value::Null);
+    assert!(
+        record["companion"]["default"].get("per_long").is_none(),
+        "a resolved request leaves no companion record: {record}"
+    );
+}
+
+/// A companion record whose digest does not match the pending request it is
+/// meant to prove — a target that changed after the delivery — is no proof. The
+/// click guard refuses the approval and the result names the missing delivery.
+#[tokio::test]
+async fn a_stale_companion_digest_is_refused_at_the_click() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!("echo {}", "x".repeat(5_000));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    // The turn has ended: the click has no live accumulator to ack, so the
+    // result card itself is returned.
+    Turn::set_card_state(
+        &app.cards_handle(),
+        "ses_test",
+        crate::feishu::card::CardState::Idle,
+    )
+    .await;
+
+    // Simulate a record left by a delivery of a DIFFERENT target.
+    app.permission.surfaces.set_companion(
+        "per_long",
+        crate::bridge::surfaces::CompanionDelivery {
+            message_id: "om_post".into(),
+            lane: crate::bridge::surfaces::CompanionLane::RichText,
+            target_digest: 0,
+        },
+    );
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_test",
+            "directory": "/work",
+            "request_id": "per_long",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+        }))
+        .await
+        .expect("a card-action result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "a stale digest never approves"
+    );
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已拒绝：完整目标未送达"),
+        "the toast names the missing delivery"
+    );
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains("完整目标没有成功送达"),
+        "the result card says why: {text}"
+    );
+}
+
+/// The result card an over-budget approval returns is the same summary form:
+/// it names the action, the total length and the companion lane, and never
+/// renders the full target on the card.
+#[tokio::test]
+async fn an_over_budget_allow_result_card_names_the_target() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!("echo {}", "x".repeat(5_000));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command.clone()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    // The turn has ended: the click has no live accumulator to ack, so the
+    // result card itself is returned.
+    Turn::set_card_state(
+        &app.cards_handle(),
+        "ses_test",
+        crate::feishu::card::CardState::Idle,
+    )
+    .await;
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_test",
+            "directory": "/work",
+            "request_id": "per_long",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+        }))
+        .await
+        .expect("a card-action result");
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(text.contains("✅ 已允许一次"), "decision missing: {text}");
+    assert!(
+        text.contains("执行 Shell 命令"),
+        "the result names the action: {text}"
+    );
+    assert!(
+        text.contains("5005 字符"),
+        "and the target's total length: {text}"
+    );
+    assert!(
+        text.contains("富文本消息（Rich Text Message）"),
+        "and where the full target went: {text}"
+    );
+    assert!(
+        !text.contains(&command),
+        "the result never renders the full target: {text}"
+    );
+}
+
+/// ADR-0083 §5's ladder: a target whose Rich Text `post` body would exceed the
+/// 30 KB cap does NOT take that lane — the File Message carries the full bytes
+/// under a name that names the request, and the card summary says File Message
+/// while still naming the target excerpt.
+#[tokio::test]
+async fn an_over_budget_post_body_falls_to_a_file_companion() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = "x".repeat(31_000);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_huge".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command.clone()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(replies.lock().await.is_empty(), "never declined");
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "post"
+        )),
+        "a body past the post cap takes no Rich Text lane"
+    );
+    let upload = calls
+        .iter()
+        .find_map(|call| match call {
+            PlatformCall::UploadFile { name, content, .. } => Some((name.clone(), content.clone())),
+            _ => None,
+        })
+        .expect("the File Message lane uploads the full target");
+    assert!(
+        upload.0.contains("per_huge") && upload.0.ends_with(".txt"),
+        "the file name names the request: {}",
+        upload.0
+    );
+    assert_eq!(
+        upload.1,
+        command.as_bytes(),
+        "the uploaded bytes are the full target"
+    );
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { msg_type, content, .. }
+                if msg_type == "file" && content["file_key"] == "file_test"
+        )),
+        "the File Message carries the uploaded key: {calls:?}"
+    );
+
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let text = card_text(&card);
+    assert!(
+        text.contains("文件消息（File Message）"),
+        "the summary names the File Message lane: {text}"
+    );
+    let excerpt: String = command.chars().take(120).collect();
+    assert!(
+        text.contains(&excerpt),
+        "the summary still names the target excerpt: {text}"
+    );
+    assert!(
+        !text.contains(&command),
+        "the card never carries the full target: {text}"
+    );
+}
+
+/// The companion proof covers the **summed** target budget, not the longest
+/// single target: two patterns that each fit still exceed the one display
+/// element, so the request takes the companion lane and its card carries the
+/// summed count.
+#[tokio::test]
+async fn an_over_summed_permission_surfaces_with_a_companion() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let pattern = "x".repeat(1_600);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![pattern.clone(), pattern.clone()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        replies.lock().await.is_empty(),
+        "the summed target is not declined"
+    );
+    let posts: Vec<serde_json::Value> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::SendMessageReply {
+                msg_type, content, ..
+            } if msg_type == "post" => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(posts.len(), 1, "one companion carries both targets");
+    let md = posts[0]["zh_cn"]["content"][0][0]["text"]
+        .as_str()
+        .expect("the companion carries a markdown element");
+    assert_eq!(
+        md.matches(&pattern).count(),
+        2,
+        "the companion carries both full targets"
+    );
+
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let text = card_text(&card);
+    assert!(
+        text.contains("3200 字符"),
+        "the summary names the summed length: {text}"
+    );
+    assert!(
+        text.contains("富文本消息（Rich Text Message）"),
+        "and where the full targets went: {text}"
+    );
+}
+
+/// Carry-over from #1011's review (binding for #1012): the companion proof is
+/// the ONE `PermissionOverflow`, not the target sum alone. A request whose
+/// targets fit the 3,000 budget but whose rendered body crosses the measured
+/// single-element ceiling also takes the companion lane and is surfaced with a
+/// summary. A `Body` overflow must never be the one overflow still refused.
+#[tokio::test]
+async fn a_body_overflow_also_takes_the_companion_lane() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // 2,900 target characters fit the target budget; the 200-char metadata
+    // line pushes the rendered body past 3,060.
+    let command = "x".repeat(2_900);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_body".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command.clone()],
+        metadata: Some(serde_json::json!({ "command": "y".repeat(200) })),
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        replies.lock().await.is_empty(),
+        "the rendered-body overflow is not declined"
+    );
+    let posts: Vec<serde_json::Value> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::SendMessageReply {
+                msg_type, content, ..
+            } if msg_type == "post" => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(posts.len(), 1, "the body overflow gets a companion");
+    let md = posts[0]["zh_cn"]["content"][0][0]["text"]
+        .as_str()
+        .expect("the companion carries a markdown element");
+    assert!(
+        md.contains(&command),
+        "the companion carries the full target: {md}"
+    );
+
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let text = card_text(&card);
+    assert!(
+        text.contains("富文本消息（Rich Text Message）"),
+        "the summary names the companion lane: {text}"
+    );
+    assert!(text.contains("目标长度"), "and the summary form: {text}");
+}
+
+/// If both companion lanes fail, no interactive approval is offered: the
+/// request follows the existing refusal path. A decline that also fails must
+/// stay pending and unmarked, so the next sweep retries — a refusal that never
+/// landed would otherwise leave the server waiting with no actionable card.
+#[tokio::test]
+async fn a_failed_companion_and_decline_keep_the_request_retryable() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2369,200 +2850,17 @@ async fn an_over_budget_permission_is_declined_and_never_offered() {
         always: Vec::new(),
         always_supported: true,
     }]);
-    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
-    let (app, platform) = build_app(cfg, backend).await;
-
-    // Seed a session + accumulator so the poller has a reply target.
-    seed_live_card(&app, "ses_test", "om_live").await;
-
-    tokio::spawn({
-        let app = app.clone();
-        async move {
-            app.permission
-                .poll_interval_ms
-                .store(20, std::sync::atomic::Ordering::Relaxed);
-            let _ = app.permission.poll_loop(&app.flow_handles()).await;
-        }
-    });
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while replies.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the unshowable permission was never declined"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert_eq!(
-        replies.lock().await.as_slice(),
-        &[("per_long".to_string(), "reject".to_string())],
-        "the server gets the refusal, not a stalled turn"
-    );
-
-    // No permission block, no Allow buttons, and no card carrying the raw
-    // command: the decision was never offered.
-    assert!(
-        Turn::live_permissions(&app.cards_handle(), "ses_test")
-            .await
-            .is_empty(),
-        "an unshowable permission must never become an inline block"
-    );
-    let mut cards = platform.sent_cards().await;
-    cards.extend(platform.replied_cards().await);
-    assert!(
-        cards
-            .iter()
-            .any(|card| card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
-        "the chat gets the reason card"
-    );
-    assert!(
-        cards.iter().all(|card| !card_text(card).contains(&command)),
-        "the clipped target is never rendered as an approval"
-    );
-}
-
-/// The refusal diagnostic measures the **sum** of the targets, matching the
-/// proof: two patterns that each fit are still declined, and the log names the
-/// summed length rather than the longest one.
-#[tokio::test]
-async fn an_over_summed_permission_is_declined_and_the_log_names_the_total() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let pattern = "x".repeat(1_600);
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
-        request_id: "per_long".into(),
-        session_id: Some("ses_test".into()),
-        permission: Some("bash".into()),
-        patterns: vec![pattern.clone(), pattern],
-        metadata: None,
-        always: Vec::new(),
-        always_supported: true,
-    }]);
-    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
-    let (app, platform) = build_app(cfg, backend).await;
-    seed_session(&app, "ses_test", "/work").await;
-
-    let mut seen = std::collections::HashSet::new();
-    let (_, logs) = capture_logs(async {
-        app.permission.sweep(&app.flow_handles(), &mut seen).await;
-    })
-    .await;
-
-    assert_eq!(
-        replies.lock().await.as_slice(),
-        &[("per_long".to_string(), "reject".to_string())],
-        "the summed target proof declines before any surface"
-    );
-    let line = assert_line_level(&logs, "declined permission per_long", "WARN");
-    assert!(
-        line.contains("targets total 3200 characters"),
-        "the diagnostic names the summed target length: {line}"
-    );
-    assert!(
-        line.contains("past the card's 3000 character budget"),
-        "and the target budget it crossed: {line}"
-    );
-    let mut cards = platform.sent_cards().await;
-    cards.extend(platform.replied_cards().await);
-    assert!(
-        cards
-            .iter()
-            .any(|card| card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
-        "the chat gets the reason card"
-    );
-}
-
-/// A request whose targets fit the 3,000 budget but whose rendered body crosses
-/// the measured single-element ceiling is declined with the render copy, before
-/// any approval surface: the chrome (here `metadata.command`) consumes the
-/// remaining room.
-#[tokio::test]
-async fn a_body_over_the_render_ceiling_is_declined_with_the_render_copy() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    // 2,900 target characters fit the target budget; the 200-char metadata
-    // line pushes the rendered body past 3,060.
-    let command = "x".repeat(2_900);
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
-        request_id: "per_body".into(),
-        session_id: Some("ses_test".into()),
-        permission: Some("bash".into()),
-        patterns: vec![command],
-        metadata: Some(serde_json::json!({ "command": "y".repeat(200) })),
-        always: Vec::new(),
-        always_supported: true,
-    }]);
-    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
-    let (app, platform) = build_app(cfg, backend).await;
-    seed_session(&app, "ses_test", "/work").await;
-
-    let mut seen = std::collections::HashSet::new();
-    let (_, logs) = capture_logs(async {
-        app.permission.sweep(&app.flow_handles(), &mut seen).await;
-    })
-    .await;
-
-    assert_eq!(
-        replies.lock().await.as_slice(),
-        &[("per_body".to_string(), "reject".to_string())],
-        "the rendered-body proof declines before any surface"
-    );
-    let line = assert_line_level(&logs, "declined permission per_body", "WARN");
-    assert!(
-        line.contains("past the card's 3060 character budget"),
-        "the diagnostic names the render ceiling: {line}"
-    );
-    let mut cards = platform.sent_cards().await;
-    cards.extend(platform.replied_cards().await);
-    assert!(
-        cards.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
-                && card_text(card).contains("3060")
-        }),
-        "the reason card names the render ceiling it crossed: {cards:?}"
-    );
-    assert!(
-        Turn::live_permissions(&app.cards_handle(), "ses_test")
-            .await
-            .is_empty(),
-        "no permission block is offered"
-    );
-}
-
-/// Whole-branch re-review #883: an over-budget permission the flow could not
-/// decline (a failed reply) must not be reported as handled. It stays pending
-/// and unmarked, nothing is posted for it, and the next sweep retries — a
-/// decline that never landed would otherwise leave the server waiting with no
-/// actionable card, because `seen` would have retired the request.
-#[tokio::test]
-async fn a_failed_decline_keeps_the_request_retryable_and_posts_nothing() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let command = format!(
-        "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
-    );
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
-        request_id: "per_long".into(),
-        session_id: Some("ses_test".into()),
-        permission: Some("bash".into()),
-        patterns: vec![command],
-        metadata: None,
-        always: Vec::new(),
-        always_supported: true,
-    }]);
+    // The decline fails once; the platform refuses every companion send across
+    // both sweeps (post + file on each).
     backend
         .fail_reply_permission_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
     let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
     let (app, platform) = build_app(cfg, backend).await;
-    seed_session(&app, "ses_test", "/work").await;
+    platform
+        .fail_send_message_count
+        .store(4, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     // The same `seen` set across both sweeps: a failed refusal that marked the
     // request seen would never be retried.
@@ -2572,7 +2870,7 @@ async fn a_failed_decline_keeps_the_request_retryable_and_posts_nothing() {
     assert_eq!(
         replies.lock().await.as_slice(),
         &[("per_long".to_string(), "reject".to_string())],
-        "the first sweep tries the decline"
+        "the first sweep tries the decline after both lanes fail"
     );
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.replied_cards().await);
@@ -2584,10 +2882,10 @@ async fn a_failed_decline_keeps_the_request_retryable_and_posts_nothing() {
         Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
             .is_empty(),
-        "and it is never offered for approval"
+        "and no interactive approval is ever offered"
     );
 
-    // The retry succeeds: the reply lands and the reason card is posted.
+    // The retry succeeds: the declination lands and the reason card is posted.
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         replies.lock().await.len(),
@@ -2600,6 +2898,12 @@ async fn a_failed_decline_keeps_the_request_retryable_and_posts_nothing() {
         cards.iter().any(|card| card_text(card)
             .contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
         "the successful retry explains the refusal"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "the request is never offered for approval"
     );
 }
 
@@ -2671,6 +2975,15 @@ async fn auto_accept_approves_an_unshowable_permission() {
             .await
             .is_empty(),
         "and no permission block is offered"
+    );
+    // Auto-Accept renders no surface at all, so it sends no companion either
+    // (ADR-0101 is untouched by the companion lane, ADR-0102).
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "auto-accept sends no companion message"
     );
     // The approval happened without a card, so the log is the only record of
     // what the session delegated: it must name the request, the target's exact
