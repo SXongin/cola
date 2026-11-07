@@ -292,35 +292,34 @@ pub(crate) fn build_unshowable_permission_retry_card() -> serde_json::Value {
     )
 }
 
-/// The receipt an inline over-budget block collapses to when an Auto-Accept
-/// session approves the request unseen while withdrawing the card that could
-/// not show it (ADR-0101, ADR-0102).
-pub(crate) const AUTOACCEPTED_PERMISSION_RECEIPT: &str = "🔄 已自动授权：目标未在卡片完整显示，已批准";
+/// The receipt an inline over-budget block collapses to when its old card is
+/// superseded by a fresh process. The request itself is reprocessed (Auto-
+/// Accept or a new companion card); this card only stops being interactive.
+pub(crate) const SUPERSEDED_PERMISSION_RECEIPT: &str = "🔄 已重新处理：旧卡片已失效";
 
-/// The header of the card that replaces a recovered over-budget permission card
-/// when an Auto-Accept session approves it unseen.
-pub(crate) const AUTOACCEPTED_PERMISSION_HEADER: &str = "🔄 权限已自动授权";
+/// The header of a standalone card that is superseded by a fresh process.
+pub(crate) const SUPERSEDED_PERMISSION_HEADER: &str = "🔄 权限请求正在重新处理";
 
-/// Why that card carries no controls.
-pub(crate) fn autoaccepted_permission_note() -> &'static str {
-    "该会话已开启自动授权，这个请求已自动批准（目标未在卡片上完整显示）。\
-     卡片不再提供操作；如需复核，请在原始客户端查看该请求。"
+/// Why a recovered card carries no controls.
+pub(crate) fn superseded_permission_note() -> &'static str {
+    "这张卡片来自旧的进程，已不再提供操作；该请求会由当前进程重新处理——\
+     自动授权会话会直接批准，其他会话会重新送达完整内容并提供新的权限卡片。"
 }
 
-/// The non-interactive card that replaces a recovered over-budget permission
-/// card after an Auto-Accept session approved it unseen.
-pub(crate) fn build_autoaccepted_permission_card() -> serde_json::Value {
+/// The non-interactive card that replaces a recovered card the new process
+/// cannot re-adopt (ADR-0101, ADR-0102).
+pub(crate) fn build_superseded_permission_card() -> serde_json::Value {
     card_shell(
-        AUTOACCEPTED_PERMISSION_HEADER,
-        "blue",
-        vec![json!({ "tag": "markdown", "content": autoaccepted_permission_note() })],
+        SUPERSEDED_PERMISSION_HEADER,
+        "grey",
+        vec![json!({ "tag": "markdown", "content": superseded_permission_note() })],
     )
 }
 
 /// The header of the card that explains a permission whose companion send
 /// outcome is unknown. An unconfirmed delivery is not a completeness proof, so
 /// the request was declined and no interactive approval is offered.
-pub(crate) const UNCERTAIN_PERMISSION_HEADER: &str = "🚫 权限请求已拒绝（目标送达结果未知）";
+pub(crate) const UNCERTAIN_PERMISSION_HEADER: &str = "🚫 权限请求已拒绝（完整内容送达结果未知）";
 
 /// Why the request was declined when the companion's outcome is unknown.
 pub(crate) fn uncertain_permission_note() -> &'static str {
@@ -340,23 +339,23 @@ pub(crate) fn build_uncertain_permission_card() -> serde_json::Value {
 
 /// The receipt an inline over-budget block collapses to when its companion
 /// outcome is unknown and the request was declined.
-pub(crate) const UNCERTAIN_PERMISSION_RECEIPT: &str = "🚫 已拒绝：完整目标送达结果未知";
+pub(crate) const UNCERTAIN_PERMISSION_RECEIPT: &str = "🚫 已拒绝：完整内容送达结果未知";
 
 /// The label of the result card when a click is refused because the companion
 /// outcome is unknown.
-pub(crate) const UNCERTAIN_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（目标送达结果未知）";
+pub(crate) const UNCERTAIN_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（完整内容送达结果未知）";
 
-/// The label of the result card cola shows when it refuses a click on a
-/// permission whose target it cannot show in full (the click asked to approve
-/// text the user never saw). Pinned with the refusal copy above.
-pub(crate) const UNSHOWABLE_PERMISSION_DECLINED_LABEL: &str = "🚫 已自动拒绝（目标无法完整显示）";
+/// The label of the result card cola shows when its click finds no confirmed
+/// companion delivery. It is a CLICK decision, not an automatic refusal of the
+/// request, so the wording says the click was declined.
+pub(crate) const MISSING_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（完整内容未送达）";
 
-/// Why the click guard refuses an over-budget approval whose companion
-/// delivery is missing or stale (ADR-0102): the full target never landed, so
-/// there is nothing the user could have reviewed to approve.
-pub(crate) fn unshowable_permission_undelivered_note() -> String {
-    "该权限请求的目标超过卡片显示预算，且完整目标没有成功送达（找不到匹配的伴随消息，或目标已变化）。\
-     为了不让你批准没有完整看到的内容，cola 已拒绝本次点击；请重试，或在原始客户端查看该请求。"
+/// Why the click guard refuses an over-budget approval whose confirmed
+/// companion delivery is missing or stale (ADR-0102): the full content never
+/// landed, so there is nothing the user could have reviewed to approve.
+pub(crate) fn missing_permission_click_note() -> String {
+    "该权限请求的完整内容超过卡片显示预算，且没有找到已送达的伴随消息（或内容已变化）。\
+     为了不让你批准没有完整看到的内容，本次点击已拒绝。请重试，或在原始客户端查看该请求。"
         .to_string()
 }
 

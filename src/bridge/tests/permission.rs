@@ -2545,12 +2545,12 @@ async fn a_stale_companion_digest_is_refused_at_the_click() {
     );
     assert_eq!(
         result.toast.as_deref(),
-        Some("已拒绝：完整目标未送达"),
+        Some("已拒绝：完整内容未送达"),
         "the toast names the missing delivery"
     );
     let text = card_text(result.card.as_ref().expect("the result card"));
     assert!(
-        text.contains("完整目标没有成功送达"),
+        text.contains("没有找到已送达的伴随消息"),
         "the result card says why: {text}"
     );
 }
@@ -2929,7 +2929,7 @@ async fn an_allow_click_on_an_uncertain_companion_is_refused() {
     );
     assert_eq!(
         result.toast.as_deref(),
-        Some("已拒绝：完整目标送达结果未知"),
+        Some("已拒绝：完整内容送达结果未知"),
         "the toast names the unknown outcome"
     );
     let text = card_text(result.card.as_ref().expect("the result card"));
@@ -2940,6 +2940,129 @@ async fn an_allow_click_on_an_uncertain_companion_is_refused() {
     assert!(
         text.contains("送达结果未知"),
         "and the result body says why approval is unavailable: {text}"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "no interactive approval is offered"
+    );
+}
+
+/// A definite Rich Text failure falls to the File lane; if the FILE send is
+/// then ambiguous, the companion outcome is unknown. No caption is sent (it
+/// would point at a file that may not exist), no retry happens, and the request
+/// follows the uncertain refusal path.
+#[tokio::test]
+async fn an_ambiguous_file_after_a_definite_post_failure_is_uncertain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!("echo {}", "x".repeat(5_000));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command.clone()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    // Keep the decline from landing, so the uncertain marker survives to be
+    // asserted after the sweep.
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .fail_send_message_definite_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform
+        .ambiguous_send_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls
+            .iter()
+            .any(|call| matches!(call, PlatformCall::UploadFile { .. })),
+        "the definite post failure falls to the File lane"
+    );
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"
+        )),
+        "the ambiguous file send did not land"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| matches!(call, PlatformCall::ReplyText { .. })),
+        "no caption points at a file that may not exist"
+    );
+    let record = app
+        .permission
+        .surfaces
+        .companion("per_long")
+        .expect("the uncertain marker is recorded");
+    assert!(record.message_id.is_empty());
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the uncertain file declines"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "no interactive approval is offered"
+    );
+}
+
+/// A "successful" send that returns no message id is treated exactly like an
+/// ambiguous send: an uncertain marker, not a delivery. The card/guard halves
+/// must agree that `is_uncertain` means no proof.
+#[tokio::test]
+async fn an_empty_companion_message_id_is_not_a_delivery() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!("echo {}", "x".repeat(5_000));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform.given_message_reply_id("");
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let record = app
+        .permission
+        .surfaces
+        .companion("per_long")
+        .expect("the send is recorded");
+    assert!(
+        record.message_id.is_empty() && record.is_uncertain(),
+        "an empty id is an uncertain marker, not a confirmed delivery"
     );
     assert!(
         Turn::live_permissions(&app.cards_handle(), "ses_test")
@@ -3203,6 +3326,15 @@ async fn a_body_overflow_also_takes_the_companion_lane() {
     assert!(
         md.contains(&"y".repeat(200)),
         "and the metadata the rendered-body proof charged: {md}"
+    );
+    assert_eq!(
+        md.matches("执行 Shell 命令").count(),
+        1,
+        "the action is not duplicated by a second header: {md}"
+    );
+    assert!(
+        !md.starts_with("```"),
+        "a rendered-body companion is markdown, not a literal code fence: {md}"
     );
 
     let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
