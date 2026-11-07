@@ -69,7 +69,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::backend::PERMISSION_PATTERN_MAX_CHARS;
+use crate::backend::PERMISSION_TARGET_MAX_CHARS;
 use crate::backend::types::{
     FormAnswer, FormFieldKind, FormValue, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
 };
@@ -1108,10 +1108,10 @@ const PROFILE_UNEXPRESSIBLE: &str = "the requested permission profile has a gran
 /// A requested path/glob whose rendered form would be truncated by the card.
 const PROFILE_TOO_LONG: &str = "a requested permission path is longer than the card can show";
 
-/// Whether the card renders this pattern in full (the renderer clips at
-/// [`PERMISSION_PATTERN_MAX_CHARS`] characters).
+/// Whether the card renders this pattern in full (the shared target budget; the
+/// bridge's summed proof covers the whole request).
 fn pattern_fits(rendered: &str) -> bool {
-    rendered.chars().count() <= PERMISSION_PATTERN_MAX_CHARS
+    rendered.chars().count() <= PERMISSION_TARGET_MAX_CHARS
 }
 
 /// Whether the card can render every part of a requested permission profile.
@@ -2129,7 +2129,7 @@ mod tests {
     /// bridge the target truthfully.
     #[test]
     fn a_command_past_the_display_budget_still_decodes_for_the_bridge_to_decide() {
-        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+        let budget = crate::backend::types::PERMISSION_TARGET_MAX_CHARS;
         let command = format!("{}a", "a".repeat(budget));
         let params = json!({
             "threadId": "thread-1",
@@ -2159,7 +2159,7 @@ mod tests {
     /// approve unseen under Auto-Accept).
     #[test]
     fn a_legacy_command_past_the_display_budget_is_unshowable() {
-        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+        let budget = crate::backend::types::PERMISSION_TARGET_MAX_CHARS;
         let params = json!({
             "conversationId": "thread-1",
             "callId": "call-1",

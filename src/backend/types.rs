@@ -681,57 +681,29 @@ impl SessionStatus {
     }
 }
 
-/// The character budget for one rendered permission pattern. A request whose
-/// rendered target would exceed it is refused before a card is offered, so the
-/// user approves exactly what the card shows. Neutral presentation contract:
-/// the card renderer and every adapter that can raise an approval share it.
-pub const PERMISSION_PATTERN_MAX_CHARS: usize = 150;
-
-/// The character budget for one rendered **command** target.
+/// The character budget for a permission request's rendered targets — the ONE
+/// display budget, shared by every action.
 ///
-/// A command approval's target is the command itself, not a short path, so the
-/// pattern budget above would truncate ordinary invocations (`cargo test
-/// --workspace --all-targets` is already over half of it) — and a target the
-/// card clips is a target the user approves without seeing. The budget is
-/// therefore larger, and still small enough that the card's own limits hold:
-/// the permission body is rendered once and copied into every button's
-/// callback value, so it appears six times in the card's JSON (one markdown
-/// element plus five buttons); 1,000 characters of the worst case (CJK, three
-/// bytes each) is 18 KB of a 25 KB body budget. See
-/// `permission_target_budget` for the one place that maps an action to it, and
-/// the card tests that pin the rendered card inside
-/// [`crate::feishu::card::MAX_CARD_JSON_CHARS`].
+/// The card renders every target of a request in one markdown element, so the
+/// budget is charged against the **sum** of their character counts
+/// ([`PermissionRequest::targets_are_fully_shown`]), never against one target
+/// at a time. 3,000 is derived from two measured ceilings:
 ///
-/// A request must never be offered for approval unless every target fits:
+/// - the platform's single markdown element renders 8,000 ASCII / 3,060 CJK
+///   characters fully (`docs/research/feishu-rich-surfaces/
+///   r1-display-surface-inventory.md`), so a script-independent budget takes
+///   the smaller number and rounds down;
+/// - the card's JSON worst case is `<` → `&#60;` at five bytes per character,
+///   so 3,000 CJK characters of target text is ~15 KB; the fenced fallback and
+///   the card's chrome still stay inside
+///   [`crate::feishu::card::MAX_CARD_JSON_CHARS`].
+///
+/// A request must never be offered for approval unless its targets fit:
 /// [`PermissionRequest::targets_are_fully_shown`] is the proof. An interactive
 /// surface declines what fails it with a named reason card rather than showing
 /// part of what a button would approve; an Auto-Accept session renders no card
 /// and approves the request unseen, logging its length (ADR-0101).
-pub const PERMISSION_COMMAND_MAX_CHARS: usize = 1000;
-
-/// Whether `action` names a shell command, i.e. a target whose text IS the
-/// decision rather than a short path or grant name. The spellings are the
-/// neutral surface's own: both OpenCode generations' shell tool and Codex's
-/// `command` approval.
-pub fn is_command_action(action: &str) -> bool {
-    matches!(action, "bash" | "shell" | "command")
-}
-
-/// The character budget for one rendered target of `action`: the command budget
-/// where the target is a command ([`is_command_action`]), the pattern budget
-/// everywhere else.
-///
-/// One definition, shared by the renderer (which clips) and by the permission
-/// flow's completeness proof (`PermissionRequest::targets_are_fully_shown`,
-/// which refuses what the renderer would clip), so the two can never disagree
-/// about what "shown in full" means.
-pub fn permission_target_budget(action: &str) -> usize {
-    if is_command_action(action) {
-        PERMISSION_COMMAND_MAX_CHARS
-    } else {
-        PERMISSION_PATTERN_MAX_CHARS
-    }
-}
+pub const PERMISSION_TARGET_MAX_CHARS: usize = 3000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PermissionRequest {
@@ -762,31 +734,35 @@ fn always_supported_default() -> bool {
 }
 
 impl PermissionRequest {
-    /// The character budget every target of this request is rendered at: the
-    /// command budget for a command target, the short pattern budget otherwise
-    /// (see [`permission_target_budget`]).
+    /// The character budget the request's rendered targets share (see
+    /// [`PERMISSION_TARGET_MAX_CHARS`]).
     pub fn target_budget(&self) -> usize {
-        permission_target_budget(self.permission.as_deref().unwrap_or_default())
+        PERMISSION_TARGET_MAX_CHARS
     }
 
-    /// Whether the card renders **every** target in full at
-    /// [`Self::target_budget`].
+    /// Whether the card renders **every** target in full within
+    /// [`PERMISSION_TARGET_MAX_CHARS`].
     ///
-    /// `false` means the card would have to clip one, so the request must never
-    /// be offered for **approval on a card**: the buttons approve what the card
-    /// shows, and a clipped command would approve a suffix the user never saw.
-    /// Every client is covered here rather than in its adapter — the card is
-    /// the shared decision surface, so the completeness proof belongs to the
+    /// The budget is charged against the **sum** of every target's character
+    /// count, because the card renders them all in one element: two 1,500
+    /// character patterns are as long as one 3,000 character pattern, and the
+    /// element sees both the same way.
+    ///
+    /// `false` means the card would have to clip something, so the request must
+    /// never be offered for **approval on a card**: the buttons approve what
+    /// the card shows, and a clipped target would approve text the user never
+    /// saw. Every client is covered here rather than in its adapter — the card
+    /// is the shared decision surface, so the completeness proof belongs to the
     /// same layer as the renderer that clips. An Auto-Accept session renders no
     /// card; it approves the request unseen and records its length (ADR-0101),
     /// so this proof has nothing to guard there.
     pub fn targets_are_fully_shown(&self) -> bool {
-        self.longest_target_len() <= self.target_budget()
+        self.total_target_len() <= self.target_budget()
     }
 
     /// The longest target by character count, if the request carries any. One
-    /// definition for "what the card would clip": the proof, the Auto-Accept
-    /// audit line and the refusal's diagnostic all read it.
+    /// definition for "what the card would clip": the Auto-Accept audit line
+    /// and the refusal's diagnostic read it.
     pub fn longest_target(&self) -> Option<&str> {
         self.patterns
             .iter()
@@ -798,11 +774,51 @@ impl PermissionRequest {
     pub fn longest_target_len(&self) -> usize {
         self.longest_target().map_or(0, |target| target.chars().count())
     }
+
+    /// The summed character count of every target, 0 when the request carries
+    /// none. This is what the display budget bounds: the card renders the
+    /// targets together in one element.
+    pub fn total_target_len(&self) -> usize {
+        self.patterns.iter().map(|pattern| pattern.chars().count()).sum()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one display budget is charged against the SUM of every target, not
+    /// each separately: two patterns under the budget individually can still
+    /// overflow the one element the card renders them in.
+    #[test]
+    fn targets_are_fully_shown_measures_the_sum_at_the_target_budget() {
+        let request = |patterns: Vec<&str>| PermissionRequest {
+            request_id: "per_1".into(),
+            session_id: Some("ses_1".into()),
+            permission: Some("bash".into()),
+            patterns: patterns.into_iter().map(str::to_string).collect(),
+            metadata: None,
+            always: Vec::new(),
+            always_supported: true,
+        };
+        assert_eq!(PERMISSION_TARGET_MAX_CHARS, 3000);
+        assert!(
+            request(vec![&"a".repeat(1500), &"b".repeat(1500)]).targets_are_fully_shown(),
+            "exactly the budget is fully shown"
+        );
+        assert!(
+            !request(vec![&"a".repeat(1500), &"b".repeat(1501)]).targets_are_fully_shown(),
+            "two patterns that each fit still overflow the summed budget"
+        );
+        assert!(
+            !request(vec![&"a".repeat(3001)]).targets_are_fully_shown(),
+            "a single over-budget target is refused"
+        );
+        assert!(
+            request(vec![]).targets_are_fully_shown(),
+            "no targets, nothing to clip"
+        );
+    }
 
     /// The one liveness predicate (ADR-0059's "live Execution"): Idle is the
     /// only status that is not a live run; Busy and Retry are.

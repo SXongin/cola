@@ -7164,7 +7164,6 @@ async fn an_adoption_carries_a_pending_request_onto_the_successor() {
             "open_message_id": "msg_reply",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");

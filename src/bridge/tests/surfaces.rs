@@ -167,7 +167,6 @@ async fn restart_readopts_a_pending_inline_permission() {
             "open_message_id": "om_live",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -358,7 +357,6 @@ async fn restart_readopts_a_pending_standalone_permission() {
             "open_message_id": sent.message_id,
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -806,7 +804,7 @@ async fn sweep_records_pending_sessions_for_liveness() {
 fn over_budget_perm(request_id: &str, session_id: &str) -> crate::backend::types::PermissionRequest {
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     perm_request(request_id, session_id, &command)
 }
@@ -1597,7 +1595,6 @@ async fn a_click_on_a_stale_allow_card_declines_an_unshowable_target() {
             "request_id": "per_long",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "⚡ **执行 Shell 命令**",
         }))
         .await
         .expect("the click produces a result");

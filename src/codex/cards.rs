@@ -3846,8 +3846,8 @@ async fn a_profile_with_a_hidden_grant_is_declined() {
         Some(json!({ "permissions": {} })),
         "a profile the card cannot show is never granted"
     );
-    // A path longer than the card's pattern budget is the same class: the
-    // suffix would be clipped, so it is declined, not partially shown.
+    // A path longer than the card's shared target budget is the same class:
+    // the suffix would be clipped, so it is declined, not partially shown.
     server.request_to_subscribers(
         THREAD,
         "item/permissions/requestApproval",
@@ -3857,7 +3857,9 @@ async fn a_profile_with_a_hidden_grant_is_declined() {
             "itemId": "item-2",
             "cwd": WORK,
             "permissions": {
-                "fileSystem": { "write": ["a".repeat(145)] }
+                "fileSystem": {
+                    "write": ["a".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)]
+                }
             }
         }),
     );

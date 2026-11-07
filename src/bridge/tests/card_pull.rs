@@ -447,7 +447,6 @@ async fn a_busy_follow_permission_click_resumes_the_run() {
         "directory": "/work",
         "perm_label": "✅ 已允许一次",
         "perm_color": "green",
-        "perm_body": "bash",
     });
     let result = app
         .host_action(value)

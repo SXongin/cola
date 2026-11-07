@@ -9389,7 +9389,6 @@ Index: /x/src/main.rs
             "open_message_id": "om_typed",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -9599,7 +9598,6 @@ Index: /x/src/main.rs
             "open_message_id": "om_ack",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");

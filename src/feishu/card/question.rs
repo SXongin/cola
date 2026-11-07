@@ -39,10 +39,14 @@ pub(crate) const SESSION_ALWAYS_NOTE: &str = "🔁 始终允许：本会话内�
 pub fn permission_buttons(
     session_id: &str,
     request_id: &str,
-    body: &str,
     directory: &str,
     always_supported: bool,
 ) -> Vec<serde_json::Value> {
+    // The callback carries routing plus the decision and its display labels —
+    // never the body. The body is the largest part of the block, and echoing it
+    // into every button multiplied the card's JSON by the button count; a click
+    // rebuilds the result body from what it already has (the verified pending
+    // request, or the block's recorded target).
     let btn_value = |reply: &str, label: &str, color: &str| {
         json!({
             "action": "perm",
@@ -52,7 +56,6 @@ pub fn permission_buttons(
             "directory": directory,
             "perm_label": label,
             "perm_color": color,
-            "perm_body": body,
         })
     };
     let mut elements = Vec::new();
@@ -91,7 +94,6 @@ pub fn build_permission_card(
     elements.extend(permission_buttons(
         session_id,
         request_id,
-        &body,
         directory,
         always_supported,
     ));
@@ -117,18 +119,19 @@ fn permission_button_count(always_supported: bool) -> usize {
 
 /// The serialized-JSON size estimate of one permission block.
 ///
-/// Every button echoes the body and the whole routing triple (`session_id`,
-/// `request_id`, `directory`) in its callback value, so each of those appears
-/// once as the block's element and once per button. The routing values come
-/// from the caller — a long directory is the common case, and a fixed overhead
-/// would let the streaming card's split underestimate itself past Feishu's
-/// limit.
+/// The body is rendered **once**, as the block's own markdown element; the
+/// buttons no longer echo it, so it is charged once. Every button still carries
+/// the whole routing triple (`session_id`, `request_id`, `directory`) in its
+/// callback value, so each of those appears once as the block's element and
+/// once per button. The routing values come from the caller — a long directory
+/// is the common case, and a fixed overhead would let the streaming card's
+/// split underestimate itself past Feishu's limit.
 ///
 /// The body is estimated **as the card renders it**, not as authored:
 /// [`CardMarkdown::element`] is what both the standalone card and the streaming
 /// body apply, and it expands `<` to `&#60;` (five bytes for one), so a
-/// 150-char reason of `<` would add 600 bytes per copy that a raw-length
-/// estimate missed. The result is then charged at its JSON-escaped length
+/// 150-char reason of `<` adds 600 bytes to the element that a raw-length
+/// estimate would miss. The result is then charged at its JSON-escaped length
 /// ([`json_escaped_len`]). The `BUTTON_OVERHEAD` margin also absorbs the
 /// fenced-fallback wrapper (a card whose content Feishu rejected renders the
 /// body verbatim inside one fence instead of cleaning it).
@@ -149,9 +152,6 @@ pub(crate) fn permission_block_estimate(
     let cleaned = json_escaped_len(&CardMarkdown::new().element(body));
     let fenced = json_escaped_len(body) + crate::feishu::card::fenced_block_overhead(body);
     let element = cleaned.max(fenced);
-    // The buttons echo `perm_body`: the cleaned body on a standalone card, the
-    // authored one on the streaming card. Neither is ever fenced.
-    let echo = cleaned.max(json_escaped_len(body));
     let routing = json_escaped_len(request_id) + json_escaped_len(session_id) + json_escaped_len(directory);
     let buttons = permission_button_count(always_supported);
     let note = if always_supported {
@@ -159,7 +159,7 @@ pub(crate) fn permission_block_estimate(
     } else {
         0
     };
-    element + buttons * (echo + routing + BUTTON_OVERHEAD) + note
+    element + buttons * (routing + BUTTON_OVERHEAD) + note
 }
 
 /// Compact one-line target for a question's Interaction Receipt: each
@@ -1699,7 +1699,13 @@ mod tests {
         assert_eq!(once["session_id"], "ses_abc");
         assert_eq!(once["perm_label"], "✅ 已允许一次");
         assert_eq!(once["perm_color"], "green");
-        assert!(once["perm_body"].as_str().unwrap().contains("bash"));
+        // The body is rendered once as the block element; a callback carries
+        // routing and the display labels only, never the body.
+        assert!(
+            once.get("perm_body").is_none(),
+            "the button must not echo the body: {once}"
+        );
+        assert_eq!(once["directory"], "/tmp/proj/lib");
         let reject = values.iter().find(|v| v["reply"] == "reject").unwrap();
         assert_eq!(reject["perm_color"], "red");
         let always = values.iter().find(|v| v["reply"] == "always").unwrap();
@@ -1744,15 +1750,15 @@ mod tests {
         );
     }
 
-    /// Whole-branch review #883: the command budget is only safe if the card it
-    /// produces is. A permission body is rendered once and echoed into every
-    /// button's `perm_body`, so it appears six times in the card's JSON; this
-    /// pins the worst case — a full-budget CJK command — inside the card's own
-    /// budget. Raising [`crate::backend::types::PERMISSION_COMMAND_MAX_CHARS`]
-    /// fails here, which is the point.
+    /// The shared target budget is only safe if the card it produces is. This
+    /// pins the worst case — a full-budget CJK command, the smallest per-element
+    /// ceiling the platform measured — inside the card's own JSON budget, with
+    /// the body rendered once. Raising
+    /// [`crate::backend::types::PERMISSION_TARGET_MAX_CHARS`] fails here, which
+    /// is the point.
     #[test]
-    fn a_permission_card_at_the_command_budget_fits_the_card_budget() {
-        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+    fn a_permission_card_at_the_target_budget_fits_the_card_budget() {
+        let budget = crate::backend::types::PERMISSION_TARGET_MAX_CHARS;
         let command = "啊".repeat(budget);
         let body =
             format!("⚡ **执行 Shell 命令**\n**对象**:\n- `{command}`\n\nAI 想要执行这个操作，是否允许？");
@@ -1828,7 +1834,7 @@ mod tests {
             "estimate {estimate} under the rendered block's {rendered} bytes"
         );
         // The authored bytes alone would have been 4 bytes short per '<' on
-        // every copy (the element plus each button).
+        // the element, so the estimate must charge the sanitized size.
         assert!(
             json_escaped_len(&cleaned) - json_escaped_len(&body) >= 600,
             "the expansion the raw charge would miss"
@@ -1844,10 +1850,11 @@ mod tests {
     fn a_backtick_heavy_body_is_charged_with_its_fence() {
         let body = format!(
             "⚡ **执行 Shell 命令**\n**对象**:\n- `{}`\n",
-            "`".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+            "`".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
         );
         let estimate = permission_block_estimate(&body, false, "n:1", "ses", "/d");
-        // What the fallback writes: the fenced element plus one echoed button.
+        // What the fallback writes: the fenced element plus the routing-only
+        // buttons (the body is not echoed into them).
         let fenced = crate::feishu::card::fenced_code(&body, None);
         let element = serde_json::json!({ "tag": "markdown", "content": fenced })
             .to_string()
@@ -1863,7 +1870,6 @@ mod tests {
                 "directory": "/d",
                 "perm_label": "✅ 已允许一次",
                 "perm_color": "green",
-                "perm_body": body,
             }
         })
         .to_string()
