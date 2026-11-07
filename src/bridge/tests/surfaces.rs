@@ -1626,3 +1626,70 @@ async fn a_click_on_a_stale_allow_card_declines_an_unshowable_target() {
         "nothing may claim the approval happened: {text}"
     );
 }
+
+/// The sweep resolves the inline host by walking the parent chain, which calls
+/// `session_info`; that read must not happen under the owning Session's card
+/// write lock. A stalled read otherwise holds the lock indefinitely, blocking
+/// flushes, `/card` and install for that Session. The walk is resolved and
+/// bounded before the lock, so the lock stays free and the request falls
+/// through to its standalone card after the read times out.
+#[tokio::test]
+async fn a_stalled_parent_walk_never_holds_the_sweep_card_lock() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    backend.hang_session_info_reads(usize::MAX);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.permission
+        .list_timeout_ms
+        .store(500, std::sync::atomic::Ordering::SeqCst);
+
+    let handles = app.flow_handles();
+    let sweep_app = app.clone();
+    let sweep = tokio::spawn(async move {
+        let mut seen = std::collections::HashSet::new();
+        sweep_app
+            .permission
+            .sweep(&sweep_app.flow_handles(), &mut seen)
+            .await;
+        seen
+    });
+    // Wait until the sweep has actually reached the stalled read.
+    for _ in 0..200 {
+        if !backend.session_info_calls.lock().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        !backend.session_info_calls.lock().await.is_empty(),
+        "the sweep reached the parent-chain walk"
+    );
+
+    // The Session's card write lock must be free while that read is stalled.
+    let lock = handles.cards.write_lock("ses_test").await;
+    let guard = tokio::time::timeout(std::time::Duration::from_millis(250), lock.lock())
+        .await
+        .expect("the parent walk must not hold the Session's card write lock");
+    drop(guard);
+
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(2), sweep)
+        .await
+        .expect("the bounded walk must let the sweep finish")
+        .unwrap();
+    assert!(
+        seen.contains("per_1"),
+        "the request is surfaced on its standalone card after the walk times out"
+    );
+    assert_eq!(
+        platform.sent_cards().await.len(),
+        1,
+        "the timed-out walk falls through to the standalone path: {:?}",
+        platform.calls.lock().await
+    );
+}
