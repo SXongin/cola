@@ -64,9 +64,11 @@ the card's bottom:
 - **List cards** (`/switch`, `/dir`, `/sub`, the `/skill` picker): the search
   form renders **after** the rows and the pager. `/switch` keeps only its
   ＋新建会话 footer below.
-- **Session Card** (ADR-0100): it carries no typed input, so the rule reaches it
-  only through its folded 最近对话 tail; the snapshot's receipt log and its
-  rebuild path no longer exist.
+- **Session Card** (ADR-0100): its **one-shot read** carries no typed input, so
+  the rule reaches it only through its folded 最近对话 tail; the snapshot's
+  receipt log and its rebuild path no longer exist. A render-owned **follow** of
+  a busy Session is not a read — it may seed a live Question, whose input/form
+  follows this same rule at the card's end.
 
 ## Consequences
 
