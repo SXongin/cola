@@ -183,7 +183,9 @@ and the map from the old numbers.
   question at a time (`question_elements`) — the reader picks which, and the
   switch is a form **submit** so the open question's draft travels with it
   (ADR-0094) — search forms after the rows and pager (`search_form` call
-  sites), and a folded tail on the Session Card (#917, ADR-0093).
+  sites), and a folded tail beyond a Session Card's one-shot **read** (#917,
+  ADR-0093); a render-owned follow's seeded question still keeps its input at
+  the card's end.
   One form per question block, at the body's top level: a `form` inside a
   `collapsible_panel` is rejected (200621), a panel inside the form is legal.
 - **`info-probe`** — the generation is probed with `GET /api/info`, and the
