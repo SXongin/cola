@@ -1105,8 +1105,9 @@ fn permission_from_patch(approval: &PatchApproval) -> PermissionRequest {
 /// not the client's schema.
 const PROFILE_UNEXPRESSIBLE: &str = "the requested permission profile has a grant the card cannot show";
 
-/// A requested path/glob whose rendered form would be truncated by the card.
-const PROFILE_TOO_LONG: &str = "a requested permission path is longer than the card can show";
+/// A requested permission profile whose summed paths are longer than the card
+/// can show.
+const PROFILE_TOO_LONG: &str = "the requested permission paths are longer than the card can show in total";
 
 /// Whether the card can render every part of a requested permission profile.
 /// `permission_patterns` is the renderer; this is its completeness proof, so an

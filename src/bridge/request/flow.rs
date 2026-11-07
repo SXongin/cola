@@ -24,9 +24,7 @@ use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
     vanished_receipt,
 };
-use super::kind::{
-    PendingRequest, Prepared, Refusal, RequestKind, permission_target, permission_unshowable_budget,
-};
+use super::kind::{PendingRequest, PermissionOverflow, Prepared, Refusal, RequestKind, permission_target};
 
 /// One question request's captured reply inputs (spec #364, S6): the request's
 /// fields and the index-aligned per-field answer slots (`answers[i]` is `None`
@@ -194,10 +192,10 @@ async fn post_unshowable_notice(
     handles: &FlowHandles,
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
+    overflow: PermissionOverflow,
 ) {
     let session_id = p.session_id.as_deref().unwrap_or("");
-    let budget = permission_unshowable_budget(p).unwrap_or(crate::backend::PERMISSION_BODY_MAX_CHARS);
-    let card = crate::feishu::card::question::build_unshowable_permission_card(budget);
+    let card = crate::feishu::card::question::build_unshowable_permission_card(overflow.budget());
     match resolve_card_target(
         &handles.sessions,
         &handles.cards,
@@ -228,8 +226,9 @@ async fn post_unshowable_notice(
 /// What to leave behind when a stored surface must stop being interactive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Withdrawal {
-    /// cola refused the request: the card carries the auto-reject copy.
-    Refused,
+    /// cola refused the request: the card carries the auto-reject copy naming
+    /// the bound that failed.
+    Refused(PermissionOverflow),
     /// The server no longer holds it (another client settled it): a neutral
     /// "handled elsewhere" surface, never a claim that cola rejected it.
     ResolvedElsewhere,
@@ -1233,9 +1232,9 @@ impl RequestFlow {
         }
         match self.kind.refuse(self, handles, req, dir).await {
             Refusal::NotApplicable => {}
-            Refusal::Refused => {
+            Refusal::Refused(overflow) => {
                 match self
-                    .withdraw_stored_surface(handles, req, Withdrawal::Refused)
+                    .withdraw_stored_surface(handles, req, Withdrawal::Refused(overflow))
                     .await
                 {
                     // The PATCH failed; the stored surface (and the payload)
@@ -1248,7 +1247,7 @@ impl RequestFlow {
                     WithdrawalOutcome::None => {
                         seen.insert(req.id().to_string());
                         if let PendingRequest::Permission(p) = req {
-                            post_unshowable_notice(handles, p, dir).await;
+                            post_unshowable_notice(handles, p, dir, overflow).await;
                         }
                         return true;
                     }
@@ -1596,7 +1595,9 @@ impl RequestFlow {
         };
         self.recovered.lock().await.remove(req.id());
         let receipt = match how {
-            Withdrawal::Refused => crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT.to_string(),
+            Withdrawal::Refused(_) => {
+                crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT.to_string()
+            }
             Withdrawal::ResolvedElsewhere => handled_elsewhere_receipt(&permission_target(p)),
             Withdrawal::Retrying => {
                 crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT.to_string()
@@ -1606,10 +1607,8 @@ impl RequestFlow {
         // this exact payload rather than re-deciding what the card should say.
         let standalone = self.sent_cards.lock().await.get(req.id()).cloned();
         let card = match (how, &standalone) {
-            (Withdrawal::Refused, _) => {
-                let budget =
-                    permission_unshowable_budget(p).unwrap_or(crate::backend::PERMISSION_BODY_MAX_CHARS);
-                crate::feishu::card::question::build_unshowable_permission_card(budget)
+            (Withdrawal::Refused(overflow), _) => {
+                crate::feishu::card::question::build_unshowable_permission_card(overflow.budget())
             }
             (Withdrawal::ResolvedElsewhere, Some(sent)) => {
                 crate::feishu::card::notify::build_resolved_elsewhere_card(self.kind.label(), &sent.summary)

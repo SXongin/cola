@@ -2474,6 +2474,65 @@ async fn an_over_summed_permission_is_declined_and_the_log_names_the_total() {
     );
 }
 
+/// A request whose targets fit the 3,000 budget but whose rendered body crosses
+/// the measured single-element ceiling is declined with the render copy, before
+/// any approval surface: the chrome (here `metadata.command`) consumes the
+/// remaining room.
+#[tokio::test]
+async fn a_body_over_the_render_ceiling_is_declined_with_the_render_copy() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // 2,900 target characters fit the target budget; the 200-char metadata
+    // line pushes the rendered body past 3,060.
+    let command = "x".repeat(2_900);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_body".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: Some(serde_json::json!({ "command": "y".repeat(200) })),
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let mut seen = std::collections::HashSet::new();
+    let (_, logs) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_body".to_string(), "reject".to_string())],
+        "the rendered-body proof declines before any surface"
+    );
+    let line = assert_line_level(&logs, "declined permission per_body", "WARN");
+    assert!(
+        line.contains("past the card's 3060 character budget"),
+        "the diagnostic names the render ceiling: {line}"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+                && card_text(card).contains("3060")
+        }),
+        "the reason card names the render ceiling it crossed: {cards:?}"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "no permission block is offered"
+    );
+}
+
 /// Whole-branch re-review #883: an over-budget permission the flow could not
 /// decline (a failed reply) must not be reported as handled. It stays pending
 /// and unmarked, nothing is posted for it, and the next sweep retries — a
