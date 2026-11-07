@@ -106,3 +106,8 @@ decisions. It stands aside wherever no card is rendered:
   charges the rendered body against `PERMISSION_BODY_MAX_CHARS` (the measured
   single-element ceiling). This ADR's decision — the proof guards only surfaces
   that render a card — is unchanged; only the budget the proof applies moved.
+  Because the renderer's chrome consumes the remaining room, a real near-budget
+  bash request (3,000-char command plus `metadata.command`) is refused before any
+  surface again until #1012's companion lane surfaces it with the full target in
+  a companion message; that handoff is the reason the refused class is accepted
+  here rather than expanded.

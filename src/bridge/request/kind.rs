@@ -258,8 +258,9 @@ pub(crate) enum Refusal {
     /// Nothing to refuse: surface the request normally.
     NotApplicable,
     /// Refused on the server. The request must not be surfaced, and any
-    /// surface a previous process persisted for it is withdrawn.
-    Refused,
+    /// surface a previous process persisted for it is withdrawn. Carries the
+    /// bound that failed, so the reason card names it without re-deciding.
+    Refused(PermissionOverflow),
     /// The server no longer holds the request: another client (or an earlier
     /// sweep) settled it. The stored surface is withdrawn **neutrally** — cola
     /// did not reject anything, so no auto-reject copy may be left behind — and
@@ -331,9 +332,9 @@ impl RequestKind for PermissionKind {
         let PendingRequest::Permission(p) = req else {
             return Refusal::NotApplicable;
         };
-        if permission_fits_card(p) {
+        let Some(overflow) = permission_overflow(p) else {
             return Refusal::NotApplicable;
-        }
+        };
         // The completeness proof guards the CARD: it stops a click approving
         // text the card had to clip. Auto-Accept renders no card at all — the
         // session opted into "answer without asking me" — so there is nothing
@@ -357,7 +358,7 @@ impl RequestKind for PermissionKind {
             // the pre-#892 decline.
             AutoAcceptFlag::Off | AutoAcceptFlag::Capped => {}
         }
-        decline_unshowable(handles, p, dir).await
+        decline_unshowable(handles, p, dir, overflow).await
     }
 
     async fn prepare(
@@ -590,7 +591,7 @@ impl RequestKind for PermissionKind {
         // the click reads the request and refuses when it cannot be shown. That
         // same read is what rebuilds the result body: the callback no longer
         // carries it.
-        let mut unshowable: Option<usize> = None;
+        let mut unshowable: Option<PermissionOverflow> = None;
         let mut verified: Option<crate::backend::types::PermissionRequest> = None;
         if matches!(reply, "once" | "always")
             && let Some(dir) = directory
@@ -604,9 +605,9 @@ impl RequestKind for PermissionKind {
             match listed {
                 Some(Ok(perms)) => {
                     if let Some(p) = perms.iter().find(|p| p.request_id == req_id) {
-                        match permission_unshowable_budget(p) {
+                        match permission_overflow(p) {
                             None => verified = Some(p.clone()),
-                            Some(budget) => unshowable = Some(budget),
+                            Some(overflow) => unshowable = Some(overflow),
                         }
                     }
                 }
@@ -769,8 +770,8 @@ impl RequestKind for PermissionKind {
                 _ => "已拒绝".to_string(),
             }
         };
-        let body = if let Some(budget) = unshowable {
-            crate::feishu::card::question::unshowable_permission_note(budget)
+        let body = if let Some(overflow) = unshowable {
+            crate::feishu::card::question::unshowable_permission_note(overflow.budget())
         } else if let Some(p) = verified.as_ref() {
             // The approval re-read the request from the server; the result card
             // describes exactly that request, never the callback's stale copy.
@@ -942,9 +943,10 @@ async fn decline_unshowable(
     handles: &FlowHandles,
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
+    overflow: PermissionOverflow,
 ) -> Refusal {
     let session_id = p.session_id.clone().unwrap_or_default();
-    let budget = permission_unshowable_budget(p).unwrap_or(PERMISSION_BODY_MAX_CHARS);
+    let budget = overflow.budget();
     let rendered = rendered_permission_chars(p);
     let total = p.total_target_len();
     match handles
@@ -960,7 +962,7 @@ async fn decline_unshowable(
                  characters (rendered content is {rendered}), past the card's {budget} character budget",
                 p.request_id
             );
-            Refusal::Refused
+            Refusal::Refused(overflow)
         }
         // Another client (or an earlier sweep) settled it before us: there is
         // nothing left to refuse, and nothing cola may claim it rejected.
@@ -1082,9 +1084,10 @@ const AUTO_ACCEPT_TARGET_LOG_CHARS: usize = 120;
 /// INFO, like every other auto-accepted transition (ADR-0048); the "unseen"
 /// wording is what sets it apart from an ordinary auto-accept.
 fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
-    let Some(budget) = permission_unshowable_budget(p) else {
+    let Some(overflow) = permission_overflow(p) else {
         return;
     };
+    let budget = overflow.budget();
     let first_line = p
         .longest_target()
         .map(|target| target.lines().next().unwrap_or(""))
@@ -2271,28 +2274,52 @@ fn rendered_permission_chars(p: &crate::backend::types::PermissionRequest) -> us
         .count()
 }
 
-/// The display bound a permission crosses when its card cannot show it in full:
-/// the summed target budget or the rendered-body ceiling. `None` means the card
-/// can show the whole request.
-///
-/// Measuring the renderer's own output ([`rendered_permission_chars`]) keeps the
-/// proof and the card from disagreeing about what "shown in full" means: the
-/// target budget alone would let the header, reason and metadata the renderer
-/// adds push the one element past the measured ceiling.
-pub(crate) fn permission_unshowable_budget(p: &crate::backend::types::PermissionRequest) -> Option<usize> {
-    if !p.targets_are_fully_shown() {
-        Some(PERMISSION_TARGET_MAX_CHARS)
-    } else if p.body_has_own_cap() || p.fits_rendered_body(rendered_permission_chars(p)) {
-        None
-    } else {
-        Some(PERMISSION_BODY_MAX_CHARS)
+/// Which bound a permission card crosses when it cannot show the request in
+/// full. One type, so no caller can mistake a budget for an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionOverflow {
+    /// The summed targets exceed [`PERMISSION_TARGET_MAX_CHARS`].
+    Targets,
+    /// The rendered body exceeds the measured single-element ceiling
+    /// [`PERMISSION_BODY_MAX_CHARS`].
+    Body,
+}
+
+impl PermissionOverflow {
+    /// The bound the refusal copy names.
+    pub(crate) fn budget(self) -> usize {
+        match self {
+            Self::Targets => PERMISSION_TARGET_MAX_CHARS,
+            Self::Body => PERMISSION_BODY_MAX_CHARS,
+        }
     }
 }
 
-/// Whether a permission card can show this request in full. The one predicate
-/// every interactive surface and the Auto-Accept audit share.
-pub(crate) fn permission_fits_card(p: &crate::backend::types::PermissionRequest) -> bool {
-    permission_unshowable_budget(p).is_none()
+/// Whether `describe_permission` renders a diff for this request (the diff
+/// carries its own escaped-byte cap and truncation note, #792/#794). Keyed on
+/// the metadata actually carrying a diff, never on the action name alone: an
+/// `edit` with no diff still renders its scaffolding in one element.
+fn renders_diff_body(p: &crate::backend::types::PermissionRequest) -> bool {
+    matches!(p.permission.as_deref(), Some("edit" | "patch" | "apply_patch"))
+        && crate::feishu::card::tool_render::diff_from_metadata(p.metadata.as_ref()).is_some()
+}
+
+/// The ONE proof for "can the card show this request in full?".
+///
+/// `None` means yes. Otherwise the returned bound is the one that failed — the
+/// summed target display budget or the rendered-body render invariant. The body
+/// is measured from the renderer's own sanitized output, so the proof and the
+/// element cannot disagree.
+pub(crate) fn permission_overflow(
+    p: &crate::backend::types::PermissionRequest,
+) -> Option<PermissionOverflow> {
+    if !p.targets_are_fully_shown() {
+        return Some(PermissionOverflow::Targets);
+    }
+    if renders_diff_body(p) {
+        return None;
+    }
+    (rendered_permission_chars(p) > PERMISSION_BODY_MAX_CHARS).then_some(PermissionOverflow::Body)
 }
 
 /// The result body for a click that ran no verification read (a rejection).
@@ -2533,7 +2560,7 @@ Index: /proj/src/main.rs
             bare <= crate::backend::PERMISSION_BODY_MAX_CHARS,
             "a bare max-budget command fits the measured element ceiling: {bare}"
         );
-        assert!(permission_fits_card(&p), "and is showable");
+        assert_eq!(permission_overflow(&p), None, "and is showable");
 
         // A real V1 bash permission carries `metadata.command`; the extra
         // metadata line is exactly the scaffolding the target-only proof missed.
@@ -2543,11 +2570,107 @@ Index: /proj/src/main.rs
             with_metadata > crate::backend::PERMISSION_BODY_MAX_CHARS,
             "the metadata line pushes the one element past the ceiling: {with_metadata}"
         );
-        assert!(!permission_fits_card(&p), "so the card cannot show it in full");
         assert_eq!(
-            permission_unshowable_budget(&p),
-            Some(crate::backend::PERMISSION_BODY_MAX_CHARS),
+            permission_overflow(&p),
+            Some(PermissionOverflow::Body),
             "the refusal names the body ceiling it crossed"
+        );
+    }
+
+    /// The render ceiling is character-based and enforced at its exact
+    /// boundary. A `<` inside a code span is ONE sanitized character (targets
+    /// render in backticks), so the target budget governs it; outside a code
+    /// span the same `<` costs five, which is why the body measure is the
+    /// sanitized character count and not the authored one.
+    #[test]
+    fn the_render_ceiling_is_character_based_at_its_boundary() {
+        let mut p = crate::backend::types::PermissionRequest {
+            request_id: "n:1".into(),
+            session_id: Some("thread-1".into()),
+            permission: Some("bash".into()),
+            patterns: vec!["x".repeat(crate::backend::PERMISSION_TARGET_MAX_CHARS)],
+            metadata: Some(serde_json::json!({ "cwd": "" })),
+            always: vec![],
+            always_supported: true,
+        };
+        assert_eq!(
+            rendered_permission_chars(&p),
+            crate::backend::PERMISSION_BODY_MAX_CHARS,
+            "the measured boundary itself"
+        );
+        assert_eq!(permission_overflow(&p), None, "exactly the ceiling fits");
+
+        p.metadata = Some(serde_json::json!({ "cwd": "x" }));
+        assert_eq!(
+            rendered_permission_chars(&p),
+            crate::backend::PERMISSION_BODY_MAX_CHARS + 1,
+            "the boundary is character-counted"
+        );
+        assert_eq!(
+            permission_overflow(&p),
+            Some(PermissionOverflow::Body),
+            "one character over the ceiling is refused"
+        );
+
+        // The same 3,000 `<` glyphs as a target are inside a code span: the
+        // sanitizer leaves them at one character each, so the card fits.
+        p.patterns = vec!["<".repeat(crate::backend::PERMISSION_TARGET_MAX_CHARS)];
+        p.metadata = None;
+        assert_eq!(rendered_permission_chars(&p), 3_049);
+        assert_eq!(permission_overflow(&p), None);
+
+        // Outside a code span (a reason), each `<` expands five-fold; a max
+        // target plus a 150-`<` reason crosses the ceiling.
+        p.metadata = Some(serde_json::json!({ "reason": "<".repeat(150), "cwd": "/w" }));
+        assert!(
+            rendered_permission_chars(&p) > crate::backend::PERMISSION_BODY_MAX_CHARS,
+            "the five-byte expansion is charged against the element ceiling"
+        );
+        assert_eq!(permission_overflow(&p), Some(PermissionOverflow::Body));
+    }
+
+    /// The diff exemption is keyed on the diff actually being present in the
+    /// metadata, not on the action name: a Codex `edit` file-change with no
+    /// diff renders its scaffolding and must obey the ceiling.
+    #[test]
+    fn an_edit_without_a_rendered_diff_is_not_exempt_from_the_ceiling() {
+        let mut p = crate::backend::types::PermissionRequest {
+            request_id: "n:1".into(),
+            session_id: Some("thread-1".into()),
+            permission: Some("edit".into()),
+            patterns: vec!["x".repeat(crate::backend::PERMISSION_TARGET_MAX_CHARS)],
+            metadata: Some(serde_json::json!({
+                "reason": "<".repeat(150),
+                "command": "y".repeat(200),
+                "cwd": "z".repeat(200),
+                "description": "w".repeat(200),
+            })),
+            always: vec![],
+            always_supported: true,
+        };
+        assert!(
+            rendered_permission_chars(&p) > crate::backend::PERMISSION_BODY_MAX_CHARS,
+            "the no-diff edit renders a large element"
+        );
+        assert_eq!(
+            permission_overflow(&p),
+            Some(PermissionOverflow::Body),
+            "no diff means no exemption"
+        );
+
+        // A real diff renders and keeps its own escaped-byte cap.
+        p.metadata = Some(serde_json::json!({
+            "filepath": "/proj/src/main.rs",
+            "diff": format!("--- a\n+++ b\n@@ -1 +1 @@\n-{}\n+new\n", "x".repeat(5_000)),
+        }));
+        assert!(
+            rendered_permission_chars(&p) > crate::backend::PERMISSION_BODY_MAX_CHARS,
+            "the diff body is large"
+        );
+        assert_eq!(
+            permission_overflow(&p),
+            None,
+            "a rendered diff is exempt from the element ceiling"
         );
     }
 

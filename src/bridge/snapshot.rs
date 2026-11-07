@@ -101,7 +101,7 @@ pub(crate) async fn gather_snapshot(
         .into_iter()
         .filter(|p| {
             p.session_id.as_deref() == Some(session_id)
-                && crate::bridge::request::kind::permission_fits_card(p)
+                && crate::bridge::request::kind::permission_overflow(p).is_none()
         })
         .map(crate::bridge::request::kind::PendingRequest::Permission)
         .chain(
