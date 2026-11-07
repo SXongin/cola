@@ -3814,6 +3814,12 @@ impl Turn {
     /// terminal card with no action (`Done`/`Stopped`): a Turn that ran in
     /// between already superseded the older card, so it is left alone rather
     /// than stamped for noise.
+    ///
+    /// A card that still **owes a continuation** is never supersedable either
+    /// (ADR-0100): its `pending_split` queue, reply target and unrendered
+    /// content are the chain's only record of work not yet on a card, so
+    /// replacing it would drop the owed continuation. `/card` leaves it current
+    /// and stamps its own read taken over, exactly like a live block.
     pub(crate) async fn card_to_supersede(cards: &CardsHandle, session_id: &str) -> Option<String> {
         let live = cards.cards.lock().await;
         live.get(session_id)
@@ -3824,6 +3830,7 @@ impl Turn {
                 // in Error). Stamping it would strip the only answerable
                 // controls, so it is not supersedable.
                 card.acc.live_request_ids().is_empty()
+                    && !card.owes_continuation()
                     && (*state == crate::feishu::card::CardState::Idle || state.offers_recovery())
             })
             .and_then(|card| card.card_message_id.clone())
@@ -3865,10 +3872,13 @@ impl Turn {
         acc.mark_idle_read();
         let session = state::CardSession::new(acc, Some(card_message_id.to_string()));
         let mut live = cards.cards.lock().await;
-        if live
-            .get(session_id)
-            .is_some_and(|card| card.is_running() || !card.acc.live_request_ids().is_empty())
-        {
+        if live.get(session_id).is_some_and(|card| {
+            // A chain card that still owes a continuation keeps the session:
+            // replacing it would discard the queue, its reply target and the
+            // content it owes (ADR-0100). `/card` then stamps its own read
+            // taken over instead.
+            card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation()
+        }) {
             return false;
         }
         live.insert(session_id.to_string(), session);

@@ -2839,6 +2839,37 @@ async fn card_pull_migrates_a_pending_permission() {
     );
 }
 
+/// Leave `ses_test` with a `Done` card that still owes a split continuation: a
+/// pull queue whose continuation create failed, with the run then settling.
+/// The queue and its reply target are the only record of that tail.
+async fn seed_done_card_owing_continuation(app: &Arc<App>, platform: &RecordingPlatform) {
+    seed_live_card(app, "ses_test", "已完成但欠一段续卡。").await;
+    platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let cards = app.cards_handle();
+    Turn::split_card_chain(
+        &cards,
+        "ses_test",
+        "msg_pull",
+        crate::bridge::turn::SplitKind::Pull,
+    )
+    .await;
+    assert!(
+        Turn::has_pending_split(&cards, "ses_test").await,
+        "the failed continuation leaves its split queued: {:?}",
+        Turn::pending_splits(&cards, "ses_test").await
+    );
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the failed continuation leaves the finalized card current"
+    );
+    // The run settles while the continuation is still owed: the terminal card
+    // remains the chain's only anchor for that queued content/its target.
+    Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
+}
+
 /// Seed the session's live card (content `text`, id `om_live`), so `/card` has
 /// something to pull down.
 async fn seed_live_card(app: &Arc<App>, session_id: &str, text: &str) {
@@ -3379,5 +3410,142 @@ fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
         unseeded_body.lead,
         vec![crate::feishu::card::session::WAITING_CHIP.to_string()],
         "the status comes from the read, not the seed set: {unseeded}"
+    );
+}
+
+/// A terminal card that still owes a queued continuation is the chain's live
+/// anchor: replacing it would discard the split queue, its reply target and the
+/// content it still owes (a Wake split whose continuation create failed). A
+/// `/card` read must leave it current and stamp its own read taken over; once
+/// the continuation is served the card is supersedable again.
+#[tokio::test]
+async fn a_card_read_never_drops_an_owed_continuation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    seed_session(&app, "ses_test", "/work").await;
+    seed_done_card_owing_continuation(&app, &platform).await;
+
+    // `/card` may not replace that card.
+    platform.given_reply_id("om_read");
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "a card that owes a continuation stays current"
+    );
+    let calls = platform.calls.lock().await.clone();
+    let read = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "om_read" => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the posted read is stamped taken over");
+    assert_eq!(
+        read["header"]["title"]["content"], "⏳ 已由新卡片接管 · 已停止更新",
+        "the posted read cannot look current"
+    );
+
+    // The queue and its reply target survived: the next flush serves the owed
+    // continuation to the Wake's message.
+    platform.given_reply_id("om_cont");
+    Turn::flush_card(&cards, "ses_test").await;
+    let (reply_to, _) = continuation(&platform).await;
+    assert_eq!(
+        reply_to, "msg_pull",
+        "the owed continuation still replies to the split's own target"
+    );
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_cont"),
+        "the continuation is the chain's newest card"
+    );
+
+    // Once the continuation is served and the run settles, `/card` replaces
+    // the chain's terminal card normally.
+    Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
+    platform.given_reply_id("om_read_2");
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_read_2"),
+        "a served continuation no longer blocks the read"
+    );
+}
+
+/// The busy-follow arm is also a compare-and-swap (ADR-0100): a chain that
+/// still owes a continuation keeps the Session even when the read says busy, so
+/// the queued split and its reply target survive. The follow's card is stamped
+/// taken over and no Chain Record is written.
+#[tokio::test]
+async fn a_busy_follow_never_drops_an_owed_continuation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = idle_read_backend();
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    seed_done_card_owing_continuation(&app, &platform).await;
+
+    platform.given_reply_id("om_read");
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the follow arm refuses to replace a card that owes a continuation"
+    );
+    assert!(
+        Turn::has_pending_split(&cards, "ses_test").await,
+        "the queued split and its reply target survive: {:?}",
+        Turn::pending_splits(&cards, "ses_test").await
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "a refused arm writes no Chain Record"
+    );
+    let calls = platform.calls.lock().await.clone();
+    let read = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "om_read" => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the posted read is stamped taken over");
+    assert_eq!(
+        read["header"]["title"]["content"], "⏳ 已由新卡片接管 · 已停止更新",
+        "the follow's read never looks current"
     );
 }
