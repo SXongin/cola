@@ -2352,11 +2352,14 @@ async fn a_failed_decline_keeps_the_request_retryable_and_posts_nothing() {
     );
 }
 
-/// Whole-branch re-review #883: `/autoaccept` is a policy about requests cola
-/// can show. An over-budget target is declined even under it — approving text
-/// nobody could review is the one thing the toggle does not buy.
+/// #892: Auto-Accept is a delegation of the decision, not a surface — it
+/// renders no card, so the card's completeness proof has nothing to guard. An
+/// over-budget target is approved unseen, and the approval line names its
+/// length. Declining here settled the request with no path to approve it from
+/// any client (it leaves the server's pending list), so a model re-emitting the
+/// same long command looped on denials.
 #[tokio::test]
-async fn auto_accept_declines_an_unshowable_permission_too() {
+async fn auto_accept_approves_an_unshowable_permission() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2394,18 +2397,70 @@ async fn auto_accept_declines_an_unshowable_permission_too() {
     .await;
 
     let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let (_, logs) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
 
     assert_eq!(
         replies.lock().await.as_slice(),
-        &[("per_long".to_string(), "reject".to_string())],
-        "an unshowable target is declined, never auto-approved"
+        &[("per_long".to_string(), "once".to_string())],
+        "auto-accept approves even a target the card cannot show"
     );
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.replied_cards().await);
     assert!(
-        cards.iter().any(|card| card_text(card)
-            .contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
-        "and the refusal is explained"
+        cards.iter().all(
+            |card| !card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+        ),
+        "nothing was surfaced, so there is no refusal card to explain"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "and no permission block is offered"
+    );
+    // The approval happened without a card, so the log is the only record of
+    // what the session delegated: it must name the request and the length.
+    let line = assert_line_level(&logs, "approved permission per_long", "WARN");
+    assert!(
+        line.contains("past the card's"),
+        "the unseen approval names the budget it crossed: {line}"
+    );
+}
+
+/// #892: turning Auto-Accept on approves the requests that are ALREADY pending,
+/// including an over-budget one. This path renders no card either, so the
+/// completeness proof must not reappear here (it used to decline them).
+#[tokio::test]
+async fn autoaccept_on_approves_an_already_pending_unshowable_permission() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    send_command(&app, "/autoaccept on", "msg_cmd").await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "enabling auto-accept approves the pending over-budget request too"
     );
 }
