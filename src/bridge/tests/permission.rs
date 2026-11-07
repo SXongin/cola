@@ -2765,11 +2765,11 @@ async fn a_definitely_failed_post_falls_to_a_file_companion() {
     );
 }
 
-/// An ambiguous Rich Text send may have landed. It is terminal: no File lane
-/// duplicate, no decline, and the card says the outcome is unknown. The
-/// matching record still lets the click approve.
+/// An ambiguous companion send is NOT a delivery: it leaves only a no-duplicate
+/// marker, the request follows the uncertain refusal path, and no interactive
+/// approval is offered. A later sweep must not re-send the companion.
 #[tokio::test]
-async fn an_ambiguous_companion_send_is_terminal_and_not_duplicated() {
+async fn an_ambiguous_companion_send_is_not_retried_and_follows_the_uncertain_refusal_path() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2784,6 +2784,11 @@ async fn an_ambiguous_companion_send_is_terminal_and_not_duplicated() {
         always: Vec::new(),
         always_supported: true,
     }]);
+    // The first decline fails, so the pending request survives to prove the
+    // marker blocks a re-send on the next sweep.
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
     let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
     let (app, platform) = build_app(cfg, backend).await;
     platform
@@ -2794,50 +2799,153 @@ async fn an_ambiguous_companion_send_is_terminal_and_not_duplicated() {
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
-    assert!(replies.lock().await.is_empty(), "never declined");
-    let calls = platform.calls.lock().await.clone();
-    assert!(
-        !calls.iter().any(|call| matches!(
-            call,
-            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
-        )),
-        "an ambiguous send does not fall to the File lane"
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the ambiguous companion declines instead of offering approval"
     );
     let record = app
         .permission
         .surfaces
         .companion("per_long")
-        .expect("the uncertain delivery is recorded");
+        .expect("the no-duplicate marker is recorded");
     assert!(
         record.message_id.is_empty(),
-        "the record marks the unknown outcome"
+        "the marker is explicitly not a confirmed delivery"
     );
-    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
-        .await
-        .expect("the streaming card renders");
     assert!(
-        card_text(&card).contains("结果未知"),
-        "the summary says the outcome is unknown: {}",
-        card_text(&card)
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "no interactive approval is offered"
     );
-
-    // A fresh sweep must not re-send (the record is terminal).
-    let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert!(
         !platform.calls.lock().await.iter().any(|call| matches!(
             call,
             PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
         )),
-        "the uncertain delivery is never retried"
+        "the ambiguous send does not fall to the File lane"
     );
 
-    // The matching digest still approves.
-    click_perm(&app, "once", "per_long", "✅ 已允许一次").await;
+    // The next sweep meets the marker: no re-send, and the decline lands with
+    // the uncertain copy.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
     assert_eq!(
         replies.lock().await.as_slice(),
-        &[("per_long".to_string(), "once".to_string())],
-        "the click approves the content the delivery recorded"
+        &[
+            ("per_long".to_string(), "reject".to_string()),
+            ("per_long".to_string(), "reject".to_string()),
+        ],
+        "the retry declines, it does not re-send or approve"
+    );
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "the marker prevents a duplicate companion"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "still no interactive approval"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNCERTAIN_PERMISSION_HEADER)
+                && card_text(card).contains("送达结果未知")
+        }),
+        "the refusal copy names the unknown outcome: {cards:?}"
+    );
+    assert!(
+        app.permission.surfaces.companion("per_long").is_none(),
+        "the settled request forgets the marker"
+    );
+}
+
+/// An Allow click is refused when the only record is an uncertain marker: the
+/// click guard treats it like a missing delivery (no completeness proof).
+#[tokio::test]
+async fn an_allow_click_on_an_uncertain_companion_is_refused() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!("echo {}", "x".repeat(5_000));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .ambiguous_send_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    // End the turn so the click returns a result card rather than an ack.
+    Turn::set_card_state(
+        &app.cards_handle(),
+        "ses_test",
+        crate::feishu::card::CardState::Idle,
+    )
+    .await;
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_test",
+            "directory": "/work",
+            "request_id": "per_long",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+        }))
+        .await
+        .expect("a card-action result");
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[
+            ("per_long".to_string(), "reject".to_string()),
+            ("per_long".to_string(), "reject".to_string()),
+        ],
+        "an uncertain marker never approves"
+    );
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已拒绝：完整目标送达结果未知"),
+        "the toast names the unknown outcome"
+    );
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains(crate::feishu::card::question::UNCERTAIN_PERMISSION_CLICK_LABEL),
+        "the result label names the unknown outcome: {text}"
+    );
+    assert!(
+        text.contains("送达结果未知"),
+        "and the result body says why approval is unavailable: {text}"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "no interactive approval is offered"
     );
 }
 

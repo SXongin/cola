@@ -317,6 +317,35 @@ pub(crate) fn build_autoaccepted_permission_card() -> serde_json::Value {
     )
 }
 
+/// The header of the card that explains a permission whose companion send
+/// outcome is unknown. An unconfirmed delivery is not a completeness proof, so
+/// the request was declined and no interactive approval is offered.
+pub(crate) const UNCERTAIN_PERMISSION_HEADER: &str = "🚫 权限请求已拒绝（目标送达结果未知）";
+
+/// Why the request was declined when the companion's outcome is unknown.
+pub(crate) fn uncertain_permission_note() -> &'static str {
+    "该权限请求的完整内容超过卡片显示预算，cola 已尝试通过伴随消息发送，但发送结果未知——它可能已送达，也可能没有。\
+     在无法确认完整内容已送达之前，不能提供批准操作；该请求已按拒绝处理，在服务端已结清。\
+     请重试，或在原始客户端查看该请求；也可以先开启自动授权（`/autoaccept on`）再让它执行。"
+}
+
+/// The non-interactive card that explains an unknown companion outcome.
+pub(crate) fn build_uncertain_permission_card() -> serde_json::Value {
+    card_shell(
+        UNCERTAIN_PERMISSION_HEADER,
+        "grey",
+        vec![json!({ "tag": "markdown", "content": uncertain_permission_note() })],
+    )
+}
+
+/// The receipt an inline over-budget block collapses to when its companion
+/// outcome is unknown and the request was declined.
+pub(crate) const UNCERTAIN_PERMISSION_RECEIPT: &str = "🚫 已拒绝：完整目标送达结果未知";
+
+/// The label of the result card when a click is refused because the companion
+/// outcome is unknown.
+pub(crate) const UNCERTAIN_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（目标送达结果未知）";
+
 /// The label of the result card cola shows when it refuses a click on a
 /// permission whose target it cannot show in full (the click asked to approve
 /// text the user never saw). Pinned with the refusal copy above.

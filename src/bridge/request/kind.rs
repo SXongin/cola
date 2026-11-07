@@ -573,6 +573,10 @@ impl RequestKind for PermissionKind {
         let mut unshowable: Option<PermissionOverflow> = None;
         let mut verified: Option<crate::backend::types::PermissionRequest> = None;
         let mut verified_companion: Option<CompanionDelivery> = None;
+        // The click found an uncertain marker rather than a confirmed delivery:
+        // the card must name the unknown outcome, not claim the companion
+        // definitely failed (ADR-0102).
+        let mut companion_uncertain = false;
         if matches!(reply, "once" | "always")
             && let Some(dir) = directory
         {
@@ -593,13 +597,19 @@ impl RequestKind for PermissionKind {
                                 // companion proof; neither is exempt.
                                 match flow
                                     .surfaces
-                                    .matching_companion(req_id, companion_target_digest(p))
+                                    .delivered_companion(req_id, companion_target_digest(p))
                                 {
                                     Some(delivery) => {
                                         verified_companion = Some(delivery);
                                         verified = Some(p.clone());
                                     }
-                                    None => unshowable = Some(overflow),
+                                    None => {
+                                        companion_uncertain = flow
+                                            .surfaces
+                                            .matching_companion(req_id, companion_target_digest(p))
+                                            .is_some();
+                                        unshowable = Some(overflow);
+                                    }
                                 }
                             }
                         }
@@ -696,8 +706,12 @@ impl RequestKind for PermissionKind {
                 // on which card is current.
                 let unshowable_receipt =
                     |_target: &str| crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT.to_string();
+                let uncertain_receipt =
+                    |_target: &str| crate::feishu::card::question::UNCERTAIN_PERMISSION_RECEIPT.to_string();
                 let normal_receipt = |target: &str| permission_receipt(target, reply);
-                let residue = if unshowable.is_some() {
+                let residue = if companion_uncertain {
+                    Residue::PerBlock(&uncertain_receipt)
+                } else if unshowable.is_some() {
                     Residue::PerBlock(&unshowable_receipt)
                 } else {
                     Residue::PerBlock(&normal_receipt)
@@ -750,12 +764,16 @@ impl RequestKind for PermissionKind {
         };
         // Result card: shows the decision, no buttons. A forced refusal says
         // why — it is not the decision the button label claimed.
-        let label = if unshowable.is_some() {
+        let label = if companion_uncertain {
+            crate::feishu::card::question::UNCERTAIN_PERMISSION_CLICK_LABEL
+        } else if unshowable.is_some() {
             crate::feishu::card::question::UNSHOWABLE_PERMISSION_DECLINED_LABEL
         } else {
             display_label
         };
-        let toast = if unshowable.is_some() {
+        let toast = if companion_uncertain {
+            "已拒绝：完整目标送达结果未知".to_string()
+        } else if unshowable.is_some() {
             "已拒绝：完整目标未送达".to_string()
         } else {
             match reply {
@@ -764,10 +782,14 @@ impl RequestKind for PermissionKind {
                 _ => "已拒绝".to_string(),
             }
         };
-        let body = if unshowable.is_some() {
-            // The click was an Allow whose request has no matching companion:
-            // the full target was never delivered, so the approval is refused
-            // and the card says why.
+        let body = if companion_uncertain {
+            // The only record is an uncertain marker: its outcome is unknown,
+            // so no approval is possible and the card says so honestly.
+            crate::feishu::card::question::uncertain_permission_note().to_string()
+        } else if unshowable.is_some() {
+            // The click was an Allow whose request has no companion record: the
+            // full content was never delivered, so the approval is refused and
+            // the card says why.
             crate::feishu::card::question::unshowable_permission_undelivered_note()
         } else if let Some(p) = verified.as_ref() {
             // The approval re-read the request from the server; the result card
@@ -2286,9 +2308,8 @@ pub(crate) fn companion_target_digest(p: &crate::backend::types::PermissionReque
 
 /// The summary form of a permission for an over-budget request (ADR-0102): the
 /// action, the total character count, the first 120 characters of the content
-/// the proof measures, and where the full content lives. `delivery` is the
-/// record that actually landed (or may have landed), so the card never points
-/// at a message that does not exist.
+/// the proof measures, and where the full content lives. `delivery` is a
+/// **confirmed** record; an uncertain marker returns the non-approval copy.
 pub(crate) fn describe_permission_summary(
     p: &crate::backend::types::PermissionRequest,
     delivery: &CompanionDelivery,
@@ -2296,18 +2317,19 @@ pub(crate) fn describe_permission_summary(
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
     let excerpt: String = companion_text(p).chars().take(120).collect();
-    let destination = if delivery.is_uncertain() {
-        format!(
-            "已尝试通过{}发送（结果未知，可能已送达）。",
-            delivery.lane.label()
-        )
-    } else {
-        format!("已通过{}发送。", delivery.lane.label())
-    };
+    if delivery.is_uncertain() {
+        // Defensive: an uncertain marker is not a proof, so no interactive
+        // summary may claim the content was sent or offer approval.
+        return format!(
+            "{emoji} **{label}**\n**目标长度**: {} 字符\n**完整内容**: 发送结果未知，未确认送达；无法批准。",
+            p.total_target_len()
+        );
+    }
     let mut s = format!(
-        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整内容**: {destination}",
+        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整内容**: 已通过{}发送。",
         p.total_target_len(),
-        crate::feishu::card::fenced_code(&excerpt, None)
+        crate::feishu::card::fenced_code(&excerpt, None),
+        delivery.lane.label()
     );
     s.push_str("\n\nAI 想要执行这个操作，是否允许？");
     s
@@ -2332,7 +2354,8 @@ pub(crate) enum CompanionOutcome {
     Delivered,
     /// The send may have landed (a timeout or a post-accept 5xx) but returned
     /// no id. It is terminal: a retry could duplicate the message, so the
-    /// record carries an empty message id and the summary says so.
+    /// record carries an empty message id. It is not a delivery proof, so the
+    /// caller refuses the request and names the unknown outcome.
     Uncertain,
     /// No lane delivered: the request must follow the refusal path.
     Failed,
@@ -2347,7 +2370,8 @@ pub(crate) enum CompanionOutcome {
 /// [`crate::feishu::card::viewer::rich_post_md`] sizing; a body past its 30 KB
 /// cap, or a send that **definitely** did not land, falls to the File Message
 /// lane through [`crate::bridge::viewer::send_file_message_with_outcome`]. An
-/// ambiguous send is terminal — it must not be retried into a duplicate.
+/// ambiguous send is terminal — it must not be retried into a duplicate — and
+/// leaves only a non-proof marker; the caller offers no interactive approval.
 pub(crate) async fn ensure_permission_companion(
     handles: &FlowHandles,
     surfaces: &Surfaces,
@@ -2440,9 +2464,9 @@ pub(crate) async fn ensure_permission_companion(
             }
             Some(Err(error)) => {
                 // The post may have landed after Feishu accepted it. Falling to
-                // the File lane could duplicate the whole content, and declining
-                // would reject a request the user may be looking at. Record the
-                // uncertain delivery and surface the summary.
+                // the File lane could duplicate the whole content. Record only a
+                // no-duplicate marker; the caller refuses the request because
+                // this is not a delivery proof.
                 tracing::warn!(
                     "permission {} companion Rich Text Message outcome unknown: {error}; \
                      not retrying",

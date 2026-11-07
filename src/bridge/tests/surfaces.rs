@@ -1153,6 +1153,91 @@ async fn restart_approves_a_recovered_over_budget_permission_unseen_on_auto_acce
     );
 }
 
+/// An uncertain companion marker survives a restart: it still prevents a
+/// duplicate send and it never becomes a delivery proof. An Allow click is
+/// refused with the uncertain copy, and no send is retried.
+#[tokio::test]
+async fn restart_keeps_an_uncertain_companion_marker_non_approvable() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    // Pre-restart: the companion send is ambiguous and the decline fails, so
+    // the request stays pending with only the marker.
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(over_budget_perm("per_long", "ses_1"));
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    platform
+        .ambiguous_send_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
+    seed_live_card(&app, "ses_1", "om_live").await;
+    sweep(&app.permission, &app).await;
+    assert!(
+        persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "the marker is persisted"
+    );
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    let marker = app
+        .permission
+        .surfaces
+        .companion("per_long")
+        .expect("the uncertain marker hydrates at startup");
+    assert!(
+        marker.message_id.is_empty(),
+        "the marker is not a confirmed delivery"
+    );
+
+    // The Allow click is refused before any sweep can re-send.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_long",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+        }))
+        .await
+        .expect("a card-action result");
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the restarted marker never approves"
+    );
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已拒绝：完整目标送达结果未知"),
+        "the toast names the unknown outcome"
+    );
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "the marker prevents a duplicate companion after the restart"
+    );
+
+    // A sweep also sends nothing: the marker is terminal for delivery.
+    sweep(&app.permission, &app).await;
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "no companion is re-sent after the restart"
+    );
+}
+
 /// Whole-branch re-review #883: a refusal that **fails** must still neutralize
 /// the stored card — an over-budget card from an older build must never keep
 /// its Allow buttons while the request is still pending — but with a "will
