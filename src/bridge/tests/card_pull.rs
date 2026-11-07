@@ -1214,9 +1214,11 @@ async fn an_abort_after_the_arm_insert_leaves_the_follow_rendering() {
 
 /// The previous card's stamp runs BEFORE the arm, so aborting the command
 /// inside that bounded GET/PATCH leaves no armed card: the map stays the old
-/// idle read and no rendererless live card is created.
+/// idle read and no rendererless live card is created. The cancellation debt
+/// the stamp opened is still paid — the just-sent read is stamped taken over —
+/// so the chat never shows a second card that looks current.
 #[tokio::test]
-async fn an_abort_during_the_old_card_stamp_never_arms_a_rendererless_follow() {
+async fn an_abort_during_the_old_card_stamp_marks_the_sent_read() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1285,6 +1287,28 @@ async fn an_abort_during_the_old_card_stamp_never_arms_a_rendererless_follow() {
     assert!(
         cards.chains.get("ses_test").is_none(),
         "the aborted follow wrote no Chain Record"
+    );
+    // The command was cancelled after it stamped the previous card; the read it
+    // had just sent must not stay indistinguishable from current.
+    let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let calls = platform.calls.lock().await.clone();
+            if let Some(card) = calls.iter().rev().find_map(|call| match call {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_follow" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            }) {
+                return card;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the aborted command must still mark the sent read taken over");
+    assert!(
+        card_text(&marked).contains("已由新卡片接管"),
+        "the sent read is marked superseded: {marked}"
     );
 }
 

@@ -1083,6 +1083,71 @@ async fn mark_untracked_read(
     }
 }
 
+/// The follow arm's cancellation debt: `/card` stamps the previous card BEFORE
+/// the arm switches the map, so a cancellation between the two would leave a
+/// stamped old card plus a just-sent read nobody tracks. On drop (the command
+/// was cancelled) this spawns the same best-effort stamp for the sent read —
+/// unless the arm already made it the Session's card, which is the one case
+/// where it must stay unmarked. Disarmed on every normal exit once the card is
+/// tracked or the explicit failure path has marked it.
+struct UntrackedReadOnCancel {
+    cards: crate::bridge::handles::CardsHandle,
+    session_id: String,
+    sent: String,
+    card: serde_json::Value,
+    armed: bool,
+}
+
+impl UntrackedReadOnCancel {
+    fn new(
+        cards: &crate::bridge::handles::CardsHandle,
+        session_id: &str,
+        sent: &str,
+        card: &serde_json::Value,
+    ) -> Self {
+        Self {
+            cards: cards.clone(),
+            session_id: session_id.to_string(),
+            sent: sent.to_string(),
+            card: card.clone(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UntrackedReadOnCancel {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The arm may have committed the sent card before the cancellation
+        // reached us (its insert is one map critical section). Then the read IS
+        // the Session's card and marking it would stamp a live card taken
+        // over; only a read the map does not name is untracked.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let cards = self.cards.clone();
+        let session_id = self.session_id.clone();
+        let sent = self.sent.clone();
+        let card = self.card.clone();
+        runtime.spawn(async move {
+            if crate::bridge::turn::Turn::card_message_id(&cards, &session_id)
+                .await
+                .as_deref()
+                == Some(sent.as_str())
+            {
+                return;
+            }
+            mark_untracked_read(&cards, &session_id, &sent, &card).await;
+        });
+    }
+}
+
 /// `/card`'s second state (ADR-0100): with no renderer owning the Session, read
 /// it once and post exactly ONE read-only Session Card.
 ///
@@ -1227,6 +1292,11 @@ async fn post_idle_card(
     // PATCH are the lock's other long awaits (ADR-0100).
     let sent = handles.flow.platform.reply_card(message_id, &card).await?;
     if let Some(plan) = &mut follow {
+        // From here on the command owes the just-sent read an ending if it is
+        // cancelled before the arm makes it the Session's card: the previous
+        // card may already be stamped (below), so a dropped future must still
+        // mark the read instead of leaving it looking current.
+        let mut untracked = UntrackedReadOnCancel::new(cards, session_id, &sent, &card);
         // The old card is neutralised BEFORE the arm switches the map: it
         // must never stay the visible card while the follow (or a later idle
         // read) becomes current. A failed stamp aborts the command and keeps
@@ -1243,6 +1313,7 @@ async fn post_idle_card(
                 // The old card stays current, but the just-sent read must not
                 // be indistinguishable from it: mark the untracked read too.
                 mark_untracked_read(cards, session_id, &sent, &card).await;
+                untracked.disarm();
                 tracing::warn!(
                     "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
                     previous
@@ -1258,6 +1329,10 @@ async fn post_idle_card(
             .arm_snapshot_follow_locked(&handles.flow, session_id, &sent, plan, true)
             .await;
         if armed {
+            // A committed arm makes the sent read the Session's card: the
+            // cancellation debt is settled, so drop it before anything else
+            // can observe the command as cancelled.
+            untracked.disarm();
             // Only a committed follow adopts a new run, so that is the only
             // branch that may drop a pre-run `/stop`; a refused arm leaves the
             // marker for the run that actually owns the card.
@@ -1277,6 +1352,7 @@ async fn post_idle_card(
             tracing::info!("card read: session {session_id} follows the running turn on the posted card");
         } else {
             mark_untracked_read(cards, session_id, &sent, &card).await;
+            untracked.disarm();
             tracing::info!(
                 "card read: session {session_id} the old card kept the session during the follow read; the posted read is stamped"
             );
