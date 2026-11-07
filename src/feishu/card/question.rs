@@ -292,6 +292,31 @@ pub(crate) fn build_unshowable_permission_retry_card() -> serde_json::Value {
     )
 }
 
+/// The receipt an inline over-budget block collapses to when an Auto-Accept
+/// session approves the request unseen while withdrawing the card that could
+/// not show it (ADR-0101, ADR-0102).
+pub(crate) const AUTOACCEPTED_PERMISSION_RECEIPT: &str = "🔄 已自动授权：目标未在卡片完整显示，已批准";
+
+/// The header of the card that replaces a recovered over-budget permission card
+/// when an Auto-Accept session approves it unseen.
+pub(crate) const AUTOACCEPTED_PERMISSION_HEADER: &str = "🔄 权限已自动授权";
+
+/// Why that card carries no controls.
+pub(crate) fn autoaccepted_permission_note() -> &'static str {
+    "该会话已开启自动授权，这个请求已自动批准（目标未在卡片上完整显示）。\
+     卡片不再提供操作；如需复核，请在原始客户端查看该请求。"
+}
+
+/// The non-interactive card that replaces a recovered over-budget permission
+/// card after an Auto-Accept session approved it unseen.
+pub(crate) fn build_autoaccepted_permission_card() -> serde_json::Value {
+    card_shell(
+        AUTOACCEPTED_PERMISSION_HEADER,
+        "blue",
+        vec![json!({ "tag": "markdown", "content": autoaccepted_permission_note() })],
+    )
+}
+
 /// The label of the result card cola shows when it refuses a click on a
 /// permission whose target it cannot show in full (the click asked to approve
 /// text the user never saw). Pinned with the refusal copy above.
@@ -1812,8 +1837,12 @@ mod tests {
         // 5,000 characters is over budget, so the surface is the summary and
         // the full target rides the companion. The card carries no full target.
         let long = request("x".repeat(5_000));
-        let summary =
-            crate::bridge::request::kind::describe_permission_summary(&long, CompanionLane::RichText);
+        let delivery = crate::bridge::surfaces::CompanionDelivery {
+            message_id: "om_post".into(),
+            lane: CompanionLane::RichText,
+            target_digest: 0,
+        };
+        let summary = crate::bridge::request::kind::describe_permission_summary(&long, &delivery);
         let summary_card = build_permission_card("ses", "n:1", &summary, "/tmp/proj", true);
         let len = summary_card.to_string().len();
         assert!(

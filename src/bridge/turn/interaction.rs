@@ -76,7 +76,7 @@ impl Turn {
         session_id: &str,
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
-        companion: Option<crate::bridge::surfaces::CompanionLane>,
+        companion: Option<crate::bridge::surfaces::CompanionDelivery>,
     ) -> bool {
         // Inserting a block is a card-surface mutation that must not interleave
         // with a flush: a background write that already passed its typed-answer
@@ -97,12 +97,12 @@ impl Turn {
         session_id: &str,
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
-        companion: Option<crate::bridge::surfaces::CompanionLane>,
+        companion: Option<crate::bridge::surfaces::CompanionDelivery>,
     ) -> bool {
         let block = state::InteractionBlock::Permission(state::PendingPermission {
             session_id: p.session_id.clone().unwrap_or_default(),
             request_id: p.request_id.clone(),
-            body: crate::bridge::request::kind::describe_permission_for(p, companion),
+            body: crate::bridge::request::kind::describe_permission_for(p, companion.as_ref()),
             target: crate::bridge::request::kind::permission_target(p),
             directory: directory.to_string(),
             always_supported: p.always_supported,
