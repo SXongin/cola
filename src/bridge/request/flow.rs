@@ -1102,11 +1102,16 @@ impl RequestFlow {
     /// request forever because every later sweep would treat it as surfaced and
     /// `rehost_block` has no card to re-host it on.
     ///
-    /// The inline/standalone decision holds the OWNING Session's card write
-    /// lock from the host check through the send and its `sent_cards` record
-    /// (ADR-0100). `/card`'s post-and-arm takes the same lock, so the two
-    /// cannot both deliver one request: whichever runs second sees the first's
-    /// effect (a live card carrying the block, or a recorded standalone).
+    /// The inline/standalone decision holds ONE Session's card write lock at a
+    /// time (ADR-0038's 2026-11-07 amendment, ADR-0100). The host is resolved
+    /// before any lock; the inline path then takes the HOST's lock and
+    /// re-checks its liveness before inserting/flushing. If it is no longer
+    /// live, that lock is released and the standalone path takes the REQUEST
+    /// Session's own lock for the decision, send and `sent_cards` record. The
+    /// two are never nested. `/card`'s post-and-arm takes the same host lock,
+    /// so the two cannot both deliver one request: whichever runs second sees
+    /// the first's effect (a live card carrying the block, or a recorded
+    /// standalone).
     async fn surface(
         &self,
         handles: &FlowHandles,
@@ -1233,16 +1238,16 @@ impl RequestFlow {
         // children) its nearest ancestor with a live card. Only a separate card
         // when there is no active card (e.g. external turns or restarts).
         //
-        // The WHOLE decision — the inline check, the block insert/flush, and
-        // the standalone send with its `sent_cards` record — holds the owning
-        // Session's card write lock (ADR-0100). `/card`'s post-and-arm takes
-        // the same lock, so a sweep that read "no live card" just before the
-        // arm cannot then post a standalone card for the request the follow
-        // seeded: either it commits first (this sweep sees the live card and
-        // attaches there, or finds the block already carried) or it sends
-        // first (the follow's seed filter sees that surface and does not
-        // duplicate it).
-        // Resolve the standalone target BEFORE the lock: this walk reads the
+        // LOCK ORDER (ADR-0038's amendment): never hold two Sessions' card
+        // locks. The host is resolved first (bounded); the inline decision then
+        // takes the HOST's write lock — the same lock `/card`'s post-and-arm and
+        // a busy follow take — re-checks the host's liveness and inserts/flushes
+        // under it. If the host is gone, that lock is released before the
+        // standalone path takes the REQUEST Session's own lock for its decision,
+        // send and `sent_cards` record. A sub-task child's lock is never taken
+        // while the ancestor host's is, so the old nested acquisition (and its
+        // host-check-under-the-child's-lock race) cannot recur.
+        // Resolve the standalone target BEFORE any lock: this walk reads the
         // parent chain and the server's session metadata, which has no card
         // state to serialize with.
         let target = resolve_card_target(
@@ -1257,12 +1262,12 @@ impl RequestFlow {
         // Resolve the inline host BEFORE the lock too, and BOUND it by the
         // flow's read timeout: the parent-chain walk calls `session_info`,
         // which has no timeout of its own, so a half-open connection would
-        // otherwise hold the owning Session's card write lock indefinitely —
-        // blocking flushes, `/card`, install and the rest of that sweep. On
-        // timeout the request falls through to the standalone path (retried
-        // next tick if no card lands). The inline check is re-run under the
-        // lock below, so a follow that committed in this window still hosts
-        // the request instead of a stale standalone.
+        // otherwise hold a card write lock indefinitely — blocking flushes,
+        // `/card`, install and the rest of that sweep. On timeout the request
+        // falls through to the standalone path (retried next tick if no card
+        // lands). The liveness check is re-run under the HOST's lock below, so
+        // a `/card` read or a follow that committed in this window wins
+        // instead of letting the insert land on a card that stopped being live.
         let resolved_host = crate::bridge::bounded_call(
             &format!("{} inline host ({})", self.kind.label(), req.session_id()),
             self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -1275,68 +1280,96 @@ impl RequestFlow {
         .await
         .and_then(Result::ok)
         .flatten();
+        // Inline path: take the HOST's write lock — never the request
+        // Session's while also holding the host's, and never the reverse. A
+        // sub-task child has no card of its own, so its lock would serialize
+        // nothing with `/card` or the follow (which take the host's); the
+        // host's lock is what makes the liveness check and the insert one
+        // critical section (ADR-0038's amendment, ADR-0100).
+        if let Some(host) = resolved_host {
+            let host_lock = handles.cards.write_lock(&host).await;
+            let host_guard = host_lock.lock().await;
+            // Re-check under the host's lock: the parent may have ended and
+            // `/card` installed an Idle card during the bounded host walk. An
+            // insert must never land on a card that stopped being live.
+            if Turn::is_running(&handles.cards, &host).await {
+                let pushed = self
+                    .kind
+                    .add_inline_locked(self, &handles.cards, &host, req, dir)
+                    .await;
+                if pushed {
+                    // The block landed: this request is surfaced from now on.
+                    seen.insert(req.id().to_string());
+                    tracing::info!(
+                        "{} {} inlined on session {} card",
+                        self.kind.label(),
+                        req.id(),
+                        host
+                    );
+                    // Flush so the inline section appears NOW — the render loop
+                    // only flushes on new parts, and a blocked prompt produces
+                    // none.
+                    Turn::flush_card_locked(&handles.cards, &host).await;
+                    return false;
+                }
+                // `add_inline_locked` false is ambiguous: the card session
+                // vanished, OR it already carries the block. A busy follow
+                // seeds its read's pendings without the sweep's `seen`, so the
+                // latter is the normal case for a request `/card` just put on
+                // the card — falling through here would post a duplicate
+                // standalone card. Only a card that still carries the request
+                // is "already surfaced"; a vanished one still needs its own.
+                if Turn::has_interaction_in(&handles.cards, &host, req.id()).await {
+                    seen.insert(req.id().to_string());
+                    tracing::info!(
+                        "{} {} already carried by session {} card",
+                        self.kind.label(),
+                        req.id(),
+                        host
+                    );
+                    return false;
+                }
+            }
+            // The host stopped being live (or its card vanished mid-pass):
+            // release it and let the request surface on its own card. Nothing
+            // has been inserted or repainted.
+            drop(host_guard);
+        }
+        // Standalone path: the request Session's OWN write lock covers its
+        // decision, send and surface record. The host's lock is already
+        // released here — the two are never nested.
         let owning_lock = handles.cards.write_lock(req.session_id()).await;
         let guard = owning_lock.lock().await;
-        // Re-validate under the lock: the resolved host may have stopped
-        // running, or a follow may have committed during the walk (its card is
-        // the request's host now).
-        let host = match resolved_host {
-            Some(host) if Turn::is_running(&handles.cards, &host).await => Some(host),
-            _ if Turn::is_running(&handles.cards, req.session_id()).await => {
-                Some(req.session_id().to_string())
-            }
-            _ => None,
-        };
-        if let Some(host) = host {
-            // The common case — the request's own card — is already under
-            // this lock; a sub-task child hosted on an ancestor takes that
-            // card's own lock inside the add/flush (never both held in the
-            // reverse order).
-            let pushed = if host == req.session_id() {
-                self.kind
-                    .add_inline_locked(self, &handles.cards, &host, req, dir)
-                    .await
-            } else {
-                self.kind.add_inline(self, &handles.cards, &host, req, dir).await
-            };
+        // A card may have appeared on the request Session itself during the
+        // walk (a follow that committed after host resolution). Re-check under
+        // its own lock so the standalone send cannot duplicate a block that
+        // just landed there.
+        if Turn::is_running(&handles.cards, req.session_id()).await {
+            let pushed = self
+                .kind
+                .add_inline_locked(self, &handles.cards, req.session_id(), req, dir)
+                .await;
             if pushed {
-                // The block landed: this request is surfaced from now on.
                 seen.insert(req.id().to_string());
                 tracing::info!(
                     "{} {} inlined on session {} card",
                     self.kind.label(),
                     req.id(),
-                    host
+                    req.session_id()
                 );
-                // Flush so the inline section appears NOW — the render loop
-                // only flushes on new parts, and a blocked prompt produces
-                // none.
-                if host == req.session_id() {
-                    Turn::flush_card_locked(&handles.cards, &host).await;
-                } else {
-                    Turn::flush_card(&handles.cards, &host).await;
-                }
+                Turn::flush_card_locked(&handles.cards, req.session_id()).await;
                 return false;
             }
-            // `add_inline` false is ambiguous: the card session vanished,
-            // OR it already carries the block. A busy follow seeds its
-            // read's pendings without the sweep's `seen`, so the latter is
-            // the normal case for a request `/card` just put on the card —
-            // falling through here would post a duplicate standalone card.
-            // Only a card that still carries the request is "already
-            // surfaced"; a vanished one still needs its own card.
-            if Turn::has_interaction_in(&handles.cards, &host, req.id()).await {
+            if Turn::has_interaction_in(&handles.cards, req.session_id(), req.id()).await {
                 seen.insert(req.id().to_string());
                 tracing::info!(
                     "{} {} already carried by session {} card",
                     self.kind.label(),
                     req.id(),
-                    host
+                    req.session_id()
                 );
                 return false;
             }
-            // The card vanished mid-pass: fall through to a standalone card,
-            // still unmarked until that lands.
         }
         let card = self.kind.build_card(req, dir);
         // Reply to the message that triggered the prompt for this session; fall
