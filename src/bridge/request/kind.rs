@@ -106,9 +106,8 @@ pub trait RequestKind: Send + Sync {
     /// made**, including the restart re-adoption of a card a previous process
     /// persisted. A request the card cannot show in full is no longer refused
     /// on its way in (ADR-0102): a permission takes the companion lane instead.
-    /// The flow still applies this hook for the two shapes that do end in a
-    /// decline — a companion that could not be delivered, and a recovered card
-    /// with no companion record — using the same refusal vocabulary.
+    /// A recovered card without a usable companion is withdrawn by the flow and
+    /// takes the fresh path, not this hook.
     ///
     /// `Refused` means the request is settled on the server; the flow then
     /// withdraws any persisted surface and offers nothing. `Failed` means the
@@ -256,6 +255,18 @@ pub trait RequestKind: Send + Sync {
     ) -> Option<CardActionResult>;
 }
 
+/// Why a permission is being declined on the server. One reason type keeps the
+/// reply skeleton shared while the copy follows the actual failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclineReason {
+    /// The card (and companion) cannot show the request in full: the target or
+    /// rendered-body bound failed.
+    Overflow(PermissionOverflow),
+    /// The companion's delivery outcome is unknown; it may or may not have
+    /// landed. An unconfirmed delivery is not a completeness proof.
+    CompanionUncertain,
+}
+
 /// What [`RequestKind::refuse`] decided for one listed request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -263,8 +274,8 @@ pub(crate) enum Refusal {
     NotApplicable,
     /// Refused on the server. The request must not be surfaced, and any
     /// surface a previous process persisted for it is withdrawn. Carries the
-    /// bound that failed, so the reason card names it without re-deciding.
-    Refused(PermissionOverflow),
+    /// reason, so the reason card names it without re-deciding.
+    Refused(DeclineReason),
     /// The server no longer holds the request: another client (or an earlier
     /// sweep) settled it. The stored surface is withdrawn **neutrally** — cola
     /// did not reject anything, so no auto-reject copy may be left behind — and
@@ -767,14 +778,14 @@ impl RequestKind for PermissionKind {
         let label = if companion_uncertain {
             crate::feishu::card::question::UNCERTAIN_PERMISSION_CLICK_LABEL
         } else if unshowable.is_some() {
-            crate::feishu::card::question::UNSHOWABLE_PERMISSION_DECLINED_LABEL
+            crate::feishu::card::question::MISSING_PERMISSION_CLICK_LABEL
         } else {
             display_label
         };
         let toast = if companion_uncertain {
-            "已拒绝：完整目标送达结果未知".to_string()
+            "已拒绝：完整内容送达结果未知".to_string()
         } else if unshowable.is_some() {
-            "已拒绝：完整目标未送达".to_string()
+            "已拒绝：完整内容未送达".to_string()
         } else {
             match reply {
                 "once" => "已允许本次执行".to_string(),
@@ -787,10 +798,10 @@ impl RequestKind for PermissionKind {
             // so no approval is possible and the card says so honestly.
             crate::feishu::card::question::uncertain_permission_note().to_string()
         } else if unshowable.is_some() {
-            // The click was an Allow whose request has no companion record: the
-            // full content was never delivered, so the approval is refused and
+            // The click was an Allow whose request has no confirmed companion:
+            // the full content was never delivered, so the click is refused and
             // the card says why.
-            crate::feishu::card::question::unshowable_permission_undelivered_note()
+            crate::feishu::card::question::missing_permission_click_note()
         } else if let Some(p) = verified.as_ref() {
             // The approval re-read the request from the server; the result card
             // describes exactly that request, never the callback's stale copy.
@@ -818,7 +829,7 @@ impl RequestKind for PermissionKind {
 /// the parent's flag, consistent with `approve_pending_for_session`.
 /// What the parent-chain read says about a session's Auto-Accept flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AutoAcceptFlag {
+enum AutoAcceptFlag {
     /// The session, or an ancestor, has it on.
     On,
     /// The chain was walked to its end and nothing mapped has it on.
@@ -834,7 +845,7 @@ pub(crate) enum AutoAcceptFlag {
 /// retry an unknown instead of reading it as off — declining on a guess is the
 /// irreversible outcome #892 is about), and `Capped` when a too-deep chain left
 /// the answer unreachable (a retry loop would hang the turn forever).
-pub(crate) async fn should_auto_accept(
+async fn should_auto_accept(
     flow: &RequestFlow,
     sessions: &SessionsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
@@ -949,26 +960,22 @@ pub(crate) async fn set_auto_accept(
     })
 }
 
-/// Decline a permission whose full content could not be delivered on a card or
-/// in a companion (ADR-0102).
+/// Settle a permission on the server with `reject` — the ONE refusal skeleton
+/// for both an over-budget bound and an uncertain companion outcome.
 ///
-/// Only the server answer happens here: the turn is blocked on it, so it must
-/// land first, and whether the user gets the reason card or their persisted
-/// card is withdrawn is the flow's decision (`withdraw_stored_surface`).
-/// **A failed reply is not a refusal**: it returns [`Refusal::Failed`] so the
-/// flow keeps the request retryable instead of reporting it settled. A request
-/// the server no longer lists (another sweep or client settled it first) is
-/// already refused.
-pub(crate) async fn decline_unshowable(
+/// The turn is blocked on the reply, so it must land first; whether the user
+/// gets the reason card or their persisted card is withdrawn is the flow's
+/// decision (`withdraw_stored_surface`). **A failed reply is not a refusal**:
+/// it returns [`Refusal::Failed`] so the flow keeps the request retryable
+/// instead of reporting it settled. A request the server no longer lists
+/// (another sweep or client settled it first) is already refused.
+pub(crate) async fn decline_permission(
     handles: &FlowHandles,
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
-    overflow: PermissionOverflow,
+    reason: DeclineReason,
 ) -> Refusal {
     let session_id = p.session_id.clone().unwrap_or_default();
-    let budget = overflow.budget();
-    let rendered = rendered_permission_chars(p);
-    let total = p.total_target_len();
     match handles
         .backend
         .clone()
@@ -977,20 +984,30 @@ pub(crate) async fn decline_unshowable(
         .await
     {
         Ok(()) => {
-            tracing::warn!(
-                "declined permission {} on session {session_id}: its targets total {total} \
-                 characters (rendered content is {rendered}), past the card's {budget} character budget",
-                p.request_id
-            );
-            Refusal::Refused(overflow)
+            match reason {
+                DeclineReason::Overflow(overflow) => tracing::warn!(
+                    "declined permission {} on session {session_id}: its targets total {} \
+                     characters (rendered content is {}), past the card's {} character budget",
+                    p.request_id,
+                    p.total_target_len(),
+                    rendered_permission_chars(p),
+                    overflow.budget()
+                ),
+                DeclineReason::CompanionUncertain => tracing::warn!(
+                    "declined permission {} on session {session_id}: its companion delivery \
+                     outcome is unknown; no interactive approval is offered",
+                    p.request_id
+                ),
+            }
+            Refusal::Refused(reason)
         }
         // Another client (or an earlier sweep) settled it before us: there is
         // nothing left to refuse, and nothing cola may claim it rejected.
         Err(crate::error::BridgeError::NotFound(_)) => Refusal::ResolvedElsewhere,
         Err(e) => {
             tracing::warn!(
-                "declining unshowable permission {} on session {session_id} failed: {e}; it will \
-                 be retried on the next sweep and is never offered in the meantime",
+                "declining permission {} on session {session_id} failed: {e}; it will be \
+                 retried on the next sweep and is never offered in the meantime",
                 p.request_id
             );
             Refusal::Failed
@@ -1103,7 +1120,7 @@ const AUTO_ACCEPT_TARGET_LOG_CHARS: usize = 120;
 /// it unshowable (and the summed target length), and the target's first line.
 /// INFO, like every other auto-accepted transition (ADR-0048); the "unseen"
 /// wording is what sets it apart from an ordinary auto-accept.
-pub(crate) fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
+fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
     let Some(overflow) = permission_overflow(p) else {
         return;
     };
@@ -2307,24 +2324,19 @@ pub(crate) fn companion_target_digest(p: &crate::backend::types::PermissionReque
 }
 
 /// The summary form of a permission for an over-budget request (ADR-0102): the
-/// action, the total character count, the first 120 characters of the content
-/// the proof measures, and where the full content lives. `delivery` is a
-/// **confirmed** record; an uncertain marker returns the non-approval copy.
+/// action, the total character count, the first 120 characters of the target,
+/// and where the full content lives. Callers pass a **confirmed** delivery
+/// (`delivered_companion`); an uncertain marker never reaches a card.
 pub(crate) fn describe_permission_summary(
     p: &crate::backend::types::PermissionRequest,
     delivery: &CompanionDelivery,
 ) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
-    let excerpt: String = companion_text(p).chars().take(120).collect();
-    if delivery.is_uncertain() {
-        // Defensive: an uncertain marker is not a proof, so no interactive
-        // summary may claim the content was sent or offer approval.
-        return format!(
-            "{emoji} **{label}**\n**目标长度**: {} 字符\n**完整内容**: 发送结果未知，未确认送达；无法批准。",
-            p.total_target_len()
-        );
-    }
+    // The excerpt is the target text, not the rendered body: the body's first
+    // line already repeats the action above, and the full content (including
+    // its chrome) travels in the companion.
+    let excerpt: String = p.patterns.join("\n\n").chars().take(120).collect();
     let mut s = format!(
         "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整内容**: 已通过{}发送。",
         p.total_target_len(),
@@ -2419,19 +2431,27 @@ pub(crate) async fn ensure_permission_companion(
     let body = companion_text(p);
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
-    // Reuse ADR-0083 §5's Rich Text sizing: `rich_post_md` returns the fenced
-    // body only when it fits the post cap; the preamble is charged separately
-    // because it rides the same message.
-    let rich = crate::feishu::card::viewer::rich_post_md(
-        crate::feishu::card::viewer::ViewerKind::Text,
-        Some("txt"),
-        &body,
-    )
-    .map(|fenced| format!("{emoji} **{label}**\n\n{fenced}"))
-    .filter(|md| {
-        crate::feishu::card::sanitize::serialized_len(md) + 128
-            <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES
-    });
+    // A TARGET overflow is raw text, so it gets the action header and a fenced
+    // block. A BODY overflow is already the renderer's markdown (action,
+    // metadata, footer); send it as-is — fencing it would show the markdown
+    // literally and prepending the action would repeat it.
+    let rich = match permission_overflow(p) {
+        Some(PermissionOverflow::Targets) => crate::feishu::card::viewer::rich_post_md(
+            crate::feishu::card::viewer::ViewerKind::Text,
+            Some("txt"),
+            &body,
+        )
+        .map(|fenced| format!("{emoji} **{label}**\n\n{fenced}"))
+        .filter(|md| {
+            crate::feishu::card::sanitize::serialized_len(md) + 128
+                <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES
+        }),
+        // Body overflow, or no overflow (defensive): the body already names the
+        // action and renders readably.
+        _ => (crate::feishu::card::sanitize::serialized_len(&body) + 128
+            <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES)
+            .then_some(body.clone()),
+    };
     if let Some(md) = rich {
         let content = crate::feishu::card::viewer::rich_post_content(&md);
         match crate::bridge::bounded_call(
@@ -2441,7 +2461,7 @@ pub(crate) async fn ensure_permission_companion(
         )
         .await
         {
-            Some(Ok((sent_id, _))) => {
+            Some(Ok((sent_id, _))) if !sent_id.is_empty() => {
                 let delivery = CompanionDelivery {
                     message_id: sent_id,
                     lane: CompanionLane::RichText,
@@ -2454,6 +2474,22 @@ pub(crate) async fn ensure_permission_companion(
                     delivery.message_id
                 );
                 return CompanionOutcome::Delivered;
+            }
+            Some(Ok(_)) => {
+                // A success without a message id lands in the marker half: the
+                // two definitions of "delivered" must agree.
+                tracing::warn!(
+                    "permission {} companion Rich Text Message returned no message id; \
+                     recording an uncertain marker",
+                    p.request_id
+                );
+                let delivery = CompanionDelivery {
+                    message_id: String::new(),
+                    lane: CompanionLane::RichText,
+                    target_digest: digest,
+                };
+                surfaces.set_companion(&p.request_id, delivery.clone());
+                return CompanionOutcome::Uncertain;
             }
             Some(Err(error)) if error.is_definite_non_delivery() => {
                 tracing::warn!(
@@ -2534,18 +2570,37 @@ pub(crate) async fn ensure_permission_companion(
     .await;
     match delivery {
         crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
-            let delivery = CompanionDelivery {
-                message_id: sent_id.unwrap_or_default(),
-                lane: CompanionLane::File,
-                target_digest: digest,
-            };
-            surfaces.set_companion(&p.request_id, delivery.clone());
-            tracing::info!(
-                "permission {} companion delivered as a File Message ({})",
-                p.request_id,
-                delivery.message_id
-            );
-            CompanionOutcome::Delivered
+            match sent_id.filter(|id| !id.is_empty()) {
+                Some(message_id) => {
+                    let delivery = CompanionDelivery {
+                        message_id,
+                        lane: CompanionLane::File,
+                        target_digest: digest,
+                    };
+                    surfaces.set_companion(&p.request_id, delivery.clone());
+                    tracing::info!(
+                        "permission {} companion delivered as a File Message ({})",
+                        p.request_id,
+                        delivery.message_id
+                    );
+                    CompanionOutcome::Delivered
+                }
+                None => {
+                    // A success without a message id is a marker, not a proof.
+                    tracing::warn!(
+                        "permission {} companion File Message returned no message id; \
+                         recording an uncertain marker",
+                        p.request_id
+                    );
+                    let delivery = CompanionDelivery {
+                        message_id: String::new(),
+                        lane: CompanionLane::File,
+                        target_digest: digest,
+                    };
+                    surfaces.set_companion(&p.request_id, delivery.clone());
+                    CompanionOutcome::Uncertain
+                }
+            }
         }
         crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
             tracing::warn!(

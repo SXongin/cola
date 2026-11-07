@@ -947,10 +947,10 @@ fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: 
     }
 }
 
-/// Whole-branch re-review #883: an over-budget permission whose card an older
-/// build persisted is **declined before readoption**, not re-adopted. The
-/// persisted card is repainted to a non-interactive receipt in the same sweep,
-/// no second card is posted, and the request is settled on the server.
+/// ADR-0101/0102: a recovered over-budget card an older build persisted is
+/// **withdrawn, not re-adopted**. The request then takes the normal fresh path;
+/// with no reply target the companion cannot land, so it follows the refusal
+/// path and the chat gets the reason card.
 #[tokio::test]
 async fn restart_declines_an_over_budget_inline_permission_instead_of_readopting_it() {
     let _wd = test_work_dir();
@@ -974,30 +974,32 @@ async fn restart_declines_an_over_budget_inline_permission_instead_of_readopting
     assert_eq!(
         backend.reply_permission_calls.lock().await.as_slice(),
         &[("per_long".to_string(), "reject".to_string())],
-        "the recovered request is declined, not offered"
+        "the fresh path declines when no companion can land"
     );
     let withdrawn = last_update_of(&platform, "om_card")
         .await
         .expect("the persisted card is withdrawn in the same sweep");
     let text = card_text(&withdrawn);
     assert!(
-        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT),
-        "the block becomes the refusal receipt: {text}"
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the old block says it was reprocessed: {text}"
     );
     assert!(
         !text.contains("允许一次") && !text.contains("始终允许"),
         "no control survives on the withdrawn card: {text}"
     );
     assert!(
-        posted_cards(&platform).await.is_empty(),
-        "no second card may be posted for the request"
+        posted_cards(&platform).await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+        }),
+        "the fresh refusal posts its reason card"
     );
     assert!(
         !platform.calls.lock().await.iter().any(|call| matches!(
             call,
             PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
         )),
-        "and no companion is sent for a card that is being withdrawn"
+        "no companion can be sent without a reply target"
     );
     assert!(
         app.cards_handle()
@@ -1019,8 +1021,8 @@ async fn restart_declines_an_over_budget_inline_permission_instead_of_readopting
 }
 
 /// The standalone half of the same rule: a request card an older build posted
-/// for an over-budget request is repainted as the refusal card, forgotten, and
-/// never clicked.
+/// for an over-budget request is withdrawn as reprocessed, then the fresh path
+/// declines with its own reason card.
 #[tokio::test]
 async fn restart_declines_an_over_budget_standalone_permission_instead_of_readopting_it() {
     let _wd = test_work_dir();
@@ -1042,30 +1044,32 @@ async fn restart_declines_an_over_budget_standalone_permission_instead_of_readop
     assert_eq!(
         backend.reply_permission_calls.lock().await.as_slice(),
         &[("per_long".to_string(), "reject".to_string())],
-        "the recovered request is declined, not offered"
+        "the fresh path declines when no companion can land"
     );
     let withdrawn = last_update_of(&platform, "om_standalone")
         .await
         .expect("the persisted standalone card is repainted");
     let text = card_text(&withdrawn);
     assert!(
-        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER),
-        "the card carries the refusal copy: {text}"
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_HEADER),
+        "the old card says it was reprocessed: {text}"
     );
     assert!(
         !text.contains("允许一次"),
         "no control survives on the withdrawn card: {text}"
     );
     assert!(
-        posted_cards(&platform).await.is_empty(),
-        "no second card may be posted for the request"
+        posted_cards(&platform).await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+        }),
+        "the fresh refusal posts its reason card"
     );
     assert!(
         !platform.calls.lock().await.iter().any(|call| matches!(
             call,
             PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
         )),
-        "a withdrawn recovered card gets no companion"
+        "no companion can be sent without a reply target"
     );
     assert!(
         !app.permission.sent_cards.lock().await.contains_key("per_long"),
@@ -1077,11 +1081,12 @@ async fn restart_declines_an_over_budget_standalone_permission_instead_of_readop
     );
 }
 
-/// ADR-0101's rule survives the companion lane: an Auto-Accept session never
-/// declines an over-budget request. A recovered card an older build persisted
-/// (no companion) is approved unseen and withdrawn, not re-adopted or declined.
+/// ADR-0101: a recovered over-budget card is never approved or declined in
+/// place. The old surface is withdrawn neutrally, then the request takes the
+/// normal fresh path — here Auto-Accept approves it unseen with its usual INFO
+/// line and no second card.
 #[tokio::test]
-async fn restart_approves_a_recovered_over_budget_permission_unseen_on_auto_accept() {
+async fn restart_withdraws_an_unbacked_card_then_auto_accepts_through_the_fresh_path() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1117,28 +1122,34 @@ async fn restart_approves_a_recovered_over_budget_permission_unseen_on_auto_acce
     })
     .await;
 
-    assert_eq!(
-        backend.reply_permission_calls.lock().await.as_slice(),
-        &[("per_long".to_string(), "once".to_string())],
-        "Auto-Accept approves the recovered over-budget request unseen"
-    );
-    // The unseen approval is audited with the same line ADR-0101 requires.
-    let line = assert_line_level(&logs, "approved permission per_long", "INFO");
-    assert!(
-        line.contains("(targets total"),
-        "the audit line names the length it approved: {line}"
-    );
+    // The old card is withdrawn, not taken over.
     let withdrawn = last_update_of(&platform, "om_card")
         .await
         .expect("the recovered card is withdrawn");
     let text = card_text(&withdrawn);
     assert!(
-        text.contains(crate::feishu::card::question::AUTOACCEPTED_PERMISSION_RECEIPT),
-        "the card says the request was auto-approved: {text}"
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the old card says it was reprocessed: {text}"
     );
     assert!(
         !text.contains("允许一次") && !text.contains("始终允许"),
         "no control survives: {text}"
+    );
+
+    // The normal prepare path approves it unseen and audits it.
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "Auto-Accept approves through the fresh prepare path"
+    );
+    let line = assert_line_level(&logs, "approved permission per_long", "INFO");
+    assert!(
+        line.contains("(targets total"),
+        "the ADR-0101 audit line names the length it approved: {line}"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "Auto-Accept posts no second card"
     );
     assert!(
         !platform.calls.lock().await.iter().any(|call| matches!(
@@ -1150,6 +1161,71 @@ async fn restart_approves_a_recovered_over_budget_permission_unseen_on_auto_acce
     assert!(
         !persisted(&session_file).unwrap_or_default().contains("per_long"),
         "the recovered surface is gone"
+    );
+}
+
+/// ADR-0101/0102: a recovered over-budget card with no usable companion is
+/// withdrawn, then the normal fresh path delivers the companion and surfaces
+/// the summary — never approving or declining the old decision in place.
+#[tokio::test]
+async fn restart_withdraws_an_unbacked_card_then_delivers_a_fresh_companion() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    // A live card is the reply target the companion rides under.
+    seed_live_card(&app, "ses_1", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let withdrawn = last_update_of(&platform, "om_card")
+        .await
+        .expect("the recovered card is withdrawn");
+    assert!(
+        card_text(&withdrawn).contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the old card says it was reprocessed: {}",
+        card_text(&withdrawn)
+    );
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "the old decision is not declined in place"
+    );
+    let posts = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| {
+            matches!(
+                call,
+                PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "post"
+            )
+        })
+        .count();
+    assert_eq!(posts, 1, "the fresh path delivers one companion");
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_1")
+        .await
+        .expect("the new summary card renders");
+    let text = card_text(&card);
+    assert!(
+        text.contains("富文本消息（Rich Text Message）"),
+        "the new card carries the summary: {text}"
+    );
+    assert!(text.contains("3005 字符"), "and the total content length: {text}");
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "the old card is patched, not duplicated"
     );
 }
 
@@ -1216,7 +1292,7 @@ async fn restart_keeps_an_uncertain_companion_marker_non_approvable() {
     );
     assert_eq!(
         result.toast.as_deref(),
-        Some("已拒绝：完整目标送达结果未知"),
+        Some("已拒绝：完整内容送达结果未知"),
         "the toast names the unknown outcome"
     );
     assert!(
@@ -1238,11 +1314,190 @@ async fn restart_keeps_an_uncertain_companion_marker_non_approvable() {
     );
 }
 
-/// Whole-branch re-review #883: a refusal that **fails** must still neutralize
-/// the stored card — an over-budget card from an older build must never keep
-/// its Allow buttons while the request is still pending — but with a "will
-/// retry" receipt that claims nothing, and without marking the request seen so
-/// the next sweep retries the decline and then explains it.
+/// A recovered unbacked card whose Auto-Accept flag read fails is withdrawn,
+/// and the request is left retryable — the fresh `prepare` path retries it and
+/// then auto-accepts once the hop heals. No approval or decline is made on the
+/// old decision.
+#[tokio::test]
+async fn restart_withdraws_a_recovered_card_then_retries_an_unknown_auto_accept() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_parent".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: true,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.with_session_parent("ses_child", "ses_parent");
+        b.ask_permission(over_budget_perm("per_long", "ses_child"));
+        b.fail_session_infos(1);
+    })
+    .await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "an unknown read neither approves nor declines"
+    );
+    let withdrawn = last_update_of(&platform, "om_card")
+        .await
+        .expect("the unbacked card is withdrawn");
+    assert!(
+        card_text(&withdrawn).contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the old card is neutral: {}",
+        card_text(&withdrawn)
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_child")
+            .await
+            .is_empty(),
+        "no interactive approval is offered while the flag is unknown"
+    );
+
+    // The hop heals: the fresh prepare path auto-accepts unseen.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the fresh prepare path approves once the flag resolves"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "Auto-Accept still posts no second card"
+    );
+}
+
+/// A recovered unbacked card on a chain too deep to read (Capped) is withdrawn,
+/// then the fresh path declines it when no companion can land rather than
+/// approving or declining the old decision in place.
+#[tokio::test]
+async fn restart_withdraws_a_recovered_card_then_handles_a_capped_chain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_0", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        for hop in 0..8 {
+            b.with_session_parent(&format!("ses_{hop}"), &format!("ses_{}", hop + 1));
+        }
+        b.ask_permission(over_budget_perm("per_long", "ses_0"));
+    })
+    .await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let withdrawn = last_update_of(&platform, "om_card")
+        .await
+        .expect("the unbacked card is withdrawn");
+    assert!(
+        card_text(&withdrawn).contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the old card is neutral: {}",
+        card_text(&withdrawn)
+    );
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the fresh path declines when no companion can land"
+    );
+    assert!(
+        posted_cards(&platform).await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+        }),
+        "the chat gets the reason card"
+    );
+}
+
+/// A failed superseded withdrawal must keep the companion marker: an uncertain
+/// record is still the only proof state once the card is neutralized, and the
+/// next sweep must neither re-send nor approve it.
+#[tokio::test]
+async fn a_failed_withdrawal_keeps_the_uncertain_companion_marker() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    let request = over_budget_perm("per_long", "ses_1");
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+    {
+        use crate::bridge::surfaces::{CompanionDelivery, CompanionLane, Surfaces};
+        let surfaces = Surfaces::load(crate::state::StateLayout::beside(
+            &session_file,
+            "interactive_surfaces.json",
+        ));
+        surfaces.set_companion(
+            "per_long",
+            CompanionDelivery {
+                message_id: String::new(),
+                lane: CompanionLane::RichText,
+                target_digest: crate::bridge::request::kind::companion_target_digest(&request),
+            },
+        );
+    }
+
+    let (app, platform, backend) = restart_app(&session_file, move |b| {
+        b.ask_permission(request);
+    })
+    .await;
+    // Both the superseded withdrawal and its immediate neutralization fail.
+    platform
+        .fail_update_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+
+    assert!(
+        app.permission.surfaces.companion("per_long").is_some(),
+        "a failed PATCH keeps the marker"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_some(),
+        "and the old card is still live until a retry lands"
+    );
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "nothing is approved or declined on the failed withdrawal"
+    );
+}
+
+/// An unbacked recovered card whose superseded-withdrawal PATCH fails must
+/// still be neutralized immediately with a "will retry" receipt, and the
+/// request stays unmarked so the next sweep finishes the withdrawal and then
+/// takes the fresh path (here: the reason card).
 #[tokio::test]
 async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retries() {
     let _wd = test_work_dir();
@@ -1257,20 +1512,22 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
 
     let (app, platform, backend) = restart_app(&session_file, |b| {
         b.ask_permission(over_budget_perm("per_long", "ses_1"));
-        b.fail_reply_permission_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
     })
     .await;
+    // The superseded withdrawal's PATCH fails once; the immediate
+    // neutralization then lands with the "will retry" receipt.
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
 
     // One persistent `seen`, like the poll loop: a failure must not retire the
     // request, or the retry below could never happen.
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
-    assert_eq!(
-        backend.reply_permission_calls.lock().await.len(),
-        1,
-        "the first sweep attempts the decline"
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "the first sweep neither approves nor declines the old decision"
     );
     let neutral = last_update_of(&platform, "om_card")
         .await
@@ -1281,25 +1538,21 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
         "the block says it will retry: {text}"
     );
     assert!(
-        !text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT),
-        "it must not claim cola rejected it: {text}"
-    );
-    assert!(
         !text.contains("允许一次") && !text.contains("始终允许"),
-        "no control survives while the refusal is unlanded: {text}"
+        "no control survives while the withdrawal is unlanded: {text}"
     );
     assert!(
         posted_cards(&platform).await.is_empty(),
-        "nothing is posted before the refusal lands: {text}"
+        "nothing is posted before the withdrawal lands: {text}"
     );
 
-    // The retry lands; with the handle already forgotten, the reason card is
-    // posted to the chat instead of a second withdrawal.
+    // The retry lands; the request then takes the fresh path and is declined
+    // (no reply target means the companion cannot land).
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert_eq!(
         backend.reply_permission_calls.lock().await.len(),
-        2,
-        "the second sweep retries the decline"
+        1,
+        "the second sweep declines through the fresh path"
     );
     assert!(
         posted_cards(&platform)
@@ -1311,10 +1564,9 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
     );
 }
 
-/// Whole-branch re-review #883: `NotFound` on the decline means the server no
-/// longer holds the request — another client settled it. The old card is
-/// withdrawn **neutrally** (handled elsewhere), never with the auto-reject
-/// receipt, and no reason card is posted.
+/// `NotFound` on the fresh decline means the server no longer holds the
+/// request — another client settled it. The old card was already withdrawn as
+/// reprocessed, no reason card is posted, and cola claims no decision.
 #[tokio::test]
 async fn restart_withdraws_a_persisted_card_neutrally_when_another_client_answered() {
     let _wd = test_work_dir();
@@ -1344,8 +1596,8 @@ async fn restart_withdraws_a_persisted_card_neutrally_when_another_client_answer
         .expect("the persisted card is withdrawn");
     let text = card_text(&withdrawn);
     assert!(
-        text.contains("已由其他客户端处理"),
-        "the neutral handled-elsewhere receipt: {text}"
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the old card says it was reprocessed: {text}"
     );
     assert!(
         !text.contains("自动拒绝"),
@@ -1370,12 +1622,10 @@ async fn restart_withdraws_a_persisted_card_neutrally_when_another_client_answer
     );
 }
 
-/// Whole-branch re-review #883: a withdrawal whose card PATCH fails must keep
-/// the handle and the persisted record — otherwise the old Allow card stays
-/// clickable and cola has thrown away the only state that could neutralize it.
-/// The next sweep redelivers the withdrawal (the request already left the
-/// pending list, so this is the sweep-level retry) without double-posting or
-/// leaving two receipts.
+/// A superseded-card withdrawal whose PATCH fails is retried from the pending
+/// backlog, while the still-live old card is neutralized immediately with the
+/// "will retry" receipt. The next sweep finishes the withdrawal and then takes
+/// the fresh path (here: the reason card), without duplicating the old card.
 #[tokio::test]
 async fn restart_retries_a_withdrawal_whose_card_update_failed() {
     let _wd = test_work_dir();
@@ -1399,10 +1649,9 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
 
     sweep(&app.permission, &app).await;
 
-    assert_eq!(
-        backend.reply_permission_calls.lock().await.as_slice(),
-        &[("per_long".to_string(), "reject".to_string())],
-        "the decline landed"
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "the first sweep neither approves nor declines the old decision"
     );
     assert!(
         app.cards_handle()
@@ -1410,17 +1659,17 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
             .lock()
             .await
             .message_of("per_long")
-            .is_some(),
-        "a failed PATCH keeps the handle, or the withdrawal could never be retried"
-    );
-    assert!(
-        persisted(&session_file).unwrap_or_default().contains("per_long"),
-        "and keeps the persisted record"
+            .is_none(),
+        "the immediate neutralization forgot the handle"
     );
 
-    // The request is no longer listed (it was declined), so only the
-    // sweep-level retry can finish the job.
+    // The retry lands, then the request takes the fresh path and is declined.
     sweep(&app.permission, &app).await;
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the fresh path declines"
+    );
 
     let updates: Vec<serde_json::Value> = {
         let calls = platform.calls.lock().await;
@@ -1441,32 +1690,23 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
     );
     let final_card = updates.last().expect("the successful retry");
     let text = card_text(final_card);
-    assert_eq!(
-        text.matches(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT)
-            .count(),
-        1,
-        "exactly one receipt survives: {text}"
+    assert!(
+        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT),
+        "the immediate neutralization receipt survives: {text}"
     );
     assert!(
         !text.contains("允许一次") && !text.contains("始终允许"),
         "the card ends non-interactive: {text}"
     );
     assert!(
-        app.cards_handle()
-            .card_handles
-            .lock()
-            .await
-            .message_of("per_long")
-            .is_none(),
-        "the handle is forgotten only after the retry landed"
-    );
-    assert!(
         !persisted(&session_file).unwrap_or_default().contains("per_long"),
         "and the persisted record is gone"
     );
     assert!(
-        posted_cards(&platform).await.is_empty(),
-        "no chat card duplicates the receipt on the withdrawn card"
+        posted_cards(&platform).await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+        }),
+        "the fresh refusal posts its reason card once"
     );
 }
 
@@ -1523,8 +1763,8 @@ async fn a_hung_withdrawal_patch_does_not_wedge_the_sweep() {
             .lock()
             .await
             .message_of("per_long")
-            .is_some(),
-        "and its handle is retained"
+            .is_none(),
+        "the immediate neutralization still stopped the old controls"
     );
     release.notify_waiters();
 }
@@ -1667,9 +1907,11 @@ async fn the_withdrawal_retry_attempts_are_budgeted_per_sweep() {
         b.ask_permissions(requests);
     })
     .await;
+    // Each request tries two PATCHes: the superseded withdrawal, then the
+    // immediate "will retry" neutralization.
     platform
         .fail_update_count
-        .store(REQUESTS, std::sync::atomic::Ordering::SeqCst);
+        .store(REQUESTS * 2, std::sync::atomic::Ordering::SeqCst);
     sweep(&app.permission, &app).await;
     assert_eq!(app.permission.pending_withdrawal_count().await, REQUESTS);
 
@@ -1709,9 +1951,11 @@ async fn the_withdrawal_retry_phase_is_time_bounded() {
         b.ask_permission(over_budget_perm("per_long", "ses_1"));
     })
     .await;
+    // Both the superseded withdrawal and its immediate neutralization fail, so
+    // the old card stays live and the pending entry is retried.
     platform
         .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+        .store(2, std::sync::atomic::Ordering::SeqCst);
     sweep(&app.permission, &app).await;
     assert_eq!(app.permission.pending_withdrawal_count().await, 1);
 
@@ -1775,21 +2019,20 @@ async fn a_bare_404_keeps_the_withdrawal_retryable() {
         1,
         "a bare 404 stays retryable"
     );
+    // The immediate neutralization (a separate PATCH) lands, so the old card
+    // stops being interactive even though the superseded withdrawal waits.
     assert!(
         app.cards_handle()
             .card_handles
             .lock()
             .await
             .message_of("per_long")
-            .is_some(),
-        "and keeps the handle, because the message may still exist"
-    );
-    assert!(
-        persisted(&session_file).unwrap_or_default().contains("per_long"),
-        "and keeps the persisted record"
+            .is_none(),
+        "the immediate neutralization forgot the handle"
     );
 
-    // The next sweep (no injected 404) finishes the withdrawal.
+    // The next sweep (no injected 404) finishes the withdrawal and takes the
+    // fresh path.
     sweep(&app.permission, &app).await;
     assert_eq!(app.permission.pending_withdrawal_count().await, 0);
     let final_card = last_update_of(&platform, "om_card")
@@ -1797,17 +2040,16 @@ async fn a_bare_404_keeps_the_withdrawal_retryable() {
         .expect("the retry patched the card");
     let text = card_text(&final_card);
     assert!(
-        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT),
+        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT),
         "and the card ends non-interactive: {text}"
     );
     assert!(!text.contains("允许一次"), "no control survives: {text}");
 }
 
-/// Whole-branch re-review #883: the completeness guard also runs at the
-/// **click** path. A card can stay live with its Allow buttons through the
-/// worst window — the server refusal fails, the retry-receipt PATCH fails, and
-/// the backlog entry waits — so a click must re-read the request and refuse,
-/// never approve a target the card cannot show.
+/// The completeness guard also runs at the **click** path. A card can stay
+/// live with its Allow buttons while the superseded-withdrawal PATCH is
+/// retried; a click must re-read the request and refuse because no confirmed
+/// companion exists, never approve content the card cannot show.
 #[tokio::test]
 async fn a_click_on_a_stale_allow_card_without_a_companion_is_refused() {
     let _wd = test_work_dir();
@@ -1824,23 +2066,21 @@ async fn a_click_on_a_stale_allow_card_without_a_companion_is_refused() {
         b.ask_permission(over_budget_perm("per_long", "ses_1"));
     })
     .await;
-    // Worst window: the decline fails AND the retry receipt cannot be patched.
-    backend
-        .fail_reply_permission_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    // Worst window: both the superseded-card PATCH and its immediate
+    // neutralization fail, so the old controls stay live and the withdrawal
+    // waits for a retry.
     platform
         .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+        .store(2, std::sync::atomic::Ordering::SeqCst);
     sweep(&app.permission, &app).await;
-    assert_eq!(
-        backend.reply_permission_calls.lock().await.len(),
-        1,
-        "the sweep tried and failed the decline"
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "the sweep neither approves nor declines the old decision"
     );
     assert_eq!(
         app.permission.pending_withdrawal_count().await,
         1,
-        "and kept the withdrawal for a retry"
+        "the unsafe card is kept for a withdrawal retry"
     );
 
     // The user now clicks the old card's Allow button (the card is still live).
@@ -1860,24 +2100,21 @@ async fn a_click_on_a_stale_allow_card_without_a_companion_is_refused() {
     let calls = backend.reply_permission_calls.lock().await.clone();
     assert_eq!(
         calls,
-        vec![
-            ("per_long".to_string(), "reject".to_string()),
-            ("per_long".to_string(), "reject".to_string()),
-        ],
+        vec![("per_long".to_string(), "reject".to_string())],
         "the click is declined, never approved: {calls:?}"
     );
     assert_eq!(
         result.toast.as_deref(),
-        Some("已拒绝：完整目标未送达"),
+        Some("已拒绝：完整内容未送达"),
         "the toast names the refusal"
     );
     let text = card_text(result.card.as_ref().expect("the result card"));
     assert!(
-        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_DECLINED_LABEL),
+        text.contains(crate::feishu::card::question::MISSING_PERMISSION_CLICK_LABEL),
         "the result explains the forced refusal: {text}"
     );
     assert!(
-        text.contains("完整目标没有成功送达"),
+        text.contains("没有找到已送达的伴随消息"),
         "the result names the missing companion as the reason: {text}"
     );
     assert!(

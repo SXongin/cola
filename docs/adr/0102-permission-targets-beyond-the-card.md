@@ -68,14 +68,16 @@ is allowed only when the full content was delivered for that request.
   record, with copy that names the unknown outcome. This covers **any**
   `PermissionOverflow` — the summed target budget and the rendered-body ceiling
   alike.
-- **A recovered card without proof is withdrawn.** Readoption does not trust a
-  persisted over-budget card that has no matching confirmed companion record
-  (including one whose only record is an uncertain marker): the card becomes
-  non-interactive and the request follows the matching refusal path. If the
-  session is in Auto-Accept, the request is approved unseen and the card is
-  withdrawn, because Auto-Accept renders no decision surface (ADR-0101). A card
-  from an older build therefore cannot approve text a newer build never
-  delivered.
+- **A recovered card without proof is withdrawn, never decided in place.**
+  Readoption does not trust a persisted over-budget card that has no matching
+  confirmed companion record (including one whose only record is an uncertain
+  marker): the card is withdrawn neutrally and the recovered entry is forgotten.
+  The request then continues through the **normal fresh path in the same sweep**
+  — `prepare` may approve it unseen on an Auto-Accept session (with its usual
+  INFO line), the companion lane may deliver and surface the summary, or a
+  failed companion follows the refusal path. The old decision is never silently
+  taken over (ADR-0101), and a card from an older build cannot approve text a
+  newer build never delivered.
 - **Fallback is out of scope here.** If neither lane delivers, this ticket keeps
   the existing refusal path. A fallback card is a later ticket and this ADR does
   not pre-decide its controls or confirmation steps.
