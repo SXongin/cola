@@ -968,7 +968,7 @@ async fn a_busy_read_with_an_untimed_newest_message_stays_static() {
         "ses_test",
         vec![SessionTranscript::new(vec![
             typed_message(
-                "msg_cola_older",
+                "msg_older",
                 MessageRole::User,
                 Some(1_000),
                 vec![text_part("有时间的老消息")],
@@ -1013,6 +1013,72 @@ async fn a_busy_read_with_an_untimed_newest_message_stays_static() {
         cards.chains.get("ses_test").is_none(),
         "an unfollowed read writes no Chain Record"
     );
+}
+
+/// An untimed newest user message with live Background Tasks is still a
+/// Waiting Session: the idle card and the adoption line say 等待后台任务, not
+/// 空闲 (the run can wake by itself; #999 US2).
+#[tokio::test]
+async fn an_untimed_newest_message_with_live_tasks_reads_waiting() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_transcript(
+        "ses_test",
+        vec![
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_older",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("有时间的老消息")],
+                ),
+                typed_message(
+                    "msg_untimed",
+                    MessageRole::User,
+                    None,
+                    vec![text_part("没有时间的新消息")],
+                ),
+            ])
+            .with_background_tasks(vec![background_shell(1_100)]),
+        ],
+    );
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.handle_message(incoming(
+        "msg_card".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+
+    let card = one_posted_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("⏳ 等待后台任务"),
+        "an untimed newest message with live tasks still waits: {text}"
+    );
+    assert!(!text.contains("✅ 空闲"), "never a false idle: {text}");
+    let cards = app.cards_handle();
+    assert!(!Turn::is_running(&cards, "ses_test").await);
+    assert!(cards.chains.get("ses_test").is_none());
+
+    let line = crate::bridge::snapshot::adoption_line(
+        &crate::bridge::handles::SnapshotHandles::from_flow(&app.flow_handles()),
+        "接管",
+        &list_session("ses_test", "标题", "/work", 1),
+    )
+    .await;
+    assert!(
+        line.contains("⏳ 等待后台任务"),
+        "the adoption line names the wait: {line}"
+    );
+    assert!(!line.contains("✅ 空闲"), "never a false idle: {line}");
 }
 
 /// `/card` always answers: a backend that hangs its transcript read times out
