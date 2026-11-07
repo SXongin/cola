@@ -849,12 +849,14 @@ impl Turn {
     /// `anchor` — opens with the 承接 line, carries the session's work context,
     /// answers to `facts.reply_to` and is marked a continuation (it offers no
     /// Retry). Returns the card to send; the caller attaches its id with
-    /// [`Self::take_over_card`]. `None` when a **live** card appeared while the
-    /// decision ran — it owns the session now, so the caller must send nothing
-    /// and the next poll re-decides. An **Idle Session Card** or a terminal
-    /// chain card does not block the arm: neither is a live chain (ADR-0100),
-    /// and the fresh continuation replaces the entry in the map while the old
-    /// message stays untouched in the chat.
+    /// [`Self::take_over_card`]. `None` when the current card is not
+    /// supersedable — it is still running, still carries a live
+    /// Permission/Question, or still owes a queued continuation (ADR-0100) —
+    /// because replacing it would drop work or strand the only answerable
+    /// controls; the caller sends nothing and the next poll re-decides. An
+    /// **Idle Session Card** or a clean terminal chain card does not block the
+    /// arm: neither owns a chain any more, and the fresh continuation replaces
+    /// the entry in the map while the old message stays untouched in the chat.
     pub(crate) async fn arm_wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -863,7 +865,23 @@ impl Turn {
     ) -> Option<serde_json::Value> {
         let work_context = StreamAccumulator::capture_work_context(facts.directory).await;
         let mut live = cards.cards.lock().await;
-        if live.get(session_id).is_some_and(state::CardSession::is_running) {
+        // The same not-supersedable predicate as the follow CAS and
+        // `record_idle_card` (ADR-0100): a card that is still running, still
+        // carries a live Permission/Question, or still owes a queued
+        // continuation is the chain's only record of that work. A terminal
+        // `Done`/`Error` card can be all three (a failed continuation create
+        // keeps its `pending_split`; LostContact/StuckPanel end in `Error`
+        // with a live block). Replacing it here would drop the queue, its
+        // reply target and the unrendered content, or strip the only
+        // answerable controls. Leave it current and let the next poll retry
+        // the Wake once the continuation is served or the block answered.
+        if let Some(card) = live.get(session_id)
+            && (card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation())
+        {
+            tracing::info!(
+                session = %session_id,
+                "wake continuation deferred: the current card still owes a continuation or carries a live request"
+            );
             return None;
         }
         let mut acc = StreamAccumulator::new(facts.subtitle);
