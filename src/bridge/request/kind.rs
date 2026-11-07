@@ -12,8 +12,9 @@ use tracing::Instrument;
 use crate::backend::{PERMISSION_BODY_MAX_CHARS, PERMISSION_TARGET_MAX_CHARS};
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
-use crate::bridge::pollers::result_card;
+use crate::bridge::pollers::{CardTarget, resolve_card_target, result_card};
 use crate::bridge::question::{MultiOutcome, action_toast, qa_completion_body, question_replay_card};
+use crate::bridge::surfaces::{CompanionDelivery, CompanionLane, Surfaces};
 use crate::bridge::turn::Turn;
 use crate::feishu::card::lang::language_for_path;
 use crate::feishu::card::tool_render::{
@@ -103,9 +104,11 @@ pub trait RequestKind: Send + Sync {
 
     /// Decide whether this request must be refused **before any surface is
     /// made**, including the restart re-adoption of a card a previous process
-    /// persisted. A request the card cannot show in full must never become —
-    /// or stay — interactive, because its buttons would approve text the user
-    /// never saw.
+    /// persisted. A request the card cannot show in full is no longer refused
+    /// on its way in (ADR-0102): a permission takes the companion lane instead.
+    /// The flow still applies this hook for the two shapes that do end in a
+    /// decline — a companion that could not be delivered, and a recovered card
+    /// with no companion record — using the same refusal vocabulary.
     ///
     /// `Refused` means the request is settled on the server; the flow then
     /// withdraws any persisted surface and offers nothing. `Failed` means the
@@ -173,6 +176,7 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        companion: Option<CompanionLane>,
     ) -> bool;
 
     /// [`Self::add_inline`] for a caller that already holds the host's card
@@ -184,6 +188,7 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        companion: Option<CompanionLane>,
     ) -> bool;
 
     /// Seed this kind's inline block on a NEW host card with the request's
@@ -199,17 +204,25 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        companion: Option<CompanionLane>,
     ) -> bool {
-        self.add_inline_locked(flow, cards, host, req, dir).await
+        self.add_inline_locked(flow, cards, host, req, dir, companion)
+            .await
     }
 
     /// Build the standalone interactive card (used when no streaming card hosts
-    /// the request inline).
-    fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value;
+    /// the request inline). `companion` names the lane that delivered an
+    /// over-budget target, so the card can carry its summary instead.
+    fn build_card(
+        &self,
+        req: &PendingRequest,
+        dir: &str,
+        companion: Option<CompanionLane>,
+    ) -> serde_json::Value;
 
     /// The description shown on the card when it is marked stale (resolved by
     /// another client).
-    fn summary(&self, req: &PendingRequest) -> String;
+    fn summary(&self, req: &PendingRequest, companion: Option<CompanionLane>) -> String;
 
     /// Resolve the kind's own inline blocks whose request vanished into their
     /// Interaction Receipts; `dead` names the owning sessions whose run is
@@ -322,44 +335,12 @@ impl RequestKind for PermissionKind {
             .await
     }
 
-    async fn refuse(
-        &self,
-        flow: &RequestFlow,
-        handles: &FlowHandles,
-        req: &PendingRequest,
-        dir: &str,
-    ) -> Refusal {
-        let PendingRequest::Permission(p) = req else {
-            return Refusal::NotApplicable;
-        };
-        let Some(overflow) = permission_overflow(p) else {
-            return Refusal::NotApplicable;
-        };
-        // The completeness proof guards the CARD: it stops a click approving
-        // text the card had to clip. Auto-Accept renders no card at all — the
-        // session opted into "answer without asking me" — so there is nothing
-        // for the proof to guard. Declining here would settle a request the
-        // user already delegated, with no path to approve it afterwards (the
-        // request leaves the server's pending list, so no client can answer
-        // it), and a model that re-emits the same long command would loop on
-        // denials (#892). The check runs only past the budget, so the ordinary
-        // path pays no extra session lookup.
-        let sid = p.session_id.clone().unwrap_or_default();
-        match should_auto_accept(flow, &handles.sessions, &handles.backend, &sid, dir).await {
-            AutoAcceptFlag::On => return Refusal::NotApplicable,
-            // Unknown: the flag read failed, so neither decline (irreversible
-            // for a request the session may have delegated) nor surface (the
-            // card may be clipped). Failed keeps it pending and unmarked, and
-            // the next sweep retries.
-            AutoAcceptFlag::Unknown => return Refusal::Failed,
-            // Off, and Capped: a chain too deep to read leaves no Auto-Accept
-            // decision to honour, and no card can approve an unshowable target;
-            // waiting forever on the structural cap would hang the turn. Take
-            // the pre-#892 decline.
-            AutoAcceptFlag::Off | AutoAcceptFlag::Capped => {}
-        }
-        decline_unshowable(handles, p, dir, overflow).await
-    }
+    // An over-budget permission is no longer refused before any surface
+    // (ADR-0102): the sweep surfaces a summary and delivers the full target as
+    // a companion message first. Refusal now covers two narrower cases — the
+    // companion could not be delivered, and a recovered card has no companion
+    // record — both handled by the flow with the same copies. The trait's
+    // default (`NotApplicable`) is therefore this kind's answer here.
 
     async fn prepare(
         &self,
@@ -424,11 +405,12 @@ impl RequestKind for PermissionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Permission(p) = req else {
             return false;
         };
-        Turn::add_permission(cards, host, p, dir).await
+        Turn::add_permission_with_companion(cards, host, p, dir, companion).await
     }
 
     async fn add_inline_locked(
@@ -438,18 +420,24 @@ impl RequestKind for PermissionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Permission(p) = req else {
             return false;
         };
-        Turn::add_permission_locked(cards, host, p, dir).await
+        Turn::add_permission_with_companion_locked(cards, host, p, dir, companion).await
     }
 
-    fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
+    fn build_card(
+        &self,
+        req: &PendingRequest,
+        dir: &str,
+        companion: Option<CompanionLane>,
+    ) -> serde_json::Value {
         let PendingRequest::Permission(p) = req else {
             return serde_json::json!({});
         };
-        let body = describe_permission(p);
+        let body = describe_permission_for(p, companion);
         crate::feishu::card::question::build_permission_card(
             p.session_id.as_deref().unwrap_or(""),
             &p.request_id,
@@ -459,9 +447,9 @@ impl RequestKind for PermissionKind {
         )
     }
 
-    fn summary(&self, req: &PendingRequest) -> String {
+    fn summary(&self, req: &PendingRequest, companion: Option<CompanionLane>) -> String {
         match req {
-            PendingRequest::Permission(p) => describe_permission(p),
+            PendingRequest::Permission(p) => describe_permission_for(p, companion),
             PendingRequest::Question(_) => String::new(),
         }
     }
@@ -584,15 +572,17 @@ impl RequestKind for PermissionKind {
 
         // The completeness guard again, at the decision point (whole-branch
         // re-review #883): an Allow click must never approve a target the card
-        // cannot show in full, even when this card escaped the surface-time
-        // refusal (an older build's persisted card, a failed withdrawal, a
-        // retry dropped at the backlog cap). The server's pending list is the
+        // could not show in full. Since ADR-0102 the proof is a DELIVERY fact:
+        // an over-budget approval is allowed only when the full target's
+        // companion record exists for this request and its digest matches the
+        // request the server still holds. The server's pending list is the
         // authority — the payload only describes what the card displayed — so
-        // the click reads the request and refuses when it cannot be shown. That
-        // same read is what rebuilds the result body: the callback no longer
-        // carries it.
+        // the click reads the request and refuses when the companion is missing
+        // or stale. That same read rebuilds the result body: the callback no
+        // longer carries it.
         let mut unshowable: Option<PermissionOverflow> = None;
         let mut verified: Option<crate::backend::types::PermissionRequest> = None;
+        let mut verified_companion: Option<CompanionLane> = None;
         if matches!(reply, "once" | "always")
             && let Some(dir) = directory
         {
@@ -607,7 +597,22 @@ impl RequestKind for PermissionKind {
                     if let Some(p) = perms.iter().find(|p| p.request_id == req_id) {
                         match permission_overflow(p) {
                             None => verified = Some(p.clone()),
-                            Some(overflow) => unshowable = Some(overflow),
+                            Some(overflow) => {
+                                // ANY overflow — the summed target budget or
+                                // the rendered-body ceiling — needs the one
+                                // companion proof; neither is exempt.
+                                match flow
+                                    .surfaces
+                                    .companion(req_id)
+                                    .filter(|delivery| delivery.target_digest == companion_target_digest(p))
+                                {
+                                    Some(delivery) => {
+                                        verified_companion = Some(delivery.lane);
+                                        verified = Some(p.clone());
+                                    }
+                                    None => unshowable = Some(overflow),
+                                }
+                            }
                         }
                     }
                 }
@@ -762,7 +767,7 @@ impl RequestKind for PermissionKind {
             display_label
         };
         let toast = if unshowable.is_some() {
-            "已自动拒绝：目标无法完整显示".to_string()
+            "已拒绝：完整目标未送达".to_string()
         } else {
             match reply {
                 "once" => "已允许本次执行".to_string(),
@@ -770,12 +775,15 @@ impl RequestKind for PermissionKind {
                 _ => "已拒绝".to_string(),
             }
         };
-        let body = if let Some(overflow) = unshowable {
-            crate::feishu::card::question::unshowable_permission_note(overflow.budget())
+        let body = if unshowable.is_some() {
+            // The click was an Allow whose request has no matching companion:
+            // the full target was never delivered, so the approval is refused
+            // and the card says why.
+            crate::feishu::card::question::unshowable_permission_undelivered_note()
         } else if let Some(p) = verified.as_ref() {
             // The approval re-read the request from the server; the result card
             // describes exactly that request, never the callback's stale copy.
-            describe_permission(p)
+            describe_permission_for(p, verified_companion)
         } else {
             // No verified request (a rejection, or one already gone): the body
             // was chosen from the surface the click landed on above.
@@ -939,7 +947,7 @@ pub(crate) async fn set_auto_accept(
 /// flow keeps the request retryable instead of reporting it settled. A request
 /// the server no longer lists (another sweep or client settled it first) is
 /// already refused.
-async fn decline_unshowable(
+pub(crate) async fn decline_unshowable(
     handles: &FlowHandles,
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
@@ -1313,6 +1321,7 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        _companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1333,6 +1342,7 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        _companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1351,6 +1361,7 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        _companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1359,7 +1370,12 @@ impl RequestKind for QuestionKind {
         Turn::add_question_locked(cards, host, q, dir, &paint).await
     }
 
-    fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
+    fn build_card(
+        &self,
+        req: &PendingRequest,
+        dir: &str,
+        _companion: Option<CompanionLane>,
+    ) -> serde_json::Value {
         let PendingRequest::Question(q) = req else {
             return serde_json::json!({});
         };
@@ -1385,7 +1401,7 @@ impl RequestKind for QuestionKind {
         )
     }
 
-    fn summary(&self, req: &PendingRequest) -> String {
+    fn summary(&self, req: &PendingRequest, _companion: Option<CompanionLane>) -> String {
         match req {
             PendingRequest::Question(q) => crate::feishu::card::question::question_summary(&q.questions),
             PendingRequest::Permission(_) => String::new(),
@@ -2262,6 +2278,239 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     s.push_str("\nAI 想要执行这个操作，是否允许？");
     s
 }
+
+/// The full target text a companion message carries: every pattern, in order,
+/// separated so two adjacent targets never read as one. The digest the click
+/// guard checks is taken over exactly this text (ADR-0102).
+pub(crate) fn companion_target_text(p: &crate::backend::types::PermissionRequest) -> String {
+    p.patterns.join("\n\n")
+}
+
+/// The stable digest of [`companion_target_text`]. It is a fingerprint, never
+/// the content: the record is persisted beside the other surfaces.
+pub(crate) fn companion_target_digest(p: &crate::backend::types::PermissionRequest) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(companion_target_text(p).as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"))
+}
+
+/// The summary form of a permission for an over-budget request (ADR-0102): the
+/// action, the total character count, the first 120 characters of the target,
+/// and the lane that carries the full text. `lane` is the companion that
+/// actually landed, so the card never points at a message that does not exist.
+pub(crate) fn describe_permission_summary(
+    p: &crate::backend::types::PermissionRequest,
+    lane: CompanionLane,
+) -> String {
+    let action = p.permission.as_deref().unwrap_or("?");
+    let (emoji, label) = describe_action(action);
+    let excerpt: String = companion_target_text(p).chars().take(120).collect();
+    let lane_name = match lane {
+        CompanionLane::RichText => "富文本消息（Rich Text Message）",
+        CompanionLane::File => "文件消息（File Message）",
+    };
+    let mut s = format!(
+        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整目标**: 已通过{lane_name}发送。",
+        p.total_target_len(),
+        crate::feishu::card::fenced_code(&excerpt, None)
+    );
+    s.push_str("\n\nAI 想要执行这个操作，是否允许？");
+    s
+}
+
+/// The body a permission surface renders: the summary when a companion carried
+/// the full target, the ordinary full description otherwise. ONE chooser, so the
+/// card, the inline block and the stale summary cannot disagree.
+pub(crate) fn describe_permission_for(
+    p: &crate::backend::types::PermissionRequest,
+    companion: Option<CompanionLane>,
+) -> String {
+    match companion {
+        Some(lane) => describe_permission_summary(p, lane),
+        None => describe_permission(p),
+    }
+}
+
+/// What [`ensure_permission_companion`] did.
+pub(crate) enum CompanionOutcome {
+    /// A companion record exists (or the send just landed).
+    Delivered(CompanionDelivery),
+    /// Neither lane delivered: the request must follow the refusal path.
+    Failed,
+}
+
+/// Deliver an over-budget permission's full target as one companion message,
+/// before any interactive surface exists (ADR-0083 §5's ladder, ADR-0102).
+///
+/// A record already written for this request is trusted and never re-sent; a
+/// record whose digest no longer matches the request is discarded and replaced.
+/// The Rich Text Message is tried first; a post body past its 30 KB cap, a
+/// failed send, or a target with no reply message all fall through to the File
+/// Message lane.
+pub(crate) async fn ensure_permission_companion(
+    handles: &FlowHandles,
+    surfaces: &Surfaces,
+    p: &crate::backend::types::PermissionRequest,
+    directory: &str,
+) -> CompanionOutcome {
+    let digest = companion_target_digest(p);
+    if let Some(existing) = surfaces.companion(&p.request_id) {
+        if existing.target_digest == digest {
+            return CompanionOutcome::Delivered(existing);
+        }
+        surfaces.remove_companion(&p.request_id);
+    }
+    let session_id = p.session_id.as_deref().unwrap_or("");
+    let Some(target) = resolve_card_target(
+        &handles.sessions,
+        &handles.cards,
+        &handles.backend,
+        &handles.platform,
+        session_id,
+        directory,
+    )
+    .await
+    else {
+        tracing::warn!(
+            "permission {} companion: no reply target on session {session_id}",
+            p.request_id
+        );
+        return CompanionOutcome::Failed;
+    };
+    let CardTarget::ReplyTo(message_id) = target else {
+        // A Chat target has no message to reply to, and only a card can be sent
+        // to a chat; the companion lanes require a reply message. Treat it as a
+        // failed delivery so the request is never offered without its target.
+        tracing::warn!(
+            "permission {} companion: only a chat target resolves; cannot deliver the full target",
+            p.request_id
+        );
+        return CompanionOutcome::Failed;
+    };
+
+    let full = companion_target_text(p);
+    let action = p.permission.as_deref().unwrap_or("?");
+    let (emoji, label) = describe_action(action);
+    let md = format!(
+        "{emoji} **{label}**\n\n**完整目标**（{} 字符）：\n{}",
+        p.total_target_len(),
+        crate::feishu::card::fenced_code(&full, None)
+    );
+    if crate::feishu::card::sanitize::serialized_len(&md) + 128
+        <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES
+    {
+        let content = crate::feishu::card::viewer::rich_post_content(&md);
+        match crate::bridge::bounded_call(
+            &format!("permission {} companion post", p.request_id),
+            COMPANION_SEND_TIMEOUT_MS,
+            handles.platform.reply_message(&message_id, "post", &content),
+        )
+        .await
+        {
+            Some(Ok((sent_id, _))) => {
+                let delivery = CompanionDelivery {
+                    message_id: sent_id,
+                    lane: CompanionLane::RichText,
+                    target_digest: digest,
+                };
+                surfaces.set_companion(&p.request_id, delivery.clone());
+                tracing::info!(
+                    "permission {} companion delivered as a Rich Text Message ({})",
+                    p.request_id,
+                    delivery.message_id
+                );
+                return CompanionOutcome::Delivered(delivery);
+            }
+            Some(Err(error)) => tracing::warn!(
+                "permission {} companion Rich Text Message failed: {error}; trying the File Message lane",
+                p.request_id
+            ),
+            None => tracing::warn!(
+                "permission {} companion Rich Text Message timed out; trying the File Message lane",
+                p.request_id
+            ),
+        }
+    }
+
+    // File Message lane: the bytes are the full target, under a name that names
+    // the request (the client shows it as the file's caption).
+    let safe_id: String = p
+        .request_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = format!("permission-{safe_id}.txt");
+    let content = crate::backend::FileContent::from_bytes("text/plain", &name, full.clone().into_bytes());
+    let file_key = match crate::bridge::bounded_call(
+        &format!("permission {} companion upload", p.request_id),
+        COMPANION_SEND_TIMEOUT_MS,
+        handles.platform.upload_file(&content),
+    )
+    .await
+    {
+        Some(Ok(Some(key))) => key,
+        Some(Ok(None)) => {
+            tracing::warn!(
+                "permission {} companion File Message is past the upload cap",
+                p.request_id
+            );
+            return CompanionOutcome::Failed;
+        }
+        Some(Err(error)) => {
+            tracing::warn!("permission {} companion upload failed: {error}", p.request_id);
+            return CompanionOutcome::Failed;
+        }
+        None => {
+            tracing::warn!("permission {} companion upload timed out", p.request_id);
+            return CompanionOutcome::Failed;
+        }
+    };
+    let payload = serde_json::json!({ "file_key": file_key });
+    match crate::bridge::bounded_call(
+        &format!("permission {} companion file", p.request_id),
+        COMPANION_SEND_TIMEOUT_MS,
+        handles.platform.reply_message(&message_id, "file", &payload),
+    )
+    .await
+    {
+        Some(Ok((sent_id, _))) => {
+            let delivery = CompanionDelivery {
+                message_id: sent_id,
+                lane: CompanionLane::File,
+                target_digest: digest,
+            };
+            surfaces.set_companion(&p.request_id, delivery.clone());
+            tracing::info!(
+                "permission {} companion delivered as a File Message ({})",
+                p.request_id,
+                delivery.message_id
+            );
+            CompanionOutcome::Delivered(delivery)
+        }
+        Some(Err(error)) => {
+            tracing::warn!(
+                "permission {} companion File Message failed: {error}",
+                p.request_id
+            );
+            CompanionOutcome::Failed
+        }
+        None => {
+            tracing::warn!("permission {} companion File Message timed out", p.request_id);
+            CompanionOutcome::Failed
+        }
+    }
+}
+
+/// How long one companion send (or upload) may take. It runs in the sweep,
+/// before the request becomes interactive, so a stalled call must not hold the
+/// poller; a timeout is a failed lane, never a surfaced approval.
+const COMPANION_SEND_TIMEOUT_MS: u64 = 10_000;
 
 /// The character count of the body `describe_permission` renders, after the
 /// card's markdown sanitizer — exactly what the single card element carries.

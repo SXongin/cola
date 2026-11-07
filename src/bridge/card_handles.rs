@@ -425,6 +425,7 @@ impl CardHandles {
             };
             if let Some(surfaces) = &self.surfaces {
                 surfaces.remove_inline(&id);
+                surfaces.remove_companion(&id);
             }
             let message_id = handle.message_id;
             tracing::info!(

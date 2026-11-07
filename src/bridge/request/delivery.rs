@@ -206,6 +206,12 @@ pub(crate) async fn resolve_blocks(
     ids: &[String],
     residue: Residue<'_>,
 ) -> Option<serde_json::Value> {
+    // A companion is a transcript artifact of a pending request: every
+    // resolution path forgets it, so a later click cannot use it as proof for a
+    // request it no longer belongs to (ADR-0102).
+    for id in ids {
+        flow.surfaces.remove_companion(id);
+    }
     // The session's card-write lock, shared with `flush_card`: a resolution
     // settles the accumulator and the cached cards, and a flush that
     // snapshotted before it must not record its stale copy after — the block

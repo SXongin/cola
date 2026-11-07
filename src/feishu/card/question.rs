@@ -297,6 +297,15 @@ pub(crate) fn build_unshowable_permission_retry_card() -> serde_json::Value {
 /// text the user never saw). Pinned with the refusal copy above.
 pub(crate) const UNSHOWABLE_PERMISSION_DECLINED_LABEL: &str = "🚫 已自动拒绝（目标无法完整显示）";
 
+/// Why the click guard refuses an over-budget approval whose companion
+/// delivery is missing or stale (ADR-0102): the full target never landed, so
+/// there is nothing the user could have reviewed to approve.
+pub(crate) fn unshowable_permission_undelivered_note() -> String {
+    "该权限请求的目标超过卡片显示预算，且完整目标没有成功送达（找不到匹配的伴随消息，或目标已变化）。\
+     为了不让你批准没有完整看到的内容，cola 已拒绝本次点击；请重试，或在原始客户端查看该请求。"
+        .to_string()
+}
+
 /// The receipt line an inline permission block collapses to when cola refused
 /// it before it could be offered — its target is too long for the card to show
 /// in full, so approving it would approve unseen text. Pinned with the refusal
@@ -1768,6 +1777,52 @@ mod tests {
             "a full-budget command card is {len} bytes, over the {} budget",
             crate::feishu::card::MAX_CARD_JSON_CHARS
         );
+    }
+
+    /// ADR-0102's two budgets on one page: a 3,000-character CJK target still
+    /// renders inside the card's JSON budget (the worst case the target budget
+    /// admits), while a 5,000-character over-budget request takes the summary
+    /// form, whose card is far smaller than the full target could ever be.
+    #[test]
+    fn a_cjk_target_card_and_a_five_thousand_char_summary_stay_in_budget() {
+        use crate::backend::types::{PERMISSION_TARGET_MAX_CHARS, PermissionRequest};
+        use crate::bridge::surfaces::CompanionLane;
+
+        let request = |command: String| PermissionRequest {
+            request_id: "per_long".into(),
+            session_id: Some("ses".into()),
+            permission: Some("bash".into()),
+            patterns: vec![command],
+            metadata: None,
+            always: Vec::new(),
+            always_supported: true,
+        };
+
+        // 3,000 CJK characters: 3 bytes each, ~9 KB of JSON plus the card's
+        // chrome. The target budget's worst case must still serialize.
+        let cjk = request("啊".repeat(PERMISSION_TARGET_MAX_CHARS));
+        let full_body = crate::bridge::request::kind::describe_permission(&cjk);
+        let full_card = build_permission_card("ses", "n:1", &full_body, "/tmp/proj", true);
+        assert!(
+            full_card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "a full-budget CJK card is {} bytes",
+            full_card.to_string().len()
+        );
+
+        // 5,000 characters is over budget, so the surface is the summary and
+        // the full target rides the companion. The card carries no full target.
+        let long = request("x".repeat(5_000));
+        let summary =
+            crate::bridge::request::kind::describe_permission_summary(&long, CompanionLane::RichText);
+        let summary_card = build_permission_card("ses", "n:1", &summary, "/tmp/proj", true);
+        let len = summary_card.to_string().len();
+        assert!(
+            len <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the summary card is {len} bytes"
+        );
+        assert!(!summary_card.to_string().contains(&"x".repeat(1_000)));
+        assert!(summary.contains("目标长度"));
+        assert!(summary.contains("Rich Text Message"));
     }
 
     /// The JSON worst case the body ceiling names: a body at
