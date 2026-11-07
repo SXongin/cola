@@ -40,9 +40,11 @@ decisions. It stands aside wherever no card is rendered:
 - `approve_pending_for_session` no longer declines over-budget requests; they are
   approved with the rest. Every enable path — the permission-card toggle,
   `/autoaccept on`, and the Auto-Accept toggle card — persists the flag
-  **before** that approval pass, so a sweep landing inside it already reads the
-  session as auto-accept and does not decline the request the call is about to
-  approve. A persist that did not take effect approves nothing.
+  **before** that approval pass, so a sweep landing inside it reads the session
+  as auto-accept instead of declining the request the call is about to approve.
+  A persist that did not take effect approves nothing: the permission-card
+  toggle releases its click claim and reports the failure rather than claiming
+  the mode; the other two refuse to run the approval pass.
 - A flag read the parent chain cannot finish (a failed `session_info` hop) is
   **unknown**, not "off": the request stays pending and unmarked, and the next
   sweep retries. Reading it as off would decline the request for good, which is
@@ -80,6 +82,12 @@ decisions. It stands aside wherever no card is rendered:
   over-budget card is built for one pass; the click-time guard still refuses its
   Allow, so no unseen target is approved. The window is a permission request's
   two backend reads wide.
+- Persisting before approving narrows but does not close the read/reject race: a
+  sweep that read the flag just before the persist can still call
+  `decline_unshowable` after it, and the approval then finds the request gone
+  (`NotFound`) — the long command is lost. The window is one list-to-reply round
+  trip. Closing it needs a serialization between an enable path and the sweep,
+  which this ADR does not take on.
 - The card's budgets themselves are untouched. The reason they are small is the
   card's wire shape — every button echoes the body, so it appears six times in
   the card's JSON — and that is a separate, interactive-surface problem. Moving

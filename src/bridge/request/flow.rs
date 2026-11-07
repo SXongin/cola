@@ -119,6 +119,11 @@ pub struct RequestFlow {
     /// failure WARNs, an identical repeat is DEBUG, and a landed reply logs
     /// recovery INFO. Pruned to the pending list each sweep.
     autoaccept_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
+    /// The same ADR-0048 policy for a failed Auto-Accept **flag read** (a
+    /// parent-chain hop), keyed by session id: the sweep retries it every tick,
+    /// so the first failure WARNs, identical repeats DEBUG, and a successful
+    /// read logs recovery INFO.
+    autoaccept_read_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
     /// The persisted surface mirror (ADR-0038 restart re-adoption): every
     /// standalone card this flow sends is written through, and its persisted
     /// records seed [`Self::recovered`] at startup.
@@ -307,6 +312,9 @@ impl RequestFlow {
             dead_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             list_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
             autoaccept_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
+            autoaccept_read_failures: Arc::new(Mutex::new(
+                crate::bridge::failure_latch::FailureLatch::default(),
+            )),
             surfaces,
             recovered: Arc::new(Mutex::new(recovered)),
             session_less: Arc::new(Mutex::new(HashMap::new())),
@@ -333,6 +341,24 @@ impl RequestFlow {
             .lock()
             .await
             .succeeded(request_id, "auto-accept");
+    }
+
+    /// Record a failed Auto-Accept flag read for `session_id` (ADR-0048: the
+    /// first WARNs, identical repeats DEBUG).
+    pub(crate) async fn note_autoaccept_read_failure(&self, session_id: &str, error: impl std::fmt::Display) {
+        self.autoaccept_read_failures
+            .lock()
+            .await
+            .failed(session_id, "auto-accept flag read", "", error);
+    }
+
+    /// Clear the flag-read latch for `session_id` (INFO once when it had been
+    /// failing).
+    pub(crate) async fn note_autoaccept_read_success(&self, session_id: &str) {
+        self.autoaccept_read_failures
+            .lock()
+            .await
+            .succeeded(session_id, "auto-accept flag read");
     }
 
     /// The double-click guard's read-only check: whether `req_id` was already
@@ -873,6 +899,14 @@ impl RequestFlow {
             .lock()
             .await
             .retain(|id| pending.contains(id));
+        let waiting_sessions: std::collections::HashSet<String> = wait_candidates
+            .iter()
+            .map(|(_, session)| session.clone())
+            .collect();
+        self.autoaccept_read_failures
+            .lock()
+            .await
+            .retain(|session_id| waiting_sessions.contains(session_id));
         // ADR-0054: record which sessions wait on this kind, so the task
         // liveness line reads it without listing pending requests per render
         // poll. Only a complete sweep may replace the record — a failed
@@ -1240,13 +1274,6 @@ impl RequestFlow {
                 return false;
             }
         }
-        tracing::info!(
-            "{} ({}): {} on session {}",
-            self.kind.label(),
-            dir,
-            req.id(),
-            req.session_id()
-        );
         // ADR-0038 restart re-adoption: a request whose card a PREVIOUS
         // process persisted is already surfaced. Re-adopt that card — remember
         // what its buttons need to resolve, repaint it — instead of posting a
@@ -1273,6 +1300,16 @@ impl RequestFlow {
             Prepared::Retry => return false,
             Prepared::NotHandled => {}
         }
+        // The surfacing line is emitted only for a request this pass actually
+        // offers: a `Retry` above returns before it, so a repeatedly failing
+        // auto-accept does not re-announce the same request on every tick.
+        tracing::info!(
+            "{} ({}): {} on session {}",
+            self.kind.label(),
+            dir,
+            req.id(),
+            req.session_id()
+        );
         // One-card-per-turn: surface the request INLINE on the streaming card
         // of the session that owns it — the session itself, or (sub-task
         // children) its nearest ancestor with a live card. Only a separate card

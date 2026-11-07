@@ -859,7 +859,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.get_session_id(&key).await.as_deref(), Some("ses_a"));
 
-        crate::bridge::request::kind::set_auto_accept(
+        let _ = crate::bridge::request::kind::set_auto_accept(
             &app.sessions_handle(),
             &app.requests_handle(),
             &app.client,
