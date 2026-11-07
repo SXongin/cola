@@ -2729,6 +2729,77 @@ async fn a_permission_toggle_that_cannot_persist_claims_nothing() {
     );
 }
 
+/// A flag WRITE failure (not just a missing entry) must also leave the store's
+/// memory off: otherwise the very next sweep reads Auto-Accept as on and
+/// approves the over-budget request the user was told was not enabled (#892).
+#[tokio::test]
+async fn a_permission_toggle_whose_flag_write_fails_approves_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let perm_calls = backend.reply_permission_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_test".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    // Refuse the toggle's persist write; the in-memory flag must roll back.
+    app.sessions.lock().await.fail_writes_after(0);
+    let value = serde_json::json!({
+        "action": "perm",
+        "reply": "autoaccept",
+        "session_id": "ses_test",
+        "request_id": "per_long",
+        "directory": "/work",
+        "perm_label": "✅ 已开启自动授权",
+        "perm_color": "blue",
+        "perm_body": "bash",
+    });
+    let result = app.host_action(value).await.expect("failure result card");
+
+    assert_eq!(result.toast.as_deref(), Some("保存失败，请重试"));
+    assert!(
+        perm_calls.lock().await.is_empty(),
+        "an unwritable flag approves nothing"
+    );
+    assert!(
+        !app.sessions
+            .lock()
+            .await
+            .entry_for_session("ses_test")
+            .unwrap()
+            .auto_accept,
+        "the failed write leaves memory off, so the next sweep cannot approve unseen"
+    );
+}
+
 /// ADR-0048: the Auto-Accept reply retries every sweep, so its failure WARNs
 /// once, DEBUGs identical repeats, and INFOs the recovery. A permanently
 /// broken reply path must not flood the log.

@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use tracing::Instrument;
+
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
 use crate::bridge::pollers::result_card;
@@ -907,6 +909,27 @@ async fn decline_unshowable(
 /// surfaced, so enabling autoaccept would otherwise leave old cards hanging
 /// forever. Returns the ids of the requests that were approved.
 pub(crate) async fn approve_pending_for_session(
+    sessions: &SessionsHandle,
+    requests: &RequestsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+    directory: &str,
+) -> Vec<String> {
+    // ADR-0048: `/autoaccept on` runs under the inbound-message span (chat and
+    // topic only), so the unseen-approval audit line must take its `session=`
+    // from an own span or `rg 'session=ses_x'` cannot retrieve it.
+    let thread_key = sessions
+        .store
+        .lock()
+        .await
+        .entry_for_session(session_id)
+        .map(|entry| entry.thread_key.clone());
+    approve_pending_inner(sessions, requests, backend, session_id, directory)
+        .instrument(crate::bridge::span::request(session_id, thread_key.as_ref()))
+        .await
+}
+
+async fn approve_pending_inner(
     sessions: &SessionsHandle,
     requests: &RequestsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
