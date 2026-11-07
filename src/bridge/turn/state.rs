@@ -989,6 +989,16 @@ impl CardSession {
         !self.is_terminal()
     }
 
+    /// Whether the chain still owes a queued continuation (ADR-0043): a split
+    /// was queued and its continuation card has not been sent (a failed create,
+    /// or a finalized slice whose remainder is still owed). The card is then
+    /// the chain's live anchor even when it is terminal — replacing it would
+    /// discard the queue, its reply target and the content it still owes — so
+    /// no `/card` read or follow may supersede it (ADR-0100).
+    pub(super) fn owes_continuation(&self) -> bool {
+        !self.pending_split.is_empty()
+    }
+
     /// Whether this card joins the Session's **Card Chain** rather than being an
     /// idle Session Card (ADR-0100): any state except `Idle`. This is the
     /// Wake-side question, not a liveness predicate: a Wake continues a chain,

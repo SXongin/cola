@@ -553,13 +553,14 @@ impl Turn {
         let mut live = cards.cards.lock().await;
         // The render-owned arm's commit is also a compare-and-swap for the
         // `/card` post (ADR-0100): a Turn installed during the send owns the
-        // card, and a terminal card that still carries a live
-        // Permission/Question must keep its answerable controls, so neither is
-        // overwritten.
+        // card, a terminal card that still carries a live Permission/Question
+        // must keep its answerable controls, and a card that still owes a
+        // continuation must keep that queue and its reply target, so none of
+        // them is overwritten.
         if refuse_if_running
-            && live
-                .get(session_id)
-                .is_some_and(|card| card.is_running() || !card.acc.live_request_ids().is_empty())
+            && live.get(session_id).is_some_and(|card| {
+                card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation()
+            })
         {
             return None;
         }
