@@ -272,17 +272,37 @@ pub(crate) async fn inline_host_session(
     session_id: &str,
     directory: Option<&str>,
 ) -> Option<String> {
-    walk_parent_chain(backend, session_id, directory, |current| {
-        let current = current.to_string();
-        async move {
-            if Turn::is_running(cards, &current).await {
-                Some(current)
-            } else {
-                None
-            }
+    inline_host_session_checked(cards, backend, session_id, directory)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`inline_host_session`] with the walk's failure surfaced: a `session_info`
+/// error is **not** "no ancestor" — a caller that would post a competing card
+/// must treat it as unknown, because a host may well exist. `Ok(None)` is a
+/// completed walk that found no live card.
+pub(crate) async fn inline_host_session_checked(
+    cards: &CardsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+    directory: Option<&str>,
+) -> crate::error::Result<Option<String>> {
+    let mut current = session_id.to_string();
+    for _ in 0..8 {
+        if Turn::is_running(cards, &current).await {
+            return Ok(Some(current));
         }
-    })
-    .await
+        let Some(dir) = directory else {
+            return Ok(None);
+        };
+        let info = backend.clone().for_directory(dir).session_info(&current).await?;
+        let Some(parent) = info.parent_id.filter(|p| p != &current) else {
+            return Ok(None);
+        };
+        current = parent;
+    }
+    Ok(None)
 }
 
 /// A JSON 2.0 result card for a card-action response (must stay 2.0 to remain
