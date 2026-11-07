@@ -3051,9 +3051,17 @@ async fn adopt_session(
 
     // --force: steal the mapping only after the confirmation landed. The unmap
     // collects the stolen Session's waiting card (ADR-0059, spec #405), so the
-    // other thread's waiting card never hangs.
+    // other thread's waiting card never hangs. A failed save refuses the whole
+    // steal (the store applies the removal only after it persisted one), so the
+    // old owner keeps both its mapping and its waiting card.
     let removed = if stealing {
-        handles.flow.unmap(&info.id).await?
+        match handles.flow.unmap(&info.id).await {
+            Ok(removed) => removed,
+            Err(e) => {
+                report_adoption_failure(handles, message_id, &info.title, &e, true).await;
+                return Err(e);
+            }
+        }
     } else {
         None
     };
@@ -3070,36 +3078,63 @@ async fn adopt_session(
     entry.topic_anchor = anchor;
     entry.topic_root = pending_topic_root;
     if let Err(e) = handles.flow.activate(entry).await {
-        // A later store step failed after the steal: put the removed mapping
-        // back so the Session is never mapped nowhere. The old waiting card
-        // was already collected by `unmap`; it is deliberately not re-collected.
-        if let Some(removed) = removed
-            && let Err(restore) = handles.flow.activate(removed).await
-        {
-            tracing::error!(
-                "adoption: session {} could not be restored to its previous thread: {restore}",
-                info.id
-            );
-        }
+        // The steal already committed its own write: put the removed mapping
+        // back so the Session is never mapped nowhere. `activate` is atomic, so
+        // a second failure leaves both threads as they are — no half-promoted
+        // entry to undo — but the mapping is then genuinely lost and the
+        // notice must not claim it was kept. The old waiting card was already
+        // collected by `unmap`; it is deliberately not re-collected.
+        let kept = match removed {
+            Some(removed) => match handles.flow.activate(removed).await {
+                Ok(()) => true,
+                Err(restore) => {
+                    tracing::error!(
+                        "adoption: session {} could not be restored to its previous thread: {restore}",
+                        info.id
+                    );
+                    false
+                }
+            },
+            None => true,
+        };
         // The confirmation line already said the Session was taken over, so a
         // silent error would leave the user believing a mapping that was never
         // written. Say so in the chat (best effort), then still return the
         // error for the caller's log.
-        let _ = handles
-            .flow
-            .platform
-            .reply_text(
-                message_id,
-                &format!(
-                    "⚠️ 会话 `{}` 接管失败：{}。原映射保持不变，可稍后重试。",
-                    info.title, e
-                ),
-            )
-            .await;
+        report_adoption_failure(handles, message_id, &info.title, &e, kept).await;
         return Err(e);
     }
     crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
     Ok(())
+}
+
+/// Report a failed adoption store write in the chat.
+///
+/// The confirmation line is sent **before** the mapping write, so a silent
+/// failure would leave the user believing the Session moved. `kept` is whether
+/// the previous owner's mapping is still in place (the atomic store guarantees
+/// it for a refused write; a failed restore after a committed steal is the one
+/// case where it is not), so the line never promises a state that does not hold.
+async fn report_adoption_failure(
+    handles: &CommandHandles,
+    message_id: &str,
+    title: &str,
+    error: &crate::error::BridgeError,
+    kept: bool,
+) {
+    let consequence = if kept {
+        "原映射保持不变，可稍后重试。"
+    } else {
+        "原映射恢复失败，可稍后重试。"
+    };
+    let _ = handles
+        .flow
+        .platform
+        .reply_text(
+            message_id,
+            &format!("⚠️ 会话 `{title}` 接管失败：{error}。{consequence}"),
+        )
+        .await;
 }
 
 /// Normalize a user-supplied directory for `/dir` / `/topic` into an absolute
