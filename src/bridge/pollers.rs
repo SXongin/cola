@@ -685,6 +685,23 @@ mod tests {
         assert_eq!(found, None);
     }
 
+    /// The cap is **unknown**, not a definite "no ancestor matched": a caller
+    /// that must not read unknown as off (the auto-accept flag) gets the error
+    /// and retries instead (#892).
+    #[tokio::test]
+    async fn the_walk_result_reports_the_hop_cap_as_unknown() {
+        let parents: Vec<(String, String)> = (0..8)
+            .map(|i| (format!("s{}", i), format!("s{}", i + 1)))
+            .collect();
+        let core = core_with_parents(parents).await;
+        let found =
+            walk_parent_chain_result(&core.client, "s0", Some("/w"), |_| async move { None::<String> }).await;
+        assert!(
+            found.is_err(),
+            "exhausting the cap must not read as a completed walk: {found:?}"
+        );
+    }
+
     #[tokio::test]
     async fn walker_without_a_directory_checks_only_the_start_session() {
         // No directory handle → the parent chain can't be walked (ADR-0010).

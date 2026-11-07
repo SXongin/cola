@@ -703,9 +703,10 @@ pub const PERMISSION_PATTERN_MAX_CHARS: usize = 150;
 /// [`crate::feishu::card::MAX_CARD_JSON_CHARS`].
 ///
 /// A request must never be offered for approval unless every target fits:
-/// [`PermissionRequest::targets_are_fully_shown`] is the proof, and the
-/// permission flow declines what fails it with a named reason card rather than
-/// showing part of what a button would approve.
+/// [`PermissionRequest::targets_are_fully_shown`] is the proof. An interactive
+/// surface declines what fails it with a named reason card rather than showing
+/// part of what a button would approve; an Auto-Accept session renders no card
+/// and approves the request unseen, logging its length (ADR-0101).
 pub const PERMISSION_COMMAND_MAX_CHARS: usize = 1000;
 
 /// Whether `action` names a shell command, i.e. a target whose text IS the
@@ -772,11 +773,13 @@ impl PermissionRequest {
     /// [`Self::target_budget`].
     ///
     /// `false` means the card would have to clip one, so the request must never
-    /// be offered for approval: the buttons approve what the card shows, and a
-    /// clipped command would approve a suffix the user never saw. Every client
-    /// is covered here rather than in its adapter — the card is the shared
-    /// decision surface, so the completeness proof belongs to the same layer as
-    /// the renderer that clips.
+    /// be offered for **approval on a card**: the buttons approve what the card
+    /// shows, and a clipped command would approve a suffix the user never saw.
+    /// Every client is covered here rather than in its adapter — the card is
+    /// the shared decision surface, so the completeness proof belongs to the
+    /// same layer as the renderer that clips. An Auto-Accept session renders no
+    /// card; it approves the request unseen and records its length (ADR-0101),
+    /// so this proof has nothing to guard there.
     pub fn targets_are_fully_shown(&self) -> bool {
         self.longest_target_len() <= self.target_budget()
     }
