@@ -851,12 +851,13 @@ impl Turn {
     /// Retry). Returns the card to send; the caller attaches its id with
     /// [`Self::take_over_card`]. `None` when the current card is not
     /// supersedable — it is still running, still carries a live
-    /// Permission/Question, or still owes a queued continuation (ADR-0100) —
-    /// because replacing it would drop work or strand the only answerable
-    /// controls; the caller sends nothing and the next poll re-decides. An
-    /// **Idle Session Card** or a clean terminal chain card does not block the
-    /// arm: neither owns a chain any more, and the fresh continuation replaces
-    /// the entry in the map while the old message stays untouched in the chat.
+    /// Permission/Question, still owes a queued continuation, or still offers
+    /// a recovery action (`Error`/`Unreceived`) (ADR-0100) — because replacing
+    /// it would drop work or strand the only answerable/recovery controls; the
+    /// caller sends nothing and the next poll re-decides. An **Idle Session
+    /// Card** or a clean terminal chain card does not block the arm: neither
+    /// owns a chain any more, and the fresh continuation replaces the entry in
+    /// the map while the old message stays untouched in the chat.
     pub(crate) async fn arm_wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -867,20 +868,29 @@ impl Turn {
         let mut live = cards.cards.lock().await;
         // The same not-supersedable predicate as the follow CAS and
         // `record_idle_card` (ADR-0100): a card that is still running, still
-        // carries a live Permission/Question, or still owes a queued
-        // continuation is the chain's only record of that work. A terminal
-        // `Done`/`Error` card can be all three (a failed continuation create
-        // keeps its `pending_split`; LostContact/StuckPanel end in `Error`
-        // with a live block). Replacing it here would drop the queue, its
-        // reply target and the unrendered content, or strip the only
-        // answerable controls. Leave it current and let the next poll retry
-        // the Wake once the continuation is served or the block answered.
+        // carries a live Permission/Question, still owes a queued
+        // continuation, or still offers a recovery action (`Error`/
+        // `Unreceived`) is the chain's only record of that work. A terminal
+        // `Done`/`Error` card can be several of these (a failed continuation
+        // create keeps its `pending_split`; LostContact/StuckPanel end in
+        // `Error` with a live block; a failed/undelivered Turn ends with a
+        // Retry/重新发起 control). Replacing it here would drop the queue, its
+        // reply target and the unrendered content, strip the only answerable
+        // controls, or leave the old recovery button to click against a
+        // successor whose state no longer matches (`claim_recovery` returns
+        // `None`) — and a failed Wake send would drop the new entry without
+        // restoring this one. Leave it current and let the next poll retry the
+        // Wake once the continuation is served, the block answered, or the
+        // user retried.
         if let Some(card) = live.get(session_id)
-            && (card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation())
+            && (card.is_running()
+                || !card.acc.live_request_ids().is_empty()
+                || card.owes_continuation()
+                || card.acc.card_state().offers_recovery())
         {
             tracing::info!(
                 session = %session_id,
-                "wake continuation deferred: the current card still owes a continuation or carries a live request"
+                "wake continuation deferred: the current card still owes a continuation, carries a live request, or offers recovery"
             );
             return None;
         }
