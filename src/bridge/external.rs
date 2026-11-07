@@ -771,20 +771,17 @@ impl ExternalFlow {
             );
             return None;
         }
-        let (session_dir, session_thread_key) = {
+        let (session_dir, session_thread_key, variant) = {
             let store = handles.sessions.store.lock().await;
             match store.entry_for_session(&data.session_id) {
-                Some(e) => (e.directory.clone(), Some(e.thread_key.clone())),
-                None => (String::new(), None),
+                // Directory and variant come from the SAME entry in one store
+                // critical section: a force-adopt landing between two reads
+                // could otherwise pair the old directory with the new entry's
+                // variant.
+                Some(e) => (e.directory.clone(), Some(e.thread_key.clone()), e.variant.clone()),
+                None => (String::new(), None, None),
             }
         };
-        let variant = handles
-            .sessions
-            .store
-            .lock()
-            .await
-            .entry_for_session(&data.session_id)
-            .and_then(|e| e.variant.clone());
         // Build the accumulator OFF the card map (ADR-0100): the work-context
         // read happens here, before any write lock. The static lead joins it
         // later, under the lock, once the seed count is final.
