@@ -778,10 +778,22 @@ impl PermissionRequest {
     /// decision surface, so the completeness proof belongs to the same layer as
     /// the renderer that clips.
     pub fn targets_are_fully_shown(&self) -> bool {
-        let budget = self.target_budget();
+        self.longest_target_len() <= self.target_budget()
+    }
+
+    /// The longest target by character count, if the request carries any. One
+    /// definition for "what the card would clip": the proof, the Auto-Accept
+    /// audit line and the refusal's diagnostic all read it.
+    pub fn longest_target(&self) -> Option<&str> {
         self.patterns
             .iter()
-            .all(|pattern| pattern.chars().count() <= budget)
+            .max_by_key(|pattern| pattern.chars().count())
+            .map(String::as_str)
+    }
+
+    /// [`Self::longest_target`]'s character count, 0 when it carries none.
+    pub fn longest_target_len(&self) -> usize {
+        self.longest_target().map_or(0, |target| target.chars().count())
     }
 }
 

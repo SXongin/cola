@@ -165,16 +165,17 @@ pub trait RequestKind: Send + Sync {
     }
 
     /// Runs once per newly-seen, not-refused request before it becomes a card.
-    /// Permissions answer `/autoaccept` sessions here and return true (no
-    /// card); questions remember the full request (via the flow) for later card
-    /// rebuilds and return false.
+    /// Permissions answer `/autoaccept` sessions here and return
+    /// [`Prepared::Handled`] (no card); questions remember the full request
+    /// (via the flow) for later card rebuilds and return
+    /// [`Prepared::NotHandled`].
     async fn prepare(
         &self,
         flow: &RequestFlow,
         handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
-    ) -> bool;
+    ) -> Prepared;
 
     /// Remember a request that reached a card WITHOUT the poll loop surfacing
     /// it (a Session Snapshot claim, a busy-follow host), so its block's
@@ -312,6 +313,21 @@ pub(crate) enum Refusal {
     Failed,
 }
 
+/// What [`RequestKind::prepare`] did for one not-refused request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Prepared {
+    /// The kind handled the request: no card is needed.
+    Handled,
+    /// Not this kind's pre-card case: the flow continues to the surface.
+    NotHandled,
+    /// The handling was attempted and failed. The request is still pending, so
+    /// the flow must leave it unsurfaced and **unmarked**, and the next sweep
+    /// retries it. Without this arm a transient reply failure would retire the
+    /// request from `seen` while no card exists — pending, invisible, and
+    /// impossible to approve.
+    Retry,
+}
+
 /// The permission kind: `/autoaccept` sessions are answered automatically, and
 /// the card carries a friendly description of what the AI wants to do.
 pub struct PermissionKind;
@@ -381,9 +397,9 @@ impl RequestKind for PermissionKind {
         handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
-    ) -> bool {
+    ) -> Prepared {
         let PendingRequest::Permission(p) = req else {
-            return false;
+            return Prepared::NotHandled;
         };
         let sid = p.session_id.clone().unwrap_or_default();
         // `/autoaccept` sessions: answer the request automatically instead of
@@ -397,7 +413,7 @@ impl RequestKind for PermissionKind {
         // the decision auditable without a card (#892).
         let auto = should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await;
         if !auto {
-            return false;
+            return Prepared::NotHandled;
         }
         match handles
             .backend
@@ -413,11 +429,16 @@ impl RequestKind for PermissionKind {
                     sid,
                     p.permission.as_deref().unwrap_or("?")
                 );
-                log_unshowable_auto_accept(p, &sid);
+                log_unshowable_auto_accept(p);
+                Prepared::Handled
             }
-            Err(e) => tracing::warn!("auto-accept {} on session {}: {}", p.request_id, sid, e),
+            // The request is still pending: hand it back to the sweep instead
+            // of retiring it in `seen` with no card (see `Prepared::Retry`).
+            Err(e) => {
+                tracing::warn!("auto-accept {} on session {}: {}", p.request_id, sid, e);
+                Prepared::Retry
+            }
         }
-        true
     }
 
     async fn add_inline(
@@ -769,11 +790,13 @@ pub(crate) async fn set_auto_accept(
     directory: &str,
     on: bool,
 ) -> Vec<String> {
-    let approved = if on {
-        approve_pending_for_session(sessions, requests, backend, session_id, directory).await
-    } else {
-        Vec::new()
-    };
+    // Persist the flag BEFORE approving the pending requests: a sweep landing
+    // in the approval window must already read the session as auto-accept, or
+    // its `refuse` declines an over-budget request this very call is about to
+    // approve (#892). A failed persist is logged and the approval still runs —
+    // the user asked for it — but then no sweep can see the flag, so nothing is
+    // silently approved *because* of a half-landed mode change.
+    //
     // Resolve the SessionStore entry that owns the flag: `session_id`
     // itself, or its nearest ancestor (sub-task children are not in the
     // store, ADR-0010). Walking the chain makes a child's card flip the
@@ -788,7 +811,11 @@ pub(crate) async fn set_auto_accept(
     {
         tracing::warn!("set_auto_accept: persist failed: {}", e);
     }
-    approved
+    if on {
+        approve_pending_for_session(sessions, requests, backend, session_id, directory).await
+    } else {
+        Vec::new()
+    }
 }
 
 /// Decline a permission whose target the card cannot render in full.
@@ -807,12 +834,7 @@ async fn decline_unshowable(
 ) -> Refusal {
     let session_id = p.session_id.clone().unwrap_or_default();
     let budget = p.target_budget();
-    let longest = p
-        .patterns
-        .iter()
-        .map(|pattern| pattern.chars().count())
-        .max()
-        .unwrap_or(0);
+    let longest = p.longest_target_len();
     match handles
         .backend
         .clone()
@@ -901,7 +923,7 @@ pub(crate) async fn approve_pending_for_session(
                     sid,
                     p.permission.as_deref().unwrap_or("?")
                 );
-                log_unshowable_auto_accept(p, &sid);
+                log_unshowable_auto_accept(p);
                 approved.push(p.request_id.clone());
             }
             Err(e) => {
@@ -915,33 +937,33 @@ pub(crate) async fn approve_pending_for_session(
     approved
 }
 
+/// How much of an unseen target's first line the Auto-Accept audit record
+/// carries. The whole target is exactly what did not fit, so the line names its
+/// length and a bounded prefix.
+const AUTO_ACCEPT_TARGET_LOG_CHARS: usize = 120;
+
 /// The record an Auto-Accept approval leaves when its target was past the card
 /// budget. Nothing was shown, so this line is the only trace of what the
 /// session approved unseen (#892): it names the request, the length that made
-/// it unshowable, and the target's first line (bounded, since the whole target
-/// is exactly what did not fit).
-fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest, sid: &str) {
+/// it unshowable, and the target's first line. INFO, like every other
+/// auto-accepted transition (ADR-0048); the "unseen" wording is what sets it
+/// apart from an ordinary auto-accept.
+fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
     if p.targets_are_fully_shown() {
         return;
     }
-    let longest = p
-        .patterns
-        .iter()
-        .map(|pattern| pattern.chars().count())
-        .max()
-        .unwrap_or(0);
     let first_line = p
-        .patterns
-        .iter()
-        .max_by_key(|pattern| pattern.chars().count())
-        .map(|pattern| pattern.lines().next().unwrap_or(""))
+        .longest_target()
+        .map(|target| target.lines().next().unwrap_or(""))
         .unwrap_or("");
-    tracing::warn!(
-        "auto-accept approved permission {} on session {sid} unseen: its target is {longest} \
+    tracing::info!(
+        "auto-accept approved permission {} on session {} unseen: its target is {} \
          characters, past the card's {} character budget; first line: {}",
         p.request_id,
+        p.session_id.as_deref().unwrap_or(""),
+        p.longest_target_len(),
         p.target_budget(),
-        truncate(first_line, 120)
+        truncate(first_line, AUTO_ACCEPT_TARGET_LOG_CHARS)
     );
 }
 
@@ -1108,11 +1130,11 @@ impl RequestKind for QuestionKind {
         _handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
-    ) -> bool {
+    ) -> Prepared {
         if let PendingRequest::Question(q) = req {
             flow.remember_question(q, dir).await;
         }
-        false
+        Prepared::NotHandled
     }
 
     async fn remember_surfaced(&self, flow: &RequestFlow, req: &PendingRequest, dir: &str) {

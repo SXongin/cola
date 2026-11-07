@@ -2360,11 +2360,12 @@ async fn auto_accept_approves_an_unshowable_permission() {
         "and no permission block is offered"
     );
     // The approval happened without a card, so the log is the only record of
-    // what the session delegated: it must name the request and the length.
-    let line = assert_line_level(&logs, "approved permission per_long", "WARN");
+    // what the session delegated: it must name the request, the target's exact
+    // length, and the budget it crossed (ADR-0048: auto-accepted is INFO).
+    let line = assert_line_level(&logs, "approved permission per_long", "INFO");
     assert!(
-        line.contains("past the card's"),
-        "the unseen approval names the budget it crossed: {line}"
+        line.contains("its target is 1005 characters, past the card's 1000 character budget"),
+        "the unseen approval names the numbers it crossed: {line}"
     );
 }
 
@@ -2394,11 +2395,96 @@ async fn autoaccept_on_approves_an_already_pending_unshowable_permission() {
     let (app, _platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_test", "/work").await;
 
-    send_command(&app, "/autoaccept on", "msg_cmd").await;
+    let (_, logs) = capture_logs(async {
+        send_command(&app, "/autoaccept on", "msg_cmd").await;
+    })
+    .await;
 
     assert_eq!(
         replies.lock().await.as_slice(),
         &[("per_long".to_string(), "once".to_string())],
         "enabling auto-accept approves the pending over-budget request too"
+    );
+    let line = assert_line_level(&logs, "approved permission per_long", "INFO");
+    assert!(
+        line.contains("its target is 1005 characters, past the card's 1000 character budget"),
+        "the toggle path leaves the same audit record: {line}"
+    );
+}
+
+/// #892: an Auto-Accept whose reply FAILS must stay retryable. `prepare` runs
+/// after the sweep inserted the id into `seen`, so returning "handled" on the
+/// error retired a still-pending request with no card: invisible and
+/// unapprovable. `Prepared::Retry` removes the mark and the next sweep answers.
+#[tokio::test]
+async fn a_failed_auto_accept_of_an_unshowable_permission_is_retried() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_test".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: true,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    // The same `seen` set across both sweeps: a failed attempt that left its
+    // mark would never be retried.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the first sweep tries the auto-approval"
+    );
+    assert!(
+        !seen.contains("per_long"),
+        "a failed approval must not retire the request from the sweep"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.is_empty(),
+        "an auto-accept session posts no card, failed attempt included"
+    );
+
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[
+            ("per_long".to_string(), "once".to_string()),
+            ("per_long".to_string(), "once".to_string()),
+        ],
+        "the retry answers the still-pending request"
     );
 }

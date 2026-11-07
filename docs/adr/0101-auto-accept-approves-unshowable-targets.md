@@ -38,10 +38,17 @@ decisions. It stands aside wherever no card is rendered:
   target proves unshowable, and returns `NotApplicable` instead of declining.
   The ordinary path pays no extra session lookup.
 - `approve_pending_for_session` no longer declines over-budget requests; they are
-  approved with the rest.
-- Every such approval is recorded at WARN with the request id, the target's
+  approved with the rest. The flag is persisted **before** that approval pass,
+  so a sweep landing inside it already reads the session as auto-accept and does
+  not decline the request this call is about to approve.
+- Every such approval is recorded at INFO with the request id, the target's
   length, the budget it crossed, and the target's first line (bounded). With no
   card, that log line is the audit record of what the session approved unseen.
+  INFO is what ADR-0048 assigns an auto-accepted request; the "unseen" wording
+  distinguishes this case.
+- A failed auto-approval reply keeps the request pending and unmarked
+  (`Prepared::Retry`), so the next sweep retries it. Returning "handled" on the
+  error would retire a still-pending request with no card at all.
 - An interactive surface is unchanged: `refuse` still declines an over-budget
   target, the click-time guard still refuses to approve one, and the refusal
   copy now names the two paths that exist — ask the model to split the
@@ -56,7 +63,15 @@ decisions. It stands aside wherever no card is rendered:
   log rather than prevented by a refusal.
 - A restart still re-adopts a card a previous process surfaced before the
   toggle was on (ADR-0038): Auto-Accept does not silently take over an
-  already-offered decision.
+  already-offered decision. An over-budget card an older build could have
+  persisted therefore stays unapprovable — its Allow click is refused by the
+  click-time guard — which is the legacy state the guard exists for, not a
+  path this build can create.
+- `refuse` and `prepare` each resolve the flag independently. A toggle flipped
+  between them can let `refuse` stand aside and `prepare` decline, so an
+  over-budget card is built for one pass; the click-time guard still refuses its
+  Allow, so no unseen target is approved. The window is a permission request's
+  two backend reads wide.
 - The card's budgets themselves are untouched. The reason they are small is the
   card's wire shape — every button echoes the body, so it appears six times in
   the card's JSON — and that is a separate, interactive-surface problem. Moving
