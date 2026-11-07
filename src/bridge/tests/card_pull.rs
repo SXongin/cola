@@ -955,6 +955,61 @@ async fn a_card_read_cancelled_inside_the_commit_publishes_no_map_entry_or_secon
     );
 }
 
+/// The `/card` send is bounded: a parked Feishu create fails the command
+/// instead of holding the session write lock forever, and a later `/card`
+/// still works.
+#[tokio::test]
+async fn a_parked_card_send_times_out_without_wedging_the_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    app.core
+        .external
+        .request_timeout_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+    let (_entered, _release) = platform.pause("reply", "msg_card");
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        app.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        )),
+    )
+    .await
+    .expect("a stalled send must not hang /card");
+    assert!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .is_none(),
+        "a timed-out send records nothing"
+    );
+
+    // The write lock was released: a later `/card` answers normally.
+    app.handle_message(incoming(
+        "msg_card_2".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("msg_reply"),
+        "the later read posts normally"
+    );
+}
+
 /// `/card` always answers: a backend that hangs its transcript read times out
 /// into the best-effort static read instead of hanging the command.
 #[tokio::test]
@@ -2163,6 +2218,106 @@ async fn a_parked_stamp_patch_times_out_and_keeps_the_old_read_current() {
         Some("om_idle_1"),
         "a timed-out stamp leaves the old read current"
     );
+}
+
+/// A terminal card can still carry an unanswered Permission/Question (a lost
+/// contact or stuck panel ends the Turn in Error). `/card` must not replace it:
+/// the old card stays current with its answerable controls, and the posted read
+/// is marked TakenOver so it cannot look current.
+#[tokio::test]
+async fn a_card_read_keeps_a_terminal_card_with_a_live_block_answerable() {
+    let _wd = test_work_dir();
+    for permission in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, idle_read_backend()).await;
+        seed_session(&app, "ses_test", "/work").await;
+        seed_live_card(&app, "ses_test", "失败内容").await;
+        platform.given_reply_id("om_read");
+        let cards = app.cards_handle();
+        if permission {
+            assert!(
+                Turn::add_permission(
+                    &cards,
+                    "ses_test",
+                    &perm_request("per_1", "ses_test", "ls -la"),
+                    "/work"
+                )
+                .await
+            );
+        } else {
+            let question = crate::backend::types::QuestionRequest {
+                id: "q_1".into(),
+                session_id: "ses_test".into(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "继续？".into(),
+                    header: "继续".into(),
+                    options: vec![crate::backend::types::QuestionOption {
+                        label: "是".into(),
+                        description: String::new(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let paint = crate::bridge::question::QuestionPaint::blank(question.questions.len());
+            assert!(Turn::add_question(&cards, "ses_test", &question, "/work", &paint).await);
+        }
+        Turn::set_card_state(&cards, "ses_test", CardState::Error).await;
+
+        app.handle_message(incoming(
+            "msg_card".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+            Some("om_live"),
+            "the terminal block card stays current"
+        );
+        if permission {
+            assert!(!Turn::live_permissions(&cards, "ses_test").await.is_empty());
+        } else {
+            assert!(!Turn::live_questions(&cards, "ses_test").await.is_empty());
+        }
+        let rendered = Turn::rendered_card(&cards, "ses_test")
+            .await
+            .expect("the old card renders")
+            .to_string();
+        assert!(
+            rendered.contains("✅ 允许一次") || rendered.contains("继续？"),
+            "the answerable controls survive: {rendered}"
+        );
+
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_live"
+            )),
+            "the block card is never stamped: {calls:?}"
+        );
+        let read = calls
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_read" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+            .expect("the untracked read is marked taken over");
+        assert_eq!(
+            read["header"]["title"]["content"], "⏳ 已由新卡片接管 · 已停止更新",
+            "the posted read cannot look current"
+        );
+    }
 }
 
 /// A Turn that ran between two `/card` commands has already superseded the

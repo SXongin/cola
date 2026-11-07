@@ -1204,7 +1204,28 @@ async fn post_idle_card(
             .external
             .compose_snapshot_follow_lead(plan, "读取", &title, &data);
     }
-    let sent = handles.flow.platform.reply_card(message_id, &card).await?;
+    // Bound the send: it runs under the Session's card write lock, so a
+    // stalled Feishu create must fail the command rather than block every
+    // flush, sweep and later `/card` for that Session.
+    let send = tokio::time::timeout(
+        std::time::Duration::from_millis(
+            handles
+                .external
+                .request_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        handles.flow.platform.reply_card(message_id, &card),
+    )
+    .await;
+    let sent = match send {
+        Ok(sent) => sent?,
+        Err(_) => {
+            tracing::warn!("card read: session {session_id} card send timed out");
+            return Err(crate::error::BridgeError::Feishu(
+                "card read send timed out".into(),
+            ));
+        }
+    };
     if let Some(plan) = &mut follow {
         // The old card is neutralised BEFORE the arm switches the map: it
         // must never stay the visible card while the follow (or a later idle
@@ -1257,7 +1278,7 @@ async fn post_idle_card(
         } else {
             crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
             tracing::info!(
-                "card read: session {session_id} a Turn took the card during the follow read; the posted read is stamped"
+                "card read: session {session_id} the old card kept the session during the follow read; the posted read is stamped"
             );
         }
         return Ok(());
@@ -1293,7 +1314,7 @@ async fn post_idle_card(
     } else {
         crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
         tracing::info!(
-            "card read: session {session_id} a Turn took the card during the read; the posted read is stamped"
+            "card read: session {session_id} the old card kept the session during the read; the posted read is stamped"
         );
     }
     Ok(())

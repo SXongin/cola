@@ -466,7 +466,14 @@ pub(crate) async fn stamp_taken_over(
     )
     .await;
     match write {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => {
+            // The stamp repainted the card outside the handle registry, so its
+            // cached JSON is now older than Feishu's: release it, like a
+            // collect. A still-pending request's re-host can then never
+            // resurrect the dead header/controls from the stale cache.
+            cards.card_handles.lock().await.release_cache(card_message_id);
+            true
+        }
         Ok(Err(e)) => {
             tracing::warn!("idle card: could not stamp {card_message_id} taken over: {e}");
             false
@@ -2689,6 +2696,46 @@ mod tests {
         assert_eq!(
             Turn::card_message_id(&handles.cards, "ses_test").await.as_deref(),
             Some("om_idle")
+        );
+    }
+
+    /// A successful stamp repaints the card outside the handle registry, so it
+    /// releases the cached JSON: a late question/click ack cannot resurrect the
+    /// dead header or controls from the stale cache (like a collect).
+    #[tokio::test]
+    async fn a_successful_stamp_releases_the_card_handle_cache() {
+        use crate::bridge::test_support::{
+            MockBackend, build_app, perm_request, seed_live_card, test_config,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        seed_live_card(&app, "ses_test", "om_live").await;
+        let cards = app.cards_handle();
+        assert!(
+            Turn::add_permission(
+                &cards,
+                "ses_test",
+                &perm_request("per_1", "ses_test", "ls -la"),
+                "/work"
+            )
+            .await
+        );
+        Turn::flush_card(&cards, "ses_test").await;
+        assert!(
+            cards.card_handles.lock().await.cached_count() > 0,
+            "the flushed card's handle is cached"
+        );
+
+        let view = Turn::rendered_card(&cards, "ses_test")
+            .await
+            .expect("the card renders");
+        assert!(stamp_taken_over(&cards, "om_live", Some(&view)).await);
+        assert_eq!(
+            cards.card_handles.lock().await.cached_count(),
+            0,
+            "a successful stamp releases the stale cache"
         );
     }
 
