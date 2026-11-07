@@ -1244,9 +1244,7 @@ impl RequestFlow {
         // duplicate it).
         // Resolve the standalone target BEFORE the lock: this walk reads the
         // parent chain and the server's session metadata, which has no card
-        // state to serialize with. The inline check is re-run under the lock
-        // below, so a follow that committed in this window still hosts the
-        // request instead of a stale standalone.
+        // state to serialize with.
         let target = resolve_card_target(
             &handles.sessions,
             &handles.cards,
@@ -1256,61 +1254,86 @@ impl RequestFlow {
             dir,
         )
         .await;
+        // Resolve the inline host BEFORE the lock too, and BOUND it by the
+        // flow's read timeout: the parent-chain walk calls `session_info`,
+        // which has no timeout of its own, so a half-open connection would
+        // otherwise hold the owning Session's card write lock indefinitely —
+        // blocking flushes, `/card`, install and the rest of that sweep. On
+        // timeout the request falls through to the standalone path (retried
+        // next tick if no card lands). The inline check is re-run under the
+        // lock below, so a follow that committed in this window still hosts
+        // the request instead of a stale standalone.
+        let resolved_host = crate::bridge::bounded_call(
+            &format!("{} inline host ({})", self.kind.label(), req.session_id()),
+            self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            async {
+                Ok::<_, crate::error::BridgeError>(
+                    inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await,
+                )
+            },
+        )
+        .await
+        .and_then(Result::ok)
+        .flatten();
         let owning_lock = handles.cards.write_lock(req.session_id()).await;
         let guard = owning_lock.lock().await;
-        if let Some(host) =
-            inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await
-        {
-            // Re-validate under the lock: the walk's card may have been
-            // replaced by a terminal one while it ran.
-            if Turn::is_running(&handles.cards, &host).await {
-                // The common case — the request's own card — is already under
-                // this lock; a sub-task child hosted on an ancestor takes that
-                // card's own lock inside the add/flush (never both held in the
-                // reverse order).
-                let pushed = if host == req.session_id() {
-                    self.kind
-                        .add_inline_locked(self, &handles.cards, &host, req, dir)
-                        .await
+        // Re-validate under the lock: the resolved host may have stopped
+        // running, or a follow may have committed during the walk (its card is
+        // the request's host now).
+        let host = match resolved_host {
+            Some(host) if Turn::is_running(&handles.cards, &host).await => Some(host),
+            _ if Turn::is_running(&handles.cards, req.session_id()).await => {
+                Some(req.session_id().to_string())
+            }
+            _ => None,
+        };
+        if let Some(host) = host {
+            // The common case — the request's own card — is already under
+            // this lock; a sub-task child hosted on an ancestor takes that
+            // card's own lock inside the add/flush (never both held in the
+            // reverse order).
+            let pushed = if host == req.session_id() {
+                self.kind
+                    .add_inline_locked(self, &handles.cards, &host, req, dir)
+                    .await
+            } else {
+                self.kind.add_inline(self, &handles.cards, &host, req, dir).await
+            };
+            if pushed {
+                // The block landed: this request is surfaced from now on.
+                seen.insert(req.id().to_string());
+                tracing::info!(
+                    "{} {} inlined on session {} card",
+                    self.kind.label(),
+                    req.id(),
+                    host
+                );
+                // Flush so the inline section appears NOW — the render loop
+                // only flushes on new parts, and a blocked prompt produces
+                // none.
+                if host == req.session_id() {
+                    Turn::flush_card_locked(&handles.cards, &host).await;
                 } else {
-                    self.kind.add_inline(self, &handles.cards, &host, req, dir).await
-                };
-                if pushed {
-                    // The block landed: this request is surfaced from now on.
-                    seen.insert(req.id().to_string());
-                    tracing::info!(
-                        "{} {} inlined on session {} card",
-                        self.kind.label(),
-                        req.id(),
-                        host
-                    );
-                    // Flush so the inline section appears NOW — the render loop
-                    // only flushes on new parts, and a blocked prompt produces
-                    // none.
-                    if host == req.session_id() {
-                        Turn::flush_card_locked(&handles.cards, &host).await;
-                    } else {
-                        Turn::flush_card(&handles.cards, &host).await;
-                    }
-                    return false;
+                    Turn::flush_card(&handles.cards, &host).await;
                 }
-                // `add_inline` false is ambiguous: the card session vanished,
-                // OR it already carries the block. A busy follow seeds its
-                // read's pendings without the sweep's `seen`, so the latter is
-                // the normal case for a request `/card` just put on the card —
-                // falling through here would post a duplicate standalone card.
-                // Only a card that still carries the request is "already
-                // surfaced"; a vanished one still needs its own card.
-                if Turn::has_interaction_in(&handles.cards, &host, req.id()).await {
-                    seen.insert(req.id().to_string());
-                    tracing::info!(
-                        "{} {} already carried by session {} card",
-                        self.kind.label(),
-                        req.id(),
-                        host
-                    );
-                    return false;
-                }
+                return false;
+            }
+            // `add_inline` false is ambiguous: the card session vanished,
+            // OR it already carries the block. A busy follow seeds its
+            // read's pendings without the sweep's `seen`, so the latter is
+            // the normal case for a request `/card` just put on the card —
+            // falling through here would post a duplicate standalone card.
+            // Only a card that still carries the request is "already
+            // surfaced"; a vanished one still needs its own card.
+            if Turn::has_interaction_in(&handles.cards, &host, req.id()).await {
+                seen.insert(req.id().to_string());
+                tracing::info!(
+                    "{} {} already carried by session {} card",
+                    self.kind.label(),
+                    req.id(),
+                    host
+                );
+                return false;
             }
             // The card vanished mid-pass: fall through to a standalone card,
             // still unmarked until that lands.
