@@ -1015,6 +1015,136 @@ async fn switch_card_force_adopt_steals_owned_session() {
     );
 }
 
+/// A forced card adoption collects the old owner's waiting card once its
+/// atomic steal persisted (ADR-0059, spec #405): the card in the other chat
+/// must not keep sitting on 「⏳ 等待后台任务」 with no continuation.
+#[tokio::test]
+async fn switch_card_force_adopt_collects_the_old_owners_waiting_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_owned", "被占用的会话", "/work/auth", 100)]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let other = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(other.clone(), "ses_owned", "/work/auth"),
+    )
+    .await;
+    let cards = app.cards_handle();
+    crate::bridge::turn::Turn::seed_card(&cards, "ses_owned", Some("om_waiting")).await;
+    crate::bridge::turn::Turn::set_card_state(&cards, "ses_owned", crate::feishu::card::CardState::Waiting)
+        .await;
+
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "force_adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_owned",
+    });
+    let result = app.host_action(value).await.expect("force_adopt result");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已切换 被占用的会话")),
+        "the successful steal patches the compact 已切换 card: {:?}",
+        result.card
+    );
+    let lobby = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    assert_eq!(
+        app.sessions.lock().await.get_active(&lobby).unwrap().session_id,
+        "ses_owned"
+    );
+    assert!(
+        app.sessions.lock().await.get_active(&other).is_none(),
+        "the old owner becomes sessionless"
+    );
+
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        1,
+        "the old owner's waiting card is collected after the steal: {patches:?}"
+    );
+    assert!(
+        card_header(&patches[0]).contains("已切换会话"),
+        "the collect names the switch: {}",
+        patches[0]
+    );
+}
+
+/// A card adoption whose atomic activation cannot be persisted must not patch
+/// the clicked list card to 已切换: the Session stays with its old owner (or
+/// unmapped) and the toast says the takeover failed.
+#[tokio::test]
+async fn switch_card_adopt_failure_does_not_patch_the_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_free", "自由会话", "/work/free", 100)]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_active", "/work/active"),
+    )
+    .await;
+    let cards = app.cards_handle();
+    crate::bridge::turn::Turn::seed_card(&cards, "ses_active", Some("om_waiting")).await;
+    crate::bridge::turn::Turn::set_card_state(&cards, "ses_active", crate::feishu::card::CardState::Waiting)
+        .await;
+
+    app.sessions.lock().await.fail_writes_after(0);
+    let value = serde_json::json!({
+        "action": "switch",
+        "op": "adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_free",
+        "open_message_id": "om_switch_card",
+    });
+    let result = app.host_action(value).await.expect("adopt result");
+    assert!(
+        result.card.is_none(),
+        "a failed save must not patch the list to 已切换: {:?}",
+        result.card
+    );
+    assert!(
+        result
+            .toast
+            .as_deref()
+            .is_some_and(|toast| toast.contains("接管失败")),
+        "the user is told the takeover failed: {:?}",
+        result.toast
+    );
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .is_some_and(|entry| entry.session_id == "ses_active"),
+        "the displaced session stays mapped"
+    );
+    assert!(
+        app.sessions.lock().await.entry_for_session("ses_free").is_none(),
+        "the target session is not mapped"
+    );
+    assert!(
+        patches_to(&platform, "om_waiting").await.is_empty(),
+        "the displaced waiting card is not collected either: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        crate::bridge::turn::Turn::card_state(&app.cards_handle(), "ses_active").await,
+        Some(crate::feishu::card::CardState::Waiting),
+        "the displaced card keeps waiting"
+    );
+}
+
 /// The confirm card's 返回列表 button rebuilds the session list card.
 #[tokio::test]
 async fn switch_card_back_rebuilds_list() {

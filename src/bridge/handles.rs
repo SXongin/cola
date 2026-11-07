@@ -2801,16 +2801,23 @@ impl FlowHandles {
             .await;
     }
 
-    /// Promote `entry` as its thread's Active Session, collecting the displaced
-    /// Session's waiting card first (ADR-0059, spec #405): the displaced
-    /// Session can no longer be continued by a message in this thread, so a
-    /// card it left on 「⏳ 等待后台任务」 is collected as
-    /// 「⏳ 已切换会话 · 后台任务仍在运行」 and stops updating, while its
-    /// background work runs on. The collect runs BEFORE the activation, so a
-    /// polling Wake cannot resume a chain the switch is leaving behind.
-    /// Re-activating the already-active session collects nothing.
+    /// Promote `entry` as its thread's Active Session, then collect what the
+    /// activation displaced (ADR-0059, spec #405). Two Sessions can be left
+    /// without a continuation here:
     ///
-    /// The displaced Session is no longer what this chat mirrors, so its
+    /// - the target thread's previous Active Session, which a message in this
+    ///   thread can no longer continue;
+    /// - `entry`'s previous owner, when it was mapped to ANOTHER thread: the
+    ///   atomic store write replaces that mapping (a `--force` steal), so the
+    ///   old owner's card must not keep sitting on 「⏳ 等待后台任务」.
+    ///
+    /// Both ids are captured **before** the write, but every collect runs
+    /// **after** it persisted: the store's activation is atomic, so a refused
+    /// save leaves the mapping with the old owner and neither card may be
+    /// stamped `SwitchedAway` for a switch that never happened. Re-activating
+    /// the already-active session collects nothing.
+    ///
+    /// Each displaced Session is no longer what its chat mirrors, so its
     /// client-held stream is released best-effort (it stays mapped and
     /// switchable; a later read re-adopts it).
     ///
@@ -2822,29 +2829,41 @@ impl FlowHandles {
     /// next Turn in the thread collects its card — the Turn's supersede collect
     /// reads every mapped session.
     pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
+        let session_id = entry.session_id.clone();
         let displaced = self
             .sessions
             .active_entry(&entry.thread_key)
             .await
             .filter(|previous| previous.session_id != entry.session_id)
             .map(|previous| previous.session_id);
-        if let Some(previous) = &displaced {
-            Turn::collect_waiting(&self.cards, previous, CollectReason::SwitchedAway).await;
-        }
+        // `activate` replaces an existing mapping of the same session id in the
+        // same write, so a force-adopt from another thread steals it atomically.
+        let stolen = self
+            .sessions
+            .thread_for_session(&entry.session_id)
+            .await
+            .is_some_and(|owner| owner != entry.thread_key);
         self.sessions.activate(entry).await?;
         if let Some(previous) = displaced {
+            Turn::collect_waiting(&self.cards, &previous, CollectReason::SwitchedAway).await;
             self.release_mirror(&previous).await;
+        }
+        if stolen {
+            Turn::collect_waiting(&self.cards, &session_id, CollectReason::SwitchedAway).await;
+            self.release_mirror(&session_id).await;
         }
         Ok(())
     }
 
     /// Unmap `session_id` — a `--force` steal by another thread, or a dead
     /// mapping being replaced — collecting the waiting card it leaves behind
-    /// first (ADR-0059, spec #405): the Session stops being any thread's Active
+    /// (ADR-0059, spec #405): the Session stops being any thread's Active
     /// Session, so its card must not keep sitting on 「⏳ 等待后台任务」. The
-    /// returned entry is the removed mapping, `None` when nothing was mapped
-    /// (and then nothing is collected). A removed mapping has its client-held
-    /// stream released best-effort — the server session stays.
+    /// collect runs only after the removal persisted: a refused save leaves the
+    /// mapping in place, and then its card must stay untouched. The returned
+    /// entry is the removed mapping, `None` when nothing was mapped (and then
+    /// nothing is collected). A removed mapping has its client-held stream
+    /// released best-effort — the server session stays.
     pub(crate) async fn unmap(&self, session_id: &str) -> crate::error::Result<Option<SessionEntry>> {
         let removed = self.sessions.remove_session(session_id).await?;
         if removed.is_some() {
