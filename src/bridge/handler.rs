@@ -3549,19 +3549,23 @@ impl App {
         )
     }
 
-    /// The adoption tail shared by the card's 接管/切换 and 强制接管 ops: patch
-    /// the clicked card in place to the compact 已切换 state (ADR-0100/ADR-0052,
-    /// which retires the Session Snapshot from this op), then persist the new
-    /// active entry. The card and the toast carry the SAME 已切换 verb whether
-    /// this is a first adoption or a re-switch. The returned card IS the ack's
+    /// The adoption tail shared by the card's 接管/切换 and 强制接管 ops: persist
+    /// the new active entry, then patch the clicked card in place to the compact
+    /// 已切换 state (ADR-0100/ADR-0052, which retires the Session Snapshot from
+    /// this op). The card and the toast carry the SAME 已切换 verb whether this
+    /// is a first adoption or a re-switch. The returned card IS the ack's
     /// replacement (ADR-0100's one-card rule), so no second message is sent.
     /// `back` is the switch card's list state the adoption came from
     /// (ADR-0052): the compact state carries its 返回列表 button.
     ///
-    /// The steal is `set_active`'s: it removes any existing entry with this
-    /// session id, so a `force_adopt` from another thread leaves that owner
-    /// sessionless there. No pre-remove — if the adoption work failed, the old
-    /// mapping would otherwise be lost for nothing.
+    /// The steal is the atomic activation's: it replaces any existing entry
+    /// with this session id in the same write, so a `force_adopt` from another
+    /// thread leaves that owner sessionless there and its waiting card is
+    /// collected only after the write persisted (ADR-0059, spec #405). No
+    /// pre-remove — if the adoption work failed, the old mapping would
+    /// otherwise be lost for nothing. A failed save therefore answers with a
+    /// failure toast and **no** replacement card: patching the list to 已切换
+    /// would claim an adoption that did not happen.
     async fn apply_card_adoption(
         &self,
         core: &Arc<SharedCore>,
@@ -3570,12 +3574,6 @@ impl App {
         open_message_id: Option<String>,
         back: Option<&crate::feishu::card::session::BackToList>,
     ) -> CardActionResult {
-        let card = crate::feishu::card::session::build_switched_state_card(
-            &target.title,
-            &target.id,
-            &target.directory,
-            back,
-        );
         // In a topic the patched card lives INSIDE it, so persist its own
         // message id as the fallback-card anchor (the Topic Anchor semantics of
         // ADR-0100 / ADR-0052): later permission/question cards reply
@@ -3597,12 +3595,25 @@ impl App {
         entry.agent = target.agent.clone();
         entry.topic_anchor = topic_anchor;
         entry.topic_root = pending_topic_root;
+        // The ack's card is the confirmation, so it must not claim 已切换 for a
+        // save that failed: the atomic activation leaves the Session with its
+        // old owner (or unmapped), so answer with the failure and leave the
+        // clicked list card as it was.
         if let Err(e) = core.activate_session(entry).await {
             tracing::warn!("switch card adopt: persist failed: {}", e);
+            return CardActionResult {
+                card: None,
+                toast: Some(format!("⚠️ 接管失败：{e}")),
+            };
         }
         crate::bridge::topic::claim_pending_cover(&core.topic_handles(), thread_key, &target.id).await;
         CardActionResult {
-            card: Some(card),
+            card: Some(crate::feishu::card::session::build_switched_state_card(
+                &target.title,
+                &target.id,
+                &target.directory,
+                back,
+            )),
             toast: Some(format!(
                 "已切换「{}」",
                 crate::bridge::display::title_or_id_tail(target)
