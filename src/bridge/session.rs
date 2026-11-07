@@ -804,16 +804,33 @@ impl SessionStore {
         F: FnOnce(&mut SessionEntry),
     {
         let client_id = self.client_id.clone();
-        let Some(entry) = self
-            .entries_mut()
-            .iter_mut()
-            .find(|e| e.client_id == client_id && e.session_id == session_id)
-        else {
-            return Ok(None);
+        let (before, updated) = {
+            let Some(entry) = self
+                .entries_mut()
+                .iter_mut()
+                .find(|e| e.client_id == client_id && e.session_id == session_id)
+            else {
+                return Ok(None);
+            };
+            let before = entry.clone();
+            f(entry);
+            (before, entry.clone())
         };
-        f(entry);
-        let updated = entry.clone();
-        self.write_to_disk()?;
+        if let Err(e) = self.write_to_disk() {
+            // A blocking write that failed returns the error, so memory must
+            // not claim the change: restore the entry. Memory leads the file
+            // only while a deferred caller may still be waiting (ADR-0089); an
+            // auto-accept flag living only in memory would approve the pending
+            // requests on the next sweep (#892).
+            if let Some(entry) = self
+                .entries_mut()
+                .iter_mut()
+                .find(|e| e.client_id == client_id && e.session_id == session_id)
+            {
+                *entry = before;
+            }
+            return Err(e);
+        }
         Ok(Some(updated))
     }
 
@@ -1175,37 +1192,60 @@ impl SessionStore {
         expected_epoch: u64,
         on: bool,
     ) -> crate::error::Result<bool> {
-        let applied = match session_id {
+        match session_id {
             None => {
                 if self.pending_epoch_for(key) != expected_epoch {
                     return Ok(false);
                 }
-                let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
-                    return Ok(false);
+                let before = {
+                    let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
+                        return Ok(false);
+                    };
+                    let before = pending.clone();
+                    pending.auto_accept = on;
+                    before
                 };
-                pending.auto_accept = on;
-                true
+                if let Err(e) = self.write_to_disk() {
+                    // A returned write error must leave memory unchanged, or
+                    // the next sweep reads a mode the user was told did not
+                    // persist (#892, ADR-0089's blocking path).
+                    if let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
+                        *pending = before;
+                    }
+                    return Err(e);
+                }
+                Ok(true)
             }
             Some(session_id) => {
                 let client_id = self.client_id.clone();
-                let Some(entry) = self
-                    .entries_mut()
-                    .iter_mut()
-                    .find(|e| e.client_id == client_id && e.session_id == session_id)
-                else {
-                    return Ok(false);
+                let before = {
+                    let Some(entry) = self
+                        .entries_mut()
+                        .iter_mut()
+                        .find(|e| e.client_id == client_id && e.session_id == session_id)
+                    else {
+                        return Ok(false);
+                    };
+                    if &entry.thread_key != key {
+                        return Ok(false);
+                    }
+                    let before = entry.clone();
+                    entry.auto_accept = on;
+                    before
                 };
-                if &entry.thread_key != key {
-                    return Ok(false);
+                if let Err(e) = self.write_to_disk() {
+                    if let Some(entry) = self
+                        .entries_mut()
+                        .iter_mut()
+                        .find(|e| e.client_id == client_id && e.session_id == session_id)
+                    {
+                        *entry = before;
+                    }
+                    return Err(e);
                 }
-                entry.auto_accept = on;
-                true
+                Ok(true)
             }
-        };
-        if applied {
-            self.write_to_disk()?;
         }
-        Ok(applied)
     }
 
     /// Write a [`SessionSettings`] snapshot back to the target it came from and
@@ -2020,6 +2060,63 @@ mod tests {
         assert!(
             matches!(store.claim_pending_for_creation(&key), PendingClaim::Creating),
             "the claim survives, so the next message retries instead of starting a second creation"
+        );
+    }
+
+    /// A failed blocking `update` must restore the entry: the caller got an
+    /// error, and an Auto-Accept flag living only in memory would approve the
+    /// pending requests on the next sweep (#892).
+    #[test]
+    fn update_failure_restores_the_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_keep", "/tmp/a"))
+            .unwrap();
+
+        store.fail_writes_after(0);
+        let err = store.update("ses_keep", |e| e.auto_accept = true).unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+        assert!(
+            !store.entry_for_session("ses_keep").unwrap().auto_accept,
+            "a refused write must not leave the flag on in memory"
+        );
+    }
+
+    /// The same contract for the field-scoped `/autoaccept` write, on both the
+    /// mapped-session and the Pending Session targets.
+    #[test]
+    fn a_failed_auto_accept_write_restores_the_flag() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .activate(make_entry("chat1", "root1", "ses_keep", "/tmp/a"))
+            .unwrap();
+
+        store.fail_writes_after(0);
+        let err = store
+            .set_auto_accept(&key, Some("ses_keep"), 0, true)
+            .unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+        assert!(
+            !store.entry_for_session("ses_keep").unwrap().auto_accept,
+            "a refused write must not leave the mapped flag on"
+        );
+
+        // A Pending Session target rolls back the same way.
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+            .unwrap();
+        let epoch = store.pending_epoch_for(&key);
+        store.fail_writes_after(0);
+        let err = store.set_auto_accept(&key, None, epoch, true).unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+        assert!(
+            !store.pending_for(&key).unwrap().auto_accept,
+            "a refused write must not leave the pending flag on"
         );
     }
 

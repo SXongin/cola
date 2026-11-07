@@ -180,7 +180,12 @@ where
         };
         current = parent;
     }
-    Ok(None)
+    // The 8-hop cap is a safety bound, not a definite "no ancestor matched":
+    // reporting a match-less end here would read as "off" and decline a
+    // request for good. Unknown is the honest answer (#892).
+    Err(crate::error::BridgeError::OpenCode(
+        "parent chain exceeded the 8-hop cap".into(),
+    ))
 }
 
 /// Resolve a `message_id` that lives INSIDE the given topic, so a card can

@@ -44,16 +44,20 @@ decisions. It stands aside wherever no card is rendered:
   as auto-accept instead of declining the request the call is about to approve.
   A persist that did not take effect approves nothing: the permission-card
   toggle releases its click claim and reports the failure rather than claiming
-  the mode; the other two refuse to run the approval pass.
-- A flag read the parent chain cannot finish (a failed `session_info` hop) is
-  **unknown**, not "off": the request stays pending and unmarked, and the next
-  sweep retries. Reading it as off would decline the request for good, which is
-  the irreversible outcome this ADR exists to remove.
+  the mode; the other two refuse to run the approval pass. The store rolls a
+  failed blocking write back before returning its error, so memory never keeps a
+  flag the user was told did not persist.
+- A flag read the parent chain cannot finish (a failed `session_info` hop, or
+  the 8-hop cap) is **unknown**, not "off": the request stays pending and
+  unmarked, and the next sweep retries. Reading it as off would decline the
+  request for good, which is the irreversible outcome this ADR exists to remove.
 - Every such approval is recorded at INFO with the request id, the target's
   length, the budget it crossed, and the target's first line (bounded). With no
   card, that log line is the audit record of what the session approved unseen.
   INFO is what ADR-0048 assigns an auto-accepted request; the "unseen" wording
-  distinguishes this case.
+  distinguishes this case. The approval pass takes its own request span, so the
+  line carries `session=` even under `/autoaccept on` (whose ambient span is the
+  inbound message's).
 - A failed auto-approval reply keeps the request pending and unmarked
   (`Prepared::Retry`), so the next sweep retries it. Returning "handled" on the
   error would retire a still-pending request with no card at all. The retry
