@@ -1312,6 +1312,85 @@ async fn an_abort_during_the_old_card_stamp_marks_the_sent_read() {
     );
 }
 
+/// The idle branch stamps the previous read and then records it as current; a
+/// cancellation inside that stamp must still mark the just-sent read, exactly
+/// like the follow branch, or two reads look current at once.
+#[tokio::test]
+async fn an_abort_during_an_idle_reads_old_card_stamp_marks_the_sent_read() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, idle_read_backend()).await;
+    platform.given_reply_id("om_idle_1");
+    platform.given_reply_id("om_idle_2");
+    seed_session(&app, "ses_test", "/work").await;
+
+    // First `/card`: an idle read becomes the current card.
+    app.handle_message(incoming(
+        "msg_card_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "/card".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_idle_1")
+    );
+    let idle = platform.replied_cards().await[0].clone();
+    platform.given_card_view("om_idle_1", idle);
+
+    // The second `/card` parks in the previous read's stamp, before recording.
+    let (entered, release) = platform.pause("update", "om_idle_1");
+    let app2 = app.clone();
+    let second = tokio::spawn(async move {
+        app2.handle_message(incoming(
+            "msg_card_2".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "/card".into(),
+            None,
+        ))
+        .await;
+    });
+    entered.notified().await;
+    second.abort();
+    let _ = second.await;
+    release.notify_one();
+
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_idle_1"),
+        "the aborted command never recorded its read as current"
+    );
+    let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let calls = platform.calls.lock().await.clone();
+            if let Some(card) = calls.iter().rev().find_map(|call| match call {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_2" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            }) {
+                return card;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the aborted idle read must still mark its sent read taken over");
+    assert!(
+        card_text(&marked).contains("已由新卡片接管"),
+        "the sent read is marked superseded: {marked}"
+    );
+}
+
 /// A Turn install that is admitted before `/card` arms its follow now waits on
 /// the session write lock: it cannot replace the follow card between the arm
 /// and the seed. When it does land, the seeded request is re-surfaced on the
