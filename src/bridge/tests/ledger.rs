@@ -3592,9 +3592,9 @@ async fn a_verdict_that_does_not_answer_for_the_child_keeps_its_marker() {
 }
 
 /// Spec #588 / #590: a late Wake after a cleanup is untouched — the cleaned
-/// task's completion still resumes the chain (the split continuation opens with
-/// its own work) and the Wake's completion entry still renders on the card
-/// whose chain observed it. The cleanup suppresses nothing.
+/// task's completion still resumes the Session on a Fresh continuation (the
+/// cleaned card is terminal, so ADR-0100's live-predicate opens a fresh card)
+/// and the resumed work renders there. The cleanup suppresses nothing.
 ///
 /// The launches name the child session, so the Wake correlates to the run the
 /// cleanup retired: this is the guard for the CLEANUP class of that suppression
@@ -3653,35 +3653,29 @@ async fn a_late_wake_after_a_cleanup_still_resumes_the_chain() {
         "the late Wake still continues the chain: {:?}",
         platform.calls.lock().await
     );
-    // The handover PATCH on the card that hosted the task carries the Wake's
-    // own completion entry — nothing the cleanup did suppresses it — and the
-    // cleanup's 🧹 entry stays there exactly once.
-    let handover = patches_to(&platform, "om_waiting")
-        .await
-        .last()
-        .cloned()
-        .expect("the handover PATCH lands on the hosted card");
-    assert!(
-        card_text(&handover).contains("🔔 subagent 完成：review the diff"),
-        "the late Wake's completion entry is never suppressed: {handover}"
-    );
-    assert_eq!(
-        card_text(&handover)
-            .matches("🧹 subagent 已清理：review the diff（人工）")
-            .count(),
-        1,
-        "the cleanup entry stays exactly once on the card that hosted the task: {handover}"
-    );
-    // The continuation opens with the resumed work and never replays the
-    // cleanup entry: entries never migrate to a continuation.
+    // The Fresh continuation carries the late Wake's resumed work — nothing the
+    // cleanup did suppresses it — and opens with the 承接 receipt.
     let continuation = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&continuation).contains("审阅完成。"),
-        "the resumed work lands on the continuation: {continuation}"
+        card_text(&continuation).contains("审阅完成。") && card_text(&continuation).contains(WAKE_LEAD),
+        "the late Wake still continues with its resumed work: {continuation}"
     );
     assert!(
         !card_text(&continuation).contains("🧹 subagent 已清理"),
         "the cleanup entry stays on its own card: {continuation}"
+    );
+    // The hosted card keeps the cleanup's 🧹 entry exactly once.
+    let hosted = patches_to(&platform, "om_waiting")
+        .await
+        .last()
+        .cloned()
+        .expect("the hosted card was patched");
+    assert_eq!(
+        card_text(&hosted)
+            .matches("🧹 subagent 已清理：review the diff（人工）")
+            .count(),
+        1,
+        "the cleanup entry stays exactly once on the card that hosted the task: {hosted}"
     );
 }
 

@@ -860,11 +860,16 @@ impl ExternalFlow {
     }
 
     /// The post-and-arm's commit (ADR-0100): insert the render-owned
-    /// `CardSession` carrying the id the send returned and write the chain
-    /// record, in one write-lock critical section. The caller holds the
-    /// Session's card write lock across its send, this insert and the seed.
-    /// With `refuse_if_running`, a live card that appeared during the send
-    /// wins and nothing is inserted.
+    /// `CardSession` carrying the id the send returned, spawn its render loop,
+    /// seed, and write the chain record, under one write-lock critical
+    /// section. The caller holds the Session's card write lock across its send
+    /// and this work. With `refuse_if_running`, a live card that appeared
+    /// during the send wins and nothing is inserted.
+    ///
+    /// A cancellation AFTER the sync spawn but BEFORE the record write leaves
+    /// an armed card with its renderer and a momentarily missing record; the
+    /// loop's own flush re-points the record when it runs. That is a record
+    /// lag for the reap, never a rendererless live card or a second card.
     pub(crate) async fn arm_snapshot_follow_locked(
         &self,
         handles: &FlowHandles,
@@ -1302,7 +1307,15 @@ impl ExternalFlow {
         // (the user's message the exchange continues from), else an in-topic
         // anchor — the external path's fallback order. `None` means only a
         // top-level send could reach the thread, which a split cannot do.
-        let reply_target = self.wake_reply_target(handles, sid, thread_key).await;
+        // The residual floor is NOT a Wake: it continues the chain's own late
+        // tail, so a terminal chain card's reply target is still the chain's
+        // message and may carry the one neutral card. A genuine Wake never
+        // takes this path (it falls to Fresh).
+        let reply_target = if residual {
+            self.residual_reply_target(handles, sid, thread_key).await
+        } else {
+            self.wake_reply_target(handles, sid, thread_key).await
+        };
         let Some(reply_to) = reply_target else {
             // The RESIDUAL floor must never drop content (#606): with no
             // reachable target a split cannot open a card, so a Wake-less tail
@@ -1392,15 +1405,29 @@ impl ExternalFlow {
         sid: &str,
         thread_key: &crate::config::ThreadKey,
     ) -> Option<String> {
-        // A Wake continues the Session's Card Chain, so it asks whether the
-        // map entry is a chain card — not whether it is live. A terminal chain
-        // card still supplies the user message its chain answers; an Idle
-        // Session Card, which joins no chain, is never a target (ADR-0100). A
-        // `/card` read replaces the terminal card, and `wake_continuation`
-        // routes a late Wake to the Fresh arm: it opens a new continuation card,
-        // replying to a Topic's anchor when there is one and sending top-level
-        // in a main chat. Nothing re-points the read at a chain it does not
-        // own — the anchor below is only the Fresh card's delivery target.
+        // Only a LIVE card supplies a reply target (ADR-0100): a Wake continues
+        // the Session's chain on a Fresh card, so a terminal or idle entry must
+        // fall through to the topic anchor (or top-level). A terminal chain card
+        // remains in the map but no longer renders, and reusing its reply target
+        // would put the continuation on a card whose `is_running` is false.
+        if Turn::is_running(&handles.cards, sid).await
+            && let Some(target) = Turn::reply_target(&handles.cards, sid).await
+        {
+            return Some(target);
+        }
+        crate::bridge::pollers::resolve_topic_anchor(&handles.sessions, &handles.platform, thread_key).await
+    }
+
+    /// The residual floor's reply target: a Wake-less late tail is not a Wake,
+    /// so a terminal chain card's own reply message can still carry its one
+    /// neutral continuation (rather than rebuilding the finalized card in
+    /// place). Falls back to the topic anchor, then top level.
+    async fn residual_reply_target(
+        &self,
+        handles: &FlowHandles,
+        sid: &str,
+        thread_key: &crate::config::ThreadKey,
+    ) -> Option<String> {
         if Turn::is_chain_card(&handles.cards, sid).await
             && let Some(target) = Turn::reply_target(&handles.cards, sid).await
         {
@@ -2075,13 +2102,12 @@ mod tests {
         );
     }
 
-    /// The Wake continuation asks whether the map entry is a **chain card**
-    /// (ADR-0100's Wake exception), not whether it is live: a running Turn,
-    /// `Waiting`, `Restarted` and a terminal Turn card all keep the chain's
-    /// target because a Wake continues that chain. An **Idle** Session Card
-    /// joins no chain, so it is never a Wake target and the topic anchor wins.
+    /// Only a LIVE card supplies a Wake's reply target (ADR-0100): a running
+    /// Turn, `Waiting` and `Restarted` keep the chain's target; a terminal
+    /// Done card and an Idle read fall back to the topic anchor, where the
+    /// Fresh continuation lands.
     #[tokio::test]
-    async fn an_idle_card_is_not_the_wake_reply_target() {
+    async fn only_a_live_card_is_the_wake_reply_target() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2107,16 +2133,16 @@ mod tests {
                 "{live:?} still owns the chain's reply target"
             );
         }
-        // A terminal Turn card is still the chain's newest card: a Wake after
-        // it continues that chain under the same user message.
+        // A terminal card no longer renders: the Wake opens Fresh on the
+        // topic anchor instead of replying to the dead card.
         Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
         assert_eq!(
             app.external
                 .wake_reply_target(&app.flow_handles(), "ses_test", &thread_key)
                 .await
                 .as_deref(),
-            Some("msg_1"),
-            "a terminal chain card still names the message the chain answers"
+            Some("msg_anchor"),
+            "a terminal card falls back to the topic anchor"
         );
 
         // An Idle Session Card joins no chain, so it must never be a target.

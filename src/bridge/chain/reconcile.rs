@@ -625,7 +625,24 @@ async fn probe_card(
     // reads. Treating it as a `Successor` would collect the card the record
     // still names and release the record — the predecessor collect the idle arm
     // deliberately stops before.
+    //
+    // The record's own card may still owe its terminal PATCH: a Turn ended, its
+    // ending write is still in the outbox, `/card` replaced the card with the
+    // read. That owed fact is the record's, so report the recorded card as
+    // terminal-with-update-pending — the decision Keeps until the outbox
+    // drains instead of projecting or re-settling the recorded card. Once
+    // drained, the read is the documented orphan (`None`).
     if !current_is_chain_card {
+        if handles
+            .cards
+            .feishu
+            .has_pending_card_update(record.card_message_id.as_str())
+        {
+            return CardProbe::Recorded {
+                terminal: true,
+                update_pending: true,
+            };
+        }
         return CardProbe::None;
     }
     // A live or yielded card is still running; a terminal one is not.
@@ -2561,6 +2578,63 @@ mod tests {
             Turn::record_idle_card(&handles.cards, "ses_test", "om_idle", "msg_card").await,
             "the terminal chain card is replaced by the read"
         );
+        // The record's card still owes its terminal PATCH: stage one in the
+        // outbox and fail its first transport attempt.
+        platform
+            .fail_update_transport_count
+            .store(100, std::sync::atomic::Ordering::SeqCst);
+        let stamp = crate::feishu::card::shell::CardBuilder::new()
+            .with_state(CardState::Restarted)
+            .build();
+        let generation = handles.cards.chains.generation("ses_test");
+        let outcome = handles
+            .cards
+            .feishu
+            .submit_ordered(crate::feishu::delivery::KeyedSubmission {
+                message_id: "om_chain",
+                generation,
+                intent: crate::feishu::delivery::CardWriteIntent::Settle,
+                card: &stamp,
+                fallback: None,
+            })
+            .await
+            .settled()
+            .await;
+        assert!(
+            matches!(outcome, crate::feishu::delivery::WriteOutcome::Failed(_)),
+            "the ending is still owed: {outcome:?}"
+        );
+        assert!(handles.cards.feishu.has_pending_card_update("om_chain"));
+
+        // The Idle entry reports the record's owed ending, so the reap Keeps
+        // instead of projecting or re-settling the recorded card.
+        let reads = gather_reads(&handles, "ses_test", &record, Some("/work"), None).await;
+        assert_eq!(
+            reads.card,
+            CardProbe::Recorded {
+                terminal: true,
+                update_pending: true,
+            },
+            "the idle read preserves the record's owed ending"
+        );
+        assert_eq!(
+            decision::reconcile(&record, &reads),
+            ChainDisposition::Keep,
+            "an owed ending keeps the recorded card"
+        );
+
+        // Once the outbox drains, the read is the documented orphan.
+        platform
+            .fail_update_transport_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        handles.cards.feishu.drain_pending_card_updates(true).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while handles.cards.feishu.has_pending_card_update("om_chain") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drain delivers the owed ending");
         let reads = gather_reads(&handles, "ses_test", &record, Some("/work"), None).await;
         assert_eq!(
             reads.card,

@@ -551,7 +551,7 @@ async fn switch_reeswitch_line_reports_a_pending_already_on_its_own_card() {
     let line = texts.first().expect("the re-switch answers a line");
     assert!(
         line.contains(crate::feishu::card::session::WAITING_CHIP),
-        "the operator's pending outranks the run state: {line}"
+        "the Host's pending outranks the run state: {line}"
     );
     assert!(
         !line.contains(crate::feishu::card::session::BUSY_CHIP),

@@ -1050,6 +1050,23 @@ pub(crate) fn is_reset_flag(name: &str) -> bool {
     name == "--reset"
 }
 
+/// Split the Session's Card Chain at the `/card` command (ADR-0043's pull),
+/// shared by the outer pull check and the in-lock re-check inside
+/// [`post_idle_card`].
+async fn split_card_for_pull(
+    cards: &crate::bridge::handles::CardsHandle,
+    session_id: &str,
+    message_id: &str,
+) {
+    crate::bridge::turn::Turn::split_card_chain(
+        cards,
+        session_id,
+        message_id,
+        crate::bridge::turn::SplitKind::Pull,
+    )
+    .await;
+}
+
 /// `/card`'s second state (ADR-0100): with no renderer owning the Session, read
 /// it once and post exactly ONE read-only Session Card.
 ///
@@ -1165,13 +1182,7 @@ async fn post_idle_card(
     // entered after the guard is released (it takes the same lock).
     if crate::bridge::turn::Turn::is_running(cards, session_id).await {
         drop(guard);
-        crate::bridge::turn::Turn::split_card_chain(
-            cards,
-            session_id,
-            message_id,
-            crate::bridge::turn::SplitKind::Pull,
-        )
-        .await;
+        split_card_for_pull(cards, session_id, message_id).await;
         return Ok(());
     }
     let previous = crate::bridge::turn::Turn::card_to_supersede(cards, session_id).await;
@@ -1208,8 +1219,11 @@ async fn post_idle_card(
                 // one card is current; the posted read stays untracked and the
                 // next `/card` retries the stamp.
                 drop(guard);
+                // The old card stays current, but the just-sent read must not
+                // be indistinguishable from it: mark the untracked read too.
+                crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
                 tracing::warn!(
-                    "card read: session {session_id} could not stamp the previous card {}; leaving it current",
+                    "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
                     previous
                 );
                 return Ok(());
@@ -1258,8 +1272,11 @@ async fn post_idle_card(
             // old read current, leave the just-sent read untracked, and let the
             // next `/card` retry the stamp.
             drop(guard);
+            // The old read stays current; the just-sent read is visibly
+            // superseded so a third `/card` cannot mistake it for current.
+            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
             tracing::warn!(
-                "card read: session {session_id} could not stamp the previous card {}; leaving it current",
+                "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
                 previous
             );
             return Ok(());
@@ -1865,13 +1882,7 @@ pub(crate) async fn handle_command(
             let running = crate::bridge::turn::Turn::is_running(&handles.flow.cards, &session_id).await;
             if running {
                 tracing::info!("card pull: session {session_id} live card split requested");
-                crate::bridge::turn::Turn::split_card_chain(
-                    &handles.flow.cards,
-                    &session_id,
-                    message_id,
-                    crate::bridge::turn::SplitKind::Pull,
-                )
-                .await;
+                split_card_for_pull(&handles.flow.cards, &session_id, message_id).await;
                 return Ok(());
             }
             post_idle_card(handles, &session_id, message_id).await?;

@@ -1644,7 +1644,7 @@ async fn an_idle_read_points_at_a_pending_request_without_hosting_it() {
     let text = card_text(&card);
     assert!(
         text.contains("⏳ 等待你的确认"),
-        "the read waits on the operator: {text}"
+        "the read waits on the Host: {text}"
     );
     assert!(
         text.contains("有 1 个请求等待你处理"),
@@ -2068,6 +2068,21 @@ async fn a_failed_previous_read_stamp_keeps_the_old_read_current() {
             .as_deref(),
         Some("om_idle_1"),
         "the old read stays current when its stamp PATCH fails"
+    );
+    let calls = platform.calls.lock().await.clone();
+    let untracked = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_2" => {
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .expect("the untracked read is marked superseded");
+    assert_eq!(
+        untracked["header"]["title"]["content"], "⏳ 已由新卡片接管 · 已停止更新",
+        "the just-sent read cannot be mistaken for current"
     );
 
     // The next `/card` retries the stamp and becomes current.
@@ -3090,7 +3105,7 @@ fn a_pending_read_renders_the_same_status_and_pointer_on_both_drivers() {
     );
 
     // #1005's filter: a request another card already hosts is not seeded here,
-    // so this card carries none — but the READ still waits on the operator, so
+    // so this card carries none — but the READ still waits on the Host, so
     // the status line keeps 等待你的确认 and only the pointer goes away.
     let unseeded = crate::bridge::external::snapshot_follow_lead("接管", "唯一外部标题", &read, &[], true);
     let unseeded_body = follow_lead_body(&unseeded);

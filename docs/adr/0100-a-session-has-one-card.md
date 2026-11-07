@@ -148,18 +148,17 @@ two are separate compositions that can drift.
   `inline_host_session` and `resolve_card_target`'s in-flight arm
   (`src/bridge/pollers.rs`), and the click's inline-host decision
   (`RequestFlow::handle_card_action`, `src/bridge/request/flow.rs`).
-  `ExternalFlow::wake_reply_target` asks the chain-card predicate instead — the
-  Wake exception below. `is_running` is
+  `ExternalFlow::wake_reply_target` asks `Turn::is_running` too: a Wake
+  continues the Session's **Card Chain** on a **Fresh** card, and only a live
+  card supplies its reply target. A card past its ending (Done/Stopped) or an
+  Idle read therefore falls through to the topic anchor or top level, with the
+  late content still carried on the Fresh continuation. `Turn::is_chain_card`
+  stays for the flush/split/residual guards. `is_running` is
   `!is_terminal()`, so `Waiting` still counts (it is the chain's newest card) and
-  `Restarted` still counts (deliberately not terminal). One wake-specific
-  exception: a Wake continues the Session's **Card Chain**, so a terminal chain
-  card still supplies that chain's reply target (`wake_reply_target` asks
-  `Turn::is_chain_card`); refusing it would drop a late Wake after a Done card
-  (pinned by `a_wake_after_a_done_card_continues_on_a_new_card`), and only an
-  **Idle Session Card**, which joins no chain, is refused. Without this, an idle
-  card in the map would take a stale permission click down the inline path — the ack
-  returns no replacement card and the idle card never repaints the block, the
-  empty-ack class of pitfall `codex-request-ids`.
+  `Restarted` still counts (deliberately not terminal). Without the live
+  predicate, an idle card in the map would take a stale permission click down the
+  inline path — the ack returns no replacement card and the idle card never
+  repaints the block, the empty-ack class of pitfall `codex-request-ids`.
 - An adopted session's pending requests surface through the ordinary sweep
   (`RequestFlow::sweep` lists every known directory's requests): inline on a live
   card, else their own. A **busy follow** seeds the read's pendings onto its own
