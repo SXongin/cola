@@ -249,7 +249,9 @@ pub(crate) const UNSHOWABLE_PERMISSION_HEADER: &str = "🔐 权限请求已自�
 pub(crate) fn unshowable_permission_note(budget: usize) -> String {
     format!(
         "该权限请求的目标超过 **{budget}** 字符，卡片无法完整显示。为了不让你批准只看到一部分的内容，\
-         cola 已自动拒绝；请在原始客户端中确认后重试。"
+         cola 已自动拒绝，该请求在服务端已结清——其他客户端也无法再批准。\
+         请让 AI 把这条操作拆成更短的步骤后重试；或先开启自动授权（`/autoaccept on`）再让它执行，\
+         自动授权不需要逐条查看。"
     )
 }
 
