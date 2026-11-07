@@ -144,7 +144,7 @@ jobs:
     # ran the same action, pin and model successfully the day before. Unpin when
     # codex-action supports 26.04 (track its releases).
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     permissions:
       contents: read
       issues: read
@@ -400,7 +400,7 @@ jobs:
       - name: Run Codex (read-only)
         id: codex
         continue-on-error: true
-        timeout-minutes: 30
+        timeout-minutes: 45
         uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         with:
           openai-api-key: ${{ secrets.GATE_KEY || secrets.DEEPSEEK_API_KEY }}
