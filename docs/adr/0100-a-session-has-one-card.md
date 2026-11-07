@@ -116,10 +116,11 @@ await), seeds the filtered requests and writes the chain record. Nothing
 reaches `cards.cards` before that insert, so a command cancelled earlier leaves
 no Idle card behind: the next sweep
 surfaces the requests normally, and the sent card — if the send had already
-returned — stays a static read, not a host. `RequestFlow::surface` takes the same
-lock for its whole decision (it resolves the standalone target before the lock,
-then re-checks the inline host and sends under it), so it cannot observe the
-window either. Because the filter runs inside that one critical section, a
+returned — stays a static read, not a host. `RequestFlow::surface` takes the
+same host lock (or, when no live host remains, the request Session's own) for
+its decision: it resolves the standalone target and inline host before the lock,
+then re-checks the host's liveness and sends under that Session's lock, so it
+cannot observe the window either. Because the filter runs inside that one critical section, a
 request the sweep had surfaced before `/card` began keeps its own card and is
 simply not seeded, and a request that lands during the command cannot be counted
 on a card that does not carry it. The loop waits on the same session write lock
@@ -246,10 +247,12 @@ standing.
   claim registry goes, so every Interaction Block lives on a live card or its own
   standalone card.
 - ADR-0038 rule 8 — the card writer set. **Amended** (2026-11-07): `/card`'s
-  follow makes `RequestFlow::surface` hold the owning Session's card write lock
-  across its whole surfacing decision too, including the standalone send, so the
-  follow arm and the sweep cannot double-surface one request. The lock stays
-  per-session, and the sweep's non-live-card patches stay lock-free.
+  follow makes `RequestFlow::surface` hold a card write lock across its whole
+  surfacing decision too, including the standalone send, so the follow arm and
+  the sweep cannot double-surface one request. The sweep takes exactly one
+  Session's lock: the resolved HOST's for an inline block, or the request
+  Session's own for the standalone fallback — never both, and never nested. The
+  lock stays per-session, and the sweep's non-live-card patches stay lock-free.
 - ADR-0094 — several pending blocks on one snapshot, and its no-repaint
   carve-out. **Retired** with the claimed block.
 - ADR-0040 — the Session Snapshot tail's fold ids. **Retired** with the rebuild

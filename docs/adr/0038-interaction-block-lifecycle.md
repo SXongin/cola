@@ -287,16 +287,26 @@ identical ack body, which is the same wipe one click later.
 ## Amendment (2026-11-07): the sweep takes the session card-write lock for its surfacing decision
 
 Rule 8 named `flush_card` and `resolve_blocks` as the only holders. ADR-0100's
-`/card` busy follow adds a third: `RequestFlow::surface` takes the owning
-Session's card write lock for its **whole surfacing decision** — the inline-host
-check, the block insert/flush, and the standalone send with its `sent_cards`
-record — so the follow arm and the sweep cannot both deliver one request. A
-sweep that read "no live card" just before the arm must not post a standalone
-card for the request the follow seeds.
+`/card` busy follow adds a third: `RequestFlow::surface` takes a card write lock
+for its **whole surfacing decision** — the inline-host check, the block
+insert/flush, and the standalone send with its `sent_cards` record — so the
+follow arm and the sweep cannot both deliver one request. A sweep that read
+"no live card" just before the arm must not post a standalone card for the
+request the follow seeds.
 
-The lock remains per-session and is never held across another Session's work.
-The standalone send is one Feishu create and is deliberately not wrapped in a
-request timeout: a create has at-least-once semantics, so abandoning a slow
-response could orphan a card that did land and a retry would post a second
+The lock remains per-session, and a sweep **never holds two Sessions' locks**
+(ADR-0100's 2026-11-07 amendment). It resolves the inline host first, bounded
+and before any lock because the parent-chain walk reads the server. When a host
+exists, the inline decision — re-checking the host's liveness, inserting the
+block, flushing — takes **the host's** card write lock, the same lock `/card`'s
+post-and-arm and a busy follow take. If the host is no longer live (a Turn that
+ended between the walk and the lock, or a card that vanished), that lock is
+released and the standalone path takes **the request Session's own** write lock
+for its decision, send and `sent_cards` record. The two locks are never nested:
+a sub-task child's lock is not held while its ancestor host's is, so the old
+child → ancestor acquisition and its liveness check under the wrong lock are
+gone. The standalone send is one Feishu create and is deliberately not wrapped
+in a request timeout: a create has at-least-once semantics, so abandoning a
+slow response could orphan a card that did land and a retry would post a second
 (ADR-0100). The sweep patches that target standalone or superseded cards — the
 ones Rule 8 already calls lock-free — stay exactly that.
