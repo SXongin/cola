@@ -283,3 +283,20 @@ One more write owns the render gate's header cache: a click's callback ack is
 the card's body, so a resolution that restamps the header advances the cache
 with it (`Turn::mark_header_shown`) — otherwise the next tick re-sent the
 identical ack body, which is the same wipe one click later.
+
+## Amendment (2026-11-07): the sweep takes the session card-write lock for its surfacing decision
+
+Rule 8 named `flush_card` and `resolve_blocks` as the only holders. ADR-0100's
+`/card` busy follow adds a third: `RequestFlow::surface` takes the owning
+Session's card write lock for its **whole surfacing decision** — the inline-host
+check, the block insert/flush, and the standalone send with its `sent_cards`
+record — so the follow arm and the sweep cannot both deliver one request. A
+sweep that read "no live card" just before the arm must not post a standalone
+card for the request the follow seeds.
+
+The lock remains per-session and is never held across another Session's work.
+The standalone send is one Feishu create and is deliberately not wrapped in a
+request timeout: a create has at-least-once semantics, so abandoning a slow
+response could orphan a card that did land and a retry would post a second
+(ADR-0100). The sweep patches that target standalone or superseded cards — the
+ones Rule 8 already calls lock-free — stay exactly that.

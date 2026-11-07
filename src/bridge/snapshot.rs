@@ -47,10 +47,11 @@ pub struct SnapshotData {
     /// message is included, for its record line).
     pub tail: Vec<TailEntry>,
     /// The newest user message's anchor — its identity together with its
-    /// server time — from the Session Transcript's `newest_user` projection.
-    /// The busy-adopt follow renders from it (ticket 06), so the message it
-    /// answers travels with the turn. `None` when the session has no user
-    /// message: nothing to follow.
+    /// server time — from the Session Transcript's read order. The busy-adopt
+    /// follow renders from it (ticket 06), so the message it answers travels
+    /// with the turn. `None` when the session has no user message, or when the
+    /// newest one carries no server time: an untimed message has no render
+    /// anchor, so `/card` stays a static read (ADR-0100's #1005 carve-out).
     pub newest_user_anchor: Option<TurnAnchor>,
     /// Whether the newest user message is a Cola-Authored Message (`msg_cola_`
     /// id, ADR-0026) — the busy follow's guard: cola's own run hands off
@@ -117,7 +118,12 @@ pub(crate) async fn gather_snapshot(
     };
     // Newest user and tail come from the shared transcript projections (ADR-0053),
     // so the snapshot cannot drift from the Turn and external-sync reads.
-    let newest_user = transcript.newest_user();
+    // The ACTUAL newest user message, timed or not: an untimed newest message
+    // has no anchor, and falling back to an older timed one would scope a
+    // follow to the wrong run. An untimed result therefore leaves
+    // `newest_user_anchor` None and `/card` posts its static read (ADR-0100's
+    // #1005 carve-out).
+    let newest_user = transcript.newest_user_including_untimed();
     let newest_user_anchor = newest_user.and_then(|message| message.anchor());
     let newest_user_is_cola_authored = match newest_user {
         Some(message) => backend.is_cola_authored(message.id.as_str()).await,
@@ -476,6 +482,23 @@ mod tests {
         let no_time = typed_message("msg_cola_x", MessageRole::User, None, vec![text_part("hi")]);
         let snap = gather_from_typed_backend(typed_backend(vec![no_time])).await;
         assert_eq!(snap.newest_user_anchor, None);
+
+        // An UNTIMED newest message is the read's newest even though it has no
+        // anchor: an older timed message is never substituted (#1005's
+        // carve-out), and the authorship is the untimed message's own.
+        let older = user("msg_cola_x", 1000, &["我发的"]);
+        let untimed = typed_message(
+            "msg_other_untimed",
+            MessageRole::User,
+            None,
+            vec![text_part("没有时间")],
+        );
+        let snap = gather_from_typed_backend(typed_backend(vec![older, untimed])).await;
+        assert_eq!(snap.newest_user_anchor, None);
+        assert!(
+            !snap.newest_user_is_cola_authored,
+            "the untimed newest message's own authorship wins over the older timed one"
+        );
     }
 
     #[tokio::test]

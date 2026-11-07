@@ -751,10 +751,12 @@ impl ExternalFlow {
         busy_now: bool,
         data: &crate::bridge::snapshot::SnapshotData,
     ) -> Option<SnapshotFollowPlan> {
-        // Deliberate scope limit: the follow needs the run's anchor to scope
-        // what it streams. A newest user message the server reports without a
-        // `created_ms` has no anchor, so the read stays static rather than
-        // guessing a window for the renderer.
+        // ADR-0100's recorded #1005 carve-out: the follow needs the run's
+        // anchor to scope what it streams. A newest user message the server
+        // reports without a `created_ms` has no anchor, so the read stays
+        // static rather than guessing a window for the renderer (the read is
+        // still posted). An older timed message is never substituted: the
+        // gather reports the actual newest user message.
         let Some(anchor) = data.newest_user_anchor.clone() else {
             tracing::warn!(
                 "busy follow: session {} busy but has no user message to follow",

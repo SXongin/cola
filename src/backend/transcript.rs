@@ -320,6 +320,18 @@ impl SessionTranscript {
             .max_by_key(|message| message.time.map(|time| time.created))
     }
 
+    /// The newest user message in READ ORDER, timed or not. [`Self::newest_user`]
+    /// deliberately skips untimed messages (their time is unknown), but a
+    /// caller deciding whether the newest message can be anchored must see the
+    /// actual last user message: falling back to an older timed one would scope
+    /// a follow to the wrong run.
+    pub fn newest_user_including_untimed(&self) -> Option<&TranscriptMessage> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+    }
+
     /// The input of the tool call `call_id`, joined over the WHOLE read: a
     /// Background Task can outlive the Turn that started it, so its part may
     /// sit anywhere in the transcript (ADR-0060's label join). `None` when no
