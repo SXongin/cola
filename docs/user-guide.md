@@ -807,7 +807,7 @@ detailed help for any of these.
 | `/model <p/m>` | Switch model (OpenCode: takes effect next message, persisted; Codex: records a one-shot pick for a live thread's next new message, dropped on restart; a Pending Session keeps its creation pick) |
 | `/think [level]` | Set/clear thinking level, per model (OpenCode: next message, persisted; Codex: one-shot for a live thread's next new message, dropped on restart; a Pending Session keeps its creation level) |
 | `#<id> [#<id> …] [text]` | Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and a `#<id>` that matches no skill stays plain text (`#644`, `C#caveman` and `##foreman` are never skill tokens). A bare `/skill` opens the skill picker — searchable by id/name/description and paged 20 rows at a time — and `/skill <id>` is an alias for ids the `#` form cannot type (`2fa-helper`, `web_scrape`) |
-| `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session. A permission whose target the card cannot show in full (an over-long command) is still declined, never approved unseen |
+| `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session. Every request is approved unseen, including a target the card cannot show in full (an over-long command); each such approval is logged with its request id and target length |
 | `/restart` | Restart cola (keeps startup args + log redirect) |
 | `/restart-opencode` | Restart the OpenCode server (cola's Owned Server or the V2 Shared Service) |
 | `/update` | Update cola via its install channel (GitHub Releases self-update, or the cargo command for `cargo install`/`cargo binstall` installs) |

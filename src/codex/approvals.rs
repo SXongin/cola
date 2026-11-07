@@ -2122,12 +2122,13 @@ mod tests {
 
     /// Whole-branch review #883 / re-review: the adapter decodes every
     /// command, including one past the card's display budget. The *bridge* is
-    /// where the completeness proof runs (it declines such a request and posts
-    /// the reason), so it covers every client with one rule instead of each
-    /// adapter carrying presentation policy. What the adapter must still do is
-    /// hand the bridge the target truthfully.
+    /// where the completeness proof runs (it declines such a request for a card
+    /// surface; an Auto-Accept session approves it unseen and logs the length,
+    /// #892), so it covers every client with one rule instead of each adapter
+    /// carrying presentation policy. What the adapter must still do is hand the
+    /// bridge the target truthfully.
     #[test]
-    fn a_command_past_the_display_budget_still_decodes_for_the_bridge_to_decline() {
+    fn a_command_past_the_display_budget_still_decodes_for_the_bridge_to_decide() {
         let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
         let command = format!("{}a", "a".repeat(budget));
         let params = json!({
@@ -2154,7 +2155,8 @@ mod tests {
 
     /// The legacy family is subject to the same neutral proof: its target is
     /// the joined argv, so a long invocation is unshowable exactly like the
-    /// modern one — and the bridge declines it there.
+    /// modern one — and the bridge decides it there (decline for a card,
+    /// approve unseen under Auto-Accept).
     #[test]
     fn a_legacy_command_past_the_display_budget_is_unshowable() {
         let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
