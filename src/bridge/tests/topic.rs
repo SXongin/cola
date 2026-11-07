@@ -1984,6 +1984,244 @@ async fn a_failed_forced_topic_adoption_keeps_the_old_owner() {
     );
 }
 
+/// Seed a mapped session with a waiting card, the state a `--force` steal
+/// displaces.
+async fn seed_mapped_waiting(app: &Arc<App>, key: &crate::config::ThreadKey, session_id: &str) {
+    seed_entry(
+        app,
+        crate::config::SessionEntry::new(key.clone(), session_id, "/work/ext"),
+    )
+    .await;
+    let cards = app.cards_handle();
+    crate::bridge::turn::Turn::seed_card(&cards, session_id, Some("om_waiting")).await;
+    crate::bridge::turn::Turn::set_card_state(&cards, session_id, crate::feishu::card::CardState::Waiting)
+        .await;
+}
+
+/// The failure notice an adoption posts after its confirmation line, if any.
+async fn adoption_failure_notice(platform: &RecordingPlatform) -> Option<String> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .rev()
+        .find_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } if text.contains("接管失败") => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// A forced adoption whose steal cannot be persisted changes nothing: the old
+/// owner keeps its mapping and pending, its waiting card is not collected, the
+/// topic maps nothing, and the chat is told the takeover failed.
+#[tokio::test]
+async fn a_forced_adoption_whose_steal_cannot_persist_keeps_the_old_owner() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_foreign123abc",
+        "外部会话",
+        "/work/ext",
+        100,
+    )]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let old_key = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+    seed_mapped_waiting(&app, &old_key, "ses_foreign123abc").await;
+    seed_pending(
+        &app,
+        crate::bridge::session::PendingEntry::new(old_key.clone(), "/work/ext"),
+    )
+    .await;
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
+    let writes_before = app.sessions.lock().await.writes();
+
+    // Fail the very next store write: the steal's removal.
+    app.sessions.lock().await.fail_writes_after(0);
+    send_command_in(
+        &app,
+        "/switch ses_foreign123abc --force",
+        topic_key.clone(),
+        "msg_steal",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    {
+        let store = app.sessions.lock().await;
+        assert_eq!(
+            store
+                .entry_for_session("ses_foreign123abc")
+                .map(|entry| entry.thread_key.clone()),
+            Some(old_key.clone()),
+            "a refused removal leaves the old owner's mapping in place"
+        );
+        assert!(
+            store.pending_for(&old_key).is_some(),
+            "a refused removal leaves the old owner's pending alone"
+        );
+        assert!(
+            store.list_thread(&topic_key).is_empty(),
+            "the failed steal maps nothing to the new topic"
+        );
+        assert_eq!(
+            store.writes(),
+            writes_before,
+            "the refused steal persisted nothing"
+        );
+    }
+    assert!(
+        patches_to(&platform, "om_waiting").await.is_empty(),
+        "the old owner's waiting card is not collected: {:?}",
+        platform.calls.lock().await
+    );
+    let notice = adoption_failure_notice(&platform)
+        .await
+        .expect("the chat is told the takeover failed");
+    assert!(
+        notice.contains("原映射保持不变"),
+        "the notice promises the unchanged mapping the store guarantees: {notice}"
+    );
+}
+
+/// A forced adoption whose steal persisted but whose activation did not is
+/// rolled back: the old owner is restored, the new thread is not promoted, its
+/// pending survives, and the notice says the mapping was kept.
+#[tokio::test]
+async fn a_forced_adoption_whose_activation_cannot_persist_restores_the_old_owner() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_foreign123abc",
+        "外部会话",
+        "/work/ext",
+        100,
+    )]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let old_key = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+    seed_mapped_waiting(&app, &old_key, "ses_foreign123abc").await;
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
+    let mut pending = crate::bridge::session::PendingEntry::new(topic_key.clone(), "/work/ext");
+    pending.topic_root = Some("om_root".into());
+    seed_pending(&app, pending).await;
+    let writes_before = app.sessions.lock().await.writes();
+
+    // The steal succeeds; the activation is the second write and fails. The
+    // one-shot fault then lets the restore write through.
+    app.sessions.lock().await.fail_writes_after(1);
+    send_command_in(
+        &app,
+        "/switch ses_foreign123abc --force",
+        topic_key.clone(),
+        "msg_steal",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    {
+        let store = app.sessions.lock().await;
+        assert_eq!(
+            store
+                .entry_for_session("ses_foreign123abc")
+                .map(|entry| entry.thread_key.clone()),
+            Some(old_key.clone()),
+            "the removed mapping is restored to its old owner"
+        );
+        assert!(
+            store.list_thread(&topic_key).is_empty(),
+            "the refused activation promotes nothing to the new thread"
+        );
+        let pending = store
+            .pending_for(&topic_key)
+            .expect("the refused activation does not consume the target pending");
+        assert_eq!(
+            pending.topic_root.as_deref(),
+            Some("om_root"),
+            "the pending keeps its cover root for the retry"
+        );
+        assert_eq!(
+            store.writes(),
+            writes_before + 2,
+            "exactly the steal and the restore persisted"
+        );
+    }
+    let notice = adoption_failure_notice(&platform)
+        .await
+        .expect("the chat is told the takeover failed");
+    assert!(
+        notice.contains("原映射保持不变"),
+        "the restore makes the notice true: {notice}"
+    );
+}
+
+/// A non-force adoption of an unmapped session whose activation cannot be
+/// persisted leaves the thread unmapped and its pending intact.
+#[tokio::test]
+async fn an_adoption_whose_activation_cannot_persist_keeps_the_thread_unmapped() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_free123abc",
+        "自由会话",
+        "/work/free",
+        100,
+    )]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
+    let mut pending = crate::bridge::session::PendingEntry::new(topic_key.clone(), "/work/free");
+    pending.topic_root = Some("om_root".into());
+    seed_pending(&app, pending).await;
+    let writes_before = app.sessions.lock().await.writes();
+
+    // No steal: the activation is the next store write.
+    app.sessions.lock().await.fail_writes_after(0);
+    send_command_in(
+        &app,
+        "/switch ses_free123abc",
+        topic_key.clone(),
+        "msg_adopt",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    {
+        let store = app.sessions.lock().await;
+        assert!(
+            store.entry_for_session("ses_free123abc").is_none(),
+            "the refused activation maps nothing"
+        );
+        assert!(
+            store.list_thread(&topic_key).is_empty(),
+            "the thread stays unmapped"
+        );
+        assert!(
+            store.pending_for(&topic_key).is_some(),
+            "the pending survives the failed adoption"
+        );
+        assert_eq!(
+            store.writes(),
+            writes_before,
+            "the refused activation persisted nothing"
+        );
+    }
+    let notice = adoption_failure_notice(&platform)
+        .await
+        .expect("the chat is told the adoption failed");
+    assert!(
+        notice.contains("原映射保持不变"),
+        "nothing changed, and the notice says so: {notice}"
+    );
+}
+
 /// ADR-0023: a plain message in a cola-created topic carries `parent_id`
 /// pointing at the topic's own creation messages — the thread root (the
 /// user's `/topic` command) or the seed card (`topic_anchor`). Neither must
