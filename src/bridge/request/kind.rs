@@ -359,6 +359,19 @@ impl RequestKind for PermissionKind {
         if p.targets_are_fully_shown() {
             return Refusal::NotApplicable;
         }
+        // The completeness proof guards the CARD: it stops a click approving
+        // text the card had to clip. Auto-Accept renders no card at all — the
+        // session opted into "answer without asking me" — so there is nothing
+        // for the proof to guard. Declining here would settle a request the
+        // user already delegated, with no path to approve it afterwards (the
+        // request leaves the server's pending list, so no client can answer
+        // it), and a model that re-emits the same long command would loop on
+        // denials (#892). The check runs only past the budget, so the ordinary
+        // path pays no extra session lookup.
+        let sid = p.session_id.clone().unwrap_or_default();
+        if should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await {
+            return Refusal::NotApplicable;
+        }
         decline_unshowable(handles, p, dir).await
     }
 
@@ -377,12 +390,11 @@ impl RequestKind for PermissionKind {
         // showing a card (mirrors OpenChamber's toggle). Resolves sub-task child
         // sessions up their parent chain so they inherit the parent's flag.
         //
-        // Auto-Accept is a policy about *showable* requests: `refuse` above has
-        // already declined a target the card cannot show in full, so a session
-        // that opted into approving without a card still never approves text
-        // nobody could review. That is deliberate (whole-branch re-review
-        // #883): the exception is named in the `/autoaccept` help and the user
-        // guide, so the toggle cannot silently cover an unseen target.
+        // Auto-Accept is a delegation of the decision, not a surface: it renders
+        // no card, so the card's completeness proof (`refuse` above) stands
+        // aside for these sessions. A target past the card budget is approved
+        // unseen, and the log line names its length — that record is what keeps
+        // the decision auditable without a card (#892).
         let auto = should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await;
         if !auto {
             return false;
@@ -394,12 +406,15 @@ impl RequestKind for PermissionKind {
             .reply_permission(&sid, &p.request_id, "once")
             .await
         {
-            Ok(()) => tracing::info!(
-                "Auto-accepted permission {} on session {} ({})",
-                p.request_id,
-                sid,
-                p.permission.as_deref().unwrap_or("?")
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    "Auto-accepted permission {} on session {} ({})",
+                    p.request_id,
+                    sid,
+                    p.permission.as_deref().unwrap_or("?")
+                );
+                log_unshowable_auto_accept(p, &sid);
+            }
             Err(e) => tracing::warn!("auto-accept {} on session {}: {}", p.request_id, sid, e),
         }
         true
@@ -532,7 +547,7 @@ impl RequestKind for PermissionKind {
             let mut r = result_card(
                 "✅ 已开启自动授权",
                 "blue",
-                "该会话后续权限请求将自动批准；卡片无法完整显示的仍会拒绝。",
+                "该会话后续权限请求将自动批准；卡片无法完整显示的目标也会批准（见日志）。",
             );
             r.toast = Some("已开启自动授权".to_string());
             settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
@@ -856,29 +871,10 @@ pub(crate) async fn approve_pending_for_session(
         if !session_belongs_to(sessions, backend, &sid, session_id, directory).await {
             continue;
         }
-        // The completeness proof comes first, like the sweep's `refuse`: a
-        // target the card cannot show in full is **declined**, never
-        // auto-approved unseen — `/autoaccept` is a policy about requests cola
-        // can show (whole-branch re-review #883).
-        if !p.targets_are_fully_shown() {
-            match backend
-                .clone()
-                .for_directory(directory)
-                .reply_permission(&sid, &p.request_id, "reject")
-                .await
-            {
-                Ok(()) => tracing::warn!(
-                    "auto-accept declined unshowable permission {} on session {sid}",
-                    p.request_id
-                ),
-                Err(crate::error::BridgeError::NotFound(_)) => {}
-                Err(e) => tracing::warn!(
-                    "auto-accept declining unshowable permission {} on session {sid} failed: {e}",
-                    p.request_id
-                ),
-            }
-            continue;
-        }
+        // Likewise, `refuse` stands aside for an auto-accept session, so the
+        // completeness proof must not reappear here: a target past the card
+        // budget is approved unseen (this path renders no card either), and
+        // `log_unshowable_auto_accept` records the length (#892).
         // Take the settlement claim BEFORE the reply lands: the request
         // leaves the server's pending list the moment it is applied, and a
         // sweep landing in that window would otherwise read the
@@ -905,6 +901,7 @@ pub(crate) async fn approve_pending_for_session(
                     sid,
                     p.permission.as_deref().unwrap_or("?")
                 );
+                log_unshowable_auto_accept(p, &sid);
                 approved.push(p.request_id.clone());
             }
             Err(e) => {
@@ -918,15 +915,45 @@ pub(crate) async fn approve_pending_for_session(
     approved
 }
 
+/// The record an Auto-Accept approval leaves when its target was past the card
+/// budget. Nothing was shown, so this line is the only trace of what the
+/// session approved unseen (#892): it names the request, the length that made
+/// it unshowable, and the target's first line (bounded, since the whole target
+/// is exactly what did not fit).
+fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest, sid: &str) {
+    if p.targets_are_fully_shown() {
+        return;
+    }
+    let longest = p
+        .patterns
+        .iter()
+        .map(|pattern| pattern.chars().count())
+        .max()
+        .unwrap_or(0);
+    let first_line = p
+        .patterns
+        .iter()
+        .max_by_key(|pattern| pattern.chars().count())
+        .map(|pattern| pattern.lines().next().unwrap_or(""))
+        .unwrap_or("");
+    tracing::warn!(
+        "auto-accept approved permission {} on session {sid} unseen: its target is {longest} \
+         characters, past the card's {} character budget; first line: {}",
+        p.request_id,
+        p.target_budget(),
+        truncate(first_line, 120)
+    );
+}
+
 /// Receipt for the Auto-Accept toggle: it names the MODE change, never the
 /// requests it resolved — naming a command made the line read as "only this
 /// command is now auto-approved". One per toggle, however many pending blocks
 /// it swallowed (the blocks are dismissed without lines of their own). Shared
-/// by the card button and the `/autoaccept on` command. It names the one
-/// exception: a permission whose target the card cannot show in full is
-/// declined, never auto-approved unseen.
+/// by the card button and the `/autoaccept on` command. It names the trade the
+/// mode accepts: a target the card cannot show in full is approved too, unseen
+/// (#892).
 pub(crate) const AUTOACCEPT_RECEIPT: &str =
-    "🔄 已开启自动授权：后续权限请求将自动批准（卡片无法完整显示的仍会拒绝）";
+    "🔄 已开启自动授权：后续权限请求将自动批准（卡片无法完整显示的也会批准）";
 
 /// The Interaction Receipt for a Session Snapshot's claimed block resolved by
 /// another client (#175, ADR-0038 rule 4): the same neutral line an inline
