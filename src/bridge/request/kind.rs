@@ -807,9 +807,9 @@ pub(crate) async fn set_auto_accept(
     // Persist the flag BEFORE approving the pending requests: a sweep landing
     // in the approval window must already read the session as auto-accept, or
     // its `refuse` declines an over-budget request this very call is about to
-    // approve (#892). A failed persist is logged and the approval still runs —
-    // the user asked for it — but then no sweep can see the flag, so nothing is
-    // silently approved *because* of a half-landed mode change.
+    // approve (#892). A persist that did not take effect — a store error, or
+    // the mapped entry vanishing between the walk and the write — approves
+    // nothing: the mode never changed.
     //
     // Resolve the SessionStore entry that owns the flag: `session_id`
     // itself, or its nearest ancestor (sub-task children are not in the
@@ -822,7 +822,16 @@ pub(crate) async fn set_auto_accept(
     .await;
     let persisted = match owner {
         Some(entry) => match sessions.update(&entry.session_id, |e| e.auto_accept = on).await {
-            Ok(_) => true,
+            // `Ok(None)` = the entry vanished between the walk and the write
+            // (a concurrent forget/unmap). Nothing was persisted.
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::warn!(
+                    "set_auto_accept: session {} disappeared before the flag was persisted",
+                    entry.session_id
+                );
+                false
+            }
             Err(e) => {
                 tracing::warn!("set_auto_accept: persist failed: {}", e);
                 false
