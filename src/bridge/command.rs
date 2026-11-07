@@ -3099,19 +3099,20 @@ async fn adopt_session(
     force: bool,
     force_hint: &str,
 ) -> crate::error::Result<()> {
-    // Idempotent: already the active session of this thread.
-    {
+    // Idempotent: already the active session of this thread. The reply still
+    // carries the ONE-line status summary (ADR-0100, #1004) — the same
+    // `adoption_line` the adoption itself uses — so re-running the command
+    // reports the Session's current state instead of a bare title.
+    let already_active = {
         let store = handles.flow.sessions.store.lock().await;
-        if let Some(e) = store.get_active(thread_key)
-            && e.session_id == info.id
-        {
-            handles
-                .flow
-                .platform
-                .reply_text(message_id, &format!("Already active: \"{}\".", info.title))
-                .await?;
-            return Ok(());
-        }
+        store
+            .get_active(thread_key)
+            .is_some_and(|e| e.session_id == info.id)
+    };
+    if already_active {
+        let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "接管", info).await;
+        handles.flow.platform.reply_text(message_id, &line).await?;
+        return Ok(());
     }
     // Mapped to another thread: reject unless --force.
     let owner = {
