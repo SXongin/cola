@@ -3081,6 +3081,21 @@ async fn adopt_session(
                 info.id
             );
         }
+        // The confirmation line already said the Session was taken over, so a
+        // silent error would leave the user believing a mapping that was never
+        // written. Say so in the chat (best effort), then still return the
+        // error for the caller's log.
+        let _ = handles
+            .flow
+            .platform
+            .reply_text(
+                message_id,
+                &format!(
+                    "⚠️ 会话 `{}` 接管失败：{}。原映射保持不变，可稍后重试。",
+                    info.title, e
+                ),
+            )
+            .await;
         return Err(e);
     }
     crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
