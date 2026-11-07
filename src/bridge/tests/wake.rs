@@ -4196,3 +4196,78 @@ async fn a_wake_does_not_replace_a_terminal_card_with_a_live_block() {
         "the permission is still answerable"
     );
 }
+
+/// A bare actionable `Error`/`Unreceived` card owns the only recovery control.
+/// The Wake's Fresh arm must leave it current: replacing it makes a Retry/
+/// 重新发起 click reach `claim_recovery` on a successor whose state no longer
+/// matches (it returns `None`), and a failed Wake send drops the successor
+/// without restoring this card (ADR-0100).
+#[tokio::test]
+async fn a_wake_does_not_replace_a_bare_actionable_terminal_card() {
+    for state in [CardState::Error, CardState::Unreceived] {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.fail_prompts(1, "simulated failure");
+        let (app, _platform) = build_app(cfg, backend).await;
+        seed_session(&app, "ses_test", "/work").await;
+
+        // A real failed Turn records the prompt and ends on an actionable card;
+        // the state loop below re-labels that same accumulator.
+        app.handle_message(incoming(
+            "msg_user".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        ))
+        .await;
+        let cards = app.cards_handle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if Turn::card_state(&cards, "ses_test").await == Some(CardState::Error) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the failed Turn ends on an Error card");
+        let id_before = Turn::card_message_id(&cards, "ses_test").await;
+        assert!(id_before.is_some(), "the recovery card was sent");
+        Turn::set_card_state(&cards, "ses_test", state.clone()).await;
+
+        let anchor = turn_anchor(3_000);
+        let facts = ContinuationFacts {
+            reply_to: Some("msg_user"),
+            chat_id: "chat_1",
+            subtitle: "test",
+            directory: "/work",
+            variant: None,
+        };
+        assert!(
+            Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts)
+                .await
+                .is_none(),
+            "{state:?}: a Wake must not replace a card that offers recovery"
+        );
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_test").await,
+            id_before,
+            "{state:?}: the actionable card stays current"
+        );
+        assert_eq!(
+            Turn::card_state(&cards, "ses_test").await,
+            Some(state.clone()),
+            "{state:?}: the state is untouched"
+        );
+        assert!(
+            Turn::claim_recovery(&cards, "ses_test", state.clone())
+                .await
+                .is_some(),
+            "{state:?}: the recovery control still claims"
+        );
+    }
+}
