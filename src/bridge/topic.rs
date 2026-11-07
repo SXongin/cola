@@ -227,7 +227,16 @@ async fn open_topic_inner(
             // topic has no prior mapping there, so the collect is normally a
             // no-op, but the operation stays the one way to change a thread's
             // Active Session (ADR-0059, spec #405).
-            handles.flow.activate(entry).await?;
+            //
+            // The adoption line is already IN this topic (it is the seed
+            // `open_cover_topic` posted), so a refused save must not leave the
+            // user reading a success line for a mapping that never landed.
+            // Say so in the topic, then still return the error: the caller
+            // logs it and no anchor/cover is recorded.
+            if let Err(e) = handles.flow.activate(entry).await {
+                report_topic_adoption_failure(&handles.flow.platform, &anchor, &session_id, &e).await;
+                return Err(e.into());
+            }
             record_cover_title(
                 &handles.flow.cards,
                 &session_id,
@@ -393,6 +402,26 @@ async fn open_cover_topic(
         TopicSeed::AdoptionLine(line) => platform.reply_in_thread(&root, &line).await?,
     };
     Ok((anchor, thread_id, root, cover_id))
+}
+
+/// Tell the new topic that an adoption's confirmation line was followed by a
+/// failed save (ADR-0016, ADR-0100): the line is posted before the mapping
+/// write, so a silent failure would leave the user believing the Session moved
+/// into a topic that has no mapping and no anchor. Best effort — the caller
+/// still returns the original error.
+async fn report_topic_adoption_failure(
+    platform: &Arc<dyn feishu::Platform>,
+    anchor: &str,
+    session_id: &str,
+    error: &BridgeError,
+) {
+    let notice = format!(
+        "⚠️ 会话 `{}` 接管未保存：{error}。原映射保持不变，可稍后重试。",
+        id_tail(session_id)
+    );
+    if let Err(e) = platform.reply_in_thread(anchor, &notice).await {
+        tracing::warn!("topic: could not report the failed adoption of session {session_id}: {e}");
+    }
 }
 
 /// ADR-0023: when the server's session title differs from the one shown on the

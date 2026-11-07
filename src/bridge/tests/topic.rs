@@ -1228,6 +1228,77 @@ async fn topic_adopt_opens_topic_around_existing_session() {
     assert!(app.sessions.lock().await.get_active(&lobby_key).is_none());
 }
 
+/// The adoption line is posted into the new topic before the mapping write.
+/// A refused save must therefore be reported IN that topic — never a silent
+/// error behind a success line — and the error still reaches the caller. The
+/// store keeps no mapping and claims no anchor, so a retry starts clean.
+#[tokio::test]
+async fn topic_adopt_whose_save_fails_reports_it_in_the_new_topic() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, platform) = build_app(cfg, backend).await;
+    let info = list_session("ses_foreign123abc", "重写登录模块", "/work/auth", 100);
+
+    // The confirmation line and cover are posted; the activation is the next
+    // store write and it is refused.
+    app.sessions.lock().await.fail_writes_after(0);
+    let result = crate::bridge::topic::open_topic(
+        &app.topic_handles(),
+        "chat_1",
+        "msg_topic_cmd",
+        crate::bridge::topic::TopicOpening::Adopt { info },
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "a refused activation must return the error to the caller"
+    );
+    {
+        let store = app.sessions.lock().await;
+        assert!(
+            store.entry_for_session("ses_foreign123abc").is_none(),
+            "the refused save maps nothing"
+        );
+        let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+        assert!(
+            store.get_active(&topic_key).is_none(),
+            "no anchor is claimed for a topic that was never mapped"
+        );
+    }
+
+    // The line is followed by a visible failure notice in the same topic.
+    let calls = platform.calls.lock().await.clone();
+    let line_at = calls
+        .iter()
+        .position(|call| {
+            matches!(
+                call,
+                PlatformCall::ReplyInThread { message_id, text, .. }
+                    if message_id == "msg_sent" && text.contains("已接管")
+            )
+        })
+        .expect("the adoption line is posted first");
+    let notice = calls
+        .iter()
+        .skip(line_at + 1)
+        .find_map(|call| match call {
+            PlatformCall::ReplyInThread { message_id, text, .. }
+                if message_id == "msg_topic_reply" && text.contains("接管未保存") =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a failure notice must follow the adoption line in the topic: {calls:?}"));
+    assert!(
+        notice.contains("原映射保持不变"),
+        "the notice names the consequence the atomic store guarantees: {notice}"
+    );
+}
+
 /// Re-mapping a session into a topic keeps its per-session overrides: the
 /// topic adopt rebuilds the entry, but auto-accept/model/variant belong to
 /// the session, not to the lobby mapping being left behind.
