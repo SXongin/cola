@@ -389,6 +389,9 @@ pub struct RecordingPlatform {
     /// When true, `reply_in_thread` fails (tests that a failed in-topic
     /// confirmation is propagated instead of adopting with no anchor).
     pub fail_reply_in_thread: bool,
+    /// The next N `reply_in_thread` calls fail, then the call succeeds — a
+    /// transient failure a test can retry past.
+    pub fail_reply_in_thread_count: std::sync::atomic::AtomicUsize,
     /// The next N `reply_card` calls fail (a CONTINUATION send that must be
     /// retried without duplicating receipts, while the loading card's own
     /// reply — if any — succeeds).
@@ -521,6 +524,7 @@ impl RecordingPlatform {
             fail_send_card: false,
             fail_reply_card: false,
             fail_reply_in_thread: false,
+            fail_reply_in_thread_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1109,7 +1113,15 @@ impl feishu::Platform for RecordingPlatform {
         message_id: &str,
         text: &str,
     ) -> crate::error::Result<(String, Option<String>)> {
-        if self.fail_reply_in_thread {
+        let transient = self
+            .fail_reply_in_thread_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if transient {
+            self.fail_reply_in_thread_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self.fail_reply_in_thread || transient {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated reply_in_thread failure".into(),
             ));

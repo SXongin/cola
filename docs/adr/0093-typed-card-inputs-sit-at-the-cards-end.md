@@ -83,9 +83,10 @@ the card's bottom:
 - Nothing here is observable in `cargo test` beyond element order. The layout
   assertions pin the structure; whether the keyboard jump is gone is a
   device observation, recorded on the issue.
-- The residual: a card that legitimately needs many folded panels, or several
-  pending blocks in one snapshot card, can still approach the threshold. The
-  fix is to keep the distance small, not to assume any single element is safe.
+- The residual: a card that legitimately needs many folded panels can still
+  approach the threshold. The old snapshot card's several-pending-block case is
+  retired with ADR-0100. The fix is to keep the distance small, not to assume
+  any single element is safe.
 - A device tap-through of a real four-question card (Android 14 / Feishu 8.4.9,
   2026-11-01, after the fix shipped) showed **no jump in normal use**. One case
   still jumps: the reader deliberately drags the box to the screen's very

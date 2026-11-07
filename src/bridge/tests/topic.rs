@@ -1878,6 +1878,112 @@ async fn a_failed_in_topic_confirmation_adopts_nothing() {
     );
 }
 
+/// A forced topic adoption is all-or-nothing: a transient in-topic
+/// confirmation failure leaves the previous owner's mapping (and waiting card)
+/// intact, and a retry succeeds.
+#[tokio::test]
+async fn a_failed_forced_topic_adoption_keeps_the_old_owner() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_foreign123abc",
+        "外部会话",
+        "/work/ext",
+        100,
+    )]);
+    let platform = RecordingPlatform::new();
+    platform
+        .fail_reply_in_thread_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+
+    let old_key = crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: old_key.clone(),
+            session_id: "ses_foreign123abc".into(),
+            directory: "/work/ext".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    let cards = app.cards_handle();
+    crate::bridge::turn::Turn::seed_card(&cards, "ses_foreign123abc", Some("om_waiting")).await;
+    crate::bridge::turn::Turn::set_card_state(
+        &cards,
+        "ses_foreign123abc",
+        crate::feishu::card::CardState::Waiting,
+    )
+    .await;
+
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
+    send_command_in(
+        &app,
+        "/switch ses_foreign123abc --force",
+        topic_key.clone(),
+        "msg_topic_cmd",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    {
+        let store = app.sessions.lock().await;
+        assert_eq!(
+            store
+                .get_active(&old_key)
+                .expect("the old owner keeps the mapping")
+                .session_id,
+            "ses_foreign123abc"
+        );
+        assert!(
+            store.get_active(&topic_key).is_none(),
+            "the failed force adoption writes no new entry"
+        );
+    }
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_waiting"
+        )),
+        "the old owner's waiting card is not collected: {calls:?}"
+    );
+
+    // The transient failure is gone: the retry adopts into the topic.
+    send_command_in(
+        &app,
+        "/switch ses_foreign123abc --force",
+        topic_key.clone(),
+        "msg_topic_cmd_2",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+    let store = app.sessions.lock().await;
+    assert_eq!(
+        store.get_active(&topic_key).expect("the retry adopts").session_id,
+        "ses_foreign123abc"
+    );
+    assert!(
+        store.get_active(&old_key).is_none(),
+        "the retry steals the mapping"
+    );
+    assert_eq!(
+        store.get_active(&topic_key).unwrap().topic_anchor.as_deref(),
+        Some("msg_topic_reply"),
+        "the retry's line is the topic anchor"
+    );
+}
+
 /// ADR-0023: a plain message in a cola-created topic carries `parent_id`
 /// pointing at the topic's own creation messages — the thread root (the
 /// user's `/topic` command) or the seed card (`topic_anchor`). Neither must

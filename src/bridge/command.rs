@@ -2993,43 +2993,39 @@ async fn adopt_session(
         let store = handles.flow.sessions.store.lock().await;
         store.thread_for_session(&info.id)
     };
-    if let Some(owner_key) = owner
-        && owner_key != *thread_key
+    let stealing = owner.as_ref().is_some_and(|owner_key| owner_key != thread_key);
+    if let Some(owner_key) = owner.as_ref()
+        && owner_key != thread_key
+        && !force
     {
-        if !force {
-            let chat_name = handles
-                .flow
-                .platform
-                .chat_name(&owner_key.chat_id)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_else(|| owner_key.chat_id.clone());
-            let where_flag = if owner_key.thread_id != owner_key.chat_id {
-                "话题"
-            } else {
-                "主对话"
-            };
-            handles.flow.platform
-                    .reply_text(
-                        message_id,
-                        &format!(
-                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `{} {} --force` 强行接管。",
-                            info.title,
-                            info.directory,
-                            chat_name,
-                            where_flag,
-                            owner_key.chat_id,
-                            force_hint,
-                            info.id
-                        ),
-                    )
-                    .await?;
-            return Ok(());
-        }
-        // --force: steal the mapping; the other thread becomes sessionless.
-        // The unmap collects the stolen Session's waiting card (ADR-0059,
-        // spec #405), so the other thread's waiting card never hangs.
-        handles.flow.unmap(&info.id).await?;
+        let chat_name = handles
+            .flow
+            .platform
+            .chat_name(&owner_key.chat_id)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| owner_key.chat_id.clone());
+        let where_flag = if owner_key.thread_id != owner_key.chat_id {
+            "话题"
+        } else {
+            "主对话"
+        };
+        handles.flow.platform
+                .reply_text(
+                    message_id,
+                    &format!(
+                        "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `{} {} --force` 强行接管。",
+                        info.title,
+                        info.directory,
+                        chat_name,
+                        where_flag,
+                        owner_key.chat_id,
+                        force_hint,
+                        info.id
+                    ),
+                )
+                .await?;
+        return Ok(());
     }
 
     // ADR-0100: the confirmation is ONE text line carrying the status summary
@@ -3038,14 +3034,26 @@ async fn adopt_session(
     // left to the ordinary sweep — nothing claims them here.
     let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "接管", info).await;
 
+    // Send the confirmation BEFORE any store mutation. A failed send then
+    // leaves the previous owner's mapping (and its waiting card) intact, so
+    // the user can simply retry; the old ordering unmapped first and could
+    // strand the Session when a topic send failed.
+    //
+    // In a topic the line doubles as the fallback-card anchor (ADR-0023): its
+    // message id becomes `topic_anchor`, so permission/question cards land
+    // inside the topic.
     let anchor = if kind == ConversationKind::Topic {
-        // The line is sent inside the topic and doubles as the fallback-card
-        // anchor (ADR-0023): permission/question cards reply to it and land
-        // inside the topic. Its message id is persisted as `topic_anchor`. A
-        // failed send is PROPAGATED, never swallowed: carrying on would adopt
-        // with no line and a `None` anchor, so later cards could not land in
-        // the topic.
         Some(handles.flow.platform.reply_in_thread(message_id, &line).await?.0)
+    } else {
+        handles.flow.platform.reply_text(message_id, &line).await?;
+        None
+    };
+
+    // --force: steal the mapping only after the confirmation landed. The unmap
+    // collects the stolen Session's waiting card (ADR-0059, spec #405), so the
+    // other thread's waiting card never hangs.
+    let removed = if stealing {
+        handles.flow.unmap(&info.id).await?
     } else {
         None
     };
@@ -3059,15 +3067,23 @@ async fn adopt_session(
     };
     let mut entry = SessionEntry::new(thread_key.clone(), info.id.clone(), info.directory.clone());
     entry.agent = info.agent.clone();
-    entry.topic_anchor = anchor.clone();
+    entry.topic_anchor = anchor;
     entry.topic_root = pending_topic_root;
-    handles.flow.activate(entry).await?;
-    crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
-    // In a topic the line was already sent inside it (the in-thread send
-    // above); don't reply twice.
-    if kind != ConversationKind::Topic {
-        handles.flow.platform.reply_text(message_id, &line).await?;
+    if let Err(e) = handles.flow.activate(entry).await {
+        // A later store step failed after the steal: put the removed mapping
+        // back so the Session is never mapped nowhere. The old waiting card
+        // was already collected by `unmap`; it is deliberately not re-collected.
+        if let Some(removed) = removed
+            && let Err(restore) = handles.flow.activate(removed).await
+        {
+            tracing::error!(
+                "adoption: session {} could not be restored to its previous thread: {restore}",
+                info.id
+            );
+        }
+        return Err(e);
     }
+    crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
     Ok(())
 }
 
