@@ -24,7 +24,7 @@ use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
     vanished_receipt,
 };
-use super::kind::{PendingRequest, Refusal, RequestKind, permission_target};
+use super::kind::{PendingRequest, Prepared, Refusal, RequestKind, permission_target};
 
 /// One question request's captured reply inputs (spec #364, S6): the request's
 /// fields and the index-aligned per-field answer slots (`answers[i]` is `None`
@@ -1227,11 +1227,18 @@ impl RequestFlow {
             seen.insert(req.id().to_string());
             return false;
         }
-        // Kind-specific pre-card handling (auto-accept / remember). true →
-        // handled, no card needed.
-        if self.kind.prepare(self, handles, req, dir).await {
-            seen.insert(req.id().to_string());
-            return true;
+        // Kind-specific pre-card handling (auto-accept / remember). `Handled`
+        // → no card needed; `Retry` → the handling failed and the request is
+        // still pending, so it must stay unmarked and the next sweep retries.
+        // Only a handled request joins `seen`; a retried one must never be
+        // retired from the sweep while no card exists.
+        match self.kind.prepare(self, handles, req, dir).await {
+            Prepared::Handled => {
+                seen.insert(req.id().to_string());
+                return true;
+            }
+            Prepared::Retry => return false,
+            Prepared::NotHandled => {}
         }
         // One-card-per-turn: surface the request INLINE on the streaming card
         // of the session that owns it — the session itself, or (sub-task
