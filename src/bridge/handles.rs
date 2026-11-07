@@ -627,17 +627,25 @@ impl SessionsHandle {
     }
 
     /// Persist `entry` as its thread's active session and drop the session-list
-    /// cache: creating or adopting a session changes what `/switch`
-    /// should offer. The cache is dropped even when the save fails, because the
+    /// cache: creating or adopting a session changes what `/switch` should
+    /// offer. The cache is dropped even when the save fails, because the
     /// in-memory mapping already changed.
+    ///
+    /// Reads the card-collect displacements in the same store critical section
+    /// as the write (see [`SessionStore::activate_with_displacements`]), so a
+    /// concurrent switch cannot slip its own activation between the read and
+    /// the write.
     ///
     /// **Raw mutator — module-private on purpose.** Every activation a caller
     /// outside this module performs goes through [`FlowHandles::activate`],
     /// which collects the displaced Session's waiting card first (ADR-0059,
     /// spec #405); keeping this private is what makes that collect an
     /// invariant instead of a rule each call site must remember.
-    pub(in crate::bridge::handles) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
-        let result = self.store.lock().await.activate(entry);
+    pub(in crate::bridge::handles) async fn activate_with_displacements(
+        &self,
+        entry: SessionEntry,
+    ) -> crate::error::Result<(Option<String>, bool)> {
+        let result = self.store.lock().await.activate_with_displacements(entry);
         *self.cache.lock().await = None;
         result
     }
@@ -2830,26 +2838,12 @@ impl FlowHandles {
     /// reads every mapped session.
     pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
         let session_id = entry.session_id.clone();
-        // Both displacement facts are read in ONE store snapshot: `activate`
-        // below is a separate (atomic) write, but two concurrent switches must
-        // never read a torn pair — one seeing the other's already-displaced
-        // session as still active (and its own target as not stolen) would skip
-        // a card collect for a Session neither switch is showing any more.
-        let (displaced, stolen) = {
-            let store = self.sessions.store.lock().await;
-            let displaced = store
-                .get_active(&entry.thread_key)
-                .filter(|previous| previous.session_id != entry.session_id)
-                .map(|previous| previous.session_id.clone());
-            // `activate` replaces an existing mapping of the same session id in
-            // the same write, so a force-adopt from another thread steals it
-            // atomically.
-            let stolen = store
-                .thread_for_session(&entry.session_id)
-                .is_some_and(|owner| owner != entry.thread_key);
-            (displaced, stolen)
-        };
-        self.sessions.activate(entry).await?;
+        // Both displacement facts and the atomic activation share ONE store
+        // critical section: a switch cannot read the previous Active Session,
+        // lose the lock to another switch, and then collect a card the other
+        // switch already superseded. The activation's save stays atomic, so a
+        // refused write still leaves both mappings and their cards untouched.
+        let (displaced, stolen) = self.sessions.activate_with_displacements(entry).await?;
         if let Some(previous) = displaced {
             Turn::collect_waiting(&self.cards, &previous, CollectReason::SwitchedAway).await;
             self.release_mirror(&previous).await;

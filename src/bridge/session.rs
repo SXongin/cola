@@ -644,6 +644,33 @@ impl SessionStore {
         Ok(())
     }
 
+    /// [`Self::activate`] plus the card-collect displacements read in the SAME
+    /// critical section: the thread's previous Active Session (when it is a
+    /// different Session) and whether the promoted Session was mapped to
+    /// another thread. Callers hold the store lock across both reads and the
+    /// write, so two concurrent switches cannot both see the same displaced
+    /// Session while the other's activation lands in between — which would
+    /// leave the Session the second switch actually displaced uncollected.
+    ///
+    /// Returns `(displaced, stolen)`; both are `None`/`false` for a
+    /// re-activation of the already-active Session. A refused save returns the
+    /// error and promotes nothing (the atomicity [`Self::activate`] documents).
+    pub fn activate_with_displacements(
+        &mut self,
+        entry: SessionEntry,
+    ) -> crate::error::Result<(Option<String>, bool)> {
+        let session_id = entry.session_id.clone();
+        let displaced = self
+            .get_active(&entry.thread_key)
+            .filter(|previous| previous.session_id != session_id)
+            .map(|previous| previous.session_id.clone());
+        let stolen = self
+            .thread_for_session(&session_id)
+            .is_some_and(|owner| owner != entry.thread_key);
+        self.activate(entry)?;
+        Ok((displaced, stolen))
+    }
+
     /// Promote the session a **materialisation** created (issue #910), scoped to
     /// its claim's generation. Only the creation that still owns the claim may
     /// promote (and resolve the pending): after a `/switch forget`, a `/new` or a
@@ -1844,6 +1871,42 @@ mod tests {
         let reloaded = SessionStore::new(path).unwrap();
         assert!(reloaded.get_active(&key_a).is_none());
         assert!(reloaded.get_active(&key_b).is_some());
+    }
+
+    /// The displacements a switch collects are read in the SAME critical
+    /// section as the atomic activation: the target thread's previous Active
+    /// Session and the promoted Session's previous owner. Re-activating the
+    /// already-active Session displaces nothing.
+    #[test]
+    fn activate_with_displacements_reads_and_writes_together() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let other = ThreadKey::new("chat2".into(), "chat2".into());
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+        store
+            .activate(make_entry("chat2", "chat2", "ses_steal", "/tmp/steal"))
+            .unwrap();
+
+        let (displaced, stolen) = store
+            .activate_with_displacements(make_entry("chat1", "root1", "ses_steal", "/tmp/steal"))
+            .unwrap();
+        assert_eq!(displaced.as_deref(), Some("ses_old"));
+        assert!(stolen, "the session was mapped to another thread");
+        assert_eq!(
+            store.get_active(&key).map(|e| e.session_id.as_str()),
+            Some("ses_steal")
+        );
+        assert!(store.get_active(&other).is_none());
+
+        let (displaced, stolen) = store
+            .activate_with_displacements(make_entry("chat1", "root1", "ses_steal", "/tmp/steal"))
+            .unwrap();
+        assert_eq!(displaced, None);
+        assert!(!stolen);
     }
 
     #[test]
