@@ -150,18 +150,29 @@ where
         .flatten()
 }
 
+/// Why [`walk_parent_chain_result`] could not finish.
+#[derive(Debug)]
+pub(crate) enum WalkFailure {
+    /// A `session_info` hop failed; retrying later can succeed.
+    Transient(crate::error::BridgeError),
+    /// The chain is deeper than the 8-hop cap: its end was never reached.
+    /// Retrying cannot fix this — it is a structural bound, not a failure.
+    Capped,
+}
+
 /// [`walk_parent_chain`] that tells "the chain ended without a match" from
-/// "the walk could not finish". A caller that must not mistake an
-/// indeterminate answer for a definite one uses this: `Ok(None)` means the
-/// chain was walked to its end (or no directory was given), `Err` means a hop
-/// failed. The auto-accept flag read is the case that needs it — "unknown" must
-/// retry, never read as "off" and decline a request for good (#892).
+/// "the walk could not finish", and tells a transient hop failure from the
+/// structural cap. A caller that must not mistake an indeterminate answer for a
+/// definite one uses this: `Ok(None)` means the chain was walked to its end (or
+/// no directory was given). The auto-accept flag read is the case that needs it
+/// — "unknown" must retry, never read as "off" and decline a request for good
+/// (#892) — while the cap must not retry forever.
 pub(crate) async fn walk_parent_chain_result<F, Fut, T>(
     backend: &Arc<dyn crate::backend::Backend>,
     start: &str,
     directory: Option<&str>,
     mut predicate: F,
-) -> crate::error::Result<Option<T>>
+) -> std::result::Result<Option<T>, WalkFailure>
 where
     F: FnMut(&str) -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
@@ -174,18 +185,18 @@ where
         let Some(dir) = directory else {
             return Ok(None);
         };
-        let info = backend.clone().for_directory(dir).session_info(&current).await?;
+        let info = backend
+            .clone()
+            .for_directory(dir)
+            .session_info(&current)
+            .await
+            .map_err(WalkFailure::Transient)?;
         let Some(parent) = info.parent_id.filter(|p| p != &current) else {
             return Ok(None);
         };
         current = parent;
     }
-    // The 8-hop cap is a safety bound, not a definite "no ancestor matched":
-    // reporting a match-less end here would read as "off" and decline a
-    // request for good. Unknown is the honest answer (#892).
-    Err(crate::error::BridgeError::OpenCode(
-        "parent chain exceeded the 8-hop cap".into(),
-    ))
+    Err(WalkFailure::Capped)
 }
 
 /// Resolve a `message_id` that lives INSIDE the given topic, so a card can
@@ -697,8 +708,8 @@ mod tests {
         let found =
             walk_parent_chain_result(&core.client, "s0", Some("/w"), |_| async move { None::<String> }).await;
         assert!(
-            found.is_err(),
-            "exhausting the cap must not read as a completed walk: {found:?}"
+            matches!(found, Err(WalkFailure::Capped)),
+            "exhausting the cap must report the structural bound, not a completed walk: {found:?}"
         );
     }
 

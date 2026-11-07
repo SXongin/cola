@@ -2479,6 +2479,49 @@ async fn autoaccept_on_approves_an_already_pending_unshowable_permission() {
     );
 }
 
+/// The `/autoaccept on` command persists before approving too: an unwritable
+/// store must approve nothing and leave the flag (and memory) off.
+#[tokio::test]
+async fn autoaccept_on_with_an_unwritable_store_approves_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    app.sessions.lock().await.fail_writes_after(0);
+    send_command(&app, "/autoaccept on", "msg_cmd").await;
+
+    assert!(
+        replies.lock().await.is_empty(),
+        "an unwritable flag approves nothing"
+    );
+    assert!(
+        !app.sessions
+            .lock()
+            .await
+            .entry_for_session("ses_test")
+            .unwrap()
+            .auto_accept,
+        "the failed write leaves memory off"
+    );
+}
+
 /// #892: an Auto-Accept whose reply FAILS must stay retryable. `prepare` runs
 /// after the sweep inserted the id into `seen`, so returning "handled" on the
 /// error retired a still-pending request with no card: invisible and
@@ -2712,8 +2755,12 @@ async fn a_permission_toggle_that_cannot_persist_claims_nothing() {
 
     assert_eq!(
         result.toast.as_deref(),
-        Some("保存失败，请重试"),
+        Some("自动授权状态保存失败，请重试。"),
         "the failure is reported, not sold as success"
+    );
+    assert!(
+        result.card.is_none(),
+        "the original card must survive: a buttonless result would strand the request"
     );
     assert!(
         perm_calls.lock().await.is_empty(),
@@ -2784,7 +2831,7 @@ async fn a_permission_toggle_whose_flag_write_fails_approves_nothing() {
     });
     let result = app.host_action(value).await.expect("failure result card");
 
-    assert_eq!(result.toast.as_deref(), Some("保存失败，请重试"));
+    assert_eq!(result.toast.as_deref(), Some("自动授权状态保存失败，请重试。"));
     assert!(
         perm_calls.lock().await.is_empty(),
         "an unwritable flag approves nothing"
