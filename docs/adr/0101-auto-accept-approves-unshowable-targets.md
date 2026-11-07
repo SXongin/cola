@@ -2,12 +2,15 @@
 
 ## Context
 
-A permission request whose target is longer than the card's display budget
-(`PERMISSION_COMMAND_MAX_CHARS` = 1000 for a command, `PERMISSION_PATTERN_MAX_CHARS`
-= 150 otherwise) cannot be rendered in full on the card. Since #883 the bridge
-refuses such a request **before any surface**: `PermissionKind::refuse` declines
-it with `reject` and posts a card that explains why. The rule exists so no
-button can approve text the card clipped.
+A permission request whose card cannot be rendered in full — its targets summed
+past the display budget, or the rendered body past the measured single-element
+ceiling — cannot be approved safely. (When this decision was recorded the two
+budgets were per-command and per-pattern constants; #1011 replaced them with
+`PERMISSION_TARGET_MAX_CHARS` / `PERMISSION_BODY_MAX_CHARS`, and moved the body
+out of the button callback.) Since #883 the bridge refuses such a request
+**before any surface**: `PermissionKind::refuse` declines it with `reject` and
+posts a card that explains why. The rule exists so no button can approve text
+the card clipped.
 
 The rule was extended to Auto-Accept as well: `approve_pending_for_session` and
 the sweep's `refuse` declined over-budget targets even for a session that had
@@ -54,8 +57,9 @@ decisions. It stands aside wherever no card is rendered:
   — a structural bound, not a failed hop — so it falls back to the interactive
   rule: a showable target surfaces, an unshowable one declines (retrying a
   permanent cap would hang the turn forever).
-- Every such approval is recorded at INFO with the request id, the target's
-  length, the budget it crossed, and the target's first line (bounded). With no
+- Every such approval is recorded at INFO with the request id, the summed target
+  length, the rendered content length, the budget it crossed, and the target's
+  first line (bounded). With no
   card, that log line is the audit record of what the session approved unseen.
   INFO is what ADR-0048 assigns an auto-accepted request; the "unseen" wording
   distinguishes this case. The approval pass takes its own request span, so the
@@ -95,8 +99,10 @@ decisions. It stands aside wherever no card is rendered:
   (`NotFound`) — the long command is lost. The window is one list-to-reply round
   trip. Closing it needs a serialization between an enable path and the sweep,
   which this ADR does not take on.
-- The card's budgets themselves are untouched. The reason they are small is the
-  card's wire shape — every button echoes the body, so it appears six times in
-  the card's JSON — and that is a separate, interactive-surface problem. Moving
-  the body out of the button callback (the click already re-reads the request
-  from the server) is the recorded next lever, not part of this decision.
+- The card's budgets were later changed by #1011, the lever this decision named:
+  every button no longer echoes the body (the click re-reads the request from
+  the server), the per-command and per-pattern budgets collapsed into one summed
+  `PERMISSION_TARGET_MAX_CHARS` (3,000), and the completeness proof now also
+  charges the rendered body against `PERMISSION_BODY_MAX_CHARS` (the measured
+  single-element ceiling). This ADR's decision — the proof guards only surfaces
+  that render a card — is unchanged; only the budget the proof applies moved.

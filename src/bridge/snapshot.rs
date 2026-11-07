@@ -99,7 +99,10 @@ pub(crate) async fn gather_snapshot(
     // reason card.
     let pending: Vec<crate::bridge::request::kind::PendingRequest> = permissions
         .into_iter()
-        .filter(|p| p.session_id.as_deref() == Some(session_id) && p.targets_are_fully_shown())
+        .filter(|p| {
+            p.session_id.as_deref() == Some(session_id)
+                && crate::bridge::request::kind::permission_fits_card(p)
+        })
         .map(crate::bridge::request::kind::PendingRequest::Permission)
         .chain(
             questions

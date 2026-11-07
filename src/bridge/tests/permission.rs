@@ -256,8 +256,58 @@ async fn a_reject_result_card_names_the_callback_label_and_ignores_a_stale_body(
         "the result names the callback label: {text}"
     );
     assert!(
+        text.contains("ls -la") && text.contains("执行 Shell 命令"),
+        "the result names the standalone card's summary: {text}"
+    );
+    assert!(
         !text.contains("STALE CALLBACK BODY"),
         "a callback body from an older build is ignored: {text}"
+    );
+}
+
+/// An allow click whose request is no longer in the pending list (the server
+/// raced past it) still replies, and the result body comes from the card's
+/// recorded summary rather than a `permission:` placeholder.
+#[tokio::test]
+async fn an_allow_click_without_a_pending_request_uses_the_recorded_summary() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // Nothing pending on the server: the verification read finds no request.
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+    app.permission.sent_cards.lock().await.insert(
+        "per_1".into(),
+        crate::bridge::request::flow::SentCard {
+            message_id: "om_card".into(),
+            summary: "⚡ **执行 Shell 命令**\n- `ls -la`".into(),
+            directory: "/work".into(),
+            session_id: "ses_1".into(),
+        },
+    );
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": "om_card",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+        }))
+        .await
+        .expect("a card-action result");
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains("ls -la") && text.contains("执行 Shell 命令"),
+        "the result names the summary the card showed: {text}"
+    );
+    assert!(
+        !text.contains("Permission: once"),
+        "the placeholder never appears: {text}"
     );
 }
 
@@ -2371,6 +2421,59 @@ async fn an_over_budget_permission_is_declined_and_never_offered() {
     );
 }
 
+/// The refusal diagnostic measures the **sum** of the targets, matching the
+/// proof: two patterns that each fit are still declined, and the log names the
+/// summed length rather than the longest one.
+#[tokio::test]
+async fn an_over_summed_permission_is_declined_and_the_log_names_the_total() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let pattern = "x".repeat(1_600);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![pattern.clone(), pattern],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let mut seen = std::collections::HashSet::new();
+    let (_, logs) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the summed target proof declines before any surface"
+    );
+    let line = assert_line_level(&logs, "declined permission per_long", "WARN");
+    assert!(
+        line.contains("targets total 3200 characters"),
+        "the diagnostic names the summed target length: {line}"
+    );
+    assert!(
+        line.contains("past the card's 3000 character budget"),
+        "and the target budget it crossed: {line}"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards
+            .iter()
+            .any(|card| card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
+        "the chat gets the reason card"
+    );
+}
+
 /// Whole-branch re-review #883: an over-budget permission the flow could not
 /// decline (a failed reply) must not be reported as handled. It stays pending
 /// and unmarked, nothing is posted for it, and the next sweep retries — a
@@ -2515,7 +2618,7 @@ async fn auto_accept_approves_an_unshowable_permission() {
     // length, and the budget it crossed (ADR-0048: auto-accepted is INFO).
     let line = assert_line_level(&logs, "approved permission per_long", "INFO");
     assert!(
-        line.contains("its target is 3005 characters, past the card's 3000 character budget"),
+        line.contains("(targets total 3005), past the card's 3000 character budget"),
         "the unseen approval names the numbers it crossed: {line}"
     );
     let expected_first_line = format!("first line: echo {}…", "x".repeat(115));
@@ -2563,7 +2666,7 @@ async fn autoaccept_on_approves_an_already_pending_unshowable_permission() {
     );
     let line = assert_line_level(&logs, "approved permission per_long", "INFO");
     assert!(
-        line.contains("its target is 3005 characters, past the card's 3000 character budget"),
+        line.contains("(targets total 3005), past the card's 3000 character budget"),
         "the toggle path leaves the same audit record: {line}"
     );
 }

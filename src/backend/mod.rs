@@ -28,7 +28,7 @@ pub mod types;
 
 pub(crate) use lifecycle::wait_for_server_ready;
 pub use lifecycle::{AttachOutcome, EnsureAttached, RestartOutcome, ServerLifecycle};
-pub use types::PERMISSION_TARGET_MAX_CHARS;
+pub use types::{PERMISSION_BODY_MAX_CHARS, PERMISSION_TARGET_MAX_CHARS};
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.

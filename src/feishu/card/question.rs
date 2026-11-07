@@ -79,9 +79,9 @@ pub fn permission_buttons(
 
 /// Build the interactive permission card (JSON 2.0). Buttons sit directly in
 /// `body.elements` — the v1 `action` container is gone in schema 2.0. Each
-/// button carries the request id, session id, owning directory and a
-/// description so the card callback (`action: "perm"`) can route the reply
-/// back to the right instance and render a result card.
+/// button carries the request id, session id and owning directory so the card
+/// callback (`action: "perm"`) can route the reply back to the right instance;
+/// the body is rendered once above the controls, never echoed into them.
 pub fn build_permission_card(
     session_id: &str,
     request_id: &str,
@@ -132,9 +132,8 @@ fn permission_button_count(always_supported: bool) -> usize {
 /// body apply, and it expands `<` to `&#60;` (five bytes for one), so a
 /// 150-char reason of `<` adds 600 bytes to the element that a raw-length
 /// estimate would miss. The result is then charged at its JSON-escaped length
-/// ([`json_escaped_len`]). The `BUTTON_OVERHEAD` margin also absorbs the
-/// fenced-fallback wrapper (a card whose content Feishu rejected renders the
-/// body verbatim inside one fence instead of cleaning it).
+/// ([`json_escaped_len`]), taking the larger of the cleaned and fenced element
+/// so the content-rejection fallback is covered too.
 pub(crate) fn permission_block_estimate(
     body: &str,
     always_supported: bool,
@@ -147,7 +146,7 @@ pub(crate) fn permission_block_estimate(
     const BUTTON_OVERHEAD: usize = 360;
     // The element is rendered either cleaned (normal) or fenced (the card's
     // content-rejection fallback, which wraps the body in a fence sized to its
-    // longest backtick run — a 1,000-backtick command gains ~2 KB). Charge the
+    // longest backtick run — a 3,000-backtick command gains ~6 KB). Charge the
     // larger of the two so neither path can outgrow the reserve.
     let cleaned = json_escaped_len(&CardMarkdown::new().element(body));
     let fenced = json_escaped_len(body) + crate::feishu::card::fenced_block_overhead(body);
@@ -248,7 +247,7 @@ pub(crate) const UNSHOWABLE_PERMISSION_HEADER: &str = "🔐 权限请求已自�
 /// the card below renders the same text, so the two never disagree.
 pub(crate) fn unshowable_permission_note(budget: usize) -> String {
     format!(
-        "该权限请求的目标超过 **{budget}** 字符，卡片无法完整显示。为了不让你批准只看到一部分的内容，\
+        "该权限请求在卡片上需要显示的内容超过 **{budget}** 字符，卡片无法完整显示。为了不让你批准只看到一部分的内容，\
          cola 已自动拒绝，该请求在服务端已结清——其他客户端也无法再批准。\
          请让 AI 把这条操作拆成更短的步骤后重试；或先开启自动授权（`/autoaccept on`）再让它执行，\
          自动授权不需要逐条查看。"
@@ -1771,6 +1770,27 @@ mod tests {
         );
     }
 
+    /// The JSON worst case the body ceiling names: a body at
+    /// [`crate::backend::types::PERMISSION_BODY_MAX_CHARS`] characters where
+    /// every character is outside a code span, so the sanitizer expands each
+    /// `<` to `&#60;` (five bytes). The card still serializes under its own
+    /// budget.
+    #[test]
+    fn a_permission_card_at_the_angle_expansion_worst_case_fits_the_card_budget() {
+        let body = "<".repeat(crate::backend::types::PERMISSION_BODY_MAX_CHARS);
+        let card = build_permission_card("ses_abc", "n:1", &body, "/tmp/proj", true);
+        let len = card.to_string().len();
+        assert!(
+            len <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the `<`-expansion worst case is {len} bytes, over the {} budget",
+            crate::feishu::card::MAX_CARD_JSON_CHARS
+        );
+        assert!(
+            len >= 15_000,
+            "the sanitized ceiling's five-byte case is ~15 KB, got {len}"
+        );
+    }
+
     /// The block estimate the streaming card's split reserves must be an upper
     /// bound on what the block's elements actually serialize to — otherwise a
     /// near-full card would still append it past Feishu's limit. The routing
@@ -1779,8 +1799,8 @@ mod tests {
     fn the_permission_block_estimate_covers_the_rendered_block() {
         let long_directory = format!("/work/{}", "a-project-directory/".repeat(12));
         // A 150-character `<` reason: `CardMarkdown::clean` expands each `<` to
-        // `&#60;` (5 bytes), so a raw-length estimate under-counts every copy by
-        // 600 bytes — the case the cleaning step in the estimate exists for.
+        // `&#60;` (5 bytes), so a raw-length estimate under-counts the element
+        // by 600 bytes — the case the cleaning step in the estimate exists for.
         let angle_reason = format!(
             "⚡ **执行 Shell 命令**\n**原因**: {}\n**对象**:\n- `ls`\n\nAI 想要执行这个操作，是否允许？",
             "<".repeat(150)

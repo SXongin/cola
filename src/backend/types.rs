@@ -682,28 +682,51 @@ impl SessionStatus {
 }
 
 /// The character budget for a permission request's rendered targets — the ONE
-/// display budget, shared by every action.
+/// target-text budget, shared by every action.
 ///
 /// The card renders every target of a request in one markdown element, so the
 /// budget is charged against the **sum** of their character counts
 /// ([`PermissionRequest::targets_are_fully_shown`]), never against one target
-/// at a time. 3,000 is derived from two measured ceilings:
+/// at a time. 3,000 is a readability and wire-cost budget measured against the
+/// platform's behaviour:
 ///
 /// - the platform's single markdown element renders 8,000 ASCII / 3,060 CJK
 ///   characters fully (`docs/research/feishu-rich-surfaces/
-///   r1-display-surface-inventory.md`), so a script-independent budget takes
-///   the smaller number and rounds down;
-/// - the card's JSON worst case is `<` → `&#60;` at five bytes per character,
-///   so 3,000 CJK characters of target text is ~15 KB; the fenced fallback and
-///   the card's chrome still stay inside
-///   [`crate::feishu::card::MAX_CARD_JSON_CHARS`].
+///   r1-display-surface-inventory.md`), so the target budget takes the smaller
+///   number and rounds down, leaving a small margin;
+/// - a 3,000-character CJK target is ~9 KB of JSON; the body is measured
+///   **after** the card sanitizer, where a character outside a code span can
+///   cost five bytes (`<` → `&#60;`), so the [`PERMISSION_BODY_MAX_CHARS`]
+///   ceiling is at most ~15 KB. The fenced fallback and card chrome still stay
+///   inside [`crate::feishu::card::MAX_CARD_JSON_CHARS`].
 ///
-/// A request must never be offered for approval unless its targets fit:
-/// [`PermissionRequest::targets_are_fully_shown`] is the proof. An interactive
-/// surface declines what fails it with a named reason card rather than showing
-/// part of what a button would approve; an Auto-Accept session renders no card
-/// and approves the request unseen, logging its length (ADR-0101).
+/// The targets are only part of the element: the renderer also adds a header,
+/// reason, metadata lines and a footer. The card proof therefore charges those
+/// too, against [`PERMISSION_BODY_MAX_CHARS`] — see
+/// [`PermissionRequest::fits_rendered_body`].
+///
+/// A request must never be offered for approval unless both bounds fit. An
+/// interactive surface declines what fails them with a named reason card rather
+/// than showing part of what a button would approve; an Auto-Accept session
+/// renders no card and approves the request unseen, logging its length
+/// (ADR-0101).
 pub const PERMISSION_TARGET_MAX_CHARS: usize = 3000;
+
+/// The character ceiling for the WHOLE rendered permission body — targets plus
+/// the renderer's scaffolding — as one markdown element.
+///
+/// The platform documents no per-element text cap, and cola's own measurement
+/// is that a single markdown element of 8,000 ASCII / 3,060 CJK characters
+/// renders fully. A CJK glyph is the widest glyph, so a body of at most 3,060
+/// **characters** (whatever the script) stays inside both measured points.
+/// [`PERMISSION_TARGET_MAX_CHARS`] bounds the target text alone; this ceiling is
+/// what leaves room for the header, reason, metadata lines and footer the
+/// renderer adds around it.
+///
+/// A diff body (`edit`/`patch`/`apply_patch`) is exempt: it keeps its own
+/// escaped-byte cap and explicit truncation note (#792/#794), which the pattern
+/// proof does not cover.
+pub const PERMISSION_BODY_MAX_CHARS: usize = 3060;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PermissionRequest {
@@ -734,19 +757,15 @@ fn always_supported_default() -> bool {
 }
 
 impl PermissionRequest {
-    /// The character budget the request's rendered targets share (see
-    /// [`PERMISSION_TARGET_MAX_CHARS`]).
-    pub fn target_budget(&self) -> usize {
-        PERMISSION_TARGET_MAX_CHARS
-    }
-
     /// Whether the card renders **every** target in full within
     /// [`PERMISSION_TARGET_MAX_CHARS`].
     ///
     /// The budget is charged against the **sum** of every target's character
     /// count, because the card renders them all in one element: two 1,500
     /// character patterns are as long as one 3,000 character pattern, and the
-    /// element sees both the same way.
+    /// element sees both the same way. This is the target-text half of the card
+    /// proof; [`Self::fits_rendered_body`] adds the scaffolding the renderer
+    /// puts around them.
     ///
     /// `false` means the card would have to clip something, so the request must
     /// never be offered for **approval on a card**: the buttons approve what
@@ -757,12 +776,37 @@ impl PermissionRequest {
     /// card; it approves the request unseen and records its length (ADR-0101),
     /// so this proof has nothing to guard there.
     pub fn targets_are_fully_shown(&self) -> bool {
-        self.total_target_len() <= self.target_budget()
+        self.total_target_len() <= PERMISSION_TARGET_MAX_CHARS
     }
 
-    /// The longest target by character count, if the request carries any. One
-    /// definition for "what the card would clip": the Auto-Accept audit line
-    /// and the refusal's diagnostic read it.
+    /// Whether the card can render the request in full: the targets fit their
+    /// summed budget **and** the whole rendered body fits the measured
+    /// single-element ceiling ([`PERMISSION_BODY_MAX_CHARS`]).
+    ///
+    /// `rendered_body_chars` is the renderer's own output — `describe_permission`
+    /// after the card's markdown sanitizer — so the proof and the rendered
+    /// element cannot disagree about what "shown in full" means. A diff body is
+    /// exempt from the body ceiling: its own escaped-byte cap and truncation
+    /// note bound it instead (#792/#794).
+    pub fn fits_rendered_body(&self, rendered_body_chars: usize) -> bool {
+        self.targets_are_fully_shown()
+            && (self.body_has_own_cap() || rendered_body_chars <= PERMISSION_BODY_MAX_CHARS)
+    }
+
+    /// Whether the rendered body carries its own size cap — a diff, which is
+    /// exempt from [`PERMISSION_BODY_MAX_CHARS`] (#792/#794).
+    pub fn body_has_own_cap(&self) -> bool {
+        Self::renders_diff(self.permission.as_deref().unwrap_or_default())
+    }
+
+    /// Whether `action` renders a diff.
+    fn renders_diff(action: &str) -> bool {
+        matches!(action, "edit" | "patch" | "apply_patch")
+    }
+
+    /// The longest target by character count, if the request carries any. Used
+    /// for the Auto-Accept audit line's bounded first-line excerpt, never for
+    /// the display proof (which is the summed length).
     pub fn longest_target(&self) -> Option<&str> {
         self.patterns
             .iter()
@@ -770,13 +814,8 @@ impl PermissionRequest {
             .map(String::as_str)
     }
 
-    /// [`Self::longest_target`]'s character count, 0 when it carries none.
-    pub fn longest_target_len(&self) -> usize {
-        self.longest_target().map_or(0, |target| target.chars().count())
-    }
-
     /// The summed character count of every target, 0 when the request carries
-    /// none. This is what the display budget bounds: the card renders the
+    /// none. This is what the target budget bounds: the card renders the
     /// targets together in one element.
     pub fn total_target_len(&self) -> usize {
         self.patterns.iter().map(|pattern| pattern.chars().count()).sum()
@@ -817,6 +856,39 @@ mod tests {
         assert!(
             request(vec![]).targets_are_fully_shown(),
             "no targets, nothing to clip"
+        );
+    }
+
+    /// The card proof charges the whole rendered body, not just the targets:
+    /// the renderer's scaffolding shares the measured single-element ceiling.
+    /// A diff body keeps its own cap and is exempt from this ceiling.
+    #[test]
+    fn the_card_proof_charges_the_rendered_body_too() {
+        let request = |action: &str, pattern: String| PermissionRequest {
+            request_id: "per_1".into(),
+            session_id: Some("ses_1".into()),
+            permission: Some(action.into()),
+            patterns: vec![pattern],
+            metadata: None,
+            always: Vec::new(),
+            always_supported: true,
+        };
+        let at_budget = request("bash", "x".repeat(PERMISSION_TARGET_MAX_CHARS));
+        assert!(
+            at_budget.fits_rendered_body(PERMISSION_BODY_MAX_CHARS),
+            "the maximum target plus its scaffolding fits the body ceiling"
+        );
+        assert!(
+            !at_budget.fits_rendered_body(PERMISSION_BODY_MAX_CHARS + 1),
+            "scaffolding past the ceiling refuses the card"
+        );
+        assert!(
+            !request("bash", "x".repeat(PERMISSION_TARGET_MAX_CHARS + 1)).fits_rendered_body(1),
+            "an over-budget target is refused however small the body measures"
+        );
+        assert!(
+            request("edit", "x".repeat(PERMISSION_TARGET_MAX_CHARS)).fits_rendered_body(usize::MAX),
+            "a diff body keeps its own cap, not this ceiling"
         );
     }
 
