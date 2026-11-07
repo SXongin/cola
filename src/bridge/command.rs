@@ -1067,6 +1067,22 @@ async fn split_card_for_pull(
     .await;
 }
 
+/// Mark a just-sent read that never became the Session's card: it stays a
+/// visible message, so it must not look current. Best effort; a failed PATCH
+/// is logged with the untracked id.
+async fn mark_untracked_read(
+    cards: &crate::bridge::handles::CardsHandle,
+    session_id: &str,
+    sent: &str,
+    card: &serde_json::Value,
+) {
+    if !crate::bridge::chain::stamp_taken_over(cards, sent, Some(card)).await {
+        tracing::warn!(
+            "card read: session {session_id} untracked read {sent} could not be stamped taken over"
+        );
+    }
+}
+
 /// `/card`'s second state (ADR-0100): with no renderer owning the Session, read
 /// it once and post exactly ONE read-only Session Card.
 ///
@@ -1204,28 +1220,12 @@ async fn post_idle_card(
             .external
             .compose_snapshot_follow_lead(plan, "读取", &title, &data);
     }
-    // Bound the send: it runs under the Session's card write lock, so a
-    // stalled Feishu create must fail the command rather than block every
-    // flush, sweep and later `/card` for that Session.
-    let send = tokio::time::timeout(
-        std::time::Duration::from_millis(
-            handles
-                .external
-                .request_timeout_ms
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        handles.flow.platform.reply_card(message_id, &card),
-    )
-    .await;
-    let sent = match send {
-        Ok(sent) => sent?,
-        Err(_) => {
-            tracing::warn!("card read: session {session_id} card send timed out");
-            return Err(crate::error::BridgeError::Feishu(
-                "card read send timed out".into(),
-            ));
-        }
-    };
+    // Deliberately UNBOUNDED: Feishu's create has no idempotency key, so a
+    // timeout around a create whose response is slow could abandon a card that
+    // did land, leaving it untracked for a retry to duplicate. A real send
+    // error takes the ordinary failure path; the bounded reads and stamp
+    // PATCH are the lock's other long awaits (ADR-0100).
+    let sent = handles.flow.platform.reply_card(message_id, &card).await?;
     if let Some(plan) = &mut follow {
         // The old card is neutralised BEFORE the arm switches the map: it
         // must never stay the visible card while the follow (or a later idle
@@ -1242,7 +1242,7 @@ async fn post_idle_card(
                 drop(guard);
                 // The old card stays current, but the just-sent read must not
                 // be indistinguishable from it: mark the untracked read too.
-                crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+                mark_untracked_read(cards, session_id, &sent, &card).await;
                 tracing::warn!(
                     "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
                     previous
@@ -1276,7 +1276,7 @@ async fn post_idle_card(
             // that point leaves a live card with a render loop.
             tracing::info!("card read: session {session_id} follows the running turn on the posted card");
         } else {
-            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+            mark_untracked_read(cards, session_id, &sent, &card).await;
             tracing::info!(
                 "card read: session {session_id} the old card kept the session during the follow read; the posted read is stamped"
             );
@@ -1295,7 +1295,7 @@ async fn post_idle_card(
             drop(guard);
             // The old read stays current; the just-sent read is visibly
             // superseded so a third `/card` cannot mistake it for current.
-            crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+            mark_untracked_read(cards, session_id, &sent, &card).await;
             tracing::warn!(
                 "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
                 previous
@@ -1312,7 +1312,7 @@ async fn post_idle_card(
     if recorded {
         tracing::info!("card read: session {session_id} idle Session Card posted");
     } else {
-        crate::bridge::chain::stamp_taken_over(cards, &sent, Some(&card)).await;
+        mark_untracked_read(cards, session_id, &sent, &card).await;
         tracing::info!(
             "card read: session {session_id} the old card kept the session during the read; the posted read is stamped"
         );

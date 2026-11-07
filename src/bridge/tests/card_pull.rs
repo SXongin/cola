@@ -955,45 +955,37 @@ async fn a_card_read_cancelled_inside_the_commit_publishes_no_map_entry_or_secon
     );
 }
 
-/// The `/card` send is bounded: a parked Feishu create fails the command
-/// instead of holding the session write lock forever, and a later `/card`
-/// still works.
+/// A busy Session whose newest user message carries no server time cannot be
+/// followed (no render anchor): `/card` posts the static read, never a dead end.
 #[tokio::test]
-async fn a_parked_card_send_times_out_without_wedging_the_session() {
+async fn a_busy_read_with_an_untimed_newest_message_stays_static() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, idle_read_backend()).await;
-    app.core
-        .external
-        .request_timeout_ms
-        .store(50, std::sync::atomic::Ordering::Relaxed);
-    seed_session(&app, "ses_test", "/work").await;
-    let (_entered, _release) = platform.pause("reply", "msg_card");
-
-    tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        app.handle_message(incoming(
-            "msg_card".into(),
-            "chat_1".into(),
-            "p2p".into(),
-            None,
-            "/card".into(),
-            None,
-        )),
-    )
-    .await
-    .expect("a stalled send must not hang /card");
-    assert!(
-        Turn::card_message_id(&app.cards_handle(), "ses_test")
-            .await
-            .is_none(),
-        "a timed-out send records nothing"
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy));
+    backend.given_transcript(
+        "ses_test",
+        vec![SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_older",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("有时间的老消息")],
+            ),
+            typed_message(
+                "msg_untimed",
+                MessageRole::User,
+                None,
+                vec![text_part("没有时间的新消息")],
+            ),
+        ])],
     );
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
 
-    // The write lock was released: a later `/card` answers normally.
     app.handle_message(incoming(
-        "msg_card_2".into(),
+        "msg_card".into(),
         "chat_1".into(),
         "p2p".into(),
         None,
@@ -1001,12 +993,25 @@ async fn a_parked_card_send_times_out_without_wedging_the_session() {
         None,
     ))
     .await;
-    assert_eq!(
-        Turn::card_message_id(&app.cards_handle(), "ses_test")
-            .await
-            .as_deref(),
-        Some("msg_reply"),
-        "the later read posts normally"
+
+    let card = one_posted_card(&platform).await;
+    assert!(
+        card_text(&card).contains("⚙️ 运行中"),
+        "the read still reports busy: {}",
+        card_text(&card)
+    );
+    let cards = app.cards_handle();
+    assert!(
+        !Turn::is_running(&cards, "ses_test").await,
+        "no follow is armed without an anchor"
+    );
+    assert!(
+        !Turn::is_chain_card(&cards, "ses_test").await,
+        "the card stays a read"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "an unfollowed read writes no Chain Record"
     );
 }
 

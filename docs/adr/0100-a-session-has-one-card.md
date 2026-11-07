@@ -98,7 +98,11 @@ the session reads busy: that run is cola's own, and its hand-off belongs to the
 Chain Record and Session Sync (ADR-0063, ADR-0071), never to a Session Card that
 would take the chain over. With cola's own renderer alive `/card` never reaches
 this branch — it pulls — so the guard only covers a run cola lost its renderer
-for.
+for. One recorded #1005 carve-out: an **untimed newest user message** has no
+render anchor, so the follow cannot scope the run; `/card` posts the static read
+rather than guess a window (the read is still always posted — never a dead end).
+The gather reports the actual newest user message, timed or not, so an older
+timed message is never substituted for the untimed one.
 
 The post and the arm are **one commit**, ordered so a cancellation can never
 publish a half-built card. Before taking the lock, the command reads the Session
@@ -123,14 +127,22 @@ until the command releases it, so it cannot render before the seed and chain
 record are written; a cancellation at either of those later awaits drops the
 guard but leaves the already-spawned loop alive, which settles the card normally.
 An abort can therefore never leave a live `CardSession` with no render loop —
-the insert and the spawn are indivisible to cancellation.
+the insert and the spawn are indivisible to cancellation. The **send itself is
+not wrapped in a request timeout**: Feishu's create carries no idempotency key,
+so abandoning a create whose response is slow can orphan a card that did land,
+and a retry would post a second one. The bounded reads and the bounded stamp
+PATCH are the lock's long awaits; the create is one platform call, and a real
+send error takes the existing failure path.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and
 the busy follow hands it to its prepared accumulator's static lead (set under the
 card write lock, where the seed count is final). A test renders the same
 `SnapshotData` through both and asserts the body text is equal, because today the
-two are separate compositions that can drift.
+two are separate compositions that can drift. An **oversized read tail** is the
+one presentation difference: the one-shot card must evict its oldest entries to
+fit one card and names the omission, while the live lead renders all four (its
+card can split). The equality contract is asserted on a fitting tail.
 
 ## Consequences
 
@@ -226,6 +238,11 @@ standing.
 - ADR-0038 rule 6 — the Session Snapshot's claimed blocks. **Retired**: the
   claim registry goes, so every Interaction Block lives on a live card or its own
   standalone card.
+- ADR-0038 rule 8 — the card writer set. **Amended** (2026-11-07): `/card`'s
+  follow makes `RequestFlow::surface` hold the owning Session's card write lock
+  across its whole surfacing decision too, including the standalone send, so the
+  follow arm and the sweep cannot double-surface one request. The lock stays
+  per-session, and the sweep's non-live-card patches stay lock-free.
 - ADR-0094 — several pending blocks on one snapshot, and its no-repaint
   carve-out. **Retired** with the claimed block.
 - ADR-0040 — the Session Snapshot tail's fold ids. **Retired** with the rebuild
