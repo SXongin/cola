@@ -104,6 +104,15 @@ rather than guess a window (the read is still always posted — never a dead end
 The gather reports the actual newest user message, timed or not, so an older
 timed message is never substituted for the untimed one.
 
+A **sub-task child never arms this follow** (and an inconclusive parent lookup
+is treated as a child): its run is rendered by the nearest live ancestor's card,
+and its pending requests surface through the ordinary sweep. `/card` on a child
+either pulls a live ancestor or posts the static read — it never arms or seeds a
+child card. This removes the case where a parent Turn installs while the child
+command is in flight and both the sweep (under the parent's lock) and a child
+follow (under the child's) would host the same request. The child's own read
+still always answers; it just never becomes a renderer.
+
 The post and the arm are **one commit**, ordered so a cancellation can never
 publish a half-built card. Before taking the lock, the command reads the Session
 and builds the follow's accumulator **off the card map**. Then, under the

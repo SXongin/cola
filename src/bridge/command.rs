@@ -1128,61 +1128,39 @@ async fn live_card_host(handles: &CommandHandles, session_id: &str, directory: &
     }
 }
 
-/// [`live_card_host`] restricted to an **ancestor**: the Session's own live
-/// card is deliberately excluded. The follow's post-send re-check must not
-/// treat a Turn that installed on the Session itself during the send as an
-/// ancestor host — the arm's own CAS owns that case (it refuses a running
-/// card), while a pull here would split the brand-new Turn.
-async fn ancestor_live_host(handles: &CommandHandles, session_id: &str, directory: &str) -> CardHost {
+/// Whether the server reports a parent for `session_id` — i.e. whether this is
+/// a sub-task child. A child never arms its own follow (ADR-0100): its run is
+/// rendered by the parent's card, and its pending requests surface through the
+/// sweep. `None` is an inconclusive lookup, and callers must treat that as a
+/// child (safety over follow coverage).
+async fn session_has_parent(handles: &CommandHandles, session_id: &str, directory: &str) -> Option<bool> {
     let timeout_ms = handles
         .external
         .request_timeout_ms
         .load(std::sync::atomic::Ordering::Relaxed);
-    let resolved =
-        crate::bridge::bounded_call(&format!("card ancestor host ({session_id})"), timeout_ms, async {
-            let info = handles
-                .flow
-                .backend
-                .clone()
-                .for_directory(directory)
-                .session_info(session_id)
-                .await?;
-            let Some(parent) = info.parent_id.filter(|parent| parent != session_id) else {
-                return Ok(None);
-            };
-            crate::bridge::pollers::inline_host_session_checked(
-                &handles.flow.cards,
-                &handles.flow.backend,
-                &parent,
-                Some(directory),
-            )
-            .await
-        })
-        .await;
+    let resolved = crate::bridge::bounded_call(&format!("card parent ({session_id})"), timeout_ms, async {
+        let info = handles
+            .flow
+            .backend
+            .clone()
+            .for_directory(directory)
+            .session_info(session_id)
+            .await?;
+        Ok::<_, crate::error::BridgeError>(info.parent_id.filter(|parent| parent != session_id).is_some())
+    })
+    .await;
     match resolved {
         None => {
-            tracing::warn!(
-                "card ancestor host ({session_id}): parent walk timed out; treating a host as possible"
-            );
-            CardHost::Unknown
+            tracing::warn!("card parent ({session_id}): lookup timed out; treating it as a child");
+            None
         }
         Some(Err(e)) => {
-            tracing::warn!(
-                "card ancestor host ({session_id}): parent walk failed ({e}); treating a host as possible"
-            );
-            CardHost::Unknown
+            tracing::warn!("card parent ({session_id}): lookup failed ({e}); treating it as a child");
+            None
         }
-        Some(Ok(None)) => CardHost::Absent,
-        Some(Ok(Some(host))) => {
-            if crate::bridge::turn::Turn::is_running(&handles.flow.cards, &host).await {
-                CardHost::Live(host)
-            } else {
-                CardHost::Absent
-            }
-        }
+        Some(Ok(has_parent)) => Some(has_parent),
     }
 }
-
 /// Mark a just-sent read that never became the Session's card: it stays a
 /// visible message, so it must not look current. Best effort; a failed PATCH
 /// is logged with the untracked id.
@@ -1292,6 +1270,12 @@ impl Drop for UntrackedReadOnCancel {
 /// map before that insert, so a command cancelled earlier leaves no Idle card
 /// behind. The seed is attached after the commit (the blocks need a card to
 /// land on); a request another card already hosts keeps its own card.
+///
+/// `allow_follow` is false when the caller must keep the read static: a
+/// sub-task child never arms its own follow (its render is the parent's card
+/// and its pendings surface through the sweep, ADR-0100), an inconclusive
+/// host/parent probe, and a host probe that may have found an ancestor are all
+/// static-read cases.
 async fn post_idle_card(
     handles: &CommandHandles,
     session_id: &str,
@@ -1428,42 +1412,12 @@ async fn post_idle_card(
         // future must still mark the read instead of leaving it looking
         // current.
         let mut untracked = UntrackedReadOnCancel::new(cards, session_id, &sent, &card);
-
-        // The ancestor may have become a host during the unbounded send (or
-        // the pre-send probe was inconclusive). Re-resolve WHILE the child's
-        // lock is still held: the walk takes no ancestor lock, so nothing is
-        // nested, and keeping the lock preserves the send/arm/seed critical
-        // section against the sweep and a Turn install. On a host (or an
-        // inconclusive walk) the guard is released before the ancestor's lock
-        // is taken.
-        match ancestor_live_host(handles, session_id, &directory).await {
-            CardHost::Live(host) => {
-                // A renderer now owns the requests this follow would seed.
-                // Keep the sent read static and pull the host instead of
-                // arming a second host for the same request.
-                drop(guard);
-                mark_untracked_read(cards, session_id, &sent, &card).await;
-                untracked.disarm();
-                tracing::info!(
-                    "card read: session {session_id} host {host} appeared during the send; pulling it instead of arming the follow"
-                );
-                split_card_for_pull(cards, &host, message_id).await;
-                return Ok(());
-            }
-            CardHost::Unknown => {
-                // A host may exist. Arm nothing; the sent read is stamped so it
-                // does not look current while the sweep hosts on the ancestor.
-                drop(guard);
-                mark_untracked_read(cards, session_id, &sent, &card).await;
-                untracked.disarm();
-                tracing::warn!(
-                    "card read: session {session_id} host probe inconclusive after the send; leaving the read static"
-                );
-                return Ok(());
-            }
-            CardHost::Absent => {}
-        }
-
+        // Only a ROOT Session reaches this branch: a sub-task child never arms
+        // its own follow (ADR-0100 — its run is the parent's card, its pendings
+        // surface through the sweep), so `allow_follow` is false for it. A root
+        // has no ancestor a Turn could install on, and the arm CAS below owns a
+        // Turn that appeared on this Session during the send.
+        //
         // The old card is neutralised BEFORE the arm switches the map: it
         // must never stay the visible card while the follow (or a later idle
         // read) becomes current. A failed stamp aborts the command and keeps
@@ -2179,7 +2133,20 @@ pub(crate) async fn handle_command(
                 }
                 CardHost::Absent => {}
             }
-            post_idle_card(handles, &session_id, message_id, true).await?;
+            // No live host. A sub-task child never arms its own follow
+            // (ADR-0100): its run is rendered by the parent's card, and its
+            // pendings surface through the sweep. An inconclusive parent
+            // lookup is treated as a child — safety over follow coverage.
+            let is_child = !matches!(
+                session_has_parent(handles, &session_id, &directory).await,
+                Some(false)
+            );
+            if is_child {
+                tracing::info!(
+                    "card read: session {session_id} is a sub-task child; the read stays static and follows nothing"
+                );
+            }
+            post_idle_card(handles, &session_id, message_id, !is_child).await?;
         }
         Command::AgentCard => {
             crate::feishu::card::command::send_agent_card(handles, &thread_key, message_id).await?;
