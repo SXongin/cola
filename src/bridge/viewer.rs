@@ -1154,8 +1154,28 @@ pub(crate) async fn send_file_message(
     hash: u64,
     timeout_ms: u64,
 ) -> FileDelivery {
+    send_file_message_with_outcome(platform, cards, reply_target, content, hash, timeout_ms, None)
+        .await
+        .0
+}
+
+/// [`send_file_message`] with the created message id and an optional caption
+/// line sent just before the file. The permission companion uses this to name
+/// the request in the chat: Feishu's `msg_type: "file"` payload carries only
+/// `file_key`, so the caption is a short preceding reply (the uploaded filename
+/// names the request too). Returns the lane outcome and the File Message id when
+/// the send was accepted.
+pub(crate) async fn send_file_message_with_outcome(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    content: &FileContent,
+    hash: u64,
+    timeout_ms: u64,
+    caption: Option<&str>,
+) -> (FileDelivery, Option<String>) {
     if !crate::feishu::file::deliverable_file(content) {
-        return FileDelivery::Undelivered;
+        return (FileDelivery::Undelivered, None);
     }
     let cell = content_cell(&cards.file_uploads, hash).await;
     let file_key = match cell
@@ -1177,8 +1197,23 @@ pub(crate) async fn send_file_message(
     {
         Ok(Some(file_key)) => file_key.clone(),
         // Past Feishu's cap, a failed upload, or a timeout.
-        Ok(None) | Err(()) => return FileDelivery::Undelivered,
+        Ok(None) | Err(()) => return (FileDelivery::Undelivered, None),
     };
+    if let Some(caption) = caption {
+        // Best effort: the uploaded filename still names the request, so a
+        // failed caption must not block the file itself.
+        match crate::bridge::bounded_call(
+            "viewer file caption",
+            timeout_ms,
+            platform.reply_text(reply_target, caption),
+        )
+        .await
+        {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => tracing::warn!("viewer File Message caption failed: {error}"),
+            None => tracing::warn!("viewer File Message caption timed out"),
+        }
+    }
     let payload = serde_json::json!({ "file_key": file_key });
     match crate::bridge::bounded_call(
         "viewer file message",
@@ -1187,7 +1222,7 @@ pub(crate) async fn send_file_message(
     )
     .await
     {
-        Some(Ok(_)) => FileDelivery::SentAsFile,
+        Some(Ok((message_id, _))) => (FileDelivery::SentAsFile, Some(message_id)),
         Some(Err(error)) => {
             tracing::warn!("viewer File Message send failed: {error}");
             // A transport/5xx/parse failure may have landed after Feishu
@@ -1195,12 +1230,12 @@ pub(crate) async fn send_file_message(
             // created. Keeping an ambiguous send terminal is what stops a
             // retry from duplicating the File Message.
             if error.is_definite_non_delivery() {
-                FileDelivery::Undelivered
+                (FileDelivery::Undelivered, None)
             } else {
-                FileDelivery::FileSendOutcomeUnknown
+                (FileDelivery::FileSendOutcomeUnknown, None)
             }
         }
-        None => FileDelivery::FileSendOutcomeUnknown,
+        None => (FileDelivery::FileSendOutcomeUnknown, None),
     }
 }
 

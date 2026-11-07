@@ -1077,6 +1077,82 @@ async fn restart_declines_an_over_budget_standalone_permission_instead_of_readop
     );
 }
 
+/// ADR-0101's rule survives the companion lane: an Auto-Accept session never
+/// declines an over-budget request. A recovered card an older build persisted
+/// (no companion) is approved unseen and withdrawn, not re-adopted or declined.
+#[tokio::test]
+async fn restart_approves_a_recovered_over_budget_permission_unseen_on_auto_accept() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_1".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: true,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    let mut seen = std::collections::HashSet::new();
+    let (_, logs) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "Auto-Accept approves the recovered over-budget request unseen"
+    );
+    // The unseen approval is audited with the same line ADR-0101 requires.
+    let line = assert_line_level(&logs, "approved permission per_long", "INFO");
+    assert!(
+        line.contains("(targets total"),
+        "the audit line names the length it approved: {line}"
+    );
+    let withdrawn = last_update_of(&platform, "om_card")
+        .await
+        .expect("the recovered card is withdrawn");
+    let text = card_text(&withdrawn);
+    assert!(
+        text.contains(crate::feishu::card::question::AUTOACCEPTED_PERMISSION_RECEIPT),
+        "the card says the request was auto-approved: {text}"
+    );
+    assert!(
+        !text.contains("允许一次") && !text.contains("始终允许"),
+        "no control survives: {text}"
+    );
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "Auto-Accept sends no companion"
+    );
+    assert!(
+        !persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "the recovered surface is gone"
+    );
+}
+
 /// Whole-branch re-review #883: a refusal that **fails** must still neutralize
 /// the stored card — an over-budget card from an older build must never keep
 /// its Allow buttons while the request is still pending — but with a "will
@@ -1648,7 +1724,7 @@ async fn a_bare_404_keeps_the_withdrawal_retryable() {
 /// the backlog entry waits — so a click must re-read the request and refuse,
 /// never approve a target the card cannot show.
 #[tokio::test]
-async fn a_click_on_a_stale_allow_card_declines_an_unshowable_target() {
+async fn a_click_on_a_stale_allow_card_without_a_companion_is_refused() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");

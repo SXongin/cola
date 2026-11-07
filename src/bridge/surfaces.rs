@@ -61,23 +61,43 @@ pub enum CompanionLane {
     /// One Rich Text Message (`msg_type: "post"` carrying the `md` tag).
     RichText,
     /// One File Message (an uploaded `.txt`) when the `post` body would exceed
-    /// its 30 KB cap or the Rich Text send failed.
+    /// its 30 KB cap or the Rich Text send definitely failed.
     File,
 }
 
-/// One companion message that carried a permission request's full target —
+impl CompanionLane {
+    /// The user-facing name the summary and result cards render.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::RichText => "富文本消息（Rich Text Message）",
+            Self::File => "文件消息（File Message）",
+        }
+    }
+}
+
+/// One companion message that carried a permission request's full content —
 /// the persisted proof the click guard trusts (ADR-0102). The record is
-/// client-scoped like every other surface, written only after a successful
-/// send, and read back after a restart without re-sending.
+/// client-scoped like every other surface, written only after a send that
+/// landed or may have landed, and read back after a restart without re-sending.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompanionDelivery {
-    /// The message the companion landed as.
+    /// The message the companion landed as. Empty when the send outcome was
+    /// ambiguous (a timeout or a 5xx after the request went out): the message
+    /// may exist, so it must not be retried into a duplicate, but no id came
+    /// back. The summary says the outcome is unknown.
     pub message_id: String,
     pub lane: CompanionLane,
-    /// The digest of the exact target text that was delivered. The click guard
+    /// The digest of the exact content that was delivered. The click guard
     /// compares it with the pending request it re-reads, so a card can never
-    /// approve a target the companion did not carry.
+    /// approve content the companion did not carry.
     pub target_digest: u64,
+}
+
+impl CompanionDelivery {
+    /// Whether the send may have landed but returned no message id.
+    pub(crate) fn is_uncertain(&self) -> bool {
+        self.message_id.is_empty()
+    }
 }
 
 /// One standalone request card cola sent — the persisted half of a flow's
@@ -383,6 +403,15 @@ impl Surfaces {
     /// This client's companion record for `request_id`, when one was delivered.
     pub fn companion(&self, request_id: &str) -> Option<CompanionDelivery> {
         self.lock().companion.get(&self.client_id, request_id).cloned()
+    }
+
+    /// The record for `request_id` only when it proves the exact content
+    /// identified by `target_digest`. This is the one predicate the click
+    /// guard, readoption and delivery replacement share (ADR-0102), so a stale
+    /// record can never validate a different request.
+    pub fn matching_companion(&self, request_id: &str, target_digest: u64) -> Option<CompanionDelivery> {
+        self.companion(request_id)
+            .filter(|delivery| delivery.target_digest == target_digest)
     }
 
     /// Forget a companion record — its request resolved (or was refused).

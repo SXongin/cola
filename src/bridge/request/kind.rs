@@ -176,7 +176,6 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        companion: Option<CompanionLane>,
     ) -> bool;
 
     /// [`Self::add_inline`] for a caller that already holds the host's card
@@ -188,7 +187,6 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        companion: Option<CompanionLane>,
     ) -> bool;
 
     /// Seed this kind's inline block on a NEW host card with the request's
@@ -204,25 +202,18 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        companion: Option<CompanionLane>,
     ) -> bool {
-        self.add_inline_locked(flow, cards, host, req, dir, companion)
-            .await
+        self.add_inline_locked(flow, cards, host, req, dir).await
     }
 
     /// Build the standalone interactive card (used when no streaming card hosts
-    /// the request inline). `companion` names the lane that delivered an
-    /// over-budget target, so the card can carry its summary instead.
-    fn build_card(
-        &self,
-        req: &PendingRequest,
-        dir: &str,
-        companion: Option<CompanionLane>,
-    ) -> serde_json::Value;
+    /// the request inline). The flow supplies the companion delivery a
+    /// permission's summary needs.
+    fn build_card(&self, flow: &RequestFlow, req: &PendingRequest, dir: &str) -> serde_json::Value;
 
     /// The description shown on the card when it is marked stale (resolved by
-    /// another client).
-    fn summary(&self, req: &PendingRequest, companion: Option<CompanionLane>) -> String;
+    /// another client). The flow supplies the companion delivery.
+    fn summary(&self, flow: &RequestFlow, req: &PendingRequest) -> String;
 
     /// Resolve the kind's own inline blocks whose request vanished into their
     /// Interaction Receipts; `dead` names the owning sessions whose run is
@@ -357,11 +348,11 @@ impl RequestKind for PermissionKind {
         // showing a card (mirrors OpenChamber's toggle). Resolves sub-task child
         // sessions up their parent chain so they inherit the parent's flag.
         //
-        // Auto-Accept is a delegation of the decision, not a surface: it renders
-        // no card, so the card's completeness proof (`refuse` above) stands
-        // aside for these sessions. A target past the card budget is approved
-        // unseen, and the log line names its length — that record is what keeps
-        // the decision auditable without a card (#892).
+        // Auto-Accept is a delegation of the decision, not a surface: it
+        // returns before the companion step and renders no card. A target past
+        // the card budget is approved unseen, and the log line names its length
+        // — that record is what keeps the decision auditable without a card
+        // (#892).
         match should_auto_accept(flow, &handles.sessions, &handles.backend, &sid, dir).await {
             AutoAcceptFlag::On => {}
             AutoAcceptFlag::Off | AutoAcceptFlag::Capped => return Prepared::NotHandled,
@@ -400,44 +391,40 @@ impl RequestKind for PermissionKind {
 
     async fn add_inline(
         &self,
-        _flow: &RequestFlow,
+        flow: &RequestFlow,
         cards: &CardsHandle,
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Permission(p) = req else {
             return false;
         };
+        let companion = flow.companion_for(req);
         Turn::add_permission_with_companion(cards, host, p, dir, companion).await
     }
 
     async fn add_inline_locked(
         &self,
-        _flow: &RequestFlow,
+        flow: &RequestFlow,
         cards: &CardsHandle,
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Permission(p) = req else {
             return false;
         };
+        let companion = flow.companion_for(req);
         Turn::add_permission_with_companion_locked(cards, host, p, dir, companion).await
     }
 
-    fn build_card(
-        &self,
-        req: &PendingRequest,
-        dir: &str,
-        companion: Option<CompanionLane>,
-    ) -> serde_json::Value {
+    fn build_card(&self, flow: &RequestFlow, req: &PendingRequest, dir: &str) -> serde_json::Value {
         let PendingRequest::Permission(p) = req else {
             return serde_json::json!({});
         };
-        let body = describe_permission_for(p, companion);
+        let companion = flow.companion_for(req);
+        let body = describe_permission_for(p, companion.as_ref());
         crate::feishu::card::question::build_permission_card(
             p.session_id.as_deref().unwrap_or(""),
             &p.request_id,
@@ -447,9 +434,12 @@ impl RequestKind for PermissionKind {
         )
     }
 
-    fn summary(&self, req: &PendingRequest, companion: Option<CompanionLane>) -> String {
+    fn summary(&self, flow: &RequestFlow, req: &PendingRequest) -> String {
         match req {
-            PendingRequest::Permission(p) => describe_permission_for(p, companion),
+            PendingRequest::Permission(p) => {
+                let companion = flow.companion_for(req);
+                describe_permission_for(p, companion.as_ref())
+            }
             PendingRequest::Question(_) => String::new(),
         }
     }
@@ -582,7 +572,7 @@ impl RequestKind for PermissionKind {
         // longer carries it.
         let mut unshowable: Option<PermissionOverflow> = None;
         let mut verified: Option<crate::backend::types::PermissionRequest> = None;
-        let mut verified_companion: Option<CompanionLane> = None;
+        let mut verified_companion: Option<CompanionDelivery> = None;
         if matches!(reply, "once" | "always")
             && let Some(dir) = directory
         {
@@ -603,11 +593,10 @@ impl RequestKind for PermissionKind {
                                 // companion proof; neither is exempt.
                                 match flow
                                     .surfaces
-                                    .companion(req_id)
-                                    .filter(|delivery| delivery.target_digest == companion_target_digest(p))
+                                    .matching_companion(req_id, companion_target_digest(p))
                                 {
                                     Some(delivery) => {
-                                        verified_companion = Some(delivery.lane);
+                                        verified_companion = Some(delivery);
                                         verified = Some(p.clone());
                                     }
                                     None => unshowable = Some(overflow),
@@ -783,7 +772,7 @@ impl RequestKind for PermissionKind {
         } else if let Some(p) = verified.as_ref() {
             // The approval re-read the request from the server; the result card
             // describes exactly that request, never the callback's stale copy.
-            describe_permission_for(p, verified_companion)
+            describe_permission_for(p, verified_companion.as_ref())
         } else {
             // No verified request (a rejection, or one already gone): the body
             // was chosen from the surface the click landed on above.
@@ -807,7 +796,7 @@ impl RequestKind for PermissionKind {
 /// the parent's flag, consistent with `approve_pending_for_session`.
 /// What the parent-chain read says about a session's Auto-Accept flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoAcceptFlag {
+pub(crate) enum AutoAcceptFlag {
     /// The session, or an ancestor, has it on.
     On,
     /// The chain was walked to its end and nothing mapped has it on.
@@ -823,7 +812,7 @@ enum AutoAcceptFlag {
 /// retry an unknown instead of reading it as off — declining on a guess is the
 /// irreversible outcome #892 is about), and `Capped` when a too-deep chain left
 /// the answer unreachable (a retry loop would hang the turn forever).
-async fn should_auto_accept(
+pub(crate) async fn should_auto_accept(
     flow: &RequestFlow,
     sessions: &SessionsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
@@ -889,7 +878,7 @@ pub(crate) async fn set_auto_accept(
 ) -> Option<Vec<String>> {
     // Persist the flag BEFORE approving the pending requests: a sweep landing
     // in the approval window must already read the session as auto-accept, or
-    // its `refuse` declines an over-budget request this very call is about to
+    // its `prepare` surfaces an over-budget request this very call is about to
     // approve (#892). A persist that did not take effect — a store error, or
     // the mapped entry vanishing between the walk and the write — approves
     // nothing: the mode never changed.
@@ -938,11 +927,12 @@ pub(crate) async fn set_auto_accept(
     })
 }
 
-/// Decline a permission whose target the card cannot render in full.
+/// Decline a permission whose full content could not be delivered on a card or
+/// in a companion (ADR-0102).
 ///
 /// Only the server answer happens here: the turn is blocked on it, so it must
 /// land first, and whether the user gets the reason card or their persisted
-/// card is withdrawn is the flow's decision (`withdraw_refused_surface`).
+/// card is withdrawn is the flow's decision (`withdraw_stored_surface`).
 /// **A failed reply is not a refusal**: it returns [`Refusal::Failed`] so the
 /// flow keeps the request retryable instead of reporting it settled. A request
 /// the server no longer lists (another sweep or client settled it first) is
@@ -1036,9 +1026,9 @@ async fn approve_pending_inner(
         if !session_belongs_to(sessions, backend, &sid, session_id, directory).await {
             continue;
         }
-        // Likewise, `refuse` stands aside for an auto-accept session, so the
-        // completeness proof must not reappear here: a target past the card
-        // budget is approved unseen (this path renders no card either), and
+        // Auto-Accept returns before the companion step, so the completeness
+        // proof must not reappear here: a target past the card budget is
+        // approved unseen (this path renders no card either), and
         // `log_unshowable_auto_accept` records the length (#892).
         // Take the settlement claim BEFORE the reply lands: the request
         // leaves the server's pending list the moment it is applied, and a
@@ -1091,7 +1081,7 @@ const AUTO_ACCEPT_TARGET_LOG_CHARS: usize = 120;
 /// it unshowable (and the summed target length), and the target's first line.
 /// INFO, like every other auto-accepted transition (ADR-0048); the "unseen"
 /// wording is what sets it apart from an ordinary auto-accept.
-fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
+pub(crate) fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
     let Some(overflow) = permission_overflow(p) else {
         return;
     };
@@ -1321,7 +1311,6 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        _companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1342,7 +1331,6 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        _companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1361,7 +1349,6 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
-        _companion: Option<CompanionLane>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1370,12 +1357,7 @@ impl RequestKind for QuestionKind {
         Turn::add_question_locked(cards, host, q, dir, &paint).await
     }
 
-    fn build_card(
-        &self,
-        req: &PendingRequest,
-        dir: &str,
-        _companion: Option<CompanionLane>,
-    ) -> serde_json::Value {
+    fn build_card(&self, _flow: &RequestFlow, req: &PendingRequest, dir: &str) -> serde_json::Value {
         let PendingRequest::Question(q) = req else {
             return serde_json::json!({});
         };
@@ -1401,7 +1383,7 @@ impl RequestKind for QuestionKind {
         )
     }
 
-    fn summary(&self, req: &PendingRequest, _companion: Option<CompanionLane>) -> String {
+    fn summary(&self, _flow: &RequestFlow, req: &PendingRequest) -> String {
         match req {
             PendingRequest::Question(q) => crate::feishu::card::question::question_summary(&q.questions),
             PendingRequest::Permission(_) => String::new(),
@@ -2279,38 +2261,51 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     s
 }
 
-/// The full target text a companion message carries: every pattern, in order,
-/// separated so two adjacent targets never read as one. The digest the click
-/// guard checks is taken over exactly this text (ADR-0102).
-pub(crate) fn companion_target_text(p: &crate::backend::types::PermissionRequest) -> String {
-    p.patterns.join("\n\n")
+/// The exact content a companion carries and the digest covers.
+///
+/// A **targets** overflow delivers the raw targets: `describe_permission`
+/// clips each one to the display budget, which would drop the very text the
+/// companion exists to show. A **rendered-body** overflow delivers the full
+/// rendered description, so the chrome the proof charged (reason, metadata,
+/// header) is in the companion too rather than being "proved" by text that
+/// never contained the clipped part. The digest is over exactly this text.
+pub(crate) fn companion_text(p: &crate::backend::types::PermissionRequest) -> String {
+    match permission_overflow(p) {
+        Some(PermissionOverflow::Targets) => p.patterns.join("\n\n"),
+        _ => describe_permission(p),
+    }
 }
 
-/// The stable digest of [`companion_target_text`]. It is a fingerprint, never
-/// the content: the record is persisted beside the other surfaces.
+/// The stable digest of [`companion_text`]. It is a fingerprint, never the
+/// content: the record is persisted beside the other surfaces.
 pub(crate) fn companion_target_digest(p: &crate::backend::types::PermissionRequest) -> u64 {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(companion_target_text(p).as_bytes());
+    let digest = Sha256::digest(companion_text(p).as_bytes());
     u64::from_be_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"))
 }
 
 /// The summary form of a permission for an over-budget request (ADR-0102): the
-/// action, the total character count, the first 120 characters of the target,
-/// and the lane that carries the full text. `lane` is the companion that
-/// actually landed, so the card never points at a message that does not exist.
+/// action, the total character count, the first 120 characters of the content
+/// the proof measures, and where the full content lives. `delivery` is the
+/// record that actually landed (or may have landed), so the card never points
+/// at a message that does not exist.
 pub(crate) fn describe_permission_summary(
     p: &crate::backend::types::PermissionRequest,
-    lane: CompanionLane,
+    delivery: &CompanionDelivery,
 ) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
-    let excerpt: String = companion_target_text(p).chars().take(120).collect();
-    let lane_name = match lane {
-        CompanionLane::RichText => "富文本消息（Rich Text Message）",
-        CompanionLane::File => "文件消息（File Message）",
+    let excerpt: String = companion_text(p).chars().take(120).collect();
+    let destination = if delivery.is_uncertain() {
+        format!(
+            "已尝试通过{}发送（结果未知，可能已送达）。",
+            delivery.lane.label()
+        )
+    } else {
+        format!("已通过{}发送。", delivery.lane.label())
     };
     let mut s = format!(
-        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整目标**: 已通过{lane_name}发送。",
+        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整内容**: {destination}",
         p.total_target_len(),
         crate::feishu::card::fenced_code(&excerpt, None)
     );
@@ -2319,34 +2314,40 @@ pub(crate) fn describe_permission_summary(
 }
 
 /// The body a permission surface renders: the summary when a companion carried
-/// the full target, the ordinary full description otherwise. ONE chooser, so the
-/// card, the inline block and the stale summary cannot disagree.
+/// the full content, the ordinary full description otherwise. ONE chooser, so
+/// the card, the inline block and the stale summary cannot disagree.
 pub(crate) fn describe_permission_for(
     p: &crate::backend::types::PermissionRequest,
-    companion: Option<CompanionLane>,
+    companion: Option<&CompanionDelivery>,
 ) -> String {
     match companion {
-        Some(lane) => describe_permission_summary(p, lane),
+        Some(delivery) => describe_permission_summary(p, delivery),
         None => describe_permission(p),
     }
 }
 
 /// What [`ensure_permission_companion`] did.
 pub(crate) enum CompanionOutcome {
-    /// A companion record exists (or the send just landed).
-    Delivered(CompanionDelivery),
-    /// Neither lane delivered: the request must follow the refusal path.
+    /// The send landed and returned a message id.
+    Delivered,
+    /// The send may have landed (a timeout or a post-accept 5xx) but returned
+    /// no id. It is terminal: a retry could duplicate the message, so the
+    /// record carries an empty message id and the summary says so.
+    Uncertain,
+    /// No lane delivered: the request must follow the refusal path.
     Failed,
 }
 
-/// Deliver an over-budget permission's full target as one companion message,
+/// Deliver an over-budget permission's full content as one companion message,
 /// before any interactive surface exists (ADR-0083 §5's ladder, ADR-0102).
 ///
-/// A record already written for this request is trusted and never re-sent; a
-/// record whose digest no longer matches the request is discarded and replaced.
-/// The Rich Text Message is tried first; a post body past its 30 KB cap, a
-/// failed send, or a target with no reply message all fall through to the File
-/// Message lane.
+/// A matching record already written for this request is trusted and never
+/// re-sent; a record whose digest no longer matches is discarded and replaced.
+/// The Rich Text Message is tried first via the existing
+/// [`crate::feishu::card::viewer::rich_post_md`] sizing; a body past its 30 KB
+/// cap, or a send that **definitely** did not land, falls to the File Message
+/// lane through [`crate::bridge::viewer::send_file_message_with_outcome`]. An
+/// ambiguous send is terminal — it must not be retried into a duplicate.
 pub(crate) async fn ensure_permission_companion(
     handles: &FlowHandles,
     surfaces: &Surfaces,
@@ -2354,12 +2355,15 @@ pub(crate) async fn ensure_permission_companion(
     directory: &str,
 ) -> CompanionOutcome {
     let digest = companion_target_digest(p);
-    if let Some(existing) = surfaces.companion(&p.request_id) {
-        if existing.target_digest == digest {
-            return CompanionOutcome::Delivered(existing);
-        }
-        surfaces.remove_companion(&p.request_id);
+    if let Some(existing) = surfaces.matching_companion(&p.request_id, digest) {
+        return if existing.is_uncertain() {
+            CompanionOutcome::Uncertain
+        } else {
+            CompanionOutcome::Delivered
+        };
     }
+    // A record for a different digest is stale: replace it, never trust it.
+    surfaces.remove_companion(&p.request_id);
     let session_id = p.session_id.as_deref().unwrap_or("");
     let Some(target) = resolve_card_target(
         &handles.sessions,
@@ -2380,25 +2384,31 @@ pub(crate) async fn ensure_permission_companion(
     let CardTarget::ReplyTo(message_id) = target else {
         // A Chat target has no message to reply to, and only a card can be sent
         // to a chat; the companion lanes require a reply message. Treat it as a
-        // failed delivery so the request is never offered without its target.
+        // failed delivery so the request is never offered without its content.
         tracing::warn!(
-            "permission {} companion: only a chat target resolves; cannot deliver the full target",
+            "permission {} companion: only a chat target resolves; cannot deliver the full content",
             p.request_id
         );
         return CompanionOutcome::Failed;
     };
 
-    let full = companion_target_text(p);
+    let body = companion_text(p);
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
-    let md = format!(
-        "{emoji} **{label}**\n\n**完整目标**（{} 字符）：\n{}",
-        p.total_target_len(),
-        crate::feishu::card::fenced_code(&full, None)
-    );
-    if crate::feishu::card::sanitize::serialized_len(&md) + 128
-        <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES
-    {
+    // Reuse ADR-0083 §5's Rich Text sizing: `rich_post_md` returns the fenced
+    // body only when it fits the post cap; the preamble is charged separately
+    // because it rides the same message.
+    let rich = crate::feishu::card::viewer::rich_post_md(
+        crate::feishu::card::viewer::ViewerKind::Text,
+        Some("txt"),
+        &body,
+    )
+    .map(|fenced| format!("{emoji} **{label}**\n\n{fenced}"))
+    .filter(|md| {
+        crate::feishu::card::sanitize::serialized_len(md) + 128
+            <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES
+    });
+    if let Some(md) = rich {
         let content = crate::feishu::card::viewer::rich_post_content(&md);
         match crate::bridge::bounded_call(
             &format!("permission {} companion post", p.request_id),
@@ -2419,21 +2429,52 @@ pub(crate) async fn ensure_permission_companion(
                     p.request_id,
                     delivery.message_id
                 );
-                return CompanionOutcome::Delivered(delivery);
+                return CompanionOutcome::Delivered;
             }
-            Some(Err(error)) => tracing::warn!(
-                "permission {} companion Rich Text Message failed: {error}; trying the File Message lane",
-                p.request_id
-            ),
-            None => tracing::warn!(
-                "permission {} companion Rich Text Message timed out; trying the File Message lane",
-                p.request_id
-            ),
+            Some(Err(error)) if error.is_definite_non_delivery() => {
+                tracing::warn!(
+                    "permission {} companion Rich Text Message definitely failed: {error}; \
+                     trying the File Message lane",
+                    p.request_id
+                );
+            }
+            Some(Err(error)) => {
+                // The post may have landed after Feishu accepted it. Falling to
+                // the File lane could duplicate the whole content, and declining
+                // would reject a request the user may be looking at. Record the
+                // uncertain delivery and surface the summary.
+                tracing::warn!(
+                    "permission {} companion Rich Text Message outcome unknown: {error}; \
+                     not retrying",
+                    p.request_id
+                );
+                let delivery = CompanionDelivery {
+                    message_id: String::new(),
+                    lane: CompanionLane::RichText,
+                    target_digest: digest,
+                };
+                surfaces.set_companion(&p.request_id, delivery.clone());
+                return CompanionOutcome::Uncertain;
+            }
+            None => {
+                tracing::warn!(
+                    "permission {} companion Rich Text Message timed out; not retrying",
+                    p.request_id
+                );
+                let delivery = CompanionDelivery {
+                    message_id: String::new(),
+                    lane: CompanionLane::RichText,
+                    target_digest: digest,
+                };
+                surfaces.set_companion(&p.request_id, delivery.clone());
+                return CompanionOutcome::Uncertain;
+            }
         }
     }
 
-    // File Message lane: the bytes are the full target, under a name that names
-    // the request (the client shows it as the file's caption).
+    // File Message lane: the bytes are the full content, under a name that
+    // names the request, with a preceding caption naming it too (Feishu's
+    // `file` payload carries only `file_key`, so a caption cannot ride it).
     let safe_id: String = p
         .request_id
         .chars()
@@ -2446,42 +2487,31 @@ pub(crate) async fn ensure_permission_companion(
         })
         .collect();
     let name = format!("permission-{safe_id}.txt");
-    let content = crate::backend::FileContent::from_bytes("text/plain", &name, full.clone().into_bytes());
-    let file_key = match crate::bridge::bounded_call(
-        &format!("permission {} companion upload", p.request_id),
+    let content = crate::backend::FileContent::from_bytes("text/plain", &name, body.into_bytes());
+    let hash = crate::bridge::handles::content_identity_hash(
+        &content.mime,
+        &content.name,
+        content.data.as_deref().unwrap_or_default(),
+    );
+    let caption = format!(
+        "📎 权限请求 {}：完整内容（{} 字符）见下方 .txt 文件。",
+        p.request_id,
+        p.total_target_len()
+    );
+    let (delivery, sent_id) = crate::bridge::viewer::send_file_message_with_outcome(
+        &handles.platform,
+        &handles.cards,
+        &message_id,
+        &content,
+        hash,
         COMPANION_SEND_TIMEOUT_MS,
-        handles.platform.upload_file(&content),
+        Some(&caption),
     )
-    .await
-    {
-        Some(Ok(Some(key))) => key,
-        Some(Ok(None)) => {
-            tracing::warn!(
-                "permission {} companion File Message is past the upload cap",
-                p.request_id
-            );
-            return CompanionOutcome::Failed;
-        }
-        Some(Err(error)) => {
-            tracing::warn!("permission {} companion upload failed: {error}", p.request_id);
-            return CompanionOutcome::Failed;
-        }
-        None => {
-            tracing::warn!("permission {} companion upload timed out", p.request_id);
-            return CompanionOutcome::Failed;
-        }
-    };
-    let payload = serde_json::json!({ "file_key": file_key });
-    match crate::bridge::bounded_call(
-        &format!("permission {} companion file", p.request_id),
-        COMPANION_SEND_TIMEOUT_MS,
-        handles.platform.reply_message(&message_id, "file", &payload),
-    )
-    .await
-    {
-        Some(Ok((sent_id, _))) => {
+    .await;
+    match delivery {
+        crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
             let delivery = CompanionDelivery {
-                message_id: sent_id,
+                message_id: sent_id.unwrap_or_default(),
                 lane: CompanionLane::File,
                 target_digest: digest,
             };
@@ -2491,17 +2521,23 @@ pub(crate) async fn ensure_permission_companion(
                 p.request_id,
                 delivery.message_id
             );
-            CompanionOutcome::Delivered(delivery)
+            CompanionOutcome::Delivered
         }
-        Some(Err(error)) => {
+        crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
             tracing::warn!(
-                "permission {} companion File Message failed: {error}",
+                "permission {} companion File Message outcome unknown; not retrying",
                 p.request_id
             );
-            CompanionOutcome::Failed
+            let delivery = CompanionDelivery {
+                message_id: String::new(),
+                lane: CompanionLane::File,
+                target_digest: digest,
+            };
+            surfaces.set_companion(&p.request_id, delivery.clone());
+            CompanionOutcome::Uncertain
         }
-        None => {
-            tracing::warn!("permission {} companion File Message timed out", p.request_id);
+        _ => {
+            tracing::warn!("permission {} companion File Message did not land", p.request_id);
             CompanionOutcome::Failed
         }
     }
@@ -2509,7 +2545,8 @@ pub(crate) async fn ensure_permission_companion(
 
 /// How long one companion send (or upload) may take. It runs in the sweep,
 /// before the request becomes interactive, so a stalled call must not hold the
-/// poller; a timeout is a failed lane, never a surfaced approval.
+/// poller. A timeout is an UNCERTAIN send — it may have landed, so it is
+/// recorded and never retried rather than treated as a failed lane.
 const COMPANION_SEND_TIMEOUT_MS: u64 = 10_000;
 
 /// The character count of the body `describe_permission` renders, after the
