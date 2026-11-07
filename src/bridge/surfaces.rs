@@ -54,6 +54,32 @@ pub struct CachedSurface {
     pub spans: Vec<BlockSpan>,
 }
 
+/// The lane that carried an over-budget permission's full target (ADR-0083 §5,
+/// ADR-0102): the Rich Text Message, or the File Message it falls back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompanionLane {
+    /// One Rich Text Message (`msg_type: "post"` carrying the `md` tag).
+    RichText,
+    /// One File Message (an uploaded `.txt`) when the `post` body would exceed
+    /// its 30 KB cap or the Rich Text send failed.
+    File,
+}
+
+/// One companion message that carried a permission request's full target —
+/// the persisted proof the click guard trusts (ADR-0102). The record is
+/// client-scoped like every other surface, written only after a successful
+/// send, and read back after a restart without re-sending.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompanionDelivery {
+    /// The message the companion landed as.
+    pub message_id: String,
+    pub lane: CompanionLane,
+    /// The digest of the exact target text that was delivered. The click guard
+    /// compares it with the pending request it re-reads, so a card can never
+    /// approve a target the companion did not carry.
+    pub target_digest: u64,
+}
+
 /// One standalone request card cola sent — the persisted half of a flow's
 /// `sent_cards` (ADR-0038, rule 6).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,11 +129,16 @@ struct SurfaceFile {
     cards: ClientScoped<CachedSurface>,
     #[serde(default)]
     standalone: ClientScoped<StandaloneSurface>,
+    #[serde(default)]
+    companion: ClientScoped<CompanionDelivery>,
 }
 
 impl SurfaceFile {
     fn is_empty(&self) -> bool {
-        self.inline.is_empty() && self.cards.is_empty() && self.standalone.is_empty()
+        self.inline.is_empty()
+            && self.cards.is_empty()
+            && self.standalone.is_empty()
+            && self.companion.is_empty()
     }
 
     /// This client's maps, flattened for the startup hydration.
@@ -203,6 +234,7 @@ impl Surfaces {
                         inline: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, inline),
                         cards: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, file.cards),
                         standalone: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, standalone),
+                        companion: ClientScoped::default(),
                     }
                 }
                 Err(error) => {
@@ -335,6 +367,47 @@ impl Surfaces {
         self.mutate(|state| state.standalone.remove(&self.client_id, request_id).is_some());
     }
 
+    /// Record the companion message that delivered `request_id`'s full target.
+    /// Written only after the send landed, so the record is never a promise
+    /// (ADR-0102).
+    pub fn set_companion(&self, request_id: &str, delivery: CompanionDelivery) {
+        self.mutate(|state| {
+            let changed = state.companion.get(&self.client_id, request_id) != Some(&delivery);
+            if changed {
+                state.companion.insert(&self.client_id, request_id, delivery);
+            }
+            changed
+        });
+    }
+
+    /// This client's companion record for `request_id`, when one was delivered.
+    pub fn companion(&self, request_id: &str) -> Option<CompanionDelivery> {
+        self.lock().companion.get(&self.client_id, request_id).cloned()
+    }
+
+    /// Forget a companion record — its request resolved (or was refused).
+    pub fn remove_companion(&self, request_id: &str) {
+        self.mutate(|state| state.companion.remove(&self.client_id, request_id).is_some());
+    }
+
+    /// Forget every companion record `keep` does not name. The sweep calls this
+    /// only when every directory listed successfully, so "not pending" really
+    /// means the request resolved (#130).
+    pub fn retain_companions(&self, keep: impl Fn(&str) -> bool) {
+        let stale: Vec<String> = {
+            let state = self.lock();
+            state
+                .companion
+                .iter_client(&self.client_id)
+                .map(|(id, _)| id.clone())
+                .filter(|id| !keep(id))
+                .collect()
+        };
+        for id in stale {
+            self.remove_companion(&id);
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, SurfaceFile> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -399,12 +472,56 @@ mod tests {
                     session_id: "ses_1".into(),
                 },
             );
+            surfaces.set_companion(
+                "per_3",
+                CompanionDelivery {
+                    message_id: "om_post".into(),
+                    lane: CompanionLane::RichText,
+                    target_digest: 42,
+                },
+            );
         }
 
-        let loaded = Surfaces::load(path).snapshot();
+        let surfaces = Surfaces::load(path);
+        let loaded = surfaces.snapshot();
         assert_eq!(loaded.inline.get("per_1"), Some(&inline("om_1")));
         assert_eq!(loaded.cards.get("om_1").unwrap().spans, vec![span("per_1", 0, 2)]);
         assert_eq!(loaded.standalone.get("per_2").unwrap().message_id, "om_2");
+        assert_eq!(
+            surfaces.companion("per_3"),
+            Some(CompanionDelivery {
+                message_id: "om_post".into(),
+                lane: CompanionLane::RichText,
+                target_digest: 42,
+            })
+        );
+    }
+
+    /// A companion record is removed with its request, and a record for another
+    /// request is retained. The sweep relies on the retain helper's predicate
+    /// being applied to every stored id.
+    #[test]
+    fn companion_records_are_removed_and_retained_by_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interactive_surfaces.json");
+        let surfaces = Surfaces::load(path.clone());
+        for (id, digest) in [("per_1", 1), ("per_2", 2)] {
+            surfaces.set_companion(
+                id,
+                CompanionDelivery {
+                    message_id: format!("om_{id}"),
+                    lane: CompanionLane::File,
+                    target_digest: digest,
+                },
+            );
+        }
+        surfaces.retain_companions(|id| id == "per_1");
+        assert_eq!(surfaces.companion("per_1").unwrap().target_digest, 1);
+        assert!(surfaces.companion("per_2").is_none());
+
+        surfaces.remove_companion("per_1");
+        assert!(surfaces.companion("per_1").is_none());
+        assert!(!path.exists(), "the last record leaves no file behind");
     }
 
     #[test]
