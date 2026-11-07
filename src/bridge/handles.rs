@@ -2349,12 +2349,12 @@ impl CardsHandle {
     /// (`post_idle_card`: the seed filter, pointer, send, map insert, chain
     /// record and seed) and the prompt sweep's whole surfacing decision
     /// (`RequestFlow::surface`: the inline-host re-check, the block insert/flush
-    /// and the standalone send with its `sent_cards`/surface record). They take
-    /// the **owning Session's** lock, which is what lets them exclude each
-    /// other. A sub-task request whose inline host is an ancestor nests
-    /// **child → ancestor** (the child's lock is held while the host's own
-    /// add/flush takes the ancestor's); no path takes the reverse order, so a
-    /// cross-session cycle cannot form.
+    /// and the standalone send with its `sent_cards`/surface record). The sweep
+    /// takes **one** Session's lock at a time: the HOST's for an inline block,
+    /// or the REQUEST Session's for a standalone card — never both. A sub-task
+    /// request's host is therefore the only lock its inline path holds, and
+    /// that lock is released before the standalone fallback takes the child's;
+    /// no path takes the reverse order, so a cross-session cycle cannot form.
     pub(crate) async fn write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         self.write_locks
             .lock()
@@ -2830,19 +2830,25 @@ impl FlowHandles {
     /// reads every mapped session.
     pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
         let session_id = entry.session_id.clone();
-        let displaced = self
-            .sessions
-            .active_entry(&entry.thread_key)
-            .await
-            .filter(|previous| previous.session_id != entry.session_id)
-            .map(|previous| previous.session_id);
-        // `activate` replaces an existing mapping of the same session id in the
-        // same write, so a force-adopt from another thread steals it atomically.
-        let stolen = self
-            .sessions
-            .thread_for_session(&entry.session_id)
-            .await
-            .is_some_and(|owner| owner != entry.thread_key);
+        // Both displacement facts are read in ONE store snapshot: `activate`
+        // below is a separate (atomic) write, but two concurrent switches must
+        // never read a torn pair — one seeing the other's already-displaced
+        // session as still active (and its own target as not stolen) would skip
+        // a card collect for a Session neither switch is showing any more.
+        let (displaced, stolen) = {
+            let store = self.sessions.store.lock().await;
+            let displaced = store
+                .get_active(&entry.thread_key)
+                .filter(|previous| previous.session_id != entry.session_id)
+                .map(|previous| previous.session_id.clone());
+            // `activate` replaces an existing mapping of the same session id in
+            // the same write, so a force-adopt from another thread steals it
+            // atomically.
+            let stolen = store
+                .thread_for_session(&entry.session_id)
+                .is_some_and(|owner| owner != entry.thread_key);
+            (displaced, stolen)
+        };
         self.sessions.activate(entry).await?;
         if let Some(previous) = displaced {
             Turn::collect_waiting(&self.cards, &previous, CollectReason::SwitchedAway).await;
