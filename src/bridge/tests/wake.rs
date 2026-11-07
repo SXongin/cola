@@ -48,7 +48,7 @@ use crate::backend::{
     WakeSource,
 };
 use crate::bridge::test_support::*;
-use crate::bridge::turn::{CardOwnership, Turn};
+use crate::bridge::turn::{CardOwnership, ContinuationFacts, Turn};
 use crate::feishu::card::CardState;
 
 /// A finished assistant turn whose newest message recorded a failure.
@@ -4063,4 +4063,136 @@ async fn an_unnamed_merged_wake_renders_the_bare_title() {
         .expect("the boundary ends the turn")
         .unwrap();
     result.unwrap();
+}
+
+/// Leave `ses_test` with a `Done` card that still owes a split continuation: a
+/// pull queue whose continuation create failed, with the run then settling.
+/// The queue and its reply target are the only record of that tail.
+async fn seed_done_card_owing_a_continuation(app: &Arc<App>, platform: &RecordingPlatform) {
+    seed_live_card(app, "ses_test", "om_live").await;
+    platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let cards = app.cards_handle();
+    Turn::split_card_chain(
+        &cards,
+        "ses_test",
+        "msg_pull",
+        crate::bridge::turn::SplitKind::Pull,
+    )
+    .await;
+    assert!(
+        Turn::has_pending_split(&cards, "ses_test").await,
+        "the failed continuation leaves its split queued: {:?}",
+        Turn::pending_splits(&cards, "ses_test").await
+    );
+    Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
+}
+
+/// A Wake's Fresh arm must not replace a terminal card that still owns a
+/// queued continuation (ADR-0100): `pending_split` and its reply target are the
+/// only record of the content the chain still owes, so the Wake waits for the
+/// continuation to be served. Once it is, the same Wake arms.
+#[tokio::test]
+async fn a_wake_does_not_replace_a_done_card_that_owes_a_continuation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let cards = app.cards_handle();
+    seed_done_card_owing_a_continuation(&app, &platform).await;
+
+    let id_before = Turn::card_message_id(&cards, "ses_test").await;
+    let reply_before = Turn::reply_target(&cards, "ses_test").await;
+    let queue_before = Turn::pending_splits(&cards, "ses_test").await;
+    assert_eq!(id_before.as_deref(), Some("om_live"));
+    assert!(!queue_before.is_empty(), "the fixture owes a continuation");
+
+    let anchor = turn_anchor(3_000);
+    let facts = || ContinuationFacts {
+        reply_to: Some("msg_user"),
+        chat_id: "chat_1",
+        subtitle: "test",
+        directory: "/work",
+        variant: None,
+    };
+    assert!(
+        Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts())
+            .await
+            .is_none(),
+        "a Wake must not replace a card that still owes its queued continuation"
+    );
+    // The card, its queue and its reply target are untouched.
+    assert_eq!(Turn::card_message_id(&cards, "ses_test").await, id_before);
+    assert_eq!(Turn::reply_target(&cards, "ses_test").await, reply_before);
+    assert_eq!(Turn::pending_splits(&cards, "ses_test").await, queue_before);
+    assert_eq!(Turn::card_state(&cards, "ses_test").await, Some(CardState::Done));
+
+    // Serve the queued split: the production flush retries its create.
+    Turn::flush_card(&cards, "ses_test").await;
+    assert!(!Turn::has_pending_split(&cards, "ses_test").await);
+
+    let armed = Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts())
+        .await
+        .expect("the Wake arms once the owed continuation is served");
+    assert!(
+        card_text(&armed).contains(WAKE_LEAD),
+        "the Fresh continuation opens with the 承接 line: {armed}"
+    );
+    assert!(
+        Turn::card_message_id(&cards, "ses_test").await.is_none(),
+        "the Fresh arm replaced the served card with its un-sent continuation"
+    );
+}
+
+/// A Wake's Fresh arm must not replace a terminal card that still carries a
+/// live Permission/Question: the takeover would collect the old card and strip
+/// the only answerable controls (ADR-0100).
+#[tokio::test]
+async fn a_wake_does_not_replace_a_terminal_card_with_a_live_block() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let cards = app.cards_handle();
+    Turn::add_permission(
+        &cards,
+        "ses_test",
+        &perm_request("per_live", "ses_test", "ls -la"),
+        "/work",
+    )
+    .await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Error).await;
+    assert!(Turn::has_live_interaction(&cards, "per_live").await);
+
+    let anchor = turn_anchor(3_000);
+    let facts = ContinuationFacts {
+        reply_to: Some("msg_user"),
+        chat_id: "chat_1",
+        subtitle: "test",
+        directory: "/work",
+        variant: None,
+    };
+    assert!(
+        Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts)
+            .await
+            .is_none(),
+        "a Wake must not replace a terminal card that still carries a live block"
+    );
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the Error card and its controls stay current"
+    );
+    assert_eq!(Turn::card_state(&cards, "ses_test").await, Some(CardState::Error));
+    assert!(
+        Turn::has_live_interaction(&cards, "per_live").await,
+        "the permission block survives"
+    );
+    assert_eq!(
+        Turn::live_permissions(&cards, "ses_test").await.len(),
+        1,
+        "the permission is still answerable"
+    );
 }
