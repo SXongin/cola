@@ -62,42 +62,6 @@ fn resumed_transcript() -> SessionTranscript {
     .with_wakes(vec![shell_wake(2_900)])
 }
 
-/// The first card the platform replied to `reply_to` satisfying `check`, or
-/// `None` — the recorded calls under one lock.
-async fn replied_card_where(
-    platform: &RecordingPlatform,
-    reply_to: &str,
-    check: impl Fn(&serde_json::Value) -> bool,
-) -> Option<serde_json::Value> {
-    platform.calls.lock().await.iter().find_map(|call| match call {
-        PlatformCall::ReplyCard { reply_to: mid, card } if mid == reply_to && check(card) => {
-            Some(card.clone())
-        }
-        _ => None,
-    })
-}
-
-/// Await a card replied to `reply_to` whose `check` passes, or panic after 5 s
-/// (the Wake continuation is sent on the Session Sync poller's cadence).
-async fn wait_for_replied_card(
-    platform: &RecordingPlatform,
-    reply_to: &str,
-    label: &str,
-    check: impl Fn(&serde_json::Value) -> bool,
-) -> serde_json::Value {
-    let probe = async {
-        loop {
-            if let Some(card) = replied_card_where(platform, reply_to, &check).await {
-                return card;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("no card replied to {reply_to:?} reached {label}"))
-}
-
 /// Seed a card that has already yielded 「⏳ 等待后台任务」 for an active,
 /// mapped session — with an explicit message id, so the collect's PATCH is
 /// distinguishable from every later card (the recording platform serves one id
@@ -468,18 +432,15 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     })
     .await;
 
-    wait_for_replied_card(&platform, "msg_1", "the Wake continuation", |card| {
-        card_text(card).contains(WAKE_LEAD)
-    })
-    .await;
+    assert!(
+        !continuation_sends(&platform).await.is_empty(),
+        "the Wake continuation still lands top-level: {:?}",
+        platform.calls.lock().await
+    );
     let rendered = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&rendered).contains("CI 通过了。") && card_text(&rendered).contains(WAKE_LEAD),
         "the continuation renders the resumed work: {rendered}"
-    );
-    assert!(
-        !card_text(&rendered).contains("shell 完成"),
-        "the entry stays on the card that hosted the task, never the continuation: {rendered}"
     );
 
     // Exactly one continuation for the missed work; a later Session Sync pass
@@ -497,26 +458,18 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         "later Session Sync passes must not re-post the rendered Wake: {:?}",
         platform.calls.lock().await
     );
-    // The collected card's ledger handover: one PATCH carrying the retired
-    // task's completion entry, with the collect's own facts intact — its
-    // header, and no live list left (or re-shown) anywhere.
+    // The collected card keeps its collect state; the late Wake opens a FRESH
+    // continuation instead of splitting the collected chain, so no ledger
+    // handover PATCH lands on it.
     let patches = patches_to(&platform, "om_waiting").await;
     assert_eq!(
         patches.len(),
-        2,
-        "the collect and the ledger handover are the collected card's only PATCHes: {patches:?}"
-    );
-    let handover = &patches[1];
-    assert!(
-        card_header(handover).contains("已切换会话"),
-        "the handover leaves the collect state intact: {handover}"
+        1,
+        "the collect is the collected card's only PATCH: {patches:?}"
     );
     assert!(
-        card_text(handover).contains("shell 完成"),
-        "the retired task's entry lands on the card that hosted it: {handover}"
-    );
-    assert!(
-        !card_text(handover).contains("后台任务（"),
-        "the handover never re-shows a live list: {handover}"
+        card_header(&patches[0]).contains("已切换会话"),
+        "the collect state survives: {}",
+        patches[0]
     );
 }

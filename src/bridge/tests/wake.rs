@@ -873,8 +873,8 @@ async fn a_wake_after_a_done_card_continues_on_a_new_card() {
         platform.updated_cards().await
     );
     assert!(
-        platform.replied_cards().await.iter().any(is_continuation),
-        "the continuation replies to the user's message"
+        platform.sent_cards().await.iter().any(is_continuation),
+        "a terminal card has no live reply target: the continuation lands top-level"
     );
 }
 
