@@ -138,8 +138,30 @@ pub(crate) async fn walk_parent_chain<F, Fut, T>(
     backend: &Arc<dyn crate::backend::Backend>,
     start: &str,
     directory: Option<&str>,
-    mut predicate: F,
+    predicate: F,
 ) -> Option<T>
+where
+    F: FnMut(&str) -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    walk_parent_chain_result(backend, start, directory, predicate)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`walk_parent_chain`] that tells "the chain ended without a match" from
+/// "the walk could not finish". A caller that must not mistake an
+/// indeterminate answer for a definite one uses this: `Ok(None)` means the
+/// chain was walked to its end (or no directory was given), `Err` means a hop
+/// failed. The auto-accept flag read is the case that needs it — "unknown" must
+/// retry, never read as "off" and decline a request for good (#892).
+pub(crate) async fn walk_parent_chain_result<F, Fut, T>(
+    backend: &Arc<dyn crate::backend::Backend>,
+    start: &str,
+    directory: Option<&str>,
+    mut predicate: F,
+) -> crate::error::Result<Option<T>>
 where
     F: FnMut(&str) -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
@@ -147,19 +169,18 @@ where
     let mut current = start.to_string();
     for _ in 0..8 {
         if let Some(t) = predicate(&current).await {
-            return Some(t);
+            return Ok(Some(t));
         }
-        let dir = directory?;
-        let info = backend
-            .clone()
-            .for_directory(dir)
-            .session_info(&current)
-            .await
-            .ok()?;
-        let parent = info.parent_id.filter(|p| p != &current)?;
+        let Some(dir) = directory else {
+            return Ok(None);
+        };
+        let info = backend.clone().for_directory(dir).session_info(&current).await?;
+        let Some(parent) = info.parent_id.filter(|p| p != &current) else {
+            return Ok(None);
+        };
         current = parent;
     }
-    None
+    Ok(None)
 }
 
 /// Resolve a `message_id` that lives INSIDE the given topic, so a card can

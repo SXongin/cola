@@ -38,9 +38,15 @@ decisions. It stands aside wherever no card is rendered:
   target proves unshowable, and returns `NotApplicable` instead of declining.
   The ordinary path pays no extra session lookup.
 - `approve_pending_for_session` no longer declines over-budget requests; they are
-  approved with the rest. The flag is persisted **before** that approval pass,
-  so a sweep landing inside it already reads the session as auto-accept and does
-  not decline the request this call is about to approve.
+  approved with the rest. Every enable path — the permission-card toggle,
+  `/autoaccept on`, and the Auto-Accept toggle card — persists the flag
+  **before** that approval pass, so a sweep landing inside it already reads the
+  session as auto-accept and does not decline the request the call is about to
+  approve. A persist that did not take effect approves nothing.
+- A flag read the parent chain cannot finish (a failed `session_info` hop) is
+  **unknown**, not "off": the request stays pending and unmarked, and the next
+  sweep retries. Reading it as off would decline the request for good, which is
+  the irreversible outcome this ADR exists to remove.
 - Every such approval is recorded at INFO with the request id, the target's
   length, the budget it crossed, and the target's first line (bounded). With no
   card, that log line is the audit record of what the session approved unseen.
@@ -48,7 +54,9 @@ decisions. It stands aside wherever no card is rendered:
   distinguishes this case.
 - A failed auto-approval reply keeps the request pending and unmarked
   (`Prepared::Retry`), so the next sweep retries it. Returning "handled" on the
-  error would retire a still-pending request with no card at all.
+  error would retire a still-pending request with no card at all. The retry
+  failure follows ADR-0048's warn-once cadence (WARN, then DEBUG for identical
+  repeats, INFO on recovery).
 - An interactive surface is unchanged: `refuse` still declines an over-budget
   target, the click-time guard still refuses to approve one, and the refusal
   copy now names the two paths that exist — ask the model to split the
