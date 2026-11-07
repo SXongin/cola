@@ -1081,6 +1081,46 @@ async fn an_untimed_newest_message_with_live_tasks_reads_waiting() {
     assert!(!line.contains("✅ 空闲"), "never a false idle: {line}");
 }
 
+/// A `/card` whose card create FAILS returns the error and records or stamps
+/// nothing: there is no card to track and no read to mark.
+#[tokio::test]
+async fn a_failed_card_create_records_and_stamps_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut platform = RecordingPlatform::new();
+    platform.fail_reply_card = true;
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(idle_read_backend()), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    let result = crate::bridge::command::handle_command(
+        &app.command_handles(),
+        crate::bridge::command::Command::Card,
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_card",
+        crate::config::ConversationKind::P2p,
+        None,
+        false,
+    )
+    .await;
+
+    assert!(result.is_err(), "the create error reaches the command");
+    let cards = app.cards_handle();
+    assert!(
+        Turn::card_message_id(&cards, "ses_test").await.is_none(),
+        "a failed create records no card"
+    );
+    assert!(
+        cards.chains.get("ses_test").is_none(),
+        "a failed create writes no Chain Record"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "the failed create left no card to stamp"
+    );
+}
+
 /// `/card` always answers: a backend that hangs its transcript read times out
 /// into the best-effort static read instead of hanging the command.
 #[tokio::test]
