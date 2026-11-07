@@ -497,7 +497,6 @@ impl RequestKind for PermissionKind {
             .get("perm_color")
             .and_then(|v| v.as_str())
             .unwrap_or("green");
-        let perm_body = value.get("perm_body").and_then(|v| v.as_str()).unwrap_or("");
 
         // "开启自动授权": turn on the session's Auto-Accept and approve the
         // current (plus any other) pending permission in one interaction — no
@@ -584,8 +583,11 @@ impl RequestKind for PermissionKind {
         // refusal (an older build's persisted card, a failed withdrawal, a
         // retry dropped at the backlog cap). The server's pending list is the
         // authority — the payload only describes what the card displayed — so
-        // the click reads the request and refuses when it cannot be shown.
+        // the click reads the request and refuses when it cannot be shown. That
+        // same read is what rebuilds the result body: the callback no longer
+        // carries it.
         let mut unshowable: Option<usize> = None;
+        let mut verified: Option<crate::backend::types::PermissionRequest> = None;
         if matches!(reply, "once" | "always")
             && let Some(dir) = directory
         {
@@ -597,10 +599,12 @@ impl RequestKind for PermissionKind {
             .await;
             match listed {
                 Some(Ok(perms)) => {
-                    if let Some(p) = perms.iter().find(|p| p.request_id == req_id)
-                        && !p.targets_are_fully_shown()
-                    {
-                        unshowable = Some(p.target_budget());
+                    if let Some(p) = perms.iter().find(|p| p.request_id == req_id) {
+                        if p.targets_are_fully_shown() {
+                            verified = Some(p.clone());
+                        } else {
+                            unshowable = Some(p.target_budget());
+                        }
                     }
                 }
                 // The target is unknown, so the approval is not verifiable:
@@ -627,6 +631,31 @@ impl RequestKind for PermissionKind {
         // button asked for: the click sought an approval the user could not
         // have reviewed.
         let reply = if unshowable.is_some() { "reject" } else { reply };
+
+        // A rejection runs no verification read (it approves nothing), so the
+        // result body names what the click showed from what cola already has:
+        // the callback's display label plus the target summary recorded when
+        // the request was rendered. An inline block records its one-line target;
+        // a standalone card records its summary. Read before `resolve_blocks`
+        // forgets either.
+        let click_target = {
+            let target = handles
+                .cards
+                .card_handles
+                .lock()
+                .await
+                .target_of(req_id)
+                .map(str::to_string);
+            match target {
+                Some(target) => Some(target),
+                None => flow
+                    .sent_cards
+                    .lock()
+                    .await
+                    .get(req_id)
+                    .map(|sent| sent.summary.clone()),
+            }
+        };
 
         // Double-click guard: the atomic claim decides who replies. A click
         // that loses the race re-serves the winning click's result; only the
@@ -735,10 +764,21 @@ impl RequestKind for PermissionKind {
         };
         let body = if let Some(budget) = unshowable {
             crate::feishu::card::question::unshowable_permission_note(budget)
-        } else if perm_body.is_empty() {
-            format!("Permission: {}", reply)
+        } else if let Some(p) = verified.as_ref() {
+            // The approval re-read the request from the server; the result card
+            // describes exactly that request, never the callback's stale copy.
+            describe_permission(p)
         } else {
-            perm_body.to_string()
+            // No verified request (a rejection, or one already gone): name what
+            // the click showed — the label it carried plus the recorded target.
+            // A standalone card's summary is the full description, so it stands
+            // alone; an inline block's target is one line and gets the label.
+            let label = if perm_label.is_empty() { reply } else { perm_label };
+            match click_target.as_deref().filter(|target| !target.is_empty()) {
+                Some(target) if target.contains('\n') => target.to_string(),
+                Some(target) => format!("{label}：{target}"),
+                None => label.to_string(),
+            }
         };
         let color = if unshowable.is_some() { "red" } else { perm_color };
         let mut r = result_card(label, color, &body);
@@ -2092,6 +2132,11 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// How much of a permission's explanatory `reason` the card shows. The reason
+/// is context, not the decision target, and it keeps its own short budget even
+/// though the target budget is much larger — the spec's fixed 150 characters.
+const PERMISSION_REASON_MAX_CHARS: usize = 150;
+
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by its inline block, so the two look and
 /// behave alike).
@@ -2113,19 +2158,18 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     {
         s.push_str(&format!(
             "**原因**: {}\n",
-            truncate(reason, crate::backend::PERMISSION_PATTERN_MAX_CHARS)
+            truncate(reason, PERMISSION_REASON_MAX_CHARS)
         ));
     }
 
     if !p.patterns.is_empty() {
         s.push_str("**对象**:\n");
-        // A command's target IS the command, so it gets the wider command
-        // budget; every other pattern is a path/grant name and keeps the short
-        // one. The permission flow proves its targets fit before offering the
-        // card (`PermissionRequest::targets_are_fully_shown`), so a clip here is
-        // only reachable on a surface that bypasses that proof — never on a
-        // button a user can approve (see `permission_target_budget`).
-        let budget = crate::backend::permission_target_budget(action);
+        // Every target shares the one display budget, charged against their
+        // SUM. The permission flow proves the sum fits before offering the card
+        // (`PermissionRequest::targets_are_fully_shown`), so a per-pattern clip
+        // here is only reachable on a surface that bypasses that proof — never
+        // on a button a user can approve.
+        let budget = crate::backend::PERMISSION_TARGET_MAX_CHARS;
         for r in &p.patterns {
             s.push_str(&format!("- `{}`\n", truncate(r, budget)));
         }
@@ -2327,13 +2371,13 @@ Index: /proj/src/main.rs
         assert!(!s.contains("\\n"), "no escaped JSON: {}", s);
     }
 
-    /// Whole-branch review #883: a command's target IS the decision, so it is
-    /// rendered at the command budget in full; a path keeps the short pattern
-    /// budget. The adapter refuses anything past the same budget, so a card
-    /// never offers an approval for text it clipped.
+    /// Every target shares ONE display budget: a command is rendered whole up
+    /// to it (not clipped at a short pattern budget), and every other action
+    /// gets the same budget. The renderer's clip is only a last resort for a
+    /// surface that bypasses the completeness proof.
     #[test]
-    fn describe_permission_renders_a_command_target_at_the_command_budget() {
-        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+    fn describe_permission_renders_a_target_at_the_one_budget() {
+        let budget = crate::backend::types::PERMISSION_TARGET_MAX_CHARS;
         let command = "x".repeat(budget);
         let p = crate::backend::types::PermissionRequest {
             request_id: "n:1".into(),
@@ -2347,19 +2391,24 @@ Index: /proj/src/main.rs
         let rendered = describe_permission(&p);
         assert!(
             rendered.contains(&command),
-            "the whole command is on the card, not a 150-char prefix"
+            "the whole command is on the card at the shared budget"
         );
         assert!(!rendered.contains('…'), "nothing was clipped: {rendered}");
 
-        // A pattern budget still holds for a non-command target: a path past
-        // 150 characters is clipped, and the adapter proves that before
-        // offering the card.
+        // The same budget applies to a path: ordinary paths are no longer
+        // clipped at the old 150-character pattern budget.
         let path = format!("/proj/{}", "d/".repeat(80));
         let mut p = p;
         p.permission = Some("write".into());
-        p.patterns = vec![path];
+        p.patterns = vec![path.clone()];
         let rendered = describe_permission(&p);
-        assert!(rendered.contains('…'), "a long path keeps the short budget");
+        assert!(rendered.contains(&path), "an ordinary path fits: {rendered}");
+        assert!(!rendered.contains('…'), "and is not clipped: {rendered}");
+
+        // Only a bypassing surface can reach the renderer's clip.
+        p.patterns = vec!["x".repeat(budget + 1)];
+        let rendered = describe_permission(&p);
+        assert!(rendered.contains('…'), "past the budget is clipped: {rendered}");
     }
 
     /// V2's `edit` records `{files: [{file, patch, status, additions,

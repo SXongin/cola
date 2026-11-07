@@ -317,7 +317,7 @@ mod tests {
         ]);
         let too_long = format!(
             "echo {}",
-            "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+            "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
         );
         backend.ask_permissions(vec![
             crate::backend::types::PermissionRequest {

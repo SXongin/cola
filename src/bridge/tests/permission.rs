@@ -69,7 +69,6 @@ async fn permission_poller_sends_card_and_card_action_replies() {
         "request_id": "per_1",
         "perm_label": "✅ 已允许一次",
         "perm_color": "green",
-        "perm_body": "bash",
     });
     let result = app.host_action(value).await;
     assert!(result.is_some());
@@ -145,7 +144,6 @@ async fn a_standalone_click_ignores_a_finished_card_in_the_map() {
             "open_message_id": standalone,
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -159,6 +157,107 @@ async fn a_standalone_click_ignores_a_finished_card_in_the_map() {
     assert!(
         !ack.contains("🔐 **权限请求**"),
         "the result card carries no live block: {ack}"
+    );
+}
+
+/// The result body is rebuilt at click time, never read from the callback. An
+/// allow click re-reads the pending request to run the completeness proof, so
+/// that same request is what the result card describes.
+#[tokio::test]
+async fn a_permission_result_card_rebuilds_its_body_from_the_verified_request() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(platform.sent_cards().await.len(), 1, "one standalone card");
+    let standalone = app
+        .permission
+        .sent_cards
+        .lock()
+        .await
+        .get("per_1")
+        .expect("the standalone card is recorded")
+        .message_id
+        .clone();
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": standalone,
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            // An older build's persisted card still carries the body; it must
+            // be ignored, not echoed into the result.
+            "perm_body": "STALE CALLBACK BODY",
+        }))
+        .await
+        .expect("a card-action result");
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains("执行 Shell 命令") && text.contains("ls -la"),
+        "the result names the request re-read from the server: {text}"
+    );
+    assert!(
+        !text.contains("STALE CALLBACK BODY"),
+        "a callback body from an older build is ignored: {text}"
+    );
+}
+
+/// A rejection runs no verification read, so its result card names what the
+/// click showed: the callback's display label (plus the block's recorded target
+/// when one is registered) — never a body echoed through the callback.
+#[tokio::test]
+async fn a_reject_result_card_names_the_callback_label_and_ignores_a_stale_body() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let standalone = app
+        .permission
+        .sent_cards
+        .lock()
+        .await
+        .get("per_1")
+        .expect("the standalone card is recorded")
+        .message_id
+        .clone();
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "reject",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": standalone,
+            "perm_label": "🚫 已拒绝",
+            "perm_color": "red",
+            "perm_body": "STALE CALLBACK BODY",
+        }))
+        .await
+        .expect("a card-action result");
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains("🚫 已拒绝"),
+        "the result names the callback label: {text}"
+    );
+    assert!(
+        !text.contains("STALE CALLBACK BODY"),
+        "a callback body from an older build is ignored: {text}"
     );
 }
 
@@ -206,7 +305,6 @@ async fn a_standalone_click_ignores_an_idle_card_in_the_map() {
             "open_message_id": standalone,
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -280,7 +378,6 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
             "request_id": "per_1",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await;
     let ack = result
@@ -334,7 +431,6 @@ async fn concurrent_permission_clicks_reply_once() {
         "request_id": "per_1",
         "perm_label": "✅ 已允许一次",
         "perm_color": "green",
-        "perm_body": "bash",
     });
 
     // Hold the guard lock, start both clicks, let them queue on it, then
@@ -382,7 +478,6 @@ async fn permission_reply_404_renders_neutral_already_handled() {
         "request_id": "per_1",
         "perm_label": "✅ 已允许一次",
         "perm_color": "green",
-        "perm_body": "bash",
     });
     let result = app.host_action(value).await.expect("a result card");
     let card = result.card.expect("standalone card").to_string();
@@ -420,7 +515,6 @@ async fn permission_reply_failure_rolls_back_so_retry_replies() {
         "request_id": "per_1",
         "perm_label": "✅ 已允许一次",
         "perm_color": "green",
-        "perm_body": "bash",
     });
     let first = app.host_action(value.clone()).await.expect("a result card");
     let first_card = first.card.expect("standalone card").to_string();
@@ -466,7 +560,6 @@ async fn second_permission_click_reserves_the_first_result() {
             "request_id": "per_1",
             "perm_label": label,
             "perm_color": "green",
-            "perm_body": "bash",
         })
     };
     let first = app
@@ -619,7 +712,6 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         "request_id": "per_aa_toggle",
         "perm_label": "✅ 已开启自动授权",
         "perm_color": "blue",
-        "perm_body": "bash",
     });
     let result = app.host_action(value).await.expect("toggle result");
     let ack = result
@@ -1459,7 +1551,6 @@ async fn click_perm(app: &Arc<App>, reply: &str, req: &str, label: &str) -> Stri
         "request_id": req,
         "perm_label": label,
         "perm_color": "green",
-        "perm_body": "bash",
     });
     app.host_action(value)
         .await
@@ -1667,7 +1758,6 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
             "request_id": "per_1",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -1928,7 +2018,6 @@ async fn permission_click_at_the_split_limit_falls_back_to_the_flushed_receipt()
             "request_id": "per_1",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -2218,7 +2307,7 @@ async fn an_over_budget_permission_is_declined_and_never_offered() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -2294,7 +2383,7 @@ async fn a_failed_decline_keeps_the_request_retryable_and_posts_nothing() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -2365,7 +2454,7 @@ async fn auto_accept_approves_an_unshowable_permission() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -2426,7 +2515,7 @@ async fn auto_accept_approves_an_unshowable_permission() {
     // length, and the budget it crossed (ADR-0048: auto-accepted is INFO).
     let line = assert_line_level(&logs, "approved permission per_long", "INFO");
     assert!(
-        line.contains("its target is 1005 characters, past the card's 1000 character budget"),
+        line.contains("its target is 3005 characters, past the card's 3000 character budget"),
         "the unseen approval names the numbers it crossed: {line}"
     );
     let expected_first_line = format!("first line: echo {}…", "x".repeat(115));
@@ -2446,7 +2535,7 @@ async fn autoaccept_on_approves_an_already_pending_unshowable_permission() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -2474,7 +2563,7 @@ async fn autoaccept_on_approves_an_already_pending_unshowable_permission() {
     );
     let line = assert_line_level(&logs, "approved permission per_long", "INFO");
     assert!(
-        line.contains("its target is 1005 characters, past the card's 1000 character budget"),
+        line.contains("its target is 3005 characters, past the card's 3000 character budget"),
         "the toggle path leaves the same audit record: {line}"
     );
 }
@@ -2488,7 +2577,7 @@ async fn autoaccept_on_with_an_unwritable_store_approves_nothing() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -2533,7 +2622,7 @@ async fn a_failed_auto_accept_of_an_unshowable_permission_is_retried() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -2610,7 +2699,7 @@ async fn an_unknown_auto_accept_flag_never_declines_an_unshowable_permission() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_session_parent("ses_child", "ses_parent");
@@ -2749,7 +2838,6 @@ async fn a_permission_toggle_that_cannot_persist_claims_nothing() {
         "directory": "/work",
         "perm_label": "✅ 已开启自动授权",
         "perm_color": "blue",
-        "perm_body": "bash",
     });
     let result = app.host_action(value).await.expect("failure result card");
 
@@ -2786,7 +2874,7 @@ async fn a_permission_toggle_whose_flag_write_fails_approves_nothing() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
@@ -2827,7 +2915,6 @@ async fn a_permission_toggle_whose_flag_write_fails_approves_nothing() {
         "directory": "/work",
         "perm_label": "✅ 已开启自动授权",
         "perm_color": "blue",
-        "perm_body": "bash",
     });
     let result = app.host_action(value).await.expect("failure result card");
 
@@ -2857,7 +2944,7 @@ async fn a_failing_auto_accept_warns_once_then_debugs_and_reports_recovery() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {

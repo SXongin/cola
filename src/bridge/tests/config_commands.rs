@@ -1142,7 +1142,7 @@ async fn autoaccept_card_write_failure_approves_nothing() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let command = format!(
         "echo {}",
-        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        "x".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![crate::backend::types::PermissionRequest {

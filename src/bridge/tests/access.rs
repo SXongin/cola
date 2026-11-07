@@ -309,7 +309,6 @@ fn permission_click() -> serde_json::Value {
         "request_id": "per_1",
         "perm_label": "✅ 已允许一次",
         "perm_color": "green",
-        "perm_body": "bash",
     })
 }
 

@@ -1341,7 +1341,6 @@ async fn supplement_split_migrates_a_pending_permission() {
             "open_message_id": "msg_reply",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");

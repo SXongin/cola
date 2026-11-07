@@ -4705,13 +4705,11 @@ impl StreamAccumulator {
                     self.directory.as_deref().unwrap_or_default(),
                 );
             }
-            // The live interaction blocks ride this tail too. A permission's
-            // body and routing triple are copied into every button's callback
-            // value (see `permission_block_estimate`), so charging only the
+            // The live interaction blocks ride this tail too. A permission
+            // block's body is charged once, and its routing triple once per
+            // button (see `permission_block_estimate`), so charging only the
             // element would let a near-budget card append a long command or a
-            // long directory past Feishu's hard limit. The command budget was
-            // raised for exactly those blocks (whole-branch review #883), which
-            // is why they are reserved here.
+            // long directory past Feishu's hard limit.
             for block in &self.interactions {
                 if let InteractionBlock::Permission(p) = block {
                     comps += crate::feishu::card::question::permission_block_components(p.always_supported);
@@ -5008,7 +5006,6 @@ impl StreamAccumulator {
                         for btn in crate::feishu::card::question::permission_buttons(
                             &p.session_id,
                             &p.request_id,
-                            &p.body,
                             &p.directory,
                             p.always_supported,
                         ) {

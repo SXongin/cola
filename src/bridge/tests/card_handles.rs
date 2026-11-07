@@ -161,7 +161,6 @@ async fn click_with_open_message_id_acks_the_cached_card() {
             "open_message_id": "om_live",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -236,7 +235,6 @@ async fn click_updates_a_non_current_card_through_its_handle() {
             "open_message_id": "om_old",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -760,7 +758,6 @@ async fn sweep_rehosts_a_pending_block_onto_the_new_turn_card() {
             "open_message_id": "om_new",
             "perm_label": "✅ 已允许一次",
             "perm_color": "green",
-            "perm_body": "bash",
         }))
         .await
         .expect("a card-action result");
@@ -1009,7 +1006,6 @@ async fn a_resolution_racing_an_in_flight_flush_is_not_resurrected() {
                 "open_message_id": "om_live",
                 "perm_label": "✅ 已允许一次",
                 "perm_color": "green",
-                "perm_body": "bash",
             }))
             .await
         })

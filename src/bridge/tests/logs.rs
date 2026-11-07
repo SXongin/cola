@@ -431,7 +431,6 @@ async fn a_permission_card_action_carries_the_session() {
         "request_id": "per_1",
         "perm_label": "✅ 已允许一次",
         "perm_color": "green",
-        "perm_body": "bash",
     });
     let (result, logs) = capture_logs(async { app.host_action(value).await }).await;
     assert!(result.is_some(), "the click settles with a result card");
