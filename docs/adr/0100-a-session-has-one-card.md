@@ -83,7 +83,11 @@ preservation); if the PATCH itself fails, the old card is left current so its
 recovery action still works and the posted read stays untracked. The check, the
 send and the current-card update run under the session's card **write lock** —
 the same lock every flush takes — so two near-simultaneous commands serialize
-and the later one stamps the card the earlier one posted.
+and the later one stamps the card the earlier one posted. A terminal card that
+still carries a **live, unanswered Permission/Question** is not supersedable at
+all: `LostContact`/`StuckPanel` can end a Turn in `Error` with the block still
+inline, so replacing it would strip the only answerable controls. `/card` posts
+the read, leaves that card current, and stamps the posted read taken over.
 
 When the read says the session is busy, or waiting on Background Tasks, **and
 the newest user message is not cola-authored**, `/card` arms the existing external

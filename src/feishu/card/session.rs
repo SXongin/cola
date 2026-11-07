@@ -3736,6 +3736,42 @@ mod tests {
         );
     }
 
+    /// With no pending request there is no pointer at all, so the read and the
+    /// follow compose the SAME body and elements (the hint difference only
+    /// exists when blocks are carried: the driver fact #1002 documents).
+    #[test]
+    fn a_no_pending_body_is_equal_for_both_drivers() {
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Busy),
+            false,
+            vec![body_message(MessageRole::User, 1_000, "问题一")],
+        );
+        let idle = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 0,
+                blocks_here: false,
+            },
+        );
+        let follow = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 0,
+                blocks_here: true,
+            },
+        );
+        assert_eq!(idle.lead_text(), follow.lead_text());
+        assert_eq!(idle.lead_elements(), follow.lead_elements());
+        assert_eq!(
+            idle.tail_elements(&mut CardMarkdown::new()),
+            follow.tail_elements(&mut CardMarkdown::new())
+        );
+    }
+
     /// A read with nothing to report composes an empty body — no status line to
     /// guess, no pointer to invent, no empty 最近对话 heading.
     #[test]

@@ -3819,7 +3819,12 @@ impl Turn {
         live.get(session_id)
             .filter(|card| {
                 let state = card.acc.card_state();
-                *state == crate::feishu::card::CardState::Idle || state.offers_recovery()
+                // A terminal card can still carry an unanswered
+                // Permission/Question (LostContact / StuckPanel end the Turn
+                // in Error). Stamping it would strip the only answerable
+                // controls, so it is not supersedable.
+                card.acc.live_request_ids().is_empty()
+                    && (*state == crate::feishu::card::CardState::Idle || state.offers_recovery())
             })
             .and_then(|card| card.card_message_id.clone())
     }
@@ -3835,11 +3840,13 @@ impl Turn {
     /// The insert is a **compare-and-swap**, not an overwrite: a card that is
     /// still running (a Turn installed before the caller took the lock, a
     /// waiting or restart-stamped chain) wins, and the read is NOT recorded.
-    /// The caller must then stamp the just-sent read as taken over, because it
-    /// is a real message in the chat that is not the Session's card.
+    /// So does a terminal card that still carries a live Permission/Question:
+    /// replacing it would strip the only answerable controls. The caller must
+    /// then stamp the just-sent read as taken over, because it is a real
+    /// message in the chat that is not the Session's card.
     /// `install_fresh_session` now takes the same write lock, so a Turn cannot
     /// slip in during a caller's post; the CAS remains the guard for a card
-    /// that was already running when the caller entered.
+    /// that was already present when the caller entered.
     ///
     /// It deliberately writes **no Chain Record** and collects no predecessor:
     /// the idle card joins no chain, so a restart's reap, a Wake and the
@@ -3858,7 +3865,10 @@ impl Turn {
         acc.mark_idle_read();
         let session = state::CardSession::new(acc, Some(card_message_id.to_string()));
         let mut live = cards.cards.lock().await;
-        if live.get(session_id).is_some_and(state::CardSession::is_running) {
+        if live
+            .get(session_id)
+            .is_some_and(|card| card.is_running() || !card.acc.live_request_ids().is_empty())
+        {
             return false;
         }
         live.insert(session_id.to_string(), session);
