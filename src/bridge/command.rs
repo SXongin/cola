@@ -1067,6 +1067,43 @@ async fn split_card_for_pull(
     .await;
 }
 
+/// The live renderer that owns `session_id`'s card, if any: the Session itself
+/// or, for a sub-task child, its nearest ancestor with a live card (the same
+/// host predicate the request sweep uses, ADR-0100). Bounded and re-checked:
+/// the walk is a server read, and a Turn that ended during it no longer owns a
+/// card, so the caller may enter the pull path only on a host that is still
+/// running.
+///
+/// `/card` must ask this before any idle/follow decision. A child mounted in a
+/// thread has no renderer of its own, so posting a child read/follow would race
+/// the sweep, which hosts the child's requests on the ancestor's card: one
+/// request would get two live blocks.
+async fn live_card_host(handles: &CommandHandles, session_id: &str, directory: &str) -> Option<String> {
+    let timeout_ms = handles
+        .external
+        .request_timeout_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let resolved = crate::bridge::bounded_call(&format!("card host ({session_id})"), timeout_ms, async {
+        Ok::<_, crate::error::BridgeError>(
+            crate::bridge::pollers::inline_host_session(
+                &handles.flow.cards,
+                &handles.flow.backend,
+                session_id,
+                Some(directory),
+            )
+            .await,
+        )
+    })
+    .await
+    .and_then(Result::ok)
+    .flatten()?;
+    if crate::bridge::turn::Turn::is_running(&handles.flow.cards, &resolved).await {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
 /// Mark a just-sent read that never became the Session's card: it stays a
 /// visible message, so it must not look current. Best effort; a failed PATCH
 /// is logged with the untracked id.
@@ -1258,12 +1295,15 @@ async fn post_idle_card(
     let cards = &handles.flow.cards;
     let write_lock = cards.write_lock(session_id).await;
     let guard = write_lock.lock().await;
-    // A renderer may have taken the Session over between the pull check and
-    // this critical section: the render-owned meaning wins, and the split is
-    // entered after the guard is released (it takes the same lock).
-    if crate::bridge::turn::Turn::is_running(cards, session_id).await {
+    // A renderer may have taken the card over between the pull check and this
+    // critical section — the Session's own, or an ancestor's for a sub-task
+    // child (the sweep hosts the child's requests there). Either way the
+    // render-owned meaning wins, and `/card` pulls that card instead of
+    // posting a second host; the split is entered after the guard is released
+    // (it takes the host's lock, never nested under this one).
+    if let Some(host) = live_card_host(handles, session_id, &directory).await {
         drop(guard);
-        split_card_for_pull(cards, session_id, message_id).await;
+        split_card_for_pull(cards, &host, message_id).await;
         return Ok(());
     }
     let previous = crate::bridge::turn::Turn::card_to_supersede(cards, session_id).await;
@@ -1976,10 +2016,19 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             };
-            let running = crate::bridge::turn::Turn::is_running(&handles.flow.cards, &session_id).await;
-            if running {
-                tracing::info!("card pull: session {session_id} live card split requested");
-                split_card_for_pull(&handles.flow.cards, &session_id, message_id).await;
+            let directory = handles
+                .flow
+                .sessions
+                .directory_for_session(&session_id)
+                .await
+                .unwrap_or_default();
+            // A live renderer owns the card — the Session's own, or an
+            // ancestor's for a sub-task child mounted in this thread. Pull
+            // that card; posting a child read/follow would race the sweep,
+            // which hosts the child's requests on the ancestor (ADR-0100).
+            if let Some(host) = live_card_host(handles, &session_id, &directory).await {
+                tracing::info!("card pull: session {session_id} live card {host} split requested");
+                split_card_for_pull(&handles.flow.cards, &host, message_id).await;
                 return Ok(());
             }
             post_idle_card(handles, &session_id, message_id).await?;

@@ -1774,6 +1774,86 @@ async fn a_card_read_that_resolves_to_a_pull_keeps_the_stop_marker() {
     );
 }
 
+/// `/card` on a sub-task child whose live renderer is an ANCESTOR must pull
+/// that ancestor's card, not post a child read/follow. The sweep hosts the
+/// child's pending request on the ancestor, so a child follow would seed a
+/// second live block for the same request (ADR-0100).
+#[tokio::test]
+async fn card_on_a_child_pulls_the_live_parent_card_instead_of_hosting_twice() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let parent = "ses_parent";
+    let child = "ses_child";
+    backend.with_session_parent(child, parent);
+    backend.ask_permission(perm_request("per_child", child, "git status"));
+    let (app, platform) = build_app(cfg, backend).await;
+
+    // The parent owns the live card; the child is the thread's adopted active
+    // Session, so `/card` resolves to the child.
+    seed_live_card(&app, parent, "父级进行中").await;
+    seed_session(&app, child, "/work").await;
+
+    send_command(&app, "/card", "msg_card").await;
+
+    let cards = app.cards_handle();
+    assert!(
+        Turn::card_message_id(&cards, child).await.is_none(),
+        "the child must not get a read/follow card of its own"
+    );
+    assert!(
+        Turn::is_running(&cards, parent).await,
+        "the parent's live card is the one `/card` pulls"
+    );
+
+    // The pull split the parent's chain: its old card is finalized and the
+    // continuation replies to the command message.
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::UpdateMessage { message_id, card }
+                if message_id == "om_live"
+                    && card_text(card).contains("部分完成，继续中")
+                    && card_text(card).contains("父级进行中")
+        )),
+        "the parent card is finalized by the pull: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_card"
+        )),
+        "the pull continuation replies to the command: {calls:?}"
+    );
+    // Nothing on the child's behalf was posted: no idle read and no follow
+    // promise, so the sweep remains the only host.
+    let replied = platform.replied_cards().await;
+    assert!(
+        replied.iter().all(|card| {
+            card["header"]["title"]["content"] != "📄 会话" && !card_text(card).contains(FOLLOW_HINT)
+        }),
+        "no child read/follow may be posted: {replied:?}"
+    );
+
+    // The sweep now hosts the child permission on the parent's live card —
+    // exactly one block, and none on a child card.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let live = Turn::live_permissions(&cards, parent).await;
+    assert_eq!(
+        live.len(),
+        1,
+        "the parent hosts the child's permission exactly once: {live:?}"
+    );
+    assert_eq!(live[0].0, "per_child");
+    assert!(
+        Turn::live_permissions(&cards, child).await.is_empty(),
+        "no second host on a child card"
+    );
+}
+
 /// `/card` with no Session mapped to the conversation has nothing to read: one
 /// text line says so and no card is created. The 「当前没有正在运行的实时卡片」
 /// notice is retired (ADR-0100) — an existing Session always answers with a
