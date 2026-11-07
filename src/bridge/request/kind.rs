@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
+use crate::backend::{PERMISSION_BODY_MAX_CHARS, PERMISSION_TARGET_MAX_CHARS};
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
 use crate::bridge::pollers::result_card;
@@ -330,7 +331,7 @@ impl RequestKind for PermissionKind {
         let PendingRequest::Permission(p) = req else {
             return Refusal::NotApplicable;
         };
-        if p.targets_are_fully_shown() {
+        if permission_fits_card(p) {
             return Refusal::NotApplicable;
         }
         // The completeness proof guards the CARD: it stops a click approving
@@ -497,6 +498,9 @@ impl RequestKind for PermissionKind {
             .get("perm_color")
             .and_then(|v| v.as_str())
             .unwrap_or("green");
+        // The label the clicked button carried, or the raw decision when a
+        // malformed/stale callback omitted it.
+        let display_label = if perm_label.is_empty() { reply } else { perm_label };
 
         // "开启自动授权": turn on the session's Auto-Accept and approve the
         // current (plus any other) pending permission in one interaction — no
@@ -600,10 +604,9 @@ impl RequestKind for PermissionKind {
             match listed {
                 Some(Ok(perms)) => {
                     if let Some(p) = perms.iter().find(|p| p.request_id == req_id) {
-                        if p.targets_are_fully_shown() {
-                            verified = Some(p.clone());
-                        } else {
-                            unshowable = Some(p.target_budget());
+                        match permission_unshowable_budget(p) {
+                            None => verified = Some(p.clone()),
+                            Some(budget) => unshowable = Some(budget),
                         }
                     }
                 }
@@ -632,37 +635,43 @@ impl RequestKind for PermissionKind {
         // have reviewed.
         let reply = if unshowable.is_some() { "reject" } else { reply };
 
-        // A rejection runs no verification read (it approves nothing), so the
-        // result body names what the click showed from what cola already has:
-        // the callback's display label plus the target summary recorded when
-        // the request was rendered. An inline block records its one-line target;
-        // a standalone card records its summary. Read before `resolve_blocks`
-        // forgets either.
-        let click_target = {
-            let target = handles
-                .cards
-                .card_handles
-                .lock()
-                .await
-                .target_of(req_id)
-                .map(str::to_string);
-            match target {
-                Some(target) => Some(target),
-                None => flow
-                    .sent_cards
-                    .lock()
-                    .await
-                    .get(req_id)
-                    .map(|sent| sent.summary.clone()),
-            }
-        };
-
         // Double-click guard: the atomic claim decides who replies. A click
         // that loses the race re-serves the winning click's result; only the
         // winner may reach the backend.
         if !flow.try_mark_answered(&handles.requests, req_id).await {
             return flow.answered_result(req_id).await;
         }
+        // A rejection runs no verification read (it approves nothing), so the
+        // result body names what the click showed from what cola already
+        // recorded: the standalone card's own summary when the click landed on
+        // it, else the inline block's one-line target. Read before
+        // `resolve_blocks` forgets either, and only when this click has no
+        // verified request to describe — an allow never needs them.
+        let clicked_body = if verified.is_none() && unshowable.is_none() {
+            let block_target = handles
+                .cards
+                .card_handles
+                .lock()
+                .await
+                .target_of(req_id)
+                .map(str::to_string);
+            let standalone = flow.sent_cards.lock().await.get(req_id).cloned();
+            let standalone_clicked = match (clicked, standalone.as_ref()) {
+                (Some(message_id), Some(sent)) => sent.message_id == message_id,
+                // No clicked-card id: a session with no live card means the
+                // click landed on the standalone surface.
+                (None, Some(_)) => !inline,
+                _ => false,
+            };
+            Some(unverified_result_body(
+                display_label,
+                standalone_clicked,
+                standalone.as_ref().map(|sent| sent.summary.as_str()),
+                block_target.as_deref(),
+            ))
+        } else {
+            None
+        };
         // Route the reply to the instance owning the session. The card
         // carries the owning directory (ADR-0010); without it the reply
         // can't be routed, so surface the failure instead of guessing at
@@ -746,12 +755,10 @@ impl RequestKind for PermissionKind {
         };
         // Result card: shows the decision, no buttons. A forced refusal says
         // why — it is not the decision the button label claimed.
-        let label = if let Some(_budget) = unshowable {
+        let label = if unshowable.is_some() {
             crate::feishu::card::question::UNSHOWABLE_PERMISSION_DECLINED_LABEL
-        } else if !perm_label.is_empty() {
-            perm_label
         } else {
-            reply
+            display_label
         };
         let toast = if unshowable.is_some() {
             "已自动拒绝：目标无法完整显示".to_string()
@@ -769,16 +776,9 @@ impl RequestKind for PermissionKind {
             // describes exactly that request, never the callback's stale copy.
             describe_permission(p)
         } else {
-            // No verified request (a rejection, or one already gone): name what
-            // the click showed — the label it carried plus the recorded target.
-            // A standalone card's summary is the full description, so it stands
-            // alone; an inline block's target is one line and gets the label.
-            let label = if perm_label.is_empty() { reply } else { perm_label };
-            match click_target.as_deref().filter(|target| !target.is_empty()) {
-                Some(target) if target.contains('\n') => target.to_string(),
-                Some(target) => format!("{label}：{target}"),
-                None => label.to_string(),
-            }
+            // No verified request (a rejection, or one already gone): the body
+            // was chosen from the surface the click landed on above.
+            clicked_body.unwrap_or_else(|| display_label.to_string())
         };
         let color = if unshowable.is_some() { "red" } else { perm_color };
         let mut r = result_card(label, color, &body);
@@ -944,8 +944,9 @@ async fn decline_unshowable(
     directory: &str,
 ) -> Refusal {
     let session_id = p.session_id.clone().unwrap_or_default();
-    let budget = p.target_budget();
-    let longest = p.longest_target_len();
+    let budget = permission_unshowable_budget(p).unwrap_or(PERMISSION_BODY_MAX_CHARS);
+    let rendered = rendered_permission_chars(p);
+    let total = p.total_target_len();
     match handles
         .backend
         .clone()
@@ -955,8 +956,8 @@ async fn decline_unshowable(
     {
         Ok(()) => {
             tracing::warn!(
-                "declined permission {} on session {session_id}: its target is {longest} \
-                 characters, past the card's {budget} character budget",
+                "declined permission {} on session {session_id}: its targets total {total} \
+                 characters (rendered content is {rendered}), past the card's {budget} character budget",
                 p.request_id
             );
             Refusal::Refused
@@ -1074,27 +1075,28 @@ async fn approve_pending_inner(
 /// length and a bounded prefix.
 const AUTO_ACCEPT_TARGET_LOG_CHARS: usize = 120;
 
-/// The record an Auto-Accept approval leaves when its target was past the card
-/// budget. Nothing was shown, so this line is the only trace of what the
-/// session approved unseen (#892): it names the request, the length that made
-/// it unshowable, and the target's first line. INFO, like every other
-/// auto-accepted transition (ADR-0048); the "unseen" wording is what sets it
-/// apart from an ordinary auto-accept.
+/// The record an Auto-Accept approval leaves when its card could not show it in
+/// full. Nothing was shown, so this line is the only trace of what the session
+/// approved unseen (#892): it names the request, the rendered length that made
+/// it unshowable (and the summed target length), and the target's first line.
+/// INFO, like every other auto-accepted transition (ADR-0048); the "unseen"
+/// wording is what sets it apart from an ordinary auto-accept.
 fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
-    if p.targets_are_fully_shown() {
+    let Some(budget) = permission_unshowable_budget(p) else {
         return;
-    }
+    };
     let first_line = p
         .longest_target()
         .map(|target| target.lines().next().unwrap_or(""))
         .unwrap_or("");
     tracing::info!(
-        "auto-accept approved permission {} on session {} unseen: its target is {} \
-         characters, past the card's {} character budget; first line: {}",
+        "auto-accept approved permission {} on session {} unseen: its rendered content is {} \
+         characters (targets total {}), past the card's {} character budget; first line: {}",
         p.request_id,
         p.session_id.as_deref().unwrap_or(""),
-        p.longest_target_len(),
-        p.target_budget(),
+        rendered_permission_chars(p),
+        p.total_target_len(),
+        budget,
         truncate(first_line, AUTO_ACCEPT_TARGET_LOG_CHARS)
     );
 }
@@ -2258,6 +2260,64 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     s
 }
 
+/// The character count of the body `describe_permission` renders, after the
+/// card's markdown sanitizer — exactly what the single card element carries.
+/// The ONE measurement both the completeness proof and the card build use.
+fn rendered_permission_chars(p: &crate::backend::types::PermissionRequest) -> usize {
+    let body = describe_permission(p);
+    crate::feishu::card::sanitize::CardMarkdown::new()
+        .clean(&body)
+        .chars()
+        .count()
+}
+
+/// The display bound a permission crosses when its card cannot show it in full:
+/// the summed target budget or the rendered-body ceiling. `None` means the card
+/// can show the whole request.
+///
+/// Measuring the renderer's own output ([`rendered_permission_chars`]) keeps the
+/// proof and the card from disagreeing about what "shown in full" means: the
+/// target budget alone would let the header, reason and metadata the renderer
+/// adds push the one element past the measured ceiling.
+pub(crate) fn permission_unshowable_budget(p: &crate::backend::types::PermissionRequest) -> Option<usize> {
+    if !p.targets_are_fully_shown() {
+        Some(PERMISSION_TARGET_MAX_CHARS)
+    } else if p.body_has_own_cap() || p.fits_rendered_body(rendered_permission_chars(p)) {
+        None
+    } else {
+        Some(PERMISSION_BODY_MAX_CHARS)
+    }
+}
+
+/// Whether a permission card can show this request in full. The one predicate
+/// every interactive surface and the Auto-Accept audit share.
+pub(crate) fn permission_fits_card(p: &crate::backend::types::PermissionRequest) -> bool {
+    permission_unshowable_budget(p).is_none()
+}
+
+/// The result body for a click that ran no verification read (a rejection).
+///
+/// The surface the click landed on decides what it showed: a standalone card
+/// contributes its own summary, an inline block its one-line receipt target
+/// under the callback's display label, and a click with neither falls back to
+/// the label. The source is chosen by surface, never by the text's shape (a
+/// heredoc target contains newlines but is still a one-line summary).
+fn unverified_result_body(
+    display_label: &str,
+    on_standalone: bool,
+    standalone_summary: Option<&str>,
+    block_target: Option<&str>,
+) -> String {
+    let summary = standalone_summary.filter(|summary| !summary.is_empty());
+    if on_standalone && let Some(summary) = summary {
+        return summary.to_string();
+    }
+    if let Some(target) = block_target.filter(|target| !target.is_empty()) {
+        return format!("{display_label}：{target}");
+    }
+    summary.map_or_else(|| display_label.to_string(), str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2371,6 +2431,44 @@ Index: /proj/src/main.rs
         assert!(!s.contains("\\n"), "no escaped JSON: {}", s);
     }
 
+    /// The result body of an unverified click (a rejection) is chosen by the
+    /// surface the click landed on, not by the text's shape: a standalone
+    /// card's summary wins even when the same request also has an inline block;
+    /// an inline click names the block target under the callback label.
+    #[test]
+    fn an_unverified_result_body_names_the_clicked_surface() {
+        assert_eq!(
+            unverified_result_body(
+                "🚫 已拒绝",
+                true,
+                Some("⚡ **执行 Shell 命令**\n- `standalone`"),
+                Some("⚡ 执行 Shell 命令 `inline`"),
+            ),
+            "⚡ **执行 Shell 命令**\n- `standalone`",
+            "the standalone card's own summary wins"
+        );
+        assert_eq!(
+            unverified_result_body(
+                "🚫 已拒绝",
+                false,
+                Some("standalone summary"),
+                Some("⚡ 执行 Shell 命令 `inline`"),
+            ),
+            "🚫 已拒绝：⚡ 执行 Shell 命令 `inline`",
+            "an inline click names the block target under the label"
+        );
+        assert_eq!(
+            unverified_result_body("🚫 已拒绝", false, Some("standalone summary"), None),
+            "standalone summary",
+            "no block target falls back to the recorded summary"
+        );
+        assert_eq!(
+            unverified_result_body("🚫 已拒绝", false, None, None),
+            "🚫 已拒绝",
+            "nothing recorded falls back to the callback label"
+        );
+    }
+
     /// Every target shares ONE display budget: a command is rendered whole up
     /// to it (not clipped at a short pattern budget), and every other action
     /// gets the same budget. The renderer's clip is only a last resort for a
@@ -2409,6 +2507,67 @@ Index: /proj/src/main.rs
         p.patterns = vec!["x".repeat(budget + 1)];
         let rendered = describe_permission(&p);
         assert!(rendered.contains('…'), "past the budget is clipped: {rendered}");
+    }
+
+    /// The card proof measures the body the renderer actually produces, so the
+    /// scaffolding counts: a bare max-budget command fits the measured element
+    /// ceiling, while the same command plus one metadata line does not.
+    #[test]
+    fn the_card_proof_charges_the_rendered_body_not_only_the_targets() {
+        let command = "x".repeat(crate::backend::PERMISSION_TARGET_MAX_CHARS);
+        let mut p = crate::backend::types::PermissionRequest {
+            request_id: "n:1".into(),
+            session_id: Some("thread-1".into()),
+            permission: Some("bash".into()),
+            patterns: vec![command],
+            metadata: None,
+            always: vec![],
+            always_supported: true,
+        };
+        let bare = rendered_permission_chars(&p);
+        assert!(
+            bare > crate::backend::PERMISSION_TARGET_MAX_CHARS,
+            "the bare body carries its scaffolding"
+        );
+        assert!(
+            bare <= crate::backend::PERMISSION_BODY_MAX_CHARS,
+            "a bare max-budget command fits the measured element ceiling: {bare}"
+        );
+        assert!(permission_fits_card(&p), "and is showable");
+
+        // A real V1 bash permission carries `metadata.command`; the extra
+        // metadata line is exactly the scaffolding the target-only proof missed.
+        p.metadata = Some(serde_json::json!({ "command": "y".repeat(200) }));
+        let with_metadata = rendered_permission_chars(&p);
+        assert!(
+            with_metadata > crate::backend::PERMISSION_BODY_MAX_CHARS,
+            "the metadata line pushes the one element past the ceiling: {with_metadata}"
+        );
+        assert!(!permission_fits_card(&p), "so the card cannot show it in full");
+        assert_eq!(
+            permission_unshowable_budget(&p),
+            Some(crate::backend::PERMISSION_BODY_MAX_CHARS),
+            "the refusal names the body ceiling it crossed"
+        );
+    }
+
+    /// The explanatory reason keeps its own short budget (150) even though the
+    /// target budget is much larger: it is context, not the decision target.
+    #[test]
+    fn describe_permission_keeps_the_reason_at_its_own_short_budget() {
+        let reason = "r".repeat(400);
+        let rendered = describe_permission(&perm(
+            "bash",
+            serde_json::json!({ "reason": reason, "cwd": "/work" }),
+        ));
+        assert!(
+            rendered.contains(&format!("**原因**: {}…", "r".repeat(150))),
+            "the reason is clipped at its own budget: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&"r".repeat(151)),
+            "no reason text survives past 150 characters: {rendered}"
+        );
     }
 
     /// V2's `edit` records `{files: [{file, patch, status, additions,

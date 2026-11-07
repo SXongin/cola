@@ -24,7 +24,9 @@ use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
     vanished_receipt,
 };
-use super::kind::{PendingRequest, Prepared, Refusal, RequestKind, permission_target};
+use super::kind::{
+    PendingRequest, Prepared, Refusal, RequestKind, permission_target, permission_unshowable_budget,
+};
 
 /// One question request's captured reply inputs (spec #364, S6): the request's
 /// fields and the index-aligned per-field answer slots (`answers[i]` is `None`
@@ -194,7 +196,8 @@ async fn post_unshowable_notice(
     directory: &str,
 ) {
     let session_id = p.session_id.as_deref().unwrap_or("");
-    let card = crate::feishu::card::question::build_unshowable_permission_card(p.target_budget());
+    let budget = permission_unshowable_budget(p).unwrap_or(crate::backend::PERMISSION_BODY_MAX_CHARS);
+    let card = crate::feishu::card::question::build_unshowable_permission_card(budget);
     match resolve_card_target(
         &handles.sessions,
         &handles.cards,
@@ -1604,7 +1607,9 @@ impl RequestFlow {
         let standalone = self.sent_cards.lock().await.get(req.id()).cloned();
         let card = match (how, &standalone) {
             (Withdrawal::Refused, _) => {
-                crate::feishu::card::question::build_unshowable_permission_card(p.target_budget())
+                let budget =
+                    permission_unshowable_budget(p).unwrap_or(crate::backend::PERMISSION_BODY_MAX_CHARS);
+                crate::feishu::card::question::build_unshowable_permission_card(budget)
             }
             (Withdrawal::ResolvedElsewhere, Some(sent)) => {
                 crate::feishu::card::notify::build_resolved_elsewhere_card(self.kind.label(), &sent.summary)

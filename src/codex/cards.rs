@@ -3869,6 +3869,27 @@ async fn a_profile_with_a_hidden_grant_is_declined() {
         Some(json!({ "permissions": {} })),
         "an overlong path is never granted"
     );
+    // Two paths that each fit can still overflow the one element together; the
+    // adapter's gate is summed, like the bridge's proof.
+    server.request_to_subscribers(
+        THREAD,
+        "item/permissions/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-3",
+            "itemId": "item-3",
+            "cwd": WORK,
+            "permissions": {
+                "fileSystem": { "write": ["a".repeat(2_000), "b".repeat(2_000)] }
+            }
+        }),
+    );
+    server.wait_for_server_request_replies(3).await;
+    assert_eq!(
+        server.server_request_replies()[2].result,
+        Some(json!({ "permissions": {} })),
+        "two individually-fitting paths are never granted as a summed over-budget grant"
+    );
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
         !platform

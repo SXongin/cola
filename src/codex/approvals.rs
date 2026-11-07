@@ -1108,15 +1108,13 @@ const PROFILE_UNEXPRESSIBLE: &str = "the requested permission profile has a gran
 /// A requested path/glob whose rendered form would be truncated by the card.
 const PROFILE_TOO_LONG: &str = "a requested permission path is longer than the card can show";
 
-/// Whether the card renders this pattern in full (the shared target budget; the
-/// bridge's summed proof covers the whole request).
-fn pattern_fits(rendered: &str) -> bool {
-    rendered.chars().count() <= PERMISSION_TARGET_MAX_CHARS
-}
-
 /// Whether the card can render every part of a requested permission profile.
 /// `permission_patterns` is the renderer; this is its completeness proof, so an
 /// `once` grant can echo the profile without hiding a field.
+///
+/// The budget is charged against the **sum** of the rendered patterns, exactly
+/// like the bridge's `targets_are_fully_shown`: two paths that each fit can
+/// still overflow the one element the card renders them in.
 fn expressible_permission_profile(profile: &Value) -> std::result::Result<(), Decode> {
     let Some(object) = profile.as_object() else {
         return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
@@ -1128,6 +1126,13 @@ fn expressible_permission_profile(profile: &Value) -> std::result::Result<(), De
             _ if value.is_null() => {}
             _ => return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE)),
         }
+    }
+    let total: usize = permission_patterns(profile)
+        .iter()
+        .map(|pattern| pattern.chars().count())
+        .sum();
+    if total > PERMISSION_TARGET_MAX_CHARS {
+        return Err(Decode::CannotExpress(PROFILE_TOO_LONG));
     }
     Ok(())
 }
@@ -1141,8 +1146,8 @@ fn expressible_file_system(value: &Value) -> std::result::Result<(), Decode> {
     };
     for (key, value) in file_system {
         match key.as_str() {
-            "read" => expressible_path_array(value, "read")?,
-            "write" => expressible_path_array(value, "write")?,
+            "read" => expressible_path_array(value)?,
+            "write" => expressible_path_array(value)?,
             "entries" => expressible_entries(value)?,
             _ if value.is_null() => {}
             _ => return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE)),
@@ -1151,7 +1156,7 @@ fn expressible_file_system(value: &Value) -> std::result::Result<(), Decode> {
     Ok(())
 }
 
-fn expressible_path_array(value: &Value, prefix: &str) -> std::result::Result<(), Decode> {
+fn expressible_path_array(value: &Value) -> std::result::Result<(), Decode> {
     if value.is_null() {
         return Ok(());
     }
@@ -1159,11 +1164,8 @@ fn expressible_path_array(value: &Value, prefix: &str) -> std::result::Result<()
         return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
     };
     for path in paths {
-        let Some(path) = path.as_str() else {
+        if !path.is_string() {
             return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
-        };
-        if !pattern_fits(&format!("{prefix}: {path}")) {
-            return Err(Decode::CannotExpress(PROFILE_TOO_LONG));
         }
     }
     Ok(())
@@ -1183,9 +1185,9 @@ fn expressible_entries(value: &Value) -> std::result::Result<(), Decode> {
         if entry.keys().any(|key| !matches!(key.as_str(), "access" | "path")) {
             return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
         }
-        let Some(access) = entry.get("access").and_then(Value::as_str) else {
+        if entry.get("access").and_then(Value::as_str).is_none() {
             return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
-        };
+        }
         let Some(path) = entry.get("path").and_then(Value::as_object) else {
             return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
         };
@@ -1200,11 +1202,8 @@ fn expressible_entries(value: &Value) -> std::result::Result<(), Decode> {
         if path.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
         }
-        let Some(path_value) = path.get(value_key).and_then(Value::as_str) else {
+        if path.get(value_key).and_then(Value::as_str).is_none() {
             return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
-        };
-        if !pattern_fits(&format!("{access}: {path_value}")) {
-            return Err(Decode::CannotExpress(PROFILE_TOO_LONG));
         }
     }
     Ok(())
@@ -2151,6 +2150,34 @@ mod tests {
             !permission.targets_are_fully_shown(),
             "the neutral proof reports what the bridge acts on"
         );
+    }
+
+    /// Two paths that each fit the target budget can still overflow the one
+    /// element the card renders them in: the adapter's expressibility gate is
+    /// summed, exactly like the bridge's `targets_are_fully_shown`, so it fires
+    /// `PROFILE_TOO_LONG` instead of letting the bridge refuse a card later.
+    #[test]
+    fn a_profile_with_two_paths_over_the_summed_budget_is_refused() {
+        let path = "a".repeat(2_000);
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "cwd": "/work/cola",
+            "permissions": {
+                "fileSystem": { "write": [path.clone(), path] }
+            }
+        });
+        match decode_request(
+            "item/permissions/requestApproval",
+            &params,
+            &Projections::default(),
+            &pinned_decisions(),
+        ) {
+            Err(Decode::CannotExpress(PROFILE_TOO_LONG)) => {}
+            Err(other) => panic!("expected the summed path refusal, got {other:?}"),
+            Ok(_) => panic!("two 2,000-char paths exceed the 3,000-char sum"),
+        }
     }
 
     /// The legacy family is subject to the same neutral proof: its target is
