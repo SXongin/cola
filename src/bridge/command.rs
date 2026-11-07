@@ -1399,6 +1399,11 @@ async fn post_idle_card(
         }
         return Ok(());
     }
+    // The idle read owes the same cancellation ending as the follow branch:
+    // the previous read is about to be stamped, so a cancellation before
+    // `record_idle_card` must still mark the just-sent read — otherwise the
+    // old read stays current while the new one looks current too.
+    let mut untracked = UntrackedReadOnCancel::new(cards, session_id, &sent, &card);
     // Neutralise the old card BEFORE the map switch, for the same reason as the
     // follow branch: a failed stamp keeps the old read current instead of
     // recording a second unmarked card.
@@ -1412,6 +1417,7 @@ async fn post_idle_card(
             // The old read stays current; the just-sent read is visibly
             // superseded so a third `/card` cannot mistake it for current.
             mark_untracked_read(cards, session_id, &sent, &card).await;
+            untracked.disarm();
             tracing::warn!(
                 "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
                 previous
@@ -1426,9 +1432,11 @@ async fn post_idle_card(
     let recorded = crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await;
     drop(guard);
     if recorded {
+        untracked.disarm();
         tracing::info!("card read: session {session_id} idle Session Card posted");
     } else {
         mark_untracked_read(cards, session_id, &sent, &card).await;
+        untracked.disarm();
         tracing::info!(
             "card read: session {session_id} the old card kept the session during the read; the posted read is stamped"
         );
