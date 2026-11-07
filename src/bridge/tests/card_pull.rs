@@ -1953,12 +1953,12 @@ async fn card_on_a_child_pulls_the_live_parent_card_instead_of_hosting_twice() {
     );
 }
 
-/// `/card` on a child whose live renderer appears MID-SEND must not arm a
-/// follow: the sweep would host the child's pending request on the ancestor,
-/// so the follow's seed would add a second live block. The just-sent read is
-/// stamped taken over and the ancestor is pulled instead.
+/// A sub-task child NEVER arms its own follow (ADR-0100): its run is rendered
+/// by the parent's card, and its pending requests surface through the sweep. A
+/// busy child with no live ancestor therefore gets the static read — no
+/// render-owned card, no Chain Record, no seed.
 #[tokio::test]
-async fn a_child_follow_does_not_arm_when_an_ancestor_host_installs_during_the_send() {
+async fn a_subtask_child_card_posts_a_static_read_and_never_follows() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1968,120 +1968,58 @@ async fn a_child_follow_does_not_arm_when_an_ancestor_host_installs_during_the_s
     seed_session(&app, child, "/work").await;
     platform.given_reply_id("om_child_read");
 
-    // Park `/card` in the child read's send; the parent's live card appears
-    // while the child's lock is held.
-    let (entered, release) = platform.pause("reply", "msg_card");
-    let app2 = app.clone();
-    let command = tokio::spawn(async move {
-        app2.handle_message(incoming(
-            "msg_card".into(),
-            "chat_1".into(),
-            "p2p".into(),
-            None,
-            "/card".into(),
-            None,
-        ))
-        .await;
-    });
-    entered.notified().await;
-    seed_live_card(&app, parent, "父级进行中").await;
-    release.notify_one();
-    command.await.unwrap();
+    send_command(&app, "/card", "msg_card").await;
 
     let cards = app.cards_handle();
-    assert!(
-        !Turn::has_card(&cards, child).await,
-        "the follow must not arm a child card once the ancestor is live"
-    );
-    assert!(
-        Turn::is_running(&cards, parent).await,
-        "the parent's live card stays the host"
-    );
-    let stamped = patches_to(&platform, "om_child_read").await;
-    assert!(
-        stamped
-            .last()
-            .is_some_and(|card| card_text(card).contains("已由新卡片接管")),
-        "the sent child read must be stamped taken over: {stamped:?}"
-    );
-    let finalized = patches_to(&platform, "om_live").await;
-    assert!(
-        finalized
-            .iter()
-            .any(|card| card_text(card).contains("部分完成，继续中")),
-        "the parent card is pulled instead: {finalized:?}"
-    );
-
-    let mut seen = std::collections::HashSet::new();
-    app.permission.sweep(&app.flow_handles(), &mut seen).await;
-    let live = Turn::live_permissions(&cards, parent).await;
     assert_eq!(
-        live.len(),
-        1,
-        "the parent hosts the child's permission exactly once: {live:?}"
+        Turn::card_message_id(&cards, child).await.as_deref(),
+        Some("om_child_read"),
+        "the child answers with the static read"
     );
-    assert_eq!(live[0].0, "per_1");
+    assert_eq!(
+        Turn::card_state(&cards, child).await,
+        Some(CardState::Idle),
+        "the child card is a one-shot read, never a follow"
+    );
     assert!(
-        Turn::live_permissions(&cards, child).await.is_empty(),
-        "no second host on a child card"
+        cards.chains.get(child).is_none(),
+        "a static read joins no Chain Record"
+    );
+    assert!(
+        !Turn::has_interaction_in(&cards, child, "per_1").await,
+        "the read must not seed the pending"
+    );
+    let replied = platform.replied_cards().await;
+    assert_eq!(replied.len(), 1, "exactly the static read is posted: {replied:?}");
+    assert!(
+        !card_text(&replied[0]).contains(FOLLOW_HINT),
+        "the read promises no updates: {replied:?}"
     );
 }
 
-/// An inconclusive post-send host probe (a hung `session_info`) must not arm
-/// the follow either: a host may exist, so the read stays static and the sweep
-/// remains the only host.
+/// A parent Turn that installs AFTER `/card` on a child cannot create a second
+/// host: the child never armed a follow, so the sweep is the only surface and
+/// puts the pending on the parent exactly once.
 #[tokio::test]
-async fn an_inconclusive_host_probe_after_the_send_keeps_the_child_read_static() {
+async fn a_parent_installed_after_a_child_card_gets_the_pending_from_the_sweep_only() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let parent = "ses_parent";
     let child = "ses_child";
-    let backend = Arc::new(busy_child_backend(parent, child));
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
-    app.external
-        .request_timeout_ms
-        .store(100, std::sync::atomic::Ordering::Relaxed);
+    let (app, platform) = build_app(cfg, busy_child_backend(parent, child)).await;
     seed_session(&app, child, "/work").await;
     platform.given_reply_id("om_child_read");
 
-    let (entered, release) = platform.pause("reply", "msg_card");
-    let app2 = app.clone();
-    let command = tokio::spawn(async move {
-        app2.handle_message(incoming(
-            "msg_card".into(),
-            "chat_1".into(),
-            "p2p".into(),
-            None,
-            "/card".into(),
-            None,
-        ))
-        .await;
-    });
-    entered.notified().await;
-    // The parent becomes live AND the post-send walk wedges: the probe must be
-    // unknown, never "no host".
+    // The child's `/card` is already a static read; the parent Turn installs
+    // afterwards, exactly the window the old follow race exploited.
+    send_command(&app, "/card", "msg_card").await;
     seed_live_card(&app, parent, "父级进行中").await;
-    backend.hang_session_info_reads(1);
-    release.notify_one();
-    command.await.unwrap();
-
-    let cards = app.cards_handle();
-    assert!(
-        !Turn::has_card(&cards, child).await,
-        "an unknown host must not arm a child follow"
-    );
-    let stamped = patches_to(&platform, "om_child_read").await;
-    assert!(
-        stamped
-            .last()
-            .is_some_and(|card| card_text(card).contains("已由新卡片接管")),
-        "the sent child read must be stamped taken over: {stamped:?}"
-    );
 
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let cards = app.cards_handle();
     let live = Turn::live_permissions(&cards, parent).await;
     assert_eq!(
         live.len(),
@@ -2091,7 +2029,11 @@ async fn an_inconclusive_host_probe_after_the_send_keeps_the_child_read_static()
     assert_eq!(live[0].0, "per_1");
     assert!(
         Turn::live_permissions(&cards, child).await.is_empty(),
-        "no second host on a child card"
+        "the child card carries no second block"
+    );
+    assert!(
+        !Turn::has_interaction_in(&cards, child, "per_1").await,
+        "the child read never seeds the pending"
     );
 }
 
