@@ -797,8 +797,12 @@ async fn sub_attach_already_active_child_is_idempotent() {
 
     let text = platform.texts().await.join("\n");
     assert!(
-        text.contains("Already active: \"重写渲染\""),
+        text.contains("已接管「重写渲染」"),
         "the idempotent reply names the child's real title: {text}"
+    );
+    assert!(
+        text.contains(crate::feishu::card::session::IDLE_CHIP),
+        "the idempotent reply carries the shared status line: {text}"
     );
     assert!(
         platform.replied_cards().await.is_empty(),
@@ -816,8 +820,8 @@ async fn sub_attach_already_active_child_is_idempotent() {
 
 /// The already-active fallback is only for a server-reported CHILD: naming the
 /// Active Session when it is a ROOT is out of scope, so it takes the non-child
-/// refusal — never "Already active", never a write (the scope gate is not
-/// bypassable by the one session every chat has).
+/// refusal — never the idempotent adoption line, never a write (the scope gate
+/// is not bypassable by the one session every chat has).
 #[tokio::test]
 async fn sub_attach_naming_the_active_root_is_refused() {
     let _wd = test_work_dir();
@@ -845,7 +849,7 @@ async fn sub_attach_naming_the_active_root_is_refused() {
             "query {query}: the active root is refused as out of scope: {text}"
         );
         assert!(
-            !text.contains("Already active"),
+            !text.contains("已接管"),
             "query {query}: an active root is not an idempotent child takeover: {text}"
         );
         assert!(
