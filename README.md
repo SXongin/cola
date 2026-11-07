@@ -236,7 +236,8 @@ To detach from the terminal instead:
   cwd, the merged output, the exit code and the elapsed time. `/run` on its own
   pulls that card back to the newest position.
 - **As many sessions as you have tasks.** `/new`, `/dir <path>`, `/switch` to
-  adopt a session started elsewhere (with a snapshot of what is pending), `/sub`
+  adopt a session started elsewhere (one line confirming the takeover and its
+  status), `/sub`
   for the subagents a turn spawned, and `/status` for the current model, the
   next-message pick and a summary. With OpenCode the Shared Store is shared with
   the CLI and OpenChamber; with Codex, a TUI attached to the same app-server

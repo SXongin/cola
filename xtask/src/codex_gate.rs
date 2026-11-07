@@ -439,31 +439,32 @@ mod tests {
             workflow.contains("model: ${{ env.GATE_MODEL }}"),
             "the Codex step must read the shared model"
         );
-        // The VALUES move with the workflow's own comment (they are provider
+        // The DEFAULTS move with the workflow's own comment (they are provider
         // configuration, not an ADR pin), and this pins them so a revert cannot
         // leave the suite green: the gate's endpoint, its model, and the ONE
         // secret both halves read — a preflight on one key with the action on
-        // another would pass the check and 401 only when Codex runs.
+        // another would pass the check and 401 only when Codex runs. The
+        // repository `vars` override the defaults, so the provider can be
+        // switched from settings without editing the workflow.
         assert!(
-            workflow.contains("\n      GATE_ENDPOINT: https://opencode.ai/zen/go/v1/responses\n"),
-            "the gate's endpoint must be OpenCode Go's Responses endpoint"
+            workflow
+                .contains("GATE_ENDPOINT: ${{ vars.GATE_ENDPOINT || 'https://api.deepseek.com/responses' }}"),
+            "the gate's default endpoint must be DeepSeek's Responses API, overridable by vars.GATE_ENDPOINT"
         );
         assert!(
-            workflow.contains("\n      GATE_MODEL: gpt-6-luna\n"),
-            "the gate's model must be gpt-6-luna"
+            workflow.contains("GATE_MODEL: ${{ vars.GATE_MODEL || 'deepseek-flash' }}"),
+            "the gate's default model must be deepseek-flash, overridable by vars.GATE_MODEL"
         );
-        let secret_reads = workflow.matches("secrets.OPENCODE_API_KEY").count();
+        let key_reads = workflow
+            .matches("secrets.GATE_KEY || secrets.DEEPSEEK_API_KEY")
+            .count();
         assert_eq!(
-            secret_reads, 2,
-            "the preflight and the action must read the same secret"
+            key_reads, 2,
+            "the preflight and the action must read the same key (GATE_KEY, else DEEPSEEK_API_KEY)"
         );
         assert!(
-            workflow.contains("OPENCODE_API_KEY is empty"),
-            "the empty-key message must name the secret it wants"
-        );
-        assert!(
-            !workflow.contains("secrets.DEEPSEEK_API_KEY"),
-            "no step may still read the retired DeepSeek key"
+            workflow.contains("GATE_KEY (or DEEPSEEK_API_KEY) is empty"),
+            "the empty-key message must name the secrets it wants"
         );
         // The action's `drop-sudo` fails on the ubuntu-26.04 image (2026-11-01),
         // so the job runs on the image that still works.
@@ -509,12 +510,12 @@ mod tests {
             seen.contains("Authorization: Bearer test-key"),
             "the step must send the workflow's key"
         );
-        // The Go lane rejects a request without a session header, so the probe
-        // must carry it (measured: 400 `MissingSessionID` without one).
+        // The probe is a plain Responses call: no lane-specific header. The Go
+        // lane's `x-opencode-session` was dropped with the DeepSeek default,
+        // and a hard-coded lane header would break the next provider switch.
         assert!(
-            seen.to_lowercase()
-                .contains("x-opencode-session: cola-codex-gate-preflight"),
-            "the Go lane rejects a request without a session header: {seen}"
+            !seen.to_lowercase().contains("x-opencode-session"),
+            "the probe must send only what the endpoint needs: {seen}"
         );
         for field in [
             r#""model":"test-model""#,
@@ -531,7 +532,7 @@ mod tests {
         let log = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "an empty key must fail the step");
         assert!(
-            log.contains("OPENCODE_API_KEY is empty"),
+            log.contains("GATE_KEY (or DEEPSEEK_API_KEY) is empty"),
             "the step must name the missing secret: {log}"
         );
     }
@@ -618,13 +619,15 @@ mod tests {
         //
         // The step cap was raised from 12 to 30 minutes so a large diff plus
         // its embedded linked issues can finish (a 44-commit PR timed out at
-        // 12m15s); it stays well inside the job's own cap, which is what
-        // keeps a hang from burning the job.
+        // 12m15s), then to 45 for an 18k-line spec branch whose review needed
+        // more than 30 (2026-11-07: a run produced no output at the old cap);
+        // it stays well inside the job's own cap, which is what keeps a hang
+        // from burning the job.
         let codex = step(&workflow, "Run Codex (read-only)");
         for needle in [
             "bdf19a4a223ec2549a3e2274a0cf61556bc07675", // v1.13: bounds #150/#169's stdio hang
             "continue-on-error: true",
-            "timeout-minutes: 30",
+            "timeout-minutes: 45",
         ] {
             assert!(codex.contains(needle), "the Codex step must keep {needle}");
         }

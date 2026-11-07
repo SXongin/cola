@@ -1,6 +1,11 @@
 use serde_json::json;
 
-use super::shell::card_shell;
+use crate::backend::{MessageRole, TailEntry, TailMessage};
+use crate::bridge::snapshot::SnapshotData;
+
+use super::CardState;
+use super::sanitize::CardMarkdown;
+use super::shell::{CardBuilder, card_shell};
 
 /// The `/switch` card's list scope (ADR-0022). `Directory` filters the list to
 /// the active session's directory (the card's default view); `All` shows the
@@ -30,12 +35,12 @@ impl SwitchScope {
     }
 }
 
-/// The list state a `/switch`-card adoption carries onto its Session Snapshot
-/// (ADR-0052): the list's thread plus its active keyword/scope/page. The
-/// snapshot's optional 「返回列表」 button rebuilds exactly this filtered
-/// window, so an adoption that turns out wrong returns to the page it came
-/// from. Every other snapshot source has no list to return to and passes
-/// `None`.
+/// The list state a `/switch`-card adoption carries onto its compact 已切换
+/// state card (ADR-0052, ADR-0100): the list's thread plus its active
+/// keyword/scope/page. The card's optional 「返回列表」 button rebuilds exactly
+/// this filtered window, so an adoption that turns out wrong returns to the
+/// page it came from. Every other adoption source has no list to return to and
+/// passes `None`.
 #[derive(Clone)]
 pub struct BackToList {
     pub thread_key: crate::config::ThreadKey,
@@ -45,7 +50,7 @@ pub struct BackToList {
 }
 
 /// The 「返回列表」 button (ADR-0052) shared by the force-confirm card and the
-/// adopt snapshot: a standalone schema-2.0-safe button whose `op: "back"`
+/// compact 已切换 card: a standalone schema-2.0-safe button whose `op: "back"`
 /// rebuilds the `/switch` list with this filter and page.
 pub(crate) fn back_to_list_button(back: &BackToList) -> serde_json::Value {
     json!({
@@ -62,6 +67,48 @@ pub(crate) fn back_to_list_button(back: &BackToList) -> serde_json::Value {
             "page": back.page,
         },
     })
+}
+
+/// A session's display title: the cleaned session label, falling back to the
+/// id tail when the label is empty. Shared by the compact switch-list state
+/// card, a text adoption's one-line confirmation, and the busy follow's static
+/// identity line.
+pub(crate) fn display_title(title: &str, session_id: &str) -> String {
+    let label = crate::feishu::card::clean_session_label(title);
+    if label.is_empty() {
+        crate::bridge::display::id_tail(session_id)
+    } else {
+        label
+    }
+}
+
+/// Build the compact switch-list adoption state card (ADR-0100): every
+/// 接管/切换 click on the `/switch` card patches the clicked list card in place
+/// to this small 已切换 confirmation — no Session Snapshot is posted on an
+/// adoption, and the ack must not post a second message. The card and the
+/// toast carry the SAME 已切换 verb (ADR-0052 records this compact state), so
+/// the two never disagree.
+///
+/// It carries no status chip, no tail and no pending blocks: the list card has
+/// no room for them, and the text adoption surfaces are where a status summary
+/// lives (they have no list to return to). `back` is the `/switch`-list state
+/// the adoption came from: it renders the optional 「返回列表」 button
+/// (ADR-0052) with the same behavior as the force-confirm card's.
+pub fn build_switched_state_card(
+    title: &str,
+    session_id: &str,
+    directory: &str,
+    back: Option<&BackToList>,
+) -> serde_json::Value {
+    let title = display_title(title, session_id);
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": format!("已切换到该会话（目录 `{directory}`）。")
+    })];
+    if let Some(back) = back {
+        elements.push(back_to_list_button(back));
+    }
+    card_shell(&format!("已切换 {title}"), "blue", elements)
 }
 
 /// One session entry of the `/switch` card: a full-width text row followed by
@@ -1384,6 +1431,502 @@ fn browse_entry_button(thread_key: &crate::config::ThreadKey) -> serde_json::Val
             "thread_id": thread_key.thread_id,
         },
     })
+}
+
+// ---------------------------------------------------------------------------
+// The Session Card body (ADR-0100)
+// ---------------------------------------------------------------------------
+
+/// The update promise a FOLLOWED card's IDENTITY line carries (ADR-0028,
+/// ADR-0100): the follow streams the in-flight turn into the card, or the wait
+/// is served in place and resumed by its completion Wake. It is deliberately
+/// not part of the shared body (#1002) — the one-shot read renders the same
+/// body without it, because nothing would deliver on the promise.
+pub(crate) const FOLLOW_HINT: &str = "有新进展会自动更新";
+
+/// The busy run-state chip (ADR-0028). Tests assert this constant so a copy
+/// tweak lives in one place.
+pub(crate) const BUSY_CHIP: &str = "⚙️ 运行中";
+
+/// The 等待后台任务 chip (#586, ADR-0059): the adopted Session's Execution has
+/// ended while Background Tasks are still live, so the card follows the wait
+/// instead of reporting 空闲 — the card yields ⏳ with the ledger, and the
+/// completion Wake resumes it in place.
+pub(crate) const WAITING_BACKGROUND_CHIP: &str = "⏳ 等待后台任务";
+
+/// The retry run-state chip.
+pub(crate) const RETRY_CHIP: &str = "🔁 需要重试";
+
+/// The idle run-state chip.
+pub(crate) const IDLE_CHIP: &str = "✅ 空闲";
+
+/// The 等待你的确认 chip, shown when the session has a pending request — the
+/// Host's action beats the server's run state.
+pub(crate) const WAITING_CHIP: &str = "⏳ 等待你的确认";
+
+/// The status arm a read resolves to (ADR-0100 precedence
+/// 等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲). One predicate, so every
+/// driver of the status line sees the same table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusArm {
+    Pending,
+    Waiting,
+    Busy,
+    Retry,
+    Idle,
+}
+
+impl StatusArm {
+    /// Resolve the read's facts once. `waiting` is the gather's ADR-0059 fact
+    /// (server-idle with live Background Tasks, #586) — it names the wait even
+    /// though the server reads idle. `None` when there is no status to report —
+    /// the line is omitted rather than guessed.
+    fn resolve(
+        has_pending: bool,
+        waiting: bool,
+        status: Option<crate::backend::types::SessionStatus>,
+    ) -> Option<Self> {
+        if has_pending {
+            return Some(Self::Pending);
+        }
+        if waiting {
+            return Some(Self::Waiting);
+        }
+        match status {
+            Some(crate::backend::types::SessionStatus::Busy) => Some(Self::Busy),
+            Some(crate::backend::types::SessionStatus::Retry) => Some(Self::Retry),
+            Some(crate::backend::types::SessionStatus::Idle) => Some(Self::Idle),
+            None => None,
+        }
+    }
+
+    fn chip(self) -> &'static str {
+        match self {
+            Self::Pending => WAITING_CHIP,
+            Self::Waiting => WAITING_BACKGROUND_CHIP,
+            Self::Busy => BUSY_CHIP,
+            Self::Retry => RETRY_CHIP,
+            Self::Idle => IDLE_CHIP,
+        }
+    }
+}
+
+/// The status chip for a session's state, WITHOUT any update promise: a
+/// one-shot read and a text confirmation have no renderer to deliver one. The
+/// same chip feeds the busy follow's body too — its promise lives in the
+/// identity line, never in the shared body (ADR-0100, #1002).
+pub(crate) fn status_chip(
+    has_pending: bool,
+    waiting: bool,
+    status: Option<crate::backend::types::SessionStatus>,
+) -> Option<String> {
+    StatusArm::resolve(has_pending, waiting, status).map(|arm| arm.chip().to_string())
+}
+
+/// What a driver does with the pending requests a Session Snapshot read
+/// carries, as the body needs it (ADR-0100). It carries ONE fact: the count of
+/// requests THIS card carries, which is all the count-only pointer names. The
+/// status line's 等待你的确认 is deliberately NOT derived from it — that asks the
+/// READ ([`read_has_pending`]), so a driver that leaves a request to its own
+/// card (the busy follow's `is_already_surfaced` filter, #1005) still reports
+/// the wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingFacts {
+    /// The requests this card counts: a follow's seeded blocks, or the count
+    /// an idle read points at.
+    pub(crate) on_card: usize,
+    /// Whether those requests' own blocks ride this card. A one-shot read
+    /// carries none, so its pointer must name where they do live
+    /// (「见原卡片」); a follow seeds the blocks it counts, so its pointer is
+    /// hint-free.
+    pub(crate) blocks_here: bool,
+}
+
+/// Whether the READ has a request waiting on the Host — the status line's
+/// top precedence, independent of what a driver carries (ADR-0100: the
+/// Host's request outranks the run state, even when the driver leaves that
+/// request to its own surface). Filtered to this session so a sibling's request
+/// can never make the card claim a wait it cannot show.
+fn read_has_pending(data: &SnapshotData) -> bool {
+    data.pending.iter().any(|req| req.session_id() == data.session_id)
+}
+
+/// The 最近对话 section's heading.
+const TAIL_HEADING: &str = "**最近对话**";
+
+/// A tail message that carries nothing to show, in both presentations.
+const EMPTY_MESSAGE: &str = "（空消息）";
+
+/// One message's body as both presentations render it: a body with no
+/// non-whitespace content is the empty-message line, so the folded panel and the
+/// live lead cannot disagree on whether the entry is empty.
+fn tail_body(message: &TailMessage) -> String {
+    let body = message.body_text();
+    if body.trim().is_empty() {
+        EMPTY_MESSAGE.to_string()
+    } else {
+        body
+    }
+}
+
+/// The visible line naming the OLDEST tail entries a one-shot card's budget
+/// could not carry (issue #726). Shared by both presentations so the card and
+/// the live lead cannot word the degradation differently.
+fn omitted_tail_notice(omitted: usize) -> String {
+    format!("…更早的 {omitted} 条记录已省略（超出单卡容量）")
+}
+
+/// The live lead's text form for one Compaction marker: the same title the
+/// card's panel header carries, then the summary the panel folds. The prefix
+/// distinguishes a marker row from a message body in the text form, and the
+/// content comes from the SAME helpers the card's panel uses, so the two
+/// drivers cannot word the same read differently (#1002).
+pub(crate) const LEAD_COMPACTION_PREFIX: &str = "🗜 ";
+
+fn lead_compaction_text(compaction: &crate::backend::Compaction) -> String {
+    let mut text = format!(
+        "{LEAD_COMPACTION_PREFIX}{}",
+        crate::feishu::card::compaction::compaction_title(compaction)
+    );
+    if let Some(chunks) = crate::feishu::card::compaction::compaction_fold_body(compaction) {
+        text.push('\n');
+        text.push_str(&chunks.concat());
+    }
+    text
+}
+
+/// One Session Card body composed ONCE from a Session Snapshot read (ADR-0100):
+/// the status line, the count-only pending pointer, and the 最近对话 tail. The
+/// idle card renders it and the busy follow hands it to the external renderer's
+/// static lead, so the same read cannot render two ways; the two differ only in
+/// presentation ([`Self::lead_elements`]/[`Self::tail_elements`] versus
+/// [`Self::lead_text`]).
+pub(crate) struct SessionCardBody<'a> {
+    status: Option<String>,
+    pending: Option<String>,
+    tail: &'a [TailEntry],
+    omitted_tail: usize,
+}
+
+/// Compose the body from a read (ADR-0100). `tail` is the entries this card
+/// renders — a one-shot card's budget may carry only a prefix — and
+/// `omitted_tail` names the older entries it left out. `pending` says what the
+/// driver does with the read's requests; it is never inferred from `data`
+/// alone, because a one-shot card may carry fewer blocks than the read holds.
+pub(crate) fn session_card_body<'a>(
+    data: &SnapshotData,
+    tail: &'a [TailEntry],
+    omitted_tail: usize,
+    pending: PendingFacts,
+) -> SessionCardBody<'a> {
+    let has_pending = read_has_pending(data);
+    // ONE status line for both drivers (ADR-0100, #1002): the follow's update
+    // promise belongs to its identity line, not the shared body, so the same
+    // read renders the same text on the static card and the follow lead.
+    let status = status_chip(has_pending, data.waiting, data.status);
+    SessionCardBody {
+        status,
+        pending: (pending.on_card > 0).then(|| {
+            if pending.blocks_here {
+                format!("有 {} 个请求等待你处理", pending.on_card)
+            } else {
+                format!("有 {} 个请求等待你处理（见原卡片）", pending.on_card)
+            }
+        }),
+        tail,
+        omitted_tail,
+    }
+}
+
+/// The ONE-line status summary a text adoption confirms with (ADR-0100): the
+/// same [`status_chip`] precedence the Session Card's status line renders,
+/// hint-free because a text line has no renderer to deliver an update promise.
+/// Taking a Session over no longer posts a card, so this is how the
+/// confirmation still answers "is the last Turn done, is something blocking
+/// me". `None` when the read has no status to report, so a failed status read
+/// is omitted rather than guessed.
+pub(crate) fn status_line(data: &SnapshotData) -> Option<String> {
+    status_chip(read_has_pending(data), data.waiting, data.status)
+}
+
+/// Build the Session Card's read-only mode (ADR-0100): the one-shot read of a
+/// Session no renderer owns, posted by `/card`. The header is the state's
+/// static 「📄 会话」 (grey, no phase timer) and the body is the ONE composition
+/// — the status line, the count-only pending pointer (which names 「见原卡片」
+/// because this card carries no operable blocks) and the 最近对话 tail — with
+/// every tail **Compaction** marker at its server position. There is
+/// deliberately no operable element: no form, no button, no input and no
+/// recovery action, because an unanswered Permission/Question always lives on a
+/// live card or its own standalone card, never on a read.
+///
+/// One-shot cards have no splitter, so an oversized tail degrades by dropping
+/// its OLDEST entries into the body's visible omission notice, exactly as the
+/// one-shot budget always has (issue #726).
+pub(crate) fn build_idle_card(data: &SnapshotData) -> serde_json::Value {
+    // The pointer counts the requests the READ waits on, not blocks this card
+    // carries: an idle card carries none, so `PendingFacts::blocks_here` is
+    // false and the pointer is text pointing at their own cards.
+    let on_card = data
+        .pending
+        .iter()
+        .filter(|req| req.session_id() == data.session_id)
+        .count();
+    build_session_card(data, on_card)
+}
+
+/// The one budgeted builder for the static read: hint-free status line and the
+/// pointer that names where the blocks actually live ([`build_idle_card`]).
+/// The follow's own presentation is composed by the external renderer's static
+/// lead ([`crate::bridge::external::snapshot_follow_lead`]), not here — the
+/// follow card is never the pre-arm send (ADR-0100).
+fn build_session_card(data: &SnapshotData, on_card: usize) -> serde_json::Value {
+    let build = |omitted: usize| {
+        let mut md = CardMarkdown::new();
+        let body = session_card_body(
+            data,
+            &data.tail[omitted..],
+            omitted,
+            PendingFacts {
+                on_card,
+                blocks_here: false,
+            },
+        );
+        let mut elements = body.lead_elements();
+        elements.extend(body.tail_elements(&mut md));
+        let mut builder = CardBuilder::new().with_state(CardState::Idle);
+        for element in elements {
+            builder = builder.with_element(element);
+        }
+        builder.build()
+    };
+    let full = build(0);
+    if fits_card(&full) {
+        return full;
+    }
+    // This builder has no splitter, so an oversized tail degrades by dropping
+    // its OLDEST entries into the body's visible omission notice, exactly as
+    // every one-shot card's budget always has (issue #726).
+    let floor = build(data.tail.len());
+    if fits_card(&floor) {
+        return smallest_omission(data.tail.len(), build, floor);
+    }
+    // Even the bare status/pointer shell is over budget (a pathological flush
+    // field): send it anyway, so the reader still gets the status, but say so
+    // rather than failing silently.
+    tracing::warn!(
+        "Session Card is {} chars with every tail entry dropped (budget {}): the non-evictable shell exceeds one card",
+        floor.to_string().len(),
+        crate::feishu::card::MAX_CARD_JSON_CHARS
+    );
+    floor
+}
+
+/// Whether an assembled one-shot card fits the platform's one-card budgets: the
+/// serialized size AND the component ceiling. Both bind independently — a tail
+/// of many title-only Compaction rows is small in bytes but can cross
+/// [`crate::feishu::card::MAX_CARD_COMPONENTS`] (issue #726's review).
+pub(crate) fn fits_card(card: &serde_json::Value) -> bool {
+    card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS
+        && card_components(card) <= crate::feishu::card::MAX_CARD_COMPONENTS
+}
+
+/// The card's component count as Feishu charges it: every body element, and
+/// every element nested inside a panel (a folded panel is a component AND its
+/// markdown chunks are components).
+pub(crate) fn card_components(card: &serde_json::Value) -> usize {
+    card["body"]["elements"]
+        .as_array()
+        .map(|elements| {
+            elements
+                .iter()
+                .map(|element| 1 + nested_components(element))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The components one element carries beyond itself.
+fn nested_components(element: &serde_json::Value) -> usize {
+    element["elements"]
+        .as_array()
+        .map(|children| children.iter().map(|child| 1 + nested_components(child)).sum())
+        .unwrap_or(0)
+}
+
+/// The smallest prefix omission in `0..=len` whose card fits, given that the
+/// fully-evicted build (`len`) is already known to fit.
+///
+/// The predicate is monotone: one more omitted entry removes its bytes and adds
+/// at most a character to the omission line, so more omission never costs more.
+pub(crate) fn smallest_omission(
+    len: usize,
+    mut build: impl FnMut(usize) -> serde_json::Value,
+    known_fit: serde_json::Value,
+) -> serde_json::Value {
+    let (mut lo, mut hi) = (0, len);
+    let mut best = None;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let card = build(mid);
+        if fits_card(&card) {
+            best = Some(card);
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    best.unwrap_or(known_fit)
+}
+
+impl SessionCardBody<'_> {
+    /// The body's lead as card elements: the status line, then the count-only
+    /// pending pointer. A one-shot card inserts its pending blocks between this
+    /// lead and [`Self::tail_elements`]; an idle card has no blocks at all.
+    pub(crate) fn lead_elements(&self) -> Vec<serde_json::Value> {
+        let mut elements = Vec::new();
+        if let Some(status) = &self.status {
+            elements.push(json!({ "tag": "markdown", "content": status }));
+        }
+        if let Some(pending) = &self.pending {
+            elements.push(json!({ "tag": "markdown", "content": pending }));
+        }
+        elements
+    }
+
+    /// Whether the body renders a 最近对话 section at all — false only when
+    /// there is neither an entry nor an omitted-entry fact.
+    pub(crate) fn has_tail(&self) -> bool {
+        self.omitted_tail > 0 || !self.tail.is_empty()
+    }
+
+    /// The 最近对话 section as card elements: its heading, the omitted-entries
+    /// line, then one folded panel per entry. A **Compaction** marker takes its
+    /// server position among the messages through the live card's own row
+    /// builder (ADR-0082), so the two surfaces cannot disagree on the copy or
+    /// the fold. No tail → no section.
+    pub(crate) fn tail_elements(&self, md: &mut CardMarkdown) -> Vec<serde_json::Value> {
+        let mut panels = Vec::new();
+        if !self.has_tail() {
+            return panels;
+        }
+        panels.push(json!({ "tag": "markdown", "content": TAIL_HEADING }));
+        // The budget's degradation is deliberate and visible (#726): an entry
+        // the card could not carry is COUNTED here rather than silently
+        // disappearing. The line is unfurled text, outside every entry's fold.
+        if self.omitted_tail > 0 {
+            panels.push(json!({
+                "tag": "markdown",
+                "content": omitted_tail_notice(self.omitted_tail)
+            }));
+        }
+        for (i, entry) in self.tail.iter().enumerate() {
+            // The static read is sent once; the tail's order is fixed, so the
+            // entry index is a stable element id (and a stable test target).
+            // The index is the entry's position in the FULL tail, so an
+            // evicted prefix cannot renumber the panels that remain.
+            let element_id = format!("tail_{}", self.omitted_tail + i);
+            let message = match entry {
+                TailEntry::Compaction(marker) => {
+                    panels.extend(crate::feishu::card::compaction::compaction_elements(
+                        &marker.compaction,
+                        Some(&element_id),
+                        md,
+                    ));
+                    continue;
+                }
+                TailEntry::Message(message) => message,
+            };
+            let (role, preview) = tail_preview(message);
+            let title = if preview.is_empty() {
+                format!("{role} {EMPTY_MESSAGE}")
+            } else {
+                format!("{role} {preview}…")
+            };
+            let body = tail_body(message);
+            let chunks = crate::feishu::card::chunk_text(&body, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
+            let chunks: Vec<String> = chunks.iter().map(|c| md.clean(c)).collect();
+            panels.push(super::shell::collapsible_panel_chunks(
+                &title,
+                &chunks,
+                Some(&element_id),
+            ));
+        }
+        panels
+    }
+
+    /// The body as the live lead's plain text: the status line, the pointer and
+    /// the tail as one `最近对话` section of `role body` lines. A **Compaction**
+    /// marker keeps its server position here too, with the same title and
+    /// folded summary the card presentation ([`Self::tail_elements`]) renders.
+    /// The live timeline may also render the compaction row, so the row appears
+    /// twice on a followed card; that is the accepted cost of #1002's explicit
+    /// equal-body requirement, which narrows ADR-0082's exactly-once note to
+    /// the live timeline's own render.
+    /// A marker-only tail therefore renders the heading and the marker.
+    pub(crate) fn lead_text(&self) -> String {
+        let mut text = String::new();
+        if let Some(status) = &self.status {
+            text.push_str(status);
+        }
+        if let Some(pending) = &self.pending {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(pending);
+        }
+        if self.omitted_tail == 0 && self.tail.is_empty() {
+            return text;
+        }
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(TAIL_HEADING);
+        if self.omitted_tail > 0 {
+            text.push('\n');
+            text.push_str(&omitted_tail_notice(self.omitted_tail));
+        }
+        for entry in self.tail {
+            match entry {
+                TailEntry::Message(message) => {
+                    let role = role_marker(&message.role);
+                    text.push_str(&format!("\n{role} {}", tail_body(message)));
+                }
+                // ADR-0082's "the live timeline renders the marker itself" note
+                // yields to #1002's explicit body-equality contract: both
+                // drivers must show the same read, so the lead keeps the marker
+                // at its server position, exactly like `tail_elements`.
+                TailEntry::Compaction(marker) => {
+                    text.push('\n');
+                    text.push_str(&lead_compaction_text(&marker.compaction));
+                }
+            }
+        }
+        text
+    }
+}
+
+/// The emoji marker for a tail entry's role, shared by the body's card elements
+/// and its text form so the two presentations cannot disagree.
+fn role_marker(role: &MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "👤",
+        MessageRole::Assistant => "🤖",
+        _ => "💬",
+    }
+}
+
+/// One tail message's role marker + short preview, shared by the body's folded
+/// panels and its text form. A files-only entry previews its record line so the
+/// folded panel names the file (ADR-0076); a text-bearing entry previews its
+/// text, unchanged.
+fn tail_preview(message: &TailMessage) -> (&'static str, String) {
+    let source = if message.text.trim().is_empty() && !message.files.is_empty() {
+        message.body_text()
+    } else {
+        message.text.clone()
+    };
+    let preview: String = source.chars().take(40).collect::<String>().trim().to_string();
+    (role_marker(&message.role), preview)
 }
 
 #[cfg(test)]
@@ -2838,5 +3381,564 @@ mod tests {
             .find(|button| button["value"]["op"] == "pick")
             .expect("pick button");
         assert_eq!(pick["text"]["content"], "✅ 当前");
+    }
+
+    // -- The Session Card body (ADR-0100) -----------------------------------
+
+    fn body_read(
+        status: Option<crate::backend::types::SessionStatus>,
+        waiting: bool,
+        tail: Vec<TailEntry>,
+    ) -> SnapshotData {
+        SnapshotData {
+            session_id: "ses_body".into(),
+            directory: "/work".into(),
+            status,
+            waiting,
+            pending: Vec::new(),
+            tail,
+            newest_user_anchor: None,
+            newest_user_is_cola_authored: false,
+        }
+    }
+
+    /// The facts a driver that carries everything the read does reports — the
+    /// busy follow's shape: it seeds every pending block it counts.
+    fn facts(read: &SnapshotData) -> PendingFacts {
+        PendingFacts {
+            on_card: read.pending.len(),
+            blocks_here: true,
+        }
+    }
+
+    fn body_permission(request_id: &str, session_id: &str) -> crate::bridge::request::kind::PendingRequest {
+        crate::bridge::request::kind::PendingRequest::Permission(crate::backend::types::PermissionRequest {
+            request_id: request_id.into(),
+            session_id: Some(session_id.into()),
+            permission: Some("bash".into()),
+            patterns: vec!["ls".into()],
+            metadata: None,
+            always: vec![],
+            always_supported: true,
+        })
+    }
+
+    fn body_message(role: MessageRole, created_ms: i64, text: &str) -> TailEntry {
+        TailEntry::Message(TailMessage {
+            role,
+            created_ms,
+            text: text.into(),
+            files: Vec::new(),
+        })
+    }
+
+    fn body_marker(created_ms: i64, summary: &str) -> TailEntry {
+        TailEntry::Compaction(crate::backend::TailMarker {
+            created_ms,
+            compaction: crate::backend::Compaction {
+                status: crate::backend::CompactionStatus::Completed,
+                reason: crate::backend::CompactionReason::Auto,
+                summary: summary.into(),
+                usage: None,
+                error: None,
+                recent: String::new(),
+            },
+        })
+    }
+
+    fn body_file(name: &str) -> crate::backend::FileContent {
+        crate::backend::FileContent::decode("data:image/png;base64,QUJD", Some("image/png"), Some(name))
+            .expect("an inline payload is a File Content")
+    }
+
+    fn body_tail_message(
+        role: MessageRole,
+        created_ms: i64,
+        text: &str,
+        files: Vec<crate::backend::FileContent>,
+    ) -> TailEntry {
+        TailEntry::Message(TailMessage {
+            role,
+            created_ms,
+            text: text.into(),
+            files,
+        })
+    }
+
+    /// The component ceiling binds too (#726's review): 160 title-only
+    /// Compaction rows are small in bytes but would cross Feishu's component
+    /// limit, so the one-shot card's eviction ladder must keep counting
+    /// components. The newest entry — the message after all the markers — is
+    /// the one that survives.
+    #[test]
+    fn a_tail_of_many_component_rows_is_evicted_by_component_count() {
+        let mut tail: Vec<TailEntry> = (0..160).map(|i| body_marker(i, "")).collect();
+        tail.push(body_message(MessageRole::User, 9_000, "最后一条消息"));
+        let read = body_read(Some(crate::backend::types::SessionStatus::Idle), false, tail);
+        let card = build_idle_card(&read);
+        let s = card.to_string();
+
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "byte budget: {}",
+            s.len()
+        );
+        assert!(
+            card_components(&card) <= crate::feishu::card::MAX_CARD_COMPONENTS,
+            "component budget: {} > {}",
+            card_components(&card),
+            crate::feishu::card::MAX_CARD_COMPONENTS
+        );
+        assert!(s.contains("条记录已省略"), "the eviction is named: {s}");
+        assert!(s.contains("最后一条消息"), "the newest entry survives: {s}");
+    }
+
+    /// ADR-0076: a files-only tail entry renders its `📎 name · mime · size`
+    /// record line instead of the empty-message stand-in, and a text-bearing
+    /// entry keeps its text preview — the file line never replaces the text.
+    #[test]
+    fn a_file_bearing_tail_entry_records_the_file_line() {
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![
+                body_tail_message(MessageRole::User, 1_000, "", vec![body_file("only.png")]),
+                body_tail_message(MessageRole::User, 2_000, "看看这个", vec![body_file("and.png")]),
+            ],
+        );
+
+        let card = build_idle_card(&read);
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(
+            text.contains("📎 only.png · image/png · 3 B"),
+            "the files-only entry records its line: {text}"
+        );
+        assert!(
+            text.contains("📎 and.png · image/png · 3 B"),
+            "each file records its own line: {text}"
+        );
+        assert!(
+            !text.contains("（空消息）"),
+            "a files-only entry is not an empty message: {text}"
+        );
+        assert!(
+            text.contains("👤 看看这个…"),
+            "the text-bearing entry keeps its preview: {text}"
+        );
+    }
+
+    /// The preview derivation keeps a text-bearing entry's text: the file
+    /// record line belongs to the folded body, not to the title.
+    #[test]
+    fn tail_preview_keeps_a_text_bearing_entry_text() {
+        let text_bearing = TailMessage {
+            role: MessageRole::User,
+            created_ms: 1_000,
+            text: "看看这个".into(),
+            files: vec![body_file("and.png")],
+        };
+        assert_eq!(tail_preview(&text_bearing), ("👤", "看看这个".to_string()));
+
+        let files_only = TailMessage {
+            role: MessageRole::User,
+            created_ms: 2_000,
+            text: String::new(),
+            files: vec![body_file("only.png")],
+        };
+        assert_eq!(
+            tail_preview(&files_only),
+            ("👤", "📎 only.png · image/png · 3 B".to_string()),
+            "a files-only entry previews its record line"
+        );
+    }
+
+    /// The body's text form is the status line, then the count-only pointer,
+    /// then the tail — the order the idle card and the busy follow both carry.
+    /// The pointer counts what THIS card carries; the status line's precedence
+    /// puts the Host's request ahead of the server's run state.
+    #[test]
+    fn the_body_text_orders_the_status_line_the_pointer_and_the_tail() {
+        let mut read = body_read(
+            Some(crate::backend::types::SessionStatus::Busy),
+            false,
+            vec![
+                body_message(MessageRole::User, 1_000, "问题一"),
+                body_message(MessageRole::Assistant, 2_000, "回答一"),
+            ],
+        );
+        read.pending = vec![
+            body_permission("req_1", "ses_body"),
+            body_permission("req_2", "ses_body"),
+        ];
+        let body = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 2,
+                blocks_here: true,
+            },
+        );
+        assert_eq!(
+            body.lead_text(),
+            "⏳ 等待你的确认\n有 2 个请求等待你处理\n\n**最近对话**\n👤 问题一\n🤖 回答一"
+        );
+        // The same composition as elements: the lead, then the tail section.
+        let mut md = CardMarkdown::new();
+        let lead = body.lead_elements();
+        assert_eq!(lead[0]["content"], WAITING_CHIP);
+        assert_eq!(lead[1]["content"], "有 2 个请求等待你处理");
+        let tail = body.tail_elements(&mut md);
+        assert_eq!(tail[0]["content"], TAIL_HEADING);
+        assert_eq!(tail.len(), 3, "heading + one panel per message: {tail:?}");
+    }
+
+    /// A **Compaction** marker keeps its server position among the tail's four
+    /// messages in BOTH presentations (#1002): the card renders it as its
+    /// one-line row plus the folded summary, and the live lead's text keeps the
+    /// same title and summary. ADR-0082's "the live timeline renders it itself"
+    /// note yields to that explicit body-equality contract; the marker never
+    /// consumes one of the tail's message slots.
+    #[test]
+    fn the_body_keeps_a_compaction_at_its_server_position_in_both_forms() {
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![
+                body_message(MessageRole::User, 1_000, "问题一"),
+                body_message(MessageRole::Assistant, 2_000, "回答一"),
+                body_marker(2_500, "保留了结论。"),
+                body_message(MessageRole::User, 3_000, "问题二"),
+                body_message(MessageRole::Assistant, 4_000, "回答二"),
+            ],
+        );
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let elements = body.tail_elements(&mut CardMarkdown::new());
+        let titles: Vec<&str> = elements
+            .iter()
+            .filter(|element| element["tag"] == "collapsible_panel")
+            .map(|element| element["header"]["title"]["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "👤 问题一…",
+                "🤖 回答一…",
+                "已压缩上下文（自动）",
+                "👤 问题二…",
+                "🤖 回答二…",
+            ],
+            "the marker sits at its server position: {elements:?}"
+        );
+        assert_eq!(
+            body.lead_text(),
+            "✅ 空闲\n\n**最近对话**\n👤 问题一\n🤖 回答一\n🗜 已压缩上下文（自动）\n保留了结论。\n👤 问题二\n🤖 回答二"
+        );
+    }
+
+    /// A marker-only tail still renders the heading and the marker: the text
+    /// form keeps the marker rather than leaving an empty 最近对话 header.
+    #[test]
+    fn a_marker_only_tail_renders_its_marker_in_the_lead() {
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Busy),
+            false,
+            vec![body_marker(1_000, "保留了结论。")],
+        );
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let text = body.lead_text();
+        assert_eq!(
+            text,
+            format!("{BUSY_CHIP}\n\n{TAIL_HEADING}\n🗜 已压缩上下文（自动）\n保留了结论。")
+        );
+        // A marker followed by a message keeps both, in order.
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Busy),
+            false,
+            vec![
+                body_marker(500, "保留了结论。"),
+                body_message(MessageRole::User, 1_000, "继续"),
+            ],
+        );
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let text = body.lead_text();
+        assert!(
+            text.find("🗜 已压缩上下文（自动）") < text.find("👤 继续"),
+            "the marker stays at its server position: {text}"
+        );
+    }
+
+    /// A one-shot read must not promise what nothing will deliver (ADR-0100):
+    /// the static Session Card's busy and waiting status lines carry the chip
+    /// alone, even for a cola-authored turn cola itself will never follow.
+    #[test]
+    fn a_static_reads_busy_status_line_promises_no_update() {
+        for (read, chip) in [
+            (
+                body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]),
+                BUSY_CHIP,
+            ),
+            (
+                body_read(Some(crate::backend::types::SessionStatus::Idle), true, vec![]),
+                WAITING_BACKGROUND_CHIP,
+            ),
+        ] {
+            let body = session_card_body(
+                &read,
+                &read.tail,
+                0,
+                PendingFacts {
+                    on_card: 0,
+                    blocks_here: false,
+                },
+            );
+            assert_eq!(body.lead_text(), chip, "the reader card carries no hint");
+            assert!(!body.lead_text().contains(FOLLOW_HINT), "{chip}");
+        }
+    }
+
+    /// The pending pointer names where a one-shot read's requests actually live:
+    /// the read carries no blocks, so it points at their own cards (ADR-0100's
+    /// 「见原卡片」), while a follow that seeds the counted blocks is hint-free.
+    #[test]
+    fn the_pending_pointer_names_another_card_only_when_the_blocks_are_not_here() {
+        let mut read = body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]);
+        read.pending = vec![body_permission("req_1", "ses_body")];
+
+        let static_read = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 1,
+                blocks_here: false,
+            },
+        );
+        assert_eq!(
+            static_read.lead_text(),
+            format!("{WAITING_CHIP}\n有 1 个请求等待你处理（见原卡片）"),
+            "the read names where the request lives"
+        );
+
+        let follow = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 1,
+                blocks_here: true,
+            },
+        );
+        assert_eq!(
+            follow.lead_text(),
+            format!("{WAITING_CHIP}\n有 1 个请求等待你处理"),
+            "the follow carries the block itself"
+        );
+    }
+
+    /// With no pending request there is no pointer at all, so the read and the
+    /// follow compose the SAME body and elements (the hint difference only
+    /// exists when blocks are carried: the driver fact #1002 documents).
+    #[test]
+    fn a_no_pending_body_is_equal_for_both_drivers() {
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Busy),
+            false,
+            vec![body_message(MessageRole::User, 1_000, "问题一")],
+        );
+        let idle = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 0,
+                blocks_here: false,
+            },
+        );
+        let follow = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 0,
+                blocks_here: true,
+            },
+        );
+        assert_eq!(idle.lead_text(), follow.lead_text());
+        assert_eq!(idle.lead_elements(), follow.lead_elements());
+        assert_eq!(
+            idle.tail_elements(&mut CardMarkdown::new()),
+            follow.tail_elements(&mut CardMarkdown::new())
+        );
+    }
+
+    /// A read with nothing to report composes an empty body — no status line to
+    /// guess, no pointer to invent, no empty 最近对话 heading.
+    #[test]
+    fn an_unreadable_empty_session_composes_an_empty_body() {
+        let read = body_read(None, false, vec![]);
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        assert_eq!(body.lead_text(), "");
+        assert!(body.lead_elements().is_empty());
+        assert!(!body.has_tail());
+        assert!(body.tail_elements(&mut CardMarkdown::new()).is_empty());
+    }
+
+    /// The status line asks the READ, not the seed set (ADR-0100): a read with
+    /// a request waiting on the Host keeps 等待你的确认 even when this card
+    /// carries none of them — the busy follow leaves an already-surfaced
+    /// request to its own card (#1005). The pointer counts zero, because there
+    /// is nothing here to go answer.
+    #[test]
+    fn a_waited_on_request_keeps_the_status_even_when_the_card_carries_none() {
+        let mut read = body_read(Some(crate::backend::types::SessionStatus::Busy), false, vec![]);
+        read.pending = vec![body_permission("req_1", "ses_body")];
+        let body = session_card_body(
+            &read,
+            &read.tail,
+            0,
+            PendingFacts {
+                on_card: 0,
+                blocks_here: true,
+            },
+        );
+        assert_eq!(body.lead_text(), WAITING_CHIP);
+        assert_eq!(body.lead_elements().len(), 1, "the status line only, no pointer");
+    }
+
+    /// An omitted-entry fact renders as its own visible line, in both forms, so
+    /// a budgeted card's tail is a window rather than a silent truncation.
+    #[test]
+    fn an_omitted_tail_names_what_it_left_out() {
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![body_message(MessageRole::User, 1_000, "保留")],
+        );
+        let body = session_card_body(&read, &read.tail, 2, facts(&read));
+        assert!(
+            body.lead_text().contains("…更早的 2 条记录已省略"),
+            "{}",
+            body.lead_text()
+        );
+        let elements = body.tail_elements(&mut CardMarkdown::new());
+        assert!(
+            elements[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("…更早的 2 条记录已省略")
+        );
+    }
+
+    /// The idle Session Card (ADR-0100) is the ONE read composition under the
+    /// static 「📄 会话」 header: the status line, the count-only pending pointer
+    /// and the 最近对话 tail — with a Compaction marker at its server position.
+    /// It carries no operable element at all: no form, button, input, selector,
+    /// checker, action container or overflow control. The request it points at
+    /// is never hosted here.
+    #[test]
+    fn the_idle_card_is_read_only_and_names_the_read() {
+        let mut read = body_read(
+            Some(crate::backend::types::SessionStatus::Busy),
+            false,
+            vec![
+                body_message(MessageRole::User, 1_000, "继续改登录"),
+                body_marker(1_500, "旧上下文已压缩"),
+                body_message(MessageRole::Assistant, 2_000, "好的，已改完"),
+            ],
+        );
+        read.pending = vec![body_permission("per_idle", "ses_body")];
+
+        let card = build_idle_card(&read);
+
+        assert_eq!(card["header"]["title"]["content"], "📄 会话");
+        assert_eq!(card["header"]["template"], "grey");
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains(WAITING_CHIP), "the Host's request leads: {text}");
+        assert!(
+            text.contains("有 1 个请求等待你处理"),
+            "the pointer counts: {text}"
+        );
+        assert!(text.contains("**最近对话**"), "the tail renders: {text}");
+        assert!(
+            text.contains("继续改登录") && text.contains("好的，已改完"),
+            "{text}"
+        );
+        assert!(
+            text.contains("旧上下文已压缩"),
+            "the marker keeps its position: {text}"
+        );
+
+        let mut tags = Vec::new();
+        collect_tags(&card, &mut tags);
+        for tag in [
+            "form",
+            "button",
+            "input",
+            "select_static",
+            "multi_select_static",
+            "select_person",
+            "multi_select_person",
+            "checker",
+            "overflow",
+            "action",
+            "actions",
+        ] {
+            assert!(
+                !tags.iter().any(|found| found == tag),
+                "the idle card must render no {tag}: {card}"
+            );
+        }
+        assert!(
+            !text.contains("允许一次") && !text.contains("🔐 **权限请求**"),
+            "the pending request stays on its own card: {text}"
+        );
+    }
+
+    /// Every `tag` value anywhere on a card, nested elements included.
+    fn collect_tags(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(tag) = map.get("tag").and_then(|tag| tag.as_str()) {
+                    out.push(tag.to_string());
+                }
+                for value in map.values() {
+                    collect_tags(value, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for value in items {
+                    collect_tags(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// An idle read taller than one card degrades visibly: the oldest tail entry
+    /// is dropped into the shared omission notice and the card still fits the
+    /// one-card budget. This is the one-shot ladder, not a silent truncation.
+    #[test]
+    fn an_idle_read_too_tall_for_one_card_names_what_it_left_out() {
+        let huge = "长".repeat(12_000);
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![
+                body_message(MessageRole::User, 1_000, &huge),
+                body_message(MessageRole::Assistant, 2_000, "最新的回答"),
+            ],
+        );
+
+        let card = build_idle_card(&read);
+
+        assert!(fits_card(&card), "the degraded card fits one card");
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains("最新的回答"), "the newest entry survives: {text}");
+        assert!(
+            text.contains("…更早的 1 条记录已省略"),
+            "the dropped entry is named: {text}"
+        );
+        assert!(!text.contains(&huge), "the oversized old entry is gone");
     }
 }

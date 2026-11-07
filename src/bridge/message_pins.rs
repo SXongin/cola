@@ -30,7 +30,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::bridge::failure_latch::FailureLatch;
-use crate::bridge::snapshot_claims::ClaimKind;
+use crate::bridge::request::kind::InteractionKind;
 use crate::feishu::Platform;
 use crate::feishu::client::MESSAGE_PIN_SCOPE;
 
@@ -47,7 +47,7 @@ pub(crate) struct WaitingCard {
 /// What cola believes it has pinned for one request.
 #[derive(Clone, Debug)]
 struct Pinned {
-    kind: ClaimKind,
+    kind: InteractionKind,
     directory: String,
     message_id: String,
 }
@@ -95,7 +95,7 @@ impl MessagePins {
     pub(crate) async fn sync(
         &self,
         feishu: &Arc<dyn Platform>,
-        kind: ClaimKind,
+        kind: InteractionKind,
         waiting: &[WaitingCard],
         failed_dirs: &HashSet<String>,
     ) {
@@ -251,7 +251,7 @@ mod tests {
 
         pins.sync(
             &feishu,
-            ClaimKind::Permission,
+            InteractionKind::Permission,
             std::slice::from_ref(&card),
             &no_dirs(),
         )
@@ -259,19 +259,21 @@ mod tests {
         assert_eq!(platform.message_pins().await, vec![("msg_card".into(), true)]);
 
         // Idempotent: the same waiting request makes no second call.
-        pins.sync(&feishu, ClaimKind::Permission, &[card], &no_dirs())
+        pins.sync(&feishu, InteractionKind::Permission, &[card], &no_dirs())
             .await;
         assert_eq!(platform.message_pins().await.len(), 1);
 
         // Resolved elsewhere: the next complete sweep unpins.
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
         assert_eq!(
             platform.message_pins().await,
             vec![("msg_card".into(), true), ("msg_card".into(), false)],
             "one pin, one unpin"
         );
 
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
         assert_eq!(platform.message_pins().await.len(), 2, "nothing tracked any more");
     }
 
@@ -286,14 +288,14 @@ mod tests {
 
         pins.sync(
             &feishu,
-            ClaimKind::Permission,
+            InteractionKind::Permission,
             std::slice::from_ref(&perm),
             &no_dirs(),
         )
         .await;
         pins.sync(
             &feishu,
-            ClaimKind::Question,
+            InteractionKind::Question,
             std::slice::from_ref(&ques),
             &no_dirs(),
         )
@@ -305,11 +307,13 @@ mod tests {
         );
 
         // One request leaves: the other still holds the card.
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
         assert_eq!(platform.message_pins().await.len(), 1, "still pinned");
 
         // The last one leaves: unpin.
-        pins.sync(&feishu, ClaimKind::Question, &[], &no_dirs()).await;
+        pins.sync(&feishu, InteractionKind::Question, &[], &no_dirs())
+            .await;
         assert_eq!(
             platform.message_pins().await,
             vec![("msg_card".into(), true), ("msg_card".into(), false)]
@@ -326,16 +330,18 @@ mod tests {
 
         pins.sync(
             &feishu,
-            ClaimKind::Permission,
+            InteractionKind::Permission,
             std::slice::from_ref(&card),
             &no_dirs(),
         )
         .await;
         let failed: HashSet<String> = ["/work".to_string()].into_iter().collect();
-        pins.sync(&feishu, ClaimKind::Permission, &[], &failed).await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &failed)
+            .await;
         assert_eq!(platform.message_pins().await.len(), 1, "unknown is not resolved");
 
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
         assert_eq!(
             platform.message_pins().await.len(),
             2,
@@ -352,9 +358,9 @@ mod tests {
         let old = waiting("per_1", "/work", "msg_old");
         let new = waiting("per_1", "/work", "msg_new");
 
-        pins.sync(&feishu, ClaimKind::Permission, &[old], &no_dirs())
+        pins.sync(&feishu, InteractionKind::Permission, &[old], &no_dirs())
             .await;
-        pins.sync(&feishu, ClaimKind::Permission, &[new], &no_dirs())
+        pins.sync(&feishu, InteractionKind::Permission, &[new], &no_dirs())
             .await;
         assert_eq!(
             platform.message_pins().await,
@@ -377,14 +383,14 @@ mod tests {
 
         pins.sync(
             &feishu,
-            ClaimKind::Permission,
+            InteractionKind::Permission,
             std::slice::from_ref(&card),
             &no_dirs(),
         )
         .await;
         pins.sync(
             &feishu,
-            ClaimKind::Permission,
+            InteractionKind::Permission,
             std::slice::from_ref(&card),
             &no_dirs(),
         )
@@ -399,11 +405,13 @@ mod tests {
         platform
             .fail_pin
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        pins.sync(&feishu, ClaimKind::Permission, &[card], &no_dirs())
+        pins.sync(&feishu, InteractionKind::Permission, &[card], &no_dirs())
             .await;
         platform.fail_pin.store(true, std::sync::atomic::Ordering::SeqCst);
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
         let calls = platform.message_pins().await;
         assert_eq!(
             calls.len(),
@@ -415,8 +423,10 @@ mod tests {
         platform
             .fail_pin
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
-        pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
+        pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+            .await;
         assert_eq!(
             platform.message_pins().await.len(),
             6,
@@ -438,14 +448,14 @@ mod tests {
         let (_, logs) = capture_logs(async {
             pins.sync(
                 &feishu,
-                ClaimKind::Permission,
+                InteractionKind::Permission,
                 std::slice::from_ref(&card),
                 &no_dirs(),
             )
             .await;
             pins.sync(
                 &feishu,
-                ClaimKind::Permission,
+                InteractionKind::Permission,
                 std::slice::from_ref(&card),
                 &no_dirs(),
             )
@@ -485,7 +495,7 @@ mod tests {
         let (_, logs) = capture_logs(async {
             pins.sync(
                 &feishu,
-                ClaimKind::Permission,
+                InteractionKind::Permission,
                 std::slice::from_ref(&card),
                 &no_dirs(),
             )
@@ -498,8 +508,10 @@ mod tests {
         // The failed unpin has the same shape: one WARN, the repeats DEBUG.
         platform.fail_pin.store(true, std::sync::atomic::Ordering::SeqCst);
         let (_, logs) = capture_logs(async {
-            pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
-            pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+            pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+                .await;
+            pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+                .await;
         })
         .await;
         assert_eq!(
@@ -522,7 +534,8 @@ mod tests {
             .fail_pin
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let (_, logs) = capture_logs(async {
-            pins.sync(&feishu, ClaimKind::Permission, &[], &no_dirs()).await;
+            pins.sync(&feishu, InteractionKind::Permission, &[], &no_dirs())
+                .await;
         })
         .await;
         assert_eq!(platform.message_pins().await.len(), 6);
@@ -537,7 +550,7 @@ mod tests {
 
         pins.sync(
             &feishu,
-            ClaimKind::Permission,
+            InteractionKind::Permission,
             &[waiting("per_1", "/work", "msg_card")],
             &no_dirs(),
         )

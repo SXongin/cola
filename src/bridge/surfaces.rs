@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::card_handles::BlockSpan;
+use crate::bridge::request::kind::InteractionKind;
 use crate::bridge::sidecar;
-use crate::bridge::snapshot_claims::ClaimKind;
 use crate::state::ClientScoped;
 
 /// One live interaction block and the card that renders it — the persisted
@@ -38,7 +38,7 @@ pub struct InlineSurface {
     #[serde(default)]
     pub client_id: String,
     pub message_id: String,
-    pub kind: ClaimKind,
+    pub kind: InteractionKind,
     pub session_id: String,
     pub directory: String,
     /// The block's compact receipt target, recorded at render time.
@@ -61,7 +61,7 @@ pub struct StandaloneSurface {
     /// The Agent Client that minted the request/session (ADR-0091).
     #[serde(default)]
     pub client_id: String,
-    pub kind: ClaimKind,
+    pub kind: InteractionKind,
     pub message_id: String,
     pub summary: String,
     pub directory: String,
@@ -369,7 +369,7 @@ mod tests {
         InlineSurface {
             client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             message_id: message_id.into(),
-            kind: ClaimKind::Permission,
+            kind: InteractionKind::Permission,
             session_id: "ses_1".into(),
             directory: "/work".into(),
             target: "⚡ 执行 Shell 命令 `ls`".into(),
@@ -392,7 +392,7 @@ mod tests {
                 "per_2",
                 StandaloneSurface {
                     client_id: crate::config::DEFAULT_CLIENT_ID.into(),
-                    kind: ClaimKind::Permission,
+                    kind: InteractionKind::Permission,
                     message_id: "om_2".into(),
                     summary: "ls".into(),
                     directory: "/work".into(),

@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use crate::bridge::test_support::*;
-use crate::feishu::card::CardState;
 
 /// A two-question request the question flow can replay and reply to.
 fn question_request(request_id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
@@ -34,16 +33,6 @@ fn question_request(request_id: &str, session_id: &str) -> crate::backend::types
         ],
         ..Default::default()
     }
-}
-
-/// Seed the live streaming card a Turn would have: an accumulator with a card
-/// message id, finished content and a reply target.
-async fn seed_live_card(app: &Arc<App>, session_id: &str, message_id: &str) {
-    let cards = app.cards_handle();
-    Turn::seed_card(&cards, session_id, Some(message_id)).await;
-    Turn::set_card_state(&cards, session_id, CardState::Done).await;
-    Turn::push_text(&cards, session_id, "回合的内容。").await;
-    Turn::set_reply_target(&cards, session_id, "msg_1").await;
 }
 
 /// One deterministic sweep (tests drive the poll loop's pass directly).
@@ -119,8 +108,8 @@ async fn restart_readopts_a_pending_inline_permission() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
-    seed_session(&app, "ses_1", "/work").await;
     seed_live_card(&app, "ses_1", "om_live").await;
+    Turn::push_text(&app.cards_handle(), "ses_1", "回合的内容。").await;
     sweep(&app.permission, &app).await;
     assert_eq!(
         app.card_handles.lock().await.message_of("per_1"),
@@ -228,8 +217,8 @@ async fn restart_readopts_a_pending_inline_question() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
-    seed_session(&app, "ses_1", "/work").await;
     seed_live_card(&app, "ses_1", "om_live").await;
+    Turn::push_text(&app.cards_handle(), "ses_1", "回合的内容。").await;
     sweep(&app.question, &app).await;
     assert_eq!(app.card_handles.lock().await.message_of("que_1"), Some("om_live"));
     assert!(persisted(&session_file).is_some());
@@ -505,6 +494,77 @@ async fn a_fresh_app_surfaces_a_pending_request_standalone() {
     assert!(raw.contains("per_1"), "{raw}");
 }
 
+/// ADR-0100 regression: taking a session over no longer embeds/claims its
+/// pending requests, so the sweep is the ONLY surface for them. An unmapped
+/// session's request is listed (its directory is known through a mapped
+/// sibling) but has no reply target yet; the failed surface must stay
+/// UNMARKED, or every later sweep treats it as already surfaced and
+/// `rehost_block` has no card to re-host it on — the request would be
+/// invisible forever. Sweep → adopt → the same `seen` → the card appears.
+#[tokio::test]
+async fn an_unmapped_sessions_pending_survives_until_adoption() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_mapped", "本项目会话", "/work/proj", 100),
+        list_session("ses_foreign", "外部会话", "/work/proj", 200),
+    ]);
+    backend.ask_permission(perm_request("per_1", "ses_foreign", "ls -la"));
+    let (app, platform) = build_app(test_config(&session_file), backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "ses_mapped",
+            "/work/proj",
+        ),
+    )
+    .await;
+
+    // ONE seen set across both sweeps, exactly as `poll_loop` keeps it.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "an unmapped session has no reply target yet: nothing can be posted"
+    );
+    assert!(
+        !seen.contains("per_1"),
+        "a failed surface must not mark the request as seen"
+    );
+
+    // The user takes the foreign session over (ADR-0100: one text line, no
+    // card, nothing claimed).
+    send_command(&app, "/switch ses_foreign", "msg_switch").await;
+    assert!(
+        platform
+            .texts()
+            .await
+            .iter()
+            .any(|line| line.contains("已接管「外部会话」")
+                && line.contains(crate::feishu::card::session::WAITING_CHIP)),
+        "the confirmation names the wait: {:?}",
+        platform.texts().await
+    );
+
+    // The next sweep surfaces the still-pending request on its own card.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let posted = posted_cards(&platform).await;
+    assert_eq!(
+        posted.len(),
+        1,
+        "the adopted session's permission now has a card: {posted:?}"
+    );
+    assert!(
+        card_text(&posted[0]).contains("🔐 权限请求"),
+        "the standalone permission card: {}",
+        card_text(&posted[0])
+    );
+    assert!(seen.contains("per_1"), "the successful surface is marked");
+}
+
 /// A request resolved while cola was down is reconciled by the first sweep —
 /// the persisted inline block becomes its neutral receipt and no card is
 /// resurrected.
@@ -519,8 +579,8 @@ async fn restart_reconciles_an_inline_block_resolved_while_down() {
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(test_config(&session_file), backend.clone(), platform.clone()).unwrap());
-    seed_session(&app, "ses_1", "/work").await;
     seed_live_card(&app, "ses_1", "om_live").await;
+    Turn::push_text(&app.cards_handle(), "ses_1", "回合的内容。").await;
     sweep(&app.permission, &app).await;
     assert!(persisted(&session_file).is_some());
 
@@ -756,7 +816,7 @@ fn over_budget_perm(request_id: &str, session_id: &str) -> crate::backend::types
 /// card exists, so it can no longer produce one. `inline` picks the shape: an
 /// inline block on a streaming card, or a standalone request card.
 fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: bool, message_id: &str) {
-    use crate::bridge::snapshot_claims::ClaimKind;
+    use crate::bridge::request::kind::InteractionKind;
     use crate::bridge::surfaces::{InlineSurface, StandaloneSurface, Surfaces};
 
     let surfaces = Surfaces::load(crate::state::StateLayout::beside(
@@ -785,7 +845,7 @@ fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: 
             InlineSurface {
                 client_id: String::new(),
                 message_id: message_id.into(),
-                kind: ClaimKind::Permission,
+                kind: InteractionKind::Permission,
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 target: "per_long".into(),
@@ -796,7 +856,7 @@ fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: 
             request_id,
             StandaloneSurface {
                 client_id: String::new(),
-                kind: ClaimKind::Permission,
+                kind: InteractionKind::Permission,
                 message_id: message_id.into(),
                 summary: "⚡ **执行 Shell 命令**\n**对象**:\n- `echo …`".into(),
                 directory: "/work".into(),
@@ -1564,5 +1624,72 @@ async fn a_click_on_a_stale_allow_card_declines_an_unshowable_target() {
     assert!(
         !text.contains("已允许"),
         "nothing may claim the approval happened: {text}"
+    );
+}
+
+/// The sweep resolves the inline host by walking the parent chain, which calls
+/// `session_info`; that read must not happen under the owning Session's card
+/// write lock. A stalled read otherwise holds the lock indefinitely, blocking
+/// flushes, `/card` and install for that Session. The walk is resolved and
+/// bounded before the lock, so the lock stays free and the request falls
+/// through to its standalone card after the read times out.
+#[tokio::test]
+async fn a_stalled_parent_walk_never_holds_the_sweep_card_lock() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_test", "ls -la"));
+    backend.hang_session_info_reads(usize::MAX);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.permission
+        .list_timeout_ms
+        .store(500, std::sync::atomic::Ordering::SeqCst);
+
+    let handles = app.flow_handles();
+    let sweep_app = app.clone();
+    let sweep = tokio::spawn(async move {
+        let mut seen = std::collections::HashSet::new();
+        sweep_app
+            .permission
+            .sweep(&sweep_app.flow_handles(), &mut seen)
+            .await;
+        seen
+    });
+    // Wait until the sweep has actually reached the stalled read.
+    for _ in 0..200 {
+        if !backend.session_info_calls.lock().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        !backend.session_info_calls.lock().await.is_empty(),
+        "the sweep reached the parent-chain walk"
+    );
+
+    // The Session's card write lock must be free while that read is stalled.
+    let lock = handles.cards.write_lock("ses_test").await;
+    let guard = tokio::time::timeout(std::time::Duration::from_millis(250), lock.lock())
+        .await
+        .expect("the parent walk must not hold the Session's card write lock");
+    drop(guard);
+
+    let seen = tokio::time::timeout(std::time::Duration::from_secs(2), sweep)
+        .await
+        .expect("the bounded walk must let the sweep finish")
+        .unwrap();
+    assert!(
+        seen.contains("per_1"),
+        "the request is surfaced on its standalone card after the walk times out"
+    );
+    assert_eq!(
+        platform.sent_cards().await.len(),
+        1,
+        "the timed-out walk falls through to the standalone path: {:?}",
+        platform.calls.lock().await
     );
 }

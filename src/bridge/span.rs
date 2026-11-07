@@ -81,11 +81,10 @@ pub(crate) fn external(session_id: &str, thread_key: Option<&ThreadKey>) -> trac
     span
 }
 
-/// A snapshot adoption's span: the gather's best-effort reads, the card build
-/// and the post-send follow/claim decision are retrievable by the adopted
-/// Session. A first adoption is not mapped to its Chat/Topic yet, so `chat`/
-/// `topic` ride along only when the Session already has a mapping — a sub-task
-/// child never does.
+/// A session read's span: the gather's best-effort reads and the adoption
+/// confirmation built from them are retrievable by the read Session. A first
+/// adoption is not mapped to its Chat/Topic yet, so `chat`/`topic` ride along
+/// only when the Session already has a mapping — a sub-task child never does.
 pub(crate) fn snapshot(session_id: &str, thread_key: Option<&ThreadKey>) -> tracing::Span {
     let span = tracing::info_span!(
         "snapshot",

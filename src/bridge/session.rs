@@ -249,6 +249,12 @@ pub struct SessionStore {
     next_pending_epoch: u64,
     /// Monotonic generation for materialisation claims.
     next_creation: u64,
+    /// Test-only fault injection: the number of successful writes before the
+    /// next one fails, or [`Self::WRITE_FAULT_DISARMED`]. A write is refused
+    /// *before* the writer sees it, exactly like an unwritable file, so a test
+    /// can fail one specific store mutation in the middle of an adoption.
+    #[cfg(test)]
+    fail_after_writes: std::sync::atomic::AtomicUsize,
 }
 
 /// One live materialisation claim (issue #910).
@@ -445,6 +451,8 @@ impl SessionStore {
             pending_epoch: std::collections::HashMap::new(),
             next_pending_epoch: 0,
             next_creation: 0,
+            #[cfg(test)]
+            fail_after_writes: std::sync::atomic::AtomicUsize::new(Self::WRITE_FAULT_DISARMED),
         };
         if legacy {
             // ADR-0091: the one eager rewrite. A later process reads version 1
@@ -545,19 +553,38 @@ impl SessionStore {
     /// Pending Session of the thread is resolved in the same in-memory step:
     /// a thread cannot have both (ADR-0041). Centralised here so no activation
     /// path can leave a pending behind to supersede the session it activated.
+    ///
+    /// Test-only: the durable paths build a candidate state and commit it
+    /// through [`Self::commit_state`] instead (see [`Self::activate`]).
+    #[cfg(test)]
     fn promote(&mut self, entry: SessionEntry) {
+        let client_id = self.client_id.clone();
         // Activation resolves the thread's Pending Session (a pending and an
         // active session are mutually exclusive, ADR-0041).
         self.pending_mut().retain(|p| p.thread_key != entry.thread_key);
-        self.promote_entry(entry);
+        Self::promote_entry_into(self.entries_mut(), &client_id, entry);
     }
 
-    /// Promote the entry without resolving the thread's Pending Session: a
-    /// materialisation whose replacement pending must survive (issue #910).
-    fn promote_entry(&mut self, mut entry: SessionEntry) {
+    /// [`Self::promote`] applied to a candidate state: resolve `entry`'s
+    /// thread's Pending Session, then insert the entry at the front.
+    fn promote_into(
+        entries: &mut Vec<SessionEntry>,
+        pending: &mut Vec<PendingEntry>,
+        client_id: &str,
+        entry: SessionEntry,
+    ) {
+        // Activation resolves the thread's Pending Session (a pending and an
+        // active session are mutually exclusive, ADR-0041).
+        pending.retain(|p| p.thread_key != entry.thread_key);
+        Self::promote_entry_into(entries, client_id, entry);
+    }
+
+    /// Insert the entry at the front of a candidate state, carrying the
+    /// per-session overrides an existing mapping of the same session had.
+    fn promote_entry_into(entries: &mut Vec<SessionEntry>, client_id: &str, mut entry: SessionEntry) {
         // The store owns which client the mapping belongs to: a caller builds
         // an entry without knowing the process's active client.
-        entry.client_id = self.client_id.clone();
+        entry.client_id = client_id.to_string();
         // Replace any existing mapping of this session. ADR-0041 keeps the
         // per-session overrides on the session: an adoption flow rebuilds the
         // mapping fields but never sets model/variant/auto_accept, so
@@ -569,12 +596,11 @@ impl SessionStore {
         // written through the settings path (`update`), never activation.
         // Everything the flow owns — thread key, directory, agent, topic
         // anchors — stays as the new entry set it.
-        if let Some(pos) = self
-            .entries
+        if let Some(pos) = entries
             .iter()
             .position(|e| e.client_id == entry.client_id && e.session_id == entry.session_id)
         {
-            let previous = self.entries_mut().remove(pos);
+            let previous = entries.remove(pos);
             if entry.model.is_none() {
                 entry.model = previous.model;
             }
@@ -585,7 +611,7 @@ impl SessionStore {
                 entry.auto_accept = previous.auto_accept;
             }
         }
-        self.entries_mut().insert(0, entry);
+        entries.insert(0, entry);
     }
 
     /// Promote `entry` as its thread's active session and persist the store.
@@ -593,19 +619,56 @@ impl SessionStore {
     /// forget the save. Activation also resolves the thread's Pending Session
     /// (a pending and an active session are mutually exclusive, ADR-0041) —
     /// materialisation is exactly this operation, in one write.
+    ///
+    /// The mutation is **atomic** (the adoption path depends on it): it is
+    /// applied to a candidate copy, written, and only then published. On a
+    /// failed save the mapping, the pending and the materialisation inputs are
+    /// exactly as the caller left them, so the caller's failure notice can
+    /// truthfully say nothing changed.
     pub fn activate(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
         let key = entry.thread_key.clone();
+        let mut entries = (*self.entries).clone();
+        let mut pending = (*self.pending).clone();
+        Self::promote_into(&mut entries, &mut pending, &self.client_id, entry);
+        self.commit_state(entries, pending)?;
         // An adoption/creation that is not a materialisation of the thread's
         // pending (a `/switch`, a recreate) resolves any claim: the thread's
         // active session is this one now. A materialisation must use
         // [`Self::activate_created`], which resolves only its own generation.
-        self.creating.remove(&entry.thread_key);
-        self.promote(entry);
+        self.creating.remove(&key);
         // With the claim resolved and the pending consumed, nothing can compare
         // against the thread's epoch any more (issue #910, the same rule as
-        // `remove_thread`).
+        // `remove_thread`). Only now — a refused save must leave the claim
+        // intact so the operation can be retried.
         self.prune_pending_epoch(&key);
-        self.write_to_disk()
+        Ok(())
+    }
+
+    /// [`Self::activate`] plus the card-collect displacements read in the SAME
+    /// critical section: the thread's previous Active Session (when it is a
+    /// different Session) and whether the promoted Session was mapped to
+    /// another thread. Callers hold the store lock across both reads and the
+    /// write, so two concurrent switches cannot both see the same displaced
+    /// Session while the other's activation lands in between — which would
+    /// leave the Session the second switch actually displaced uncollected.
+    ///
+    /// Returns `(displaced, stolen)`; both are `None`/`false` for a
+    /// re-activation of the already-active Session. A refused save returns the
+    /// error and promotes nothing (the atomicity [`Self::activate`] documents).
+    pub fn activate_with_displacements(
+        &mut self,
+        entry: SessionEntry,
+    ) -> crate::error::Result<(Option<String>, bool)> {
+        let session_id = entry.session_id.clone();
+        let displaced = self
+            .get_active(&entry.thread_key)
+            .filter(|previous| previous.session_id != session_id)
+            .map(|previous| previous.session_id.clone());
+        let stolen = self
+            .thread_for_session(&session_id)
+            .is_some_and(|owner| owner != entry.thread_key);
+        self.activate(entry)?;
+        Ok((displaced, stolen))
     }
 
     /// Promote the session a **materialisation** created (issue #910), scoped to
@@ -641,14 +704,19 @@ impl SessionStore {
             return Ok(false);
         }
         let replaced = self.pending_epoch.get(&key).copied().unwrap_or_default() != claim.epoch;
-        self.creating.remove(&key);
+        let mut entries = (*self.entries).clone();
+        let mut pending = (*self.pending).clone();
         if replaced {
-            self.promote_entry(entry);
+            Self::promote_entry_into(&mut entries, &self.client_id, entry);
         } else {
-            self.promote(entry);
+            Self::promote_into(&mut entries, &mut pending, &self.client_id, entry);
         }
+        // Same atomic contract as `activate`: a refused save leaves the claim
+        // and every mapping/pending exactly as they were, so the materialisation
+        // can be retried instead of half-resolving.
+        self.commit_state(entries, pending)?;
+        self.creating.remove(&key);
         self.prune_pending_epoch(&key);
-        self.write_to_disk()?;
         Ok(true)
     }
 
@@ -1193,19 +1261,20 @@ impl SessionStore {
         Ok(applied)
     }
 
-    /// Remove a session entry by session ID.
-    fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
-        let pos = self
-            .entries
-            .iter()
-            .position(|e| e.client_id == self.client_id && e.session_id == session_id)?;
-        Some(self.entries_mut().remove(pos))
-    }
-
     /// Remove a mapping and persist the store.
+    ///
+    /// Atomic for the same reason [`Self::activate`] is: the adoption path
+    /// treats a returned `Err` as "the previous owner still holds the
+    /// session", and `unmap` collects its waiting card only on `Ok`. A refused
+    /// save therefore leaves the entry in memory exactly where it was.
     pub fn remove_persist(&mut self, session_id: &str) -> crate::error::Result<Option<SessionEntry>> {
-        let removed = self.remove(session_id);
-        self.write_to_disk()?;
+        let client_id = self.client_id.clone();
+        let mut entries = (*self.entries).clone();
+        let position = entries
+            .iter()
+            .position(|e| e.client_id == client_id && e.session_id == session_id);
+        let removed = position.map(|pos| entries.remove(pos));
+        self.commit_state(entries, (*self.pending).clone())?;
         Ok(removed)
     }
 
@@ -1293,17 +1362,48 @@ impl SessionStore {
     }
 
     fn write_to_disk(&self) -> crate::error::Result<()> {
-        // Atomic, and the failure is returned: this is the one sidecar whose
-        // loss is not recoverable, so its writer must not log-and-continue.
-        // The blocking form keeps that contract; a caller that must not wait
-        // (a card callback) uses `write_to_disk_deferred` (ADR-0089).
+        self.write_snapshot(self.snapshot())
+    }
+
+    /// Write `snapshot` and wait for the durable result.
+    ///
+    /// Atomic, and the failure is returned: this is the one sidecar whose
+    /// loss is not recoverable, so its writer must not log-and-continue.
+    /// The blocking form keeps that contract; a caller that must not wait
+    /// (a card callback) uses `write_to_disk_deferred` (ADR-0089).
+    fn write_snapshot(
+        &self,
+        snapshot: crate::bridge::store_writer::StoreSnapshot,
+    ) -> crate::error::Result<()> {
+        #[cfg(test)]
+        self.inject_write_fault()?;
         match &self.writer {
-            Some(writer) => writer.write_blocking(self.snapshot())?,
+            Some(writer) => writer.write_blocking(snapshot)?,
             None => {
-                let bytes = self.snapshot().to_bytes()?;
+                let bytes = snapshot.to_bytes()?;
                 sidecar::write_atomic(&self.path, &bytes)?
             }
         }
+        Ok(())
+    }
+
+    /// Publish a candidate state only after it has been written (the atomic
+    /// mutation contract shared by `activate`, `activate_created` and
+    /// `remove_persist`). A refused save returns `Err` with the store's
+    /// current in-memory state untouched, so a caller can tell the user the
+    /// mapping did not move.
+    fn commit_state(
+        &mut self,
+        entries: Vec<SessionEntry>,
+        pending: Vec<PendingEntry>,
+    ) -> crate::error::Result<()> {
+        let entries = Arc::new(entries);
+        let pending = Arc::new(pending);
+        let snapshot =
+            crate::bridge::store_writer::StoreSnapshot::new(Arc::clone(&entries), Arc::clone(&pending));
+        self.write_snapshot(snapshot)?;
+        self.entries = entries;
+        self.pending = pending;
         Ok(())
     }
 
@@ -1370,10 +1470,44 @@ impl SessionStore {
     }
 
     /// Test-only durable write; production reaches it only through
-    /// activate/update/remove_persist/remove_thread_persist.
+    /// activate/activate_created/update/remove_persist/remove_thread_persist.
     #[cfg(test)]
     pub(crate) fn persist(&self) -> crate::error::Result<()> {
         self.write_to_disk()
+    }
+
+    /// Test-only: fail the write after `successful_writes` more successful
+    /// ones (`0` fails the very next write). The fault is one-shot: the failed
+    /// write disarms it, so a later store operation — e.g. the adoption path's
+    /// restore — behaves normally.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_after(&self, successful_writes: usize) {
+        self.fail_after_writes
+            .store(successful_writes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    const WRITE_FAULT_DISARMED: usize = usize::MAX;
+
+    /// Test-only: refuse the write before it reaches the writer thread, exactly
+    /// like an unwritable file, so the caller sees a failed save with its
+    /// in-memory state untouched.
+    #[cfg(test)]
+    fn inject_write_fault(&self) -> crate::error::Result<()> {
+        use std::sync::atomic::Ordering;
+        let remaining = self.fail_after_writes.load(Ordering::SeqCst);
+        if remaining == Self::WRITE_FAULT_DISARMED {
+            return Ok(());
+        }
+        if remaining == 0 {
+            self.fail_after_writes
+                .store(Self::WRITE_FAULT_DISARMED, Ordering::SeqCst);
+            return Err(crate::error::BridgeError::Io(std::io::Error::other(
+                "injected session-store write failure",
+            )));
+        }
+        self.fail_after_writes.store(remaining - 1, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Test-only: the gate the writer thread stops at before each write, so a
@@ -1566,7 +1700,7 @@ mod tests {
         let key = ThreadKey::new("chat1".into(), "root1".into());
         store.set_active(make_entry("chat1", "root1", "ses_rm", "/tmp/y"));
 
-        let removed = store.remove("ses_rm");
+        let removed = store.remove_persist("ses_rm").unwrap();
         assert!(removed.is_some());
         assert!(store.get_active(&key).is_none());
     }
@@ -1739,6 +1873,42 @@ mod tests {
         assert!(reloaded.get_active(&key_b).is_some());
     }
 
+    /// The displacements a switch collects are read in the SAME critical
+    /// section as the atomic activation: the target thread's previous Active
+    /// Session and the promoted Session's previous owner. Re-activating the
+    /// already-active Session displaces nothing.
+    #[test]
+    fn activate_with_displacements_reads_and_writes_together() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let other = ThreadKey::new("chat2".into(), "chat2".into());
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+        store
+            .activate(make_entry("chat2", "chat2", "ses_steal", "/tmp/steal"))
+            .unwrap();
+
+        let (displaced, stolen) = store
+            .activate_with_displacements(make_entry("chat1", "root1", "ses_steal", "/tmp/steal"))
+            .unwrap();
+        assert_eq!(displaced.as_deref(), Some("ses_old"));
+        assert!(stolen, "the session was mapped to another thread");
+        assert_eq!(
+            store.get_active(&key).map(|e| e.session_id.as_str()),
+            Some("ses_steal")
+        );
+        assert!(store.get_active(&other).is_none());
+
+        let (displaced, stolen) = store
+            .activate_with_displacements(make_entry("chat1", "root1", "ses_steal", "/tmp/steal"))
+            .unwrap();
+        assert_eq!(displaced, None);
+        assert!(!stolen);
+    }
+
     #[test]
     fn persist_failure_is_returned() {
         let dir = tempdir().unwrap();
@@ -1751,6 +1921,106 @@ mod tests {
             .activate(make_entry("chat1", "root1", "ses_fail", "/tmp/f"))
             .unwrap_err();
         assert!(matches!(err, crate::error::BridgeError::Io(_)));
+    }
+
+    /// A refused `remove_persist` leaves the mapping in memory (and on disk):
+    /// the adoption path's unmap must be able to report "the old owner still
+    /// holds it" and keep its waiting card.
+    #[test]
+    fn remove_persist_failure_keeps_the_mapping() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .activate(make_entry("chat1", "root1", "ses_keep", "/tmp/a"))
+            .unwrap();
+
+        store.fail_writes_after(0);
+        let err = store.remove_persist("ses_keep").unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+        assert_eq!(
+            store.entry_for_session("ses_keep").map(|e| e.thread_key.clone()),
+            Some(key),
+            "the mapping survives a refused removal"
+        );
+
+        // The file still holds it too.
+        let reloaded = SessionStore::new(path).unwrap();
+        assert_eq!(
+            reloaded
+                .get_active(&ThreadKey::new("chat1".into(), "root1".into()))
+                .map(|e| e.session_id.as_str()),
+            Some("ses_keep")
+        );
+    }
+
+    /// A refused `activate` changes nothing: the new entry is not promoted and
+    /// the thread's Pending Session (and its materialisation inputs) survive.
+    #[test]
+    fn activate_failure_keeps_the_mapping_and_pending() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .activate(make_entry("chat1", "root1", "ses_old", "/tmp/old"))
+            .unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+            .unwrap();
+
+        store.fail_writes_after(0);
+        let err = store
+            .activate(make_entry("chat1", "root1", "ses_new", "/tmp/new"))
+            .unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+        assert!(
+            store.entry_for_session("ses_new").is_none(),
+            "the refused activation is not promoted"
+        );
+        assert_eq!(
+            store.entry_for_session("ses_old").map(|e| e.thread_key.clone()),
+            Some(key.clone()),
+            "the previous mapping is untouched"
+        );
+        assert!(
+            store.pending_for(&key).is_some(),
+            "the pending is not consumed by a refused activation"
+        );
+    }
+
+    /// [`SessionStore::activate_created`] shares the atomic contract: a failed
+    /// save keeps the claim so the materialisation can be retried.
+    #[test]
+    fn activate_created_failure_keeps_the_claim_and_pending() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/new"))
+            .unwrap();
+        let claim = store.claim_pending_for_creation(&key);
+        let generation = match claim {
+            PendingClaim::Claimed(_, generation) => generation,
+            _ => panic!("expected a claim"),
+        };
+
+        store.fail_writes_after(0);
+        let err = store
+            .activate_created(make_entry("chat1", "root1", "ses_new", "/tmp/new"), generation)
+            .unwrap_err();
+        assert!(matches!(err, crate::error::BridgeError::Io(_)));
+        assert!(
+            store.entry_for_session("ses_new").is_none(),
+            "the refused materialisation is not mapped"
+        );
+        assert!(store.pending_for(&key).is_some(), "the pending survives");
+        assert!(
+            matches!(store.claim_pending_for_creation(&key), PendingClaim::Creating),
+            "the claim survives, so the next message retries instead of starting a second creation"
+        );
     }
 
     /// The mapping is written atomically: a failed write leaves the previous

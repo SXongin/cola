@@ -15,7 +15,7 @@ use super::{InlineResidue, Turn, TurnPinSource, state};
 
 impl Turn {
     /// Whether ANY card session still carries a block for `request_id` (the
-    /// snapshot-claimability probe, ADR-0028).
+    /// already-surfaced probe, ADR-0038).
     pub(crate) async fn has_interaction(cards: &CardsHandle, request_id: &str) -> bool {
         cards
             .cards
@@ -69,6 +69,18 @@ impl Turn {
         // #917). The write lock is the flush's own, so the pair is ordered.
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
+        Self::add_permission_locked(cards, session_id, p, directory).await
+    }
+
+    /// [`Self::add_permission`] for a caller that already holds the Session's
+    /// card write lock: the sweep's surfacing decision takes it across the
+    /// inline-host check, the block insert and the flush (ADR-0100).
+    pub(crate) async fn add_permission_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        p: &crate::backend::types::PermissionRequest,
+        directory: &str,
+    ) -> bool {
         let block = state::InteractionBlock::Permission(state::PendingPermission {
             session_id: p.session_id.clone().unwrap_or_default(),
             request_id: p.request_id.clone(),
@@ -97,6 +109,18 @@ impl Turn {
         // flush are one ordered step against every card write (issue #917).
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
+        Self::add_question_locked(cards, session_id, q, directory, paint).await
+    }
+
+    /// [`Self::add_question`] for a caller that already holds the Session's
+    /// card write lock (ADR-0100's one surfacing decision).
+    pub(crate) async fn add_question_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        q: &crate::backend::types::QuestionRequest,
+        directory: &str,
+        paint: &crate::bridge::question::QuestionPaint,
+    ) -> bool {
         let block = state::InteractionBlock::Question(state::PendingQuestion {
             request_id: q.id.clone(),
             session_id: q.session_id.clone(),
@@ -145,7 +169,7 @@ impl Turn {
         dead: &HashSet<String>,
     ) -> Vec<String> {
         Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
-            state::block_of_kind(crate::bridge::snapshot_claims::ClaimKind::Permission, block)
+            state::block_of_kind(crate::bridge::request::kind::InteractionKind::Permission, block)
         })
         .await
     }
@@ -159,7 +183,7 @@ impl Turn {
         dead: &HashSet<String>,
     ) -> Vec<String> {
         Self::resolve_vanished(cards, pending, failed_dirs, cola_claimed, dead, |block| {
-            state::block_of_kind(crate::bridge::snapshot_claims::ClaimKind::Question, block)
+            state::block_of_kind(crate::bridge::request::kind::InteractionKind::Question, block)
         })
         .await
     }
@@ -170,7 +194,7 @@ impl Turn {
     /// classifier and the resolution can never disagree.
     pub(crate) async fn vanished_block_sessions(
         cards: &CardsHandle,
-        kind: crate::bridge::snapshot_claims::ClaimKind,
+        kind: crate::bridge::request::kind::InteractionKind,
         pending: &HashSet<String>,
         failed_dirs: &HashSet<String>,
         cola_claimed: &HashSet<String>,

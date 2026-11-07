@@ -54,8 +54,8 @@ pub(crate) const SETTLING_CLAIM_TTL: std::time::Duration = std::time::Duration::
 /// State shared across every flow: the session map, the per-session live cards
 /// ([`CardSession`] — accumulator + card identity in one place), the two
 /// request flows (permission/question pollers + card actions, on the core so
-/// snapshot claims and question remembering are reachable from the command
-/// layer, ADR-0028), the double-click guard, prompt serialization, and the two
+/// question remembering is reachable from the command layer), the double-click
+/// guard, prompt serialization, and the two
 /// adapters. Owned by the bridge coordinator ([`super::App`]) and passed by
 /// handle to the flow modules that need it: a flow receives the narrow
 /// per-concern handles it uses ([`crate::bridge::handles`]), never the whole
@@ -90,17 +90,9 @@ pub struct SharedCore {
     pub question: Arc<crate::bridge::request::flow::RequestFlow>,
     /// External-message flow: owns `last_user_msg_epoch`, notifies Feishu when
     /// another shared-store client posts while cola is idle, and arms the
-    /// external-reply renderers (including the busy-adopt follow, ADR-0028).
-    /// Shared (`Arc`) because the topic/command bundles carry it to settle a
-    /// sent snapshot through `ExternalFlow::settle_snapshot_after_send`.
+    /// external-reply renderers — including the follow a busy Session Card read
+    /// hands its run to (ADR-0100).
     pub external: Arc<crate::bridge::external::ExternalFlow>,
-    /// ADR-0028 snapshot claim registry: which snapshot card hosts which
-    /// adopt-time pending block, what each snapshot was built from, and the
-    /// tombstones for late second clicks. One Mutex keeps claim/host/tombstone
-    /// mutations atomic (they always change together). The poll loop treats a
-    /// claimed id as already-surfaced (no standalone card, no re-inline); a
-    /// claimed id leaving the pending list drops its block.
-    pub snapshot_claims: Arc<Mutex<crate::bridge::snapshot_claims::SnapshotClaims>>,
     /// request ids already answered on the permission/question cards. Guards
     /// against double-click races (two card callbacks before the result card
     /// replaces the buttons): a second click on the same request is ignored
@@ -386,9 +378,6 @@ impl SharedCore {
                     Arc::clone(&completion_notice_delay_ms),
                 ),
             )),
-            snapshot_claims: Arc::new(Mutex::new(
-                crate::bridge::snapshot_claims::SnapshotClaims::default(),
-            )),
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             settling_requests: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
@@ -503,16 +492,10 @@ impl SharedCore {
         }
     }
 
-    /// The read-side bundle a Session Snapshot gather needs.
-    pub(crate) fn snapshot_handles(&self) -> crate::bridge::handles::SnapshotHandles {
-        crate::bridge::handles::SnapshotHandles::from_flow(&self.flow_handles())
-    }
-
     /// The topic-opening bundle.
     pub(crate) fn topic_handles(&self) -> crate::bridge::handles::TopicHandles {
         crate::bridge::handles::TopicHandles {
             flow: self.flow_handles(),
-            external: Arc::clone(&self.external),
         }
     }
 
@@ -576,7 +559,6 @@ impl SharedCore {
             question: Arc::clone(&self.question),
             answered_requests: Arc::clone(&self.answered_requests),
             settling_requests: Arc::clone(&self.settling_requests),
-            snapshot_claims: Arc::clone(&self.snapshot_claims),
         }
     }
 

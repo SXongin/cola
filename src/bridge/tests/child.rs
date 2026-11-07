@@ -429,10 +429,11 @@ async fn sub_status_read_failure_keeps_the_rows_without_a_state() {
     );
 }
 
-/// `/sub attach <id>` adopts a direct child: the chat receives exactly one
-/// Session Snapshot receipt, the child becomes the Active Session, and the
-/// parent stays mapped — `/switch` switches back to it. No prompt is ever sent
-/// into the child (spec #344, ADR-0054).
+/// `/sub attach <id>` adopts a direct child: the chat receives exactly ONE
+/// confirmation text line carrying the child's status (ADR-0100 — no card), the
+/// child becomes the Active Session, and the parent stays mapped — `/switch`
+/// switches back to it. No prompt is ever sent into the child (spec #344,
+/// ADR-0054).
 #[tokio::test]
 async fn sub_attach_adopts_a_direct_child_and_keeps_the_parent_mapped() {
     let _wd = test_work_dir();
@@ -454,13 +455,14 @@ async fn sub_attach_adopts_a_direct_child_and_keeps_the_parent_mapped() {
 
     send_command(&app, "/sub attach ses_c1", "m1").await;
 
-    // Exactly one receipt, and it is the Session Snapshot with the adopt verb.
+    // Exactly one confirmation line, carrying the child's status — no card.
     let cards = platform.replied_cards().await;
-    assert_eq!(cards.len(), 1, "one Session Snapshot receipt: {cards:?}");
+    assert!(cards.is_empty(), "no card on a child adoption: {cards:?}");
+    let texts = platform.texts().await;
+    assert_eq!(texts.len(), 1, "one confirmation line: {texts:?}");
     assert!(
-        card_text(&cards[0]).contains("已接管 重写渲染"),
-        "snapshot header: {}",
-        card_text(&cards[0])
+        texts[0].contains("已接管「重写渲染」") && texts[0].contains(crate::feishu::card::session::IDLE_CHIP),
+        "the line names the takeover and the live state: {texts:?}"
     );
     assert!(
         prompts.lock().await.is_empty(),
@@ -705,7 +707,7 @@ async fn sub_attach_owned_child_is_refused_without_force() {
     );
     assert!(
         platform.replied_cards().await.is_empty(),
-        "a refused adoption sends no Session Snapshot"
+        "a refused adoption sends no card"
     );
     assert_eq!(
         app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -757,13 +759,15 @@ async fn sub_attach_force_steals_the_child_from_another_chat() {
         "the old owner becomes sessionless"
     );
     let cards = platform.replied_cards().await;
-    assert_eq!(cards.len(), 1, "the steal still ends in one snapshot: {cards:?}");
-    assert!(card_text(&cards[0]).contains("已接管 重写渲染"), "{cards:?}");
+    assert!(cards.is_empty(), "the steal posts no card: {cards:?}");
+    let texts = platform.texts().await;
+    assert_eq!(texts.len(), 1, "the steal still ends in one line: {texts:?}");
+    assert!(texts[0].contains("已接管「重写渲染」"), "{texts:?}");
 }
 
 /// Re-running `/sub attach` for the already-active child is idempotent: the
-/// reply says so, no Session Snapshot is sent, and the store is not written
-/// again.
+/// reply says so, no adoption line or card is sent, and the store is not
+/// written again.
 #[tokio::test]
 async fn sub_attach_already_active_child_is_idempotent() {
     let _wd = test_work_dir();
@@ -793,12 +797,16 @@ async fn sub_attach_already_active_child_is_idempotent() {
 
     let text = platform.texts().await.join("\n");
     assert!(
-        text.contains("Already active: \"重写渲染\""),
+        text.contains("已接管「重写渲染」"),
         "the idempotent reply names the child's real title: {text}"
     );
     assert!(
+        text.contains(crate::feishu::card::session::IDLE_CHIP),
+        "the idempotent reply carries the shared status line: {text}"
+    );
+    assert!(
         platform.replied_cards().await.is_empty(),
-        "an already-active child gets no second snapshot"
+        "an already-active child gets no second card"
     );
     let after = std::fs::read(&store_path).expect("the store is still readable");
     assert_eq!(before, after, "no second mapping write");
@@ -812,8 +820,8 @@ async fn sub_attach_already_active_child_is_idempotent() {
 
 /// The already-active fallback is only for a server-reported CHILD: naming the
 /// Active Session when it is a ROOT is out of scope, so it takes the non-child
-/// refusal — never "Already active", never a write (the scope gate is not
-/// bypassable by the one session every chat has).
+/// refusal — never the idempotent adoption line, never a write (the scope gate
+/// is not bypassable by the one session every chat has).
 #[tokio::test]
 async fn sub_attach_naming_the_active_root_is_refused() {
     let _wd = test_work_dir();
@@ -841,12 +849,12 @@ async fn sub_attach_naming_the_active_root_is_refused() {
             "query {query}: the active root is refused as out of scope: {text}"
         );
         assert!(
-            !text.contains("Already active"),
+            !text.contains("已接管"),
             "query {query}: an active root is not an idempotent child takeover: {text}"
         );
         assert!(
             platform.replied_cards().await.is_empty(),
-            "query {query}: no Session Snapshot"
+            "query {query}: no card"
         );
         assert_eq!(
             app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -858,10 +866,10 @@ async fn sub_attach_naming_the_active_root_is_refused() {
     }
 }
 
-/// Taking over a running child succeeds, and the Session Snapshot reflects its
-/// live state (运行中) rather than hiding it.
+/// Taking over a running child succeeds, and the ONE-line confirmation (ADR-0100)
+/// reflects its live state (运行中) rather than hiding it.
 #[tokio::test]
-async fn sub_attach_running_child_snapshot_shows_its_live_state() {
+async fn sub_attach_running_child_line_shows_its_live_state() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -881,11 +889,15 @@ async fn sub_attach_running_child_snapshot_shows_its_live_state() {
 
     send_command(&app, "/sub attach ses_c1", "m1").await;
 
-    let card = first_card(&platform).await;
-    let text = card_text(&card);
+    let texts = platform.texts().await;
+    let line = texts.first().expect("the adoption answers a line");
     assert!(
-        text.contains(crate::feishu::snapshot_card::BUSY_CHIP),
-        "the snapshot shows the child's live run state: {text}"
+        line.contains(crate::feishu::card::session::BUSY_CHIP),
+        "the confirmation shows the child's live run state: {line}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "the running child's adoption posts no card"
     );
     assert_eq!(
         app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -899,7 +911,7 @@ async fn sub_attach_running_child_snapshot_shows_its_live_state() {
 
 /// `/switch <child-id> --force` cannot adopt an unmapped child: the general
 /// command refuses with the `/sub attach` pointer before any mapping write or
-/// Session Snapshot (spec #344).
+/// card (spec #344).
 #[tokio::test]
 async fn switch_force_refuses_an_unmapped_child_and_points_at_sub_attach() {
     let _wd = test_work_dir();
@@ -932,7 +944,7 @@ async fn switch_force_refuses_an_unmapped_child_and_points_at_sub_attach() {
     );
     assert!(
         platform.replied_cards().await.is_empty(),
-        "a refused child gets no Session Snapshot"
+        "a refused child gets no card"
     );
     assert_eq!(
         app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -982,7 +994,7 @@ async fn switch_force_does_not_steal_a_child_mapped_to_another_chat() {
     );
     assert!(
         platform.replied_cards().await.is_empty(),
-        "a refused child gets no Session Snapshot"
+        "a refused child gets no card"
     );
     assert_eq!(
         app.sessions.lock().await.get_active(&key()).unwrap().session_id,
@@ -1142,10 +1154,7 @@ async fn switch_card_adopt_refuses_an_unmapped_child() {
             }))
             .await
             .expect("the op returns a result");
-        assert!(
-            result.card.is_none(),
-            "{op}: a refused child gets no Session Snapshot"
-        );
+        assert!(result.card.is_none(), "{op}: a refused child gets no card");
         let toast = result.toast.unwrap_or_default();
         assert!(
             toast.contains("/sub attach"),

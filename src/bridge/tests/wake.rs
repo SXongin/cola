@@ -48,7 +48,7 @@ use crate::backend::{
     WakeSource,
 };
 use crate::bridge::test_support::*;
-use crate::bridge::turn::{CardOwnership, Turn};
+use crate::bridge::turn::{CardOwnership, ContinuationFacts, Turn};
 use crate::feishu::card::CardState;
 
 /// A finished assistant turn whose newest message recorded a failure.
@@ -873,8 +873,215 @@ async fn a_wake_after_a_done_card_continues_on_a_new_card() {
         platform.updated_cards().await
     );
     assert!(
-        platform.replied_cards().await.iter().any(is_continuation),
-        "the continuation replies to the user's message"
+        platform.sent_cards().await.iter().any(is_continuation),
+        "a terminal card has no live reply target: the continuation lands top-level"
+    );
+}
+
+/// A `/card` read replaces the terminal chain card (ADR-0100) but joins no
+/// chain: a later Wake must not be read as continuing that read (its empty
+/// accumulator makes every part look unrendered, and the read must never be
+/// repainted). Instead the Fresh arm opens a continuation card in the main
+/// chat's top level and renders the new work — never a silent drop.
+#[tokio::test]
+async fn a_wake_after_a_card_read_opens_a_fresh_card_in_a_main_chat() {
+    let _wd = test_work_dir();
+    let done = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![done], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done)
+    );
+
+    // `/card`: the done chain card is replaced by the one-shot read.
+    assert!(
+        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        "the read replaces the spent chain card"
+    );
+
+    // A shell/subagent completion Wake lands after the read, with new work.
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "后台合并完成。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("后台合并完成。"),
+    )
+    .await;
+
+    // The read is never continued or repainted.
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == "om_read"
+        )),
+        "the read is never repainted: {calls:?}"
+    );
+    // A main chat has no reply target, so the fresh card is sent top-level; the
+    // run's work then streams onto it (the assertion above).
+    assert!(
+        !platform.sent_cards().await.is_empty(),
+        "the fresh continuation reaches the chat top level: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("后台合并完成。")),
+        "the fresh continuation carries the late work: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// The same read-then-Wake after a `/card` in a **topic**: the Fresh arm's
+/// reply target is the topic anchor, so the continuation opens there instead of
+/// the split arm's silent `None`.
+#[tokio::test]
+async fn a_wake_after_a_card_read_opens_a_fresh_card_in_a_topic() {
+    let _wd = test_work_dir();
+    let done = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![done], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+    assert!(
+        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        "the read replaces the spent chain card"
+    );
+
+    // The Session is mapped to a topic whose anchor is the takeover's line.
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_topic".into());
+    let mut entry = crate::config::SessionEntry::new(topic_key, "ses_test", "/work");
+    entry.topic_anchor = Some("msg_anchor".into());
+    seed_entry(&app, entry).await;
+
+    script_transcript(
+        &backend,
+        vec![
+            SessionTranscript::new(vec![
+                user("msg_cola_anchor", 1_000, "第一条消息"),
+                assistant(2_000, "第一轮回答。"),
+                assistant(3_100, "后台合并完成。"),
+            ])
+            .with_executions(vec![execution(2_500), execution(4_000)])
+            .with_wakes(vec![shell_wake(2_900)]),
+        ],
+    )
+    .await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the continuation's done card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("后台合并完成。"),
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == "om_read"
+        )),
+        "the read is never repainted: {calls:?}"
+    );
+    assert!(
+        platform
+            .replied_cards_with_targets()
+            .await
+            .iter()
+            .any(|(target, _)| target == "msg_anchor"),
+        "the continuation opens on the topic anchor: {calls:?}"
+    );
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("后台合并完成。")),
+        "the continuation renders the late work: {calls:?}"
+    );
+}
+
+/// A **Wake-less** residual tail after `/card` must not spin the residual
+/// floor (ADR-0100): the idle read joins no chain, so the Fresh gate sees no
+/// Wake and decides nothing. Nothing PATCHes the read, no card opens, and no
+/// per-tick WARN is emitted while the stale record (if any) waits for the next
+/// Turn's `seed_orphan_delta`.
+#[tokio::test]
+async fn a_wake_less_tail_after_a_card_read_is_silent() {
+    let _wd = test_work_dir();
+    let late = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "第一条消息"),
+        assistant(2_000, "第一轮回答。"),
+        assistant(3_100, "收尾时补上的一段。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![late], Some(SessionStatus::Idle)).await;
+    assert!(
+        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        "the read is installed"
+    );
+
+    let ((), logs) = capture_logs(async {
+        spawn_sync(&app);
+        // Several Sync ticks: the old residual arm warned on each one.
+        wait_for_transcript_reads(&backend, "ses_test", 3).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                if message_id == "om_read"
+        )),
+        "the read is never repainted: {calls:?}"
+    );
+    assert_eq!(
+        card_posts(&platform).await,
+        0,
+        "a Wake-less tail opens no card: {calls:?}"
+    );
+    assert_eq!(
+        level_count(&logs, "wake continuation", "WARN"),
+        0,
+        "no per-tick wake WARN: {logs}"
     );
 }
 
@@ -3856,4 +4063,211 @@ async fn an_unnamed_merged_wake_renders_the_bare_title() {
         .expect("the boundary ends the turn")
         .unwrap();
     result.unwrap();
+}
+
+/// Leave `ses_test` with a `Done` card that still owes a split continuation: a
+/// pull queue whose continuation create failed, with the run then settling.
+/// The queue and its reply target are the only record of that tail.
+async fn seed_done_card_owing_a_continuation(app: &Arc<App>, platform: &RecordingPlatform) {
+    seed_live_card(app, "ses_test", "om_live").await;
+    platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let cards = app.cards_handle();
+    Turn::split_card_chain(
+        &cards,
+        "ses_test",
+        "msg_pull",
+        crate::bridge::turn::SplitKind::Pull,
+    )
+    .await;
+    assert!(
+        Turn::has_pending_split(&cards, "ses_test").await,
+        "the failed continuation leaves its split queued: {:?}",
+        Turn::pending_splits(&cards, "ses_test").await
+    );
+    Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
+}
+
+/// A Wake's Fresh arm must not replace a terminal card that still owns a
+/// queued continuation (ADR-0100): `pending_split` and its reply target are the
+/// only record of the content the chain still owes, so the Wake waits for the
+/// continuation to be served. Once it is, the same Wake arms.
+#[tokio::test]
+async fn a_wake_does_not_replace_a_done_card_that_owes_a_continuation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let cards = app.cards_handle();
+    seed_done_card_owing_a_continuation(&app, &platform).await;
+
+    let id_before = Turn::card_message_id(&cards, "ses_test").await;
+    let reply_before = Turn::reply_target(&cards, "ses_test").await;
+    let queue_before = Turn::pending_splits(&cards, "ses_test").await;
+    assert_eq!(id_before.as_deref(), Some("om_live"));
+    assert!(!queue_before.is_empty(), "the fixture owes a continuation");
+
+    let anchor = turn_anchor(3_000);
+    let facts = || ContinuationFacts {
+        reply_to: Some("msg_user"),
+        chat_id: "chat_1",
+        subtitle: "test",
+        directory: "/work",
+        variant: None,
+    };
+    assert!(
+        Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts())
+            .await
+            .is_none(),
+        "a Wake must not replace a card that still owes its queued continuation"
+    );
+    // The card, its queue and its reply target are untouched.
+    assert_eq!(Turn::card_message_id(&cards, "ses_test").await, id_before);
+    assert_eq!(Turn::reply_target(&cards, "ses_test").await, reply_before);
+    assert_eq!(Turn::pending_splits(&cards, "ses_test").await, queue_before);
+    assert_eq!(Turn::card_state(&cards, "ses_test").await, Some(CardState::Done));
+
+    // Serve the queued split: the production flush retries its create.
+    Turn::flush_card(&cards, "ses_test").await;
+    assert!(!Turn::has_pending_split(&cards, "ses_test").await);
+
+    let armed = Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts())
+        .await
+        .expect("the Wake arms once the owed continuation is served");
+    assert!(
+        card_text(&armed).contains(WAKE_LEAD),
+        "the Fresh continuation opens with the 承接 line: {armed}"
+    );
+    assert!(
+        Turn::card_message_id(&cards, "ses_test").await.is_none(),
+        "the Fresh arm replaced the served card with its un-sent continuation"
+    );
+}
+
+/// A Wake's Fresh arm must not replace a terminal card that still carries a
+/// live Permission/Question: the takeover would collect the old card and strip
+/// the only answerable controls (ADR-0100).
+#[tokio::test]
+async fn a_wake_does_not_replace_a_terminal_card_with_a_live_block() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let cards = app.cards_handle();
+    Turn::add_permission(
+        &cards,
+        "ses_test",
+        &perm_request("per_live", "ses_test", "ls -la"),
+        "/work",
+    )
+    .await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Error).await;
+    assert!(Turn::has_live_interaction(&cards, "per_live").await);
+
+    let anchor = turn_anchor(3_000);
+    let facts = ContinuationFacts {
+        reply_to: Some("msg_user"),
+        chat_id: "chat_1",
+        subtitle: "test",
+        directory: "/work",
+        variant: None,
+    };
+    assert!(
+        Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts)
+            .await
+            .is_none(),
+        "a Wake must not replace a terminal card that still carries a live block"
+    );
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the Error card and its controls stay current"
+    );
+    assert_eq!(Turn::card_state(&cards, "ses_test").await, Some(CardState::Error));
+    assert!(
+        Turn::has_live_interaction(&cards, "per_live").await,
+        "the permission block survives"
+    );
+    assert_eq!(
+        Turn::live_permissions(&cards, "ses_test").await.len(),
+        1,
+        "the permission is still answerable"
+    );
+}
+
+/// A bare actionable `Error`/`Unreceived` card owns the only recovery control.
+/// The Wake's Fresh arm must leave it current: replacing it makes a Retry/
+/// 重新发起 click reach `claim_recovery` on a successor whose state no longer
+/// matches (it returns `None`), and a failed Wake send drops the successor
+/// without restoring this card (ADR-0100).
+#[tokio::test]
+async fn a_wake_does_not_replace_a_bare_actionable_terminal_card() {
+    for state in [CardState::Error, CardState::Unreceived] {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.fail_prompts(1, "simulated failure");
+        let (app, _platform) = build_app(cfg, backend).await;
+        seed_session(&app, "ses_test", "/work").await;
+
+        // A real failed Turn records the prompt and ends on an actionable card;
+        // the state loop below re-labels that same accumulator.
+        app.handle_message(incoming(
+            "msg_user".into(),
+            "chat_1".into(),
+            "p2p".into(),
+            None,
+            "hi".into(),
+            None,
+        ))
+        .await;
+        let cards = app.cards_handle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if Turn::card_state(&cards, "ses_test").await == Some(CardState::Error) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the failed Turn ends on an Error card");
+        let id_before = Turn::card_message_id(&cards, "ses_test").await;
+        assert!(id_before.is_some(), "the recovery card was sent");
+        Turn::set_card_state(&cards, "ses_test", state.clone()).await;
+
+        let anchor = turn_anchor(3_000);
+        let facts = ContinuationFacts {
+            reply_to: Some("msg_user"),
+            chat_id: "chat_1",
+            subtitle: "test",
+            directory: "/work",
+            variant: None,
+        };
+        assert!(
+            Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts)
+                .await
+                .is_none(),
+            "{state:?}: a Wake must not replace a card that offers recovery"
+        );
+        assert_eq!(
+            Turn::card_message_id(&cards, "ses_test").await,
+            id_before,
+            "{state:?}: the actionable card stays current"
+        );
+        assert_eq!(
+            Turn::card_state(&cards, "ses_test").await,
+            Some(state.clone()),
+            "{state:?}: the state is untouched"
+        );
+        assert!(
+            Turn::claim_recovery(&cards, "ses_test", state.clone())
+                .await
+                .is_some(),
+            "{state:?}: the recovery control still claims"
+        );
+    }
 }

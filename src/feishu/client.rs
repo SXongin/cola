@@ -363,10 +363,7 @@ impl Client {
     /// interactive card, which creates a topic around the seed message when it
     /// is not already inside one. Returns `(message_id, thread_id)`: the id of
     /// the created reply (which lives INSIDE the topic, usable as an anchor to
-    /// reply into it later) and the topic's `thread_id`. Used by `/topic` to
-    /// open a real, UI-separated conversation and by `/topic --adopt` to place
-    /// the Session Snapshot card as the topic's first message and anchor
-    /// (ADR-0028).
+    /// reply into it later) and the topic's `thread_id`.
     ///
     /// `thread_id` is `None` when the response carries no topic (the chat does
     /// not support topic replies) — the caller must not persist a broken

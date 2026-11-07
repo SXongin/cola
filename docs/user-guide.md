@@ -795,14 +795,14 @@ detailed help for any of these.
 | `/switch forget` | Un-map this chat's session (the server session stays) |
 | `/sub` | Child-session card: the current session's direct child sessions, read-only (运行中/空闲 per row) |
 | `/sub list [kw]` | Same card, filtered by keyword (title/dir/id); the filter and page round-trip like `/switch` |
-| `/sub attach <id\|标题> [--force]` | Take over one of the current session's direct child sessions into this chat (Session Snapshot receipt; `--force` steals a mapping owned by another chat) |
+| `/sub attach <id\|标题> [--force]` | Take over one of the current session's direct child sessions into this chat (one-line confirmation carrying the session's status; `--force` steals a mapping owned by another chat) |
 | `/new [name]` | Declare a new session in the current project — created by the next message (no session → default dir) |
 | `/topic [dir] [name]` | Open a new Feishu topic in `<dir>`; its first message creates the session (bare `/topic` uses the current project) |
 | `/topic --adopt <kw> [--force]` | Open a topic around an existing session |
 | `/name <name>` | Rename current session (server-side, visible to all clients; on a pending, set the creation title) |
 | `/stop` | Interrupt execution |
 | `/compact` | Compact context |
-| `/card` | Pull the live card down to the newest position after mid-turn command replies bury it (replies a notice when no turn is running) |
+| `/card` | Pull the live card down to the newest position after mid-turn command replies bury it; with nothing rendering the Session, read it once and post a read-only Session card (status, how many requests wait for you, the last four messages), or — when the read is busy/waiting on a run cola did not start — follow that run to its end on the same card. A run cola itself started stays a static read, and a static read never promises refreshes |
 | `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
 | `/model <p/m>` | Switch model (OpenCode: takes effect next message, persisted; Codex: records a one-shot pick for a live thread's next new message, dropped on restart; a Pending Session keeps its creation pick) |
 | `/think [level]` | Set/clear thinking level, per model (OpenCode: next message, persisted; Codex: one-shot for a live thread's next new message, dropped on restart; a Pending Session keeps its creation level) |
@@ -902,12 +902,15 @@ Notes:
   empty state. The `/sub list` view is observation only: it never messages a
   child. `/sub attach <id|id-prefix|title> [--force]` takes one of the current
   session's **direct** children over into this chat — the same adoption as
-  `/switch` (Session Snapshot receipt with its pending permissions/questions;
-  an owner refusal naming the other chat unless `--force`, which steals that
-  mapping). The query accepts the same forms as `/switch` (exact id, unique
-  id-prefix, title substring), scoped to those children: unknown and ambiguous
-  queries are reported, and a session that is not a direct child is refused.
-  Taking over a running child is allowed and the snapshot shows its live state.
+  `/switch` (one text line carrying the session's status — 等待你的确认 / 等待后台任务 /
+  运行中 / 需要重试 / 空闲 — never a card, with pending permissions/questions
+  surfacing as their own cards; an owner refusal naming the other chat unless
+  `--force`, which steals that mapping). The query accepts the same forms as
+  `/switch` (exact id, unique id-prefix, title substring), scoped to those
+  children: unknown and ambiguous queries are reported, and a session that is
+  not a direct child is refused.
+  Taking over a running child is allowed and the confirmation line shows its
+  live state.
   The parent stays mapped, so `/switch` switches back, and re-running `/sub
   attach` for the already-active child changes nothing. This is cola's only
   sanctioned way to take over a child; no message is ever injected into a

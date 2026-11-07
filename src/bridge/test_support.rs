@@ -295,11 +295,6 @@ pub enum PlatformCall {
         text: String,
         thread_id: Option<String>,
     },
-    ReplyCardInThread {
-        message_id: String,
-        card: serde_json::Value,
-        thread_id: Option<String>,
-    },
     CompletionNotice {
         reply_to: String,
         open_id: String,
@@ -391,6 +386,12 @@ pub struct RecordingPlatform {
     pub fail_send_card: bool,
     /// When true, `reply_card` fails (tests the restart-announce fallback).
     pub fail_reply_card: bool,
+    /// When true, `reply_in_thread` fails (tests that a failed in-topic
+    /// confirmation is propagated instead of adopting with no anchor).
+    pub fail_reply_in_thread: bool,
+    /// The next N `reply_in_thread` calls fail, then the call succeeds — a
+    /// transient failure a test can retry past.
+    pub fail_reply_in_thread_count: std::sync::atomic::AtomicUsize,
     /// The next N `reply_card` calls fail (a CONTINUATION send that must be
     /// retried without duplicating receipts, while the loading card's own
     /// reply — if any — succeeds).
@@ -522,6 +523,8 @@ impl RecordingPlatform {
             chat_names: std::collections::HashMap::new(),
             fail_send_card: false,
             fail_reply_card: false,
+            fail_reply_in_thread: false,
+            fail_reply_in_thread_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_count: std::sync::atomic::AtomicUsize::new(0),
@@ -669,17 +672,6 @@ impl RecordingPlatform {
         .await
     }
 
-    /// Every card replied into a thread — the shape a continuation uses when
-    /// the conversation is a Topic. Kept separate from [`Self::replied_cards`]
-    /// because its call carries a thread id too.
-    pub(crate) async fn replied_in_thread_cards(&self) -> Vec<serde_json::Value> {
-        self.cards_of(|c| match c {
-            PlatformCall::ReplyCardInThread { card, .. } => Some(card),
-            _ => None,
-        })
-        .await
-    }
-
     /// Every replied card paired with the message id it replied under, in call
     /// order (asserts a reply lands under the right message).
     pub(crate) async fn replied_cards_with_targets(&self) -> Vec<(String, serde_json::Value)> {
@@ -788,8 +780,7 @@ impl RecordingPlatform {
             match call {
                 PlatformCall::ReplyCard { card, .. }
                 | PlatformCall::SendCard { card, .. }
-                | PlatformCall::UpdateMessage { card, .. }
-                | PlatformCall::ReplyCardInThread { card, .. } => {
+                | PlatformCall::UpdateMessage { card, .. } => {
                     collect_button_values(card, &mut out);
                 }
                 _ => {}
@@ -1122,6 +1113,19 @@ impl feishu::Platform for RecordingPlatform {
         message_id: &str,
         text: &str,
     ) -> crate::error::Result<(String, Option<String>)> {
+        let transient = self
+            .fail_reply_in_thread_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if transient {
+            self.fail_reply_in_thread_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self.fail_reply_in_thread || transient {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated reply_in_thread failure".into(),
+            ));
+        }
         let thread_id = self.reply_in_thread_thread_id.clone();
         self.calls.lock().await.push(PlatformCall::ReplyInThread {
             message_id: message_id.into(),
@@ -1129,23 +1133,6 @@ impl feishu::Platform for RecordingPlatform {
             thread_id: thread_id.clone(),
         });
         // The mock's created topic-reply message id becomes the anchor.
-        Ok(("msg_topic_reply".into(), thread_id))
-    }
-
-    async fn reply_card_in_thread(
-        &self,
-        message_id: &str,
-        card: &serde_json::Value,
-    ) -> crate::error::Result<(String, Option<String>)> {
-        let thread_id = self.reply_in_thread_thread_id.clone();
-        self.calls.lock().await.push(PlatformCall::ReplyCardInThread {
-            message_id: message_id.into(),
-            card: card.clone(),
-            thread_id: thread_id.clone(),
-        });
-        // The mock's created topic-reply message id becomes the anchor (same
-        // id as the text reply_in_thread, so topic-adopt tests asserting the
-        // anchor id pass for both seed kinds).
         Ok(("msg_topic_reply".into(), thread_id))
     }
 
@@ -1585,9 +1572,6 @@ pub struct MockBackend {
     /// When true, `reply_question`/`reject_question` report the request as
     /// already gone (404), like a question resolved elsewhere.
     pub reply_question_not_found: bool,
-    /// Requests a test adds AFTER the app is built (simulating a request that
-    /// arrives after the snapshot was sent, ADR-0028).
-    pub extra_permissions: Arc<tokio::sync::Mutex<Vec<crate::backend::types::PermissionRequest>>>,
     /// session_id → server title (simulates OpenChamber's session title).
     /// `std::sync::Mutex` for interior mutability: `update_session_title`
     /// writes it through `&self` (the trait requires `&self`).
@@ -2002,6 +1986,16 @@ pub struct MockBackend {
     /// Scripts the ADR-0028 busy→idle race: the first `session_status` read
     /// returns Busy (and clears the flag), later reads serve the map.
     pub status_busy_once: std::sync::atomic::AtomicBool,
+    /// Scripts the gather→arm idle→busy window: the first `session_status`
+    /// read returns Idle, the next Busy, later reads serve the map.
+    pub status_idle_then_busy_once: std::sync::atomic::AtomicBool,
+    /// The Busy half of [`Self::status_idle_then_busy_once`].
+    pub status_busy_after_idle: std::sync::atomic::AtomicBool,
+    /// Arms [`Self::hang_second_session_status`]: the next status read serves,
+    /// the one after hangs forever.
+    pub hang_status_after_first: std::sync::atomic::AtomicBool,
+    /// The hanging second status read's own flag.
+    pub hang_status_next: std::sync::atomic::AtomicBool,
     /// Scenario state for [`MockBackend::given_prompt`]: `(needle, parts)`
     /// pairs matched against the prompt text, first match wins.
     prompt_scripts: Vec<(String, Vec<Part>)>,
@@ -2053,7 +2047,6 @@ impl MockBackend {
             fail_reply_permission_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_reply_question_count: std::sync::atomic::AtomicUsize::new(0).into(),
             reply_question_not_found: false,
-            extra_permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_scripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2171,6 +2164,10 @@ impl MockBackend {
             delay_reads_with_tail: std::sync::Mutex::new(None),
             on_transcript_read: std::sync::Mutex::new(None),
             status_busy_once: std::sync::atomic::AtomicBool::new(false),
+            status_idle_then_busy_once: std::sync::atomic::AtomicBool::new(false),
+            status_busy_after_idle: std::sync::atomic::AtomicBool::new(false),
+            hang_status_after_first: std::sync::atomic::AtomicBool::new(false),
+            hang_status_next: std::sync::atomic::AtomicBool::new(false),
             prompt_scripts: Vec::new(),
             last_prompt_parts: std::sync::Mutex::new(None),
             fail_prompt_message: None,
@@ -2839,13 +2836,19 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: `request` arrives AFTER the app was built (the snapshot was
-    /// already sent, ADR-0028).
-    pub(crate) fn ask_permission_later(&self, request: crate::backend::types::PermissionRequest) -> &Self {
-        self.extra_permissions
-            .try_lock()
-            .expect("ask_permission_later before the app is built")
-            .push(request);
+    /// Scenario: the gather's `session_status` reads Idle, the follow's arm-time
+    /// read sees Busy (the run started in between), later reads serve the map.
+    pub(crate) fn idle_then_busy_once(&self) -> &Self {
+        self.status_idle_then_busy_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the first `session_status` read serves, the next hangs
+    /// forever (the gather succeeds, the follow prepare stalls).
+    pub(crate) fn hang_second_session_status(&self) -> &Self {
+        self.hang_status_after_first
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3539,15 +3542,12 @@ impl crate::backend::Backend for MockBackend {
             ));
         }
         let replied = self.replied_permissions.lock().await;
-        let mut out: Vec<_> = self
+        let out: Vec<_> = self
             .permissions
             .iter()
             .filter(|p| !replied.contains(&p.request_id))
             .cloned()
             .collect();
-        // Post-build scripting: a test may add requests AFTER the app is built
-        // (simulating a request arriving after the snapshot was sent).
-        out.extend(self.extra_permissions.lock().await.iter().cloned());
         Ok(out)
     }
 
@@ -3933,6 +3933,36 @@ impl crate::backend::Backend for MockBackend {
         // map (the follow's arm-time check sees the turn already finished).
         if self
             .status_busy_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(Some(crate::backend::types::SessionStatus::Busy));
+        }
+        // Scripts the gather→arm idle→busy window: the gather reads Idle, the
+        // follow's own status read sees Busy.
+        // Scripts the gather→prepare split: the first read serves, the second
+        // hangs so the prepare's outer bound is what ends it.
+        if self
+            .hang_status_after_first
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.hang_status_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        } else if self
+            .hang_status_next
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
+        if self
+            .status_idle_then_busy_once
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.status_busy_after_idle
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(Some(crate::backend::types::SessionStatus::Idle));
+        }
+        if self
+            .status_busy_after_idle
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             return Ok(Some(crate::backend::types::SessionStatus::Busy));
@@ -4555,7 +4585,6 @@ pub(crate) async fn wait_for_recorded_card(
     loop {
         let mut cards = platform.updated_cards().await;
         cards.extend(platform.replied_cards().await);
-        cards.extend(platform.replied_in_thread_cards().await);
         if cards.iter().any(&check) {
             return;
         }
@@ -4840,21 +4869,45 @@ pub(crate) async fn seed_session(app: &Arc<App>, session_id: &str, directory: &s
     .await;
 }
 
-/// #144 rig: the three live surfaces a pending request may own. The caller
-/// seeds the one session (`ses_1`, `/work`) before passing these to
+/// Seed a LIVE card host for poll/click fixtures: map the Session to `chat_1`
+/// at `/work`, install its card (with `message_id`), mark it `Streaming`, and
+/// give it a reply target. A finished card is no inline host (ADR-0100), and
+/// `handle_message` runs its scripted prompt to the end, so a test that needs
+/// an in-flight card seeds one directly.
+pub(crate) async fn seed_live_card(app: &Arc<App>, session_id: &str, message_id: &str) {
+    seed_session(app, session_id, "/work").await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some(message_id)).await;
+    Turn::set_card_state(&cards, session_id, crate::feishu::card::CardState::Streaming).await;
+    Turn::set_reply_target(&cards, session_id, "msg_1").await;
+}
+
+/// A bare [`SharedCore`](crate::bridge::core::SharedCore) over a fresh config
+/// with a recording platform and the given Backend — the handle-level seam for
+/// tests that drive `FlowHandles` without building an `App`.
+pub(crate) fn core_with(
+    cfg: &crate::config::Config,
+    backend: MockBackend,
+) -> Arc<crate::bridge::core::SharedCore> {
+    let layout = crate::state::StateLayout::from_config(cfg);
+    let platform = Arc::new(RecordingPlatform::new());
+    Arc::new(
+        crate::bridge::core::SharedCore::new(cfg, layout, Arc::new(backend), platform)
+            .expect("the test core builds"),
+    )
+}
+
+/// #144 rig: the two live surfaces a pending request may own. The caller seeds
+/// the one session (`ses_1`, `/work`) before passing these to
 /// [`assert_failed_dir_keeps_surfaces`].
 pub(crate) struct FailedDirSurfaces {
     /// The standalone card's request id and Message id.
     pub card_id: &'static str,
     pub card_message_id: &'static str,
-    /// The inline request id, already seeded onto `inline_acc`.
+    /// The inline request id, seeded onto the streaming card by the rig.
     pub inline_id: &'static str,
-    /// The snapshot host's Message id; the claim rides `claim`.
-    pub snapshot_message_id: &'static str,
     /// The request inlined on the streaming card, seeded onto it by the rig.
     pub inline_request: crate::bridge::request::kind::PendingRequest,
-    /// The request embedded (and claimed) by the snapshot card.
-    pub claim: crate::bridge::request::kind::PendingRequest,
 }
 
 /// Seed `request` as an inline block on `session_id`'s card, kind-agnostically —
@@ -4884,9 +4937,9 @@ async fn seed_inline_request(
 }
 
 /// #144: drive one hanging-list sweep and one successful-list sweep over the
-/// three surfaces: the first must keep them all ("unknown must never be read
-/// as resolved"), the second must still fire every cleanup. `flow` and `hang`
-/// pick the kind; `surfaces` carries its kind-specific fixtures.
+/// two surfaces: the first must keep them both ("unknown must never be read as
+/// resolved"), the second must still fire every cleanup. `flow` and `hang` pick
+/// the kind; `surfaces` carries its kind-specific fixtures.
 pub(crate) async fn assert_failed_dir_keeps_surfaces(
     app: &Arc<App>,
     flow: &crate::bridge::request::flow::RequestFlow,
@@ -4896,7 +4949,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
 ) {
     flow.list_timeout_ms
         .store(30, std::sync::atomic::Ordering::Relaxed);
-    let claim_id = surfaces.claim.id().to_string();
 
     // One live surface per request, all owned by the failing directory /work.
     flow.sent_cards.lock().await.insert(
@@ -4911,24 +4963,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
     let cards = app.core.cards_handle();
     Turn::seed_card(&cards, "ses_1", None).await;
     seed_inline_request(&cards, "ses_1", &surfaces.inline_request, "/work").await;
-    app.core.snapshot_claims.lock().await.claim(
-        surfaces.snapshot_message_id,
-        "已接管",
-        "标题",
-        &crate::bridge::snapshot::SnapshotData {
-            session_id: "ses_1".into(),
-            directory: "/work".into(),
-            status: None,
-            waiting: false,
-            pending: vec![surfaces.claim],
-            pending_elsewhere: None,
-            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
-            tail: vec![],
-            newest_user_anchor: None,
-            newest_user_is_cola_authored: false,
-        },
-        None,
-    );
 
     // The list call hangs: /work said nothing this sweep.
     hang.store(1, std::sync::atomic::Ordering::SeqCst);
@@ -4943,17 +4977,12 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
         inline_surface_live(app, surfaces.inline_id).await,
         "a failed list must not drop the inline section"
     );
-    assert!(
-        app.core.snapshot_claims.lock().await.contains(&claim_id),
-        "a failed list must not drop the snapshot claim"
-    );
     let first_calls = platform.calls.lock().await.clone();
     assert!(
         first_calls.iter().all(|c| !matches!(
             c,
             PlatformCall::UpdateMessage { message_id, .. }
                 if message_id == surfaces.card_message_id
-                    || message_id == surfaces.snapshot_message_id
         )),
         "a failed list must not re-render any surface: {first_calls:?}"
     );
@@ -4974,10 +5003,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
         inline_handled_elsewhere_receipt_present(app).await,
         "a successful list must leave the gone inline block's receipt (#175)"
     );
-    assert!(
-        !app.core.snapshot_claims.lock().await.contains(&claim_id),
-        "a successful list must still drop the gone claim"
-    );
     let calls = platform.calls.lock().await.clone();
     assert!(
         calls.iter().any(|c| matches!(
@@ -4986,14 +5011,6 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
                 if message_id == surfaces.card_message_id && card.to_string().contains("已处理")
         )),
         "the standalone card is marked stale: {calls:?}"
-    );
-    assert!(
-        calls.iter().any(|c| matches!(
-            c,
-            PlatformCall::UpdateMessage { message_id, .. }
-                if message_id == surfaces.snapshot_message_id
-        )),
-        "the snapshot is re-rendered without the block: {calls:?}"
     );
 }
 

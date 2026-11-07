@@ -15,8 +15,8 @@
 //!
 //! - [`FlowHandles`] — the four per-concern handles plus the backend and the
 //!   platform: the request flow and the external-message flow run on it.
-//! - [`SnapshotHandles`] — the read-side subset a Session Snapshot gather and
-//!   its claim filter need.
+//! - [`SnapshotHandles`] — the read-side subset a Session Snapshot gather
+//!   needs.
 //! - [`TopicHandles`] — [`FlowHandles`] plus the external flow the topic
 //!   opening settles an adopted snapshot through.
 //! - [`CommandHandles`] — [`FlowHandles`] plus the turn config (the default
@@ -33,12 +33,11 @@ use tokio::sync::Mutex;
 
 use crate::bridge::card_handles::CardHandles;
 use crate::bridge::core::{CoverTitle, SESSION_INFO_TIMEOUT, SETTLING_CLAIM_TTL, SessionListCache};
-use crate::bridge::external::ExternalFlow;
 use crate::bridge::message_pins::MessagePins;
 use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::flow::RequestFlow;
+use crate::bridge::request::kind::InteractionKind;
 use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore, WorktreeAdjust};
-use crate::bridge::snapshot_claims::{ClaimKind, SnapshotClaims};
 use crate::bridge::turn::{CardSession, CollectReason, Turn};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
@@ -628,17 +627,25 @@ impl SessionsHandle {
     }
 
     /// Persist `entry` as its thread's active session and drop the session-list
-    /// cache: creating or adopting a session changes what `/switch`
-    /// should offer. The cache is dropped even when the save fails, because the
+    /// cache: creating or adopting a session changes what `/switch` should
+    /// offer. The cache is dropped even when the save fails, because the
     /// in-memory mapping already changed.
+    ///
+    /// Reads the card-collect displacements in the same store critical section
+    /// as the write (see [`SessionStore::activate_with_displacements`]), so a
+    /// concurrent switch cannot slip its own activation between the read and
+    /// the write.
     ///
     /// **Raw mutator — module-private on purpose.** Every activation a caller
     /// outside this module performs goes through [`FlowHandles::activate`],
     /// which collects the displaced Session's waiting card first (ADR-0059,
     /// spec #405); keeping this private is what makes that collect an
     /// invariant instead of a rule each call site must remember.
-    pub(in crate::bridge::handles) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
-        let result = self.store.lock().await.activate(entry);
+    pub(in crate::bridge::handles) async fn activate_with_displacements(
+        &self,
+        entry: SessionEntry,
+    ) -> crate::error::Result<(Option<String>, bool)> {
+        let result = self.store.lock().await.activate_with_displacements(entry);
         *self.cache.lock().await = None;
         result
     }
@@ -2261,7 +2268,9 @@ pub(crate) struct CardsHandle {
     /// How long a **preserved-ending card-view read** is awaited before the
     /// ending degrades to the bare card (ms, spec #571 review): the read a
     /// collect or a settle makes to keep the card's body, which the reap pass
-    /// must never await unboundedly. The Session Sync pass's own request bound
+    /// must never await unboundedly. It also bounds the `TakenOver` stamp's
+    /// view read and PATCH, so a stalled Feishu write cannot hold the Session's
+    /// card write lock indefinitely. The Session Sync pass's own request bound
     /// by default; a test may shorten it through the handle.
     pub(crate) preserved_view_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     /// The process-local File Content image cache (ADR-0076): `content hash →
@@ -2342,6 +2351,18 @@ impl CardsHandle {
     /// ledger handover), `refresh_yielded_ledger` (a yielded card's in-place
     /// ledger update and quiet true-end settle) and `resolve_blocks` are the
     /// holders.
+    ///
+    /// Two more holders joined for ADR-0100, and both take it across a
+    /// read-send-record sequence rather than one call: `/card`'s post-and-arm-seed
+    /// (`post_idle_card`: the seed filter, pointer, send, map insert, chain
+    /// record and seed) and the prompt sweep's whole surfacing decision
+    /// (`RequestFlow::surface`: the inline-host re-check, the block insert/flush
+    /// and the standalone send with its `sent_cards`/surface record). The sweep
+    /// takes **one** Session's lock at a time: the HOST's for an inline block,
+    /// or the REQUEST Session's for a standalone card — never both. A sub-task
+    /// request's host is therefore the only lock its inline path holds, and
+    /// that lock is released before the standalone fallback takes the child's;
+    /// no path takes the reverse order, so a cross-session cycle cannot form.
     pub(crate) async fn write_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
         self.write_locks
             .lock()
@@ -2355,13 +2376,11 @@ impl CardsHandle {
 /// The two request flows and the claim state their settlements use.
 ///
 /// **Locks owned:** the flows' own state (`sent_cards`, `question_state`,
-/// `answered_results`), the double-click guard `answered_requests`, the
-/// settlement claims `settling_requests`, and the ADR-0028 `snapshot_claims`
-/// registry. The claim sets are taken briefly and never held across a backend
-/// or Feishu call; the snapshot registry is released before the PATCH its
-/// rebuilt card produces. When a path needs both a flow's `sent_cards` and the
-/// card-handle registry it snapshots one, drops it, then takes the other (one
-/// lock order, no deadlock surface).
+/// `answered_results`), the double-click guard `answered_requests`, and the
+/// settlement claims `settling_requests`. The claim sets are taken briefly and
+/// never held across a backend or Feishu call. When a path needs both a flow's
+/// `sent_cards` and the card-handle registry it snapshots one, drops it, then
+/// takes the other (one lock order, no deadlock surface).
 #[derive(Clone)]
 pub(crate) struct RequestsHandle {
     /// Permission flow: owns `sent_cards`, polls pending requests, auto-accepts
@@ -2380,18 +2399,15 @@ pub(crate) struct RequestsHandle {
     /// a claim older than [`SETTLING_CLAIM_TTL`] is abandoned and dropped by
     /// [`Self::claimed_requests`].
     pub(crate) settling_requests: Arc<Mutex<HashMap<String, std::time::Instant>>>,
-    /// ADR-0028 snapshot claim registry: which snapshot card hosts which
-    /// adopt-time pending block.
-    pub(crate) snapshot_claims: Arc<Mutex<SnapshotClaims>>,
 }
 
 impl RequestsHandle {
-    /// The flow that owns requests of `kind` — the registry pairing every
-    /// snapshot-claim kind with its poller and settlement state.
-    pub(crate) fn flow_for(&self, kind: ClaimKind) -> &Arc<RequestFlow> {
+    /// The flow that owns requests of `kind` — the pairing of every request
+    /// kind with its poller and settlement state.
+    pub(crate) fn flow_for(&self, kind: InteractionKind) -> &Arc<RequestFlow> {
         match kind {
-            ClaimKind::Permission => &self.permission,
-            ClaimKind::Question => &self.question,
+            InteractionKind::Permission => &self.permission,
+            InteractionKind::Question => &self.question,
         }
     }
 
@@ -2793,16 +2809,23 @@ impl FlowHandles {
             .await;
     }
 
-    /// Promote `entry` as its thread's Active Session, collecting the displaced
-    /// Session's waiting card first (ADR-0059, spec #405): the displaced
-    /// Session can no longer be continued by a message in this thread, so a
-    /// card it left on 「⏳ 等待后台任务」 is collected as
-    /// 「⏳ 已切换会话 · 后台任务仍在运行」 and stops updating, while its
-    /// background work runs on. The collect runs BEFORE the activation, so a
-    /// polling Wake cannot resume a chain the switch is leaving behind.
-    /// Re-activating the already-active session collects nothing.
+    /// Promote `entry` as its thread's Active Session, then collect what the
+    /// activation displaced (ADR-0059, spec #405). Two Sessions can be left
+    /// without a continuation here:
     ///
-    /// The displaced Session is no longer what this chat mirrors, so its
+    /// - the target thread's previous Active Session, which a message in this
+    ///   thread can no longer continue;
+    /// - `entry`'s previous owner, when it was mapped to ANOTHER thread: the
+    ///   atomic store write replaces that mapping (a `--force` steal), so the
+    ///   old owner's card must not keep sitting on 「⏳ 等待后台任务」.
+    ///
+    /// Both ids are captured **before** the write, but every collect runs
+    /// **after** it persisted: the store's activation is atomic, so a refused
+    /// save leaves the mapping with the old owner and neither card may be
+    /// stamped `SwitchedAway` for a switch that never happened. Re-activating
+    /// the already-active session collects nothing.
+    ///
+    /// Each displaced Session is no longer what its chat mirrors, so its
     /// client-held stream is released best-effort (it stays mapped and
     /// switchable; a later read re-adopts it).
     ///
@@ -2814,29 +2837,33 @@ impl FlowHandles {
     /// next Turn in the thread collects its card — the Turn's supersede collect
     /// reads every mapped session.
     pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
-        let displaced = self
-            .sessions
-            .active_entry(&entry.thread_key)
-            .await
-            .filter(|previous| previous.session_id != entry.session_id)
-            .map(|previous| previous.session_id);
-        if let Some(previous) = &displaced {
-            Turn::collect_waiting(&self.cards, previous, CollectReason::SwitchedAway).await;
-        }
-        self.sessions.activate(entry).await?;
+        let session_id = entry.session_id.clone();
+        // Both displacement facts and the atomic activation share ONE store
+        // critical section: a switch cannot read the previous Active Session,
+        // lose the lock to another switch, and then collect a card the other
+        // switch already superseded. The activation's save stays atomic, so a
+        // refused write still leaves both mappings and their cards untouched.
+        let (displaced, stolen) = self.sessions.activate_with_displacements(entry).await?;
         if let Some(previous) = displaced {
+            Turn::collect_waiting(&self.cards, &previous, CollectReason::SwitchedAway).await;
             self.release_mirror(&previous).await;
+        }
+        if stolen {
+            Turn::collect_waiting(&self.cards, &session_id, CollectReason::SwitchedAway).await;
+            self.release_mirror(&session_id).await;
         }
         Ok(())
     }
 
     /// Unmap `session_id` — a `--force` steal by another thread, or a dead
     /// mapping being replaced — collecting the waiting card it leaves behind
-    /// first (ADR-0059, spec #405): the Session stops being any thread's Active
+    /// (ADR-0059, spec #405): the Session stops being any thread's Active
     /// Session, so its card must not keep sitting on 「⏳ 等待后台任务」. The
-    /// returned entry is the removed mapping, `None` when nothing was mapped
-    /// (and then nothing is collected). A removed mapping has its client-held
-    /// stream released best-effort — the server session stays.
+    /// collect runs only after the removal persisted: a refused save leaves the
+    /// mapping in place, and then its card must stay untouched. The returned
+    /// entry is the removed mapping, `None` when nothing was mapped (and then
+    /// nothing is collected). A removed mapping has its client-held stream
+    /// released best-effort — the server session stays.
     pub(crate) async fn unmap(&self, session_id: &str) -> crate::error::Result<Option<SessionEntry>> {
         let removed = self.sessions.remove_session(session_id).await?;
         if removed.is_some() {
@@ -2891,57 +2918,54 @@ impl FlowHandles {
     }
 }
 
-/// The read-side bundle a Session Snapshot gather and its claim filter need:
-/// no platform (the card is built as JSON and sent by the caller) and no wait
-/// state (nothing here blocks on a prompt).
+/// The read-side bundle a Session Snapshot gather needs: the session store
+/// (for the read's span) and the backend, with no platform and no wait state —
+/// nothing in a read blocks on a prompt.
 #[derive(Clone)]
 pub(crate) struct SnapshotHandles {
     pub(crate) sessions: SessionsHandle,
-    pub(crate) cards: CardsHandle,
-    pub(crate) requests: RequestsHandle,
     pub(crate) backend: Arc<dyn crate::backend::Backend>,
-    /// Whether Message Pin is on (`[bridge] instant_reminder`): the snapshot's
-    /// 等待你的确认 pointer may promise 置顶 only then (ADR-0028 update
-    /// 2026-09-25). Config, not wait state — nothing here blocks.
-    pub(crate) pins_enabled: bool,
+    /// How long the adoption read may take before it degrades to the
+    /// title-only line. Defaults to the same 30 s bound the gate and the
+    /// request flows use; tests may shorten it.
+    pub(crate) read_timeout_ms: u64,
 }
 
 impl SnapshotHandles {
-    /// The snapshot subset of a flow bundle.
+    /// The read-side subset of a flow bundle.
     pub(crate) fn from_flow(flow: &FlowHandles) -> Self {
         Self {
             sessions: flow.sessions.clone(),
-            cards: flow.cards.clone(),
-            requests: flow.requests.clone(),
             backend: Arc::clone(&flow.backend),
-            pins_enabled: flow.waits.message_pins.enabled(),
+            read_timeout_ms: 30_000,
         }
     }
 }
 
-/// The topic-opening bundle: the flow handles plus the external flow whose
-/// snapshot-settle helper an adopted topic calls after its in-topic seed lands.
+/// The topic-opening bundle: the flow handles plus the read-side subset an
+/// adopted topic reads its one-line confirmation from.
 #[derive(Clone)]
 pub(crate) struct TopicHandles {
     pub(crate) flow: FlowHandles,
-    pub(crate) external: Arc<ExternalFlow>,
 }
 
 impl TopicHandles {
-    /// The snapshot subset of this bundle.
+    /// The read-side subset of this bundle.
     pub(crate) fn snapshot_handles(&self) -> SnapshotHandles {
         SnapshotHandles::from_flow(&self.flow)
     }
 }
 
 /// The command bundle: the flow handles plus the turn config (the default
-/// session directory a bare `/topic`/`/new` falls back to) and the external
-/// flow the adoption tails settle a sent snapshot through.
+/// session directory a bare `/topic`/`/new` falls back to).
 #[derive(Clone)]
 pub(crate) struct CommandHandles {
     pub(crate) flow: FlowHandles,
     pub(crate) config: TurnConfig,
-    pub(crate) external: Arc<ExternalFlow>,
+    /// The external flow, which owns the busy follow `/card` arms on a read
+    /// whose Session is still running (ADR-0100): its renderer cadences and
+    /// the existing follow machinery.
+    pub(crate) external: Arc<crate::bridge::external::ExternalFlow>,
     /// `/diff`'s process-internal cooldown (spec #803): one entry per chat,
     /// claimed before any git/render/upload work. Shared with the rest of the
     /// process through the core, so two `/diff`s in one chat cannot both run
@@ -3037,11 +3061,10 @@ impl CommandHandles {
     pub(crate) fn topic_handles(&self) -> TopicHandles {
         TopicHandles {
             flow: self.flow.clone(),
-            external: Arc::clone(&self.external),
         }
     }
 
-    /// The snapshot subset of this bundle.
+    /// The read-side subset of this bundle.
     pub(crate) fn snapshot_handles(&self) -> SnapshotHandles {
         SnapshotHandles::from_flow(&self.flow)
     }

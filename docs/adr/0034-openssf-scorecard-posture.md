@@ -411,6 +411,31 @@ contract, approval only on `PASS` and pinned to the reviewed commit, and the
 skips (fork, Dependabot, `release/*`). Swapping the provider is a workflow change
 that CI has to prove, not a decision-record change.
 
+## Amendment (2026-11-07): the gate's provider is repository configuration
+
+The 2026-10-17 amendment left the provider, endpoint, model and secret as
+workflow configuration and required a workflow diff to swap them. The
+2026-11-06 forced move showed the cost: the Go lane's monthly allowance was
+spent, and a gate whose provider could only change by a commit left every PR
+un-reviewable until that commit landed.
+
+The gate's effective provider is therefore **repository configuration**:
+`vars.GATE_ENDPOINT` and `vars.GATE_MODEL`, with the provider key in the
+`GATE_KEY` secret (falling back to `DEEPSEEK_API_KEY`). The workflow records the
+defaults — DeepSeek's native Responses API and `deepseek-flash` — and the xtask
+gate tests pin them, so the checked-in policy stays visible and testable. This
+supersedes the 2026-10-17 amendment's "swapping the provider is a workflow
+change" sentence only; its other rules (the provider is not an ADR pin, and the
+workflow's comment is the record) stand.
+
+A swap **among Responses providers that accept a bearer token** is now a
+repository-settings change with no workflow diff, and it still fails loudly: the
+credential preflight names the endpoint and the HTTP status, and the review step
+reads the same values, so a bad switch cannot silently produce a review from a
+different lane. A lane that needs an extra request header — the Go lane's
+`x-opencode-session`, removed from the preflight with the 2026-11-06 move — is
+not covered by the switch and still requires a workflow change.
+
 ## Amendment (2026-10-17): a repo-local skill may shadow its upstream
 
 The 2026-10-09 amendment recorded that the upstream `/implement` and

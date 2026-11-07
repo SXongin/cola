@@ -250,10 +250,11 @@ pub(crate) const TOPIC_NEST_REJECTION: &str =
 pub(crate) const TOPIC_ADOPT_NEST_REJECTION: &str =
     "⚠️ /topic --adopt 只能从会话顶层使用，不能在话题里开话题。请在主会话里发 /topic --adopt <会话>。";
 
-/// `/card` with no live Card to pull down (ADR-0043, 2026-09-22 amendment):
-/// no Turn is rendering, so there is nothing to move — one text notice, no
-/// card.
-const NO_LIVE_CARD: &str = "当前没有正在运行的实时卡片。";
+/// `/card` with no Session mapped to this conversation: there is nothing to
+/// read, so one text line says so. The 「当前没有正在运行的实时卡片」 notice is
+/// retired (ADR-0100) — an existing Session always answers with a card, either
+/// the render-owned one pulled down or a one-shot read.
+const NO_SESSION_TO_READ: &str = "当前没有可读取的会话。";
 
 /// `/stop` with no live card to finalize (an idle session, or a card already
 /// at a terminal): nothing will render the stop, so the command itself says
@@ -813,7 +814,7 @@ pub fn help_text() -> String {
 `/name <name>` · Rename current session server-side (on a pending, set the creation title)
 `/stop` · Interrupt execution
 `/compact` · Compact context
-`/card` · Pull the live card back to the newest position (after command replies bury it)
+`/card` · Pull the live card back to the newest position, read the Session when no Turn is rendering, or follow a run cola did not start
 `/agent <name>` · Switch agent (takes effect next message)
 `/model <p/m>` · Switch model (takes effect next message)
 `/think [等级]` · Set/clear thinking level (per model; takes effect next message)
@@ -854,7 +855,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays); this is the one `/switch` form a bound topic accepts, because it unbinds instead of selecting\nExamples: `/switch backend`, `/switch ses_abc --force`"
         }
         "sub" => {
-            "/sub [list [keyword]] | /sub attach <id|id-prefix|title> [--force]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\n- `/sub attach <id|id-prefix|title> [--force]` — take over one of the current session's DIRECT children into this chat (the child becomes the Active Session and gets the usual Session Snapshot receipt). The query resolves like `/switch` (exact id → unique id-prefix → title substring) but only among this session's direct children: an unknown or ambiguous query is reported, and a session that is not a direct child is refused. If the child is mapped to another chat, the owner is named and it is refused unless `--force` (which steals the mapping). Taking over a running child is allowed and the snapshot shows its live state; re-running it for the already-active child changes nothing. The parent stays mapped — `/switch` switches back to it.\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`, `/sub attach 1a2b3c4`, `/sub attach 渲染 --force`"
+            "/sub [list [keyword]] | /sub attach <id|id-prefix|title> [--force]\nShow the child sessions of the current Active Session, read-only: each row carries the child's title, id tail, agent, last activity and live run state (运行中 when Busy/Retry, 空闲 when Idle — one status read per listed row). The view is scoped to THIS session: children of other sessions never appear, and only direct children are listed (no nested descendants, no transcripts).\n- `/sub` / `/sub list` — the child-session card\n- `/sub list <keyword>` — the same card pre-filtered (title/directory/id, whitespace-token AND)\n- `/sub attach <id|id-prefix|title> [--force]` — take over one of the current session's DIRECT children into this chat (the child becomes the Active Session and the takeover confirms in ONE text line carrying its status — no card; pending permissions/questions surface as their own cards). The query resolves like `/switch` (exact id → unique id-prefix → title substring) but only among this session's direct children: an unknown or ambiguous query is reported, and a session that is not a direct child is refused. If the child is mapped to another chat, the owner is named and it is refused unless `--force` (which steals the mapping). Taking over a running child is allowed and the line shows its live state; re-running it for the already-active child changes nothing. The parent stays mapped — `/switch` switches back to it.\nThe card's search box and pagination keep the active keyword/page through every rebuild (six rows per page, ADR-0052). Without an Active Session (a fresh chat, or a Pending Session declared by `/new`/`/dir`/`/topic`) the card opens with a plain empty state.\nExamples: `/sub`, `/sub list 渲染`, `/sub attach 1a2b3c4`, `/sub attach 渲染 --force`"
         }
         "attach" => {
             "/switch <id|title> [--force]\nTake over a session created outside Feishu into this chat. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring. If the session already belongs to another chat, show its owner and reject unless `--force`.\nExample: `/switch ses_abc123`"
@@ -878,7 +879,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/compact\nCompact the current session's context: summarize older messages to free context window."
         }
         "card" => {
-            "/card\nPull the live card back to the newest position: split the Card Chain at this command, so a continuation card becomes the newest message and keeps receiving updates (ADR-0043). Use it after running commands mid-turn — their replies deliberately stay the newest messages, which buries the live card above them. Nothing happens without a running Turn: cola replies a notice. The previous card is finalized with the 部分完成，继续中 header and keeps everything streamed before the pull; the continuation carries the status line and only the content that arrives after it."
+            "/card\nBring this Session's card to the newest position, read the Session when no Turn is rendering, or follow a run cola did not start (ADR-0100).\n- With a live Turn (or an external follow) owning the card, it splits the Card Chain at this command: the previous card is finalized with the 部分完成，继续中 header and keeps everything streamed before the pull, and a continuation card replied to this message becomes the newest live card. Use it after command replies, which deliberately stay the newest messages and bury the card above them.\n- With nothing rendering the Session, it reads the Session once. If the read says the Session is busy, or waiting on background tasks, AND the newest message was not written by cola, the posted card follows that run to its end instead of freezing: the run's continuation lands on the card you just asked for. A run cola itself started stays static, and a static read's status line never promises an update it cannot deliver.\n- Otherwise the read stays a one-shot read-only 会话 card: the status line (等待你的确认 > 等待后台任务 > 运行中 > 需要重试 > 空闲), how many requests are waiting for you (their own cards hold the buttons; the pointer names 「见原卡片」), and the last four messages with any Compaction marker. The read carries no button, no form and no Turn Footer; a later `/card` supersedes it (the previous card is marked 已由新卡片接管 · 已停止更新), while a Turn that ran in between leaves it alone.\nThe command always answers — the old 「当前没有正在运行的实时卡片」 notice is retired — except in a conversation with no Session at all."
         }
         "agent" => {
             "/agent <name>\nSwitch the agent for the current session — a per-session override sent on the NEXT message (the OpenCode server has no agent-switch endpoint). Without an override the server's default agent applies; the card (`/agent` alone) shows the current one. `--reset` clears the override back to the server default. Persisted across restarts. On a Pending Session (`/new`/`/dir`/`/topic` before its first message) the override is recorded on the pending and applies to the session the first message creates. Unknown agent names surface as an error on the next prompt.\nExample: `/agent build`"
@@ -1047,6 +1048,400 @@ impl<'a> crate::update::UpdateReporter for FeishuUpdateReporter<'a> {
 /// Defined once so the text handlers and their tests can't drift apart.
 pub(crate) fn is_reset_flag(name: &str) -> bool {
     name == "--reset"
+}
+
+/// Split the Session's Card Chain at the `/card` command (ADR-0043's pull),
+/// shared by the outer pull check and the in-lock re-check inside
+/// [`post_idle_card`].
+async fn split_card_for_pull(
+    cards: &crate::bridge::handles::CardsHandle,
+    session_id: &str,
+    message_id: &str,
+) {
+    crate::bridge::turn::Turn::split_card_chain(
+        cards,
+        session_id,
+        message_id,
+        crate::bridge::turn::SplitKind::Pull,
+    )
+    .await;
+}
+
+/// The live renderer that owns `session_id`'s card, if any: the Session itself
+/// or, for a sub-task child, its nearest ancestor with a live card (the same
+/// host predicate the request sweep uses, ADR-0100). Bounded and re-checked:
+/// the walk is a server read, and a Turn that ended during it no longer owns a
+/// card, so the caller may enter the pull path only on a host that is still
+/// running.
+///
+/// `/card` must ask this before any idle/follow decision. A child mounted in a
+/// thread has no renderer of its own, so posting a child read/follow would race
+/// the sweep, which hosts the child's requests on the ancestor's card: one
+/// request would get two live blocks.
+async fn live_card_host(handles: &CommandHandles, session_id: &str, directory: &str) -> Option<String> {
+    let timeout_ms = handles
+        .external
+        .request_timeout_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let resolved = crate::bridge::bounded_call(&format!("card host ({session_id})"), timeout_ms, async {
+        Ok::<_, crate::error::BridgeError>(
+            crate::bridge::pollers::inline_host_session(
+                &handles.flow.cards,
+                &handles.flow.backend,
+                session_id,
+                Some(directory),
+            )
+            .await,
+        )
+    })
+    .await
+    .and_then(Result::ok)
+    .flatten()?;
+    if crate::bridge::turn::Turn::is_running(&handles.flow.cards, &resolved).await {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+/// Mark a just-sent read that never became the Session's card: it stays a
+/// visible message, so it must not look current. Best effort; a failed PATCH
+/// is logged with the untracked id.
+async fn mark_untracked_read(
+    cards: &crate::bridge::handles::CardsHandle,
+    session_id: &str,
+    sent: &str,
+    card: &serde_json::Value,
+) {
+    if !crate::bridge::chain::stamp_taken_over(cards, sent, Some(card)).await {
+        tracing::warn!(
+            "card read: session {session_id} untracked read {sent} could not be stamped taken over"
+        );
+    }
+}
+
+/// The follow arm's cancellation debt: `/card` stamps the previous card BEFORE
+/// the arm switches the map, so a cancellation between the two would leave a
+/// stamped old card plus a just-sent read nobody tracks. On drop (the command
+/// was cancelled) this spawns the same best-effort stamp for the sent read —
+/// unless the arm already made it the Session's card, which is the one case
+/// where it must stay unmarked. Disarmed on every normal exit once the card is
+/// tracked or the explicit failure path has marked it.
+struct UntrackedReadOnCancel {
+    cards: crate::bridge::handles::CardsHandle,
+    session_id: String,
+    sent: String,
+    card: serde_json::Value,
+    armed: bool,
+}
+
+impl UntrackedReadOnCancel {
+    fn new(
+        cards: &crate::bridge::handles::CardsHandle,
+        session_id: &str,
+        sent: &str,
+        card: &serde_json::Value,
+    ) -> Self {
+        Self {
+            cards: cards.clone(),
+            session_id: session_id.to_string(),
+            sent: sent.to_string(),
+            card: card.clone(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UntrackedReadOnCancel {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The arm may have committed the sent card before the cancellation
+        // reached us (its insert is one map critical section). Then the read IS
+        // the Session's card and marking it would stamp a live card taken
+        // over; only a read the map does not name is untracked.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let cards = self.cards.clone();
+        let session_id = self.session_id.clone();
+        let sent = self.sent.clone();
+        let card = self.card.clone();
+        runtime.spawn(async move {
+            if crate::bridge::turn::Turn::card_message_id(&cards, &session_id)
+                .await
+                .as_deref()
+                == Some(sent.as_str())
+            {
+                return;
+            }
+            mark_untracked_read(&cards, &session_id, &sent, &card).await;
+        });
+    }
+}
+
+/// `/card`'s second state (ADR-0100): with no renderer owning the Session, read
+/// it once and post exactly ONE read-only Session Card.
+///
+/// The read and the build happen off the card map; the **check, the send and
+/// the current-card update** then share the Session's card-write lock, so two
+/// near-simultaneous `/card`s serialize and the later one stamps the card the
+/// earlier one posted. The stamp applies only while the map still holds that
+/// previous card and it is either an **idle read** or an **actionable terminal**
+/// (`Error`/`Unreceived`, whose now-dead Retry/重新发起 control must be
+/// stripped): a Turn that ran in between has already superseded it (the map
+/// holds the Turn's card), and a `Done`/`Stopped` card carries no control, so
+/// both are left untouched. The idle card joins no Chain Record, so nothing
+/// here records one.
+///
+/// A **Turn** installs its accumulator under this same lock now, so it cannot
+/// replace the card during the send. The map write is still a
+/// compare-and-swap: a running card that was already installed before this
+/// command took the lock wins, the read is not recorded, and the just-sent
+/// message is stamped taken over so it never looks current.
+///
+/// A read that says **busy** or **waiting** and whose newest user message is not
+/// cola-authored follows the run instead (ADR-0100): the prepared follow — its
+/// accumulator, static lead and seed set — is built before the lock, and the
+/// same critical section sends the card, inserts the render-owned `CardSession`
+/// carrying the sent id and writes its chain record. Nothing reaches the card
+/// map before that insert, so a command cancelled earlier leaves no Idle card
+/// behind. The seed is attached after the commit (the blocks need a card to
+/// land on); a request another card already hosts keeps its own card.
+async fn post_idle_card(
+    handles: &CommandHandles,
+    session_id: &str,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let directory = handles
+        .flow
+        .sessions
+        .directory_for_session(session_id)
+        .await
+        .unwrap_or_default();
+    // `/card` always answers, and the two reads are bounded SEPARATELY: a
+    // gather timeout posts the best-effort static read (no status, no tail),
+    // while a prepare timeout keeps the good gather and posts the static read
+    // from it. A server that accepts TCP but never replies cannot hang the
+    // command.
+    let timeout_ms = handles
+        .external
+        .request_timeout_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let gathered = crate::bridge::bounded_call("card read", timeout_ms, async {
+        Ok::<_, crate::error::BridgeError>(
+            crate::bridge::snapshot::gather_snapshot(&handles.flow.backend, session_id, &directory).await,
+        )
+    })
+    .await;
+    let (data, gathered_ok) = match gathered {
+        Some(Ok(data)) => (data, true),
+        _ => {
+            tracing::warn!(
+                "card read: session {session_id} read timed out; posting the best-effort static read"
+            );
+            (
+                crate::bridge::snapshot::SnapshotData {
+                    session_id: session_id.to_string(),
+                    directory: directory.clone(),
+                    status: None,
+                    waiting: false,
+                    pending: Vec::new(),
+                    tail: Vec::new(),
+                    newest_user_anchor: None,
+                    newest_user_is_cola_authored: false,
+                },
+                false,
+            )
+        }
+    };
+    let mut follow = if gathered_ok {
+        let prepared = crate::bridge::bounded_call("card follow prepare", timeout_ms, async {
+            Ok::<_, crate::error::BridgeError>(
+                handles
+                    .external
+                    .prepare_snapshot_follow(&handles.flow, &data)
+                    .await,
+            )
+        })
+        .await;
+        match prepared {
+            Some(Ok(follow)) => follow,
+            _ => {
+                tracing::warn!(
+                    "card read: session {session_id} follow prepare timed out; posting the static read"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // The follow's identity line names the Session the same way an adoption
+    // does; the read itself never carried a title.
+    let title = if follow.is_some() {
+        handles
+            .external
+            .session_title(&handles.flow.backend, session_id, &directory)
+            .await
+    } else {
+        String::new()
+    };
+    let cards = &handles.flow.cards;
+    let write_lock = cards.write_lock(session_id).await;
+    let guard = write_lock.lock().await;
+    // A renderer may have taken the card over between the pull check and this
+    // critical section — the Session's own, or an ancestor's for a sub-task
+    // child (the sweep hosts the child's requests there). Either way the
+    // render-owned meaning wins, and `/card` pulls that card instead of
+    // posting a second host; the split is entered after the guard is released
+    // (it takes the host's lock, never nested under this one).
+    if let Some(host) = live_card_host(handles, session_id, &directory).await {
+        drop(guard);
+        split_card_for_pull(cards, &host, message_id).await;
+        return Ok(());
+    }
+    let previous = crate::bridge::turn::Turn::card_to_supersede(cards, session_id).await;
+    // The pointer, the send, the arm and the seed are one critical section:
+    // the seed is filtered HERE (so no sweep can surface one between the
+    // decision and the attach), and the card's count names exactly that set.
+    //
+    // The card SENT is always the static idle read (ADR-0100): if this command
+    // dies before the arm, or the arm refuses, what stays in the chat must not
+    // promise updates or claim the pendings ride it. The renderer's first flush
+    // paints the follow lead afterwards, once a renderer actually exists.
+    let card = crate::feishu::card::session::build_idle_card(&data);
+    if let Some(plan) = &mut follow {
+        handles
+            .external
+            .resolve_snapshot_follow_seeds(&handles.flow, plan)
+            .await;
+        handles
+            .external
+            .compose_snapshot_follow_lead(plan, "读取", &title, &data);
+    }
+    // Deliberately UNBOUNDED: Feishu's create has no idempotency key, so a
+    // timeout around a create whose response is slow could abandon a card that
+    // did land, leaving it untracked for a retry to duplicate. A real send
+    // error takes the ordinary failure path; the bounded reads and stamp
+    // PATCH are the lock's other long awaits (ADR-0100).
+    let sent = handles.flow.platform.reply_card(message_id, &card).await?;
+    if let Some(plan) = &mut follow {
+        // From here on the command owes the just-sent read an ending if it is
+        // cancelled before the arm makes it the Session's card: the previous
+        // card may already be stamped (below), so a dropped future must still
+        // mark the read instead of leaving it looking current.
+        let mut untracked = UntrackedReadOnCancel::new(cards, session_id, &sent, &card);
+        // The old card is neutralised BEFORE the arm switches the map: it
+        // must never stay the visible card while the follow (or a later idle
+        // read) becomes current. A failed stamp aborts the command and keeps
+        // the old card current, so exactly one card is current and the next
+        // `/card` retries. The stamp is under the lock for that ordering; it
+        // is a bounded GET + PATCH on another message.
+        if let Some(previous) = &previous {
+            let stamped = crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+            if !stamped {
+                // The old card could not be marked. Keep it current so exactly
+                // one card is current; the posted read stays untracked and the
+                // next `/card` retries the stamp.
+                drop(guard);
+                // The old card stays current, but the just-sent read must not
+                // be indistinguishable from it: mark the untracked read too.
+                mark_untracked_read(cards, session_id, &sent, &card).await;
+                untracked.disarm();
+                tracing::warn!(
+                    "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
+                    previous
+                );
+                return Ok(());
+            }
+        }
+        // The send awaited; a Turn may have installed itself meanwhile. The
+        // arm's own compare-and-swap refuses a running card, so the read is not
+        // recorded and the just-sent message is stamped taken over.
+        let armed = handles
+            .external
+            .arm_snapshot_follow_locked(&handles.flow, session_id, &sent, plan, true)
+            .await;
+        if armed {
+            // A committed arm makes the sent read the Session's card: the
+            // cancellation debt is settled, so drop it before anything else
+            // can observe the command as cancelled.
+            untracked.disarm();
+            // Only a committed follow adopts a new run, so that is the only
+            // branch that may drop a pre-run `/stop`; a refused arm leaves the
+            // marker for the run that actually owns the card.
+            handles
+                .flow
+                .waits
+                .stopped_sessions
+                .lock()
+                .await
+                .remove(session_id);
+        }
+        drop(guard);
+        if armed {
+            // The arm already spawned the renderer right after its map insert
+            // (before the seed/record awaits), so a cancellation anywhere after
+            // that point leaves a live card with a render loop.
+            tracing::info!("card read: session {session_id} follows the running turn on the posted card");
+        } else {
+            mark_untracked_read(cards, session_id, &sent, &card).await;
+            untracked.disarm();
+            tracing::info!(
+                "card read: session {session_id} the old card kept the session during the follow read; the posted read is stamped"
+            );
+        }
+        return Ok(());
+    }
+    // The idle read owes the same cancellation ending as the follow branch:
+    // the previous read is about to be stamped, so a cancellation before
+    // `record_idle_card` must still mark the just-sent read — otherwise the
+    // old read stays current while the new one looks current too.
+    let mut untracked = UntrackedReadOnCancel::new(cards, session_id, &sent, &card);
+    // Neutralise the old card BEFORE the map switch, for the same reason as the
+    // follow branch: a failed stamp keeps the old read current instead of
+    // recording a second unmarked card.
+    if let Some(previous) = &previous {
+        let stamped = crate::bridge::chain::stamp_taken_over(cards, previous, None).await;
+        if !stamped {
+            // No predecessor is ever left both unmarked and current: keep the
+            // old read current, leave the just-sent read untracked, and let the
+            // next `/card` retry the stamp.
+            drop(guard);
+            // The old read stays current; the just-sent read is visibly
+            // superseded so a third `/card` cannot mistake it for current.
+            mark_untracked_read(cards, session_id, &sent, &card).await;
+            untracked.disarm();
+            tracing::warn!(
+                "card read: session {session_id} could not stamp the previous card {}; leaving it current and marking the new read",
+                previous
+            );
+            return Ok(());
+        }
+    }
+    // The send awaited; a Turn may have installed itself meanwhile. The CAS in
+    // `record_idle_card` refuses a running card, and the read then stays a
+    // plain message marked superseded — never the Session's card, never a host
+    // for a later flush.
+    let recorded = crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await;
+    drop(guard);
+    if recorded {
+        untracked.disarm();
+        tracing::info!("card read: session {session_id} idle Session Card posted");
+    } else {
+        mark_untracked_read(cards, session_id, &sent, &card).await;
+        untracked.disarm();
+        tracing::info!(
+            "card read: session {session_id} the old card kept the session during the read; the posted read is stamped"
+        );
+    }
+    Ok(())
 }
 
 /// Execute a parsed slash command against the shared handles. Unrecognized
@@ -1622,22 +2017,29 @@ pub(crate) async fn handle_command(
             // replies bury the live card above them, and this command moves
             // the chain's live continuation back to the newest message.
             let Some(session_id) = handles.flow.sessions.get_session_id(&thread_key).await else {
-                handles.flow.platform.reply_text(message_id, NO_LIVE_CARD).await?;
+                handles
+                    .flow
+                    .platform
+                    .reply_text(message_id, NO_SESSION_TO_READ)
+                    .await?;
                 return Ok(());
             };
-            let running = crate::bridge::turn::Turn::is_running(&handles.flow.cards, &session_id).await;
-            if !running {
-                handles.flow.platform.reply_text(message_id, NO_LIVE_CARD).await?;
+            let directory = handles
+                .flow
+                .sessions
+                .directory_for_session(&session_id)
+                .await
+                .unwrap_or_default();
+            // A live renderer owns the card — the Session's own, or an
+            // ancestor's for a sub-task child mounted in this thread. Pull
+            // that card; posting a child read/follow would race the sweep,
+            // which hosts the child's requests on the ancestor (ADR-0100).
+            if let Some(host) = live_card_host(handles, &session_id, &directory).await {
+                tracing::info!("card pull: session {session_id} live card {host} split requested");
+                split_card_for_pull(&handles.flow.cards, &host, message_id).await;
                 return Ok(());
             }
-            tracing::info!("card pull: session {session_id} live card split requested");
-            crate::bridge::turn::Turn::split_card_chain(
-                &handles.flow.cards,
-                &session_id,
-                message_id,
-                crate::bridge::turn::SplitKind::Pull,
-            )
-            .await;
+            post_idle_card(handles, &session_id, message_id).await?;
         }
         Command::AgentCard => {
             crate::feishu::card::command::send_agent_card(handles, &thread_key, message_id).await?;
@@ -2182,9 +2584,8 @@ async fn handle_switch_action(
 /// `/switch <keyword>` — switch within the thread first, then adopt a unique
 /// global match (ADR-0008). Resolution order:
 /// 1. Current thread's mapped sessions (matched by title/directory/id);
-///    a unique hit switches without changing the mapping. The re-switch ack
-///    is a Session Snapshot card (已切换) unless the suppression predicate
-///    says there is nothing to report (ADR-0028).
+///    a unique hit switches without changing the mapping and confirms in one
+///    text line carrying the status summary (ADR-0100).
 /// 2. Global store search (sub-task children excluded); a unique hit adopts
 ///    into the current thread and becomes active.
 /// 3. Multiple hits: list up to 8 candidates and point at `/attach`.
@@ -2228,48 +2629,13 @@ async fn handle_switch(
         if let Some(entry) = entry {
             handles.flow.activate(entry).await?;
         }
-        // ADR-0028 suppression: re-activating a session already mapped to
-        // this thread reports a snapshot only when there is content to show —
-        // busy/retry, a pending request, or an external newest message. An
-        // idle, pending-free, cola-authored session keeps today's one-line
-        // text ack (its recent life is already visible in this thread). The
-        // `already_mapped` input is true by construction: the hit came from
-        // this thread's mapped-session list. The gather and the 切换 card's
-        // build run inside the Session's `snapshot` span (ADR-0048).
-        match crate::bridge::snapshot::re_switch_snapshot(
-            &handles.snapshot_handles(),
-            thread_key,
-            &hit.id,
-            &hit.directory,
-            &hit.title,
-            // The text form has no card list to return to.
-            None,
-        )
-        .await
-        {
-            crate::bridge::snapshot::ReSwitchSnapshot::Full { card, data } => {
-                // Claim the snapshot's embedded pendings against the sent card
-                // so the poll loop never duplicates them.
-                let mid = handles.flow.platform.reply_card(message_id, &card).await?;
-                crate::bridge::external::settle_snapshot_after_send(
-                    &handles.external,
-                    &handles.flow,
-                    &mid,
-                    "切换",
-                    &hit.title,
-                    &data,
-                    None,
-                )
-                .await;
-            }
-            crate::bridge::snapshot::ReSwitchSnapshot::Suppressed => {
-                handles
-                    .flow
-                    .platform
-                    .reply_text(message_id, &format!("Switched to \"{}\".", hit.title))
-                    .await?;
-            }
-        }
+        // ADR-0100: a re-activation confirms in ONE text line carrying the
+        // status summary, whether or not there is content to report — the
+        // snapshot card is retired from this path. Pending requests surface
+        // through the ordinary sweep. The gather runs inside the Session's
+        // `snapshot` span (ADR-0048).
+        let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "切换", hit).await;
+        handles.flow.platform.reply_text(message_id, &line).await?;
         return Ok(());
     }
     if thread_hits.len() > 1 {
@@ -2477,10 +2843,10 @@ async fn handle_attach(
 /// id-prefix → title substring); a session outside that scope is refused, never
 /// adopted — the child filter is this command's policy, not the shared
 /// resolver's (spec #344). Adoption then reuses [`adopt_session`] end to end:
-/// Session Mapping activation, the one Session Snapshot receipt with its
-/// claimable pendings, the owner check, and `--force` to steal a mapping owned
-/// by another chat. The parent stays mapped and switchable; no prompt is ever
-/// sent into the child (ADR-0054).
+/// Session Mapping activation, the ONE confirmation text line carrying the
+/// child's status (ADR-0100), the owner check, and `--force` to steal a mapping
+/// owned by another chat. The parent stays mapped and switchable; no prompt is
+/// ever sent into the child (ADR-0054).
 async fn handle_sub_attach(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -2530,7 +2896,7 @@ async fn handle_sub_attach(
             // scope refusal, and a stale mapping absent from the fetched list
             // is not in scope either — fabricating a record would bypass the
             // scope gate. It goes through the same adoption path, whose
-            // already-active branch writes nothing and sends no snapshot.
+            // already-active branch writes nothing and sends no card.
             if let Some(active_info) = sessions.iter().find(|s| s.id == active_id && s.is_child())
                 && matches!(
                     resolve_session(std::slice::from_ref(active_info), query),
@@ -2637,50 +3003,51 @@ async fn handle_topic_adopt(
         return Ok(());
     }
     // Mapped to another thread: reject unless --force (mirrors adopt_session).
+    // With `--force` the steal rides the topic's own activation below:
+    // `open_topic` opens and seeds the topic FIRST, then its atomic activation
+    // replaces the old owner's mapping — so a failed open/send or a refused
+    // save leaves the old owner's mapping (and its waiting card) untouched.
+    // Unmapping here would lose it before the topic existed.
     let owner = {
         let store = handles.flow.sessions.store.lock().await;
         store.thread_for_session(&info.id)
     };
     if let Some(owner_key) = owner
         && owner_key != *thread_key
+        && !force
     {
-        if !force {
-            let chat_name = handles
-                .flow
-                .platform
-                .chat_name(&owner_key.chat_id)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_else(|| owner_key.chat_id.clone());
-            let where_flag = if owner_key.thread_id != owner_key.chat_id {
-                "话题"
-            } else {
-                "主对话"
-            };
-            handles.flow.platform
-                    .reply_text(
-                        message_id,
-                        &format!(
-                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `/topic --adopt {} --force` 强行接管。",
-                            info.title,
-                            info.directory,
-                            chat_name,
-                            where_flag,
-                            owner_key.chat_id,
-                            info.id
-                        ),
-                    )
-                    .await?;
-            return Ok(());
-        }
-        // --force: steal the mapping; the other thread becomes sessionless.
-        // The unmap collects the stolen Session's waiting card (ADR-0059,
-        // spec #405), so the other thread's waiting card never hangs.
-        handles.flow.unmap(&info.id).await?;
+        let chat_name = handles
+            .flow
+            .platform
+            .chat_name(&owner_key.chat_id)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| owner_key.chat_id.clone());
+        let where_flag = if owner_key.thread_id != owner_key.chat_id {
+            "话题"
+        } else {
+            "主对话"
+        };
+        handles.flow.platform
+                .reply_text(
+                    message_id,
+                    &format!(
+                        "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `/topic --adopt {} --force` 强行接管。",
+                        info.title,
+                        info.directory,
+                        chat_name,
+                        where_flag,
+                        owner_key.chat_id,
+                        info.id
+                    ),
+                )
+                .await?;
+        return Ok(());
     }
-    // Open the topic in one transaction (ADR-0016): the pre-mapping snapshot,
-    // cover card (ADR-0023), in-topic seed, Session Mapping and the snapshot
-    // claim all live in `bridge::topic`.
+    // Open the topic in one transaction (ADR-0016): the pre-mapping
+    // confirmation read, cover card (ADR-0023), in-topic text seed and Session
+    // Mapping all live in `bridge::topic`. The adopted session's pending
+    // requests are left to the ordinary sweep (ADR-0100).
     match crate::bridge::topic::open_topic(
         &handles.topic_handles(),
         &thread_key.chat_id,
@@ -2719,10 +3086,13 @@ async fn handle_topic_adopt(
 /// → idempotent no-op. Mapped to another thread → rejected with an
 /// actionable card unless `--force` (which steals the mapping). Copies
 /// `directory` + `agent` from the server; `auto_accept` resets to false.
-/// The adoption confirmation is the Session Snapshot card (ADR-0028): in a
-/// never-had-a-session topic it is sent inside the topic and doubles as the
-/// fallback-card anchor (`reply_card_in_thread`, ADR-0006); in the lobby it
-/// is the reply replacing the old 「已接管…」 text.
+///
+/// ADR-0100: the adoption confirmation is ONE text line carrying the status
+/// summary the Session Snapshot used to show — no card. In a topic it is
+/// replied in-thread and its message id becomes the fallback-card anchor
+/// (`reply_in_thread`, ADR-0006), so permission/question cards still land
+/// inside the topic; in the lobby it is a plain reply. Pending requests surface
+/// through the ordinary sweep.
 ///
 /// `force_hint` is the command the owner refusal points the user at (with
 /// `--force` appended): `/switch` for the general adoption path, `/sub attach`
@@ -2737,91 +3107,87 @@ async fn adopt_session(
     force: bool,
     force_hint: &str,
 ) -> crate::error::Result<()> {
-    // Idempotent: already the active session of this thread.
-    {
+    // Idempotent: already the active session of this thread. The reply still
+    // carries the ONE-line status summary (ADR-0100, #1004) — the same
+    // `adoption_line` the adoption itself uses — so re-running the command
+    // reports the Session's current state instead of a bare title.
+    let already_active = {
         let store = handles.flow.sessions.store.lock().await;
-        if let Some(e) = store.get_active(thread_key)
-            && e.session_id == info.id
-        {
-            handles
-                .flow
-                .platform
-                .reply_text(message_id, &format!("Already active: \"{}\".", info.title))
-                .await?;
-            return Ok(());
-        }
+        store
+            .get_active(thread_key)
+            .is_some_and(|e| e.session_id == info.id)
+    };
+    if already_active {
+        let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "接管", info).await;
+        handles.flow.platform.reply_text(message_id, &line).await?;
+        return Ok(());
     }
     // Mapped to another thread: reject unless --force.
     let owner = {
         let store = handles.flow.sessions.store.lock().await;
         store.thread_for_session(&info.id)
     };
-    if let Some(owner_key) = owner
-        && owner_key != *thread_key
+    if let Some(owner_key) = owner.as_ref()
+        && owner_key != thread_key
+        && !force
     {
-        if !force {
-            let chat_name = handles
-                .flow
-                .platform
-                .chat_name(&owner_key.chat_id)
-                .await
-                .unwrap_or(None)
-                .unwrap_or_else(|| owner_key.chat_id.clone());
-            let where_flag = if owner_key.thread_id != owner_key.chat_id {
-                "话题"
-            } else {
-                "主对话"
-            };
-            handles.flow.platform
-                    .reply_text(
-                        message_id,
-                        &format!(
-                            "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `{} {} --force` 强行接管。",
-                            info.title,
-                            info.directory,
-                            chat_name,
-                            where_flag,
-                            owner_key.chat_id,
-                            force_hint,
-                            info.id
-                        ),
-                    )
-                    .await?;
-            return Ok(());
-        }
-        // --force: steal the mapping; the other thread becomes sessionless.
-        // The unmap collects the stolen Session's waiting card (ADR-0059,
-        // spec #405), so the other thread's waiting card never hangs.
-        handles.flow.unmap(&info.id).await?;
-    }
-
-    // ADR-0028: every adoption ends in exactly ONE Session Snapshot card
-    // (replacing the old 「已接管…」 texts) — never a card plus a text, never
-    // nothing. Gathered BEFORE the mapping write below, so the card reflects
-    // the session's pre-adoption state; each field is best-effort, so a read
-    // failure degrades that field rather than blocking the adoption.
-    let (card, data) =
-        crate::bridge::snapshot::snapshot_card_for(&handles.snapshot_handles(), "接管", info, None).await;
-
-    let anchor = if kind == ConversationKind::Topic {
-        // The snapshot is sent inside the topic and doubles as the fallback-card
-        // anchor (ADR-0023): permission/question cards reply to it and land
-        // inside the topic. Its message id is persisted as `topic_anchor`.
-        match handles
+        let chat_name = handles
             .flow
             .platform
-            .reply_card_in_thread(message_id, &card)
+            .chat_name(&owner_key.chat_id)
             .await
-        {
-            Ok((anchor, _)) => Some(anchor),
-            Err(e) => {
-                tracing::warn!("attach: snapshot in-thread send failed: {}", e);
-                None
-            }
-        }
+            .unwrap_or(None)
+            .unwrap_or_else(|| owner_key.chat_id.clone());
+        let where_flag = if owner_key.thread_id != owner_key.chat_id {
+            "话题"
+        } else {
+            "主对话"
+        };
+        handles.flow.platform
+                .reply_text(
+                    message_id,
+                    &format!(
+                        "⚠️ 会话 `{}`（目录 `{}`）已被其他聊天占用：\n{}\n（{}，chat `{}`）\n\n可先请对方 `/switch forget` 解除，或使用 `{} {} --force` 强行接管。",
+                        info.title,
+                        info.directory,
+                        chat_name,
+                        where_flag,
+                        owner_key.chat_id,
+                        force_hint,
+                        info.id
+                    ),
+                )
+                .await?;
+        return Ok(());
+    }
+
+    // ADR-0100: the confirmation is ONE text line carrying the status summary
+    // (gathered before the mapping write below, so it reflects the session's
+    // pre-adoption state; each read field is best-effort). Pending requests are
+    // left to the ordinary sweep — nothing claims them here.
+    let line = crate::bridge::snapshot::adoption_line(&handles.snapshot_handles(), "接管", info).await;
+
+    // Send the confirmation BEFORE any store mutation. A failed send then
+    // leaves the previous owner's mapping (and its waiting card) intact, so
+    // the user can simply retry; the old ordering unmapped first and could
+    // strand the Session when a topic send failed.
+    //
+    // In a topic the line doubles as the fallback-card anchor (ADR-0023): its
+    // message id becomes `topic_anchor`, so permission/question cards land
+    // inside the topic.
+    let anchor = if kind == ConversationKind::Topic {
+        Some(handles.flow.platform.reply_in_thread(message_id, &line).await?.0)
     } else {
+        handles.flow.platform.reply_text(message_id, &line).await?;
         None
     };
+
+    // The activation below IS the steal: its atomic store write replaces any
+    // existing mapping of the session id, so a `--force` adoption moves the
+    // Session here in the same write that drops the old owner. Nothing is
+    // unmapped ahead of it, and `FlowHandles::activate` collects both displaced
+    // waiting cards only after that write persisted (ADR-0059, spec #405).
+    //
     // ADR-0041: when this topic's session was still pending (the `/switch <id>`
     // recovery path for a mistaken `/topic`), carry its cover root onto the
     // adopted entry — the quote-injection guard and the cover record must not
@@ -2832,37 +3198,42 @@ async fn adopt_session(
     };
     let mut entry = SessionEntry::new(thread_key.clone(), info.id.clone(), info.directory.clone());
     entry.agent = info.agent.clone();
-    entry.topic_anchor = anchor.clone();
+    entry.topic_anchor = anchor;
     entry.topic_root = pending_topic_root;
-    handles.flow.activate(entry).await?;
-    crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
-    // In a topic the snapshot was already sent inside it (the in-thread send
-    // above); don't reply twice.
-    if kind != ConversationKind::Topic {
-        let mid = handles.flow.platform.reply_card(message_id, &card).await?;
-        crate::bridge::external::settle_snapshot_after_send(
-            &handles.external,
-            &handles.flow,
-            &mid,
-            "接管",
-            &info.title,
-            &data,
-            None,
-        )
-        .await;
-    } else if let Some(anchor) = &anchor {
-        crate::bridge::external::settle_snapshot_after_send(
-            &handles.external,
-            &handles.flow,
-            anchor,
-            "接管",
-            &info.title,
-            &data,
-            None,
-        )
-        .await;
+    if let Err(e) = handles.flow.activate(entry).await {
+        // One atomic write: a failure leaves the previous owner's mapping AND
+        // its waiting card exactly as they were, so the notice can promise both.
+        // The confirmation line already said the Session was taken over, so a
+        // silent error would leave the user believing a mapping that was never
+        // written. Say so in the chat (best effort), then still return the
+        // error for the caller's log.
+        report_adoption_failure(handles, message_id, &info.title, &e).await;
+        return Err(e);
     }
+    crate::bridge::topic::claim_pending_cover(&handles.topic_handles(), thread_key, &info.id).await;
     Ok(())
+}
+
+/// Report a failed adoption store write in the chat.
+///
+/// The confirmation line is sent **before** the mapping write, so a silent
+/// failure would leave the user believing the Session moved. The store's
+/// activation is atomic and the displaced card is collected only after it
+/// persists, so the previous mapping and its card are guaranteed unchanged.
+async fn report_adoption_failure(
+    handles: &CommandHandles,
+    message_id: &str,
+    title: &str,
+    error: &crate::error::BridgeError,
+) {
+    let _ = handles
+        .flow
+        .platform
+        .reply_text(
+            message_id,
+            &format!("⚠️ 会话 `{title}` 接管失败：{error}。原映射保持不变，可稍后重试。"),
+        )
+        .await;
 }
 
 /// Normalize a user-supplied directory for `/dir` / `/topic` into an absolute
@@ -3738,6 +4109,39 @@ mod tests {
         assert!(
             run.contains("Windows"),
             "the Windows refusal is documented: {run}"
+        );
+    }
+
+    /// `/card`'s help describes ALL THREE states (ADR-0100): the pull, the
+    /// busy/waiting follow, and the one-shot read it falls back to — never the
+    /// retired 「当前没有正在运行的实时卡片」 notice. The index line names them
+    /// too.
+    #[test]
+    fn help_documents_the_card_reads_three_states() {
+        let index = help_text();
+        assert!(
+            index.contains("read the Session when no Turn is rendering"),
+            "the index names the read: {index}"
+        );
+        assert!(
+            index.contains("follow a run cola did not start"),
+            "the index names the follow: {index}"
+        );
+        let card = command_help("card").expect("card has a help topic");
+        assert!(card.contains("部分完成"), "the pull is documented: {card}");
+        assert!(
+            card.contains("follows that run to its end"),
+            "the busy/waiting follow is documented: {card}"
+        );
+        assert!(card.contains("read-only 会话 card"), "{card}");
+        assert!(card.contains("no button, no form"), "{card}");
+        assert!(
+            card.contains("已由新卡片接管"),
+            "the supersede is documented: {card}"
+        );
+        assert!(
+            card.contains("见原卡片"),
+            "the pending pointer's copy is documented: {card}"
         );
     }
 

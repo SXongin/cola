@@ -143,10 +143,10 @@ fn rendered_block(
     block: &super::state::InteractionBlock,
 ) -> Option<RenderedBlock> {
     use super::state::InteractionBlock;
-    use crate::bridge::snapshot_claims::ClaimKind;
+    use crate::bridge::request::kind::InteractionKind;
     let kind = match block {
-        InteractionBlock::Permission(_) => ClaimKind::Permission,
-        InteractionBlock::Question(_) => ClaimKind::Question,
+        InteractionBlock::Permission(_) => InteractionKind::Permission,
+        InteractionBlock::Question(_) => InteractionKind::Question,
         InteractionBlock::Receipt(_) => return None,
     };
     Some(RenderedBlock {
@@ -652,7 +652,7 @@ pub(super) async fn flush_card_locked(
     // Both survive the flush — a chain that exhausted the size bound, or died
     // between a finalize and its continuation, must be picked up where it
     // stopped, never restarted by overwriting the finalized slice.
-    let (pending_split, mut card_is_live, suspended) = {
+    let (pending_split, mut card_is_live, suspended, is_read) = {
         let cards = cards.cards.lock().await;
         let Some(card) = cards.get(session_id) else {
             return FlushOutcome::Unwritten;
@@ -661,8 +661,19 @@ pub(super) async fn flush_card_locked(
             card.pending_split.clone(),
             card.card_is_live,
             card.acc.card_fallback() == CardFallback::Suspended,
+            // The one "read is not a chain" predicate (ADR-0100): an idle
+            // Session Card is the only non-chain entry.
+            !card.is_chain_card(),
         )
     };
+    // A read-only Session Card is sent once and never flushed (ADR-0100): a
+    // flush would repaint it as a live card and, with `card_is_live` false,
+    // could even continue it onto a new card and write a Chain Record. The
+    // admission paths refuse it first; this is the last line so no caller can
+    // repurpose the read as the chain.
+    if is_read {
+        return FlushOutcome::Unwritten;
+    }
     if suspended {
         // A yielded card's ledger-only refresh (`Forbid`, ADR-0060) must never
         // post a new card, so a payload it cannot land stays suspended: the

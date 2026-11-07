@@ -19,15 +19,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     // Run the permission poller briefly.
     tokio::spawn({
@@ -107,6 +99,130 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     );
 }
 
+/// A click on a STANDALONE request card stays standalone even when the
+/// Session's card map still holds a finished card (ADR-0100): the map entry is
+/// not a live card, so the click must return its replacement result card
+/// rather than being routed down the inline path — whose ack carries no card
+/// because no live accumulator renders the block.
+#[tokio::test]
+async fn a_standalone_click_ignores_a_finished_card_in_the_map() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+
+    // No live card: the request is surfaced on its own card.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(platform.sent_cards().await.len(), 1, "one standalone card");
+    let standalone = app
+        .permission
+        .sent_cards
+        .lock()
+        .await
+        .get("per_1")
+        .expect("the standalone card is recorded")
+        .message_id
+        .clone();
+
+    // The Turn finished, but its card stays in the map and still names a reply
+    // target: neither fact makes it a live host.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_1", Some("om_finished")).await;
+    Turn::set_reply_target(&cards, "ses_1", "msg_1").await;
+    Turn::set_card_state(&cards, "ses_1", crate::feishu::card::CardState::Done).await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": standalone,
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+    let ack = card_text(
+        result
+            .card
+            .as_ref()
+            .expect("a standalone click returns its replacement result card"),
+    );
+    assert!(ack.contains("✅ 已允许一次"), "receipt missing: {ack}");
+    assert!(
+        !ack.contains("🔐 **权限请求**"),
+        "the result card carries no live block: {ack}"
+    );
+}
+
+/// The idle Session Card is equally not an inline host (ADR-0100): a standalone
+/// click must still return its own replacement result card, never the empty ack
+/// the inline path would imply.
+#[tokio::test]
+async fn a_standalone_click_ignores_an_idle_card_in_the_map() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_1", "/work").await;
+
+    // No live card: the request is surfaced on its own card.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(platform.sent_cards().await.len(), 1, "one standalone card");
+    let standalone = app
+        .permission
+        .sent_cards
+        .lock()
+        .await
+        .get("per_1")
+        .expect("the standalone card is recorded")
+        .message_id
+        .clone();
+
+    // The idle read is terminal and carries no live block; a click must not be
+    // routed down its (non-existent) inline path.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_1", Some("om_idle")).await;
+    Turn::set_reply_target(&cards, "ses_1", "msg_1").await;
+    Turn::set_card_state(&cards, "ses_1", crate::feishu::card::CardState::Idle).await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": standalone,
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+    let ack = card_text(
+        result
+            .card
+            .as_ref()
+            .expect("a standalone click returns its replacement result card"),
+    );
+    assert!(ack.contains("✅ 已允许一次"), "receipt missing: {ack}");
+    assert!(
+        !ack.contains("🔐 **权限请求**"),
+        "the result card carries no live block: {ack}"
+    );
+}
+
 /// Resolving an INLINE permission updates the clicked card ATOMICALLY in the
 /// callback ack (ADR-0038, rule 3): the block becomes an Interaction Receipt
 /// on the returned card, so there is no toast-then-PATCH lag and no
@@ -129,15 +245,7 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
     }]);
     let (app, platform) = build_app(cfg, backend).await;
 
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -403,15 +511,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
     let (app, _platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -482,15 +582,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
 
     // Seed a session (auto_accept defaults to false) + a live streaming card
     // so the poller surfaces the permission INLINE.
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -637,7 +729,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
                 request_id: "per_1".into(),
                 start: 0,
                 end: 2,
-                kind: crate::bridge::snapshot_claims::ClaimKind::Permission,
+                kind: crate::bridge::request::kind::InteractionKind::Permission,
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 target: "⚡ 执行 Shell 命令 `ls -la`".into(),
@@ -1183,8 +1275,8 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
 }
 
 /// #144: a directory whose list call fails must not clear its live permission
-/// surfaces — the standalone card, the inline section and the snapshot claim
-/// all survive until a SUCCESSFUL list proves the request gone.
+/// surfaces — the standalone card and the inline section both survive until a
+/// SUCCESSFUL list proves the request gone.
 #[tokio::test]
 async fn failed_directory_list_keeps_permission_surfaces() {
     let _wd = test_work_dir();
@@ -1208,14 +1300,8 @@ async fn failed_directory_list_keeps_permission_surfaces() {
             card_id: "per_card",
             card_message_id: "om_card",
             inline_id: "per_inline",
-            snapshot_message_id: "om_snapshot",
             inline_request: crate::bridge::request::kind::PendingRequest::Permission(perm_request(
                 "per_inline",
-                "ses_1",
-                "ls -la",
-            )),
-            claim: crate::bridge::request::kind::PendingRequest::Permission(perm_request(
-                "per_claim",
                 "ses_1",
                 "ls -la",
             )),
@@ -1399,15 +1485,7 @@ async fn permission_click_variants_leave_their_receipts() {
     ]);
     let perm_calls = backend.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, backend).await;
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    seed_live_card(&app, "ses_test", "om_live").await;
     tokio::spawn({
         let app = app.clone();
         async move {
@@ -1569,15 +1647,7 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
     backend.ask_permission(perm_req("per_1", "ses_test", "ls -la"));
     backend.permission_resolved_elsewhere();
     let (app, _platform) = build_app(cfg, backend).await;
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    seed_live_card(&app, "ses_test", "om_live").await;
     tokio::spawn({
         let app = app.clone();
         async move {
@@ -2164,15 +2234,7 @@ async fn an_over_budget_permission_is_declined_and_never_offered() {
     let (app, platform) = build_app(cfg, backend).await;
 
     // Seed a session + accumulator so the poller has a reply target.
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    seed_live_card(&app, "ses_test", "om_live").await;
 
     tokio::spawn({
         let app = app.clone();

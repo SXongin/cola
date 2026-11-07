@@ -92,8 +92,8 @@ pub enum CardState {
     /// A waiting card collected because its Session stopped being the thread's
     /// Active Session — `/switch` away, `/switch forget` (ADR-0059, spec
     /// #405): header 「⏳ 已切换会话 · 后台任务仍在运行」. Terminal, no
-    /// Completion Notice; switching back reports the Session through the
-    /// ADR-0028 snapshot, and the background work runs on.
+    /// Completion Notice; switching back reports the Session through `/card`,
+    /// and the background work runs on.
     SwitchedAway,
     /// A persisted live card collected because a new card took the chain over
     /// after a cola restart (ADR-0063): the Wake continuation the restart's
@@ -112,6 +112,13 @@ pub enum CardState {
     /// replaces the stamp when the run ends. Not terminal: the record stays,
     /// still owed a reap; not render-owned: no renderer survived the restart.
     Restarted,
+    /// The Session Card's idle state (ADR-0100): a one-shot read of a Session
+    /// that no renderer owns, posted by `/card`. Terminal — the read ends when
+    /// it is posted, so `CardSession::is_running` is false and every live-card
+    /// predicate refuses it — and neutral: no phase timer and no Turn Footer.
+    /// Read-only by construction, so an unanswered Permission/Question never
+    /// rides it (it always lives on a live card or its own standalone card).
+    Idle,
 }
 
 impl CardState {
@@ -141,6 +148,7 @@ impl CardState {
                 | Self::Superseded
                 | Self::SwitchedAway
                 | Self::TakenOver
+                | Self::Idle
         )
     }
 
@@ -172,6 +180,24 @@ impl CardState {
     /// probe reading the set differently.
     pub(crate) fn overrides_awaiting(&self) -> bool {
         self.is_terminal() || matches!(self, Self::Waiting)
+    }
+
+    /// Whether the header appends the live phase timer (ADR-0014): only the
+    /// states a renderer is actively driving. `Idle` is a one-shot read, so it
+    /// shows a plain label even if a progress read carries an elapsed value.
+    pub(crate) fn shows_phase_timer(&self) -> bool {
+        matches!(
+            self,
+            Self::Loading | Self::Reasoning | Self::Streaming | Self::Resuming
+        )
+    }
+
+    /// Whether a card of this state may carry the Turn Footer (ADR-0019,
+    /// ADR-0044): the footer describes the Turn that ran, and an `Idle` read
+    /// has no Turn to describe. The builder checks this, so a caller that
+    /// passes one by mistake still renders an idle card with no footer.
+    pub(crate) fn carries_turn_footer(&self) -> bool {
+        !matches!(self, Self::Idle)
     }
 
     /// Whether this state owns a recovery action: `Error` (the retry that
@@ -662,6 +688,7 @@ mod tests {
             CardState::Superseded,
             CardState::SwitchedAway,
             CardState::TakenOver,
+            CardState::Idle,
         ] {
             assert!(state.overrides_awaiting(), "{state:?} has its own ending to show");
         }
@@ -750,6 +777,21 @@ mod tests {
                 "{state:?} must not block a Wake continuation"
             );
         }
+    }
+
+    /// The idle state (ADR-0100) is the Session Card's read: terminal — no
+    /// renderer owns it, so `CardSession::is_running` is false and every
+    /// live-card gate refuses it — and it carries no Turn furniture: the header
+    /// shows no phase timer and the builder renders no Turn Footer. It owns no
+    /// recovery action and beats the awaiting title (its wait is over).
+    #[test]
+    fn the_idle_state_is_terminal_and_carries_no_turn_furniture() {
+        assert!(CardState::Idle.is_terminal());
+        assert!(!CardState::Idle.is_render_owned());
+        assert!(!CardState::Idle.offers_recovery());
+        assert!(CardState::Idle.overrides_awaiting());
+        assert!(!CardState::Idle.shows_phase_timer());
+        assert!(!CardState::Idle.carries_turn_footer());
     }
 
     /// The resuming state (ADR-0066) is LIVE: an in-place resumed run holds the

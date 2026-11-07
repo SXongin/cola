@@ -989,6 +989,26 @@ impl CardSession {
         !self.is_terminal()
     }
 
+    /// Whether the chain still owes a queued continuation (ADR-0043): a split
+    /// was queued and its continuation card has not been sent (a failed create,
+    /// or a finalized slice whose remainder is still owed). The card is then
+    /// the chain's live anchor even when it is terminal — replacing it would
+    /// discard the queue, its reply target and the content it still owes — so
+    /// no `/card` read or follow may supersede it (ADR-0100).
+    pub(super) fn owes_continuation(&self) -> bool {
+        !self.pending_split.is_empty()
+    }
+
+    /// Whether this card joins the Session's **Card Chain** rather than being an
+    /// idle Session Card (ADR-0100): any state except `Idle`. This is the
+    /// Wake-side question, not a liveness predicate: a Wake continues a chain,
+    /// so a terminal chain card still names the message its chain answers; an
+    /// idle Session Card joins no chain and is never a Wake target. Live-card
+    /// readers ask [`Self::is_running`] instead.
+    pub(super) fn is_chain_card(&self) -> bool {
+        self.acc.card_state != crate::feishu::card::CardState::Idle
+    }
+
     /// Whether this card has reached a terminal ending — the card-state rule
     /// the Chain Record's release check reads off the locked card
     /// ([`crate::bridge::chain::release_spent`]).
@@ -1003,9 +1023,11 @@ impl CardSession {
         self.card_message_id.as_deref()
     }
 
-    /// Re-point the live card identity at a new message (ADR-0028: a re-adopt
-    /// mid-turn sends a fresh snapshot; the follow renderer keeps updating the
-    /// new card instead of the old one). The accumulator content is untouched.
+    /// Re-point the live card identity at a new message. The accumulator
+    /// content is untouched. Test-only since the Session Snapshot readopt path
+    /// was retired (#1006); the render test still proves the in-flight upload
+    /// uses the card's CURRENT id.
+    #[cfg(test)]
     pub(super) fn repoint(&mut self, message_id: &str) {
         self.card_message_id = Some(message_id.to_string());
         self.acc.reply_to_message_id = Some(message_id.to_string());
@@ -2235,6 +2257,13 @@ impl StreamAccumulator {
     #[cfg(test)]
     pub(super) fn set_card_state(&mut self, state: CardState) {
         self.card_state = state;
+    }
+
+    /// Adopt the read-only Session Card state (ADR-0100): the accumulator backs
+    /// a one-shot read posted by `/card`, sent once and never flushed. Terminal,
+    /// so no renderer owns it, and neutral: no phase timer and no Turn Footer.
+    pub(super) fn mark_idle_read(&mut self) {
+        self.card_state = CardState::Idle;
     }
 
     /// Stamp the Turn's settled change-index counts: the one production writer,
@@ -5438,16 +5467,16 @@ impl StreamAccumulator {
     }
 }
 
-/// Whether `block` belongs to `kind` — the one ClaimKind → block-family
+/// Whether `block` belongs to `kind` — the one InteractionKind → block-family
 /// predicate the kind wrappers, the session collector and the resolver share.
 pub(super) fn block_of_kind(
-    kind: crate::bridge::snapshot_claims::ClaimKind,
+    kind: crate::bridge::request::kind::InteractionKind,
     block: &InteractionBlock,
 ) -> bool {
-    use crate::bridge::snapshot_claims::ClaimKind;
+    use crate::bridge::request::kind::InteractionKind;
     match kind {
-        ClaimKind::Permission => matches!(block, InteractionBlock::Permission(_)),
-        ClaimKind::Question => matches!(block, InteractionBlock::Question(_)),
+        InteractionKind::Permission => matches!(block, InteractionBlock::Permission(_)),
+        InteractionKind::Question => matches!(block, InteractionBlock::Question(_)),
     }
 }
 

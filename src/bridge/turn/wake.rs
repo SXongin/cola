@@ -18,16 +18,42 @@ use crate::bridge::turn::state::StreamAccumulator;
 
 use super::{Disposition, SettleTiming, Turn, WAKE_RECEIPT, ownership, render, settle, state};
 
-/// What an armed external card opens with, above the Turn's parts (ADR-0028).
-/// The two shapes are not interchangeable: the External Message is the user's
-/// own text and must read as a user block, while the snapshot's static prefix
-/// (its identity line plus the 最近对话 tail) is cola's own composition.
+/// What an armed external card opens with, above the Turn's parts (ADR-0028):
+/// the External Message is the user's own text and reads as a user block. A
+/// busy follow's static prefix (its identity line plus the 最近对话 tail)
+/// is cola's own composition and is set later, once its seed count is final.
 pub(crate) enum ExternalCardLead<'a> {
     /// The External Message the run answers: rendered as a distinct, quoted
-    /// user block ([`crate::feishu::card::user_message_block`]).
+    /// user block ([`crate::feishu::card::user_message_block`]). A busy
+    /// follow's static lead is set later, under its write lock, through
+    /// [`PreparedExternalRender::set_static_lead`].
     UserMessage(&'a str),
-    /// A static prefix the arm itself composed: plain card text.
-    Static(&'a str),
+}
+
+/// An external renderer's accumulator built off the card map (ADR-0100): the
+/// turn anchor, work context and variant are all in place, and only the card
+/// id a send returns, the durable seed and (for `/card`) the static lead —
+/// whose pointer names the seed set decided under the write lock — are
+/// missing. The post-and-arm holds it across its send and consumes it under
+/// that lock.
+pub(crate) struct PreparedExternalRender {
+    acc: StreamAccumulator,
+    /// The Session's directory, for the chain record's read routing.
+    session_dir: String,
+    /// The turn's server time: a lead is pushed just before it so the run's
+    /// parts always insert below.
+    anchor_ms: i64,
+}
+
+impl PreparedExternalRender {
+    /// Push the static lead a caller only knows after it has the write lock —
+    /// `/card`'s seed filter decides the pointer's count there, so the lead is
+    /// composed at the same moment.
+    pub(crate) fn set_static_lead(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.acc.push_text_at(Some(self.anchor_ms - 1), text);
+        }
+    }
 }
 
 /// What Session Sync owes for one read (ADR-0059): the decision carries
@@ -87,9 +113,12 @@ pub(crate) enum WakeContinuation {
     /// "content is never dropped" half of #606, paired with [`Self::Residual`]'s
     /// "at most one such card per request" half.
     RenderResidualInPlace,
-    /// No chain in this process and no durable record (a cola restart that
-    /// left nothing behind): arm a fresh card, scoped at the newest Wake's own
-    /// anchor so the lost card's content is never replayed.
+    /// No chain this process holds — a cola restart that left nothing behind,
+    /// or a map entry that is a one-shot **Idle Session Card** (ADR-0100,
+    /// which joins no chain and is never continued or repainted): arm a fresh
+    /// card, scoped at the newest Wake's own anchor so the lost card's content
+    /// is never replayed. A durable record an idle read left behind is not a
+    /// chain this process holds either; the fresh card re-points it on take-over.
     Fresh { anchor: TurnAnchor },
 }
 
@@ -249,8 +278,11 @@ impl Turn {
     /// identity — takes the ledger and work context, applies `ending` when the
     /// run is over (the ended-while-down projection, ticket #563) and is
     /// inserted as the session's live card, ready for the caller's create.
-    /// `None` when the session already has a card (a chain appeared meanwhile)
-    /// — the caller must send nothing.
+    /// `None` when the session already has a **chain card** (one appeared
+    /// meanwhile) — the caller must send nothing. An Idle Session Card does not
+    /// refuse it: it is a one-shot read (ADR-0100) that joins no chain, so the
+    /// projection replaces it in the map while the read's message stays
+    /// untouched.
     ///
     /// With `ending: None` the successor follows a still-live run (ticket
     /// #564): it wears a working header from its first send — never an initial
@@ -312,15 +344,23 @@ impl Turn {
         }
         let mut plans = {
             let live = cards.cards.lock().await;
-            if live.contains_key(session_id) {
+            // A chain card that appeared meanwhile owns the session. An Idle
+            // Session Card does not: it is a one-shot read (ADR-0100) that
+            // joins no chain, so the projection replaces it in the map while
+            // the read's message stays untouched in the chat.
+            if live
+                .get(session_id)
+                .is_some_and(state::CardSession::is_chain_card)
+            {
                 return None;
             }
             // The durable seed is read HERE, in the same critical section that
-            // checks the session is still card-less (issue #671, ticket #672):
-            // `read_planned_outputs` below awaits outside the lock, so a seed
-            // read before it could miss a fact a landed body wrote meanwhile.
-            // Together with the check the two are one decision — no card, so no
-            // writer — and the second check guards the install.
+            // checks the session is still chain-card-less (issue #671, ticket
+            // #672): `read_planned_outputs` below awaits outside the lock, so a
+            // seed read before it could miss a fact a landed body wrote
+            // meanwhile. Together with the check the two are one decision — no
+            // chain card, so no chain writer — and the second check guards the
+            // install.
             Self::seed_durable_announcements(cards, session_id, &mut acc);
             render::plan_ledger_entries(
                 &acc,
@@ -331,7 +371,10 @@ impl Turn {
         };
         render::read_planned_outputs(backend, &mut plans).await;
         let mut live = cards.cards.lock().await;
-        if live.contains_key(session_id) {
+        if live
+            .get(session_id)
+            .is_some_and(state::CardSession::is_chain_card)
+        {
             return None;
         }
         // `read_planned_outputs` awaited outside the lock: a queued card update
@@ -421,6 +464,27 @@ impl Turn {
         variant: Option<String>,
         lead: Option<ExternalCardLead<'_>>,
     ) {
+        let prepared =
+            Self::prepare_external_render(session_id, anchor, subtitle, session_dir, variant, lead).await;
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        Self::commit_external_render_locked(cards, session_id, card_id, prepared, false).await;
+    }
+
+    /// Build an external renderer's accumulator OFF the card map (ADR-0100):
+    /// the anchor, work context, variant and lead are ready, and only the card
+    /// id (which the send returns) and the durable seed are missing. The
+    /// work-context read runs here, before any write lock, so `/card`'s
+    /// post-and-arm critical section is only the send, the insert and the
+    /// chain record.
+    pub(crate) async fn prepare_external_render(
+        session_id: &str,
+        anchor: &TurnAnchor,
+        subtitle: &str,
+        session_dir: &str,
+        variant: Option<String>,
+        lead: Option<ExternalCardLead<'_>>,
+    ) -> PreparedExternalRender {
         let mut acc = state::StreamAccumulator::new(subtitle);
         // The external message's anchor — identity plus server time — is the
         // turn's anchor: header date, turn filter and renderer replacement
@@ -428,38 +492,95 @@ impl Turn {
         // (#183, #190).
         acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
-        acc.set_reply_target(Some(card_id.to_string()));
         acc.attach_work_context(session_dir).await;
         acc.set_variant(variant);
-        if let Some(lead) = lead {
-            match lead {
-                ExternalCardLead::UserMessage(text) => {
-                    acc.push_user_message(Some(anchor.created_ms - 1), text)
-                }
-                ExternalCardLead::Static(text) if !text.is_empty() => {
-                    acc.push_text_at(Some(anchor.created_ms - 1), text)
-                }
-                ExternalCardLead::Static(_) => {}
-            }
+        if let Some(ExternalCardLead::UserMessage(text)) = lead {
+            acc.push_user_message(Some(anchor.created_ms - 1), text);
         }
-        {
-            // The durable seed and the insert share ONE cards-map critical
-            // section (issue #671, ticket #672): the `attach_work_context`
-            // await above is where a landed mark could slip past a seed read
-            // taken before it, leaving this render to re-show the retirement.
-            let mut live = cards.cards.lock().await;
-            Self::seed_durable_announcements(cards, session_id, &mut acc);
-            live.insert(
-                session_id.to_string(),
-                state::CardSession::new(acc, Some(card_id.to_string())),
-            );
+        PreparedExternalRender {
+            acc,
+            session_dir: session_dir.to_string(),
+            anchor_ms: anchor.created_ms,
         }
+    }
+
+    /// The post-and-arm's commit (ADR-0100): the caller holds the Session's
+    /// card write lock across its send and this insert, so the two are one
+    /// critical section. `prepared` was built off the map; its reply target is
+    /// the sent card id. With `refuse_if_running`, a live card that appeared
+    /// while the caller was sending wins — nothing is inserted, no chain
+    /// record is written, and the caller keeps its just-sent card as a static
+    /// read. Returns whether the arm committed.
+    pub(crate) async fn commit_external_render_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_id: &str,
+        prepared: PreparedExternalRender,
+        refuse_if_running: bool,
+    ) -> bool {
+        let Some((chain_id, session_dir)) =
+            Self::insert_external_render_locked(cards, session_id, card_id, prepared, refuse_if_running)
+                .await
+        else {
+            return false;
+        };
         // An adopted run's card is the session's live card: take the chain over
         // (the anchor is known here, so the record needs no transcript probe,
-        // and the arm carries the directory its reads route under). A different
-        // previously recorded card was orphaned by this arm and is collected
-        // as taken over.
-        Self::take_over_card(cards, session_id, card_id, Some(session_dir)).await;
+        // and the arm carries the directory its reads route under). The guarded
+        // takeover only records while the map still holds THIS card, so a Turn
+        // that interleaved after the insert can never be re-pointed at — or
+        // have its record replaced by — a read that is no longer the Session's
+        // card.
+        Self::record_external_render_locked(cards, session_id, card_id, chain_id, &session_dir).await
+    }
+
+    /// The insert half of [`Self::commit_external_render_locked`]: the durable
+    /// seed and the render-owned `CardSession` in one cards-map critical
+    /// section. Returns the card's chain identity and directory for the record
+    /// write, or `None` when the CAS refuses.
+    pub(crate) async fn insert_external_render_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_id: &str,
+        mut prepared: PreparedExternalRender,
+        refuse_if_running: bool,
+    ) -> Option<(u64, String)> {
+        prepared.acc.set_reply_target(Some(card_id.to_string()));
+        let session_dir = prepared.session_dir.clone();
+        // The durable seed and the insert share ONE cards-map critical section
+        // (issue #671, ticket #672): a landed mark must not slip past a seed
+        // read taken before it, leaving this render to re-show the retirement.
+        let mut live = cards.cards.lock().await;
+        // The render-owned arm's commit is also a compare-and-swap for the
+        // `/card` post (ADR-0100): a Turn installed during the send owns the
+        // card, a terminal card that still carries a live Permission/Question
+        // must keep its answerable controls, and a card that still owes a
+        // continuation must keep that queue and its reply target, so none of
+        // them is overwritten.
+        if refuse_if_running
+            && live.get(session_id).is_some_and(|card| {
+                card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation()
+            })
+        {
+            return None;
+        }
+        Self::seed_durable_announcements(cards, session_id, &mut prepared.acc);
+        let session = state::CardSession::new(prepared.acc, Some(card_id.to_string()));
+        let chain_id = session.chain_id();
+        live.insert(session_id.to_string(), session);
+        Some((chain_id, session_dir))
+    }
+
+    /// The record half of [`Self::commit_external_render_locked`], split out so
+    /// the `/card` arm can spawn its render loop before this await.
+    pub(crate) async fn record_external_render_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        card_id: &str,
+        chain_id: u64,
+        session_dir: &str,
+    ) -> bool {
+        Self::take_over_card_if_current(cards, session_id, card_id, chain_id, Some(session_dir)).await
     }
 
     /// What Session Sync owes for this read: `None` when the chain has
@@ -487,7 +608,15 @@ impl Turn {
     ///   card PAST its wait it is the RESIDUAL floor ([`WakeContinuation::Residual`],
     ///   spec #602/#606): it renders on one neutral card, never a 「已恢复执行」
     ///   receipt, and never a second one.
-    /// - **No chain in this process (a cola restart).** A durable Chain Record
+    /// - **No chain in this process (a cola restart, or an idle read).** A Wake
+    ///   continues the Session's Card Chain, but an **Idle Session Card** is a
+    ///   one-shot read that joins no chain (ADR-0100): it must never be
+    ///   continued, split or repainted, so the decision falls through to the
+    ///   Fresh arm — a late Wake (or a shell/subagent completion) opens a fresh
+    ///   continuation card instead of the work being dropped. The durable Chain
+    ///   Record an idle read leaves in place is bypassed here for the same
+    ///   reason: it still names the terminal card the read replaced, not a
+    ///   chain this process holds. For a real restart, a durable Chain Record
     ///   means the projection — or, cursorless, the reap's one-release
     ///   fallback — owns the chain's Wake, so the Fresh path owes nothing
     ///   (spec #561, ticket #566). Only a recordless post reaches the Fresh
@@ -508,9 +637,30 @@ impl Turn {
         // The diff is a sync read of the accumulator's dedup state, so the
         // cards lock is held only for its scan — no clone of the chain (whose
         // rendered content can be a card's worth) is built to run it off-lock.
+        //
+        // An Idle read is not the session's chain. A terminal chain card is
+        // no longer a live chain for a WAKE: a genuine un-handed-over Wake
+        // falls through to the Fresh gate, which opens the continuation on the
+        // topic anchor or top level, where a split cannot go. Its Wake-less
+        // residual tails still take the chain's residual arms, on the card
+        // that holds the chain's own reply target.
+        let not_live;
         {
             let live = cards.cards.lock().await;
-            if let Some(card) = live.get(session_id) {
+            let entry = live.get(session_id);
+            not_live = entry.is_some_and(|card| !card.is_running());
+            // A terminal card with a genuine un-handed-over Wake is not the
+            // chain this Wake continues: skip the chain arms and let the Fresh
+            // gate below open the continuation.
+            let fresh_wake = entry.is_some_and(|card| {
+                card.is_chain_card()
+                    && !card.is_running()
+                    && newest_wake.is_some_and(|wake| {
+                        wake.source.is_genuine_resumption()
+                            && !card.acc.has_handed_over_wake(wake.id.as_str())
+                    })
+            });
+            if let Some(card) = entry.filter(|card| card.is_chain_card() && !fresh_wake) {
                 // The probe judges the chain's OWN rendered scope, not the
                 // newest user message's: a restart continuation is anchored at
                 // the Wake (`arm_wake_continuation`), and the pre-Wake content
@@ -646,7 +796,13 @@ impl Turn {
             // A durable record owns this chain's Wake: the projection (or, for
             // a cursorless record, the reap's fallback) supersedes the Fresh
             // post (spec #561, ticket #566). Only a recordless post survives.
-            recorded: cards.chains.recorded(session_id),
+            //
+            // A non-live entry is the exception: an Idle read wrote no Chain
+            // Record, and a terminal Turn card is no longer a chain this
+            // process renders. The record present in either case names a card
+            // the Wake must supersede on a Fresh card (ADR-0100), never be
+            // dropped because that stale record "owns" it.
+            recorded: !not_live && cards.chains.recorded(session_id),
             wake,
             stale,
             renders: false,
@@ -693,9 +849,15 @@ impl Turn {
     /// `anchor` — opens with the 承接 line, carries the session's work context,
     /// answers to `facts.reply_to` and is marked a continuation (it offers no
     /// Retry). Returns the card to send; the caller attaches its id with
-    /// [`Self::take_over_card`]. `None` when the session has a card after
-    /// all — the decision saw none, so a chain appeared meanwhile and owns the
-    /// session now; the caller must send nothing and the next poll re-decides.
+    /// [`Self::take_over_card`]. `None` when the current card is not
+    /// supersedable — it is still running, still carries a live
+    /// Permission/Question, still owes a queued continuation, or still offers
+    /// a recovery action (`Error`/`Unreceived`) (ADR-0100) — because replacing
+    /// it would drop work or strand the only answerable/recovery controls; the
+    /// caller sends nothing and the next poll re-decides. An **Idle Session
+    /// Card** or a clean terminal chain card does not block the arm: neither
+    /// owns a chain any more, and the fresh continuation replaces the entry in
+    /// the map while the old message stays untouched in the chat.
     pub(crate) async fn arm_wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -704,7 +866,32 @@ impl Turn {
     ) -> Option<serde_json::Value> {
         let work_context = StreamAccumulator::capture_work_context(facts.directory).await;
         let mut live = cards.cards.lock().await;
-        if live.contains_key(session_id) {
+        // The same not-supersedable predicate as the follow CAS and
+        // `record_idle_card` (ADR-0100): a card that is still running, still
+        // carries a live Permission/Question, still owes a queued
+        // continuation, or still offers a recovery action (`Error`/
+        // `Unreceived`) is the chain's only record of that work. A terminal
+        // `Done`/`Error` card can be several of these (a failed continuation
+        // create keeps its `pending_split`; LostContact/StuckPanel end in
+        // `Error` with a live block; a failed/undelivered Turn ends with a
+        // Retry/重新发起 control). Replacing it here would drop the queue, its
+        // reply target and the unrendered content, strip the only answerable
+        // controls, or leave the old recovery button to click against a
+        // successor whose state no longer matches (`claim_recovery` returns
+        // `None`) — and a failed Wake send would drop the new entry without
+        // restoring this one. Leave it current and let the next poll retry the
+        // Wake once the continuation is served, the block answered, or the
+        // user retried.
+        if let Some(card) = live.get(session_id)
+            && (card.is_running()
+                || !card.acc.live_request_ids().is_empty()
+                || card.owes_continuation()
+                || card.acc.card_state().offers_recovery())
+        {
+            tracing::info!(
+                session = %session_id,
+                "wake continuation deferred: the current card still owes a continuation, carries a live request, or offers recovery"
+            );
             return None;
         }
         let mut acc = StreamAccumulator::new(facts.subtitle);

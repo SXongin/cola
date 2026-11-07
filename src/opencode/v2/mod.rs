@@ -535,7 +535,7 @@ impl GenerationStrategy for V2Strategy {
     /// V2 has no retry entry: the active map only carries `{type:"running"}`,
     /// and a scheduled retry keeps the session's drain active, so a retrying
     /// session is indistinguishable from a running one by the map alone. The
-    /// neutral view keeps Idle/Busy/Retry (the Session Snapshot's status line),
+    /// neutral view keeps Idle/Busy/Retry (the Session Card's status line),
     /// so an ACTIVE session's newest assistant message is read and a scheduled
     /// `retry` wins over Running. That second read is paid only for active
     /// sessions — absence from the map is idle (the server's own contract)

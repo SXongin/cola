@@ -14,7 +14,7 @@ A pending Permission/Question is rendered inline on the card the Host is already
   - Click an inline permission → the resolution seam strips the section and flushes only the accumulator's current card (`resolve_blocks`, `src/bridge/request/delivery.rs:170`; `Turn::resolve_interactions`, `src/bridge/turn/mod.rs:1272`); the ack carries no card for inline clicks (`PermissionKind::handle_action`, `src/bridge/request/kind.rs:354`). A click on any other card (older chain card, card from a previous turn) changes nothing.
   - Request resolved elsewhere (OpenChamber, CLI) → the sweep's vanished-block pass strips an inline block from the accumulator but no path repaints the hosting card (`resolve_vanished_inline`, `src/bridge/request/kind.rs:195`; `Turn::resolve_vanished_permissions`/`_questions`, `src/bridge/turn/mod.rs:1221-1247`). Standalone cards survive through `mark_stale_cards` (`src/bridge/pollers.rs:476`) and snapshot claims are rebuilt, but the inline case has no equivalent. While a turn runs, the header timer's ~1.5 s tick incidentally repaints the current card; after the turn ends nothing does — the block stays forever.
   - A new turn replaces the accumulator (`Turn::start`'s fresh accumulator, `src/bridge/turn/mod.rs:226-265`); any still-pending block on the old card is orphaned — a click replies (or 404s) but can neither repaint the old card nor find its section. `CardsHandle`'s card map keeps no per-message card JSON, so no code path can reconstruct it.
-- **The mechanisms that already work.** The question path's partial-answer branch returns a rebuilt card in the callback ack (`QuestionKind::handle_action`, `src/bridge/request/kind.rs:931`; its final answer/submit/reject branches instead clear the block with a PATCH), and Feishu applies an ack card to the clicked card atomically — this is why multi-select 已选 markers appear instantly. The callback payload carries the clicked message id (`open_message_id`, `src/feishu/ws.rs:369-381`), so cola can target the exact card. Session Snapshot claims already track a block to its host message and rebuild it in place (`src/bridge/snapshot_claims.rs:129-171`). Standalone request cards already have `sent_cards` + `mark_stale_cards` (`src/bridge/pollers.rs:476`).
+- **The mechanisms that already work.** The question path's partial-answer branch returns a rebuilt card in the callback ack (`QuestionKind::handle_action`, `src/bridge/request/kind.rs:931`; its final answer/submit/reject branches instead clear the block with a PATCH), and Feishu applies an ack card to the clicked card atomically — this is why multi-select 已选 markers appear instantly. The callback payload carries the clicked message id (`open_message_id`, `src/feishu/ws.rs:369-381`), so cola can target the exact card. The **retired** Session Snapshot claims used to track a block to its host message and rebuild it in place (`src/bridge/snapshot_claims.rs:129-171`; retired by ADR-0100, no such module remains). Standalone request cards already have `sent_cards` + `mark_stale_cards` (`src/bridge/pollers.rs:476`).
 - **The Host's constraint.** A standalone request card was proposed and rejected: it fragments the message stream, and whichever card is newest, the other's live updates go out of view ("要么我最新看到的永远是这些独立卡……要么这个消息要拆得很碎").
 
 ## Decision
@@ -283,3 +283,30 @@ One more write owns the render gate's header cache: a click's callback ack is
 the card's body, so a resolution that restamps the header advances the cache
 with it (`Turn::mark_header_shown`) — otherwise the next tick re-sent the
 identical ack body, which is the same wipe one click later.
+
+## Amendment (2026-11-07): the sweep takes the session card-write lock for its surfacing decision
+
+Rule 8 named `flush_card` and `resolve_blocks` as the only holders. ADR-0100's
+`/card` busy follow adds a third: `RequestFlow::surface` takes a card write lock
+for its **whole surfacing decision** — the inline-host check, the block
+insert/flush, and the standalone send with its `sent_cards` record — so the
+follow arm and the sweep cannot both deliver one request. A sweep that read
+"no live card" just before the arm must not post a standalone card for the
+request the follow seeds.
+
+The lock remains per-session, and a sweep **never holds two Sessions' locks**
+(ADR-0100's 2026-11-07 amendment). It resolves the inline host first, bounded
+and before any lock because the parent-chain walk reads the server. When a host
+exists, the inline decision — re-checking the host's liveness, inserting the
+block, flushing — takes **the host's** card write lock, the same lock `/card`'s
+post-and-arm and a busy follow take. If the host is no longer live (a Turn that
+ended between the walk and the lock, or a card that vanished), that lock is
+released and the standalone path takes **the request Session's own** write lock
+for its decision, send and `sent_cards` record. The two locks are never nested:
+a sub-task child's lock is not held while its ancestor host's is, so the old
+child → ancestor acquisition and its liveness check under the wrong lock are
+gone. The standalone send is one Feishu create and is deliberately not wrapped
+in a request timeout: a create has at-least-once semantics, so abandoning a
+slow response could orphan a card that did land and a retry would post a second
+(ADR-0100). The sweep patches that target standalone or superseded cards — the
+ones Rule 8 already calls lock-free — stay exactly that.

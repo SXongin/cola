@@ -226,13 +226,13 @@ async fn a_completed_compaction_renders_a_folded_row_at_its_server_time() {
     );
 }
 
-/// An adopted session's Session Snapshot carries the compaction in its 最近对话
-/// tail, at its server position among the kept messages (ADR-0082, ticket #723):
+/// A Session Card read carries the compaction in its 最近对话 tail, at its
+/// server position among the kept messages (ADR-0082, ticket #723 / ADR-0100):
 /// a session whose visible history looks oddly short has its explanation
 /// sitting right where it happened, instead of a reader wondering why the
 /// conversation starts mid-thread.
 #[tokio::test]
-async fn the_snapshot_tail_carries_a_compaction_at_its_server_position() {
+async fn the_idle_read_tail_carries_a_compaction_at_its_server_position() {
     let _wd = test_work_dir();
     let timeline = vec![
         user("msg_u1", 1_000, "第一个问题"),
@@ -246,19 +246,20 @@ async fn the_snapshot_tail_carries_a_compaction_at_its_server_position() {
         assistant(5_000, "第二个回答"),
     ];
     let mut backend = MockBackend::new(realistic_parts());
-    // Busy, so the re-switch reports the full snapshot instead of the compact
-    // 已切换 state (ADR-0028 suppression).
+    // The read renders the same tail whether the Session reads busy or idle;
+    // a busy Session still posts a static read in this slice (#1005 arms the
+    // follow).
     backend.with_session_status("ses_own1", Some(SessionStatus::Busy));
     backend.given_transcript("ses_own1", vec![SessionTranscript::new(timeline)]);
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
-    send_command(&app, "/switch 本项目", "msg_switch").await;
+    send_command(&app, "/card", "msg_card").await;
     let card = platform
         .replied_cards()
         .await
         .into_iter()
         .next()
-        .expect("the busy re-switch reports a snapshot");
+        .expect("the /card read posts an idle card");
 
     let rows = compaction_rows(&card);
     assert_eq!(
@@ -283,10 +284,10 @@ async fn the_snapshot_tail_carries_a_compaction_at_its_server_position() {
 
 /// A transcript that kept no conversation message at all — a `/compact` on a
 /// session whose only readable fact is the compaction itself — still carries its
-/// marker: the snapshot's recent tail shows the compaction "either way"
+/// marker: the read's recent tail shows the compaction "either way"
 /// (ADR-0082, ticket #723). A reader who sees nothing else at least learns why.
 #[tokio::test]
-async fn the_snapshot_tail_carries_a_compaction_with_no_conversation_message() {
+async fn the_idle_read_tail_carries_a_compaction_with_no_conversation_message() {
     let _wd = test_work_dir();
     let timeline = vec![compaction(
         "msg_comp",
@@ -298,13 +299,13 @@ async fn the_snapshot_tail_carries_a_compaction_with_no_conversation_message() {
     backend.given_transcript("ses_own1", vec![SessionTranscript::new(timeline)]);
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
-    send_command(&app, "/switch 本项目", "msg_switch").await;
+    send_command(&app, "/card", "msg_card").await;
     let card = platform
         .replied_cards()
         .await
         .into_iter()
         .next()
-        .expect("the busy re-switch reports a snapshot");
+        .expect("the /card read posts an idle card");
 
     let rows = compaction_rows(&card);
     assert_eq!(
@@ -318,11 +319,11 @@ async fn the_snapshot_tail_carries_a_compaction_with_no_conversation_message() {
 }
 
 /// A compaction inside the tail's window never displaces a message: a marker is
-/// not a message, so the snapshot's 最近对话 keeps its four messages and the
+/// not a message, so the read's 最近对话 keeps its four messages and the
 /// marker rides between them (ADR-0082, ticket #723). A compaction that
 /// PRECEDED the window's oldest message stays out of it entirely.
 #[tokio::test]
-async fn a_compaction_in_the_snapshot_tail_never_displaces_a_message() {
+async fn a_compaction_in_the_idle_read_tail_never_displaces_a_message() {
     let _wd = test_work_dir();
     let timeline = vec![
         user("msg_u0", 500, "窗口外的问题"),
@@ -343,13 +344,13 @@ async fn a_compaction_in_the_snapshot_tail_never_displaces_a_message() {
     backend.given_transcript("ses_own1", vec![SessionTranscript::new(timeline)]);
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
-    send_command(&app, "/switch 本项目", "msg_switch").await;
+    send_command(&app, "/card", "msg_card").await;
     let card = platform
         .replied_cards()
         .await
         .into_iter()
         .next()
-        .expect("the busy re-switch reports a snapshot");
+        .expect("the /card read posts an idle card");
 
     let lines = body_lines(&card);
     let previews: Vec<&str> = lines.iter().map(|line| line.as_str()).collect();

@@ -258,11 +258,11 @@ impl RequestFlow {
         // cards it sent and the requests whose surfaces the next sweep must
         // re-adopt (both an inline block and a standalone card count).
         let state = surfaces.snapshot();
-        let claim_kind = kind.claim_kind();
+        let interaction_kind = kind.interaction_kind();
         let sent_cards: HashMap<String, SentCard> = state
             .standalone
             .iter()
-            .filter(|(_, s)| s.kind == claim_kind)
+            .filter(|(_, s)| s.kind == interaction_kind)
             .map(|(id, s)| {
                 (
                     id.clone(),
@@ -278,13 +278,13 @@ impl RequestFlow {
         let recovered: HashMap<String, String> = state
             .inline
             .iter()
-            .filter(|(_, s)| s.kind == claim_kind)
+            .filter(|(_, s)| s.kind == interaction_kind)
             .map(|(id, s)| (id.clone(), s.directory.clone()))
             .chain(
                 state
                     .standalone
                     .iter()
-                    .filter(|(_, s)| s.kind == claim_kind)
+                    .filter(|(_, s)| s.kind == interaction_kind)
                     .map(|(id, s)| (id.clone(), s.directory.clone())),
             )
             .collect();
@@ -387,17 +387,6 @@ impl RequestFlow {
         self.question_state.lock().await.get_mut(req_id).map(f)
     }
 
-    /// Read the whole question-state map under ONE lock — the question kind's
-    /// snapshot contribution needs a single consistent moment (ADR-0028), the
-    /// way the old inline loop held the lock across every pending block.
-    pub(crate) async fn with_question_states<R>(
-        &self,
-        f: impl FnOnce(&HashMap<String, QuestionState>) -> R,
-    ) -> R {
-        let states = self.question_state.lock().await;
-        f(&states)
-    }
-
     /// The remembered question request, cloned for a card rebuild.
     pub(crate) async fn question_request(
         &self,
@@ -451,34 +440,27 @@ impl RequestFlow {
         })
     }
 
-    /// The live state the kind contributes to a Session Snapshot re-render
-    /// after an interaction (ADR-0028) — the 已选/✅ markers the standalone
-    /// question cards show. The contribution is the kind's; a kind with no
-    /// snapshot state contributes nothing.
-    pub(crate) async fn live_snapshot_state(
-        &self,
-        pending: &[PendingRequest],
-    ) -> crate::feishu::snapshot_card::SnapshotQuestionState {
-        self.kind.snapshot_state(self, pending).await
-    }
-
     /// Let the kind remember a request surfaced without the poll loop (a
-    /// Session Snapshot claim or a busy-follow host), so its block's buttons
-    /// still resolve. A kind with no in-flight state has nothing to remember.
+    /// busy-follow host), so its block's buttons still resolve. A kind with no
+    /// in-flight state has nothing to remember.
     pub(crate) async fn remember_surfaced(&self, req: &PendingRequest, dir: &str) {
         self.kind.remember_surfaced(self, req, dir).await;
     }
 
-    /// Seed this kind's inline block on a new host card with its initial
-    /// state — the busy-follow host path (`start_snapshot_follow`).
-    pub(crate) async fn add_initial_inline(
+    /// Seed this kind's inline block on a NEW host card with its initial
+    /// state, for a caller that already holds the host's card write lock —
+    /// `/card`'s post, arm, seed and pointer are one critical section
+    /// (ADR-0100).
+    pub(crate) async fn add_initial_inline_locked(
         &self,
         cards: &CardsHandle,
         host: &str,
         req: &PendingRequest,
         dir: &str,
     ) -> bool {
-        self.kind.add_initial_inline(self, cards, host, req, dir).await
+        self.kind
+            .add_initial_inline_locked(self, cards, host, req, dir)
+            .await
     }
 
     /// The result for a click whose question state is gone (#130). It never
@@ -546,8 +528,8 @@ impl RequestFlow {
     /// [`approve_pending_for_session`]'s session/descendant filter.
     ///
     /// Only a KNOWN state is resolved: a failed/timed-out list, an empty
-    /// session id, another session, and a snapshot claim all stay untouched —
-    /// unknown is never read as resolved (#130/#144). Returns the ids the
+    /// session id, and another session all stay untouched — unknown is never
+    /// read as resolved (#130/#144). Returns the ids the
     /// server actually rejected, in list order, so the caller turns their
     /// blocks into `🚫 已拒绝` receipts through `resolve_blocks`.
     pub(crate) async fn reject_pending_for_session(
@@ -584,11 +566,6 @@ impl RequestFlow {
             // An answered request was already resolved (or is being resolved)
             // by its click: never reply a second time.
             if self.is_answered(requests, req.id()).await {
-                continue;
-            }
-            // A claimed request's block lives on a snapshot card, whose
-            // lifecycle is its own (ADR-0038, rule 6).
-            if requests.snapshot_claims.lock().await.contains(req.id()) {
                 continue;
             }
             let result = self.kind.reject(self, &dir_backend, req).await;
@@ -711,8 +688,8 @@ impl RequestFlow {
 
     /// One poll iteration: list pending requests per known session directory,
     /// surface the unseen ones, then reconcile everything that left the list
-    /// (stale standalone cards, inline sections, snapshot claims, and the
-    /// remembered question state). Extracted from the loop so tests can drive
+    /// (stale standalone cards, inline sections, and the remembered question
+    /// state). Extracted from the loop so tests can drive
     /// one deterministic sweep; the loop's serverless guard (Lazy Start hasn't
     /// attached or spawned yet) lives in [`Self::poll_loop`], so a direct
     /// caller on a serverless app must skip it itself.
@@ -905,7 +882,7 @@ impl RequestFlow {
             handles
                 .waits
                 .reminder
-                .sync(&handles.platform, self.kind.claim_kind(), &pin_targets)
+                .sync(&handles.platform, self.kind.interaction_kind(), &pin_targets)
                 .await;
         }
         // Requests cola itself is answering or has answered (a click's claim,
@@ -941,7 +918,7 @@ impl RequestFlow {
                 .or_insert(card.directory.clone());
         }
         for (session_id, directory) in handles.cards.card_handles.lock().await.vanished_sessions(
-            self.kind.claim_kind(),
+            self.kind.interaction_kind(),
             &pending,
             &failed_dirs,
             &cola_claimed,
@@ -951,7 +928,7 @@ impl RequestFlow {
         }
         for (session_id, directory) in Turn::vanished_block_sessions(
             &handles.cards,
-            self.kind.claim_kind(),
+            self.kind.interaction_kind(),
             &pending,
             &failed_dirs,
             &cola_claimed,
@@ -975,7 +952,7 @@ impl RequestFlow {
         )
         .await;
         let dropped = handles.cards.card_handles.lock().await.drop_vanished(
-            self.kind.claim_kind(),
+            self.kind.interaction_kind(),
             &pending,
             &failed_dirs,
             &cola_claimed,
@@ -1004,50 +981,16 @@ impl RequestFlow {
         for session_id in &repaint {
             Turn::flush_card(&handles.cards, session_id).await;
         }
-        // ADR-0028: a claimed request that left the pending list was
-        // resolved — by the snapshot's own buttons (the click handler
-        // re-renders synchronously; this just cleans the registry) or by
-        // another client (the block must drop from the snapshot). The
-        // snapshot card itself is never marked stale — that targets
-        // standalone cards. A claim hosted from a directory whose list failed
-        // stays: that directory said nothing (#144). The registry returns the
-        // rebuilt cards; the flow patches them (never holding the registry
-        // lock across the Feishu call).
-        let dropped = handles.requests.snapshot_claims.lock().await.drop_vanished(
-            self.kind.claim_kind(),
-            &pending,
-            &failed_dirs,
-        );
-        for (message_id, card) in dropped {
-            if let Err(e) = handles.platform.update_message(&message_id, &card).await {
-                tracing::warn!("snapshot claim drop: card update failed: {}", e);
-            } else {
-                tracing::info!("snapshot {} re-rendered without resolved claims", message_id);
-            }
-        }
         // Waiting-card pins (ADR-0043 amendment): keep every card still
         // waiting on the user in its chat's pinned-message list, so the
         // Chat/Topic's Instant Reminder nudge leads to the exact message once
         // the user opens the chat. The host is the card rendering the live
-        // block (the streaming card, possibly a re-hosted newer one), the
-        // standalone card the request was sent as, or — for a request claimed
-        // by a Session Snapshot (ADR-0028) — the snapshot card itself, whose
-        // lifecycle owns the claimed block. A request cola is already
+        // block (the streaming card, possibly a re-hosted newer one) or the
+        // standalone card the request was sent as. A request cola is already
         // answering or one auto-resolved in this sweep is not a wait and never
         // pins. Best-effort, like the reminder; a failed directory's tracked
         // pin stays (#130).
         if handles.waits.message_pins.enabled() {
-            let claimed_hosts: std::collections::HashMap<String, String> = {
-                let claims = handles.requests.snapshot_claims.lock().await;
-                pin_candidates
-                    .iter()
-                    .filter_map(|(req, _)| {
-                        claims
-                            .claim_of(req.id())
-                            .map(|(message_id, _)| (req.id().to_string(), message_id.to_string()))
-                    })
-                    .collect()
-            };
             // Snapshot the standalone cards first: never hold `sent_cards` and
             // `card_handles` at once (one lock order, no deadlock surface).
             let sent_ids: std::collections::HashMap<String, String> = self
@@ -1063,10 +1006,9 @@ impl RequestFlow {
                     .iter()
                     .filter(|(req, _)| !auto_resolved.contains(req.id()) && !cola_claimed.contains(req.id()))
                     .filter_map(|(req, dir)| {
-                        let message_id = claimed_hosts
-                            .get(req.id())
-                            .cloned()
-                            .or_else(|| handles.message_of(req.id()).map(str::to_string))
+                        let message_id = handles
+                            .message_of(req.id())
+                            .map(str::to_string)
                             .or_else(|| sent_ids.get(req.id()).cloned())?;
                         Some(crate::bridge::message_pins::WaitingCard {
                             request_id: req.id().to_string(),
@@ -1079,7 +1021,12 @@ impl RequestFlow {
             handles
                 .waits
                 .message_pins
-                .sync(&handles.platform, self.kind.claim_kind(), &waiting, &failed_dirs)
+                .sync(
+                    &handles.platform,
+                    self.kind.interaction_kind(),
+                    &waiting,
+                    &failed_dirs,
+                )
                 .await;
         }
         // #130: remember which directories listed successfully — with that
@@ -1134,8 +1081,8 @@ impl RequestFlow {
     }
 
     /// Everything one sweep does with ONE listed request, wrapped by the
-    /// caller in that request's session span (ADR-0048): the snapshot-claim
-    /// skip, the re-host for a request already surfaced, the kind's `refuse`
+    /// caller in that request's session span (ADR-0048): the re-host for a
+    /// request already surfaced, the kind's `refuse`
     /// (a request the card cannot show in full — before any surface, the
     /// restart readoption included), the kind's `prepare` (auto-accept /
     /// remember), and the card delivery — inline on the session's live card,
@@ -1145,9 +1092,26 @@ impl RequestFlow {
     ///
     /// `seen` records the requests this process has surfaced: a re-host needs
     /// the record (`seen.contains`), a first surfacing inserts it — so the
-    /// poller never surfaces one request twice. A refusal inserts it only once
-    /// the server accepted the refusal; a failed one leaves it unmarked so the
-    /// next sweep retries.
+    /// poller never surfaces one request twice. The insertion happens only
+    /// where the request ACTUALLY reached a surface: a refusal only once the
+    /// server accepted it, an inline block only once it landed, a standalone
+    /// card only once the send returned an id. A failed send — including "no
+    /// reply target or chat yet", which is exactly an unmapped session the user
+    /// has not adopted (ADR-0100: nothing claims its pending any more) — leaves
+    /// it unmarked so the next sweep retries; marking it early would bury the
+    /// request forever because every later sweep would treat it as surfaced and
+    /// `rehost_block` has no card to re-host it on.
+    ///
+    /// The inline/standalone decision holds ONE Session's card write lock at a
+    /// time (ADR-0038's 2026-11-07 amendment, ADR-0100). The host is resolved
+    /// before any lock; the inline path then takes the HOST's lock and
+    /// re-checks its liveness before inserting/flushing. If it is no longer
+    /// live, that lock is released and the standalone path takes the REQUEST
+    /// Session's own lock for the decision, send and `sent_cards` record. The
+    /// two are never nested. `/card`'s post-and-arm takes the same host lock,
+    /// so the two cannot both deliver one request: whichever runs second sees
+    /// the first's effect (a live card carrying the block, or a recorded
+    /// standalone).
     async fn surface(
         &self,
         handles: &FlowHandles,
@@ -1155,16 +1119,6 @@ impl RequestFlow {
         dir: &str,
         seen: &mut std::collections::HashSet<String>,
     ) -> bool {
-        // ADR-0028: a claimed request is hosted by a snapshot card — already
-        // surfaced, never a standalone card, never re-inlined.
-        if handles.requests.snapshot_claims.lock().await.contains(req.id()) {
-            tracing::debug!(
-                "{} {}: already hosted by a snapshot claim",
-                self.kind.label(),
-                req.id()
-            );
-            return false;
-        }
         if seen.contains(req.id()) {
             tracing::debug!(
                 "{} {}: already surfaced; re-hosting on the current card",
@@ -1253,7 +1207,6 @@ impl RequestFlow {
                 return false;
             }
         }
-        seen.insert(req.id().to_string());
         tracing::info!(
             "{} ({}): {} on session {}",
             self.kind.label(),
@@ -1271,40 +1224,33 @@ impl RequestFlow {
         if self.recovered.lock().await.remove(req.id()).is_some()
             && self.readopt_surface(handles, req, dir).await
         {
+            seen.insert(req.id().to_string());
             return false;
         }
         // Kind-specific pre-card handling (auto-accept / remember). true →
         // handled, no card needed.
         if self.kind.prepare(self, handles, req, dir).await {
+            seen.insert(req.id().to_string());
             return true;
         }
         // One-card-per-turn: surface the request INLINE on the streaming card
         // of the session that owns it — the session itself, or (sub-task
         // children) its nearest ancestor with a live card. Only a separate card
         // when there is no active card (e.g. external turns or restarts).
-        if let Some(host) =
-            inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await
-        {
-            let pushed = self.kind.add_inline(self, &handles.cards, &host, req, dir).await;
-            if pushed {
-                tracing::info!(
-                    "{} {} inlined on session {} card",
-                    self.kind.label(),
-                    req.id(),
-                    host
-                );
-                // Flush so the inline section appears NOW — the render loop
-                // only flushes on new parts, and a blocked prompt produces
-                // none.
-                Turn::flush_card(&handles.cards, &host).await;
-            }
-            return false;
-        }
-        let card = self.kind.build_card(req, dir);
-        // Reply to the message that triggered the prompt for this session; fall
-        // back to sending into the chat when the accumulator is gone (e.g.
-        // after a cola restart). Sub-task sessions resolve up the parent chain.
-        let sent_id = match resolve_card_target(
+        //
+        // LOCK ORDER (ADR-0038's amendment): never hold two Sessions' card
+        // locks. The host is resolved first (bounded); the inline decision then
+        // takes the HOST's write lock — the same lock `/card`'s post-and-arm and
+        // a busy follow take — re-checks the host's liveness and inserts/flushes
+        // under it. If the host is gone, that lock is released before the
+        // standalone path takes the REQUEST Session's own lock for its decision,
+        // send and `sent_cards` record. A sub-task child's lock is never taken
+        // while the ancestor host's is, so the old nested acquisition (and its
+        // host-check-under-the-child's-lock race) cannot recur.
+        // Resolve the standalone target BEFORE any lock: this walk reads the
+        // parent chain and the server's session metadata, which has no card
+        // state to serialize with.
+        let target = resolve_card_target(
             &handles.sessions,
             &handles.cards,
             &handles.backend,
@@ -1312,8 +1258,127 @@ impl RequestFlow {
             req.session_id(),
             dir,
         )
+        .await;
+        // Resolve the inline host BEFORE the lock too, and BOUND it by the
+        // flow's read timeout: the parent-chain walk calls `session_info`,
+        // which has no timeout of its own, so a half-open connection would
+        // otherwise hold a card write lock indefinitely — blocking flushes,
+        // `/card`, install and the rest of that sweep. On timeout the request
+        // falls through to the standalone path (retried next tick if no card
+        // lands). The liveness check is re-run under the HOST's lock below, so
+        // a `/card` read or a follow that committed in this window wins
+        // instead of letting the insert land on a card that stopped being live.
+        let resolved_host = crate::bridge::bounded_call(
+            &format!("{} inline host ({})", self.kind.label(), req.session_id()),
+            self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            async {
+                Ok::<_, crate::error::BridgeError>(
+                    inline_host_session(&handles.cards, &handles.backend, req.session_id(), Some(dir)).await,
+                )
+            },
+        )
         .await
-        {
+        .and_then(Result::ok)
+        .flatten();
+        // Inline path: take the HOST's write lock — never the request
+        // Session's while also holding the host's, and never the reverse. A
+        // sub-task child has no card of its own, so its lock would serialize
+        // nothing with `/card` or the follow (which take the host's); the
+        // host's lock is what makes the liveness check and the insert one
+        // critical section (ADR-0038's amendment, ADR-0100).
+        if let Some(host) = resolved_host {
+            let host_lock = handles.cards.write_lock(&host).await;
+            let host_guard = host_lock.lock().await;
+            // Re-check under the host's lock: the parent may have ended and
+            // `/card` installed an Idle card during the bounded host walk. An
+            // insert must never land on a card that stopped being live.
+            if Turn::is_running(&handles.cards, &host).await {
+                let pushed = self
+                    .kind
+                    .add_inline_locked(self, &handles.cards, &host, req, dir)
+                    .await;
+                if pushed {
+                    // The block landed: this request is surfaced from now on.
+                    seen.insert(req.id().to_string());
+                    tracing::info!(
+                        "{} {} inlined on session {} card",
+                        self.kind.label(),
+                        req.id(),
+                        host
+                    );
+                    // Flush so the inline section appears NOW — the render loop
+                    // only flushes on new parts, and a blocked prompt produces
+                    // none.
+                    Turn::flush_card_locked(&handles.cards, &host).await;
+                    return false;
+                }
+                // `add_inline_locked` false is ambiguous: the card session
+                // vanished, OR it already carries the block. A busy follow
+                // seeds its read's pendings without the sweep's `seen`, so the
+                // latter is the normal case for a request `/card` just put on
+                // the card — falling through here would post a duplicate
+                // standalone card. Only a card that still carries the request
+                // is "already surfaced"; a vanished one still needs its own.
+                if Turn::has_interaction_in(&handles.cards, &host, req.id()).await {
+                    seen.insert(req.id().to_string());
+                    tracing::info!(
+                        "{} {} already carried by session {} card",
+                        self.kind.label(),
+                        req.id(),
+                        host
+                    );
+                    return false;
+                }
+            }
+            // The host stopped being live (or its card vanished mid-pass):
+            // release it and let the request surface on its own card. Nothing
+            // has been inserted or repainted.
+            drop(host_guard);
+        }
+        // Standalone path: the request Session's OWN write lock covers its
+        // decision, send and surface record. The host's lock is already
+        // released here — the two are never nested.
+        let owning_lock = handles.cards.write_lock(req.session_id()).await;
+        let guard = owning_lock.lock().await;
+        // A card may have appeared on the request Session itself during the
+        // walk (a follow that committed after host resolution). Re-check under
+        // its own lock so the standalone send cannot duplicate a block that
+        // just landed there.
+        if Turn::is_running(&handles.cards, req.session_id()).await {
+            let pushed = self
+                .kind
+                .add_inline_locked(self, &handles.cards, req.session_id(), req, dir)
+                .await;
+            if pushed {
+                seen.insert(req.id().to_string());
+                tracing::info!(
+                    "{} {} inlined on session {} card",
+                    self.kind.label(),
+                    req.id(),
+                    req.session_id()
+                );
+                Turn::flush_card_locked(&handles.cards, req.session_id()).await;
+                return false;
+            }
+            if Turn::has_interaction_in(&handles.cards, req.session_id(), req.id()).await {
+                seen.insert(req.id().to_string());
+                tracing::info!(
+                    "{} {} already carried by session {} card",
+                    self.kind.label(),
+                    req.id(),
+                    req.session_id()
+                );
+                return false;
+            }
+        }
+        let card = self.kind.build_card(req, dir);
+        // Reply to the message that triggered the prompt for this session; fall
+        // back to sending into the chat when the accumulator is gone (e.g.
+        // after a cola restart). Sub-task sessions resolve up the parent chain;
+        // the target was resolved before the lock. The send and the surface
+        // record stay under the owning Session's lock so no follow can commit
+        // between them.
+        let sent_id = match target {
             Some(CardTarget::ReplyTo(msg_id)) => handles.platform.reply_card(&msg_id, &card).await.ok(),
             Some(CardTarget::Chat(chat_id)) => {
                 handles.platform.send_card("chat_id", &chat_id, &card).await.ok()
@@ -1328,6 +1393,10 @@ impl RequestFlow {
             }
         };
         if let Some(mid) = sent_id {
+            // The card landed: this request is surfaced from now on. A failed
+            // or impossible send (no mapping/reply target yet) stays unmarked
+            // so the next sweep retries it (ADR-0100).
+            seen.insert(req.id().to_string());
             let summary = self.kind.summary(req);
             self.sent_cards.lock().await.insert(
                 req.id().to_string(),
@@ -1344,7 +1413,7 @@ impl RequestFlow {
                 req.id(),
                 StandaloneSurface {
                     client_id: String::new(),
-                    kind: self.kind.claim_kind(),
+                    kind: self.kind.interaction_kind(),
                     message_id: mid,
                     summary,
                     directory: dir.to_string(),
@@ -1358,6 +1427,7 @@ impl RequestFlow {
                 req.session_id()
             );
         }
+        drop(guard);
         false
     }
 
@@ -1370,8 +1440,7 @@ impl RequestFlow {
     async fn rehost_block(&self, handles: &FlowHandles, req: &PendingRequest, dir: &str) {
         let id = req.id();
         // Only a block the flush recorded (an inline card) follows the card:
-        // a standalone card and a snapshot claim keep their lifecycles
-        // (ADR-0038, rule 6).
+        // a standalone card keeps its own lifecycle (ADR-0038, rule 6).
         let Some(old_message) = handles
             .cards
             .card_handles
@@ -1387,7 +1456,9 @@ impl RequestFlow {
         else {
             return;
         };
-        if !Turn::has_card(&handles.cards, &host).await {
+        // Re-validate under this second await: the host must still be running,
+        // not merely present in the map (ADR-0100).
+        if !Turn::is_running(&handles.cards, &host).await {
             return;
         }
         // The accumulator still carries the block (its own flush owns the
@@ -1812,23 +1883,16 @@ impl RequestFlow {
         // atomically in the ack (ADR-0038, rule 3) — the callback context
         // carries it (ws.rs injects `open_message_id`).
         let clicked = value.get("open_message_id").and_then(|v| v.as_str());
-        // ADR-0028: a claimed request's block lives on a static snapshot card,
-        // NOT a streaming card — its click is not "inline", and the ack must
-        // patch the snapshot (block updated or dropped), never a standalone
-        // card.
-        let claimed_message = {
-            let registry = handles.requests.snapshot_claims.lock().await;
-            registry.claim_of(req_id).map(|(m, _)| m.to_string())
-        };
         // Inline interaction: the session (or its sub-task parent chain) has a
-        // live streaming card, so the result is NOT returned as a replacement
+        // LIVE streaming card, so the result is NOT returned as a replacement
         // card — the streaming card re-renders itself on the next poll. The
-        // clicked card rendering the block through its handle counts too: a
-        // re-adopted card after a restart has no accumulator, but its cached
-        // JSON still carries the block and the ack can edit it in place.
-        let host = if claimed_message.is_some() {
-            None
-        } else if Turn::has_card(&handles.cards, session_id).await {
+        // card map's key is not liveness (a finished card stays there, and an
+        // idle Session Card is terminal), so the decision asks
+        // `Turn::is_running` (ADR-0100). The clicked card rendering the block
+        // through its handle counts too: a re-adopted card after a restart has
+        // no accumulator, but its cached JSON still carries the block and the
+        // ack can edit it in place.
+        let host = if Turn::is_running(&handles.cards, session_id).await {
             Some(session_id.to_string())
         } else {
             inline_host_session(&handles.cards, &handles.backend, session_id, directory).await
@@ -1844,98 +1908,11 @@ impl RequestFlow {
                 None => false,
             };
 
-        let mut r = self
-            .kind
+        self.kind
             .handle_action(
                 self, handles, session_id, req_id, reply, value, directory, inline, &host, clicked,
             )
-            .await;
-
-        // A late second click on a block already resolved from this snapshot
-        // (the double-click race: the first click's re-render is still in
-        // flight): keep patching the snapshot — never replace the whole card
-        // with a standalone result card.
-        if claimed_message.is_none()
-            && handles
-                .requests
-                .snapshot_claims
-                .lock()
-                .await
-                .is_tombstoned(req_id)
-            && let Some(result) = &mut r
-        {
-            result.card = None;
-        }
-        if let Some(result) = &mut r
-            && let Some(message_id) = claimed_message
-        {
-            // Did THIS click resolve the request? The double-click guard
-            // cannot tell a successful reply from a failed one, so check the
-            // server: the block drops only once the request is no longer
-            // pending. A failed reply (already resolved elsewhere) also leaves
-            // it pending → the block stays and the poll sweep cleans it.
-            let still_pending = match directory {
-                Some(dir) => self
-                    .kind
-                    .list(&handles.backend.clone().for_directory(dir))
-                    .await
-                    .map(|reqs| reqs.iter().any(|r| r.id() == req_id))
-                    .unwrap_or(true),
-                None => true,
-            };
-            if still_pending {
-                // The click recorded state (question) or was a no-op
-                // (double-click): keep the block and show the live answer
-                // state, so the snapshot mirrors the standalone card's
-                // 已选/✅ markers — unless nothing changed, in which case the
-                // rebuild would only wipe an open box's typed text.
-                let pending = handles
-                    .requests
-                    .snapshot_claims
-                    .lock()
-                    .await
-                    .host_pending(&message_id)
-                    .unwrap_or_default();
-                let state = handles.requests.question.live_snapshot_state(&pending).await;
-                // A repaint mirrors a change THIS click made, as the handler
-                // reported it. A click that changed nothing (a stale or dropped
-                // switch, a double-click) must not rebuild: Feishu recreates
-                // every input, so the rebuild would erase text the Host has
-                // typed into the open box. Comparing state instead cannot tell
-                // the two apart — a no-op click still sees what another click
-                // just changed.
-                if result.mutated {
-                    result.card = handles
-                        .requests
-                        .snapshot_claims
-                        .lock()
-                        .await
-                        .rebuild(&message_id, &state);
-                } else {
-                    // Nothing changed, so the snapshot must stay exactly as it
-                    // is. The handler's card, if any, is a STANDALONE result
-                    // (a replay or a stale notice) — letting it replace this
-                    // message would overwrite the whole snapshot.
-                    result.card = None;
-                    // A card-less ack is empty unless it says something: the
-                    // click would look dead (the `codex-request-ids` pitfall).
-                    result.toast.get_or_insert_with(|| "处理中…".to_string());
-                }
-            } else {
-                // Resolved: drop the block from the snapshot and patch it in
-                // place — no new message. `resolve` does the whole transition
-                // (unclaim → tombstone → rebuild → prune) under one lock.
-                let state = crate::feishu::snapshot_card::SnapshotQuestionState::new();
-                result.card =
-                    handles
-                        .requests
-                        .snapshot_claims
-                        .lock()
-                        .await
-                        .resolve(req_id, &message_id, &state);
-            }
-        }
-        r
+            .await
     }
 }
 

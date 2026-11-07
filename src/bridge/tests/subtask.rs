@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::bridge::test_support::*;
 
 #[tokio::test]
@@ -24,16 +26,10 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     let reply_sessions = backend.reply_permission_sessions.clone();
     let (app, _platform) = build_app(cfg, backend).await;
 
-    // Seed the parent session so it maps child → parent → chat.
-    app.handle_message(incoming(
-        "msg_1".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
+    // Seed the parent session so it maps child → parent → chat, with a LIVE
+    // card so the child's permission has an inline host (ADR-0100). The
+    // scripted prompt would finish before the poller runs.
+    seed_live_card(&app, &parent_id, "om_live").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -116,6 +112,117 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
         reply_sessions.lock().await.as_slice(),
         &[child.to_string()],
         "the permission reply must be routed via the child session id"
+    );
+}
+
+/// A sub-task child's permission is hosted on its nearest ancestor's live
+/// card. If the parent Turn ends between resolving that host and the insert —
+/// the window `/card`'s Idle read can land in — the sweep must not insert on
+/// the now-dead card: it releases the host's lock and surfaces the request on
+/// its own card, so the request is never a dead end on a static read.
+#[tokio::test]
+async fn subtask_permission_whose_host_goes_idle_before_insert_surfaces_standalone() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let child = "ses_child_task";
+    let parent = backend.session_id.clone();
+    backend.with_session_parent(child, &parent);
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_child".into(),
+        session_id: Some(child.into()),
+        permission: Some("bash".into()),
+        patterns: vec!["git status".into()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let info_calls = backend.session_info_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, &parent, "om_live").await;
+
+    // Hold the host's write lock: the sweep resolves the host and then waits
+    // here, exactly the window between host resolution and the inline insert.
+    let cards = app.cards_handle();
+    let host_lock = cards.write_lock(&parent).await;
+    let host_guard = host_lock.lock().await;
+    let sweep = {
+        let flow = Arc::clone(&app.permission);
+        let handles = app.flow_handles();
+        tokio::spawn(async move {
+            let mut seen = std::collections::HashSet::new();
+            flow.sweep(&handles, &mut seen).await;
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            // `prepare`'s auto-accept walk, `resolve_card_target` and then
+            // `inline_host_session` each read the child's parent; the THIRD
+            // `session_info(child)` means the host walk is evaluating the
+            // parent's liveness now.
+            let walked = info_calls
+                .lock()
+                .await
+                .iter()
+                .filter(|id| id.as_str() == child)
+                .count();
+            if walked >= 3 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sweep must walk the parent chain to resolve the host");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        !sweep.is_finished(),
+        "the sweep must be waiting on the resolved host's lock"
+    );
+
+    // The parent Turn ends and `/card` installs its Idle read while the sweep
+    // holds the resolved host. The next sweep decision must see the dead card.
+    Turn::set_card_state(&cards, &parent, crate::feishu::card::CardState::Done).await;
+    assert!(
+        Turn::record_idle_card(&cards, &parent, "om_idle", "msg_1").await,
+        "the finished card is replaced by the Idle read"
+    );
+    drop(host_guard);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), sweep)
+        .await
+        .expect("the sweep must finish once the host lock is released")
+        .expect("the sweep task must not panic");
+
+    // No block was inserted on the dead/idle card, and the request is not lost:
+    // it was surfaced as its own card.
+    assert_eq!(
+        Turn::card_message_id(&cards, &parent).await.as_deref(),
+        Some("om_idle"),
+        "the Idle read stays the parent's card"
+    );
+    assert!(
+        !Turn::has_interaction_in(&cards, &parent, "per_child").await,
+        "an Idle read must never carry the block"
+    );
+    assert!(
+        Turn::live_permissions(&cards, &parent).await.is_empty(),
+        "the parent card carries no live permission"
+    );
+    assert!(
+        app.permission.sent_cards.lock().await.contains_key("per_child"),
+        "the request must be surfaced standalone, not dropped: {:?}",
+        platform.calls.lock().await
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyCard { reply_to, card }
+                if reply_to == "msg_1" && card_text(card).contains("git status")
+        )),
+        "the standalone card is replied to the parent's chat: {calls:?}"
     );
 }
 

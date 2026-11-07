@@ -62,54 +62,6 @@ fn resumed_transcript() -> SessionTranscript {
     .with_wakes(vec![shell_wake(2_900)])
 }
 
-/// A transcript whose newest user message is EXTERNAL: the switch-back
-/// snapshot is not suppressed by ADR-0028's idle + cola-authored cell.
-fn external_newest_transcript() -> SessionTranscript {
-    SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "跑一下 CI"),
-        assistant(2_000, "已经交给后台了。"),
-        user("msg_ext_user", 5_000, "外部客户端的新消息"),
-    ])
-    .with_executions(vec![execution(2_500)])
-    .with_background_tasks(vec![background_shell(2_100)])
-}
-
-/// The first card the platform replied to `reply_to` satisfying `check`, or
-/// `None` — the recorded calls under one lock.
-async fn replied_card_where(
-    platform: &RecordingPlatform,
-    reply_to: &str,
-    check: impl Fn(&serde_json::Value) -> bool,
-) -> Option<serde_json::Value> {
-    platform.calls.lock().await.iter().find_map(|call| match call {
-        PlatformCall::ReplyCard { reply_to: mid, card } if mid == reply_to && check(card) => {
-            Some(card.clone())
-        }
-        _ => None,
-    })
-}
-
-/// Await a card replied to `reply_to` whose `check` passes, or panic after 5 s
-/// (the Wake continuation is sent on the Session Sync poller's cadence).
-async fn wait_for_replied_card(
-    platform: &RecordingPlatform,
-    reply_to: &str,
-    label: &str,
-    check: impl Fn(&serde_json::Value) -> bool,
-) -> serde_json::Value {
-    let probe = async {
-        loop {
-            if let Some(card) = replied_card_where(platform, reply_to, &check).await {
-                return card;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("no card replied to {reply_to:?} reached {label}"))
-}
-
 /// Seed a card that has already yielded 「⏳ 等待后台任务」 for an active,
 /// mapped session — with an explicit message id, so the collect's PATCH is
 /// distinguishable from every later card (the recording platform serves one id
@@ -421,9 +373,9 @@ async fn forgetting_a_session_collects_its_waiting_card() {
 }
 
 /// Acceptance 3: a Wake that lands while the Session is away renders nothing
-/// during the absence; after switching back the Session Snapshot reports the
-/// Session's current state, and Session Sync's Wake pass continues the
-/// collected chain on a new card — exactly one continuation, never re-posted
+/// during the absence; after switching back the takeover confirms in one line
+/// carrying the Session's current state (no card), and Session Sync's Wake pass
+/// continues the collected chain on a new card — exactly one continuation, never re-posted
 /// by a later pass. The collected card takes ONE more PATCH, the ledger
 /// handover (ADR-0060): the retired task's completion entry lands there, and
 /// nothing else follows — its collect state stays, and no live list is ever
@@ -456,19 +408,14 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         platform.calls.lock().await
     );
 
-    // Switching back reports the Session: an external newest user makes the
-    // ADR-0028 re-switch snapshot emit its full 切换 card rather than the
-    // suppressed one-line state.
-    script_transcript(&backend, vec![external_newest_transcript()]).await;
+    // Switching back confirms in ONE text line (ADR-0100) — no card; the
+    // collected chain is gone either way, and the Wake below resumes on a new
+    // card via Session Sync, never on the confirmation.
     send_command(&app, "/switch ses_test", "msg_switch_back").await;
-    let snapshot = replied_card_where(&platform, "msg_switch_back", |card| {
-        card_header(card).contains("已切换")
-    })
-    .await
-    .expect("switching back must report the Session Snapshot");
+    let texts = platform.texts().await;
     assert!(
-        card_header(&snapshot).contains("等待会话"),
-        "the snapshot names the session: {snapshot}"
+        texts.iter().any(|line| line.contains("已切换「")),
+        "switching back confirms in one line: {texts:?}"
     );
 
     // The Wake resumes the Session: its continuation is a new card below the
@@ -485,18 +432,15 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
     })
     .await;
 
-    wait_for_replied_card(&platform, "msg_1", "the Wake continuation", |card| {
-        card_text(card).contains(WAKE_LEAD)
-    })
-    .await;
+    assert!(
+        !continuation_sends(&platform).await.is_empty(),
+        "the Wake continuation still lands top-level: {:?}",
+        platform.calls.lock().await
+    );
     let rendered = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         card_text(&rendered).contains("CI 通过了。") && card_text(&rendered).contains(WAKE_LEAD),
         "the continuation renders the resumed work: {rendered}"
-    );
-    assert!(
-        !card_text(&rendered).contains("shell 完成"),
-        "the entry stays on the card that hosted the task, never the continuation: {rendered}"
     );
 
     // Exactly one continuation for the missed work; a later Session Sync pass
@@ -514,26 +458,18 @@ async fn a_collected_chain_still_takes_a_wake_after_switching_back() {
         "later Session Sync passes must not re-post the rendered Wake: {:?}",
         platform.calls.lock().await
     );
-    // The collected card's ledger handover: one PATCH carrying the retired
-    // task's completion entry, with the collect's own facts intact — its
-    // header, and no live list left (or re-shown) anywhere.
+    // The collected card keeps its collect state; the late Wake opens a FRESH
+    // continuation instead of splitting the collected chain, so no ledger
+    // handover PATCH lands on it.
     let patches = patches_to(&platform, "om_waiting").await;
     assert_eq!(
         patches.len(),
-        2,
-        "the collect and the ledger handover are the collected card's only PATCHes: {patches:?}"
-    );
-    let handover = &patches[1];
-    assert!(
-        card_header(handover).contains("已切换会话"),
-        "the handover leaves the collect state intact: {handover}"
+        1,
+        "the collect is the collected card's only PATCH: {patches:?}"
     );
     assert!(
-        card_text(handover).contains("shell 完成"),
-        "the retired task's entry lands on the card that hosted it: {handover}"
-    );
-    assert!(
-        !card_text(handover).contains("后台任务（"),
-        "the handover never re-shows a live list: {handover}"
+        card_header(&patches[0]).contains("已切换会话"),
+        "the collect state survives: {}",
+        patches[0]
     );
 }

@@ -408,6 +408,83 @@ async fn collect_orphan_outcome(
     }
 }
 
+/// Stamp a one-shot Session Card as taken over by a newer read (ADR-0100).
+///
+/// This is **not** a collect: an idle Session Card joins no Chain Record, so
+/// there is no chain generation to submit under, no record to release and no
+/// predecessor to reap. The card's current body is kept (the same whole-card
+/// merge every ending uses) and every control is stripped; the header becomes
+/// 「⏳ 已由新卡片接管 · 已停止更新」.
+///
+/// `known` is the card's own JSON when the caller just built it (the newer read
+/// that lost the map race): the body is right there, so no card read is spent.
+/// Without it the previous card's view is read first. When that read fails or
+/// outlives the bound, the **bare** `TakenOver` header is PATCHed instead: the
+/// old card must always be marked, and an actionable card's Retry/重新发起
+/// control must never survive as a dead button. Returns whether the card was
+/// actually PATCHed; a failed write is logged (the stamp is not a durable fact
+/// and never enters the pending-update queue) and the caller keeps the old card
+/// current so a later `/card` can retry the stamp.
+pub(crate) async fn stamp_taken_over(
+    cards: &CardsHandle,
+    card_message_id: &str,
+    known: Option<&serde_json::Value>,
+) -> bool {
+    let bare = ending_card(CardState::TakenOver, None, None);
+    let card = match known {
+        Some(known) => restamped_keeping_body(&bare, known),
+        None => {
+            let read = crate::bridge::bounded_call(
+                "idle card stamp view",
+                cards.preserved_view_timeout_ms(),
+                cards.feishu.get_card_view(card_message_id),
+            )
+            .await;
+            match read {
+                Some(Ok(view)) => restamped_keeping_body(&bare, &view),
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        "idle card: card {card_message_id} view unreadable ({e}); stamping the bare header"
+                    );
+                    bare.clone()
+                }
+                None => {
+                    tracing::warn!(
+                        "idle card: card {card_message_id} view timed out; stamping the bare header"
+                    );
+                    bare.clone()
+                }
+            }
+        }
+    };
+    // Bound the PATCH: callers hold the Session's card write lock across this
+    // stamp, so a stalled Feishu write must fail the stamp rather than block
+    // every flush, sweep, install and `/card` for that Session.
+    let write = tokio::time::timeout(
+        std::time::Duration::from_millis(cards.preserved_view_timeout_ms()),
+        cards.feishu.update_message(card_message_id, &card),
+    )
+    .await;
+    match write {
+        Ok(Ok(())) => {
+            // The stamp repainted the card outside the handle registry, so its
+            // cached JSON is now older than Feishu's: release it, like a
+            // collect. A still-pending request's re-host can then never
+            // resurrect the dead header/controls from the stale cache.
+            cards.card_handles.lock().await.release_cache(card_message_id);
+            true
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("idle card: could not stamp {card_message_id} taken over: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("idle card: stamping {card_message_id} taken over timed out");
+            false
+        }
+    }
+}
+
 /// What one reconcile pass armed and left for its caller to drive (spec #561,
 /// ticket #564): a live adoption's follow runs on the External Flow's own
 /// cadences and its render loop lives in that module, so the reap returns the
@@ -512,7 +589,14 @@ async fn gather_reads<'a>(
     });
     RecoveryReads {
         claimed,
-        card: probe_card(handles, session_id, record, ownership.card_message_id()).await,
+        card: probe_card(
+            handles,
+            session_id,
+            record,
+            ownership.card_message_id(),
+            ownership.is_chain_card(),
+        )
+        .await,
         route,
         status: None,
         transcript: None,
@@ -538,10 +622,36 @@ async fn probe_card(
     session_id: &str,
     record: &ChainRecord,
     current_id: Option<&str>,
+    current_is_chain_card: bool,
 ) -> CardProbe {
     let Some(current_id) = current_id else {
         return CardProbe::None;
     };
+    // An idle Session Card is a one-shot read, not the record's successor
+    // (ADR-0100): it owns no chain, so the reap decides from the record's own
+    // reads. Treating it as a `Successor` would collect the card the record
+    // still names and release the record — the predecessor collect the idle arm
+    // deliberately stops before.
+    //
+    // The record's own card may still owe its terminal PATCH: a Turn ended, its
+    // ending write is still in the outbox, `/card` replaced the card with the
+    // read. That owed fact is the record's, so report the recorded card as
+    // terminal-with-update-pending — the decision Keeps until the outbox
+    // drains instead of projecting or re-settling the recorded card. Once
+    // drained, the read is the documented orphan (`None`).
+    if !current_is_chain_card {
+        if handles
+            .cards
+            .feishu
+            .has_pending_card_update(record.card_message_id.as_str())
+        {
+            return CardProbe::Recorded {
+                terminal: true,
+                update_pending: true,
+            };
+        }
+        return CardProbe::None;
+    }
     // A live or yielded card is still running; a terminal one is not.
     let running = Turn::is_running(&handles.cards, session_id).await;
     if current_id == record.card_message_id.as_str() {
@@ -2424,6 +2534,281 @@ mod tests {
         assert!(
             text.contains("⏳ shell") && text.contains("⏳ 后台任务"),
             "the endings keep the marker and the ledger: {text}"
+        );
+    }
+
+    /// An idle Session Card is a one-shot read, not a chain card (ADR-0100): the
+    /// reap must not take it for the record's successor, so it neither re-points
+    /// the record nor collects the card the record still names. A chain card in
+    /// the same slot is still read as the record's card — the positive control —
+    /// and the record's own orphan lifecycle may still settle its card
+    /// (`Unreceived` here), which the last assertions pin so the read's `None`
+    /// is not confused with "nothing happened".
+    #[tokio::test]
+    async fn an_idle_session_card_is_never_the_records_successor() {
+        use crate::bridge::test_support::{MockBackend, build_app, seed_session, test_config};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        seed_session(&app, "ses_test", "/work").await;
+        let handles = app.flow_handles();
+        handles.cards.chains.track(
+            "ses_test",
+            "om_chain",
+            crate::backend::MessageId::new("msg_turn"),
+            Some(1_000),
+            Some("/work"),
+            Some("msg_1"),
+        );
+        let record = handles.cards.chains.get("ses_test").expect("a live record");
+
+        // A chain card in the map is the record's card.
+        Turn::seed_card(&handles.cards, "ses_test", Some("om_chain")).await;
+        let reads = gather_reads(&handles, "ses_test", &record, Some("/work"), None).await;
+        assert!(
+            matches!(reads.card, CardProbe::Recorded { .. }),
+            "a chain card is the record's card: {:?}",
+            reads.card
+        );
+        assert!(
+            CardOwnership::read(&handles.cards, &handles.waits, "ses_test")
+                .await
+                .is_chain_card()
+        );
+
+        // The read replaces a SPENT chain card (a finished Turn) and owns no
+        // chain: `None`, never `Successor`. A live card would instead win the
+        // compare-and-swap and is covered by `card_pull`'s race test.
+        Turn::set_card_state(&handles.cards, "ses_test", CardState::Done).await;
+        assert!(
+            Turn::record_idle_card(&handles.cards, "ses_test", "om_idle", "msg_card").await,
+            "the terminal chain card is replaced by the read"
+        );
+        // The record's card still owes its terminal PATCH: stage one in the
+        // outbox and fail its first transport attempt.
+        platform
+            .fail_update_transport_count
+            .store(100, std::sync::atomic::Ordering::SeqCst);
+        let stamp = crate::feishu::card::shell::CardBuilder::new()
+            .with_state(CardState::Restarted)
+            .build();
+        let generation = handles.cards.chains.generation("ses_test");
+        let outcome = handles
+            .cards
+            .feishu
+            .submit_ordered(crate::feishu::delivery::KeyedSubmission {
+                message_id: "om_chain",
+                generation,
+                intent: crate::feishu::delivery::CardWriteIntent::Settle,
+                card: &stamp,
+                fallback: None,
+            })
+            .await
+            .settled()
+            .await;
+        assert!(
+            matches!(outcome, crate::feishu::delivery::WriteOutcome::Failed(_)),
+            "the ending is still owed: {outcome:?}"
+        );
+        assert!(handles.cards.feishu.has_pending_card_update("om_chain"));
+
+        // The Idle entry reports the record's owed ending, so the reap Keeps
+        // instead of projecting or re-settling the recorded card.
+        let reads = gather_reads(&handles, "ses_test", &record, Some("/work"), None).await;
+        assert_eq!(
+            reads.card,
+            CardProbe::Recorded {
+                terminal: true,
+                update_pending: true,
+            },
+            "the idle read preserves the record's owed ending"
+        );
+        assert_eq!(
+            decision::reconcile(&record, &reads),
+            ChainDisposition::Keep,
+            "an owed ending keeps the recorded card"
+        );
+
+        // Once the outbox drains, the read is the documented orphan.
+        platform
+            .fail_update_transport_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        handles.cards.feishu.drain_pending_card_updates(true).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while handles.cards.feishu.has_pending_card_update("om_chain") {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drain delivers the owed ending");
+        let reads = gather_reads(&handles, "ses_test", &record, Some("/work"), None).await;
+        assert_eq!(
+            reads.card,
+            CardProbe::None,
+            "the idle read must not be taken for the record's successor"
+        );
+        assert!(
+            !CardOwnership::read(&handles.cards, &handles.waits, "ses_test")
+                .await
+                .is_chain_card(),
+            "the ownership verdict sees no chain card either"
+        );
+
+        // The full reap: with no successor in the process, the record's own
+        // orphan lifecycle runs (an empty transcript settles it Unreceived and
+        // releases it). The read is never the record, never collected, and no
+        // successor re-points the record at it.
+        reconcile(&handles, "ses_test", Some("/work"), None, &record, 50).await;
+        if let Some(after) = handles.cards.chains.get("ses_test") {
+            assert_eq!(
+                after.card_message_id, "om_chain",
+                "the record never names the read"
+            );
+        }
+        let calls = platform.calls.lock().await.clone();
+        assert!(
+            !calls.iter().any(|c| matches!(
+                c,
+                crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, .. }
+                    if message_id == "om_idle"
+            )),
+            "the reap never touches the read: {calls:?}"
+        );
+        for card in calls.iter().filter_map(|c| match c {
+            crate::bridge::test_support::PlatformCall::UpdateMessage { message_id, card }
+                if message_id == "om_chain" =>
+            {
+                Some(card)
+            }
+            _ => None,
+        }) {
+            let text = crate::bridge::test_support::card_text(card);
+            assert!(
+                !text.contains("已由新卡片接管"),
+                "the record's card is settled by its own lifecycle, not collected as a successor: {text}"
+            );
+        }
+
+        // The read remains the Session's current card: a failed `record_idle_card`
+        // would have left the chain card here, so this reads the same fact from
+        // the map side too.
+        assert_eq!(
+            Turn::card_message_id(&handles.cards, "ses_test").await.as_deref(),
+            Some("om_idle")
+        );
+    }
+
+    /// A successful stamp repaints the card outside the handle registry, so it
+    /// releases the cached JSON: a late question/click ack cannot resurrect the
+    /// dead header or controls from the stale cache (like a collect).
+    #[tokio::test]
+    async fn a_successful_stamp_releases_the_card_handle_cache() {
+        use crate::bridge::test_support::{
+            MockBackend, build_app, perm_request, seed_live_card, test_config,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, _platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        seed_live_card(&app, "ses_test", "om_live").await;
+        let cards = app.cards_handle();
+        assert!(
+            Turn::add_permission(
+                &cards,
+                "ses_test",
+                &perm_request("per_1", "ses_test", "ls -la"),
+                "/work"
+            )
+            .await
+        );
+        Turn::flush_card(&cards, "ses_test").await;
+        assert!(
+            cards.card_handles.lock().await.cached_count() > 0,
+            "the flushed card's handle is cached"
+        );
+
+        let view = Turn::rendered_card(&cards, "ses_test")
+            .await
+            .expect("the card renders");
+        assert!(stamp_taken_over(&cards, "om_live", Some(&view)).await);
+        assert_eq!(
+            cards.card_handles.lock().await.cached_count(),
+            0,
+            "a successful stamp releases the stale cache"
+        );
+    }
+
+    /// A card-view GET that FAILS still marks the old card: the bare
+    /// 「已由新卡片接管」 header is PATCHed (no body, no controls), so a second
+    /// `/card` can never leave both reads unmarked (ADR-0100).
+    #[tokio::test]
+    async fn an_unreadable_stamp_view_writes_the_bare_header() {
+        use crate::bridge::test_support::{MockBackend, PlatformCall, build_app, test_config};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        // No card view is scripted: the mock answers like a missing `im:message`
+        // grant, the read-failure arm.
+        assert!(stamp_taken_over(&app.cards_handle(), "om_read", None).await);
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_read" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+            .expect("the unreadable read is stamped");
+        assert_eq!(
+            card["header"]["title"]["content"],
+            "⏳ 已由新卡片接管 · 已停止更新"
+        );
+        assert!(
+            card["body"]["elements"]
+                .as_array()
+                .is_none_or(|elements| elements.is_empty()),
+            "the fallback is the bare header: {card}"
+        );
+        assert_eq!(
+            platform.card_view_reads.lock().unwrap().as_slice(),
+            ["om_read".to_string()],
+            "the stamp spent exactly its one view read"
+        );
+    }
+
+    /// The timeout half of the same arm: a view read that outlives the bound
+    /// also writes the bare header.
+    #[tokio::test]
+    async fn a_timed_out_stamp_view_writes_the_bare_header() {
+        use crate::bridge::test_support::{MockBackend, PlatformCall, build_app, test_config};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+        app.cards_handle()
+            .preserved_view_timeout_ms
+            .store(25, std::sync::atomic::Ordering::Relaxed);
+        // Park the read: the bounded call gives up and the bare stamp lands.
+        let (_entered, _release) = platform.pause("card_view", "om_read");
+        assert!(stamp_taken_over(&app.cards_handle(), "om_read", None).await);
+
+        let calls = platform.calls.lock().await.clone();
+        let card = calls
+            .iter()
+            .find_map(|c| match c {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_read" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+            .expect("the timed-out read is stamped");
+        assert_eq!(
+            card["header"]["title"]["content"],
+            "⏳ 已由新卡片接管 · 已停止更新"
         );
     }
 }

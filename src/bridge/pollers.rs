@@ -223,7 +223,12 @@ pub(crate) async fn resolve_card_target(
         let current = current.to_string();
         async move {
             // In-flight prompt for this session → reply to its streaming card.
-            if let Some(msg_id) = Turn::reply_target(cards, &current).await {
+            // A finished card stays in the map until the next Turn replaces it
+            // and still carries its old reply target, so the map's presence is
+            // NOT liveness: ask whether the card is running (ADR-0100).
+            if Turn::is_running(cards, &current).await
+                && let Some(msg_id) = Turn::reply_target(cards, &current).await
+            {
                 return Some(CardTarget::ReplyTo(msg_id));
             }
             // Session mapped to a chat. A topic-backed session must be reached by
@@ -252,11 +257,15 @@ pub(crate) async fn resolve_card_target(
 }
 
 /// Find the session whose streaming card an inline permission/question should
-/// be shown on: `session_id` itself when it has a live accumulator, else the
-/// nearest ancestor that does. Sub-task child sessions carry their own id and
-/// have no accumulator of their own, so the parent chain is walked (like
+/// be shown on: `session_id` itself when it has a LIVE card, else the nearest
+/// ancestor that does. Sub-task child sessions carry their own id and have no
+/// accumulator of their own, so the parent chain is walked (like
 /// `resolve_card_target`); the host's card then carries the child's buttons,
 /// and clicking them still replies to the actual (child) session via `directory`.
+///
+/// "Live" is [`Turn::is_running`], never a card-map entry (ADR-0100): a
+/// finished card stays in the map until the next Turn replaces it, and an idle
+/// Session Card is terminal by construction, so neither may host a block.
 pub(crate) async fn inline_host_session(
     cards: &CardsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
@@ -266,7 +275,7 @@ pub(crate) async fn inline_host_session(
     walk_parent_chain(backend, session_id, directory, |current| {
         let current = current.to_string();
         async move {
-            if Turn::has_card(cards, &current).await {
+            if Turn::is_running(cards, &current).await {
                 Some(current)
             } else {
                 None
@@ -281,7 +290,6 @@ pub(crate) async fn inline_host_session(
 /// Shared by the permission and question flows (and the retry action).
 pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardActionResult {
     CardActionResult {
-        mutated: false,
         card: Some(crate::feishu::card::shell::card_shell(
             title,
             template,
@@ -366,7 +374,7 @@ pub(crate) async fn mark_stale_cards(
 mod tests {
     use super::*;
     use crate::bridge::core::SharedCore;
-    use crate::bridge::test_support::{MockBackend, RecordingPlatform, test_config};
+    use crate::bridge::test_support::{MockBackend, RecordingPlatform, core_with, test_config};
     use std::sync::Arc;
 
     /// The poll loop's seam, driven by a client with no lifecycle of its own:
@@ -395,11 +403,7 @@ mod tests {
     async fn the_busy_probe_is_conservative_under_contention() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let layout = crate::state::StateLayout::from_config(&cfg);
-        let platform = Arc::new(RecordingPlatform::new());
-        let core = Arc::new(
-            SharedCore::new(&cfg, layout, Arc::new(MockBackend::new(Vec::new())), platform).unwrap(),
-        );
+        let core = core_with(&cfg, MockBackend::new(Vec::new()));
         let waits = core.waits_handle();
         let probe = busy_probe(&waits);
 
@@ -409,6 +413,111 @@ mod tests {
         drop(guard);
         waits.inflight.lock().await.insert("ses_busy".into());
         assert!(probe(), "a set with an in-flight turn is busy");
+    }
+
+    /// The inline host is the Session's LIVE card, not a card-map entry
+    /// (ADR-0100): a finished or idle card stays in the map until the next
+    /// Turn replaces it, so it must never host a request's block. `Waiting`
+    /// and `Restarted` still count as live — the chain's newest card and the
+    /// still-owed restart orphan — and a streaming Turn behaves as before.
+    #[tokio::test]
+    async fn the_inline_host_is_a_live_card_not_a_map_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let core = core_with(&cfg, MockBackend::new(Vec::new()));
+        let handles = core.flow_handles();
+        let cards = &handles.cards;
+        Turn::seed_card(cards, "ses_test", Some("om_card")).await;
+
+        for live in [
+            crate::feishu::card::CardState::Streaming,
+            crate::feishu::card::CardState::Waiting,
+            crate::feishu::card::CardState::Restarted,
+        ] {
+            Turn::set_card_state(cards, "ses_test", live.clone()).await;
+            assert_eq!(
+                inline_host_session(cards, &handles.backend, "ses_test", None)
+                    .await
+                    .as_deref(),
+                Some("ses_test"),
+                "{live:?} still owns the chain"
+            );
+        }
+        for ended in [
+            crate::feishu::card::CardState::Done,
+            crate::feishu::card::CardState::Idle,
+        ] {
+            Turn::set_card_state(cards, "ses_test", ended.clone()).await;
+            assert_eq!(
+                inline_host_session(cards, &handles.backend, "ses_test", None).await,
+                None,
+                "{ended:?} is in the map but is not a live card"
+            );
+        }
+    }
+
+    /// `resolve_card_target`'s in-flight arm asks whether the card is running,
+    /// never whether it has a reply target (ADR-0100): a terminal card's stale
+    /// target must fall through to the chat, while a running Turn replies to
+    /// its streaming card exactly as before.
+    #[tokio::test]
+    async fn a_finished_card_is_not_a_reply_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let core = core_with(&cfg, MockBackend::new(Vec::new()));
+        let handles = core.flow_handles();
+        handles
+            .sessions
+            .store
+            .lock()
+            .await
+            .set_active(crate::config::SessionEntry::new(
+                crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+                "ses_test",
+                "/work",
+            ));
+        let cards = &handles.cards;
+        Turn::seed_card(cards, "ses_test", Some("om_card")).await;
+        Turn::set_reply_target(cards, "ses_test", "msg_1").await;
+
+        Turn::set_card_state(cards, "ses_test", crate::feishu::card::CardState::Streaming).await;
+        assert!(
+            matches!(
+                resolve_card_target(
+                    &handles.sessions,
+                    cards,
+                    &handles.backend,
+                    &handles.platform,
+                    "ses_test",
+                    "/work",
+                )
+                .await,
+                Some(CardTarget::ReplyTo(ref id)) if id == "msg_1"
+            ),
+            "a running Turn replies to its streaming card"
+        );
+
+        for ended in [
+            crate::feishu::card::CardState::Done,
+            crate::feishu::card::CardState::Idle,
+        ] {
+            Turn::set_card_state(cards, "ses_test", ended.clone()).await;
+            assert!(
+                matches!(
+                    resolve_card_target(
+                        &handles.sessions,
+                        cards,
+                        &handles.backend,
+                        &handles.platform,
+                        "ses_test",
+                        "/work",
+                    )
+                    .await,
+                    Some(CardTarget::Chat(ref chat)) if chat == "chat_1"
+                ),
+                "{ended:?} must not keep a stale reply target"
+            );
+        }
     }
 
     /// The production poll loop — its own `reconnect_loop` seam, a fast
