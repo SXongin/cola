@@ -341,15 +341,21 @@ impl RequestKind for PermissionKind {
         // denials (#892). The check runs only past the budget, so the ordinary
         // path pays no extra session lookup.
         let sid = p.session_id.clone().unwrap_or_default();
-        if should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await {
-            return Refusal::NotApplicable;
+        match should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await {
+            Some(true) => return Refusal::NotApplicable,
+            // Unknown: the flag read failed, so neither decline (irreversible
+            // for a request the session may have delegated) nor surface (the
+            // card may be clipped). Failed keeps it pending and unmarked, and
+            // the next sweep retries.
+            None => return Refusal::Failed,
+            Some(false) => {}
         }
         decline_unshowable(handles, p, dir).await
     }
 
     async fn prepare(
         &self,
-        _flow: &RequestFlow,
+        flow: &RequestFlow,
         handles: &FlowHandles,
         req: &PendingRequest,
         dir: &str,
@@ -367,9 +373,12 @@ impl RequestKind for PermissionKind {
         // aside for these sessions. A target past the card budget is approved
         // unseen, and the log line names its length — that record is what keeps
         // the decision auditable without a card (#892).
-        let auto = should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await;
-        if !auto {
-            return Prepared::NotHandled;
+        match should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await {
+            Some(true) => {}
+            Some(false) => return Prepared::NotHandled,
+            // Unknown: retry rather than surface a card the toggle may have
+            // replaced (see `should_auto_accept`).
+            None => return Prepared::Retry,
         }
         match handles
             .backend
@@ -386,12 +395,15 @@ impl RequestKind for PermissionKind {
                     p.permission.as_deref().unwrap_or("?")
                 );
                 log_unshowable_auto_accept(p);
+                flow.note_autoaccept_success(&p.request_id).await;
                 Prepared::Handled
             }
             // The request is still pending: hand it back to the sweep instead
             // of retiring it in `seen` with no card (see `Prepared::Retry`).
+            // The latch WARNs the first failure and DEBUGs identical repeats
+            // (ADR-0048) — a broken reply path must not flood the log.
             Err(e) => {
-                tracing::warn!("auto-accept {} on session {}: {}", p.request_id, sid, e);
+                flow.note_autoaccept_failure(&p.request_id, &e).await;
                 Prepared::Retry
             }
         }
@@ -725,25 +737,39 @@ impl RequestKind for PermissionKind {
 /// direct lookup misses it and it would surface a card even though its parent
 /// session has autoaccept on. Walking the parent chain makes the child inherit
 /// the parent's flag, consistent with `approve_pending_for_session`.
+/// `Some(true)` — the session (or an ancestor) has Auto-Accept on; `Some(false)`
+/// — it has it off; `None` — the parent chain could not be read, so the answer
+/// is unknown. Callers must retry an unknown instead of reading it as off:
+/// declining on a guess is the irreversible outcome #892 is about.
 async fn should_auto_accept(
     sessions: &SessionsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     directory: &str,
-) -> bool {
-    crate::bridge::pollers::walk_parent_chain(backend, session_id, Some(directory), |current| {
-        let current = current.to_string();
-        async move {
-            sessions
-                .store
-                .lock()
-                .await
-                .entry_for_session(&current)
-                .map(|e| e.auto_accept)
+) -> Option<bool> {
+    let found =
+        crate::bridge::pollers::walk_parent_chain_result(backend, session_id, Some(directory), |current| {
+            let current = current.to_string();
+            async move {
+                sessions
+                    .store
+                    .lock()
+                    .await
+                    .entry_for_session(&current)
+                    .map(|e| e.auto_accept)
+            }
+        })
+        .await;
+    match found {
+        Ok(flag) => Some(flag.unwrap_or(false)),
+        Err(e) => {
+            // DEBUG: a sweep retries this path every tick until the read
+            // heals, and ADR-0048 keeps a repeating best-effort failure out of
+            // WARN. The request is never declined on the unknown.
+            tracing::debug!("auto-accept: resolving session {session_id}'s flag failed: {e}");
+            None
         }
-    })
-    .await
-    .unwrap_or(false)
+    }
 }
 
 /// Turn a session's Auto-Accept flag on/off, resolving the owning session
@@ -776,10 +802,24 @@ pub(crate) async fn set_auto_accept(
         async move { sessions.entry_for_session(&current).await }
     })
     .await;
-    if let Some(entry) = owner
-        && let Err(e) = sessions.update(&entry.session_id, |e| e.auto_accept = on).await
-    {
-        tracing::warn!("set_auto_accept: persist failed: {}", e);
+    let persisted = match owner {
+        Some(entry) => match sessions.update(&entry.session_id, |e| e.auto_accept = on).await {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!("set_auto_accept: persist failed: {}", e);
+                false
+            }
+        },
+        None => {
+            tracing::warn!("set_auto_accept: no store entry to persist the flag on");
+            false
+        }
+    };
+    // Approving with the flag unpersisted would apply a mode the store does not
+    // record: the next sweep reads it as off, and an over-budget request would
+    // be approved unseen under a session that never opted in (#892).
+    if !persisted {
+        return Vec::new();
     }
     if on {
         approve_pending_for_session(sessions, requests, backend, session_id, directory).await

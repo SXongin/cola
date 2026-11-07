@@ -2550,3 +2550,134 @@ async fn a_failed_auto_accept_of_an_unshowable_permission_is_retried() {
         "the retry answers the still-pending request"
     );
 }
+
+/// #892: an Auto-Accept flag read that FAILS ("unknown", not "off") must retry,
+/// never decline. A sub-task child is not in the store, so resolving its
+/// ancestor costs a `session_info` hop; a transient failure there used to read
+/// as "off" and reject the over-budget request for good.
+#[tokio::test]
+async fn an_unknown_auto_accept_flag_never_declines_an_unshowable_permission() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_parent("ses_child", "ses_parent");
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_child".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    backend.fail_session_infos(1);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, _platform) = build_app(cfg, backend).await;
+    // The parent carries the flag; the child inherits it up the chain.
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_parent".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: true,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        replies.lock().await.is_empty(),
+        "an unknown flag must neither approve nor decline"
+    );
+    assert!(!seen.contains("per_long"), "and the request must stay retryable");
+
+    // The hop heals: the child resolves to its auto-accept parent and the
+    // approval lands.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the retry reads the inherited flag and approves"
+    );
+}
+
+/// ADR-0048: the Auto-Accept reply retries every sweep, so its failure WARNs
+/// once, DEBUGs identical repeats, and INFOs the recovery. A permanently
+/// broken reply path must not flood the log.
+#[tokio::test]
+async fn a_failing_auto_accept_warns_once_then_debugs_and_reports_recovery() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    backend.fail_permission_replies(2);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_test".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: true,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let mut seen = std::collections::HashSet::new();
+    let (_, first) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+    assert_line_level(&first, "auto-accept per_long failed", "WARN");
+
+    let (_, second) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+    assert_line_level(&second, "auto-accept per_long still failing", "DEBUG");
+
+    let (_, third) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
+    assert_line_level(&third, "auto-accept per_long recovered", "INFO");
+    assert_eq!(
+        replies.lock().await.len(),
+        3,
+        "each sweep retried the reply until it landed"
+    );
+}

@@ -114,6 +114,11 @@ pub struct RequestFlow {
     /// recovery logs INFO. Without it a persistently failing directory WARNed
     /// on every 3 s tick.
     list_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
+    /// The same ADR-0048 policy for Auto-Accept reply failures, keyed by
+    /// request id: the sweep retries the approval every tick, so the first
+    /// failure WARNs, an identical repeat is DEBUG, and a landed reply logs
+    /// recovery INFO. Pruned to the pending list each sweep.
+    autoaccept_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
     /// The persisted surface mirror (ADR-0038 restart re-adoption): every
     /// standalone card this flow sends is written through, and its persisted
     /// records seed [`Self::recovered`] at startup.
@@ -301,6 +306,7 @@ impl RequestFlow {
             pending_sessions: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dead_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             list_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
+            autoaccept_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
             surfaces,
             recovered: Arc::new(Mutex::new(recovered)),
             session_less: Arc::new(Mutex::new(HashMap::new())),
@@ -308,6 +314,25 @@ impl RequestFlow {
             #[cfg(test)]
             wait_checks: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Record an Auto-Accept reply failure for `request_id` with ADR-0048's
+    /// warn-once cadence: the sweep retries the approval every tick, so the
+    /// first failure WARNs and an identical repeat is DEBUG.
+    pub(crate) async fn note_autoaccept_failure(&self, request_id: &str, error: impl std::fmt::Display) {
+        self.autoaccept_failures
+            .lock()
+            .await
+            .failed(request_id, "auto-accept", "", error);
+    }
+
+    /// Clear the Auto-Accept latch for `request_id` after a landed approval
+    /// (INFO once when it had been failing).
+    pub(crate) async fn note_autoaccept_success(&self, request_id: &str) {
+        self.autoaccept_failures
+            .lock()
+            .await
+            .succeeded(request_id, "auto-accept");
     }
 
     /// The double-click guard's read-only check: whether `req_id` was already
@@ -840,6 +865,14 @@ impl RequestFlow {
                 }
             }
         }
+        // Auto-Accept latches live by request id; drop the ones that left the
+        // pending list (approved, settled elsewhere, or their directory failed
+        // to list — a directory that returns may WARN again, which is a fresh
+        // failure, not a repeat).
+        self.autoaccept_failures
+            .lock()
+            .await
+            .retain(|id| pending.contains(id));
         // ADR-0054: record which sessions wait on this kind, so the task
         // liveness line reads it without listing pending requests per render
         // poll. Only a complete sweep may replace the record — a failed

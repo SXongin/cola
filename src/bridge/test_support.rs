@@ -1740,6 +1740,10 @@ pub struct MockBackend {
     /// child session_id → parent session_id, served by `session_info`
     /// (simulates sub-task sessions created by the `task` tool).
     pub session_parents: std::collections::HashMap<String, String>,
+    /// The next `count` `session_info` calls fail — exercises the parent-chain
+    /// walk's "unknown" answer (a transient hop failure must retry, never be
+    /// read as a definite flag value).
+    pub fail_session_info_count: Arc<std::sync::atomic::AtomicUsize>,
     /// The shared store served by `list_sessions` (for `/attach` and
     /// `/switch` tests).
     pub session_list: Vec<crate::backend::types::SessionListInfo>,
@@ -2094,6 +2098,7 @@ impl MockBackend {
             fail_create_session_count: std::sync::atomic::AtomicUsize::new(0).into(),
             stale_session_404: false,
             session_parents: std::collections::HashMap::new(),
+            fail_session_info_count: std::sync::atomic::AtomicUsize::new(0).into(),
             session_list: Vec::new(),
             update_title_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_title_patch: false,
@@ -2681,6 +2686,14 @@ impl MockBackend {
     /// retry.
     pub(crate) fn fail_permission_replies(&self, count: usize) -> &Self {
         self.fail_reply_permission_count
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `count` `session_info` calls fail — the parent-chain
+    /// walk returns "unknown" instead of a definite answer.
+    pub(crate) fn fail_session_infos(&self, count: usize) -> &Self {
+        self.fail_session_info_count
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self
     }
@@ -3794,6 +3807,17 @@ impl crate::backend::Backend for MockBackend {
         _d: Option<&str>,
     ) -> crate::error::Result<crate::backend::types::SessionInfo> {
         self.session_info_calls.lock().await.push(session_id.to_string());
+        if self
+            .fail_session_info_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_session_info_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(
+                "simulated session_info failure".into(),
+            ));
+        }
         hang_if_scripted(&self.hang_session_info).await;
         Ok(crate::backend::types::SessionInfo {
             id: session_id.to_string(),

@@ -5503,10 +5503,11 @@ impl App {
             .session_id
             .clone()
             .map(|id| (id, settings.directory.clone()));
-        let mut approved = Vec::new();
-        if on && let Some((id, directory)) = &active {
-            approved = core.approve_pending_for_session(id, directory).await;
-        }
+        // Persist BEFORE approving (#892): a sweep landing in the approval
+        // window must already read the flag as on, or its `refuse` declines the
+        // over-budget request this click is about to approve. A persist that
+        // did not take effect approves nothing.
+        //
         // Field-only, with the pending's identity (issue #910): a snapshot
         // write could restore a stale model, and a `/new` during the sweep must
         // not take the flag meant for the displaced pending.
@@ -5527,7 +5528,17 @@ impl App {
                     toast: Some("会话状态已变化（可能刚切换/创建），这次操作没有生效。".to_string()),
                 });
             }
-            Err(err) => tracing::warn!("autoaccept card: persist failed: {}", err),
+            Err(err) => {
+                tracing::warn!("autoaccept card: persist failed: {}", err);
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("自动授权状态保存失败，请重试。".to_string()),
+                });
+            }
+        }
+        let mut approved = Vec::new();
+        if on && let Some((id, directory)) = &active {
+            approved = core.approve_pending_for_session(id, directory).await;
         }
         // The same residue the permission card's toggle and `/autoaccept on`
         // leave: ONE mode receipt and the approved blocks dismissed. Without it
