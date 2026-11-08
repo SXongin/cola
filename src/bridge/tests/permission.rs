@@ -3350,6 +3350,59 @@ async fn an_empty_file_message_id_is_not_a_delivery() {
     );
 }
 
+/// A caption timeout is bounded and best effort: the File Message has already
+/// landed, so the companion stays confirmed and the caption is simply dropped.
+#[tokio::test]
+async fn a_timed_out_companion_caption_still_lands_the_file() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(Vec::new())).await;
+    let cards = app.cards_handle();
+    let content = crate::backend::FileContent::from_bytes(
+        "text/plain",
+        "permission-per_long.txt",
+        b"full content".to_vec(),
+    );
+    let hash = crate::bridge::handles::content_identity_hash(
+        &content.mime,
+        &content.name,
+        content.data.as_deref().unwrap_or_default(),
+    );
+    let (entered, release) = platform.pause("reply_text", "om_card");
+    let platform_dyn: std::sync::Arc<dyn crate::feishu::Platform> = platform.clone();
+    let call = tokio::spawn({
+        async move {
+            crate::bridge::viewer::send_file_message_with_outcome(
+                &platform_dyn,
+                &cards,
+                "om_card",
+                &content,
+                hash,
+                50,
+                Some("caption"),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the caption is in flight");
+    let (delivery, id) = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+        .await
+        .expect("the caption timeout is bounded")
+        .expect("the call joins");
+    assert!(
+        matches!(
+            delivery,
+            crate::feishu::card::tool_render::FileDelivery::SentAsFile
+        ),
+        "the file still lands: {delivery:?}"
+    );
+    assert_eq!(id.as_deref(), Some("msg_file"));
+    release.notify_waiters();
+}
+
 /// The companion proof covers the **summed** target budget, not the longest
 /// single target: two patterns that each fit still exceed the one display
 /// element, so the request takes the companion lane and its card carries the
