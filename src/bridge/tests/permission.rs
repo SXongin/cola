@@ -1714,10 +1714,26 @@ async fn fallback_app_for(
     Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     tempfile::TempDir,
 ) {
+    let (app, platform, replies, _pending, dir) = fallback_app_with_pending(request).await;
+    (app, platform, replies, dir)
+}
+
+/// [`fallback_app_for`] that also returns the pending-request list, so a test
+/// can mutate the server's target after the surface exists.
+async fn fallback_app_with_pending(
+    request: crate::backend::types::PermissionRequest,
+) -> (
+    Arc<App>,
+    Arc<RecordingPlatform>,
+    Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    Arc<tokio::sync::Mutex<Vec<crate::backend::types::PermissionRequest>>>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![request]);
+    let pending = Arc::clone(&backend.permissions);
     let replies = Arc::clone(&backend.reply_permission_calls);
     let (app, platform) = build_app(cfg, backend).await;
     platform
@@ -1726,7 +1742,7 @@ async fn fallback_app_for(
     seed_live_card(&app, "ses_test", "om_live").await;
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
-    (app, platform, replies, dir)
+    (app, platform, replies, pending, dir)
 }
 
 /// Neither companion lane delivering must NOT decline the request. The fresh
@@ -2101,6 +2117,15 @@ async fn a_summary_allow_refuses_a_target_that_shrank() {
     );
 
     let (message_id, fallback) = fallback_surface(&app, &platform, "per_long").await;
+    let fallback_text = card_text(&fallback);
+    assert!(
+        fallback_text.contains("之前的目标已完整送达"),
+        "a confirmed summary is not described as an unknown send: {fallback_text}"
+    );
+    assert!(
+        !fallback_text.contains("发送结果未知"),
+        "the confirmed companion must not be called unknown: {fallback_text}"
+    );
     let once = button_with_label(&fallback, "✅ 允许一次");
     let confirmation = app
         .host_action_on_message(once, &message_id)
@@ -2218,6 +2243,185 @@ async fn an_uncertain_fallback_keeps_the_unknown_copy_through_confirmation() {
         replies.lock().await.as_slice(),
         &[("per_long".to_string(), "once".to_string())],
         "the unknown-outcome fallback can still be approved after confirmation"
+    );
+}
+
+/// A request that was over budget (with a confirmed companion record) but
+/// shrank before its card was surfaced must not inherit a summary surface: the
+/// stale record is pruned, the card is ordinary, and its allow is not bounced
+/// into a fallback.
+#[tokio::test]
+async fn a_shrink_before_surfacing_prunes_the_stale_companion() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let request = long_permission("per_long", "ses_test", 5_000);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![request.clone()]);
+    let pending = Arc::clone(&backend.permissions);
+    let replies = Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    app.permission.surfaces.set_companion(
+        "per_long",
+        crate::bridge::surfaces::CompanionDelivery {
+            message_id: "om_old".into(),
+            lane: crate::bridge::surfaces::CompanionLane::RichText,
+            target_digest: crate::bridge::request::companion::companion_target_digest(&request),
+        },
+    );
+    // The server shrinks the target before the card is ever surfaced.
+    {
+        let mut pending = pending.lock().await;
+        pending[0].patterns = vec!["echo short".into()];
+        pending[0].metadata = None;
+    }
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        app.permission.surfaces.companion("per_long").is_none(),
+        "an in-budget request has no companion surface"
+    );
+    let streaming = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let allow = button_with_label(&streaming, "✅ 允许一次");
+    assert!(
+        allow.get("summary").is_none(),
+        "the ordinary card must not claim a summary surface: {allow}"
+    );
+    app.host_action_on_message(allow, "om_live")
+        .await
+        .expect("the ordinary allow returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "a fully-shown in-budget target is approved normally"
+    );
+    assert!(
+        !platform.replied_cards().await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER)
+        }),
+        "no fallback card is invented for a fully-shown target"
+    );
+}
+
+/// A rebuilt fallback whose standalone record is gone must not loop: its first
+/// step posts a fresh card instead of re-entering rebuild forever.
+#[tokio::test]
+async fn a_rebuilt_fallback_without_a_record_posts_a_fresh_card() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, _dir) = fallback_app().await;
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    // Simulate a lost record: the click has no `sent_cards` entry to seed the
+    // confirmation, so the rebuild must post a real new card.
+    app.permission.sent_cards.lock().await.remove("per_long");
+    app.permission.surfaces.remove_standalone("per_long");
+    let before = platform
+        .replied_cards()
+        .await
+        .iter()
+        .filter(|card| card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER))
+        .count();
+    let once = button_with_label(&card, "✅ 允许一次");
+
+    let result = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the first step returns a result");
+    assert!(
+        result.card.is_none(),
+        "the ack must not replace the old card with an unusable one"
+    );
+    assert!(replies.lock().await.is_empty(), "no decision is made");
+    let after = platform
+        .replied_cards()
+        .await
+        .iter()
+        .filter(|card| card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER))
+        .count();
+    assert_eq!(after, before + 1, "a fresh card is posted");
+    let (new_message, new_card) = fallback_surface(&app, &platform, "per_long").await;
+    let once = button_with_label(&new_card, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &new_message)
+        .await
+        .expect("the fresh card's first step")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    app.host_action_on_message(confirm, &new_message)
+        .await
+        .expect("the confirmation returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the fresh card restores the decision path"
+    );
+}
+
+/// Deny is not an approval: a changed target must not bounce it into a rebuilt
+/// fallback card. The one-click reject must reach the backend.
+#[tokio::test]
+async fn a_fallback_deny_ignores_a_changed_target() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, pending, _dir) =
+        fallback_app_with_pending(long_permission("per_long", "ses_test", 5_000)).await;
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    let deny = button_with_label(&card, "🚫 拒绝");
+    {
+        let mut pending = pending.lock().await;
+        pending[0].patterns = vec!["echo short".into()];
+        pending[0].metadata = None;
+    }
+
+    let result = app
+        .host_action_on_message(deny, &message_id)
+        .await
+        .expect("the deny click returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "deny still replies reject on one click"
+    );
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains("已拒绝"),
+        "the result is the deny, not a rebuilt fallback card: {text}"
+    );
+}
+
+/// Auto-Accept is not an approval of the card's text: a changed target must not
+/// bounce the toggle. It still enables the mode and approves the pending request.
+#[tokio::test]
+async fn a_fallback_autoaccept_ignores_a_changed_target() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, pending, _dir) =
+        fallback_app_with_pending(long_permission("per_long", "ses_test", 5_000)).await;
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    let autoaccept = button_with_label(&card, "⚡ 开启自动授权");
+    {
+        let mut pending = pending.lock().await;
+        pending[0].patterns = vec!["echo short".into()];
+        pending[0].metadata = None;
+    }
+
+    app.host_action_on_message(autoaccept, &message_id)
+        .await
+        .expect("the Auto-Accept click returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "Auto-Accept still approves the pending request"
+    );
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .entry_for_session("ses_test")
+            .is_some_and(|entry| entry.auto_accept),
+        "the mode is on"
     );
 }
 

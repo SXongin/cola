@@ -4720,6 +4720,7 @@ impl StreamAccumulator {
                     size += crate::feishu::card::question::permission_block_estimate(
                         &p.body,
                         p.always_supported,
+                        p.summary_digest.is_some(),
                         &p.request_id,
                         &p.session_id,
                         &p.directory,

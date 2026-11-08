@@ -339,6 +339,12 @@ impl Surfaces {
         self.lock().view(&self.client_id)
     }
 
+    /// This client's id (ADR-0091), so a surface writer can keep the scope it
+    /// read instead of minting an empty one.
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
     /// Record (or refresh) the card rendering `request_id`'s live block.
     pub fn set_inline(&self, request_id: &str, mut surface: InlineSurface) {
         surface.client_id = self.client_id.clone();
