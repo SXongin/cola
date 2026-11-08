@@ -2622,6 +2622,73 @@ async fn a_fallback_confirmation_cancel_returns_to_the_fallback_card() {
     );
 }
 
+/// A failed verification read must not replace the fallback card with a
+/// buttonless result: that is the request's only surface and `seen` keeps it
+/// from being resurfaced. Ack with no card and a retry toast, leaving the
+/// controls in place.
+#[tokio::test]
+async fn a_failed_verification_read_keeps_the_fallback_controls() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![long_permission("per_long", "ses_test", 5_000)]);
+    let fail_list = std::sync::Arc::clone(&backend.fail_list_permissions);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .fail_send_message_definite_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    let once = button_with_label(&card, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the first step returns the confirmation card")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+
+    fail_list.store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = app
+        .host_action_on_message(confirm.clone(), &message_id)
+        .await
+        .expect("the failed verification returns a result");
+    assert!(
+        result.card.is_none(),
+        "the confirmation stays the live surface, not a buttonless failure card"
+    );
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("无法校验目标，未批准"),
+        "the ack asks for a retry"
+    );
+    assert!(
+        replies.lock().await.is_empty(),
+        "nothing was approved or declined"
+    );
+
+    // The request is still actionable: clear the failure and confirm again.
+    fail_list.store(false, std::sync::atomic::Ordering::SeqCst);
+    let result = app
+        .host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the retried confirmation returns a result");
+    assert!(
+        result.card.is_some(),
+        "the retry produces the ordinary decision result"
+    );
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the retry approves the still-pending request"
+    );
+}
+
 /// 始终允许 goes through the same confirmation step and carries the original
 /// `always` decision once confirmed.
 #[tokio::test]

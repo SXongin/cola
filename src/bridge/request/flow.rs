@@ -223,6 +223,7 @@ async fn post_withdrawal_notice(
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
     how: Withdrawal,
+    walk_timeout_ms: u64,
 ) {
     let card = match how {
         Withdrawal::Refused(overflow) => {
@@ -231,36 +232,75 @@ async fn post_withdrawal_notice(
         Withdrawal::CompanionUncertain => crate::feishu::card::question::build_uncertain_permission_card(),
         _ => return,
     };
-    post_refusal_card(handles, p, directory, card).await;
+    post_refusal_card(handles, p, directory, card, walk_timeout_ms).await;
 }
 
 /// Route one non-interactive refusal card exactly like a permission card: the
 /// reply target of the session's prompt, or the chat.
+///
+/// Best effort and **bounded**: this runs in the sweep, so a half-open
+/// `session_info` or Feishu send must not freeze it. It changes no request
+/// state — the decline already landed before this notice — so a timeout only
+/// loses the notice, never the decision.
 async fn post_refusal_card(
     handles: &FlowHandles,
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
     card: serde_json::Value,
+    walk_timeout_ms: u64,
 ) {
     let session_id = p.session_id.as_deref().unwrap_or("");
-    match resolve_card_target(
-        &handles.sessions,
-        &handles.cards,
-        &handles.backend,
-        &handles.platform,
-        session_id,
-        directory,
+    let resolved = crate::bridge::bounded_call(
+        &format!("permission {} notice target", p.request_id),
+        walk_timeout_ms,
+        async {
+            Ok::<_, crate::error::BridgeError>(
+                resolve_card_target(
+                    &handles.sessions,
+                    &handles.cards,
+                    &handles.backend,
+                    &handles.platform,
+                    session_id,
+                    directory,
+                )
+                .await,
+            )
+        },
     )
-    .await
-    {
+    .await;
+    let Some(resolved) = resolved else {
+        tracing::warn!(
+            "permission {} on session {session_id}: notice target walk timed out; \
+             skipping the best-effort notice",
+            p.request_id
+        );
+        return;
+    };
+    match resolved.ok().flatten() {
         Some(CardTarget::ReplyTo(message_id)) => {
-            if let Err(e) = handles.platform.reply_card(&message_id, &card).await {
-                tracing::warn!("permission notice reply failed: {e}");
+            match crate::bridge::bounded_call(
+                &format!("permission {} notice reply", p.request_id),
+                STANDALONE_SEND_TIMEOUT_MS,
+                handles.platform.reply_card(&message_id, &card),
+            )
+            .await
+            {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => tracing::warn!("permission notice reply failed: {e}"),
+                None => tracing::warn!("permission notice reply timed out"),
             }
         }
         Some(CardTarget::Chat(chat_id)) => {
-            if let Err(e) = handles.platform.send_card("chat_id", &chat_id, &card).await {
-                tracing::warn!("permission notice send failed: {e}");
+            match crate::bridge::bounded_call(
+                &format!("permission {} notice send", p.request_id),
+                STANDALONE_SEND_TIMEOUT_MS,
+                handles.platform.send_card("chat_id", &chat_id, &card),
+            )
+            .await
+            {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => tracing::warn!("permission notice send failed: {e}"),
+                None => tracing::warn!("permission notice send timed out"),
             }
         }
         None => tracing::warn!(
@@ -1901,7 +1941,14 @@ impl RequestFlow {
                     WithdrawalOutcome::Failed => RefusalApplied::Retry,
                     WithdrawalOutcome::Updated => RefusalApplied::Handled,
                     WithdrawalOutcome::None => {
-                        post_withdrawal_notice(handles, p, dir, how).await;
+                        post_withdrawal_notice(
+                            handles,
+                            p,
+                            dir,
+                            how,
+                            self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                        .await;
                         RefusalApplied::Handled
                     }
                 }
@@ -2493,14 +2540,24 @@ impl RequestFlow {
         };
         // Inline: repaint the persisted card — refreshed from the state this
         // process holds for a question, so partial answers that did not
-        // survive the restart are not shown as selected.
+        // survive the restart are not shown as selected. Bounded like every
+        // other sweep PATCH: a hung Feishu call must not wedge the sweep.
+        let repaint_timeout_ms = self
+            .withdrawal_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         let repainted = match self
             .kind
             .refresh_cached_block(self, &handles.cards, &message_id, req, dir)
             .await
         {
-            Some(card) => match handles.platform.update_message(&message_id, &card).await {
-                Ok(()) => {
+            Some(card) => match crate::bridge::bounded_call(
+                &format!("{} {} re-adopt repaint on {}", self.kind.label(), id, message_id),
+                repaint_timeout_ms,
+                handles.platform.update_message(&message_id, &card),
+            )
+            .await
+            {
+                Some(Ok(())) => {
                     tracing::info!(
                         "{} {} re-adopted on card {} after restart",
                         self.kind.label(),
@@ -2509,13 +2566,23 @@ impl RequestFlow {
                     );
                     true
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     tracing::warn!(
                         "{} {} re-adoption repaint failed on {}: {} — surfacing it anew",
                         self.kind.label(),
                         id,
                         message_id,
                         e
+                    );
+                    false
+                }
+                None => {
+                    tracing::warn!(
+                        "{} {} re-adoption repaint timed out after {}ms on {} — surfacing it anew",
+                        self.kind.label(),
+                        id,
+                        repaint_timeout_ms,
+                        message_id
                     );
                     false
                 }
