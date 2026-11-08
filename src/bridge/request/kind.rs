@@ -777,11 +777,11 @@ impl RequestKind for PermissionKind {
         // longer carries it.
         let mut proof = ClickProof::None;
         if approval && let Some(dir) = directory {
-            // A standalone fallback/summary card is the request's only surface:
-            // a failed verification read must not replace it with a buttonless
-            // result (the request stays `seen`, so nothing would resurface it).
-            // Ack with no card and a retry toast instead, leaving the controls.
-            let keep_surface_on_unverified = inline || fallback_click || summary_click;
+            // A failed verification read must not replace ANY surface with a
+            // buttonless result — inline block or standalone card alike: the
+            // request stays `seen`, so nothing would resurface it. Ack with no
+            // card and a retry toast, leaving the controls in place.
+            let keep_surface_on_unverified = true;
             let listed = crate::bridge::bounded_call(
                 "permission click: list pending",
                 flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -1154,10 +1154,16 @@ async fn should_auto_accept(
     )
     .await;
     let Some(Ok(found)) = found else {
-        tracing::warn!(
-            "auto-accept: {session_id}'s parent walk timed out; treating it as unknown and \
-             retrying next sweep"
-        );
+        // ADR-0048's latch: WARN once, DEBUG identical repeats, INFO on
+        // recovery. A half-open server must not log a WARN every poll tick.
+        flow.note_autoaccept_read_failure(
+            session_id,
+            format!(
+                "parent walk timed out after {}ms",
+                flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+        )
+        .await;
         return AutoAcceptFlag::Unknown;
     };
     match found {
@@ -1519,9 +1525,11 @@ async fn rebuild_fallback_from_server(
     loss: FallbackLoss,
     inline: bool,
 ) -> CardActionResult {
+    // A failed read must not replace the only surface with a buttonless
+    // result: keep the controls and let the toast ask for a retry.
     let Some(dir) = directory else {
         return failed_result_card(
-            inline,
+            true,
             "无法校验该权限请求的目标，未批准；请重试。",
             "无法校验目标，未批准",
         );
@@ -1545,7 +1553,7 @@ async fn rebuild_fallback_from_server(
         Some(Err(e)) => {
             tracing::warn!("permission {req_id}: could not verify its target: {e}");
             failed_result_card(
-                inline,
+                true,
                 "无法校验该权限请求的目标，未批准；请重试。",
                 "无法校验目标，未批准",
             )
@@ -1553,7 +1561,7 @@ async fn rebuild_fallback_from_server(
         None => {
             tracing::warn!("permission {req_id}: verifying its target timed out; not approved");
             failed_result_card(
-                inline,
+                true,
                 "无法校验该权限请求的目标，未批准；请重试。",
                 "无法校验目标，未批准",
             )
@@ -1625,7 +1633,7 @@ async fn recover_from_risk_mismatch(
         // first (the ack must not replace the streaming card), then withdraw the
         // old block. A failed post leaves the old block live and retryable.
         if !flow.post_fallback_card(handles, p, dir, loss, changed).await {
-            return failed_result_card(inline, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
+            return failed_result_card(true, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
         }
         let req = PendingRequest::Permission(p.clone());
         if !flow
@@ -1657,7 +1665,7 @@ async fn recover_from_risk_mismatch(
                 toast: Some(toast),
             };
         }
-        return failed_result_card(inline, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
+        return failed_result_card(true, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
     }
     CardActionResult {
         card: Some(crate::feishu::card::question::build_fallback_permission_card(
