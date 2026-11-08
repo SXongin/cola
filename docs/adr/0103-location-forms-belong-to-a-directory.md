@@ -35,19 +35,21 @@ would mean anything.
 
 **Delivery.** A Location Form is pushed once, as a standalone card, into the
 conversation of the directory's newest mapped Session in the SessionStore's
-activation order — the order `/switch` already maintains — using that
-conversation's topic anchor when it is a topic. The card names the asking MCP
-server and its message, and shows the directory, so the answerer knows what is
-being asked and whom the answer commits. A send that fails definitively is not
-recorded as pushed, so the next complete sweep with a mapped conversation
+activation order — the order `/switch` already maintains, filtered by directory
+and Agent Client — using that conversation's topic anchor when it is a topic.
+The card names the asking MCP server and its message, and shows the directory,
+so the answerer knows what is being asked and whom the answer commits; the V2
+adapter carries `metadata.server` and `metadata.message` into the neutral
+request (today's `RawForm` drops metadata). A send that fails definitively is
+not recorded as pushed, so the next complete sweep with a mapped conversation
 retries it; a timed-out send can duplicate the card exactly as every standalone
 send can today, and this record does not claim to fix that ambiguity. If the
 mapping disappears between listing and delivery, nothing is sent and nothing is
-suppressed. The card
-never rides an inline block, never enters `pending_sessions`, and never drives
-the Instant Reminder: that surface needs a Turn's generation to own and clear
-its pin, and a Location Form has none. It does take a **Message Pin** under the
-same `instant_reminder` opt-in, because a pin is keyed by message.
+suppressed. The card never rides an inline block, never enters
+`pending_sessions`, and never drives the Instant Reminder: that surface needs a
+Turn's generation to own and clear its pin, and a Location Form has none. It
+does take a **Message Pin** under the same `instant_reminder` opt-in, because a
+pin is keyed by message.
 
 **Dismissal.** 「稍后」 withdraws the card without declining the request. The
 form stays pending and `/mcp` can reopen it as a fresh card; reopening clears
@@ -69,12 +71,13 @@ rather than a new guarantee.
 **Pull surface.** `/mcp` is the read-only counterpart: the current directory's
 MCP server statuses plus **only** Location Forms (session-backed forms already
 own their Session cards). The statuses belong here because a form names a server
-the Host may have to fix — `needs_auth` in particular — before the form can be
-answered. `/mcp` can reopen a dismissed form. The capability is an adapter
-method. OpenCode V1 publishes a status read (`/mcp`, removed in V2's form) but
-has no elicitation-form surface; Codex publishes `mcpServerStatus/list` but has
-no location-owned forms. Neither can satisfy `/mcp`'s pull surface, so both
-answer "unavailable" rather than shipping a status-only variant.
+the Host may have to fix — `needs_auth` (no usable credential) in particular —
+before the form can be answered. `/mcp` can reopen a dismissed form. The
+capability is an adapter method. OpenCode V1 publishes a status read (`/mcp`,
+replaced by `/api/mcp*` in V2) but has no elicitation-form surface; Codex
+publishes `mcpServerStatus/list` but has no location-owned forms. Neither offers
+the full surface — statuses plus Location Forms — so both answer "unavailable"
+rather than shipping a status-only variant.
 
 **Answering.** Any **Principal** admitted by the Access List may answer in the
 target Chat/Topic, matching every other Permission/Question card; the default
@@ -87,10 +90,11 @@ the wrong location is refused upstream while the form keeps waiting.
 
 **Shape.** Both elicitation modes are delivered. An `external` field renders as
 its link plus an acknowledgement. A secret field is marked uncollectable with
-the `SecretInput` reason and can only be declined — the shared card is the wrong
-place for a password or token. The decoding stays defensive: today's upstream
-form schema has no `password` format, so this guard exists for the shape the MCP
-protocol permits, not for a case in the current wire.
+the `SecretInput` reason — cola's variant for a request it cannot collect on a
+shared card — and can only be declined: the shared card is the wrong place for a
+password or token. The decoding stays defensive: today's upstream form schema
+has no `password` format, so this guard exists for the shape the MCP protocol
+permits, not for a case in the current wire.
 
 ## Consequences
 
@@ -108,7 +112,7 @@ protocol permits, not for a case in the current wire.
   remains for location-owned servers.
 - The issue's minimum was delivery and reply routing. `/mcp` and the durable
   dismissal are deliberate additions: one push with no durable pull surface
-  would lose a form the moment the Host dismissed it or cola restarted.
+  would leave a dismissed form unreachable.
 - Known limitation, recorded rather than solved: no requester means no
   requester-scoped authorization beyond the Access List, no requester-scoped
   reminder, and no way to attribute the answer to the Session whose tool call is
