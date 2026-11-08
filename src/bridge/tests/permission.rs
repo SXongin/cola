@@ -3834,12 +3834,12 @@ async fn a_body_overflow_summary_allow_is_proven_by_the_delivered_description() 
     );
 }
 
-/// A diff-carrying permission is exempt from the summed-target budget: the
-/// card must show the diff, and the allow must not need a companion. The
-/// target-overflow companion carries paths only, so routing it there would
-/// approve an edit whose diff was shown nowhere.
+/// A diff request skips the summed-target budget, but not the rendered-body
+/// ceiling: many long paths plus the diff is a `Body` overflow, so the
+/// companion carries the rendered description (diff included) and the card is a
+/// summary.
 #[tokio::test]
-async fn an_over_budget_diff_permission_stays_on_the_card_and_needs_no_companion() {
+async fn an_over_budget_diff_permission_takes_the_body_companion() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -3860,8 +3860,66 @@ async fn an_over_budget_diff_permission_stays_on_the_card_and_needs_no_companion
     };
     assert_eq!(
         crate::bridge::request::kind::permission_overflow(&request),
+        Some(crate::bridge::request::kind::PermissionOverflow::Body),
+        "many paths plus the diff cross the rendered-body ceiling"
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![request]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let posts = posted_companions(&platform).await;
+    assert_eq!(posts.len(), 1, "the body overflow takes one companion");
+    let md = posts[0]["zh_cn"]["content"][0][0]["text"]
+        .as_str()
+        .expect("the companion carries a markdown element");
+    assert!(
+        md.contains("@@ -1 +1 @@") && md.contains("+new line"),
+        "the companion is the rendered description, diff included: {md}"
+    );
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let allow = button_with_label(&card, "✅ 允许一次");
+    assert_eq!(allow["summary"], true, "the card is a summary surface");
+
+    let ack = click_perm(&app, "once", "per_diff", "✅ 已允许一次").await;
+    assert!(ack.contains("✅ 已允许一次"), "the allow lands: {ack}");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_diff".to_string(), "once".to_string())],
+        "the delivered description proves the body overflow"
+    );
+}
+
+/// A normal diff (one short path) fits the card: no companion, and the allow
+/// needs no delivery proof.
+#[tokio::test]
+async fn a_normal_diff_permission_stays_on_the_card_and_needs_no_companion() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let diff = "--- /proj/src/main.rs\n+++ /proj/src/main.rs\n@@ -1 +1 @@\n-old line\n+new line\n";
+    let request = crate::backend::types::PermissionRequest {
+        request_id: "per_diff".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("edit".into()),
+        patterns: vec!["/proj/src/main.rs".into()],
+        metadata: Some(serde_json::json!({
+            "filepath": "/proj/src/main.rs",
+            "diff": diff
+        })),
+        always: Vec::new(),
+        always_supported: true,
+    };
+    assert_eq!(
+        crate::bridge::request::kind::permission_overflow(&request),
         None,
-        "the rendered diff exempts the request from the target budget"
+        "a normal diff fits the card"
     );
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![request]);
@@ -3874,7 +3932,7 @@ async fn an_over_budget_diff_permission_stays_on_the_card_and_needs_no_companion
 
     assert!(
         posted_companions(&platform).await.is_empty(),
-        "a diff-carrying request needs no companion: its content is the card"
+        "a normal diff needs no companion: its content is the card"
     );
     assert!(
         app.permission.surfaces.companion("per_diff").is_none(),
@@ -3884,10 +3942,6 @@ async fn an_over_budget_diff_permission_stays_on_the_card_and_needs_no_companion
         .await
         .expect("the streaming card renders");
     let text = card_text(&card);
-    for i in 0..paths.len() {
-        let marker = format!("/proj/src/{i:0>2}_");
-        assert!(text.contains(&marker), "every path is on the card: {text}");
-    }
     assert!(
         text.contains("@@ -1 +1 @@") && text.contains("+new line"),
         "the unified diff is on the card: {text}"
@@ -3903,7 +3957,7 @@ async fn an_over_budget_diff_permission_stays_on_the_card_and_needs_no_companion
     assert_eq!(
         replies.lock().await.as_slice(),
         &[("per_diff".to_string(), "once".to_string())],
-        "the allow needs no companion proof and never falls back"
+        "the allow needs no companion proof"
     );
 }
 

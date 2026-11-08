@@ -2866,20 +2866,18 @@ fn renders_diff_body(p: &crate::backend::types::PermissionRequest) -> bool {
 /// is measured from the renderer's own sanitized output, so the proof and the
 /// element cannot disagree.
 ///
-/// A request that renders a unified diff is **never** an overflow: the diff is
-/// the request itself, and `describe_permission` renders it under its own
-/// escaped-byte cap (`DIFF_MAX_ESCAPED_BYTES`) with a truncation note. The
-/// summed-target budget must not win over that exemption — otherwise a
-/// diff-carrying `edit`/`patch` with many paths would take the companion lane,
-/// whose target-overflow content is the paths only, and the diff would be
-/// delivered on no surface at all.
+/// A request that renders a unified diff is exempt from the **summed-target**
+/// budget: `describe_permission` shows the diff under its own escaped-byte cap
+/// (`DIFF_MAX_ESCAPED_BYTES`) with a truncation note, so the target-overflow
+/// companion (paths only) would deliver the diff nowhere. It is **not**
+/// exempt from the rendered-body ceiling: the body still carries every pattern
+/// before the diff, and a body past `PERMISSION_BODY_MAX_CHARS` must take the
+/// companion, whose body is the rendered description (the clipped diff
+/// included).
 pub(crate) fn permission_overflow(
     p: &crate::backend::types::PermissionRequest,
 ) -> Option<PermissionOverflow> {
-    if renders_diff_body(p) {
-        return None;
-    }
-    if !p.targets_are_fully_shown() {
+    if !renders_diff_body(p) && !p.targets_are_fully_shown() {
         return Some(PermissionOverflow::Targets);
     }
     (rendered_permission_chars(p) > PERMISSION_BODY_MAX_CHARS).then_some(PermissionOverflow::Body)
@@ -3232,17 +3230,17 @@ Index: /proj/src/main.rs
         );
         assert_eq!(
             permission_overflow(&p),
-            None,
-            "a rendered diff is exempt from the element ceiling"
+            Some(PermissionOverflow::Body),
+            "a diff is exempt only from the target budget, not the element ceiling"
         );
     }
 
-    /// A diff-carrying request is exempt from the **summed-target** budget too,
-    /// not only the rendered-body ceiling: the card renders the diff, so the
-    /// target-overflow companion (which carries paths only) must never be the
-    /// chosen surface. Otherwise the diff would be delivered nowhere.
+    /// A diff-carrying request skips the **summed-target** budget (the card
+    /// carries the diff), but still obeys the rendered-body ceiling. Past that
+    /// ceiling it takes the Body companion, whose payload is the rendered
+    /// description — the clipped diff and its truncation note included.
     #[test]
-    fn a_diff_request_is_exempt_from_the_summed_target_budget() {
+    fn a_diff_request_skips_the_target_budget_but_not_the_render_ceiling() {
         let paths: Vec<String> = (0..25)
             .map(|i| format!("/proj/src/{:0>2}_{}.rs", i, "x".repeat(124)))
             .collect();
@@ -3266,23 +3264,21 @@ Index: /proj/src/main.rs
             "the paths are over the summed budget: {}",
             p.total_target_len()
         );
+        // The target budget is skipped, but the rendered body carries every
+        // pattern plus the diff and crosses the element ceiling.
         assert_eq!(
             permission_overflow(&p),
-            None,
-            "a rendered diff is never a target overflow"
+            Some(PermissionOverflow::Body),
+            "many paths plus a diff still overflow the rendered body"
         );
-
-        let rendered = describe_permission(&p);
-        for path in &paths {
-            assert!(rendered.contains(path), "every path is on the card");
-        }
+        let companion = crate::bridge::request::companion::companion_text(&p);
         assert!(
-            rendered.contains("@@ -1 +1 @@") && rendered.contains("+new"),
-            "the card shows the unified diff: {rendered}"
+            companion.contains("@@ -1 +1 @@") && companion.contains("+new"),
+            "the Body companion is the rendered description, diff included: {companion}"
         );
 
-        // A diff past its escaped-byte cap stays on the card, clipped by its
-        // own cap with its own note — the exemption is what puts it there.
+        // A diff past its escaped-byte cap travels in that same companion,
+        // clipped by its own cap with its own note.
         p.metadata = Some(serde_json::json!({
             "files": [{
                 "file": paths[0],
@@ -3292,19 +3288,36 @@ Index: /proj/src/main.rs
                 )
             }]
         }));
-        let clipped = describe_permission(&p);
+        let companion = crate::bridge::request::companion::companion_text(&p);
         assert!(
-            clipped.contains(crate::feishu::card::tool_render::DIFF_TRUNCATION_NOTE),
-            "the oversized diff is clipped by its own cap, with the note: {clipped}"
+            companion.contains(crate::feishu::card::tool_render::DIFF_TRUNCATION_NOTE),
+            "the oversized diff is clipped by its own cap, with the note: {companion}"
         );
         assert_eq!(
             permission_overflow(&p),
-            None,
-            "a clipped diff is still exempt from the target budget"
+            Some(PermissionOverflow::Body),
+            "a clipped diff is still a body overflow"
         );
 
-        // The exemption is keyed on the rendered diff, not on there being many
-        // paths: without a diff the same paths are an ordinary target overflow.
+        // A normal diff with one short path fits the card: no companion.
+        p.patterns = vec!["/proj/src/main.rs".into()];
+        p.metadata = Some(serde_json::json!({
+            "filepath": "/proj/src/main.rs",
+            "diff": "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n",
+        }));
+        assert_eq!(
+            permission_overflow(&p),
+            None,
+            "a normal diff stays on the card with no companion"
+        );
+        let rendered = describe_permission(&p);
+        assert!(
+            rendered.contains("@@ -1 +1 @@") && rendered.contains("+new"),
+            "the card shows the unified diff: {rendered}"
+        );
+
+        // Without a diff the same many paths are an ordinary target overflow.
+        p.patterns = paths;
         p.metadata = None;
         assert_eq!(
             permission_overflow(&p),
