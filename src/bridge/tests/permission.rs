@@ -2133,10 +2133,29 @@ async fn a_summary_allow_refuses_a_target_that_shrank() {
         .expect("the fallback first step")
         .card
         .expect("the confirmation card");
+    let confirmation_text = card_text(&confirmation);
+    assert!(
+        confirmation_text.contains("之前的目标已完整送达"),
+        "the confirmation keeps the previous-target copy: {confirmation_text}"
+    );
+    assert!(
+        !confirmation_text.contains("发送结果未知"),
+        "the confirmation must not call a confirmed companion unknown: {confirmation_text}"
+    );
     let confirm = button_with_label(&confirmation, "✅ 确认批准");
-    app.host_action_on_message(confirm, &message_id)
+    let result = app
+        .host_action_on_message(confirm, &message_id)
         .await
         .expect("the confirmation returns a result");
+    let result_text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        result_text.contains("之前的目标已完整送达"),
+        "the result keeps the previous-target copy: {result_text}"
+    );
+    assert!(
+        !result_text.contains("发送结果未知"),
+        "the result must not call a confirmed companion unknown: {result_text}"
+    );
     assert_eq!(
         replies.lock().await.as_slice(),
         &[("per_long".to_string(), "once".to_string())],
@@ -2422,6 +2441,109 @@ async fn a_fallback_autoaccept_ignores_a_changed_target() {
             .entry_for_session("ses_test")
             .is_some_and(|entry| entry.auto_accept),
         "the mode is on"
+    );
+}
+
+/// A summary-surface fixture whose server target has already shrunk back into
+/// budget: the streaming card still shows the old summary and its allow button,
+/// but a confirmation must see the mismatch. Returns the app, platform, reply
+/// calls, the stale allow button value, and the temp dir.
+async fn shrunk_summary_fixture() -> (
+    Arc<App>,
+    Arc<RecordingPlatform>,
+    Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    serde_json::Value,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![long_permission("per_long", "ses_test", 5_000)]);
+    let pending = Arc::clone(&backend.permissions);
+    let replies = Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let streaming = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let allow = button_with_label(&streaming, "✅ 允许一次");
+    {
+        let mut pending = pending.lock().await;
+        pending[0].patterns = vec!["echo short".into()];
+        pending[0].metadata = None;
+    }
+    (app, platform, replies, allow, dir)
+}
+
+/// A summary-surface recovery whose replacement card cannot be posted must not
+/// withdraw the old block first: the request keeps its actionable surface.
+#[tokio::test]
+async fn an_inline_recovery_post_failure_keeps_the_old_block() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, allow, _dir) = shrunk_summary_fixture().await;
+    platform
+        .fail_reply_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let result = app
+        .host_action_on_message(allow, "om_live")
+        .await
+        .expect("the summary allow returns a result");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("无法发送新的权限卡片"),
+        "a failed post asks for a retry"
+    );
+    assert!(
+        replies.lock().await.is_empty(),
+        "the failed recovery never decides the request"
+    );
+    assert_eq!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .len(),
+        1,
+        "the old summary block stays live"
+    );
+}
+
+/// A recovery that posts the replacement card but cannot withdraw the old block
+/// keeps the new card as the actionable surface and reports the partial state.
+#[tokio::test]
+async fn an_inline_recovery_keeps_the_new_card_when_withdrawal_fails() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, allow, _dir) = shrunk_summary_fixture().await;
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let result = app
+        .host_action_on_message(allow, "om_live")
+        .await
+        .expect("the summary allow returns a result");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("目标已变化，请查看新的确认卡片"),
+        "the ack points at the new card"
+    );
+    assert!(
+        replies.lock().await.is_empty(),
+        "the recovery never decides the request"
+    );
+    assert!(
+        platform.replied_cards().await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER)
+        }),
+        "the replacement fallback card was posted"
+    );
+    assert_eq!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .len(),
+        1,
+        "the old block remains until its withdrawal retries"
     );
 }
 

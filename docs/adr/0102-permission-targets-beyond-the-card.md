@@ -110,7 +110,12 @@ is allowed only when the full content was delivered for that request.
   sends **no reply at all** and acks a rebuilt fallback card — the changed
   target's summary, a fresh digest, all four controls, and a note that the
   target changed and must be confirmed again — so the pending request never
-  loses its actionable surface.
+  loses its actionable surface. When the click landed on an inline summary
+  block, the replacement standalone card is posted **before** the old block is
+  withdrawn: the "withdraw first" rule protects a fresh fallback from
+  duplicating a block, but a recovery must not leave the request surface-less
+  if the post fails. A failed withdrawal leaves the new card pending and the old
+  block logs/retries.
   Deny and Auto-Accept stay one click; Auto-Accept still renders no companion.
   A risk-confirmed approval logs at WARN with the request id, the target length
   and the fact that the user confirmed unseen text. The risk digest differs

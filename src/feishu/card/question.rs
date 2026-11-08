@@ -207,6 +207,7 @@ impl FallbackLoss {
     pub(crate) fn from_key(key: Option<&str>) -> Self {
         match key {
             Some("not_delivered") => Self::NotDelivered,
+            Some("previous_delivered") => Self::PreviousDelivered,
             _ => Self::OutcomeUnknown,
         }
     }

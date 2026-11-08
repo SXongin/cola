@@ -1558,7 +1558,8 @@ async fn recover_from_risk_mismatch(
     let card_summary =
         crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, changed);
     let digest = patterns_target_digest(p);
-    // Refresh the standalone record once, preserving its client scope.
+    // Refresh the standalone record once. `set_standalone` stamps the owning
+    // client scope, so the empty placeholder here is not persisted as-is.
     let sent = {
         let mut cards = flow.sent_cards.lock().await;
         cards.get_mut(req_id).map(|entry| {
@@ -1568,15 +1569,10 @@ async fn recover_from_risk_mismatch(
     };
     let had_sent = sent.is_some();
     if let Some(sent) = sent {
-        let client_id = flow
-            .surfaces
-            .standalone(req_id)
-            .map(|surface| surface.client_id)
-            .unwrap_or_default();
         flow.surfaces.set_standalone(
             req_id,
             crate::bridge::surfaces::StandaloneSurface {
-                client_id,
+                client_id: String::new(),
                 kind: InteractionKind::Permission,
                 message_id: sent.message_id,
                 summary: stored_summary,
