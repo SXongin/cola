@@ -699,20 +699,24 @@ pub(crate) const UNCERTAIN_PERMISSION_RECEIPT: &str = "🚫 已拒绝：完整�
 /// outcome is unknown.
 pub(crate) const UNCERTAIN_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（完整内容送达结果未知）";
 
-/// The label of the result card cola shows when its click finds no confirmed
-/// companion delivery. It is a CLICK decision, not an automatic refusal of the
-/// request, so the wording says the click was declined.
-pub(crate) const MISSING_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（完整内容未送达）";
+/// The label of the result card cola shows when its click finds no usable
+/// confirmed companion delivery. It is a CLICK decision, not an automatic
+/// refusal of the request, so the wording says the click was declined. It
+/// deliberately does not claim the content was never sent: a stale record may
+/// have delivered the *previous* target, and the full note below names that
+/// possibility.
+pub(crate) const MISSING_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（没有匹配的完整内容）";
 
-/// The receipt a clicked block collapses to when no confirmed companion exists
-/// for it: the user's click was refused, nobody auto-declined the request, and
-/// the bound may be the rendered body rather than a target length.
-pub(crate) const MISSING_PERMISSION_RECEIPT: &str = "🚫 已拒绝：完整内容未送达";
+/// The receipt a clicked block collapses to when no usable confirmed companion
+/// exists for it: the user's click was refused, nobody auto-declined the
+/// request, and the bound may be the rendered body rather than a target length.
+pub(crate) const MISSING_PERMISSION_RECEIPT: &str = "🚫 已拒绝：没有匹配的完整内容";
 
 /// Why the click guard refuses an over-budget approval whose confirmed
-/// companion delivery is missing or stale (ADR-0102): the full content never
-/// landed, so there is nothing the user could have reviewed to approve. The
-/// click itself rejects the request, so it is settled server-side.
+/// companion delivery is missing or stale (ADR-0102): no delivered content
+/// proves this exact request, so there is nothing the user could have reviewed
+/// to approve. The click itself rejects the request, so it is settled
+/// server-side.
 pub(crate) fn missing_permission_click_note() -> String {
     "该权限请求的完整内容超过卡片显示预算，且没有找到已送达的伴随消息（或内容已变化）。\
      为了不让你批准没有完整看到的内容，本次点击已拒绝，该请求在服务端已结清。\

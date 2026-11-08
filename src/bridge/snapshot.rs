@@ -94,9 +94,10 @@ pub(crate) async fn gather_snapshot(
     // sibling session's in the same directory, and never a sub-task child's
     // (ADR-0028 keeps child-session pendings on today's standalone flow). A
     // permission whose target the card cannot show in full is left out too:
-    // embedding it would bypass the permission flow's decline guard (a claimed
-    // request is never surfaced again), and the poll sweep declines it with the
-    // reason card.
+    // embedding it would bypass the permission flow's companion/fallback lane
+    // (a claimed request is never surfaced again), so the poll sweep delivers
+    // the full target as a companion and, failing that, surfaces the fallback
+    // card (ADR-0102).
     let pending: Vec<crate::bridge::request::kind::PendingRequest> = permissions
         .into_iter()
         .filter(|p| {

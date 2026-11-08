@@ -88,9 +88,10 @@ decisions. It stands aside wherever no card is rendered:
 - A restart still re-adopts a card a previous process surfaced before the
   toggle was on (ADR-0038): Auto-Accept does not silently take over an
   already-offered decision. An over-budget card an older build could have
-  persisted therefore stays unapprovable — its Allow click is refused by the
-  click-time guard — which is the legacy state the guard exists for, not a
-  path this build can create.
+  persisted is therefore withdrawn as reprocessed when the new process
+  re-adopts it — never approved or declined in place (ADR-0102) — which is the
+  legacy state the re-adoption rule exists for, not a path this build can
+  create.
 - `refuse` and `prepare` each resolve the flag independently. A toggle flipped
   between them can let `refuse` stand aside and `prepare` decline, so an
   over-budget card is built for one pass; the click-time guard still refuses its
@@ -110,7 +111,8 @@ decisions. It stands aside wherever no card is rendered:
   single-element ceiling). This ADR's decision — the proof guards only surfaces
   that render a card — is unchanged; only the budget the proof applies moved.
   Because the renderer's chrome consumes the remaining room, a real near-budget
-  bash request (3,000-char command plus `metadata.command`) is refused before any
-  surface again until #1012's companion lane surfaces it with the full target in
-  a companion message; that handoff is the reason the refused class is accepted
-  here rather than expanded.
+  bash request (3,000-char command plus `metadata.command`) no longer fits the
+  interactive card; #1012's companion lane surfaces it with the full target in
+  a companion message, and a request the lane cannot deliver takes the two-step
+  fallback card (#1013). It is not refused on the way in, which is why this ADR
+  accepts the render class rather than expanding the budget.

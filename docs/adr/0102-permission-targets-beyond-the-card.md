@@ -44,8 +44,8 @@ lane's own charter says "by what the content *is*, not how big it is"
 for size alone"). Using it here is a deliberate bend, not a new lane: the
 mechanism, its 30 KB body cap and its File Message fallback are unchanged; only
 the TRIGGER differs (a permission target past the card budget, which #1010
-explicitly assigns to this ladder). The GLOSSARY and user-guide wording are
-#1014's work, not this ADR's.
+explicitly assigns to this ladder). The GLOSSARY and user-guide wording were
+updated with #1014.
 
 Surface persistence is ADR-0038's: a restart re-adopts the card a previous
 process surfaced, and the persisted state is client-scoped (ADR-0091).

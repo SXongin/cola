@@ -3756,7 +3756,7 @@ async fn a_stale_companion_digest_is_refused_at_the_click() {
     );
     assert_eq!(
         result.toast.as_deref(),
-        Some("已拒绝：完整内容未送达"),
+        Some("已拒绝：没有匹配的完整内容"),
         "the toast names the missing delivery"
     );
     let text = card_text(result.card.as_ref().expect("the result card"));
