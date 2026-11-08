@@ -4,11 +4,13 @@
 
 OpenCode raises an MCP elicitation as a **Location Form**: the MCP server belongs
 to a directory, so the request carries no Session. Upstream marks this with the
-`global` session sentinel, whose own comment says it exists because a location
-server cannot attribute a request to a persisted session row. Making some
-servers session-owned does not change that for the rest: a location server is
-the default `[mcp]` configuration, so the session-less shape is permanent, not a
-transition to wait out.
+`global` session sentinel — `GLOBAL_ELICITATION_SESSION_ID` in OpenCode's
+`packages/core/src/mcp/index.ts`, whose comment says it exists because a
+location server cannot attribute a request to a persisted session row. The
+in-progress session-owned MCP work gives a session-owned server's elicitations
+that server's session id; a location-owned server keeps the sentinel. A location
+server is the default `[mcp]` configuration, so the session-less shape is
+permanent, not a transition to wait out.
 
 #489 made these forms terminal: one WARN, no session read, no surface. The MCP
 call stays blocked and nobody sees why. A form has no TTL — it lives in the
@@ -34,12 +36,18 @@ would mean anything.
 **Delivery.** A Location Form is pushed once, as a standalone card, into the
 conversation of the directory's newest mapped Session in the SessionStore's
 activation order — the order `/switch` already maintains — using that
-conversation's topic anchor when it is a topic. A failed send is not recorded as
-pushed, so the next complete sweep retries it under the existing bounded-send
-rule. The card never rides an inline block, never enters `pending_sessions`, and
-never drives the Instant Reminder: that surface needs a Turn's generation to own
-and clear its pin, and a Location Form has none. It does take a **Message Pin**
-under the same `instant_reminder` opt-in, because a pin is keyed by message.
+conversation's topic anchor when it is a topic. The card names the asking MCP
+server and its message, and shows the directory, so the answerer knows what is
+being asked and whom the answer commits. A send that fails definitively is not
+recorded as pushed, so the next complete sweep with a mapped conversation
+retries it; a timed-out send can duplicate the card exactly as every standalone
+send can today, and this record does not claim to fix that ambiguity. If the
+mapping disappears between listing and delivery, nothing is sent and nothing is
+suppressed. The card
+never rides an inline block, never enters `pending_sessions`, and never drives
+the Instant Reminder: that surface needs a Turn's generation to own and clear
+its pin, and a Location Form has none. It does take a **Message Pin** under the
+same `instant_reminder` opt-in, because a pin is keyed by message.
 
 **Dismissal.** 「稍后」 withdraws the card without declining the request. The
 form stays pending and `/mcp` can reopen it as a fresh card; reopening clears
@@ -63,9 +71,10 @@ MCP server statuses plus **only** Location Forms (session-backed forms already
 own their Session cards). The statuses belong here because a form names a server
 the Host may have to fix — `needs_auth` in particular — before the form can be
 answered. `/mcp` can reopen a dismissed form. The capability is an adapter
-method; OpenCode V1 has no form or MCP-status surface, and Codex publishes
-`mcpServerStatus/list` but has no location-owned forms, so both answer
-"unavailable" rather than shipping a status-only variant.
+method. OpenCode V1 publishes a status read (`/mcp`, removed in V2's form) but
+has no elicitation-form surface; Codex publishes `mcpServerStatus/list` but has
+no location-owned forms. Neither can satisfy `/mcp`'s pull surface, so both
+answer "unavailable" rather than shipping a status-only variant.
 
 **Answering.** Any **Principal** admitted by the Access List may answer in the
 target Chat/Topic, matching every other Permission/Question card; the default
@@ -94,9 +103,12 @@ protocol permits, not for a case in the current wire.
   (`src/backend/mod.rs`).
 - The #489 WARN remains for every session-less request that is not a marked
   elicitation.
-- When upstream gives session-owned elicitations a real session id, they take
-  the normal Question path unchanged; the Location path remains for
-  location-owned servers.
+- A Session-owned elicitation — which the in-progress session-owned MCP work
+  produces — takes the normal Question path unchanged; the Location path
+  remains for location-owned servers.
+- The issue's minimum was delivery and reply routing. `/mcp` and the durable
+  dismissal are deliberate additions: one push with no durable pull surface
+  would lose a form the moment the Host dismissed it or cola restarted.
 - Known limitation, recorded rather than solved: no requester means no
   requester-scoped authorization beyond the Access List, no requester-scoped
   reminder, and no way to attribute the answer to the Session whose tool call is
