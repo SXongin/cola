@@ -3846,50 +3846,6 @@ async fn a_profile_with_a_hidden_grant_is_declined() {
         Some(json!({ "permissions": {} })),
         "a profile the card cannot show is never granted"
     );
-    // A path longer than the card's shared target budget is the same class:
-    // the suffix would be clipped, so it is declined, not partially shown.
-    server.request_to_subscribers(
-        THREAD,
-        "item/permissions/requestApproval",
-        json!({
-            "threadId": THREAD,
-            "turnId": "turn-2",
-            "itemId": "item-2",
-            "cwd": WORK,
-            "permissions": {
-                "fileSystem": {
-                    "write": ["a".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)]
-                }
-            }
-        }),
-    );
-    server.wait_for_server_request_replies(2).await;
-    assert_eq!(
-        server.server_request_replies()[1].result,
-        Some(json!({ "permissions": {} })),
-        "an overlong path is never granted"
-    );
-    // Two paths that each fit can still overflow the one element together; the
-    // adapter's gate is summed, like the bridge's proof.
-    server.request_to_subscribers(
-        THREAD,
-        "item/permissions/requestApproval",
-        json!({
-            "threadId": THREAD,
-            "turnId": "turn-3",
-            "itemId": "item-3",
-            "cwd": WORK,
-            "permissions": {
-                "fileSystem": { "write": ["a".repeat(2_000), "b".repeat(2_000)] }
-            }
-        }),
-    );
-    server.wait_for_server_request_replies(3).await;
-    assert_eq!(
-        server.server_request_replies()[2].result,
-        Some(json!({ "permissions": {} })),
-        "two individually-fitting paths are never granted as a summed over-budget grant"
-    );
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(
         !platform
@@ -3898,6 +3854,66 @@ async fn a_profile_with_a_hidden_grant_is_declined() {
             .iter()
             .any(|card| card_text(card).contains("申请额外权限")),
         "no approval card for a grant the user cannot see in full"
+    );
+
+    poll.abort();
+    sync.abort();
+}
+
+/// The length half is the bridge's decision, not the adapter's: a profile the
+/// card cannot render in full must still reach the flow, which delivers its
+/// full content as a companion (or, when no companion lane can land, the
+/// two-step fallback card). It must never be answered with an empty
+/// `permissions: {}` grant — that is the silent server-side refusal #1010
+/// removed.
+#[tokio::test]
+async fn an_over_budget_profile_takes_the_fallback_instead_of_a_silent_decline() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    // Two individually-fitting paths whose sum is over the one display budget.
+    server.request_to_subscribers(
+        THREAD,
+        "item/permissions/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "cwd": WORK,
+            "permissions": {
+                "fileSystem": { "write": ["a".repeat(2_000), "b".repeat(2_000)] }
+            }
+        }),
+    );
+    let poll = spawn_permission_poll(&app);
+
+    let card = wait_for_sent_card(&platform, "the over-budget grant fallback card", |card| {
+        card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER)
+    })
+    .await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("申请额外权限"),
+        "the fallback still names the action: {text}"
+    );
+    assert!(
+        text.contains(crate::feishu::card::question::fallback_permission_risk_note()),
+        "the fallback names the risk and the way back to the client: {text}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        server.server_request_replies().is_empty(),
+        "an over-budget but expressible profile is surfaced, never silently declined"
     );
 
     poll.abort();
