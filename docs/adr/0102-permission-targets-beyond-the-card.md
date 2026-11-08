@@ -29,8 +29,9 @@ that chrome are not promised to fit. `PERMISSION_BODY_MAX_CHARS = 3060` is the
 **render invariant**, not a second display budget: it bounds the whole rendered
 body, targets plus scaffolding, and any body that passes it — reason and
 metadata chrome included — is `PermissionOverflow::Body` and takes the companion
-lane, never the card, unless it renders a diff: a diff carries its own
-escaped-byte cap and is shown truncated on the card instead.
+lane, never the card. A rendered diff skips the summed-target budget but not
+this ceiling: past it, the companion carries the rendered description (the
+clipped diff plus its truncation note), as the Decision below records.
 
 The proof counts **sanitized** characters, and a sanitized character is at most
 six JSON bytes (`\u0000`); a 3,060-character body is therefore ≈18 KB, inside

@@ -131,6 +131,12 @@ pub struct RequestFlow {
     /// so the first failure WARNs, identical repeats DEBUG, and a successful
     /// read logs recovery INFO.
     autoaccept_read_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
+    /// The ADR-0048 warn-once policy for the common standalone-target walk,
+    /// keyed by directory: a half-open `session_info` must WARN once, not once
+    /// per request per sweep.
+    target_walk_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
+    /// The same policy for the companion lane's reply-target walk.
+    companion_walk_failures: Arc<Mutex<crate::bridge::failure_latch::FailureLatch>>,
     /// The persisted surface mirror (ADR-0038 restart re-adoption): every
     /// standalone card this flow sends is written through, and its persisted
     /// records seed [`Self::recovered`] at startup.
@@ -418,6 +424,10 @@ impl RequestFlow {
             list_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
             autoaccept_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
             autoaccept_read_failures: Arc::new(Mutex::new(
+                crate::bridge::failure_latch::FailureLatch::default(),
+            )),
+            target_walk_failures: Arc::new(Mutex::new(crate::bridge::failure_latch::FailureLatch::default())),
+            companion_walk_failures: Arc::new(Mutex::new(
                 crate::bridge::failure_latch::FailureLatch::default(),
             )),
             surfaces,
@@ -1249,6 +1259,14 @@ impl RequestFlow {
                 .lock()
                 .await
                 .retain(|dir| directories.iter().any(|mapped| mapped == dir));
+            self.target_walk_failures
+                .lock()
+                .await
+                .retain(|dir| directories.iter().any(|mapped| mapped == dir));
+            self.companion_walk_failures
+                .lock()
+                .await
+                .retain(|dir| directories.iter().any(|mapped| mapped == dir));
         }
         // #130: forget question state whose request left the pending list —
         // the flip side of the stale-card / inline / claim cleanups above.
@@ -1427,6 +1445,7 @@ impl RequestFlow {
                 p,
                 dir,
                 self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                &self.companion_walk_failures,
             )
             .await
             {
@@ -1481,32 +1500,35 @@ impl RequestFlow {
         // is UNKNOWN, not "no target" — reading it as none would run the
         // last-resort decline — so the request stays pending and unmarked for
         // the next sweep.
-        let resolved_target = crate::bridge::bounded_call(
-            &format!("{} standalone target ({})", self.kind.label(), req.session_id()),
-            self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-            async {
-                Ok::<_, crate::error::BridgeError>(
-                    resolve_card_target(
-                        &handles.sessions,
-                        &handles.cards,
-                        &handles.backend,
-                        &handles.platform,
-                        req.session_id(),
-                        dir,
-                    )
-                    .await,
+        let walk_timeout_ms = self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let resolved_target = crate::bridge::bounded_call_quiet(walk_timeout_ms, async {
+            Ok::<_, crate::error::BridgeError>(
+                resolve_card_target(
+                    &handles.sessions,
+                    &handles.cards,
+                    &handles.backend,
+                    &handles.platform,
+                    req.session_id(),
+                    dir,
                 )
-            },
-        )
+                .await,
+            )
+        })
         .await;
+        let walk_condition = format!("{} target walk", self.kind.label());
         let Some(resolved_target) = resolved_target else {
-            tracing::warn!(
-                "{} {}: target walk timed out; leaving it pending for the next sweep",
-                self.kind.label(),
-                req.id()
+            self.target_walk_failures.lock().await.failed(
+                dir,
+                &walk_condition,
+                "",
+                format!("timed out after {walk_timeout_ms}ms"),
             );
             return false;
         };
+        self.target_walk_failures
+            .lock()
+            .await
+            .succeeded(dir, &walk_condition);
         let target = resolved_target.ok().flatten();
         // A fallback card needs somewhere to land. With no reply target and no
         // chat, no card can ever show the risk, so the request must not stay

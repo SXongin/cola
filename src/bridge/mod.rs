@@ -65,6 +65,18 @@ pub(crate) async fn bounded_call<T>(
     }
 }
 
+/// [`bounded_call`] without the per-call WARN. The caller owns the ADR-0048
+/// warn-once latch (the Auto-Accept, common-target and companion walks), so a
+/// timeout is logged once per condition, not once per request per sweep.
+pub(crate) async fn bounded_call_quiet<T>(
+    timeout_ms: u64,
+    fut: impl std::future::Future<Output = crate::error::Result<T>>,
+) -> Option<crate::error::Result<T>> {
+    tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut)
+        .await
+        .ok()
+}
+
 /// Why an inbound attachment was not attached to a prompt (ADR-0076's inbound
 /// amendment): the body carries the reason, so nothing is dropped silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

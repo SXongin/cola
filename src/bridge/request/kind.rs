@@ -1127,41 +1127,35 @@ async fn should_auto_accept(
     // the sweep before any surface exists, so a half-open server would freeze
     // permission surfacing for every session. Bound it like the companion and
     // host walks; a timeout is UNKNOWN, not "off" (ADR-0048/ADR-0102).
-    let found = crate::bridge::bounded_call(
-        &format!("auto-accept {session_id} parent walk"),
-        flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-        async {
-            Ok::<_, crate::error::BridgeError>(
-                crate::bridge::pollers::walk_parent_chain_result(
-                    backend,
-                    session_id,
-                    Some(directory),
-                    |current| {
-                        let current = current.to_string();
-                        async move {
-                            sessions
-                                .store
-                                .lock()
-                                .await
-                                .entry_for_session(&current)
-                                .map(|e| e.auto_accept)
-                        }
-                    },
-                )
-                .await,
+    let walk_timeout_ms = flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let found = crate::bridge::bounded_call_quiet(walk_timeout_ms, async {
+        Ok::<_, crate::error::BridgeError>(
+            crate::bridge::pollers::walk_parent_chain_result(
+                backend,
+                session_id,
+                Some(directory),
+                |current| {
+                    let current = current.to_string();
+                    async move {
+                        sessions
+                            .store
+                            .lock()
+                            .await
+                            .entry_for_session(&current)
+                            .map(|e| e.auto_accept)
+                    }
+                },
             )
-        },
-    )
+            .await,
+        )
+    })
     .await;
     let Some(Ok(found)) = found else {
         // ADR-0048's latch: WARN once, DEBUG identical repeats, INFO on
         // recovery. A half-open server must not log a WARN every poll tick.
         flow.note_autoaccept_read_failure(
             session_id,
-            format!(
-                "parent walk timed out after {}ms",
-                flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed)
-            ),
+            format!("parent walk timed out after {walk_timeout_ms}ms"),
         )
         .await;
         return AutoAcceptFlag::Unknown;
