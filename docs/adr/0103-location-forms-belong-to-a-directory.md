@@ -12,12 +12,14 @@ that server's session id; a location-owned server keeps the sentinel. A location
 server is the default `[mcp]` configuration, so the session-less shape is
 permanent, not a transition to wait out.
 
-Sharing a connection does not change ownership. A pooled connection (`pool:
-true`, OpenCode v2.2.6) serves several directories but has no roots: an
-elicitation caused by a tool call appears in the **calling** directory, while one
-with no caller is delivered to every holder as its own form, first answer wins
-and the rest are cancelled. The caller case is still directory-owned; the
-no-caller case can list one logical request in several directories.
+Sharing a connection does not change ownership. A **shared** connection — only
+an MCP 2026-07-28 connection; `pool` requests sharing, `auto` may still fall
+back, and an older or refused server keeps a private connection — serves several
+directories but has no roots: an elicitation caused by a tool call appears in
+the **calling** directory, while one with no caller is delivered to every holder
+as its own form, first answer wins and the rest are cancelled. The caller case
+is still directory-owned; the no-caller case can list one logical request in
+several directories.
 
 #489 made these forms terminal: one WARN, no session read, no surface. The MCP
 call stays blocked and nobody sees why. A form has no TTL — it lives in the
@@ -55,15 +57,17 @@ with a mapped conversation retries it; a timed-out send can duplicate the card
 exactly as every standalone send can today, and this record does not claim to
 fix that ambiguity. If the
 mapping disappears between listing and delivery, nothing is sent and nothing is
-suppressed. A form raised on a shared connection with no caller is listed in
-every directory holding that connection, so cola treats each listing as its own
-request and that rare case can produce one card per holder; answering one
-cancels the others upstream and their cards go stale on the next sweep, and no
-cross-location dedupe is attempted. The card never rides an inline block, never
-enters `pending_sessions`, and never drives the Instant Reminder: that surface
-needs a Turn's generation to own and clear its pin, and a Location Form has
-none. It does take a **Message Pin** under the same `instant_reminder` opt-in,
-because a pin is keyed by message.
+suppressed. A form raised on a shared connection with no caller is created once
+per holder with its own form id, so cola treats each listing as its own request
+and that rare case can produce one card per holder; answering one cancels the
+others upstream, and each losing card is withdrawn with a neutral
+first-answer-won line that says it was answered in another directory — never the
+generic “another client” receipt, because cola's own winning card may be the one
+that settled it. No cross-location dedupe is attempted. The card never rides an
+inline block, never enters `pending_sessions`, and never drives the Instant
+Reminder: that surface needs a Turn's generation to own and clear its pin, and a
+Location Form has none. It does take a **Message Pin** under the same
+`instant_reminder` opt-in, because a pin is keyed by message.
 
 **Dismissal.** 「稍后」 withdraws the card — and releases its Message Pin —
 without declining the request. The form stays pending and `/mcp` can reopen it
@@ -102,7 +106,10 @@ answer applies to the whole directory. Reply and cancel use the session route
 with the literal `global` session id — `POST /api/session/global/form/{id}/reply`
 and `DELETE /api/session/global/form/{id}` — plus `location[directory]`, where
 the directory is the one whose form list produced the request; a reply sent to
-the wrong location is refused upstream while the form keeps waiting.
+the wrong location is refused upstream while that form keeps waiting. A losing
+copy on a pooled no-caller request is already cancelled, so its reply takes the
+benign already-handled path and its card is withdrawn with the first-answer-won
+line above, not read as another client's decision.
 
 **Shape.** Both elicitation modes are delivered. An `external` field renders as
 its link plus an acknowledgement. A secret field is marked uncollectable with
@@ -123,9 +130,10 @@ permits, not for a case in the current wire.
   (`src/backend/mod.rs`).
 - The #489 WARN remains for every session-less request that is not a marked
   elicitation.
-- A pooled connection's caller-attributed elicitation stays in the calling
-  directory; a no-caller one may produce one card per holder, with no
-  cross-location dedupe.
+- A shared connection's caller-attributed elicitation stays in the calling
+  directory; a no-caller one may produce one card per holder, and each losing
+  card is withdrawn with a first-answer-won line. No cross-location dedupe is
+  attempted.
 - A Session-owned elicitation — which the in-progress session-owned MCP work
   produces — takes the normal Question path unchanged; the Location path
   remains for location-owned servers.
