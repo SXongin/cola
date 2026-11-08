@@ -435,7 +435,7 @@ A structured input request raised by an MCP server while it serves a tool, a res
 _Avoid_: Question (that is the model's prompt), permission (that is a tool's access decision)
 
 **Location Form** (目录级输入请求):
-An **Elicitation** whose MCP connection belongs to a directory rather than to a Session, so no Session — and no **Turn** — owns it. It carries no requester: its answer speaks for every Session using that directory (ADR-0103).
+An **Elicitation** whose MCP connection belongs to a directory rather than to a Session, so no Session — and no **Turn** — owns it. It carries no requester: its answer speaks for every Session using that directory — or, for a caller-less form on a shared connection, for every directory holding it (ADR-0103).
 _Avoid_: Session-less question, global form (the wire sentinel, not the concept)
 
 **Session Card** (会话卡):
