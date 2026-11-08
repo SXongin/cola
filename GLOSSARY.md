@@ -424,6 +424,20 @@ A structured multi-choice prompt from the AI backend, distinct from
 permissions. User selects options to reply.
 _Avoid_: Poll, survey, prompt
 
+**Elicitation** (MCP 输入请求):
+A structured input request raised by an MCP server while it serves a tool, a
+resource, or its own connection — distinct from a **Question**, which the model
+asks. It names the server asking, and its answer grants that input to the
+server connection rather than to a Session's run.
+_Avoid_: Question (that is the model's prompt), permission (nothing is being
+given access to)
+
+**Location Form** (无会话输入请求):
+An **Elicitation** whose MCP connection belongs to a directory rather than to a
+Session, so no Session — and no **Turn** — owns it. It carries no requester:
+whoever answers speaks for every Session using that directory.
+_Avoid_: Session-less question, global form (the wire sentinel, not the concept)
+
 **Custom Answer** (自定义答案):
 A user-typed entry in a multi-select **Question**'s selection, standing
 alongside the backend's options: kept verbatim (never split or trimmed) and
