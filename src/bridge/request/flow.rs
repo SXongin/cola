@@ -21,8 +21,8 @@ use crate::bridge::surfaces::{CompanionDelivery, StandaloneSurface, Surfaces};
 use crate::bridge::turn::Turn;
 
 use super::companion::{
-    CompanionOutcome, companion_target_digest, ensure_permission_companion, fallback_permission_summary,
-    patterns_target_digest,
+    CompanionOutcome, companion_target_digest, describe_permission_target_summary,
+    ensure_permission_companion, patterns_target_digest,
 };
 use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
@@ -1362,6 +1362,7 @@ impl RequestFlow {
         // replace it without touching a streaming card.
         let mut fallback_summary: Option<String> = None;
         let mut fallback_cause: Option<DeclineReason> = None;
+        let mut fallback_loss = crate::feishu::card::question::FallbackLoss::NotDelivered;
         if let PendingRequest::Permission(p) = req
             && let Some(overflow) = permission_overflow(p)
             && self.companion_for(req).is_none()
@@ -1370,11 +1371,20 @@ impl RequestFlow {
                 CompanionOutcome::Delivered => {}
                 CompanionOutcome::Uncertain => {
                     fallback_cause = Some(DeclineReason::CompanionUncertain);
-                    fallback_summary = Some(fallback_permission_summary(p));
+                    fallback_loss = crate::feishu::card::question::FallbackLoss::OutcomeUnknown;
+                    fallback_summary = Some(crate::feishu::card::question::fallback_permission_summary(
+                        &describe_permission_target_summary(p),
+                        fallback_loss,
+                        false,
+                    ));
                 }
                 CompanionOutcome::Failed => {
                     fallback_cause = Some(DeclineReason::Overflow(overflow));
-                    fallback_summary = Some(fallback_permission_summary(p));
+                    fallback_summary = Some(crate::feishu::card::question::fallback_permission_summary(
+                        &describe_permission_target_summary(p),
+                        fallback_loss,
+                        false,
+                    ));
                 }
             }
         }
@@ -1458,9 +1468,15 @@ impl RequestFlow {
         // A fallback card is standalone: withdraw any block a previous pass
         // already inserted for this request before posting it, so exactly one
         // surface carries the controls (ADR-0102 / #1013).
-        if fallback_summary.is_some() {
-            self.withdraw_block_for_fallback(handles, req, resolved_host.as_deref())
-                .await;
+        if fallback_summary.is_some()
+            && !self
+                .withdraw_block_for_fallback(handles, req, resolved_host.as_deref())
+                .await
+        {
+            // The old block could not be neutralized: do not offer a second
+            // surface beside it. Leaving the request unmarked lets the next
+            // sweep retry the withdrawal.
+            return false;
         }
         // Inline path: take the HOST's write lock — never the request
         // Session's while also holding the host's, and never the reverse. A
@@ -1564,6 +1580,7 @@ impl RequestFlow {
                     summary,
                     p.always_supported,
                     patterns_target_digest(p),
+                    fallback_loss,
                 )
             }
             _ => self.kind.build_card(self, req, dir),
@@ -1850,13 +1867,28 @@ impl RequestFlow {
     /// is forgotten, and the cached card is patched so no control lingers. The
     /// companion marker (if any) is deliberately **not** touched — it is the
     /// no-duplicate guarantee for the failed send.
+    ///
+    /// The PATCH is previewed first and only committed locally after it lands,
+    /// and it is bounded by the flow's withdrawal timeout — exactly like
+    /// [`Self::patch_stored_surfaces`]. A failed PATCH keeps the handle so the
+    /// next sweep can retry; the caller then leaves the request unmarked and
+    /// offers no second surface.
     async fn withdraw_block_for_fallback(
         &self,
         handles: &FlowHandles,
         req: &PendingRequest,
         host: Option<&str>,
-    ) {
+    ) -> bool {
         let id = req.id();
+        let session = host.unwrap_or(req.session_id());
+        let receipt = crate::feishu::card::question::FALLBACK_PERMISSION_MOVED_RECEIPT;
+        let timeout_ms = self
+            .withdrawal_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // The same write lock the flush takes: the block's disappearance and
+        // the cached card's edit must not race a render pass.
+        let write_lock = handles.cards.write_lock(session).await;
+        let _guard = write_lock.lock().await;
         let Some(message_id) = handles
             .cards
             .card_handles
@@ -1865,34 +1897,106 @@ impl RequestFlow {
             .message_of(id)
             .map(str::to_string)
         else {
-            return;
-        };
-        let session = host.unwrap_or(req.session_id());
-        let receipt = crate::feishu::card::question::FALLBACK_PERMISSION_MOVED_RECEIPT;
-        // The same write lock the flush takes: the block's disappearance and
-        // the cached card's edit must not race a render pass.
-        let write_lock = handles.cards.write_lock(session).await;
-        let _guard = write_lock.lock().await;
-        let residue = crate::bridge::turn::InlineResidue::PerBlock(&|_: &str| receipt.to_string());
-        crate::bridge::turn::Turn::resolve_interactions(&handles.cards, session, &[id.to_string()], &residue)
+            // No cached card/handle yet: the block can still live in the
+            // accumulator (a flush is what records the handle). There is no
+            // surface to PATCH, so resolving the accumulator is the whole
+            // withdrawal.
+            let residue = crate::bridge::turn::InlineResidue::PerBlock(&|_: &str| receipt.to_string());
+            crate::bridge::turn::Turn::resolve_interactions(
+                &handles.cards,
+                session,
+                &[id.to_string()],
+                &residue,
+            )
             .await;
-        let card = {
-            let mut registry = handles.cards.card_handles.lock().await;
-            let card = registry.resolve_on(&message_id, id, receipt);
-            registry.forget(id);
-            card
+            return true;
         };
-        if let Some(card) = card
-            && let Err(e) = handles.platform.update_message(&message_id, &card).await
-        {
-            tracing::warn!(
-                "fallback {}: could not withdraw its block on {}: {}",
-                id,
-                message_id,
-                e
-            );
+        // Preview the cached card's edit without committing it: a failed PATCH
+        // must leave the live block (and its handle) in place for a retry.
+        let preview = handles
+            .cards
+            .card_handles
+            .lock()
+            .await
+            .resolved_preview(&message_id, id, receipt);
+        let Some(preview) = preview else {
+            // The cached card cannot render the block: nothing there is
+            // clickable, so the handle has nothing left to neutralize.
+            handles.cards.card_handles.lock().await.forget(id);
+            let residue = crate::bridge::turn::InlineResidue::PerBlock(&|_: &str| receipt.to_string());
+            crate::bridge::turn::Turn::resolve_interactions(
+                &handles.cards,
+                session,
+                &[id.to_string()],
+                &residue,
+            )
+            .await;
+            return true;
+        };
+        let patched = crate::bridge::bounded_call(
+            &format!("fallback {} withdraw block on {}", id, message_id),
+            timeout_ms,
+            handles.platform.update_message(&message_id, &preview),
+        )
+        .await;
+        match patched {
+            Some(Ok(())) => {
+                {
+                    let mut registry = handles.cards.card_handles.lock().await;
+                    registry.resolve_on(&message_id, id, receipt);
+                    registry.forget(id);
+                }
+                // The accumulator is the render source: record the receipt
+                // there only once the PATCH has landed.
+                let residue = crate::bridge::turn::InlineResidue::PerBlock(&|_: &str| receipt.to_string());
+                crate::bridge::turn::Turn::resolve_interactions(
+                    &handles.cards,
+                    session,
+                    &[id.to_string()],
+                    &residue,
+                )
+                .await;
+                tracing::info!("withdrew {} inline block for the standalone fallback card", id);
+                true
+            }
+            Some(Err(e)) if e.is_message_gone() => {
+                let mut registry = handles.cards.card_handles.lock().await;
+                registry.forget(id);
+                registry.release_cache(&message_id);
+                drop(registry);
+                let residue = crate::bridge::turn::InlineResidue::PerBlock(&|_: &str| receipt.to_string());
+                crate::bridge::turn::Turn::resolve_interactions(
+                    &handles.cards,
+                    session,
+                    &[id.to_string()],
+                    &residue,
+                )
+                .await;
+                tracing::info!(
+                    "withdrew {} inline block: message {} is gone ({e})",
+                    id,
+                    message_id
+                );
+                true
+            }
+            other => {
+                match other {
+                    Some(Err(e)) => tracing::warn!(
+                        "fallback {}: withdrawing its block on {} failed: {e}; keeping it for a retry",
+                        id,
+                        message_id
+                    ),
+                    _ => tracing::warn!(
+                        "fallback {}: withdrawing its block on {} timed out after {}ms; keeping it \
+                         for a retry",
+                        id,
+                        message_id,
+                        timeout_ms
+                    ),
+                }
+                false
+            }
         }
-        tracing::info!("withdrew {} inline block for the standalone fallback card", id);
     }
 
     /// Patch every stored surface for `id` with the replacement `receipt` and

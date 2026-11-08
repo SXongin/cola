@@ -1672,7 +1672,7 @@ async fn fallback_surface(
         .expect("the fallback card is recorded")
         .message_id
         .clone();
-    let risk = crate::feishu::card::question::fallback_permission_risk_note();
+    let header = crate::feishu::card::question::FALLBACK_PERMISSION_HEADER;
     let card = platform
         .calls
         .lock()
@@ -1681,7 +1681,7 @@ async fn fallback_surface(
         .rev()
         .find_map(|call| match call {
             PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. }
-                if card_text(card).contains(risk) =>
+                if card_text(card).contains(header) =>
             {
                 Some(card.clone())
             }
@@ -1701,10 +1701,23 @@ async fn fallback_app() -> (
     Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     tempfile::TempDir,
 ) {
+    fallback_app_for(long_permission("per_long", "ses_test", 5_000)).await
+}
+
+/// [`fallback_app`] with a caller-supplied request (e.g. one whose backend does
+/// not advertise the session-scoped always grant).
+async fn fallback_app_for(
+    request: crate::backend::types::PermissionRequest,
+) -> (
+    Arc<App>,
+    Arc<RecordingPlatform>,
+    Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![long_permission("per_long", "ses_test", 5_000)]);
+    backend.ask_permissions(vec![request]);
     let replies = Arc::clone(&backend.reply_permission_calls);
     let (app, platform) = build_app(cfg, backend).await;
     platform
@@ -1746,10 +1759,25 @@ async fn a_failed_companion_surfaces_a_fallback_card_instead_of_rejecting() {
         "the card names the risk: {text}"
     );
     assert!(text.contains("目标长度"), "the target summary is shown: {text}");
-    assert!(text.contains("完整内容"), "and says it was not delivered: {text}");
+    assert!(
+        text.contains("**完整内容**: 未能送达。"),
+        "a definite failure says the content was not delivered: {text}"
+    );
     assert!(
         text.contains("原始客户端"),
         "and points at the original client: {text}"
+    );
+    let once = button_with_label(&card, "✅ 允许一次");
+    let digest = once["target_digest"]
+        .as_str()
+        .expect("the digest rides the callback as a string");
+    assert!(
+        once["target_digest"].is_string(),
+        "a 64-bit digest is a hex string, not a JSON number: {once}"
+    );
+    assert!(
+        u64::from_str_radix(digest, 16).is_ok(),
+        "the hex digest parses back: {digest}"
     );
     for label in ["✅ 允许一次", "🔁 始终允许", "🚫 拒绝", "⚡ 开启自动授权"] {
         assert!(
@@ -1871,9 +1899,11 @@ async fn a_fallback_confirmation_click_approves_and_audits() {
 }
 
 /// A confirmation whose digest is not the re-read request's is refused WITHOUT
-/// a reply: the target changed between the two steps.
+/// a reply — but the request stays actionable: the ack rebuilds the fallback
+/// card with the changed-target note and a fresh digest, and a subsequent
+/// correct confirmation succeeds.
 #[tokio::test]
-async fn a_fallback_confirmation_with_a_stale_digest_is_refused() {
+async fn a_fallback_confirmation_with_a_stale_digest_keeps_the_request_actionable() {
     let _wd = test_work_dir();
     let (app, platform, replies, _dir) = fallback_app().await;
     let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
@@ -1886,7 +1916,7 @@ async fn a_fallback_confirmation_with_a_stale_digest_is_refused() {
         .card
         .expect("the confirmation card");
     let mut confirm = button_with_label(&confirmation, "✅ 确认批准");
-    confirm["target_digest"] = serde_json::json!(0);
+    confirm["target_digest"] = serde_json::json!("0");
 
     let result = app
         .host_action_on_message(confirm, &message_id)
@@ -1900,14 +1930,39 @@ async fn a_fallback_confirmation_with_a_stale_digest_is_refused() {
         app.permission.sent_cards.lock().await.contains_key("per_long"),
         "and does not claim the request"
     );
-    let text = card_text(result.card.as_ref().expect("the reason card"));
+    let rebuilt = result.card.as_ref().expect("the rebuilt fallback card");
+    let text = card_text(rebuilt);
     assert!(
-        text.contains(crate::feishu::card::question::RISK_DIGEST_MISMATCH_LABEL),
-        "the result names the reason: {text}"
+        text.contains("目标已变化"),
+        "the rebuilt card says the target changed: {text}"
     );
     assert!(
-        text.contains("目标在你确认之后发生了变化"),
-        "and explains the stale target: {text}"
+        text.contains("重新查看并再次确认"),
+        "and asks the user to confirm again: {text}"
+    );
+    for label in ["✅ 允许一次", "🔁 始终允许", "🚫 拒绝", "⚡ 开启自动授权"] {
+        assert!(
+            text.contains(label),
+            "the rebuilt card keeps the `{label}` control: {text}"
+        );
+    }
+
+    // The fresh card's digest is the current target's: confirming again works.
+    let once = button_with_label(rebuilt, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the rebuilt card's first step returns the confirmation")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    app.host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the corrected confirmation returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the rebuilt fallback card recovers the decision"
     );
 }
 
@@ -1935,8 +1990,159 @@ async fn a_fallback_deny_replies_on_one_click() {
     );
 }
 
-/// 开启自动授权 on the fallback card stays one click and approves the pending
-/// request through `set_auto_accept`.
+/// 取消 on the confirmation card returns to the fallback card without replying
+/// or claiming, and the request remains confirmable.
+#[tokio::test]
+async fn a_fallback_confirmation_cancel_returns_to_the_fallback_card() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, _dir) = fallback_app().await;
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+
+    let once = button_with_label(&card, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the first step returns the confirmation card")
+        .card
+        .expect("the confirmation card");
+    let cancel = button_with_label(&confirmation, "取消");
+
+    let result = app
+        .host_action_on_message(cancel, &message_id)
+        .await
+        .expect("cancel returns a card");
+    assert!(replies.lock().await.is_empty(), "cancel never replies");
+    let rebuilt = result.card.as_ref().expect("the fallback card again");
+    let text = card_text(rebuilt);
+    assert!(
+        text.contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER),
+        "cancel restores the fallback card: {text}"
+    );
+    for label in ["✅ 允许一次", "🔁 始终允许", "🚫 拒绝", "⚡ 开启自动授权"] {
+        assert!(text.contains(label), "cancel keeps `{label}`: {text}");
+    }
+
+    // Cancelling claimed nothing: the ordinary two-step decision still works.
+    let once = button_with_label(rebuilt, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the restored card's first step returns the confirmation")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    app.host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the confirmation returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the restored card can still be confirmed"
+    );
+}
+
+/// 始终允许 goes through the same confirmation step and carries the original
+/// `always` decision once confirmed.
+#[tokio::test]
+async fn a_fallback_always_decision_confirms_before_reply() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, _dir) = fallback_app().await;
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+
+    let always = button_with_label(&card, "🔁 始终允许");
+    let confirmation = app
+        .host_action_on_message(always, &message_id)
+        .await
+        .expect("the always first step returns the confirmation card")
+        .card
+        .expect("the confirmation card");
+    assert!(
+        replies.lock().await.is_empty(),
+        "the always first step never replies"
+    );
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    let result = app
+        .host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the always confirmation returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "always".to_string())],
+        "the confirmation carries the original always decision"
+    );
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains("✅ 已始终允许（目标未完整展示）"),
+        "the result names the always decision and the unseen target: {text}"
+    );
+}
+
+/// A backend that does not advertise the session-scoped always grant gets a
+/// fallback card without the 始终允许 control (the same rule as the ordinary
+/// permission card).
+#[tokio::test]
+async fn a_fallback_card_hides_always_when_not_advertised() {
+    let _wd = test_work_dir();
+    let mut request = long_permission("per_long", "ses_test", 5_000);
+    request.always_supported = false;
+    let (app, platform, _replies, _dir) = fallback_app_for(request).await;
+    let (_message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    let text = card_text(&card);
+
+    assert!(text.contains("✅ 允许一次"), "once is offered: {text}");
+    assert!(text.contains("🚫 拒绝"), "deny is offered: {text}");
+    assert!(text.contains("⚡ 开启自动授权"), "Auto-Accept is offered: {text}");
+    assert!(
+        !text.contains("始终允许"),
+        "the unsupported always grant is not offered: {text}"
+    );
+}
+
+/// An existing inline block is withdrawn to a neutral "moved" receipt before
+/// the standalone fallback card lands, so exactly one surface carries controls.
+#[tokio::test]
+async fn a_fallback_withdraws_an_existing_block_to_its_move_receipt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let request = long_permission("per_long", "ses_test", 5_000);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![request.clone()]);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .fail_send_message_definite_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+    assert!(
+        Turn::add_permission(&app.cards_handle(), "ses_test", &request, "/work").await,
+        "the fixture inlines the request first"
+    );
+    Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "the old block is no longer live"
+    );
+    let streaming = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let text = card_text(&streaming);
+    assert!(
+        text.contains(crate::feishu::card::question::FALLBACK_PERMISSION_MOVED_RECEIPT),
+        "the streaming card carries the move receipt: {text}"
+    );
+    assert!(
+        !text.contains("✅ 允许一次"),
+        "no old control survives on the streaming card: {text}"
+    );
+    fallback_surface(&app, &platform, "per_long").await;
+}
+
 #[tokio::test]
 async fn a_fallback_autoaccept_enables_the_mode_on_one_click() {
     let _wd = test_work_dir();
@@ -1968,41 +2174,52 @@ async fn a_fallback_autoaccept_enables_the_mode_on_one_click() {
     );
 }
 
-/// The confirmation ack is the standalone fallback card's replacement: the
-/// streaming card's content is never patched with it (ADR-0102 / #1013).
+/// A fallback decision's ack replaces the standalone fallback card, never the
+/// streaming card — even though the session has a live card. Without the
+/// `fallback`/`risk_confirmed` override `settle_ack` would return the streaming
+/// card's body and the deny result would never reach the clicked card.
 #[tokio::test]
-async fn a_fallback_confirmation_never_replaces_a_streaming_card() {
+async fn a_fallback_decision_never_replaces_a_streaming_card() {
     let _wd = test_work_dir();
     let (app, platform, _replies, _dir) = fallback_app().await;
-    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
-    let before = card_text(
+    let streaming_before = card_text(
         &Turn::rendered_card(&app.cards_handle(), "ses_test")
             .await
             .expect("the streaming card renders"),
     );
-    let once = button_with_label(&card, "✅ 允许一次");
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    let deny = button_with_label(&card, "🚫 拒绝");
 
-    app.host_action_on_message(once, &message_id)
+    let result = app
+        .host_action_on_message(deny, &message_id)
         .await
-        .expect("the first step returns a card");
+        .expect("the deny click returns a result");
+    let ack = card_text(result.card.as_ref().expect("the deny result card"));
+    assert!(
+        ack.contains("🚫 已拒绝（目标未完整展示）"),
+        "the ack is the deny result, not the streaming card: {ack}"
+    );
+    assert!(
+        !ack.contains("权限请求（目标未完整展示）"),
+        "the ack must not be a fallback card either: {ack}"
+    );
 
-    let after = card_text(
+    let streaming_after = card_text(
         &Turn::rendered_card(&app.cards_handle(), "ses_test")
             .await
             .expect("the streaming card still renders"),
     );
     assert_eq!(
-        before, after,
-        "the confirmation ack must not touch the streaming card"
+        streaming_before, streaming_after,
+        "the deny ack must not touch the streaming card"
     );
     assert!(
         !platform.calls.lock().await.iter().any(|call| matches!(
             call,
             PlatformCall::UpdateMessage { card, .. }
-                if card_text(card)
-                    .contains(crate::feishu::card::question::FALLBACK_PERMISSION_CONFIRM_HEADER)
+                if card_text(card).contains("🚫 已拒绝（目标未完整展示）")
         )),
-        "no PATCH carries the confirmation onto another card"
+        "no PATCH carries the deny result onto another card"
     );
 }
 
@@ -3251,11 +3468,27 @@ async fn an_ambiguous_companion_send_surfaces_the_fallback_card_and_is_not_retri
         .replied_cards()
         .await
         .into_iter()
-        .filter(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        })
+        .filter(|card| card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER))
         .count();
     assert_eq!(fallback_cards, 1, "the fallback card is surfaced once");
+    let (_, card) = fallback_surface(&app, &platform, "per_long").await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("**完整内容**: 发送结果未知，可能已送达。"),
+        "an uncertain send is named as unknown, not as a definite failure: {text}"
+    );
+    assert!(
+        !text.contains("**完整内容**: 未能送达。"),
+        "the fallback must not claim a definite failure for an ambiguous send: {text}"
+    );
+    assert!(
+        text.contains("完整目标未能确认送达"),
+        "the risk paragraph also avoids claiming a definite failure: {text}"
+    );
+    assert!(
+        !text.contains("完整目标未能送达"),
+        "the unknown outcome must not borrow the definite-failure risk copy: {text}"
+    );
 
     // The next sweep meets the marker: no re-send, and no duplicate fallback.
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
@@ -3351,14 +3584,14 @@ async fn an_allow_click_on_an_uncertain_companion_is_refused() {
         Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
             .is_empty(),
-        "no interactive approval is offered"
+        "no inline approval is offered"
     );
 }
 
 /// A definite Rich Text failure falls to the File lane; if the FILE send is
 /// then ambiguous, the companion outcome is unknown. No caption is sent (it
 /// would point at a file that may not exist), no retry happens, and the request
-/// follows the uncertain refusal path.
+/// gets the fallback card with the unknown-outcome copy.
 #[tokio::test]
 async fn an_ambiguous_file_after_a_definite_post_failure_is_uncertain() {
     let _wd = test_work_dir();
@@ -3425,15 +3658,13 @@ async fn an_ambiguous_file_after_a_definite_post_failure_is_uncertain() {
         Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
             .is_empty(),
-        "no interactive approval is offered"
+        "no inline approval is offered"
     );
     let fallback_cards = platform
         .replied_cards()
         .await
         .into_iter()
-        .filter(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        })
+        .filter(|card| card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER))
         .count();
     assert_eq!(fallback_cards, 1, "the fallback card is surfaced");
 }
@@ -3480,7 +3711,7 @@ async fn an_empty_companion_message_id_is_not_a_delivery() {
         Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
             .is_empty(),
-        "no interactive approval is offered"
+        "no inline approval is offered"
     );
 }
 
