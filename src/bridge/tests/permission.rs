@@ -4248,6 +4248,74 @@ async fn an_over_budget_permission_without_a_reply_target_sends_the_companion_in
     );
 }
 
+/// A chat-target companion whose Rich Text body is past the 30 KB post cap
+/// takes the File Message lane into the same chat, with its following caption
+/// and the File Message summary card.
+#[tokio::test]
+async fn an_over_budget_chat_target_delivers_the_file_companion_into_the_chat() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![long_permission("per_huge", "ses_test", 31_000)]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    // No live card: the session's chat is the companion target.
+    seed_session(&app, "ses_test", "/work").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(replies.lock().await.is_empty(), "never declined");
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::UploadFile { name, .. } if name.contains("per_huge")
+        )),
+        "the full target is uploaded: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessage {
+                receive_id,
+                msg_type,
+                content,
+                ..
+            } if receive_id == "chat_1"
+                && msg_type == "file"
+                && content["file_key"] == "file_test"
+        )),
+        "the File Message is sent into the chat: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessage {
+                receive_id,
+                msg_type,
+                content,
+                ..
+            } if receive_id == "chat_1"
+                && msg_type == "text"
+                && content["text"].as_str().is_some_and(|text| text.contains("per_huge"))
+        )),
+        "the caption follows the file into the chat: {calls:?}"
+    );
+    let cards = platform.sent_cards().await;
+    assert!(
+        cards
+            .iter()
+            .any(|card| card_text(card).contains("文件消息（File Message）")),
+        "the summary card names the File Message lane: {cards:?}"
+    );
+    assert!(
+        app.permission.sent_cards.lock().await.contains_key("per_huge"),
+        "the summary is recorded as the standalone surface"
+    );
+}
+
 /// With no card target at all — the request's session is not mapped, so there
 /// is no message to reply under and no chat to send into — the fallback cannot
 /// be offered and the refusal path settles the request. It is rejected on the
