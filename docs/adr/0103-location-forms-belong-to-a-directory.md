@@ -65,11 +65,14 @@ others upstream, and the losing cards go stale through the existing
 resolved-elsewhere path. That path's copy names “another client”, which is
 imprecise when cola's own card in another directory won: the wire carries no
 fan-out marker, so the losing card cannot say that, and the generic copy is
-accepted as a known limitation. No cross-location dedupe is attempted. The card
-never rides an inline block, never enters `pending_sessions`, and never drives
-the Instant Reminder: that surface needs a Turn's generation to own and clear
-its pin, and a Location Form has none. It does take a **Message Pin** under the
-same `instant_reminder` opt-in, because a pin is keyed by message.
+accepted as a known limitation. The same copy also covers a no-answer ending —
+a connection abort or a server exit — which a session-less form cannot
+distinguish from another client's decision. No cross-location dedupe is
+attempted. The card never rides an inline block, never enters
+`pending_sessions`, and never drives the Instant Reminder: that surface needs a
+Turn's generation to own and clear its pin, and a Location Form has none. It
+does take a **Message Pin** under the same `instant_reminder` opt-in, because a
+pin is keyed by message.
 
 **Dismissal.** 「稍后」 withdraws the card — and releases its Message Pin —
 without declining the request. The form stays pending and `/mcp` can reopen it
@@ -136,7 +139,8 @@ permits, not for a case in the current wire.
   directory; a no-caller one may produce one card per holder, and each losing
   card goes stale through the existing resolved-elsewhere path. No
   cross-location dedupe is attempted, and that path's “another client” copy is
-  an accepted imprecision for a pooled loser.
+  an accepted imprecision for a pooled loser and for a no-answer ending the
+  session-less card cannot distinguish.
 - A Session-owned elicitation — which the in-progress session-owned MCP work
   produces — takes the normal Question path unchanged; the Location path
   remains for location-owned servers.
