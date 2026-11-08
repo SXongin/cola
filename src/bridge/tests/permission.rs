@@ -3767,6 +3767,79 @@ async fn a_body_overflow_summary_allow_is_proven_by_the_delivered_description() 
     );
 }
 
+/// A diff-carrying permission is exempt from the summed-target budget: the
+/// card must show the diff, and the allow must not need a companion. The
+/// target-overflow companion carries paths only, so routing it there would
+/// approve an edit whose diff was shown nowhere.
+#[tokio::test]
+async fn an_over_budget_diff_permission_stays_on_the_card_and_needs_no_companion() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let paths: Vec<String> = (0..25)
+        .map(|i| format!("/proj/src/{:0>2}_{}.rs", i, "x".repeat(124)))
+        .collect();
+    let diff = "--- /proj/src/00.rs\n+++ /proj/src/00.rs\n@@ -1 +1 @@\n-old line\n+new line\n";
+    let request = crate::backend::types::PermissionRequest {
+        request_id: "per_diff".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("edit".into()),
+        patterns: paths.clone(),
+        metadata: Some(serde_json::json!({
+            "files": [{ "file": paths[0], "patch": diff }]
+        })),
+        always: Vec::new(),
+        always_supported: true,
+    };
+    assert_eq!(
+        crate::bridge::request::kind::permission_overflow(&request),
+        None,
+        "the rendered diff exempts the request from the target budget"
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![request]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(
+        posted_companions(&platform).await.is_empty(),
+        "a diff-carrying request needs no companion: its content is the card"
+    );
+    assert!(
+        app.permission.surfaces.companion("per_diff").is_none(),
+        "and no delivery record is written"
+    );
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let text = card_text(&card);
+    for i in 0..paths.len() {
+        let marker = format!("/proj/src/{i:0>2}_");
+        assert!(text.contains(&marker), "every path is on the card: {text}");
+    }
+    assert!(
+        text.contains("@@ -1 +1 @@") && text.contains("+new line"),
+        "the unified diff is on the card: {text}"
+    );
+    let allow = button_with_label(&card, "✅ 允许一次");
+    assert!(
+        allow.get("summary").is_none(),
+        "the card is not a summary surface: {allow}"
+    );
+
+    let ack = click_perm(&app, "once", "per_diff", "✅ 已允许一次").await;
+    assert!(ack.contains("✅ 已允许一次"), "the allow lands: {ack}");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_diff".to_string(), "once".to_string())],
+        "the allow needs no companion proof and never falls back"
+    );
+}
+
 /// A companion record whose digest does not match the pending request it is
 /// meant to prove — a target that changed after the delivery — is no proof. The
 /// click guard refuses the approval and the result names the missing delivery.

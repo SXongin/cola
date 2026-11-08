@@ -67,6 +67,12 @@ is allowed only when the full content was delivered for that request.
   summed length and the companion lane with a short (60-character) target line,
   clipped to the receipt budget. The full description stays for in-budget
   requests.
+- **A rendered diff is never an overflow.** An `edit` / `patch` /
+  `apply_patch` request whose metadata carries a unified diff is shown on the
+  card under the diff's own escaped-byte cap and truncation note; neither the
+  summed-target budget nor the rendered-body ceiling applies. The target-overflow
+  companion carries targets only, so routing such a request there would approve
+  a diff that no surface showed.
 - **ADR-0083 §5's ladder.** The full content goes out as one Rich Text Message
   (`post` with an `md` tag); a body past the 30 KB `post` cap, or a send that
   definitely did not land, falls to one File Message (an uploaded `.txt` whose
