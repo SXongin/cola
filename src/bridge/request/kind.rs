@@ -81,7 +81,8 @@ impl PendingRequest {
 ///
 /// [`RequestKind::prepare`] runs before a card is built; a permission the card
 /// cannot show takes the companion lane (ADR-0102), and a companion that cannot
-/// be delivered is settled by the flow's decline path.
+/// be delivered takes the flow's fallback card. Only a request with no usable
+/// reply target is settled by the flow's decline path.
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)] // the action context is the trait's whole point
 pub trait RequestKind: Send + Sync {
@@ -2811,7 +2812,7 @@ pub(crate) enum PermissionOverflow {
 }
 
 impl PermissionOverflow {
-    /// The bound the refusal copy names.
+    /// The bound the fallback and refusal copy names.
     pub(crate) fn budget(self) -> usize {
         match self {
             Self::Targets => PERMISSION_TARGET_MAX_CHARS,

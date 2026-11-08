@@ -534,6 +534,26 @@ default `auto` policy it starts its own server on demand, so no manual
 `opencode serve` is needed. If no config file exists yet, cola prints a hint
 telling you where to put one and exits.
 
+## Permission requests
+
+A permission request renders on a card with Allow once, Always allow, Deny and
+the Auto-Accept toggle. When its target is too long for the card — the summed
+targets past cola's **Permission Display Budget**, or the rendered body past the
+single-element ceiling — cola does not decline it: the full command is delivered
+in a **companion message** in the chat (a Rich Text Message, or a File Message
+when the text is past that lane's cap), and the card shows a summary of the
+target. Read the full command in the chat, then approve the request from the
+card as usual.
+
+If the companion cannot be delivered, cola neither approves unseen text nor
+drops the request: the card explains the risk and asks for a second confirmation
+before approving. The original client — the TUI or desktop app attached to the
+same session — remains the place to inspect the request.
+
+An **Auto-Accept** session keeps its own rule: it answers every permission
+unseen and logs each approval, including an over-budget target. See
+`/autoaccept` below for the command form.
+
 ## Multi-client sync
 
 cola adds no per-client adapter: sync happens at the **server + shared store +

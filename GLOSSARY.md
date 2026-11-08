@@ -349,7 +349,7 @@ The file a **Terminal Command**'s merged stdout and stderr are written to direct
 _Avoid_: Log (unqualified — it collides with the application log), output buffer, console log
 
 **Rich Text Message** (富文本消息):
-The Feishu `post` message carrying an `md` tag that cola posts when a card structurally cannot hold a preview — past the element budget, the five-table cap or the 49-row table cap (ADR-0083). CommonMark 0.31 + GFM: headings, lists, footnotes, fenced code blocks and tables, and it is **reported** to carry none of the card's element and table caps — a claim the research marks unverified, so a failure degrades to a **File Message** (ADR-0083, decisions 5 and 6). The same 30 KB body cap as a card, and editable in place under the platform's own edit limit. It is not a **Card** — no buttons, no interactivity — and deliberately not the overflow lane for size alone; contrast a **File Message**, which carries the whole bytes.
+The Feishu `post` message carrying an `md` tag that cola posts when a card structurally cannot hold a preview — past the element budget, the five-table cap or the 49-row table cap (ADR-0083). CommonMark 0.31 + GFM: headings, lists, footnotes, fenced code blocks and tables, and it is **reported** to carry none of the card's element and table caps — a claim the research marks unverified, so a failure degrades to a **File Message** (ADR-0083, decisions 5 and 6). The same 30 KB body cap as a card, and editable in place under the platform's own edit limit. It is not a **Card** — no buttons, no interactivity — and not a general overflow lane for size alone: the one size-triggered exception is a **Permission** target past the **Permission Display Budget**, which rides it as a **Companion Message** (ADR-0102). Contrast a **File Message**, which carries the whole bytes.
 _UI label_: none — it renders as an ordinary chat message.
 _Avoid_: post message (that is the platform's `msg_type`), markdown message, format message
 
@@ -392,8 +392,24 @@ _UI label_: 🧩 已加载技能 — the fold title.
 _Avoid_: Skill panel, instruction fold
 
 **Permission**:
-A request from the AI backend to perform an action on a resource. Presented to the user as an interactive card with Allow/Deny/Always options.
+A request from the AI backend to perform an action on a resource. Presented to the user as an interactive card with Allow/Deny/Always options. When the card cannot show the target in full, the full content rides beside it as a **Companion Message**, so the request is still approved from the chat rather than declined; only a request with no usable reply surface at all stays declined.
 _Avoid_: Approval, authorization, consent
+
+**Permission Display Budget** (权限展示预算):
+The summed character size of a permission's targets that one card element can show in full — cola's 3,000 characters, the only *display* budget. It is charged across all of a request's targets together, not one at a time, and a target past it is unshowable rather than automatically declined. Distinct from the measured single-element render ceiling (3,060 characters), which bounds the whole rendered body and is a render invariant, not a tuning knob.
+_Avoid_: Card limit, character limit (the card's 30 KB JSON cap and the element ceiling are different bounds)
+
+**Companion Message** (companion 消息):
+The Rich Text Message or File Message that carries a permission target the card cannot show in full. It is sent into the Chat before any control that approves the request becomes interactive, and its confirmed delivery is what lets the card approve a target it only summarises; a File Message takes over when the text is past the Rich Text lane's cap.
+_Avoid_: Attachment, overflow message (that names a delivery lane, not this role)
+
+**Completeness Proof** (完整性证明):
+The fact that a permission's full content reached the Chat before any surface offered to approve it: a confirmed **Companion Message**, or the fallback card's explicit two-step risk confirmation when delivery cannot be proved. A budget constant alone is not a proof, and an ambiguous send leaves only a marker.
+_Avoid_: Delivery proof (reads as the transport report), budget check
+
+**Unshowable Permission** (无法完整展示的权限):
+A **Permission** whose summed targets pass the **Permission Display Budget**, or whose rendered body passes the single-element ceiling. It is not automatically declined on an interactive surface: the card shows a summary and the full content travels in a **Companion Message**; if that delivery fails, the fallback card names the risk and asks for a second confirmation. Only a request with no usable reply target keeps the old refusal path.
+_Avoid_: Over-budget request (the budget is one of two bounds), long command
 
 **Auto-Accept**:
 cola's per-session blanket flag (`auto_accept` in the SessionStore, `/autoaccept`). When on, cola answers EVERY pending permission for that session with "once" automatically — no permission card is surfaced at all. Lives in cola's store and persists. Sessions cola creates can start with it on via `[bridge] default_auto_accept` (never an adopted session — that keeps its own state). Distinct from the backend's per-type "Always" rule: Auto-Accept is session-wide (all permission types) and cola-side, while "Always" is scoped to one permission type, lives on the backend instance, and makes the backend skip the ask entirely.
@@ -527,7 +543,7 @@ A file payload a transcript part carries instead of text — the Backend's `file
 _Avoid_: Attachment, media, file part, Tool File Content (too narrow — a user message carries File Content too)
 
 **File Message**:
-The separate Feishu file message cola posts for a **File Content** it cannot embed in the card — a non-image file (a PDF) or an image past the embedding caps — uploaded once (Feishu `im:resource`) and sent once per File Content. It is not a **Card**: it rides the topic beside the **Card Chain** (replied in-thread under the live card) and is tracked by its placeholder line in the **Tool Panel**. A File Content past Feishu's 30MB message cap, or one whose send fails, has no File Message (placeholder only); an image within the caps is embedded in the card instead, never sent as a File Message.
+The separate Feishu file message cola posts for a **File Content** it cannot embed in the card — a non-image file (a PDF) or an image past the embedding caps — uploaded once (Feishu `im:resource`) and sent once per File Content. It is also the second lane of a permission **Companion Message** when the full target outgrows the Rich Text cap (ADR-0102). It is not a **Card**: it rides the topic beside the **Card Chain** (replied in-thread under the live card) and is tracked by its placeholder line in the **Tool Panel**. A File Content past Feishu's 30MB message cap, or one whose send fails, has no File Message (placeholder only); an image within the caps is embedded in the card instead, never sent as a File Message.
 _Avoid_: Attachment message, media message, upload
 
 **Turn Footer**:

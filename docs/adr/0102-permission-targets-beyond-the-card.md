@@ -16,6 +16,21 @@ completeness proof a single predicate, `PermissionOverflow` — the summed
 ADR-0101's remaining clause that an interactive surface still declines an
 over-budget target; its Auto-Accept decision is unchanged.
 
+**Why 3,000.** The platform documents no per-element text cap; cola measured
+that one markdown element of **8,000 ASCII / 3,060 CJK characters** renders
+fully (`docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md`).
+The summed target budget takes the CJK figure as the widest script, rounds it
+down to **3,000**, and leaves the remainder for the renderer's scaffolding
+(header, reason, metadata lines and footer) while several targets share the one
+element. `PERMISSION_TARGET_MAX_CHARS = 3000` is therefore the only **display**
+budget — the number an adapter or user tunes. `PERMISSION_BODY_MAX_CHARS = 3060`
+is not a second display budget but a **render invariant**: the measured
+single-element ceiling for the whole rendered body, targets plus scaffolding;
+`src/backend/types.rs` carries both derivations. A 3,000-character CJK target is
+about 9 KB of JSON; because one sanitized character can cost five bytes (`<` →
+`&#60;` outside a code span), the body's JSON worst case is ~15 KB, inside
+the card's JSON budget.
+
 The parent spec directs this ticket to reuse **ADR-0083 §5**'s existing
 Rich Text Message → File Message ladder as the one overflow mechanism. That
 lane's own charter says "by what the content *is*, not how big it is"
@@ -117,6 +132,10 @@ is allowed only when the full content was delivered for that request.
   if the post fails. A failed withdrawal leaves the new card pending and the old
   block logs/retries.
   Deny and Auto-Accept stay one click; Auto-Accept still renders no companion.
+  This two-step confirmation is the **one deliberate exception** to the delivery
+  proof: it is the only way an over-budget target is approved without a
+  confirmed companion, and it requires the user to read the risk statement and
+  confirm again against the request the click re-reads.
   A risk-confirmed approval logs at WARN with the request id, the target length
   and the fact that the user confirmed unseen text. The risk digest differs
   from the companion digest on a rendered-body overflow on purpose: the
@@ -127,6 +146,11 @@ is allowed only when the full content was delivered for that request.
 
 - A huge command is readable in the chat, stays inside the card's JSON budget,
   and can be approved where it was seen. The transcript keeps the full content.
+- Auto-Accept keeps ADR-0101's decision unchanged: it answers every pending
+  permission unseen, renders no card, sends no companion, and logs the request
+  id, the crossed bound, the target length and a bounded first line. The
+  completeness proof never applies there because no approval surface exists to
+  guard.
 - The proof depends on persisted state, which is why the record is client-scoped
   and versioned with the other surfaces (ADR-0091). A lost or corrupt record
   fails closed: the click is refused, never approved unseen.
