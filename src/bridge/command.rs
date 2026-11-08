@@ -1939,10 +1939,10 @@ pub(crate) async fn handle_command(
                         return Ok(());
                     };
                     // Persist BEFORE approving (#892): a sweep landing in the
-                    // approval window must already read the flag as on, or its
-                    // `refuse` declines the over-budget request this command is
-                    // about to approve. A persist that did not take effect
-                    // (an epoch mismatch) approves nothing.
+                    // approval window must already read the flag as on, or it
+                    // surfaces a card (and companion) for the over-budget
+                    // request this command is about to approve. A persist that
+                    // did not take effect (an epoch mismatch) approves nothing.
                     //
                     // Field-only (issue #910): the approval sweep below can run
                     // for a while, and writing the whole snapshot back would

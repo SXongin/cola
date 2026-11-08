@@ -811,7 +811,7 @@ mod tests {
         );
         assert!(
             !request(vec![&"a".repeat(3001)]).targets_are_fully_shown(),
-            "a single over-budget target is refused"
+            "a single over-budget target is not fully shown"
         );
         assert!(
             request(vec![]).targets_are_fully_shown(),

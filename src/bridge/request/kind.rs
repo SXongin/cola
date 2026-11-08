@@ -1054,7 +1054,7 @@ impl RequestKind for PermissionKind {
             ),
             ClickProof::Missing => (
                 crate::feishu::card::question::MISSING_PERMISSION_CLICK_LABEL,
-                "已拒绝：完整内容未送达".to_string(),
+                "已拒绝：没有匹配的完整内容".to_string(),
                 crate::feishu::card::question::missing_permission_click_note(),
                 "red",
             ),

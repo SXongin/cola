@@ -2261,7 +2261,7 @@ async fn a_click_on_a_stale_allow_card_without_a_companion_is_refused() {
     );
     assert_eq!(
         result.toast.as_deref(),
-        Some("已拒绝：完整内容未送达"),
+        Some("已拒绝：没有匹配的完整内容"),
         "the toast names the refusal"
     );
     let text = card_text(result.card.as_ref().expect("the result card"));
