@@ -47,7 +47,7 @@ pub fn permission_buttons(
     // into every button multiplied the card's JSON by the button count; a click
     // rebuilds the result body from what it already has (the verified pending
     // request, or the block's recorded target).
-    let btn_value = |reply: &str, label: &str, color: &str| {
+    permission_control_elements(always_supported, |reply, _decision, label, color| {
         json!({
             "action": "perm",
             "reply": reply,
@@ -57,22 +57,49 @@ pub fn permission_buttons(
             "perm_label": label,
             "perm_color": color,
         })
-    };
+    })
+}
+
+/// The four permission controls in their shared order: Allow Once / Allow
+/// Always (only when the backend advertised a session-scoped grant) / Deny /
+/// Auto-Accept. `value` supplies each button's callback payload, so the
+/// ordinary card and the fallback card share every label, type and ordering
+/// decision and differ only in what a click means.
+fn permission_control_elements(
+    always_supported: bool,
+    mut value: impl FnMut(&str, Option<&str>, &str, &str) -> serde_json::Value,
+) -> Vec<serde_json::Value> {
     let mut elements = Vec::new();
     if always_supported {
         elements.push(json!({ "tag": "markdown", "content": SESSION_ALWAYS_NOTE }));
     }
-    elements.push(
-        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许一次" }, "type": "primary", "value": btn_value("once", "✅ 已允许一次", "green") }),
-    );
+    elements.push(json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "✅ 允许一次" },
+        "type": "primary",
+        "value": value("once", Some("once"), "✅ 已允许一次", "green"),
+    }));
     if always_supported {
-        elements.push(
-            json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🔁 始终允许" }, "type": "default", "value": btn_value("always", "✅ 已始终允许", "green") }),
-        );
+        elements.push(json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "🔁 始终允许" },
+            "type": "default",
+            "value": value("always", Some("always"), "✅ 已始终允许", "green"),
+        }));
     }
     elements.extend([
-        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🚫 拒绝" }, "type": "danger", "value": btn_value("reject", "🚫 已拒绝", "red") }),
-        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "⚡ 开启自动授权" }, "type": "primary", "value": btn_value("autoaccept", "✅ 已开启自动授权", "blue") }),
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "🚫 拒绝" },
+            "type": "danger",
+            "value": value("reject", None, "🚫 已拒绝", "red"),
+        }),
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "⚡ 开启自动授权" },
+            "type": "primary",
+            "value": value("autoaccept", None, "✅ 已开启自动授权", "blue"),
+        }),
     ]);
     elements
 }
@@ -100,12 +127,24 @@ pub fn build_permission_card(
     card_shell("🔐 权限请求", "orange", elements)
 }
 
-/// The risk paragraph the fallback card and its confirmation step share
-/// (ADR-0102 / #1013). It is deliberately explicit that approval approves the
-/// command the card could not show, and points at the original client where
-/// the full request can be read.
+/// The risk paragraph the fallback card and its confirmation step share when
+/// the companion definitely failed (ADR-0102 / #1013). It is deliberately
+/// explicit that approval approves the command the card could not show, and
+/// points at the original client where the full request can be read.
 pub(crate) fn fallback_permission_risk_note() -> &'static str {
     "完整目标未能送达；批准即批准未能在卡片上完整显示的完整命令。建议先在原始客户端查看详情。"
+}
+
+/// The risk paragraph for the cause at hand: the definite wording above, or a
+/// neutral wording when the send may have landed. The unknown case must not
+/// claim a failure the companion cannot prove.
+fn fallback_permission_risk_note_for(loss: FallbackLoss) -> &'static str {
+    match loss {
+        FallbackLoss::NotDelivered => fallback_permission_risk_note(),
+        FallbackLoss::OutcomeUnknown => {
+            "完整目标未能确认送达；批准即批准未能在卡片上完整显示的完整命令。建议先在原始客户端查看详情。"
+        }
+    }
 }
 
 /// The header of the standalone card shown when neither companion lane could
@@ -116,33 +155,99 @@ pub(crate) const FALLBACK_PERMISSION_HEADER: &str = "🔐 权限请求（目标�
 /// body by [`fallback_permission_risk_note`].
 pub(crate) const FALLBACK_PERMISSION_CONFIRM_HEADER: &str = "⚠️ 确认批准（目标未完整展示）";
 
-/// The label of the result card when the confirmation's target digest no
-/// longer matches the pending request.
-pub(crate) const RISK_DIGEST_MISMATCH_LABEL: &str = "🚫 未批准（目标已变化）";
+/// Why the full target is absent from the fallback card. The distinction is
+/// the companion outcome's own: a definite failure is not the same claim as an
+/// unknown send, and the fallback copy must not turn one into the other
+/// (ADR-0102).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FallbackLoss {
+    /// No lane delivered; the complete target definitely did not land.
+    #[default]
+    NotDelivered,
+    /// A send may have landed; there is no delivery proof.
+    OutcomeUnknown,
+}
 
-/// Why a risk-confirmed click was refused without touching the backend.
-pub(crate) fn risk_digest_mismatch_note() -> String {
-    "该权限请求的目标在你确认之后发生了变化，原来的确认不再有效。本次点击没有批准，也没有拒绝，\
-     请求仍在等待处理；请回到最新的权限卡片重新查看并确认。"
-        .to_string()
+impl FallbackLoss {
+    /// The callback key the fallback card carries so the confirmation and the
+    /// result card keep the same claim.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::NotDelivered => "not_delivered",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    /// Parse a callback key. Only the explicit `not_delivered` key may claim a
+    /// definite failure; a missing or malformed key is treated as unknown, so a
+    /// legacy or malformed card cannot turn an ambiguous send into a false
+    /// claim that nothing arrived.
+    pub(crate) fn from_key(key: Option<&str>) -> Self {
+        match key {
+            Some("not_delivered") => Self::NotDelivered,
+            _ => Self::OutcomeUnknown,
+        }
+    }
+
+    /// The content line under the target head. The risk paragraph follows both.
+    fn content_line(self) -> &'static str {
+        match self {
+            Self::NotDelivered => "未能送达。",
+            Self::OutcomeUnknown => "发送结果未知，可能已送达。",
+        }
+    }
+}
+
+/// The fallback body WITHOUT the ask/final confirmation line, so the card
+/// builders own the one place that appends their prompt. The target head comes
+/// from the bridge ([`crate::bridge::request::companion::describe_permission_target_summary`]);
+/// this copy table adds the content claim, the risk and — when the user comes
+/// back after a digest mismatch — the changed-target note.
+pub(crate) fn fallback_permission_summary(target_summary: &str, loss: FallbackLoss, changed: bool) -> String {
+    let mut summary = format!(
+        "{target_summary}\n**完整内容**: {}\n\n**风险**: {}",
+        loss.content_line(),
+        fallback_permission_risk_note_for(loss)
+    );
+    if changed {
+        summary.push_str(
+            "\n\n**目标已变化**: 在你确认之后目标发生了变化，原来的确认不再有效；\
+             请重新查看并再次确认。",
+        );
+    }
+    summary
 }
 
 /// The fallback card's controls: allow-once / allow-always are FIRST-STEP
 /// buttons that only open [`build_fallback_permission_confirm_card`]; deny and
 /// Auto-Accept stay one click. Each button carries the routing triple, the
-/// decision, the risk digest of the request's patterns, and `fallback: true`
-/// so the click handler never treats the ack as a streaming-card update.
+/// loss cause, the risk digest of the request's patterns (as a hex string, so
+/// a 64-bit value survives Feishu's JSON round-trip), and `fallback: true` so
+/// the click handler never treats the ack as a streaming-card update.
 fn fallback_permission_buttons(
     session_id: &str,
     request_id: &str,
     directory: &str,
     always_supported: bool,
     target_digest: u64,
+    loss: FallbackLoss,
 ) -> Vec<serde_json::Value> {
-    let btn_value = |reply: &str, decision: Option<&str>, label: &str, color: &str| {
+    let digest = target_digest_hex(target_digest);
+    permission_control_elements(always_supported, |reply, decision, label, color| {
+        let first_step = matches!(reply, "once" | "always");
+        // The allow buttons are a first step, not a decision: the click opens
+        // the confirmation card and never reaches the backend.
+        let callback_reply = if first_step { "confirm" } else { reply };
+        // Deny and Auto-Accept keep their ordinary wording; the three
+        // decisions that touch the unseen target name it.
+        let label = if first_step || reply == "reject" {
+            format!("{label}（目标未完整展示）")
+        } else {
+            label.to_string()
+        };
         let mut value = json!({
             "action": "perm",
-            "reply": reply,
+            "reply": callback_reply,
             "session_id": session_id,
             "request_id": request_id,
             "directory": directory,
@@ -150,52 +255,28 @@ fn fallback_permission_buttons(
             "perm_color": color,
             "fallback": true,
             "always_supported": always_supported,
-            "target_digest": target_digest,
+            "target_digest": digest,
+            "loss": loss.key(),
         });
         if let Some(decision) = decision {
             value["decision"] = json!(decision);
         }
         value
-    };
-    let mut elements = Vec::new();
-    if always_supported {
-        elements.push(json!({ "tag": "markdown", "content": SESSION_ALWAYS_NOTE }));
-    }
-    elements.push(json!({
-        "tag": "button",
-        "text": { "tag": "plain_text", "content": "✅ 允许一次" },
-        "type": "primary",
-        "value": btn_value("confirm", Some("once"), "✅ 已允许一次（目标未完整展示）", "green"),
-    }));
-    if always_supported {
-        elements.push(json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "🔁 始终允许" },
-            "type": "default",
-            "value": btn_value("confirm", Some("always"), "✅ 已始终允许（目标未完整展示）", "green"),
-        }));
-    }
-    elements.extend([
-        json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "🚫 拒绝" },
-            "type": "danger",
-            "value": btn_value("reject", None, "🚫 已拒绝（目标未完整展示）", "red"),
-        }),
-        json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "⚡ 开启自动授权" },
-            "type": "primary",
-            "value": btn_value("autoaccept", None, "✅ 已开启自动授权", "blue"),
-        }),
-    ]);
-    elements
+    })
+}
+
+/// A digest's callback spelling: lowercase hex, fixed width. `value` is only
+/// guaranteed to be a JSON object, and a `u64` above 2^53 does not survive a
+/// double/string round-trip; the guard parses this back, and a parse failure is
+/// a mismatch, never a panic.
+pub(crate) fn target_digest_hex(digest: u64) -> String {
+    format!("{digest:016x}")
 }
 
 /// Build the standalone fallback card for a permission whose complete target
 /// no companion lane delivered. `summary` is
-/// [`crate::bridge::request::companion::fallback_permission_summary`], so the
-/// risk and the target summary cannot drift from the confirmation or result.
+/// [`fallback_permission_summary`], so the risk and the target summary cannot
+/// drift from the confirmation or result.
 ///
 /// It is standalone by construction: the click ack replaces *this* card, never
 /// a streaming card that happens to be live for the same session.
@@ -206,6 +287,7 @@ pub(crate) fn build_fallback_permission_card(
     summary: &str,
     always_supported: bool,
     target_digest: u64,
+    loss: FallbackLoss,
 ) -> serde_json::Value {
     let body = format!(
         "{}\n\nAI 想要执行这个操作，是否允许？",
@@ -218,6 +300,7 @@ pub(crate) fn build_fallback_permission_card(
         directory,
         always_supported,
         target_digest,
+        loss,
     ));
     card_shell(FALLBACK_PERMISSION_HEADER, "orange", elements)
 }
@@ -225,6 +308,7 @@ pub(crate) fn build_fallback_permission_card(
 /// Build the second-step confirmation card: the same summary and risk, then
 /// 确认批准 (which carries the original decision, `risk_confirmed`, and the
 /// target digest) and 取消 (which returns to the fallback card without a reply).
+#[allow(clippy::too_many_arguments)] // the routing triple, decision and copy context
 pub(crate) fn build_fallback_permission_confirm_card(
     session_id: &str,
     request_id: &str,
@@ -233,11 +317,13 @@ pub(crate) fn build_fallback_permission_confirm_card(
     target_digest: u64,
     decision: &str,
     always_supported: bool,
+    loss: FallbackLoss,
 ) -> serde_json::Value {
     let body = format!(
         "{}\n\n确认批准将执行上面这个未能在卡片上完整显示的目标。",
         super::sanitize::CardMarkdown::new().clean(summary)
     );
+    let digest = target_digest_hex(target_digest);
     let confirm = json!({
         "action": "perm",
         "reply": decision,
@@ -248,8 +334,9 @@ pub(crate) fn build_fallback_permission_confirm_card(
         "perm_color": "green",
         "fallback": true,
         "risk_confirmed": true,
-        "target_digest": target_digest,
+        "target_digest": digest,
         "always_supported": always_supported,
+        "loss": loss.key(),
     });
     let cancel = json!({
         "action": "perm",
@@ -260,8 +347,9 @@ pub(crate) fn build_fallback_permission_confirm_card(
         "perm_label": "已取消",
         "perm_color": "grey",
         "fallback": true,
-        "target_digest": target_digest,
+        "target_digest": digest,
         "always_supported": always_supported,
+        "loss": loss.key(),
     });
     card_shell(
         FALLBACK_PERMISSION_CONFIRM_HEADER,
@@ -278,16 +366,6 @@ pub(crate) fn build_fallback_permission_confirm_card(
 /// standalone fallback card. The request is still pending; this line only
 /// stops the old block's controls from lingering on the streaming card.
 pub(crate) const FALLBACK_PERMISSION_MOVED_RECEIPT: &str = "🔄 已改为单独的风险确认卡片";
-
-/// The result card for a confirmation whose digest no longer matches the
-/// re-read request. No reply has reached the backend.
-pub(crate) fn build_risk_digest_mismatch_card() -> serde_json::Value {
-    card_shell(
-        RISK_DIGEST_MISMATCH_LABEL,
-        "red",
-        vec![json!({ "tag": "markdown", "content": risk_digest_mismatch_note() })],
-    )
-}
 
 /// How many body elements one permission block adds: its description element
 /// plus every element [`permission_buttons`] renders (the scope note when the

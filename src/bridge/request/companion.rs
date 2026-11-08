@@ -56,42 +56,36 @@ fn text_digest(text: &str) -> u64 {
     u64::from_be_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"))
 }
 
-/// The target summary the fallback card shows when no companion lane delivered
-/// the full content (ADR-0102 / #1013): the action, the summed target length,
-/// the first 120 characters, where the full content should have gone, and the
-/// risk the user accepts by approving. The confirmation card and the result
-/// card reuse this whole body, so the three cannot disagree about what was not
-/// shown.
-pub(crate) fn fallback_permission_summary(p: &crate::backend::types::PermissionRequest) -> String {
-    let action = p.permission.as_deref().unwrap_or("?");
-    let (emoji, label) = describe_action(action);
-    let excerpt: String = p.patterns.join("\n\n").chars().take(120).collect();
-    format!(
-        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整内容**: 未能送达。\n\n**风险**: {}",
-        p.total_target_len(),
-        crate::feishu::card::fenced_code(&excerpt, None),
-        crate::feishu::card::question::fallback_permission_risk_note()
-    )
-}
-
-/// The summary form of a permission for an over-budget request (ADR-0102): the
-/// action, the total character count, the first 120 characters of the target,
-/// and where the full content lives. Callers pass a **confirmed** delivery
-/// (`delivered_companion`); an uncertain marker never reaches a card.
-pub(crate) fn describe_permission_summary(
-    p: &crate::backend::types::PermissionRequest,
-    delivery: &CompanionDelivery,
-) -> String {
+/// The target head both summary forms share (ADR-0102): the action, the summed
+/// target length, and the first 120 characters. The rest of the body — where
+/// the full content lives, or why it is not on the card — differs by surface.
+/// Keeping the head here means the delivered summary and the fallback summary
+/// cannot describe the same request differently.
+pub(crate) fn describe_permission_target_summary(p: &crate::backend::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
     // The excerpt is the target text, not the rendered body: the body's first
     // line already repeats the action above, and the full content (including
     // its chrome) travels in the companion.
     let excerpt: String = p.patterns.join("\n\n").chars().take(120).collect();
-    let mut s = format!(
-        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整内容**: 已通过{}发送。",
+    format!(
+        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}",
         p.total_target_len(),
-        crate::feishu::card::fenced_code(&excerpt, None),
+        crate::feishu::card::fenced_code(&excerpt, None)
+    )
+}
+
+/// The summary form of a permission for an over-budget request (ADR-0102): the
+/// target head, where the full content lives, and the ask. Callers pass a
+/// **confirmed** delivery (`delivered_companion`); an uncertain marker never
+/// reaches a delivered-summary card.
+pub(crate) fn describe_permission_summary(
+    p: &crate::backend::types::PermissionRequest,
+    delivery: &CompanionDelivery,
+) -> String {
+    let mut s = format!(
+        "{}\n**完整内容**: 已通过{}发送。",
+        describe_permission_target_summary(p),
         delivery.lane.label()
     );
     s.push_str("\n\nAI 想要执行这个操作，是否允许？");
@@ -118,9 +112,11 @@ pub(crate) enum CompanionOutcome {
     /// The send may have landed (a timeout or a post-accept 5xx) but returned
     /// no id. It is terminal: a retry could duplicate the message, so the
     /// record carries an empty message id. It is not a delivery proof, so the
-    /// caller refuses the request and names the unknown outcome.
+    /// caller surfaces the fallback card with an **unknown-outcome** content
+    /// line: the companion may exist.
     Uncertain,
-    /// No lane delivered: the request must follow the refusal path.
+    /// No lane delivered: the caller surfaces the fallback card with a
+    /// **definite non-delivery** content line.
     Failed,
 }
 
@@ -184,7 +180,8 @@ fn mark_uncertain(
 /// cap, or a send that **definitely** did not land, falls to the File Message
 /// lane through [`crate::bridge::viewer::send_file_message_with_outcome`]. An
 /// ambiguous send is terminal — it must not be retried into a duplicate — and
-/// leaves only a non-proof marker; the caller offers no interactive approval.
+/// leaves only a non-proof marker; the caller surfaces the fallback card and
+/// names the unknown outcome rather than claiming a definite failure.
 pub(crate) async fn ensure_permission_companion(
     handles: &FlowHandles,
     surfaces: &Surfaces,
@@ -281,8 +278,9 @@ pub(crate) async fn ensure_permission_companion(
             Some(Err(error)) => {
                 // The post may have landed after Feishu accepted it. Falling to
                 // the File lane could duplicate the whole content. Record only a
-                // no-duplicate marker; the caller refuses the request because
-                // this is not a delivery proof.
+                // no-duplicate marker; the caller surfaces the fallback card
+                // with the unknown-outcome copy because this is not a delivery
+                // proof.
                 tracing::warn!(
                     "permission {} companion Rich Text Message outcome unknown: {error}; \
                      not retrying",

@@ -52,7 +52,7 @@ is allowed only when the full content was delivered for that request.
   name and following caption name the request; the caption is sent after the
   file lands). An ambiguous send is terminal:
   it is never retried into a duplicate, but it is **not** a delivery. It leaves
-  a non-proof marker and the request follows the refusal path; the copy names
+  a non-proof marker and the request takes the fallback card; the copy names
   the unknown outcome instead of claiming either delivery or a definite failure.
 - **Delivered before interactive.** The companion is sent from the sweep's
   surfacing path before the inline block or standalone card is created, so there
@@ -70,9 +70,9 @@ is allowed only when the full content was delivered for that request.
   request and accepts an over-budget approval only when a **confirmed** companion
   record exists whose digest matches that request. A stale record is replaced at
   surfacing time, never trusted; an uncertain marker is refused like a missing
-  record, with copy that names the unknown outcome. This covers **any**
-  `PermissionOverflow` — the summed target budget and the rendered-body ceiling
-  alike.
+  record, except through the fallback card's explicit risk confirmation below.
+  This covers **any** `PermissionOverflow` — the summed target budget and the
+  rendered-body ceiling alike.
 - **A recovered card without proof is withdrawn, never decided in place.**
   Readoption does not trust a persisted over-budget card that has no matching
   confirmed companion record (including one whose only record is an uncertain
@@ -80,23 +80,30 @@ is allowed only when the full content was delivered for that request.
   The request then continues through the **normal fresh path in the same sweep**
   — `prepare` may approve it unseen on an Auto-Accept session (with its usual
   INFO line), the companion lane may deliver and surface the summary, or a
-  failed companion follows the refusal path. The old decision is never silently
+  failed companion takes the fallback card. The old decision is never silently
   taken over (ADR-0101), and a card from an older build cannot approve text a
   newer build never delivered.
 - **Fallback names the risk and confirms twice.** If neither lane delivers — a
   definite failure, or an uncertain marker that is not a proof — the surfacing
   path renders a **standalone** fallback card instead of replying `reject`: the
-  target summary, the risk paragraph ("完整目标未能送达；批准即批准未能在卡片上完整
-  显示的完整命令。建议先在原始客户端查看详情"), and the four controls 允许一次 /
+  target summary, a content line that follows the cause — "完整内容：未能送达。"
+  for a definite failure, "完整内容：发送结果未知，可能已送达。" for an uncertain
+  one — the risk paragraph ("完整目标未能送达；批准即批准未能在卡片上完整显示的
+  完整命令。建议先在原始客户端查看详情", with a neutral "完整目标未能确认送达…"
+  variant for the unknown case), and the four controls 允许一次 /
   始终允许 / 拒绝 / 开启自动授权. A block already inserted for the request is
   withdrawn first, and the card is standalone so its click ack replaces it
   without destroying a streaming card. The allow buttons are **first-step
   only**: their click acks a confirmation card (the same risk and summary,
   确认批准 / 取消), and neither replies nor claims the request. 确认批准 carries
   `risk_confirmed`, the original decision and a digest over the request's
-  **patterns**; the click guard allows an over-budget approval without a
-  companion only when that digest matches the request it re-reads, and a
-  mismatch is refused with a card naming the reason and **no reply at all**.
+  **patterns** (a lowercase hex string, so a 64-bit value survives the callback's
+  JSON round-trip); the click guard allows an over-budget approval without a
+  companion only when that digest matches the request it re-reads. A mismatch
+  sends **no reply at all** and acks a rebuilt fallback card — the changed
+  target's summary, a fresh digest, all four controls, and a note that the
+  target changed and must be confirmed again — so the pending request never
+  loses its actionable surface.
   Deny and Auto-Accept stay one click; Auto-Accept still renders no companion.
   A risk-confirmed approval logs at WARN with the request id, the target length
   and the fact that the user confirmed unseen text. The risk digest differs
@@ -116,9 +123,16 @@ is allowed only when the full content was delivered for that request.
   description including its non-diff chrome. A request whose text changed while
   its record stayed behind cannot borrow the old delivery.
 - An ambiguous send is recorded only as a no-duplicate marker (empty message
-  id) and never retried. It is not a completeness proof: no interactive
-  approval is offered, the request follows the refusal path, and the copy names
-  the unknown outcome.
+  id) and never retried. It is not a completeness proof, so the request takes
+  the fallback card, whose content line names the unknown outcome rather than
+  claiming either delivery or a definite failure.
+- A standalone fallback card has no inline Interaction Block, so its **result
+  card is the decision record**: the allow result carries the risk form the
+  inline receipt would have carried (`✅ 已允许一次（目标未完整展示）：…`), and a
+  block that was withdrawn for the fallback leaves the non-decision move
+  receipt (`🔄 已改为单独的风险确认卡片`) on the streaming card. There is no
+  later inline decision receipt to update, because the fallback card replaced
+  the only interactive surface.
 - The refusal copy, the reason card and the retry behaviour stay in use only for
   a request that resolves no card target at all; a failed or uncertain companion
   takes the fallback card instead.

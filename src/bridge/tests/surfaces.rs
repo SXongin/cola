@@ -1505,7 +1505,7 @@ async fn a_failed_withdrawal_keeps_the_uncertain_companion_marker() {
     );
     assert!(
         posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
+            card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER)
         }),
         "the fresh path surfaces the fallback card"
     );
