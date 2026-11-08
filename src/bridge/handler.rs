@@ -5504,9 +5504,9 @@ impl App {
             .clone()
             .map(|id| (id, settings.directory.clone()));
         // Persist BEFORE approving (#892): a sweep landing in the approval
-        // window must already read the flag as on, or its `refuse` declines the
-        // over-budget request this click is about to approve. A persist that
-        // did not take effect approves nothing.
+        // window must already read the flag as on, or it surfaces a card (and
+        // companion) for the over-budget request this click is about to
+        // approve. A persist that did not take effect approves nothing.
         //
         // Field-only, with the pending's identity (issue #910): a snapshot
         // write could restore a stale model, and a `/new` during the sweep must

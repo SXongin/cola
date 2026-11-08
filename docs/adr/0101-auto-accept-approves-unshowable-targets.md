@@ -10,10 +10,13 @@ past the display budget, or the rendered body past the measured single-element
 ceiling — cannot be approved safely. (When this decision was recorded the two
 budgets were per-command and per-pattern constants; #1011 replaced them with
 `PERMISSION_TARGET_MAX_CHARS` / `PERMISSION_BODY_MAX_CHARS`, and moved the body
-out of the button callback.) Since #883 the bridge refuses such a request
-**before any surface**: `PermissionKind::refuse` declines it with `reject` and
-posts a card that explains why. The rule exists so no button can approve text
-the card clipped.
+out of the button callback.) Until ADR-0102 superseded it for the interactive
+surface, the bridge refused such a request **before any surface**:
+`PermissionKind::refuse` declined it with `reject` and posted a card that
+explained why. The rule existed so no button could approve text the card
+clipped. That refusal path is gone in this build: a request with a card target
+takes the companion/fallback lane, and only a request that resolves no card
+target at all is declined.
 
 The rule was extended to Auto-Accept as well: `approve_pending_for_session` and
 the sweep's `refuse` declined over-budget targets even for a session that had
@@ -40,14 +43,16 @@ existed there either.
 The completeness proof is a property of the **card surface**, not of permission
 decisions. It stands aside wherever no card is rendered:
 
-- `PermissionKind::refuse` checks for an Auto-Accept session only *after* the
-  target proves unshowable, and returns `NotApplicable` instead of declining.
-  The ordinary path pays no extra session lookup.
+- The old `PermissionKind::refuse` checked for an Auto-Accept session only
+  *after* the target proved unshowable, and returned `NotApplicable` instead of
+  declining. The ordinary path paid no extra session lookup. ADR-0102 removed
+  that path for a request with a card target.
 - `approve_pending_for_session` no longer declines over-budget requests; they are
   approved with the rest. Every enable path — the permission-card toggle,
   `/autoaccept on`, and the Auto-Accept toggle card — persists the flag
   **before** that approval pass, so a sweep landing inside it reads the session
-  as auto-accept instead of declining the request the call is about to approve.
+  as auto-accept instead of surfacing a card for the request the call is about
+  to approve.
   A persist that did not take effect approves nothing: the permission-card
   toggle releases its click claim and reports the failure rather than claiming
   the mode; the other two refuse to run the approval pass. The store rolls a
@@ -73,10 +78,10 @@ decisions. It stands aside wherever no card is rendered:
   error would retire a still-pending request with no card at all. The retry
   failure follows ADR-0048's warn-once cadence (WARN, then DEBUG for identical
   repeats, INFO on recovery).
-- An interactive surface is **superseded by ADR-0102**: `refuse` no longer
-  declines an over-budget target on the way in; the companion lane surfaces it
-  with a summary and the full target, and only a request with no usable card
-  target follows the refusal path.
+- An interactive surface is **superseded by ADR-0102**: the old refusal path no
+  longer declines an over-budget target on the way in; the companion lane
+  surfaces it with a summary and the full target, and only a request with no
+  usable card target follows the refusal path.
 - `/autoaccept`'s help, the user guides, the toggle's result card and the
   Auto-Accept receipt no longer claim over-budget targets are declined.
 
@@ -92,14 +97,13 @@ decisions. It stands aside wherever no card is rendered:
   re-adopts it — never approved or declined in place (ADR-0102) — which is the
   legacy state the re-adoption rule exists for, not a path this build can
   create.
-- `refuse` and `prepare` each resolve the flag independently. A toggle flipped
-  between them can let `refuse` stand aside and `prepare` decline, so an
-  over-budget card is built for one pass; the click-time guard still refuses its
-  Allow, so no unseen target is approved. The window is a permission request's
-  two backend reads wide.
-- Persisting before approving narrows but does not close the read/reject race: a
-  sweep that read the flag just before the persist can still call
-  `decline_unshowable` after it, and the approval then finds the request gone
+- `prepare` resolves the flag once per pass. A toggle flipped between the flag
+  persist and that pass can surface a card for the request the call is about to
+  approve; the click-time guard still refuses its Allow, so no unseen target is
+  approved. The window is a permission request's two backend reads wide.
+- Persisting before approving narrows but does not close the read/surface race: a
+  sweep that read the flag just before the persist can still surface a card (and
+  companion) for the request, and the approval then finds the request gone
   (`NotFound`) — the long command is lost. The window is one list-to-reply round
   trip. Closing it needs a serialization between an enable path and the sweep,
   which this ADR does not take on.

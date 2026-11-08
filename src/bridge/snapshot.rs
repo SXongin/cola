@@ -310,9 +310,9 @@ mod tests {
 
     /// Whole-branch re-review #883: a permission whose target a card cannot
     /// render in full never enters the read, so neither the idle pointer nor a
-    /// busy follow can surface it — the permission flow's decline guard keeps
-    /// it off a card that would offer a clipped command. The in-budget request
-    /// still rides.
+    /// busy follow can surface it — the permission flow's companion/fallback
+    /// lane keeps it off the adopted card, which would otherwise offer a
+    /// clipped command. The in-budget request still rides.
     #[tokio::test]
     async fn an_unshowable_permission_never_enters_the_read() {
         let mut backend = typed_backend(vec![
