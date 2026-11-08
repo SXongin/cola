@@ -58,13 +58,15 @@ decisions. It stands aside wherever no card is rendered:
   the mode; the other two refuse to run the approval pass. The store rolls a
   failed blocking write back before returning its error, so memory never keeps a
   flag the user was told did not persist.
-- A flag read the parent chain cannot finish (a failed `session_info` hop) is
-  **unknown**, not "off": the request stays pending and unmarked, and the next
-  sweep retries. Reading it as off would decline the request for good, which is
-  the irreversible outcome this ADR exists to remove. The 8-hop cap is different
-  — a structural bound, not a failed hop — so it falls back to the interactive
-  rule: a showable target surfaces, an unshowable one declines (retrying a
-  permanent cap would hang the turn forever).
+- A flag read the parent chain cannot finish (a failed or timed-out
+  `session_info` hop) is **unknown**, not "off": the request stays pending and
+  unmarked, and the next sweep retries. Reading it as off would decline the
+  request for good, which is the irreversible outcome this ADR exists to
+  remove. The 8-hop cap is different — a structural bound, not a failed hop —
+  so it falls through to the ordinary surface rule: the request is surfaced
+  through ADR-0102's companion/fallback lane (retrying a permanent cap would
+  hang the turn forever). The old rule that an unshowable target declined on
+  the way in is gone with ADR-0102.
 - Every such approval is recorded at INFO with the request id, the summed target
   length, the rendered content length, the budget it crossed, and the target's
   first line (bounded). With no
