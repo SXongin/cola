@@ -562,7 +562,13 @@ impl RequestKind for PermissionKind {
             .get("target_digest")
             .and_then(|v| v.as_str())
             .and_then(|hex| u64::from_str_radix(hex, 16).ok());
-        let inline = inline && !fallback_click && !risk_confirmed;
+        // Only approvals need the surface proof. Deny and Auto-Accept never
+        // approve unseen text, so they must never be diverted into a rebuilt
+        // fallback card by a changed target.
+        let approval = matches!(reply, "once" | "always");
+        // A fallback click always acks its own standalone card, never a live
+        // streaming card (all fallback controls carry `fallback`).
+        let inline = inline && !fallback_click;
 
         // The fallback card's allow buttons are FIRST-STEP only: they show a
         // confirmation card and must not reply, claim, or touch any block.
@@ -769,9 +775,7 @@ impl RequestKind for PermissionKind {
         // or stale. That same read rebuilds the result body: the callback no
         // longer carries it.
         let mut proof = ClickProof::None;
-        if matches!(reply, "once" | "always")
-            && let Some(dir) = directory
-        {
+        if approval && let Some(dir) = directory {
             let listed = crate::bridge::bounded_call(
                 "permission click: list pending",
                 flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -788,6 +792,14 @@ impl RequestKind for PermissionKind {
                             // request is over budget NOW. Otherwise a shrunk
                             // target would borrow the surface's approval.
                             if risk_digest != Some(expected) {
+                                let loss = if risk_surface {
+                                    fallback_loss
+                                } else {
+                                    // A summary card's companion was confirmed
+                                    // for the previous target; do not claim its
+                                    // send was unknown.
+                                    FallbackLoss::PreviousDelivered
+                                };
                                 return Some(
                                     recover_from_risk_mismatch(
                                         flow,
@@ -797,7 +809,7 @@ impl RequestKind for PermissionKind {
                                         session_id,
                                         host,
                                         req_id,
-                                        fallback_loss,
+                                        loss,
                                         risk_digest.is_some(),
                                         inline,
                                     )
@@ -838,7 +850,7 @@ impl RequestKind for PermissionKind {
                                                 session_id,
                                                 host,
                                                 req_id,
-                                                fallback_loss,
+                                                FallbackLoss::PreviousDelivered,
                                                 true,
                                                 inline,
                                             )
@@ -1554,6 +1566,7 @@ async fn recover_from_risk_mismatch(
             entry.clone()
         })
     };
+    let had_sent = sent.is_some();
     if let Some(sent) = sent {
         let client_id = flow
             .surfaces
@@ -1582,25 +1595,43 @@ async fn recover_from_risk_mismatch(
         "请查看新的确认卡片".to_string()
     };
     if inline {
-        // The old controls live on a streaming card: withdrawing them and
-        // posting a NEW standalone card is the only way to keep the click's ack
-        // from replacing that streaming card.
+        // The old controls live on a streaming card: post a NEW standalone card
+        // first (the ack must not replace the streaming card), then withdraw the
+        // old block. A failed post leaves the old block live and retryable.
+        if !flow.post_fallback_card(handles, p, dir, loss, changed).await {
+            return failed_result_card(inline, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
+        }
         let req = PendingRequest::Permission(p.clone());
         if !flow
             .withdraw_block_for_fallback(handles, &req, host.as_deref())
             .await
         {
-            return failed_result_card(inline, "无法更新权限卡片，请重试。", "无法更新权限卡片");
-        }
-        if !flow.post_fallback_card(handles, p, dir, loss, changed).await {
-            return failed_result_card(inline, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
+            // The new card is the actionable surface; the old block may still
+            // be clickable, which the next sweep/click will recover again.
+            tracing::warn!(
+                "permission {req_id}: the replacement fallback card landed but its old block \
+                 could not be withdrawn"
+            );
         }
         return CardActionResult {
             // The ack leaves the streaming card in place (its block now carries
-            // the move receipt); the new fallback card is its own message.
+            // the move receipt when the withdrawal landed); the new fallback
+            // card is its own message.
             card: None,
             toast: Some(toast),
         };
+    }
+    if !had_sent {
+        // A rebuilt fallback with no standalone record would otherwise loop:
+        // its next allow has no summary to seed the confirmation. Post a fresh
+        // card (and its record) instead of acking an unusable one.
+        if flow.post_fallback_card(handles, p, dir, loss, changed).await {
+            return CardActionResult {
+                card: None,
+                toast: Some(toast),
+            };
+        }
+        return failed_result_card(inline, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
     }
     CardActionResult {
         card: Some(crate::feishu::card::question::build_fallback_permission_card(

@@ -103,7 +103,10 @@ is allowed only when the full content was delivered for that request.
   card's buttons carry the same patterns digest plus a `summary` marker, and the
   guard compares it **regardless of the request's current overflow** — a target
   that shrank out of the budget after the card was shown cannot borrow the old
-  surface's approval. A mismatch
+  surface's approval. A request that fits the card when it is first surfaced
+  drops any stale companion record, so an ordinary allow is not mistaken for a
+  summary surface. Deny and Auto-Accept never run this proof: they do not
+  approve unseen text, so a changed target cannot bounce them. A mismatch
   sends **no reply at all** and acks a rebuilt fallback card — the changed
   target's summary, a fresh digest, all four controls, and a note that the
   target changed and must be confirmed again — so the pending request never
@@ -137,6 +140,14 @@ is allowed only when the full content was delivered for that request.
   receipt (`🔄 已改为单独的风险确认卡片`) on the streaming card. There is no
   later inline decision receipt to update, because the fallback card replaced
   the only interactive surface.
+- A summary surface's recovery copy says the companion delivered the **previous**
+  target ("之前的目标已完整送达；当前目标已变化，未能完整展示") rather than
+  claiming an unknown send that was in fact confirmed.
+- A summary card written before the `summary` marker existed, whose companion
+  record is **also** gone, can still approve an in-budget target on one click.
+  The window requires both a legacy card and a lost record; every card this
+  build writes carries the marker and digest, and a surviving record still
+  forces the proof.
 - The refusal copy, the reason card and the retry behaviour stay in use only for
   a request that resolves no card target at all; a failed or uncertain companion
   takes the fallback card instead.

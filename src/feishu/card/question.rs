@@ -158,6 +158,10 @@ fn fallback_permission_risk_note_for(loss: FallbackLoss) -> &'static str {
             "完整目标未能确认送达；批准即批准未能在卡片上完整显示的完整命令。\
              建议先在原始客户端查看详情。"
         }
+        FallbackLoss::PreviousDelivered => {
+            "完整目标已变化；批准即批准未能在卡片上完整显示的完整命令。\
+             建议先在原始客户端查看详情。"
+        }
     }
 }
 
@@ -180,6 +184,9 @@ pub(crate) enum FallbackLoss {
     NotDelivered,
     /// A send may have landed; there is no delivery proof.
     OutcomeUnknown,
+    /// A confirmed companion carried the *previous* target; the target has
+    /// since changed, so the current one is not on the card.
+    PreviousDelivered,
 }
 
 impl FallbackLoss {
@@ -189,6 +196,7 @@ impl FallbackLoss {
         match self {
             Self::NotDelivered => "not_delivered",
             Self::OutcomeUnknown => "outcome_unknown",
+            Self::PreviousDelivered => "previous_delivered",
         }
     }
 
@@ -208,6 +216,7 @@ impl FallbackLoss {
         match self {
             Self::NotDelivered => "未能送达。",
             Self::OutcomeUnknown => "发送结果未知，可能已送达。",
+            Self::PreviousDelivered => "之前的目标已完整送达；当前目标已变化，未能完整展示。",
         }
     }
 }
@@ -217,12 +226,7 @@ impl FallbackLoss {
 /// from the bridge ([`crate::bridge::request::companion::describe_permission_target_summary`]);
 /// this copy table adds the content claim, the risk and — when the user comes
 /// back after a digest mismatch — the changed-target note.
-#[rustfmt::skip]
-pub(crate) fn fallback_permission_summary(
-    target_summary: &str,
-    loss: FallbackLoss,
-    changed: bool,
-) -> String {
+pub(crate) fn fallback_permission_summary(target_summary: &str, loss: FallbackLoss, changed: bool) -> String {
     let mut summary = format!(
         "{target_summary}\n**完整内容**: {}\n\n**风险**: {}",
         loss.content_line(),
@@ -438,6 +442,7 @@ fn permission_button_count(always_supported: bool) -> usize {
 pub(crate) fn permission_block_estimate(
     body: &str,
     always_supported: bool,
+    summary: bool,
     request_id: &str,
     session_id: &str,
     directory: &str,
@@ -445,6 +450,14 @@ pub(crate) fn permission_block_estimate(
     // A button's own labels, action, reply, colour and JSON punctuation. CJK
     // labels cost three bytes a character, which is why this is generous.
     const BUTTON_OVERHEAD: usize = 360;
+    // A summary block's buttons also carry the surface marker and the
+    // hex digest. Charge them explicitly so a split estimate cannot drift
+    // behind the rendered callback.
+    let summary_keys = if summary {
+        json_escaped_len("\"summary\":true,\"target_digest\":\"0123456789abcdef\",")
+    } else {
+        0
+    };
     // The element is rendered either cleaned (normal) or fenced (the card's
     // content-rejection fallback, which wraps the body in a fence sized to its
     // longest backtick run — a 3,000-backtick command gains ~6 KB). Charge the
@@ -459,7 +472,7 @@ pub(crate) fn permission_block_estimate(
     } else {
         0
     };
-    element + buttons * (routing + BUTTON_OVERHEAD) + note
+    element + buttons * (routing + BUTTON_OVERHEAD + summary_keys) + note
 }
 
 /// Compact one-line target for a question's Interaction Receipt: each
@@ -2301,7 +2314,7 @@ mod tests {
             let card = build_permission_card("ses", "n:1", body, directory, always, digest);
             let elements = card["body"]["elements"].as_array().expect("body elements");
             let rendered: usize = elements.iter().map(|element| element.to_string().len()).sum();
-            let estimate = permission_block_estimate(body, always, "n:1", "ses", directory);
+            let estimate = permission_block_estimate(body, always, digest.is_some(), "n:1", "ses", directory);
             assert!(
                 estimate >= rendered,
                 "estimate {estimate} under the block's {rendered} bytes (directory {directory:?})"
@@ -2312,6 +2325,21 @@ mod tests {
                 "the component count is exactly what the block renders"
             );
         }
+    }
+
+    /// A summary block's extra callback keys are charged explicitly, so the
+    /// split estimate follows the rendered buttons instead of relying on the
+    /// fixed per-button slack.
+    #[test]
+    fn a_summary_block_estimate_charges_its_callback_keys() {
+        let plain = permission_block_estimate("body", true, false, "n:1", "ses", "/d");
+        let summary = permission_block_estimate("body", true, true, "n:1", "ses", "/d");
+        let per_button = json_escaped_len("\"summary\":true,\"target_digest\":\"0123456789abcdef\",");
+        assert_eq!(
+            summary - plain,
+            permission_button_count(true) * per_button,
+            "every summary button charges the marker and digest"
+        );
     }
 
     /// Whole-branch re-review #883: the estimate must charge the **rendered**
@@ -2330,7 +2358,7 @@ mod tests {
         let card = build_permission_card("ses", "n:1", &body, "/d", true, None);
         let elements = card["body"]["elements"].as_array().expect("body elements");
         let rendered: usize = elements.iter().map(|element| element.to_string().len()).sum();
-        let estimate = permission_block_estimate(&body, true, "n:1", "ses", "/d");
+        let estimate = permission_block_estimate(&body, true, false, "n:1", "ses", "/d");
         assert!(
             estimate >= rendered,
             "estimate {estimate} under the rendered block's {rendered} bytes"
@@ -2354,7 +2382,7 @@ mod tests {
             "⚡ **执行 Shell 命令**\n**对象**:\n- `{}`\n",
             "`".repeat(crate::backend::types::PERMISSION_TARGET_MAX_CHARS)
         );
-        let estimate = permission_block_estimate(&body, false, "n:1", "ses", "/d");
+        let estimate = permission_block_estimate(&body, false, false, "n:1", "ses", "/d");
         // What the fallback writes: the fenced element plus the routing-only
         // buttons (the body is not echoed into them).
         let fenced = crate::feishu::card::fenced_code(&body, None);
@@ -2389,9 +2417,9 @@ mod tests {
     /// fixed overhead would let the streaming card's split exceed its budget.
     #[test]
     fn a_long_directory_is_charged_in_the_permission_block_estimate() {
-        let short = permission_block_estimate("body", true, "n:1", "ses", "/d");
+        let short = permission_block_estimate("body", true, false, "n:1", "ses", "/d");
         let directory = format!("/work/{}", "a-project-directory/".repeat(12));
-        let long = permission_block_estimate("body", true, "n:1", "ses", &directory);
+        let long = permission_block_estimate("body", true, false, "n:1", "ses", &directory);
         let buttons = permission_block_components(true) - 1;
         assert_eq!(
             long - short,
