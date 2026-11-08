@@ -40,7 +40,9 @@ and Agent Client — using that conversation's topic anchor when it is a topic.
 The card names the asking MCP server and its message, and shows the directory,
 so the answerer knows what is being asked and whom the answer commits; the V2
 adapter carries `metadata.server` and `metadata.message` into the neutral
-request (today's `RawForm` drops metadata). A send that fails definitively is
+request (the same upstream file writes those keys; today's `RawForm` in
+`src/opencode/v2/wire.rs` drops metadata). The new neutral fields stay optional,
+so session-backed forms keep the normal Question path. A send that fails definitively is
 not recorded as pushed, so the next complete sweep with a mapped conversation
 retries it; a timed-out send can duplicate the card exactly as every standalone
 send can today, and this record does not claim to fix that ambiguity. If the
@@ -51,12 +53,13 @@ Turn's generation to own and clear its pin, and a Location Form has none. It
 does take a **Message Pin** under the same `instant_reminder` opt-in, because a
 pin is keyed by message.
 
-**Dismissal.** 「稍后」 withdraws the card without declining the request. The
-form stays pending and `/mcp` can reopen it as a fresh card; reopening clears
-the dismissal and rewrites the standalone-surface record, so the two records
-never disagree about what the chat currently shows. Only an explicit 「取消」
-declines it, and cola never auto-declines on a timer: turning a hesitation into
-a failed tool call is worse than waiting.
+**Dismissal.** 「稍后」 withdraws the card — and releases its Message Pin —
+without declining the request. The form stays pending and `/mcp` can reopen it
+as a fresh card; reopening clears the dismissal and rewrites the
+standalone-surface record, so the two records never disagree about what the chat
+currently shows. Only an explicit 「取消」 declines it, and cola never
+auto-declines on a timer: turning a hesitation into a failed tool call is worse
+than waiting.
 
 **Persistence.** "Pushed" and "dismissed" are recorded in the client-scoped
 surface file (ADR-0038, ADR-0091), so a restart does not re-push a form the Host
@@ -74,8 +77,9 @@ own their Session cards). The statuses belong here because a form names a server
 the Host may have to fix — `needs_auth` (no usable credential) in particular —
 before the form can be answered. `/mcp` can reopen a dismissed form. The
 capability is an adapter method. OpenCode V1 publishes a status read (`/mcp`,
-replaced by `/api/mcp*` in V2) but has no elicitation-form surface; Codex
-publishes `mcpServerStatus/list` but has no location-owned forms. Neither offers
+replaced by `/api/mcp*` in V2; `docs/research/opencode-v2/r2-api-protocol-delta.md`)
+but has no elicitation-form surface; Codex publishes `mcpServerStatus/list` but
+has no location-owned forms. Neither offers
 the full surface — statuses plus Location Forms — so both answer "unavailable"
 rather than shipping a status-only variant.
 
