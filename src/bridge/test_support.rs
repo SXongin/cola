@@ -1113,6 +1113,9 @@ impl feishu::Platform for RecordingPlatform {
             message_id: message_id.into(),
             text: text.into(),
         });
+        if let Some(gate) = self.take_gate("reply_text", message_id) {
+            wait_gate(gate).await;
+        }
         if self
             .fail_reply_text_count
             .load(std::sync::atomic::Ordering::SeqCst)
