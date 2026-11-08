@@ -207,7 +207,7 @@ pub(crate) async fn ensure_permission_companion(
     // half-open server would otherwise freeze permission surfacing for every
     // session. A timeout is a failed delivery: the caller then surfaces the
     // fallback card (ADR-0102).
-    let target = crate::bridge::bounded_call(
+    let resolved = crate::bridge::bounded_call(
         &format!("permission {} companion target", p.request_id),
         target_timeout_ms,
         async {
@@ -224,10 +224,16 @@ pub(crate) async fn ensure_permission_companion(
             )
         },
     )
-    .await
-    .and_then(Result::ok)
-    .flatten();
-    let Some(target) = target else {
+    .await;
+    let Some(resolved) = resolved else {
+        tracing::warn!(
+            "permission {} companion: target walk timed out on session {session_id}; \
+             surfacing the fallback card",
+            p.request_id
+        );
+        return CompanionOutcome::Failed;
+    };
+    let Some(target) = resolved.ok().flatten() else {
         tracing::warn!(
             "permission {} companion: no reply target on session {session_id}",
             p.request_id
