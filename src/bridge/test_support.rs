@@ -271,6 +271,14 @@ pub enum PlatformCall {
         receive_id: String,
         card: serde_json::Value,
     },
+    /// A messenger send into a chat (no reply target): the chat-target
+    /// counterpart of `SendMessageReply`.
+    SendMessage {
+        receive_id_type: String,
+        receive_id: String,
+        msg_type: String,
+        content: serde_json::Value,
+    },
     UpdateMessage {
         message_id: String,
         card: serde_json::Value,
@@ -951,6 +959,22 @@ impl feishu::Platform for RecordingPlatform {
         self.calls.lock().await.push(PlatformCall::SendCard {
             receive_id: receive_id.into(),
             card: card.clone(),
+        });
+        Ok("msg_sent".into())
+    }
+
+    async fn send_message(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: &serde_json::Value,
+    ) -> crate::error::Result<String> {
+        self.calls.lock().await.push(PlatformCall::SendMessage {
+            receive_id_type: receive_id_type.into(),
+            receive_id: receive_id.into(),
+            msg_type: msg_type.into(),
+            content: content.clone(),
         });
         Ok("msg_sent".into())
     }

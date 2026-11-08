@@ -323,6 +323,48 @@ impl Client {
         }
     }
 
+    /// Send a message of an arbitrary `msg_type` into a chat (or user),
+    /// mirroring [`Self::send_card`]'s request shape. Used where the target is
+    /// a chat rather than a message to reply under.
+    pub async fn send_message(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: &serde_json::Value,
+    ) -> crate::error::Result<String> {
+        let token = self.get_access_token().await?;
+        let body = serde_json::json!({
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": content.to_string()
+        });
+
+        let text = read_body_with_diag(
+            self.http
+                .post(self.endpoint(&format!(
+                    "/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+                )))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?,
+            "send message",
+        )
+        .await?;
+        let resp: MessageResponse = parse_json(&text, "send message response")?;
+
+        if resp.code != 0 {
+            Err(api_error(
+                &format!("send message error {}", resp.code),
+                i64::from(resp.code),
+                &resp.msg,
+            ))
+        } else {
+            Ok(resp.data.message_id)
+        }
+    }
+
     /// Reply to a Feishu message, returning the sent message_id for card updates.
     pub async fn reply_text(&self, message_id: &str, text: &str) -> crate::error::Result<String> {
         let token = self.get_access_token().await?;

@@ -20,9 +20,15 @@ use super::kind::{PermissionOverflow, describe_action, describe_permission, perm
 /// never contained the clipped part. The digest is over exactly this text.
 pub(crate) fn companion_text(p: &crate::backend::types::PermissionRequest) -> String {
     match permission_overflow(p) {
-        Some(PermissionOverflow::Targets) => p.patterns.join("\n\n"),
+        Some(PermissionOverflow::Targets) => joined_patterns(p),
         _ => describe_permission(p),
     }
+}
+
+/// The raw target text a target overflow's companion carries. One definition,
+/// so the companion body, its digest and the summary excerpt cannot drift.
+fn joined_patterns(p: &crate::backend::types::PermissionRequest) -> String {
+    p.patterns.join("\n\n")
 }
 
 /// The stable digest of [`companion_text`]. It is a fingerprint, never the
@@ -46,7 +52,7 @@ pub(crate) fn companion_target_digest(p: &crate::backend::types::PermissionReque
 /// the decision's subject; a metadata-only render change must not invalidate a
 /// confirmation of unchanged commands, and a changed command must (ADR-0102).
 pub(crate) fn patterns_target_digest(p: &crate::backend::types::PermissionRequest) -> u64 {
-    text_digest(&p.patterns.join("\n\n"))
+    text_digest(&joined_patterns(p))
 }
 
 /// SHA-256 → the first eight bytes as a stable fingerprint. One definition, so
@@ -68,7 +74,7 @@ pub(crate) fn describe_permission_target_summary(p: &PermissionRequest) -> Strin
     // The excerpt is the target text, not the rendered body: the body's first
     // line already repeats the action above, and the full content (including
     // its chrome) travels in the companion.
-    let excerpt: String = p.patterns.join("\n\n").chars().take(120).collect();
+    let excerpt: String = joined_patterns(p).chars().take(120).collect();
     format!(
         "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}",
         p.total_target_len(),
@@ -240,16 +246,6 @@ pub(crate) async fn ensure_permission_companion(
         );
         return CompanionOutcome::Failed;
     };
-    let CardTarget::ReplyTo(message_id) = target else {
-        // A Chat target has no message to reply to, and only a card can be sent
-        // to a chat; the companion lanes require a reply message. Treat it as a
-        // failed delivery so the request is never offered without its content.
-        tracing::warn!(
-            "permission {} companion: only a chat target resolves; cannot deliver the full content",
-            p.request_id
-        );
-        return CompanionOutcome::Failed;
-    };
 
     let body = companion_text(p);
     let action = p.permission.as_deref().unwrap_or("?");
@@ -262,14 +258,30 @@ pub(crate) async fn ensure_permission_companion(
     let rich = companion_rich_body(&body, permission_overflow(p), &action_header);
     if let Some(md) = rich {
         let content = crate::feishu::card::viewer::rich_post_content(&md);
-        match crate::bridge::bounded_call(
-            &format!("permission {} companion post", p.request_id),
-            COMPANION_SEND_TIMEOUT_MS,
-            handles.platform.reply_message(&message_id, "post", &content),
-        )
-        .await
-        {
-            Some(Ok((sent_id, _))) if !sent_id.is_empty() => {
+        // A chat target has no message to reply under, so the same post is sent
+        // into the chat itself (`send_message`); only a `ReplyTo` uses the
+        // reply API.
+        let sent = match &target {
+            CardTarget::ReplyTo(message_id) => crate::bridge::bounded_call(
+                &format!("permission {} companion post", p.request_id),
+                COMPANION_SEND_TIMEOUT_MS,
+                handles.platform.reply_message(message_id, "post", &content),
+            )
+            .await
+            .map(|result| result.map(|(sent_id, _)| sent_id)),
+            CardTarget::Chat(chat_id) => {
+                crate::bridge::bounded_call(
+                    &format!("permission {} companion post", p.request_id),
+                    COMPANION_SEND_TIMEOUT_MS,
+                    handles
+                        .platform
+                        .send_message("chat_id", chat_id, "post", &content),
+                )
+                .await
+            }
+        };
+        match sent {
+            Some(Ok(sent_id)) if !sent_id.is_empty() => {
                 let delivery = CompanionDelivery {
                     message_id: sent_id,
                     lane: CompanionLane::RichText,
@@ -349,10 +361,14 @@ pub(crate) async fn ensure_permission_companion(
         p.request_id,
         p.total_target_len()
     );
+    let file_target = match &target {
+        CardTarget::ReplyTo(message_id) => crate::bridge::viewer::MessageTarget::ReplyTo(message_id),
+        CardTarget::Chat(chat_id) => crate::bridge::viewer::MessageTarget::Chat(chat_id),
+    };
     let (delivery, sent_id) = crate::bridge::viewer::send_file_message_with_outcome(
         &handles.platform,
         &handles.cards,
-        &message_id,
+        file_target,
         &content,
         hash,
         COMPANION_SEND_TIMEOUT_MS,

@@ -193,7 +193,7 @@ is allowed only when the full content was delivered for that request.
 - The refusal copy, the reason card and the retry behaviour stay in use only for
   a request that resolves no card target at all; a failed or uncertain companion
   takes the fallback card instead.
-- A target with only a chat reply target (no message to reply under) cannot take
-  either companion lane, so it takes the standalone fallback card sent into the
-  chat. Only a request that resolves no card target at all follows the refusal
-  path.
+- A target with only a chat reply target (no message to reply under) takes the
+  same companion lanes through the chat send (`send_message`), then the
+  standalone summary card is sent into that chat. Only a request that resolves
+  no card target at all follows the refusal path.

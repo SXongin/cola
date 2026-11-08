@@ -237,6 +237,14 @@ impl CardHandles {
     /// Drop a block's registry entry: it resolved, so nothing renders its
     /// controls anymore. Idempotent; the cached card stays until its last live
     /// block leaves (through `record` or an edit).
+    ///
+    /// This is **not** a settlement and deliberately leaves the companion
+    /// delivery record alone: `withdraw_block_for_fallback` and
+    /// `patch_stored_surfaces` call it for a `Superseded`/`Retrying` withdrawal,
+    /// where an uncertain marker must survive so the fresh path cannot re-send
+    /// (ADR-0102). The settlement paths (`drop_vanished`, `resolve_blocks`,
+    /// `mark_stale_cards`, `apply_stored_withdrawal`, `retain_companions`) own
+    /// that cleanup.
     pub fn forget(&mut self, request_id: &str) {
         self.blocks.remove(request_id);
         if let Some(surfaces) = &self.surfaces {
@@ -546,6 +554,35 @@ mod tests {
         found.sort();
         assert_eq!(found, vec!["om_new", "om_old"]);
         assert!(handles.cards_rendering("p_other").is_empty());
+    }
+
+    /// `forget` is not a settlement: a Superseded/Retrying withdrawal calls it
+    /// while the companion proof must survive, so the uncertain marker can
+    /// still prevent a duplicate send on the fresh path (ADR-0102).
+    #[test]
+    fn forget_keeps_the_companion_delivery_record() {
+        use crate::bridge::surfaces::{CompanionDelivery, CompanionLane, Surfaces};
+        let dir = tempfile::tempdir().unwrap();
+        let surfaces = std::sync::Arc::new(Surfaces::load(dir.path().join("interactive_surfaces.json")));
+        let mut handles = CardHandles::with_surfaces(surfaces.clone());
+        let c = card(vec![text("body"), text("button")]);
+        handles.record("om_1", &c, vec![block("p1", 0, 2, InteractionKind::Permission)]);
+        surfaces.set_companion(
+            "p1",
+            CompanionDelivery {
+                message_id: String::new(),
+                lane: CompanionLane::RichText,
+                target_digest: 7,
+            },
+        );
+
+        handles.forget("p1");
+
+        let kept = surfaces
+            .companion("p1")
+            .expect("forget must not clear the companion proof");
+        assert_eq!(kept.target_digest, 7, "the record is untouched");
+        assert!(kept.is_uncertain(), "and still the no-duplicate marker");
     }
 
     /// Resolving one block replaces exactly its elements and shifts the blocks

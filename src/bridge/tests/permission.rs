@@ -4120,11 +4120,12 @@ async fn a_failed_directory_keeps_a_stale_companion_record() {
     );
 }
 
-/// A target with only a chat target cannot take either companion lane (both
-/// require a message to reply under). It still gets the standalone fallback
-/// card, sent into the chat — never a silent refusal (#1013).
+/// A session with no live card resolves a **chat** target. The companion lane
+/// sends the full content into that chat with `send_message`, then the sweep
+/// posts the standalone summary card into the same chat — never a fallback just
+/// because there is no message to reply under.
 #[tokio::test]
-async fn an_over_budget_permission_without_a_reply_target_gets_the_fallback_card() {
+async fn an_over_budget_permission_without_a_reply_target_sends_the_companion_into_the_chat() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -4134,15 +4135,15 @@ async fn an_over_budget_permission_without_a_reply_target_gets_the_fallback_card
         request_id: "per_long".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
-        patterns: vec![command],
+        patterns: vec![command.clone()],
         metadata: None,
         always: Vec::new(),
         always_supported: true,
     }]);
     let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
     let (app, platform) = build_app(cfg, backend).await;
-    // No live card and no reply target: `resolve_card_target` yields a chat
-    // target, which neither companion lane can reply under.
+    // No live card: `resolve_card_target` yields the session's chat, not a
+    // message to reply under.
     seed_session(&app, "ses_test", "/work").await;
 
     let mut seen = std::collections::HashSet::new();
@@ -4150,26 +4151,46 @@ async fn an_over_budget_permission_without_a_reply_target_gets_the_fallback_card
 
     assert!(
         replies.lock().await.is_empty(),
-        "an undeliverable companion must not decline the request"
+        "a delivered companion never declines the request"
     );
     let calls = platform.calls.lock().await.clone();
+    let (receive_id_type, receive_id, content) = calls
+        .iter()
+        .find_map(|call| match call {
+            PlatformCall::SendMessage {
+                receive_id_type,
+                receive_id,
+                msg_type,
+                content,
+            } if msg_type == "post" => Some((receive_id_type.clone(), receive_id.clone(), content.clone())),
+            _ => None,
+        })
+        .expect("the companion post is sent into the chat");
+    assert_eq!(receive_id_type, "chat_id");
+    assert_eq!(receive_id, "chat_1");
+    let md = content["zh_cn"]["content"][0][0]["text"]
+        .as_str()
+        .expect("the companion carries a markdown element");
     assert!(
-        !calls.iter().any(|call| matches!(
-            call,
-            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
-        )),
-        "neither companion lane was attempted"
+        md.contains(&command),
+        "the chat companion carries the full target: {md}"
     );
-    let cards = platform.sent_cards().await;
-    assert!(
-        cards.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        }),
-        "the chat gets the fallback card: {cards:?}"
+
+    let card = platform
+        .sent_cards()
+        .await
+        .into_iter()
+        .find(|card| card_text(card).contains("富文本消息（Rich Text Message）"))
+        .expect("the standalone summary card is sent into the chat");
+    let allow = button_with_label(&card, "✅ 允许一次");
+    assert_eq!(
+        allow.get("action").and_then(|v| v.as_str()),
+        Some("perm"),
+        "the summary card's allow control is usable: {allow}"
     );
     assert!(
         app.permission.sent_cards.lock().await.contains_key("per_long"),
-        "the fallback is recorded as the standalone surface"
+        "the summary is recorded as the standalone surface"
     );
 }
 
@@ -4842,7 +4863,7 @@ async fn a_timed_out_companion_caption_still_lands_the_file() {
             crate::bridge::viewer::send_file_message_with_outcome(
                 &platform_dyn,
                 &cards,
-                "om_card",
+                crate::bridge::viewer::MessageTarget::ReplyTo("om_card"),
                 &content,
                 hash,
                 50,
@@ -5638,4 +5659,99 @@ async fn a_failing_auto_accept_warns_once_then_debugs_and_reports_recovery() {
         3,
         "each sweep retried the reply until it landed"
     );
+}
+
+/// The companion's reply-target walk is bounded: an over-budget request on an
+/// unmapped child session whose `session_info` hangs must not hang the lane.
+/// The timeout is a failed delivery, which the caller turns into the fallback
+/// card (see `a_failed_companion_surfaces_a_fallback_card_instead_of_rejecting`).
+#[tokio::test]
+async fn a_companion_target_walk_timeout_fails_instead_of_hanging() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // The child is not mapped, so the walk goes to the parent via
+    // `session_info`; that first hop is parked forever.
+    backend.with_session_parent("ses_child", "ses_parent");
+    backend.hang_session_info_reads(1);
+    let session_info_calls = std::sync::Arc::clone(&backend.session_info_calls);
+    let backend = std::sync::Arc::new(backend);
+    let platform = std::sync::Arc::new(RecordingPlatform::new());
+    let app = std::sync::Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_parent", "/work").await;
+    let request = long_permission("per_long", "ses_child", 5_000);
+
+    let handles = app.flow_handles();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::bridge::request::companion::ensure_permission_companion(
+            &handles,
+            &app.permission.surfaces,
+            &request,
+            "/work",
+            100,
+        ),
+    )
+    .await
+    .expect("the bounded walk returns instead of hanging");
+    assert!(
+        matches!(
+            outcome,
+            crate::bridge::request::companion::CompanionOutcome::Failed
+        ),
+        "a timed-out target walk is a failed delivery"
+    );
+    assert!(
+        session_info_calls
+            .lock()
+            .await
+            .iter()
+            .any(|session| session == "ses_child"),
+        "the walk reached the hung parent chain"
+    );
+    assert!(
+        app.permission.surfaces.companion("per_long").is_none(),
+        "no delivery record is written for a timeout"
+    );
+    let calls = platform.calls.lock().await;
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. }
+                | PlatformCall::SendMessage { .. }
+                | PlatformCall::UploadFile { .. }
+        )),
+        "no companion lane is attempted without a target"
+    );
+}
+
+/// `post_fallback_card` releases the Session write lock for the send: while the
+/// fallback card's `reply_card` is parked, another caller must still be able to
+/// take that Session's lock (a flush, `/card` or install would otherwise block
+/// behind a stalled Feishu call).
+#[tokio::test]
+async fn a_pending_fallback_send_never_holds_the_session_write_lock() {
+    let _wd = test_work_dir();
+    let (app, platform, _replies, allow, _dir) = shrunk_summary_fixture().await;
+    let (entered, release) = platform.pause("reply", "msg_1");
+    let click = tokio::spawn({
+        let app = app.clone();
+        async move { app.host_action_on_message(allow, "om_live").await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the replacement fallback send is in flight");
+
+    let lock = app.cards_handle().write_lock("ses_test").await;
+    let guard = tokio::time::timeout(std::time::Duration::from_millis(250), lock.lock())
+        .await
+        .expect("the Session write lock stays free while the send is pending");
+    drop(guard);
+
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), click)
+        .await
+        .expect("the click completes once the send is released")
+        .expect("the click task joins");
 }
