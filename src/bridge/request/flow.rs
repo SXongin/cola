@@ -1476,16 +1476,38 @@ impl RequestFlow {
         // host-check-under-the-child's-lock race) cannot recur.
         // Resolve the standalone target BEFORE any lock: this walk reads the
         // parent chain and the server's session metadata, which has no card
-        // state to serialize with.
-        let target = resolve_card_target(
-            &handles.sessions,
-            &handles.cards,
-            &handles.backend,
-            &handles.platform,
-            req.session_id(),
-            dir,
+        // state to serialize with. Bound it by the flow's read timeout too: a
+        // half-open `session_info` would otherwise freeze the sweep. A timeout
+        // is UNKNOWN, not "no target" — reading it as none would run the
+        // last-resort decline — so the request stays pending and unmarked for
+        // the next sweep.
+        let resolved_target = crate::bridge::bounded_call(
+            &format!("{} standalone target ({})", self.kind.label(), req.session_id()),
+            self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            async {
+                Ok::<_, crate::error::BridgeError>(
+                    resolve_card_target(
+                        &handles.sessions,
+                        &handles.cards,
+                        &handles.backend,
+                        &handles.platform,
+                        req.session_id(),
+                        dir,
+                    )
+                    .await,
+                )
+            },
         )
         .await;
+        let Some(resolved_target) = resolved_target else {
+            tracing::warn!(
+                "{} {}: target walk timed out; leaving it pending for the next sweep",
+                self.kind.label(),
+                req.id()
+            );
+            return false;
+        };
+        let target = resolved_target.ok().flatten();
         // A fallback card needs somewhere to land. With no reply target and no
         // chat, no card can ever show the risk, so the request must not stay
         // pending invisibly: keep the old refusal path as the last resort and

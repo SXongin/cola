@@ -5877,3 +5877,190 @@ async fn a_pending_fallback_send_never_holds_the_session_write_lock() {
         .expect("the click completes once the send is released")
         .expect("the click task joins");
 }
+
+/// The sweep's common target walk is bounded too. A timeout is UNKNOWN, not
+/// "no target": it must not run the last-resort decline or mark the request,
+/// and the next healthy sweep must surface it.
+#[tokio::test]
+async fn a_common_target_walk_timeout_retries_instead_of_declining() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let request = long_permission("per_long", "ses_child", 5_000);
+    let digest = crate::bridge::request::companion::companion_target_digest(&request);
+
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![request]);
+    // The child is unmapped, so the walk goes through `session_info`. Let the
+    // auto-accept hop (call 1) succeed and park the common target walk (call 2).
+    backend.with_session_parent("ses_child", "ses_parent");
+    backend.hang_session_info_on_call(2);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_parent", "/work").await;
+    app.permission
+        .list_timeout_ms
+        .store(100, std::sync::atomic::Ordering::SeqCst);
+    // A confirmed companion skips the companion walk, so the only walk after
+    // `prepare` is the common target walk.
+    app.permission.surfaces.set_companion(
+        "per_long",
+        crate::bridge::surfaces::CompanionDelivery {
+            message_id: "om_companion".into(),
+            lane: crate::bridge::surfaces::CompanionLane::RichText,
+            target_digest: digest,
+        },
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        app.permission.sweep(&app.flow_handles(), &mut seen),
+    )
+    .await
+    .expect("the bounded target walk lets the sweep finish");
+
+    assert!(
+        replies.lock().await.is_empty(),
+        "a timed-out target walk is not a decline"
+    );
+    assert!(
+        !seen.contains("per_long"),
+        "the request stays unmarked so the next sweep retries"
+    );
+    assert!(
+        platform.sent_cards().await.is_empty(),
+        "nothing is surfaced on the timeout guess"
+    );
+
+    // The next sweep is healthy: the request surfaces with its summary card.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        seen.contains("per_long"),
+        "the healthy sweep surfaces and marks the request"
+    );
+    let cards = platform.sent_cards().await;
+    assert!(
+        cards
+            .iter()
+            .any(|card| card_text(card).contains("富文本消息（Rich Text Message）")),
+        "the summary card is posted: {cards:?}"
+    );
+    assert!(replies.lock().await.is_empty(), "still no decline");
+}
+
+/// A failed verification read on a plain standalone card (no fallback/summary
+/// markers) must keep its controls too: that is the request's only surface.
+#[tokio::test]
+async fn a_failed_verification_read_keeps_a_plain_standalone_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![perm_req("per_1", "ses_test", "ls -la")]);
+    let fail_list = std::sync::Arc::clone(&backend.fail_list_permissions);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    // No live card: the request is a standalone card in the session's chat.
+    seed_session(&app, "ses_test", "/work").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let message_id = app
+        .permission
+        .sent_cards
+        .lock()
+        .await
+        .get("per_1")
+        .expect("the standalone card is recorded")
+        .message_id
+        .clone();
+    let card = platform
+        .sent_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the standalone card was sent");
+    let allow = button_with_label(&card, "✅ 允许一次");
+
+    fail_list.store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = app
+        .host_action_on_message(allow.clone(), &message_id)
+        .await
+        .expect("the failed verification returns a result");
+    assert!(
+        result.card.is_none(),
+        "the standalone card stays the live surface"
+    );
+    assert_eq!(result.toast.as_deref(), Some("无法校验目标，未批准"));
+    assert!(replies.lock().await.is_empty(), "nothing was decided");
+
+    fail_list.store(false, std::sync::atomic::Ordering::SeqCst);
+    let result = app
+        .host_action_on_message(allow, &message_id)
+        .await
+        .expect("the retried click returns a result");
+    assert!(result.card.is_some(), "the retry produces the decision result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_1".to_string(), "once".to_string())],
+        "the retry approves the still-pending request"
+    );
+}
+
+/// A legacy fallback confirmation (no digest) whose rebuild read fails must not
+/// replace the fallback card with a buttonless result; the retry after the read
+/// heals rebuilds it.
+#[tokio::test]
+async fn a_failed_legacy_digest_rebuild_keeps_the_fallback_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![long_permission("per_long", "ses_test", 5_000)]);
+    let fail_list = std::sync::Arc::clone(&backend.fail_list_permissions);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .fail_send_message_definite_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let (message_id, _card) = fallback_surface(&app, &platform, "per_long").await;
+    // A card from an older build: `confirm` with no `target_digest`.
+    let legacy = serde_json::json!({
+        "action": "perm",
+        "reply": "confirm",
+        "session_id": "ses_test",
+        "request_id": "per_long",
+        "directory": "/work",
+        "perm_label": "确认批准",
+        "perm_color": "green",
+        "fallback": true,
+        "always_supported": true,
+        "loss": "not_delivered",
+        "decision": "once"
+    });
+
+    fail_list.store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = app
+        .host_action_on_message(legacy.clone(), &message_id)
+        .await
+        .expect("the failed rebuild returns a result");
+    assert!(result.card.is_none(), "the fallback card stays the live surface");
+    assert_eq!(result.toast.as_deref(), Some("无法校验目标，未批准"));
+    assert!(replies.lock().await.is_empty(), "nothing was decided");
+
+    fail_list.store(false, std::sync::atomic::Ordering::SeqCst);
+    let result = app
+        .host_action_on_message(legacy, &message_id)
+        .await
+        .expect("the healed rebuild returns a card");
+    assert!(
+        result.card.is_some(),
+        "the rebuild posts an actionable fallback card"
+    );
+    assert!(replies.lock().await.is_empty(), "rebuilding never decides");
+}

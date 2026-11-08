@@ -1540,6 +1540,10 @@ pub struct MockBackend {
     /// Same as `hang_list_permissions`, for `session_info` (the session
     /// subtitle fetch — a wedged first request on a freshly spawned server).
     pub hang_session_info: Arc<std::sync::atomic::AtomicUsize>,
+    /// Hang the **nth** (1-based) `session_info` call rather than the next N.
+    /// Lets a test let the auto-accept walk succeed and park only the common
+    /// target walk. `0` is off.
+    pub hang_session_info_on_call: Arc<std::sync::atomic::AtomicUsize>,
     /// Same as `hang_list_permissions`, for `list_sessions` (the Lazy Start
     /// readiness probe).
     pub hang_list_sessions: Arc<std::sync::atomic::AtomicUsize>,
@@ -2084,6 +2088,7 @@ impl MockBackend {
             hang_list_questions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_transcript: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_session_info: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_session_info_on_call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_list_sessions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_list_permissions: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             list_permission_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2899,6 +2904,15 @@ impl MockBackend {
     pub(crate) fn hang_session_info_reads(&self, count: usize) -> &Self {
         self.hang_session_info
             .store(count, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the **nth** (1-based) `session_info` call hangs forever, after
+    /// the earlier calls serve normally — lets a test leave the auto-accept
+    /// walk healthy and park only the common target walk. `0` disables it.
+    pub(crate) fn hang_session_info_on_call(&self, call: usize) -> &Self {
+        self.hang_session_info_on_call
+            .store(call, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3876,6 +3890,14 @@ impl crate::backend::Backend for MockBackend {
         _d: Option<&str>,
     ) -> crate::error::Result<crate::backend::types::SessionInfo> {
         self.session_info_calls.lock().await.push(session_id.to_string());
+        let call = self.session_info_calls.lock().await.len();
+        if self
+            .hang_session_info_on_call
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == call
+        {
+            std::future::pending::<()>().await;
+        }
         if self
             .fail_session_info_count
             .load(std::sync::atomic::Ordering::SeqCst)
