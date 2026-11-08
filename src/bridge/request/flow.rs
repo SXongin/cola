@@ -1229,10 +1229,10 @@ impl RequestFlow {
 
     /// Everything one sweep does with ONE listed request, wrapped by the
     /// caller in that request's session span (ADR-0048): the re-host for a
-    /// request already surfaced, the kind's `refuse` (a companion delivery that
-    /// failed — before any surface, the restart readoption included), the kind's
-    /// `prepare` (auto-accept / remember), the companion delivery, and the card
-    /// delivery — inline on the session's live card, else a standalone card.
+    /// request already surfaced, the companion refusal (a delivery that failed),
+    /// the kind's `prepare` (auto-accept / remember), the companion delivery,
+    /// and the card delivery — inline on the session's live card, else a
+    /// standalone card.
     /// Returns whether the request was handled without a card (a refusal or an
     /// auto-accept), which the sweep must exclude from its reminder/pin
     /// reconciliation.
@@ -1280,13 +1280,6 @@ impl RequestFlow {
             self.rehost_block(handles, req, dir).await;
             return false;
         }
-        // Kind-specific refusal BEFORE any surface. An over-budget permission is
-        // no longer refused here (ADR-0102): its full target travels in a
-        // companion, so the refusal covers only a companion that could not be
-        // delivered. A refused request is settled on the server and its stored
-        // surface withdrawn in this same pass; a FAILED refusal leaves it
-        // pending and unmarked, so the next sweep retries it and this pass
-        // offers nothing.
         // A withdrawal this flow already decided but could not deliver is
         // replayed with its original payload: re-deciding now could mislabel the
         // card (the request may already be settled, or another client may have
@@ -1370,7 +1363,7 @@ impl RequestFlow {
                 CompanionOutcome::Delivered => {}
                 CompanionOutcome::Uncertain => {
                     let handled = self
-                        .settle_decline(handles, req.id(), p, dir, DeclineReason::CompanionUncertain)
+                        .settle_decline(handles, p, dir, DeclineReason::CompanionUncertain)
                         .await;
                     if handled {
                         seen.insert(req.id().to_string());
@@ -1379,7 +1372,7 @@ impl RequestFlow {
                 }
                 CompanionOutcome::Failed => {
                     let handled = self
-                        .settle_decline(handles, req.id(), p, dir, DeclineReason::Overflow(overflow))
+                        .settle_decline(handles, p, dir, DeclineReason::Overflow(overflow))
                         .await;
                     if handled {
                         seen.insert(req.id().to_string());
@@ -1662,13 +1655,12 @@ impl RequestFlow {
         }
     }
 
-    /// Apply a refusal decision's effects. `Handled` means the request is
+    /// Apply a decline decision's effects. `Handled` means the request is
     /// settled and the caller marks it seen; `Retry` means this pass must offer
-    /// nothing and leave it retryable; `NotApplicable` means nothing to refuse.
+    /// nothing and leave it retryable.
     async fn apply_refusal(
         &self,
         handles: &FlowHandles,
-        id: &str,
         p: &crate::backend::types::PermissionRequest,
         dir: &str,
         refusal: Refusal,
@@ -1679,7 +1671,7 @@ impl RequestFlow {
                     DeclineReason::Overflow(overflow) => Withdrawal::Refused(overflow),
                     DeclineReason::CompanionUncertain => Withdrawal::CompanionUncertain,
                 };
-                match self.withdraw_stored_surface(handles, id, p, how).await {
+                match self.withdraw_stored_surface(handles, p, how).await {
                     // The PATCH failed; the stored surface (and the payload)
                     // are kept so the next sweep retries the withdrawal.
                     WithdrawalOutcome::Failed => RefusalApplied::Retry,
@@ -1693,7 +1685,7 @@ impl RequestFlow {
             // Someone else settled it: withdraw a stored card without claiming
             // cola rejected anything, post nothing, and treat it as handled.
             Refusal::ResolvedElsewhere => match self
-                .withdraw_stored_surface(handles, id, p, Withdrawal::ResolvedElsewhere)
+                .withdraw_stored_surface(handles, p, Withdrawal::ResolvedElsewhere)
                 .await
             {
                 WithdrawalOutcome::Failed => RefusalApplied::Retry,
@@ -1703,7 +1695,7 @@ impl RequestFlow {
             // so the next sweep retries it, but a stored card must not stay
             // clickable in the meantime: neutralize it (claiming nothing).
             Refusal::Failed => {
-                self.withdraw_stored_surface(handles, id, p, Withdrawal::Retrying)
+                self.withdraw_stored_surface(handles, p, Withdrawal::Retrying)
                     .await;
                 RefusalApplied::Retry
             }
@@ -1716,14 +1708,13 @@ impl RequestFlow {
     async fn settle_decline(
         &self,
         handles: &FlowHandles,
-        id: &str,
         p: &crate::backend::types::PermissionRequest,
         dir: &str,
         reason: DeclineReason,
     ) -> bool {
         let refusal = decline_permission(handles, p, dir, reason).await;
         matches!(
-            self.apply_refusal(handles, id, p, dir, refusal).await,
+            self.apply_refusal(handles, p, dir, refusal).await,
             RefusalApplied::Handled
         )
     }
@@ -1751,10 +1742,10 @@ impl RequestFlow {
     async fn withdraw_stored_surface(
         &self,
         handles: &FlowHandles,
-        id: &str,
         p: &crate::backend::types::PermissionRequest,
         how: Withdrawal,
     ) -> WithdrawalOutcome {
+        let id = p.request_id.as_str();
         self.recovered.lock().await.remove(id);
         let receipt = match how {
             Withdrawal::Refused(_) => {
@@ -1813,21 +1804,26 @@ impl RequestFlow {
         outcome
     }
 
-    /// Neutralize a stored surface with a replacement payload **without
-    /// committing** the registry/sent-card mutation. The readoption failure
-    /// path uses this so the old card stops being interactive immediately while
-    /// the pending SUPERSEDED retry still finds the handle and paints the final
-    /// receipt. Returns whether every stored surface was patched.
-    async fn neutralize_stored_surface_preview(
+    /// Patch every stored surface for `id` with the replacement `receipt` and
+    /// `card`, optionally committing the registry/record mutation after each
+    /// successful PATCH. Returns `(attempted, failed)`. One loop serves both the
+    /// committed withdrawal and the preview neutralization, so they cannot
+    /// drift.
+    async fn patch_stored_surfaces(
         &self,
         handles: &FlowHandles,
         id: &str,
         receipt: &str,
         card: &serde_json::Value,
-    ) -> bool {
+        commit: bool,
+    ) -> (bool, bool) {
+        let mut attempted = false;
+        let mut failed = false;
         let timeout_ms = self
             .withdrawal_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
+        // Inline: preview the block's replacement on the cached card, PATCH,
+        // then (on commit) apply the edit and drop the handle.
         let inline = {
             let registry = handles.cards.card_handles.lock().await;
             registry
@@ -1840,88 +1836,31 @@ impl RequestFlow {
                 })
         };
         if let Some((message_id, preview)) = inline {
+            attempted = true;
             let patched = crate::bridge::bounded_call(
-                &format!("neutralize {} block on {}", id, message_id),
+                &format!("withdraw {} block on {}", id, message_id),
                 timeout_ms,
                 handles.platform.update_message(&message_id, &preview),
             )
             .await;
             match patched {
-                Some(Ok(())) => {}
-                Some(Err(e)) if e.is_message_gone() => {}
-                _ => return false,
-            }
-        }
-        let standalone = self.sent_cards.lock().await.get(id).cloned();
-        if let Some(sent) = standalone {
-            let patched = crate::bridge::bounded_call(
-                &format!("neutralize {} card on {}", id, sent.message_id),
-                timeout_ms,
-                handles.platform.update_message(&sent.message_id, card),
-            )
-            .await;
-            match patched {
-                Some(Ok(())) => {}
-                Some(Err(e)) if e.is_message_gone() => {}
-                _ => return false,
-            }
-        }
-        true
-    }
-
-    /// Patch every stored surface for `id` with the replacement `withdrawal`
-    /// names, committing the registry/persisted state **only after** the
-    /// PATCH lands.
-    ///
-    /// A failed PATCH changes nothing: the old card is still interactive, so
-    /// forgetting its handle would strand it — the withdrawal could never be
-    /// retried and the request would wait behind a button nobody neutralized.
-    async fn apply_stored_withdrawal(
-        &self,
-        handles: &FlowHandles,
-        id: &str,
-        withdrawal: &PendingWithdrawal,
-    ) -> WithdrawalOutcome {
-        let mut attempted = false;
-        let mut failed = false;
-        let timeout_ms = self
-            .withdrawal_timeout_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
-        // Inline: preview the block's replacement on the cached card, PATCH,
-        // then commit the edit and drop the handle.
-        let inline = {
-            let registry = handles.cards.card_handles.lock().await;
-            registry
-                .message_of(id)
-                .map(str::to_string)
-                .and_then(|message_id| {
-                    registry
-                        .resolved_preview(&message_id, id, &withdrawal.receipt)
-                        .map(|card| (message_id, card))
-                })
-        };
-        if let Some((message_id, card)) = inline {
-            attempted = true;
-            let patched = crate::bridge::bounded_call(
-                &format!("withdraw {} block on {}", id, message_id),
-                timeout_ms,
-                handles.platform.update_message(&message_id, &card),
-            )
-            .await;
-            match patched {
                 Some(Ok(())) => {
-                    let mut registry = handles.cards.card_handles.lock().await;
-                    registry.resolve_on(&message_id, id, &withdrawal.receipt);
-                    registry.forget(id);
+                    if commit {
+                        let mut registry = handles.cards.card_handles.lock().await;
+                        registry.resolve_on(&message_id, id, receipt);
+                        registry.forget(id);
+                    }
                     tracing::info!("withdrew {} inline block on {}", id, message_id);
                 }
                 Some(Err(e)) if e.is_message_gone() => {
                     // The message no longer exists: nothing is clickable, so
                     // the handle — and the dead card's cached JSON — have
                     // nothing left to neutralize.
-                    let mut registry = handles.cards.card_handles.lock().await;
-                    registry.forget(id);
-                    registry.release_cache(&message_id);
+                    if commit {
+                        let mut registry = handles.cards.card_handles.lock().await;
+                        registry.forget(id);
+                        registry.release_cache(&message_id);
+                    }
                     tracing::info!(
                         "withdrew {} inline block: message {} is gone ({})",
                         id,
@@ -1949,7 +1888,7 @@ impl RequestFlow {
                     }
                 }
             }
-        } else {
+        } else if commit {
             // A handle whose cached card no longer renders the block is
             // unusable, and nothing there can be clicked: drop it.
             let mut registry = handles.cards.card_handles.lock().await;
@@ -1957,27 +1896,29 @@ impl RequestFlow {
                 registry.forget(id);
             }
         }
-        // Standalone: PATCH the record's card, then forget the record.
+        // Standalone: PATCH the record's card, then (on commit) forget it.
         let standalone = self.sent_cards.lock().await.get(id).cloned();
         if let Some(sent) = standalone {
             attempted = true;
             let patched = crate::bridge::bounded_call(
                 &format!("withdraw {} card on {}", id, sent.message_id),
                 timeout_ms,
-                handles
-                    .platform
-                    .update_message(&sent.message_id, &withdrawal.card),
+                handles.platform.update_message(&sent.message_id, card),
             )
             .await;
             match patched {
                 Some(Ok(())) => {
-                    self.sent_cards.lock().await.remove(id);
-                    self.surfaces.remove_standalone(id);
+                    if commit {
+                        self.sent_cards.lock().await.remove(id);
+                        self.surfaces.remove_standalone(id);
+                    }
                     tracing::info!("withdrew {} standalone card on {}", id, sent.message_id);
                 }
                 Some(Err(e)) if e.is_message_gone() => {
-                    self.sent_cards.lock().await.remove(id);
-                    self.surfaces.remove_standalone(id);
+                    if commit {
+                        self.sent_cards.lock().await.remove(id);
+                        self.surfaces.remove_standalone(id);
+                    }
                     tracing::info!(
                         "withdrew {} standalone card: message {} is gone ({})",
                         id,
@@ -2006,6 +1947,37 @@ impl RequestFlow {
                 }
             }
         }
+        (attempted, failed)
+    }
+
+    /// Neutralize a stored surface with a replacement payload **without
+    /// committing** the registry/sent-card mutation. The readoption failure
+    /// path uses this so the old card stops being interactive immediately while
+    /// the pending SUPERSEDED retry still paints the final receipt. Returns
+    /// whether every stored surface was patched.
+    async fn neutralize_stored_surface_preview(
+        &self,
+        handles: &FlowHandles,
+        id: &str,
+        receipt: &str,
+        card: &serde_json::Value,
+    ) -> bool {
+        let (_, failed) = self
+            .patch_stored_surfaces(handles, id, receipt, card, false)
+            .await;
+        !failed
+    }
+
+    /// Patch every stored surface for `id` and commit the withdrawal.
+    async fn apply_stored_withdrawal(
+        &self,
+        handles: &FlowHandles,
+        id: &str,
+        withdrawal: &PendingWithdrawal,
+    ) -> WithdrawalOutcome {
+        let (attempted, failed) = self
+            .patch_stored_surfaces(handles, id, &withdrawal.receipt, &withdrawal.card, true)
+            .await;
         if !failed
             && matches!(
                 withdrawal.how,
@@ -2122,7 +2094,7 @@ impl RequestFlow {
                     id
                 );
                 return match self
-                    .withdraw_stored_surface(handles, id, p, Withdrawal::Superseded)
+                    .withdraw_stored_surface(handles, p, Withdrawal::Superseded)
                     .await
                 {
                     WithdrawalOutcome::Failed => {

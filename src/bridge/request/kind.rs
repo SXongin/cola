@@ -102,7 +102,7 @@ pub trait RequestKind: Send + Sync {
         req: &PendingRequest,
     ) -> crate::error::Result<()>;
 
-    /// Runs once per newly-seen, not-refused request before it becomes a card.
+    /// Runs once per newly-seen request before it becomes a card.
     /// Permissions answer `/autoaccept` sessions here and return
     /// [`Prepared::Handled`] (no card); questions remember the full request
     /// (via the flow) for later card rebuilds and return
@@ -288,7 +288,16 @@ impl ClickProof {
     }
 }
 
-/// What [`RequestKind::prepare`] did for one not-refused request.
+/// The toast for an ordinary permission decision.
+fn toast_for(reply: &str) -> String {
+    match reply {
+        "once" => "已允许本次执行".to_string(),
+        "always" => "已允许，后续将自动放行".to_string(),
+        _ => "已拒绝".to_string(),
+    }
+}
+
+/// What [`RequestKind::prepare`] did for one listed request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Prepared {
     /// The kind handled the request: no card is needed.
@@ -761,22 +770,15 @@ impl RequestKind for PermissionKind {
         // Result card: shows the decision, no buttons. A forced refusal says
         // why — it is not the decision the button label claimed.
         let (label, toast, body, color) = match &proof {
-            ClickProof::Confirmed { request, delivery } => {
-                let toast = match reply {
-                    "once" => "已允许本次执行".to_string(),
-                    "always" => "已允许，后续将自动放行".to_string(),
-                    _ => "已拒绝".to_string(),
-                };
-                (
-                    display_label,
-                    toast,
-                    // The approval re-read the request from the server; the
-                    // result card describes exactly that request, never the
-                    // callback's stale copy.
-                    describe_permission_for(request, delivery.as_ref()),
-                    perm_color,
-                )
-            }
+            ClickProof::Confirmed { request, delivery } => (
+                display_label,
+                toast_for(reply),
+                // The approval re-read the request from the server; the
+                // result card describes exactly that request, never the
+                // callback's stale copy.
+                describe_permission_for(request, delivery.as_ref()),
+                perm_color,
+            ),
             ClickProof::Uncertain => (
                 crate::feishu::card::question::UNCERTAIN_PERMISSION_CLICK_LABEL,
                 "已拒绝：完整内容送达结果未知".to_string(),
@@ -789,19 +791,12 @@ impl RequestKind for PermissionKind {
                 crate::feishu::card::question::missing_permission_click_note(),
                 "red",
             ),
-            ClickProof::None => {
-                let toast = match reply {
-                    "once" => "已允许本次执行".to_string(),
-                    "always" => "已允许，后续将自动放行".to_string(),
-                    _ => "已拒绝".to_string(),
-                };
-                (
-                    display_label,
-                    toast,
-                    clicked_body.unwrap_or_else(|| display_label.to_string()),
-                    perm_color,
-                )
-            }
+            ClickProof::None => (
+                display_label,
+                toast_for(reply),
+                clicked_body.unwrap_or_else(|| display_label.to_string()),
+                perm_color,
+            ),
         };
         let mut r = result_card(label, color, &body);
         r.toast = Some(toast);

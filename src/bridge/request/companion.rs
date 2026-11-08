@@ -82,6 +82,39 @@ pub(crate) enum CompanionOutcome {
     Failed,
 }
 
+/// The Rich Text body a companion can carry, or `None` when the lane must fall
+/// to the File Message.
+///
+/// A **targets** overflow is fenced with its action header and sized by the
+/// existing `rich_post_md` helper. A **body** overflow (or a defensive `None`)
+/// is already the renderer's markdown and is sent as-is, but still guarded by
+/// the same 30 KB post cap: the 3,060-character body ceiling is the proof's
+/// *trigger*, not the post bound, so this check keeps ADR-0083 §5's size step
+/// true if that render bound ever moves.
+pub(crate) fn companion_rich_body(
+    body: &str,
+    overflow: Option<PermissionOverflow>,
+    action_header: &str,
+) -> Option<String> {
+    match overflow {
+        Some(PermissionOverflow::Targets) => crate::feishu::card::viewer::rich_post_md(
+            crate::feishu::card::viewer::ViewerKind::Text,
+            Some("txt"),
+            body,
+        )
+        .map(|fenced| format!("{action_header}{fenced}"))
+        .filter(|md| {
+            crate::feishu::card::sanitize::serialized_len(md) + 128
+                <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES
+        }),
+        // Defensive: the rendered body is normally far below the post cap, but
+        // the ladder rule must still fall to the File Message if it is not.
+        _ => (crate::feishu::card::sanitize::serialized_len(body) + 128
+            <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES)
+            .then_some(body.to_string()),
+    }
+}
+
 /// Record a non-proof marker for a send whose outcome is unknown. It prevents a
 /// duplicate companion but never validates an approval (ADR-0102).
 fn mark_uncertain(
@@ -161,23 +194,8 @@ pub(crate) async fn ensure_permission_companion(
     // block. A BODY overflow is already the renderer's markdown (action,
     // metadata, footer); send it as-is — fencing it would show the markdown
     // literally and prepending the action would repeat it.
-    let rich = match permission_overflow(p) {
-        Some(PermissionOverflow::Targets) => crate::feishu::card::viewer::rich_post_md(
-            crate::feishu::card::viewer::ViewerKind::Text,
-            Some("txt"),
-            &body,
-        )
-        .map(|fenced| format!("{emoji} **{label}**\n\n{fenced}"))
-        .filter(|md| {
-            crate::feishu::card::sanitize::serialized_len(md) + 128
-                <= crate::feishu::card::FEISHU_CARD_LIMIT_BYTES
-        }),
-        // Body overflow, or no overflow (defensive): the body already names the
-        // action and renders readably. The rendered body is bounded by the
-        // ~3,060-character render invariant plus a small chrome, far below the
-        // 30 KB post cap, so it always takes the Rich Text lane.
-        _ => Some(body.clone()),
-    };
+    let action_header = format!("{emoji} **{label}**\n\n");
+    let rich = companion_rich_body(&body, permission_overflow(p), &action_header);
     if let Some(md) = rich {
         let content = crate::feishu::card::viewer::rich_post_content(&md);
         match crate::bridge::bounded_call(
@@ -262,7 +280,7 @@ pub(crate) async fn ensure_permission_companion(
         content.data.as_deref().unwrap_or_default(),
     );
     let caption = format!(
-        "📎 权限请求 {}：完整内容（{} 字符）见下方 .txt 文件。",
+        "📎 权限请求 {}：完整内容（{} 字符）已作为 .txt 文件发送。",
         p.request_id,
         p.total_target_len()
     );
@@ -323,3 +341,50 @@ pub(crate) async fn ensure_permission_companion(
 /// poller. A timeout is an UNCERTAIN send — it may have landed, so it is
 /// recorded and never retried rather than treated as a failed lane.
 const COMPANION_SEND_TIMEOUT_MS: u64 = 10_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ladder's 30 KB step stays true for a rendered-body companion if the
+    /// render bound ever moves: an oversized body takes the File lane.
+    #[test]
+    fn a_body_past_the_post_cap_takes_the_file_lane() {
+        let body = "x".repeat(crate::feishu::card::FEISHU_CARD_LIMIT_BYTES + 1);
+        assert!(
+            companion_rich_body(
+                &body,
+                Some(PermissionOverflow::Body),
+                "⚡ **执行 Shell 命令**\n\n"
+            )
+            .is_none(),
+            "a body past the post cap must fall to the File Message"
+        );
+    }
+
+    /// A body overflow is sent as the renderer's markdown once — no fence and no
+    /// repeated action header.
+    #[test]
+    fn a_body_overflow_is_sent_as_markdown_once() {
+        let body = "⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n\nAI 想要执行这个操作，是否允许？";
+        let md = companion_rich_body(body, Some(PermissionOverflow::Body), "⚡ **执行 Shell 命令**\n\n")
+            .expect("a normal rendered body fits");
+        assert_eq!(md, body);
+        assert_eq!(md.matches("执行 Shell 命令").count(), 1);
+        assert!(!md.starts_with("```"));
+    }
+
+    /// A targets overflow still takes the fenced lane and its own post cap.
+    #[test]
+    fn a_target_past_the_post_cap_takes_the_file_lane() {
+        let target = "x".repeat(crate::feishu::card::FEISHU_CARD_LIMIT_BYTES + 1);
+        assert!(
+            companion_rich_body(
+                &target,
+                Some(PermissionOverflow::Targets),
+                "⚡ **执行 Shell 命令**\n\n"
+            )
+            .is_none()
+        );
+    }
+}
