@@ -1686,6 +1686,18 @@ impl Platform for CardDelivery {
         self.inner.send_card(receive_id_type, receive_id, card).await
     }
 
+    async fn send_message(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: &Value,
+    ) -> Result<String> {
+        self.inner
+            .send_message(receive_id_type, receive_id, msg_type, content)
+            .await
+    }
+
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()> {
         let seq = {
             let mut state = self.state.lock().unwrap();
@@ -2117,6 +2129,15 @@ mod tests {
             _receive_id_type: &str,
             _receive_id: &str,
             _card: &Value,
+        ) -> Result<String> {
+            unimplemented!("not used")
+        }
+        async fn send_message(
+            &self,
+            _receive_id_type: &str,
+            _receive_id: &str,
+            _msg_type: &str,
+            _content: &Value,
         ) -> Result<String> {
             unimplemented!("not used")
         }

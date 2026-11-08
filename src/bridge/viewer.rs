@@ -1141,6 +1141,15 @@ async fn deliver(
 /// that wants a warning prefix wraps this text rather than restating it.
 pub(crate) const FILE_SEND_UNKNOWN_TEXT: &str = "发送结果未知，为避免重复未重试。";
 
+/// Where a Rich Text or File Message goes: a reply under an existing message,
+/// or a chat when there is no message to reply under. The permission companion
+/// can have either target; every other viewer lane replies.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MessageTarget<'a> {
+    ReplyTo(&'a str),
+    Chat(&'a str),
+}
+
 /// Upload `content` once (content-hash cached) and post exactly ONE File Message
 /// carrying its key under `reply_target`. `Undelivered` past Feishu's 30MB cap,
 /// on a failed upload or definite send refusal. A timed-out send — or one that
@@ -1154,21 +1163,29 @@ pub(crate) async fn send_file_message(
     hash: u64,
     timeout_ms: u64,
 ) -> FileDelivery {
-    send_file_message_with_outcome(platform, cards, reply_target, content, hash, timeout_ms, None)
-        .await
-        .0
+    send_file_message_with_outcome(
+        platform,
+        cards,
+        MessageTarget::ReplyTo(reply_target),
+        content,
+        hash,
+        timeout_ms,
+        None,
+    )
+    .await
+    .0
 }
 
 /// [`send_file_message`] with the created message id and an optional caption
 /// line sent after the file lands. The permission companion uses this to name
 /// the request in the chat: Feishu's `msg_type: "file"` payload carries only
-/// `file_key`, so the caption is a short follow-up reply (the uploaded filename
-/// names the request too). A caption is never sent for a failed or ambiguous
-/// send, so it cannot point at a file that is not there.
+/// `file_key`, so the caption is a short follow-up message (the uploaded
+/// filename names the request too). A caption is never sent for a failed or
+/// ambiguous send, so it cannot point at a file that is not there.
 pub(crate) async fn send_file_message_with_outcome(
     platform: &Arc<dyn Platform>,
     cards: &CardsHandle,
-    reply_target: &str,
+    target: MessageTarget<'_>,
     content: &FileContent,
     hash: u64,
     timeout_ms: u64,
@@ -1200,24 +1217,54 @@ pub(crate) async fn send_file_message_with_outcome(
         Ok(None) | Err(()) => return (FileDelivery::Undelivered, None),
     };
     let payload = serde_json::json!({ "file_key": file_key });
-    match crate::bridge::bounded_call(
-        "viewer file message",
-        timeout_ms,
-        platform.reply_message(reply_target, "file", &payload),
-    )
-    .await
-    {
+    let sent = match target {
+        MessageTarget::ReplyTo(reply_to) => {
+            crate::bridge::bounded_call(
+                "viewer file message",
+                timeout_ms,
+                platform.reply_message(reply_to, "file", &payload),
+            )
+            .await
+        }
+        MessageTarget::Chat(chat_id) => {
+            crate::bridge::bounded_call("viewer file message", timeout_ms, async {
+                platform
+                    .send_message("chat_id", chat_id, "file", &payload)
+                    .await
+                    .map(|message_id| (message_id, None))
+            })
+            .await
+        }
+    };
+    match sent {
         Some(Ok((message_id, _))) if !message_id.is_empty() => {
             // The caption names the request only AFTER the file landed: a
             // definite failure must not leave a chat line pointing at no file.
             if let Some(caption) = caption {
-                match crate::bridge::bounded_call(
-                    "viewer file caption",
-                    timeout_ms,
-                    platform.reply_text(reply_target, caption),
-                )
-                .await
-                {
+                let caption_sent = match target {
+                    MessageTarget::ReplyTo(reply_to) => {
+                        crate::bridge::bounded_call(
+                            "viewer file caption",
+                            timeout_ms,
+                            platform.reply_text(reply_to, caption),
+                        )
+                        .await
+                    }
+                    MessageTarget::Chat(chat_id) => {
+                        crate::bridge::bounded_call(
+                            "viewer file caption",
+                            timeout_ms,
+                            platform.send_message(
+                                "chat_id",
+                                chat_id,
+                                "text",
+                                &serde_json::json!({ "text": caption }),
+                            ),
+                        )
+                        .await
+                    }
+                };
+                match caption_sent {
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         tracing::warn!("viewer File Message caption failed: {error}")

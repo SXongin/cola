@@ -950,10 +950,11 @@ fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: 
 
 /// ADR-0101/0102 (#1013): a recovered over-budget card an older build
 /// persisted is **withdrawn, not re-adopted**. The request then takes the
-/// normal fresh path; with no reply target the companion cannot land, so it
-/// gets the standalone fallback card — never a silent decline.
+/// normal fresh path; with no reply target the companion goes into the
+/// session's chat and the standalone summary card follows — never a silent
+/// decline.
 #[tokio::test]
-async fn restart_withdraws_an_over_budget_inline_permission_then_surfaces_the_fallback() {
+async fn restart_withdraws_an_over_budget_inline_permission_then_surfaces_the_summary() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -974,7 +975,7 @@ async fn restart_withdraws_an_over_budget_inline_permission_then_surfaces_the_fa
 
     assert!(
         backend.reply_permission_calls.lock().await.is_empty(),
-        "the fresh path must not decline when no companion can land"
+        "the fresh path must not decline"
     );
     let withdrawn = last_update_of(&platform, "om_card")
         .await
@@ -989,17 +990,18 @@ async fn restart_withdraws_an_over_budget_inline_permission_then_surfaces_the_fa
         "no control survives on the withdrawn card: {text}"
     );
     assert!(
-        posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        }),
-        "the fresh path posts the fallback card"
+        platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessage { msg_type, .. } if msg_type == "post"
+        )),
+        "the companion is sent into the session's chat"
     );
     assert!(
-        !platform.calls.lock().await.iter().any(|call| matches!(
-            call,
-            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
-        )),
-        "no companion can be sent without a reply target"
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the fresh path surfaces the companion summary"
     );
     assert!(
         app.cards_handle()
@@ -1022,9 +1024,10 @@ async fn restart_withdraws_an_over_budget_inline_permission_then_surfaces_the_fa
 
 /// The standalone half of the same rule (#1013): a request card an older build
 /// posted for an over-budget request is withdrawn as reprocessed, then the
-/// fresh path surfaces the fallback card.
+/// fresh path delivers the companion into the session's chat and surfaces the
+/// summary card.
 #[tokio::test]
-async fn restart_withdraws_an_over_budget_standalone_permission_then_surfaces_the_fallback() {
+async fn restart_withdraws_an_over_budget_standalone_permission_then_surfaces_the_summary() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
@@ -1043,7 +1046,7 @@ async fn restart_withdraws_an_over_budget_standalone_permission_then_surfaces_th
 
     assert!(
         backend.reply_permission_calls.lock().await.is_empty(),
-        "the fresh path must not decline when no companion can land"
+        "the fresh path must not decline"
     );
     let withdrawn = last_update_of(&platform, "om_standalone")
         .await
@@ -1058,25 +1061,26 @@ async fn restart_withdraws_an_over_budget_standalone_permission_then_surfaces_th
         "no control survives on the withdrawn card: {text}"
     );
     assert!(
-        posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        }),
-        "the fresh path posts the fallback card"
+        platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessage { msg_type, .. } if msg_type == "post"
+        )),
+        "the companion is sent into the session's chat"
     );
     assert!(
-        !platform.calls.lock().await.iter().any(|call| matches!(
-            call,
-            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
-        )),
-        "no companion can be sent without a reply target"
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the fresh path surfaces the companion summary"
     );
     assert!(
         app.permission.sent_cards.lock().await.contains_key("per_long"),
-        "the fallback card is recorded as the standalone surface"
+        "the summary card is recorded as the standalone surface"
     );
     assert!(
         persisted(&session_file).unwrap_or_default().contains("per_long"),
-        "the fallback surface is persisted"
+        "the summary surface is persisted"
     );
 }
 
@@ -1134,13 +1138,92 @@ async fn restart_withdraws_a_card_whose_confirmed_companion_digest_moved() {
         !text.contains("允许一次"),
         "no control survives on the withdrawn card: {text}"
     );
+    let record = app
+        .permission
+        .surfaces
+        .companion("per_long")
+        .expect("the fresh path delivers a companion for the current target");
     assert!(
-        app.permission.surfaces.companion("per_long").is_none(),
-        "the mismatched record is replaced, not trusted"
+        record.target_digest != 0 && !record.is_uncertain(),
+        "the mismatched record is replaced, not trusted: {record:?}"
+    );
+    assert!(
+        platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessage { msg_type, .. } if msg_type == "post"
+        )),
+        "the replacement companion is sent into the session's chat"
+    );
+    assert!(
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the fresh path surfaces the summary card"
+    );
+}
+
+/// ADR-0102: a Superseded withdrawal is **not** a settlement, so it must not
+/// drop the uncertain companion marker. The fresh path then sees the marker,
+/// treats the outcome as unknown, and surfaces the fallback card — it must not
+/// re-send a companion the ambiguous-send rule says is terminal.
+#[tokio::test]
+async fn a_superseded_withdrawal_keeps_the_uncertain_companion_marker() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", false, "om_standalone");
+    // A confirmed *marker* is not a delivery: the companion may have landed, so
+    // it is never re-sent. The digest matches the request, so the fresh path
+    // must read the marker rather than discard it as stale.
+    let request = over_budget_perm("per_long", "ses_1");
+    crate::bridge::surfaces::Surfaces::load(crate::state::StateLayout::beside(
+        &session_file,
+        "interactive_surfaces.json",
+    ))
+    .set_companion(
+        "per_long",
+        crate::bridge::surfaces::CompanionDelivery {
+            message_id: String::new(),
+            lane: crate::bridge::surfaces::CompanionLane::RichText,
+            target_digest: crate::bridge::request::companion::companion_target_digest(&request),
+        },
+    );
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(request);
+    })
+    .await;
+    sweep(&app.permission, &app).await;
+
+    let marker = app
+        .permission
+        .surfaces
+        .companion("per_long")
+        .expect("a Superseded withdrawal keeps the uncertain marker");
+    assert!(
+        marker.is_uncertain(),
+        "the marker is still the no-duplicate record, not a delivery"
+    );
+    assert!(
+        !platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { .. } | PlatformCall::UploadFile { .. }
+        )),
+        "an uncertain marker is terminal: the fresh path must not re-send"
+    );
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "the uncertain outcome is not a decline"
     );
     assert!(
         posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
+            card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER)
         }),
         "the fresh path surfaces the fallback card"
     );
@@ -1453,8 +1536,9 @@ async fn restart_withdraws_a_recovered_card_then_retries_an_unknown_auto_accept(
 }
 
 /// A recovered unbacked card on a chain too deep to read (Capped) is withdrawn,
-/// then the fresh path surfaces the fallback card when no companion can land
-/// rather than approving or declining the old decision in place.
+/// then the fresh path delivers the companion into the session's chat and
+/// surfaces the summary card rather than approving or declining the old
+/// decision in place.
 #[tokio::test]
 async fn restart_withdraws_a_recovered_card_then_handles_a_capped_chain() {
     let _wd = test_work_dir();
@@ -1488,13 +1572,21 @@ async fn restart_withdraws_a_recovered_card_then_handles_a_capped_chain() {
     );
     assert!(
         backend.reply_permission_calls.lock().await.is_empty(),
-        "the fresh path must not decline when no companion can land"
+        "the fresh path must not decline"
     );
     assert!(
-        posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        }),
-        "the chat gets the fallback card"
+        platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessage { msg_type, .. } if msg_type == "post"
+        )),
+        "the companion is sent into the session's chat"
+    );
+    assert!(
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the fresh path surfaces the companion summary"
     );
 }
 
@@ -1634,8 +1726,8 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
         "nothing is posted before the withdrawal lands: {text}"
     );
 
-    // The retry lands; the request then takes the fresh path and surfaces the
-    // fallback card (no reply target means the companion cannot land).
+    // The retry lands; the request then takes the fresh path, delivers the
+    // companion into the session's chat and surfaces the summary card.
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert!(
         backend.reply_permission_calls.lock().await.is_empty(),
@@ -1653,9 +1745,8 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
         posted_cards(&platform)
             .await
             .iter()
-            .any(|card| card_text(card)
-                .contains(crate::feishu::card::question::fallback_permission_risk_note())),
-        "the landed withdrawal is followed by the fallback card"
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the landed withdrawal is followed by the companion summary"
     );
 }
 
@@ -1701,8 +1792,9 @@ async fn restart_previews_a_standalone_card_before_its_superseded_retry() {
         "the standalone record is kept for the retry"
     );
 
-    // The retry paints the final SUPERSEDED card, then the fresh path surfaces
-    // the fallback card as a new standalone surface.
+    // The retry paints the final SUPERSEDED card, then the fresh path delivers
+    // the companion into the session's chat and surfaces the summary card as a
+    // new standalone surface.
     sweep(&app.permission, &app).await;
     let final_card = last_update_of(&platform, "om_standalone")
         .await
@@ -1714,13 +1806,14 @@ async fn restart_previews_a_standalone_card_before_its_superseded_retry() {
     );
     assert!(
         app.permission.sent_cards.lock().await.contains_key("per_long"),
-        "the fresh fallback card is recorded as a new standalone surface"
+        "the fresh summary card is recorded as a new standalone surface"
     );
     assert!(
-        posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        }),
-        "the fresh path surfaces the fallback card"
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the fresh path surfaces the companion summary"
     );
 }
 
@@ -1770,13 +1863,14 @@ async fn a_failed_standalone_preview_keeps_the_record_for_the_retry() {
     );
     assert!(
         app.permission.sent_cards.lock().await.contains_key("per_long"),
-        "the fresh fallback card is recorded as a new standalone surface"
+        "the fresh summary card is recorded as a new standalone surface"
     );
     assert!(
-        posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        }),
-        "the retry surfaces the fallback card"
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the retry surfaces the companion summary"
     );
 }
 
@@ -1881,8 +1975,8 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
         "the handle is kept so the pending SUPERSEDED retry can paint it"
     );
 
-    // The retry lands, then the request takes the fresh path and surfaces the
-    // fallback card.
+    // The retry lands, then the request takes the fresh path, delivers the
+    // companion into the session's chat and surfaces the summary card.
     sweep(&app.permission, &app).await;
     assert!(
         backend.reply_permission_calls.lock().await.is_empty(),
@@ -1918,13 +2012,14 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
     );
     assert!(
         persisted(&session_file).unwrap_or_default().contains("per_long"),
-        "the new fallback surface is persisted"
+        "the new summary surface is persisted"
     );
     assert!(
-        posted_cards(&platform).await.iter().any(|card| {
-            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
-        }),
-        "the fresh path posts the fallback card once"
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| { card_text(card).contains("富文本消息（Rich Text Message）") }),
+        "the fresh path posts the companion summary once"
     );
 }
 

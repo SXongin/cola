@@ -50,6 +50,19 @@ pub trait Platform: Send + Sync {
 
     async fn send_card(&self, receive_id_type: &str, receive_id: &str, card: &Value) -> Result<String>;
 
+    /// Send a message of an arbitrary `msg_type` into a chat (or user),
+    /// mirroring [`Self::send_card`]'s `receive_id_type`/`receive_id` request
+    /// shape. The chat-target counterpart of [`Self::reply_message`], used when
+    /// a lane has a chat but no message to reply under — the permission
+    /// companion's Rich Text and File Messages.
+    async fn send_message(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: &Value,
+    ) -> Result<String>;
+
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()>;
 
     /// Edit an existing non-card message (e.g. a Rich Text Message) with the
@@ -375,6 +388,16 @@ impl Platform for Client {
 
     async fn send_card(&self, receive_id_type: &str, receive_id: &str, card: &Value) -> Result<String> {
         Client::send_card(self, receive_id_type, receive_id, card).await
+    }
+
+    async fn send_message(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: &Value,
+    ) -> Result<String> {
+        Client::send_message(self, receive_id_type, receive_id, msg_type, content).await
     }
 
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()> {
