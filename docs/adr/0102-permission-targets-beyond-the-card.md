@@ -40,12 +40,12 @@ is allowed only when the full content was delivered for that request.
   not be delivered, and a recovered card with no companion record.
 - **One proof, two renderings.** The summary card, the inline block and the
   Interaction Receipt share one summary form: the action, the summed target
-  length, the first 120 characters of what the proof measures, and where the
+  length, the first 120 characters of the target, and where the
   full content lives. The full description stays for in-budget requests.
 - **ADR-0083 §5's ladder.** The full content goes out as one Rich Text Message
   (`post` with an `md` tag); a body past the 30 KB `post` cap, or a send that
   definitely did not land, falls to one File Message (an uploaded `.txt` whose
-  name and preceding caption name the request). An ambiguous send is terminal:
+  name and following caption name the request). An ambiguous send is terminal:
   it is never retried into a duplicate, but it is **not** a delivery. It leaves
   a non-proof marker and the request follows the refusal path; the copy names
   the unknown outcome instead of claiming either delivery or a definite failure.

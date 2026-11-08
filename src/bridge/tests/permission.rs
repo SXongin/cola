@@ -1592,6 +1592,11 @@ fn perm_req(id: &str, session: &str, pattern: &str) -> crate::backend::types::Pe
     }
 }
 
+/// An over-budget bash request: `echo ` plus `chars` x's.
+fn long_permission(id: &str, session: &str, chars: usize) -> crate::backend::types::PermissionRequest {
+    perm_req(id, session, &format!("echo {}", "x".repeat(chars)))
+}
+
 /// Every Rich Text companion the platform recorded, in call order. The
 /// companion lane is the one `post` reply the permission flow sends.
 async fn posted_companions(platform: &RecordingPlatform) -> Vec<serde_json::Value> {
@@ -2460,6 +2465,10 @@ async fn an_over_budget_permission_surfaces_with_a_post_companion_and_approves()
         "the receipt names the decision: {ack}"
     );
     assert!(ack.contains("echo"), "and the target it approved: {ack}");
+    assert!(
+        ack.contains("5005 字符") && ack.contains("富文本消息"),
+        "the receipt carries the same summary (length and lane): {ack}"
+    );
     assert_eq!(
         replies.lock().await.as_slice(),
         &[("per_long".to_string(), "once".to_string())],
@@ -2601,7 +2610,7 @@ async fn a_sweep_replaces_a_stale_companion_record_before_surfacing() {
     assert_ne!(record.message_id, "om_stale", "the stale record is not kept");
     assert_eq!(
         record.target_digest,
-        crate::bridge::request::kind::companion_target_digest(&request),
+        crate::bridge::request::companion::companion_target_digest(&request),
         "the replacement proves the current content"
     );
     assert_eq!(
@@ -2652,6 +2661,46 @@ async fn a_complete_sweep_drops_a_companion_record_for_a_resolved_request() {
     assert!(
         app.permission.surfaces.companion("per_gone").is_none(),
         "a request absent from a complete sweep has resolved"
+    );
+}
+
+/// A directory whose list failed says nothing about resolution, so the sweep
+/// must keep its companion records: deleting one there would let a later sweep
+/// re-send a companion for a request that may still be pending (#130).
+#[tokio::test]
+async fn a_failed_directory_keeps_a_stale_companion_record() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(Vec::new());
+    let fail_list = backend.fail_list_permissions.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    // A real directory so a list failure is transient, not the structural
+    // dead-path state that never retries.
+    seed_session(&app, "ses_test", dir.path().to_str().unwrap()).await;
+    app.permission.surfaces.set_companion(
+        "per_gone",
+        crate::bridge::surfaces::CompanionDelivery {
+            message_id: "om_gone".into(),
+            lane: crate::bridge::surfaces::CompanionLane::RichText,
+            target_digest: 7,
+        },
+    );
+
+    fail_list.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        app.permission.surfaces.companion("per_gone").is_some(),
+        "a failed directory must not be read as resolved"
+    );
+
+    fail_list.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        app.permission.surfaces.companion("per_gone").is_none(),
+        "the next complete sweep forgets it"
     );
 }
 
@@ -3189,7 +3238,7 @@ async fn an_over_budget_post_body_falls_to_a_file_companion() {
             call,
             PlatformCall::ReplyText { text, .. } if text.contains("per_huge")
         )),
-        "a caption names the request before the file: {calls:?}"
+        "a caption names the request after the file lands: {calls:?}"
     );
     assert_eq!(
         upload.1,
@@ -3221,6 +3270,83 @@ async fn an_over_budget_post_body_falls_to_a_file_companion() {
     assert!(
         !text.contains(&command),
         "the card never carries the full target: {text}"
+    );
+}
+
+/// The caption is best effort: a failed caption must not undo a landed File
+/// Message or the companion proof.
+#[tokio::test]
+async fn a_failed_companion_caption_does_not_block_the_file() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(long_permission("per_huge", "ses_test", 31_000));
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .fail_reply_text_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert!(replies.lock().await.is_empty(), "never declined");
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"
+        )),
+        "the File Message landed despite the caption failure"
+    );
+    let record = app
+        .permission
+        .surfaces
+        .companion("per_huge")
+        .expect("the confirmed delivery is recorded");
+    assert!(!record.is_uncertain(), "the file delivery is confirmed");
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    assert!(
+        card_text(&card).contains("文件消息（File Message）"),
+        "the summary still names the lane: {}",
+        card_text(&card)
+    );
+}
+
+/// A File Message success with an empty id is a marker, not a delivery — the
+/// same rule as the Rich Text lane.
+#[tokio::test]
+async fn an_empty_file_message_id_is_not_a_delivery() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(long_permission("per_long", "ses_test", 5_000));
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .fail_send_message_definite_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_message_reply_id("");
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let record = app
+        .permission
+        .surfaces
+        .companion("per_long")
+        .expect("the send is recorded");
+    assert!(
+        record.message_id.is_empty() && record.is_uncertain(),
+        "an empty File Message id is an uncertain marker, not a delivery"
     );
 }
 
@@ -3407,18 +3533,28 @@ async fn a_failed_companion_and_decline_keep_the_request_retryable() {
     );
 
     // The retry succeeds: the declination lands and the reason card is posted.
-    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let (_, logs) = capture_logs(async {
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    })
+    .await;
     assert_eq!(
         replies.lock().await.len(),
         2,
         "the second sweep retries the decline"
     );
+    let line = assert_line_level(&logs, "declined permission per_long", "WARN");
+    assert!(
+        line.contains("past the card's 3000 character budget"),
+        "the refusal diagnostic names the crossed budget: {line}"
+    );
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.replied_cards().await);
     assert!(
-        cards.iter().any(|card| card_text(card)
-            .contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
-        "the successful retry explains the refusal"
+        cards.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+                && card_text(card).contains("3000")
+        }),
+        "the successful retry explains the refusal with the budget it crossed"
     );
     assert!(
         Turn::live_permissions(&app.cards_handle(), "ses_test")

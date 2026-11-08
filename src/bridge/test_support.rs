@@ -494,6 +494,9 @@ pub struct RecordingPlatform {
     /// The next N `reply_message` calls fail with a DEFINITE 4xx (no message was
     /// created): the shape a companion lane may fall through to the next lane.
     pub fail_send_message_definite_count: std::sync::atomic::AtomicUsize,
+    /// The next N `reply_text` calls fail with a Feishu error (the companion
+    /// caption is best-effort and must not block the file).
+    pub fail_reply_text_count: std::sync::atomic::AtomicUsize,
     /// The next N `reply_message` calls fail ambiguously after the request
     /// went out (a 5xx/transport-shaped error): the send may have landed, so a
     /// caller must treat the outcome as unknown rather than retry.
@@ -554,6 +557,7 @@ impl RecordingPlatform {
             fail_upload_file_count: std::sync::atomic::AtomicUsize::new(0),
             fail_send_message_count: std::sync::atomic::AtomicUsize::new(0),
             fail_send_message_definite_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_reply_text_count: std::sync::atomic::AtomicUsize::new(0),
             ambiguous_send_message_count: std::sync::atomic::AtomicUsize::new(0),
             refuse_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
             reject_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1109,6 +1113,17 @@ impl feishu::Platform for RecordingPlatform {
             message_id: message_id.into(),
             text: text.into(),
         });
+        if self
+            .fail_reply_text_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_reply_text_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated reply_text failure".into(),
+            ));
+        }
         Ok("msg_text".into())
     }
 

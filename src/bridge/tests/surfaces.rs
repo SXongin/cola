@@ -1460,7 +1460,7 @@ async fn a_failed_withdrawal_keeps_the_uncertain_companion_marker() {
             CompanionDelivery {
                 message_id: String::new(),
                 lane: CompanionLane::RichText,
-                target_digest: crate::bridge::request::kind::companion_target_digest(&request),
+                target_digest: crate::bridge::request::companion::companion_target_digest(&request),
             },
         );
     }
@@ -1553,6 +1553,14 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
         backend.reply_permission_calls.lock().await.len(),
         1,
         "the second sweep declines through the fresh path"
+    );
+    let final_card = last_update_of(&platform, "om_card")
+        .await
+        .expect("the retry paints the final receipt");
+    assert!(
+        card_text(&final_card).contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the retry paints the reprocessed receipt, not the retry placeholder: {}",
+        card_text(&final_card)
     );
     assert!(
         posted_cards(&platform)
@@ -1659,8 +1667,8 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
             .lock()
             .await
             .message_of("per_long")
-            .is_none(),
-        "the immediate neutralization forgot the handle"
+            .is_some(),
+        "the handle is kept so the pending SUPERSEDED retry can paint it"
     );
 
     // The retry lands, then the request takes the fresh path and is declined.
@@ -1685,14 +1693,14 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
     };
     assert_eq!(
         updates.len(),
-        2,
-        "one failed attempt and one successful retry, no duplicate deliveries"
+        3,
+        "failed withdrawal, immediate neutralization, successful retry"
     );
     let final_card = updates.last().expect("the successful retry");
     let text = card_text(final_card);
     assert!(
-        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT),
-        "the immediate neutralization receipt survives: {text}"
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "the final receipt is the reprocessed one: {text}"
     );
     assert!(
         !text.contains("允许一次") && !text.contains("始终允许"),
@@ -1712,9 +1720,9 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
 
 /// Whole-branch re-review #883: one withdrawal PATCH may not wedge the sweep.
 /// A hung Feishu call is bounded by the flow's timeout, the attempt counts as
-/// failed, the handle is kept, and the same sweep completes — otherwise a
-/// stalled PATCH would freeze the whole permission poller with an old Allow
-/// card still clickable.
+/// failed, the handle is kept for the pending retry, and the same sweep
+/// completes — otherwise a stalled PATCH would freeze the whole permission
+/// poller with an old Allow card still clickable.
 #[tokio::test]
 async fn a_hung_withdrawal_patch_does_not_wedge_the_sweep() {
     let _wd = test_work_dir();
@@ -1763,8 +1771,8 @@ async fn a_hung_withdrawal_patch_does_not_wedge_the_sweep() {
             .lock()
             .await
             .message_of("per_long")
-            .is_none(),
-        "the immediate neutralization still stopped the old controls"
+            .is_some(),
+        "the handle is kept so the pending retry can paint the final receipt"
     );
     release.notify_waiters();
 }
@@ -2027,8 +2035,8 @@ async fn a_bare_404_keeps_the_withdrawal_retryable() {
             .lock()
             .await
             .message_of("per_long")
-            .is_none(),
-        "the immediate neutralization forgot the handle"
+            .is_some(),
+        "the handle is kept so the pending retry can paint the final receipt"
     );
 
     // The next sweep (no injected 404) finishes the withdrawal and takes the
@@ -2040,8 +2048,8 @@ async fn a_bare_404_keeps_the_withdrawal_retryable() {
         .expect("the retry patched the card");
     let text = card_text(&final_card);
     assert!(
-        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT),
-        "and the card ends non-interactive: {text}"
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_RECEIPT),
+        "and the card ends on the reprocessed receipt: {text}"
     );
     assert!(!text.contains("允许一次"), "no control survives: {text}");
 }
