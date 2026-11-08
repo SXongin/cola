@@ -12,6 +12,13 @@ that server's session id; a location-owned server keeps the sentinel. A location
 server is the default `[mcp]` configuration, so the session-less shape is
 permanent, not a transition to wait out.
 
+Sharing a connection does not change ownership. A pooled connection (`pool:
+true`, OpenCode v2.2.6) serves several directories but has no roots: an
+elicitation caused by a tool call appears in the **calling** directory, while one
+with no caller is delivered to every holder as its own form, first answer wins
+and the rest are cancelled. The caller case is still directory-owned; the
+no-caller case can list one logical request in several directories.
+
 #489 made these forms terminal: one WARN, no session read, no surface. The MCP
 call stays blocked and nobody sees why. A form has no TTL — it lives in the
 server's in-memory form cache until answered, cancelled, its connection aborts,
@@ -48,11 +55,15 @@ with a mapped conversation retries it; a timed-out send can duplicate the card
 exactly as every standalone send can today, and this record does not claim to
 fix that ambiguity. If the
 mapping disappears between listing and delivery, nothing is sent and nothing is
-suppressed. The card never rides an inline block, never enters
-`pending_sessions`, and never drives the Instant Reminder: that surface needs a
-Turn's generation to own and clear its pin, and a Location Form has none. It
-does take a **Message Pin** under the same `instant_reminder` opt-in, because a
-pin is keyed by message.
+suppressed. A form raised on a shared connection with no caller is listed in
+every directory holding that connection, so cola treats each listing as its own
+request and that rare case can produce one card per holder; answering one
+cancels the others upstream and their cards go stale on the next sweep, and no
+cross-location dedupe is attempted. The card never rides an inline block, never
+enters `pending_sessions`, and never drives the Instant Reminder: that surface
+needs a Turn's generation to own and clear its pin, and a Location Form has
+none. It does take a **Message Pin** under the same `instant_reminder` opt-in,
+because a pin is keyed by message.
 
 **Dismissal.** 「稍后」 withdraws the card — and releases its Message Pin —
 without declining the request. The form stays pending and `/mcp` can reopen it
@@ -112,6 +123,9 @@ permits, not for a case in the current wire.
   (`src/backend/mod.rs`).
 - The #489 WARN remains for every session-less request that is not a marked
   elicitation.
+- A pooled connection's caller-attributed elicitation stays in the calling
+  directory; a no-caller one may produce one card per holder, with no
+  cross-location dedupe.
 - A Session-owned elicitation — which the in-progress session-owned MCP work
   produces — takes the normal Question path unchanged; the Location path
   remains for location-owned servers.
