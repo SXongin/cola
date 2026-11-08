@@ -27,9 +27,51 @@ pub(crate) fn companion_text(p: &crate::backend::types::PermissionRequest) -> St
 /// The stable digest of [`companion_text`]. It is a fingerprint, never the
 /// content: the record is persisted beside the other surfaces.
 pub(crate) fn companion_target_digest(p: &crate::backend::types::PermissionRequest) -> u64 {
+    match permission_overflow(p) {
+        Some(PermissionOverflow::Targets) => patterns_target_digest(p),
+        _ => text_digest(&companion_text(p)),
+    }
+}
+
+/// The digest of a request's raw targets — the exact text a **targets**
+/// overflow companion carries (the same `\n\n` join [`companion_text`] uses).
+///
+/// The fallback card's risk confirmation uses this digest even for a
+/// rendered-body overflow, where the companion proof hashes the whole rendered
+/// description instead. The two answer different questions: the companion
+/// digest proves that *exactly the companion's text* was delivered (for a body
+/// overflow that includes the render chrome), while the risk digest identifies
+/// the **target** the user is confirming without seeing in full. The target is
+/// the decision's subject; a metadata-only render change must not invalidate a
+/// confirmation of unchanged commands, and a changed command must (ADR-0102).
+pub(crate) fn patterns_target_digest(p: &crate::backend::types::PermissionRequest) -> u64 {
+    text_digest(&p.patterns.join("\n\n"))
+}
+
+/// SHA-256 → the first eight bytes as a stable fingerprint. One definition, so
+/// the companion proof and the risk confirmation cannot drift.
+fn text_digest(text: &str) -> u64 {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(companion_text(p).as_bytes());
+    let digest = Sha256::digest(text.as_bytes());
     u64::from_be_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"))
+}
+
+/// The target summary the fallback card shows when no companion lane delivered
+/// the full content (ADR-0102 / #1013): the action, the summed target length,
+/// the first 120 characters, where the full content should have gone, and the
+/// risk the user accepts by approving. The confirmation card and the result
+/// card reuse this whole body, so the three cannot disagree about what was not
+/// shown.
+pub(crate) fn fallback_permission_summary(p: &crate::backend::types::PermissionRequest) -> String {
+    let action = p.permission.as_deref().unwrap_or("?");
+    let (emoji, label) = describe_action(action);
+    let excerpt: String = p.patterns.join("\n\n").chars().take(120).collect();
+    format!(
+        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}\n**完整内容**: 未能送达。\n\n**风险**: {}",
+        p.total_target_len(),
+        crate::feishu::card::fenced_code(&excerpt, None),
+        crate::feishu::card::question::fallback_permission_risk_note()
+    )
 }
 
 /// The summary form of a permission for an over-budget request (ADR-0102): the
@@ -385,6 +427,63 @@ mod tests {
                 "⚡ **执行 Shell 命令**\n\n"
             )
             .is_none()
+        );
+    }
+
+    fn over_budget_request(
+        patterns: Vec<&str>,
+        metadata: Option<serde_json::Value>,
+    ) -> crate::backend::types::PermissionRequest {
+        crate::backend::types::PermissionRequest {
+            request_id: "per_1".into(),
+            session_id: Some("ses_1".into()),
+            permission: Some("bash".into()),
+            patterns: patterns.into_iter().map(str::to_string).collect(),
+            metadata,
+            always: Vec::new(),
+            always_supported: true,
+        }
+    }
+
+    /// A targets overflow's companion digest and its risk digest cover the same
+    /// text: the raw targets. The risk confirmation must agree with the proof
+    /// where the proof's text really is the targets.
+    #[test]
+    fn a_targets_overflow_shares_the_risk_digest() {
+        let p = over_budget_request(vec![&"x".repeat(1_600), &"y".repeat(1_600)], None);
+        assert_eq!(
+            companion_target_digest(&p),
+            patterns_target_digest(&p),
+            "the companion and the risk confirmation hash the same target text"
+        );
+    }
+
+    /// A rendered-body overflow's companion carries the full rendered body
+    /// (including its chrome), while the risk confirmation is over the raw
+    /// targets. A metadata-only change must move the companion proof without
+    /// invalidating a confirmation of unchanged commands.
+    #[test]
+    fn a_body_overflow_risk_digest_ignores_render_chrome() {
+        let pattern = "x".repeat(2_900);
+        let before = over_budget_request(
+            vec![pattern.as_str()],
+            Some(serde_json::json!({ "command": "y".repeat(200) })),
+        );
+        let after = over_budget_request(
+            vec![pattern.as_str()],
+            Some(serde_json::json!({ "command": "z".repeat(200) })),
+        );
+        assert_eq!(permission_overflow(&before), Some(PermissionOverflow::Body));
+        assert_eq!(permission_overflow(&after), Some(PermissionOverflow::Body));
+        assert_ne!(
+            companion_target_digest(&before),
+            companion_target_digest(&after),
+            "the companion proof covers the rendered chrome it actually carries"
+        );
+        assert_eq!(
+            patterns_target_digest(&before),
+            patterns_target_digest(&after),
+            "the risk confirmation identifies the unchanged target"
         );
     }
 }

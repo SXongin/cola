@@ -21,7 +21,9 @@ use crate::feishu::card::tool_render::{
     DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_from_metadata, parse_edit_diff,
 };
 
-use super::companion::{companion_target_digest, describe_permission_for};
+use super::companion::{
+    companion_target_digest, describe_permission_for, fallback_permission_summary, patterns_target_digest,
+};
 use super::delivery::{
     DENIED_PREFIX, Origin, RECEIPT_MAX_CHARS, Residue, ack_inline_card, already_handled_result,
     denied_receipt, failed_result_card, handled_elsewhere_receipt, receipt_line, refresh_question_block,
@@ -276,6 +278,18 @@ enum ClickProof {
         request: crate::backend::types::PermissionRequest,
         delivery: Option<CompanionDelivery>,
     },
+    /// The user explicitly risk-confirmed an over-budget approval from the
+    /// fallback card: no companion exists, but the button's digest matches the
+    /// request the server still holds. This is the ONE deliberate exception to
+    /// the delivery proof (ADR-0102 / #1013), and it is narrow: only the
+    /// fallback confirmation button carries `risk_confirmed`.
+    RiskConfirmed {
+        request: crate::backend::types::PermissionRequest,
+    },
+    /// A risk-confirmed click whose digest no longer matches the re-read
+    /// request. Nothing is replied: the user confirmed a target that changed
+    /// between the confirmation card and the click.
+    RiskMismatch,
     /// An over-budget request whose only record is an uncertain marker.
     Uncertain,
     /// An over-budget request with no matching companion record.
@@ -494,6 +508,94 @@ impl RequestKind for PermissionKind {
         // malformed/stale callback omitted it.
         let display_label = if perm_label.is_empty() { reply } else { perm_label };
 
+        // A fallback card is STANDALONE by construction (ADR-0102 / #1013): its
+        // click ack must replace that card, never a streaming card that happens
+        // to be live for the same session. The first-step allow buttons and the
+        // confirmation carry `fallback`; the confirmation also carries
+        // `risk_confirmed`.
+        let fallback_click = value.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false);
+        let risk_confirmed = value
+            .get("risk_confirmed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let risk_digest = value.get("target_digest").and_then(|v| v.as_u64());
+        let inline = inline && !fallback_click && !risk_confirmed;
+
+        // The fallback card's allow buttons are FIRST-STEP only: they show a
+        // confirmation card and must not reply, claim, or touch any block.
+        if reply == "confirm" {
+            let decision = match value.get("decision").and_then(|v| v.as_str()) {
+                Some("always") => "always",
+                _ => "once",
+            };
+            let always_supported = value
+                .get("always_supported")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let Some(dir) = directory else {
+                return Some(failed_result_card(
+                    inline,
+                    "无法重建确认卡片，请重试。",
+                    "无法重建确认卡片",
+                ));
+            };
+            let Some(card) = fallback_confirmation_card(
+                flow,
+                req_id,
+                session_id,
+                dir,
+                decision,
+                always_supported,
+                risk_digest,
+            )
+            .await
+            else {
+                return Some(failed_result_card(
+                    inline,
+                    "无法重建确认卡片，请重试。",
+                    "无法重建确认卡片",
+                ));
+            };
+            return Some(CardActionResult {
+                card: Some(card),
+                toast: Some("请再次确认".to_string()),
+            });
+        }
+
+        // 取消 on the confirmation card returns to the fallback card. Like the
+        // first step it replies nothing and claims nothing.
+        if reply == "cancel_confirm" {
+            let always_supported = value
+                .get("always_supported")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let summary = flow
+                .sent_cards
+                .lock()
+                .await
+                .get(req_id)
+                .map(|c| c.summary.clone());
+            let Some(summary) = summary.filter(|s| !s.is_empty()) else {
+                return Some(failed_result_card(
+                    inline,
+                    "无法重建权限卡片，请重试。",
+                    "无法重建权限卡片",
+                ));
+            };
+            let card = crate::feishu::card::question::build_fallback_permission_card(
+                session_id,
+                req_id,
+                directory.unwrap_or(""),
+                &summary,
+                always_supported,
+                risk_digest.unwrap_or_default(),
+            );
+            return Some(CardActionResult {
+                card: Some(card),
+                toast: Some("已取消".to_string()),
+            });
+        }
+
         // "开启自动授权": turn on the session's Auto-Accept and approve the
         // current (plus any other) pending permission in one interaction — no
         // new message, unlike typing `/autoaccept on`. The backend never sees
@@ -601,6 +703,20 @@ impl RequestKind for PermissionKind {
                                 request: p.clone(),
                                 delivery: None,
                             },
+                            Some(_) if risk_confirmed => {
+                                // The one deliberate exception to the delivery
+                                // proof: the user pressed 确认批准 on the
+                                // fallback card. Accept only when the digest
+                                // the button carried still matches the request
+                                // the server holds; a changed target is never
+                                // approved (and no reply is sent at all).
+                                let expected = patterns_target_digest(p);
+                                if risk_digest == Some(expected) {
+                                    ClickProof::RiskConfirmed { request: p.clone() }
+                                } else {
+                                    ClickProof::RiskMismatch
+                                }
+                            }
                             Some(_) => {
                                 // ANY overflow — the summed target budget or
                                 // the rendered-body ceiling — needs the one
@@ -642,6 +758,19 @@ impl RequestKind for PermissionKind {
                     ));
                 }
             }
+        }
+        // A risk confirmation whose digest no longer matches the request the
+        // server holds proves nothing: do not claim the request, do not reply
+        // (not even a reject), and say why. The request stays pending.
+        if matches!(proof, ClickProof::RiskMismatch) {
+            tracing::warn!(
+                "permission {req_id}: risk confirmation digest no longer matches the pending \
+                 request; not approved and not rejected"
+            );
+            return Some(CardActionResult {
+                card: Some(crate::feishu::card::question::build_risk_digest_mismatch_card()),
+                toast: Some("目标已变化，请重新确认".to_string()),
+            });
         }
         // A blocked proof is always declined, whatever the button asked for:
         // the click sought an approval the user could not have reviewed.
@@ -706,6 +835,21 @@ impl RequestKind for PermissionKind {
                 // The span already carries the session; the id here is the
                 // request's, so it is named as one.
                 tracing::info!("Permission reply sent: {} request={}", reply, req_id);
+                if let ClickProof::RiskConfirmed { request } = &proof {
+                    // The one auditable record of an approval the card could
+                    // not fully show (ADR-0102 / #1013): WARN, with the request
+                    // id, the exact target length and the fact that the user
+                    // confirmed unseen text.
+                    tracing::warn!(
+                        "risk-confirmed permission approval: request={} session={} decision={} \
+                         target_len={} — the user confirmed unseen text; the card did not show the \
+                         complete target",
+                        request.request_id,
+                        session_id,
+                        reply,
+                        request.total_target_len()
+                    );
+                }
                 // ADR-0038 rules 3+4: the clicked block becomes its
                 // Interaction Receipt (rendered from the accumulator, so it
                 // survives later flushes) and the ack below carries the
@@ -716,10 +860,18 @@ impl RequestKind for PermissionKind {
                 let uncertain_receipt =
                     |_target: &str| crate::feishu::card::question::UNCERTAIN_PERMISSION_RECEIPT.to_string();
                 let normal_receipt = |target: &str| permission_receipt(target, reply);
+                let risk_receipt = |target: &str| risk_permission_receipt(target, reply);
                 let residue = match proof {
                     ClickProof::Uncertain => Residue::PerBlock(&uncertain_receipt),
                     ClickProof::Missing => Residue::PerBlock(&missing_receipt),
-                    ClickProof::Confirmed { .. } | ClickProof::None => Residue::PerBlock(&normal_receipt),
+                    ClickProof::RiskConfirmed { .. } | ClickProof::RiskMismatch => {
+                        Residue::PerBlock(&risk_receipt)
+                    }
+                    ClickProof::Confirmed { .. } => Residue::PerBlock(&normal_receipt),
+                    // A fallback card's deny is a one-click decision; its
+                    // residue still says the target was not fully shown.
+                    ClickProof::None if fallback_click => Residue::PerBlock(&risk_receipt),
+                    ClickProof::None => Residue::PerBlock(&normal_receipt),
                 };
                 resolve_blocks(
                     flow,
@@ -789,6 +941,20 @@ impl RequestKind for PermissionKind {
                 crate::feishu::card::question::MISSING_PERMISSION_CLICK_LABEL,
                 "已拒绝：完整内容未送达".to_string(),
                 crate::feishu::card::question::missing_permission_click_note(),
+                "red",
+            ),
+            ClickProof::RiskConfirmed { request } => (
+                display_label,
+                toast_for(reply),
+                // The whole fallback summary — target summary plus the risk
+                // paragraph — so the result names what was not fully shown.
+                fallback_permission_summary(request),
+                perm_color,
+            ),
+            ClickProof::RiskMismatch => (
+                crate::feishu::card::question::RISK_DIGEST_MISMATCH_LABEL,
+                "目标已变化，未批准".to_string(),
+                crate::feishu::card::question::risk_digest_mismatch_note(),
                 "red",
             ),
             ClickProof::None => (
@@ -1145,6 +1311,16 @@ pub(crate) const AUTOACCEPT_RECEIPT: &str =
 /// clocks on one card (#183 follow-up). Its timeline position already places
 /// it between what the Host could see and what followed.
 fn permission_receipt(target: &str, reply: &str) -> String {
+    permission_receipt_with(target, reply, "")
+}
+
+/// [`permission_receipt`] for a fallback-card decision, where the target was
+/// not fully shown: `✅ 已允许一次（目标未完整展示）：⚡ 执行 Shell 命令 …`.
+fn risk_permission_receipt(target: &str, reply: &str) -> String {
+    permission_receipt_with(target, reply, "（目标未完整展示）")
+}
+
+fn permission_receipt_with(target: &str, reply: &str, suffix: &str) -> String {
     let line = match reply {
         once @ ("once" | "always") => {
             let prefix = if once == "once" {
@@ -1153,14 +1329,44 @@ fn permission_receipt(target: &str, reply: &str) -> String {
                 "✅ 已始终允许"
             };
             if target.is_empty() {
-                prefix.to_string()
+                format!("{prefix}{suffix}")
             } else {
-                format!("{prefix}：{target}")
+                format!("{prefix}{suffix}：{target}")
             }
         }
-        _ => return receipt_line(DENIED_PREFIX, target),
+        _ => return receipt_line(&format!("{DENIED_PREFIX}{suffix}"), target),
     };
     truncate(&line, RECEIPT_MAX_CHARS)
+}
+
+/// Build the second step's confirmation card from the summary the fallback
+/// card already showed. The summary is the standalone record's, so the two
+/// steps cannot disagree about the target. Returns `None` when no record backs
+/// the click (a stale card from before the request was surfaced).
+async fn fallback_confirmation_card(
+    flow: &RequestFlow,
+    req_id: &str,
+    session_id: &str,
+    directory: &str,
+    decision: &str,
+    always_supported: bool,
+    target_digest: Option<u64>,
+) -> Option<serde_json::Value> {
+    let summary = flow.sent_cards.lock().await.get(req_id)?.summary.clone();
+    if summary.is_empty() {
+        return None;
+    }
+    Some(
+        crate::feishu::card::question::build_fallback_permission_confirm_card(
+            session_id,
+            req_id,
+            directory,
+            &summary,
+            target_digest?,
+            decision,
+            always_supported,
+        ),
+    )
 }
 
 /// The Interaction Receipt for a resolved question:
@@ -2404,6 +2610,31 @@ mod tests {
             always: vec![],
             always_supported: true,
         }
+    }
+
+    /// A fallback decision's receipt says the target was not fully shown, while
+    /// an ordinary decision's receipt is unchanged. One prefix definition, so
+    /// the two cannot drift.
+    #[test]
+    fn a_risk_receipt_names_the_target_as_not_fully_shown() {
+        let target = "⚡ 执行 Shell 命令 `echo …`";
+        assert_eq!(
+            risk_permission_receipt(target, "once"),
+            format!("✅ 已允许一次（目标未完整展示）：{target}")
+        );
+        assert_eq!(
+            risk_permission_receipt(target, "always"),
+            format!("✅ 已始终允许（目标未完整展示）：{target}")
+        );
+        assert_eq!(
+            risk_permission_receipt(target, "reject"),
+            format!("🚫 已拒绝（目标未完整展示）：{target}")
+        );
+        assert_eq!(
+            permission_receipt(target, "once"),
+            format!("✅ 已允许一次：{target}"),
+            "the ordinary receipt is unchanged"
+        );
     }
 
     /// A switch click's toast names what happened — including the arms a stale
