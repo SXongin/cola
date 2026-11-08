@@ -1492,6 +1492,20 @@ async fn a_failed_withdrawal_keeps_the_uncertain_companion_marker() {
         backend.reply_permission_calls.lock().await.is_empty(),
         "nothing is approved or declined on the failed withdrawal"
     );
+
+    // The retry lands, then the fresh path sees the marker and declines; the
+    // settled withdrawal removes the proof/marker itself (not the prune).
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert!(
+        app.permission.surfaces.companion("per_long").is_none(),
+        "the settled withdrawal forgets the marker"
+    );
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the uncertain marker follows the refusal path"
+    );
 }
 
 /// An unbacked recovered card whose superseded-withdrawal PATCH fails must
