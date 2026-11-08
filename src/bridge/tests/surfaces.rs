@@ -1079,6 +1079,72 @@ async fn restart_withdraws_an_over_budget_standalone_permission_then_surfaces_th
     );
 }
 
+/// ADR-0102: a persisted over-budget card whose companion record is
+/// **confirmed** but whose digest no longer matches the pending request is not
+/// a proof. Content may have been delivered for the previous target, but it
+/// does not cover the request the card would approve. The new process must
+/// withdraw the old card and reprocess the request — never approve or decline
+/// in place.
+#[tokio::test]
+async fn restart_withdraws_a_card_whose_confirmed_companion_digest_moved() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", false, "om_standalone");
+    // A confirmed delivery for SOME content — just not the request this card
+    // would approve. `delivered_companion` must reject it on the digest.
+    crate::bridge::surfaces::Surfaces::load(crate::state::StateLayout::beside(
+        &session_file,
+        "interactive_surfaces.json",
+    ))
+    .set_companion(
+        "per_long",
+        crate::bridge::surfaces::CompanionDelivery {
+            message_id: "om_companion".into(),
+            lane: crate::bridge::surfaces::CompanionLane::RichText,
+            target_digest: 0,
+        },
+    );
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    sweep(&app.permission, &app).await;
+
+    assert!(
+        backend.reply_permission_calls.lock().await.is_empty(),
+        "a mismatched companion never approves or declines in place"
+    );
+    let withdrawn = last_update_of(&platform, "om_standalone")
+        .await
+        .expect("the persisted card is withdrawn and reprocessed");
+    let text = card_text(&withdrawn);
+    assert!(
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_HEADER),
+        "the old card says it was reprocessed: {text}"
+    );
+    assert!(
+        !text.contains("允许一次"),
+        "no control survives on the withdrawn card: {text}"
+    );
+    assert!(
+        app.permission.surfaces.companion("per_long").is_none(),
+        "the mismatched record is replaced, not trusted"
+    );
+    assert!(
+        posted_cards(&platform).await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::fallback_permission_risk_note())
+        }),
+        "the fresh path surfaces the fallback card"
+    );
+}
+
 /// ADR-0101: a recovered over-budget card is never approved or declined in
 /// place. The old surface is withdrawn neutrally, then the request takes the
 /// normal fresh path — here Auto-Accept approves it unseen with its usual INFO
