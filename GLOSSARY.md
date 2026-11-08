@@ -424,25 +424,19 @@ A structured multi-choice prompt from the AI backend, distinct from
 permissions. User selects options to reply.
 _Avoid_: Poll, survey, prompt
 
-**Elicitation** (MCP 输入请求):
-A structured input request raised by an MCP server while it serves a tool, a
-resource, or its own connection — distinct from a **Question**, which the model
-asks. It names the server asking, and its answer grants that input to the
-server connection rather than to a Session's run.
-_Avoid_: Question (that is the model's prompt), permission (nothing is being
-given access to)
-
-**Location Form** (无会话输入请求):
-An **Elicitation** whose MCP connection belongs to a directory rather than to a
-Session, so no Session — and no **Turn** — owns it. It carries no requester:
-whoever answers speaks for every Session using that directory.
-_Avoid_: Session-less question, global form (the wire sentinel, not the concept)
-
 **Custom Answer** (自定义答案):
 A user-typed entry in a multi-select **Question**'s selection, standing
 alongside the backend's options: kept verbatim (never split or trimmed) and
 individually removable. Distinct from an option, which the backend supplied.
 _Avoid_: Free-text answer, custom option, note
+
+**Elicitation** (MCP 输入请求):
+A structured input request raised by an MCP server while it serves a tool, a resource, or its own connection — distinct from a **Question**, which the model asks. It names the server asking, and its answer supplies data to that server connection: a Session-owned elicitation takes the ordinary Question path, while one owned only by a directory belongs to a **Location Form**. Distinct from a **Permission**, which decides whether a tool may act rather than asking for data (ADR-0103).
+_Avoid_: Question (that is the model's prompt), permission (that is a tool's access decision)
+
+**Location Form** (目录级输入请求):
+An **Elicitation** whose MCP connection belongs to a directory rather than to a Session, so no Session — and no **Turn** — owns it. It carries no requester: any **Principal** admitted by the **Access List** may answer, and that answer speaks for every Session using the directory (ADR-0103).
+_Avoid_: Session-less question, global form (the wire sentinel, not the concept)
 
 **Session Card** (会话卡):
 The one **Card** a **Session** renders into, whatever drives it. A renderer (a **Turn**, an external follow, a Wake continuation) owns it while the Session runs — then it streams, and `/card` pulls it down to the newest position (ADR-0043). When nothing owns it, `/card` posts it from a **Session Snapshot** read in its idle state: read-only, one-shot, joining no **Card Chain** and no Chain Record. It carries the status line, a count-only pointer to the requests waiting on the user, and the 最近对话 tail. An **Interaction Block** never rides an idle card — an unanswered **Permission**/**Question** *is* a session state, so it lives on a live card (inline on the **Turn** it blocks) or on its own standalone card (ADR-0074).
@@ -512,7 +506,7 @@ _UI label_: 即时提醒 — the ONLY Chinese term for the list-level pin; never
 _Avoid_: App message stream, feed card, message-list notification
 
 **Message Pin** (消息置顶):
-Feishu's `im/v1/pins` capability, enabled or disabled with the same `[bridge] instant_reminder` opt-in as the **Instant Reminder**: putting the exact card a pending **Permission**/**Question** lives on into its Chat/Topic's pinned-message list, so the reminder's list-level nudge actually leads to the waiting message once the user opens the chat — the conversation preview alone only ever shows the newest message, which in a multi-topic chat may be anything. A card rendering both kinds is pinned once and unpinned by the last wait leaving it; a re-hosted card moves its pin. Cola pins each waiting card once per wait, so an unpin the user makes by hand is never re-asserted; failures are best-effort and retried. Distinct from **Instant Reminder**, which pins the conversation, not a message.
+Feishu's `im/v1/pins` capability, enabled or disabled with the same `[bridge] instant_reminder` opt-in as the **Instant Reminder**: putting the exact card a pending **Permission**/**Question**/**Location Form** lives on into its Chat/Topic's pinned-message list, so the reminder's list-level nudge actually leads to the waiting message once the user opens the chat — the conversation preview alone only ever shows the newest message, which in a multi-topic chat may be anything. A card rendering both kinds is pinned once and unpinned by the last wait leaving it; a re-hosted card moves its pin. Cola pins each waiting card once per wait, so an unpin the user makes by hand is never re-asserted; failures are best-effort and retried. Distinct from **Instant Reminder**, which pins the conversation, not a message.
 _UI label_: 消息置顶 — one message, one pin; several pinned messages simply coexist in the chat's 置顶消息列表. There is no separate 「多条置顶」 concept: pinning is per message and the list is the set.
 _Avoid_: Pin module, 置顶 conversation, feed card, 「pin 多条」
 
