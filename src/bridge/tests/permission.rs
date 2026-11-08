@@ -5805,6 +5805,7 @@ async fn a_companion_target_walk_timeout_fails_instead_of_hanging() {
     let request = long_permission("per_long", "ses_child", 5_000);
 
     let handles = app.flow_handles();
+    let walk_failures = tokio::sync::Mutex::new(crate::bridge::failure_latch::FailureLatch::default());
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         crate::bridge::request::companion::ensure_permission_companion(
@@ -5813,6 +5814,7 @@ async fn a_companion_target_walk_timeout_fails_instead_of_hanging() {
             &request,
             "/work",
             100,
+            &walk_failures,
         ),
     )
     .await

@@ -195,6 +195,7 @@ pub(crate) async fn ensure_permission_companion(
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
     target_timeout_ms: u64,
+    walk_failures: &tokio::sync::Mutex<crate::bridge::failure_latch::FailureLatch>,
 ) -> CompanionOutcome {
     let digest = companion_target_digest(p);
     if let Some(existing) = surfaces.matching_companion(&p.request_id, digest) {
@@ -213,32 +214,33 @@ pub(crate) async fn ensure_permission_companion(
     // half-open server would otherwise freeze permission surfacing for every
     // session. A timeout is a failed delivery: the caller then surfaces the
     // fallback card (ADR-0102).
-    let resolved = crate::bridge::bounded_call(
-        &format!("permission {} companion target", p.request_id),
-        target_timeout_ms,
-        async {
-            Ok::<_, crate::error::BridgeError>(
-                resolve_card_target(
-                    &handles.sessions,
-                    &handles.cards,
-                    &handles.backend,
-                    &handles.platform,
-                    session_id,
-                    directory,
-                )
-                .await,
+    let resolved = crate::bridge::bounded_call_quiet(target_timeout_ms, async {
+        Ok::<_, crate::error::BridgeError>(
+            resolve_card_target(
+                &handles.sessions,
+                &handles.cards,
+                &handles.backend,
+                &handles.platform,
+                session_id,
+                directory,
             )
-        },
-    )
+            .await,
+        )
+    })
     .await;
     let Some(resolved) = resolved else {
-        tracing::warn!(
-            "permission {} companion: target walk timed out on session {session_id}; \
-             surfacing the fallback card",
-            p.request_id
+        walk_failures.lock().await.failed(
+            directory,
+            "permission companion target walk",
+            "",
+            format!("timed out after {target_timeout_ms}ms"),
         );
         return CompanionOutcome::Failed;
     };
+    walk_failures
+        .lock()
+        .await
+        .succeeded(directory, "permission companion target walk");
     let Some(target) = resolved.ok().flatten() else {
         tracing::warn!(
             "permission {} companion: no reply target on session {session_id}",
