@@ -540,15 +540,18 @@ A permission request renders on a card with Allow once, Always allow, Deny and
 the Auto-Accept toggle. When its target is too long for the card — the summed
 targets past cola's **Permission Display Budget**, or the rendered body past the
 single-element ceiling — cola does not decline it: the full command is delivered
-in a **companion message** in the chat (a Rich Text Message, or a File Message
-when the text is past that lane's cap), and the card shows a summary of the
-target. Read the full command in the chat, then approve the request from the
-card as usual.
+in a **companion message** in the chat — a Rich Text Message; text past that
+lane's cap, or a `post` send that definitely fails, falls to a File Message —
+and the card shows a summary of the target. Read the full command in the chat,
+then approve the request from the card as usual.
 
-If the companion cannot be delivered, cola neither approves unseen text nor
-drops the request: the card explains the risk and asks for a second confirmation
-before approving. The original client — the TUI or desktop app attached to the
-same session — remains the place to inspect the request.
+When the request has a card target and the companion cannot be delivered, cola
+neither approves unseen text nor drops the request: the card explains the risk
+and asks for a second confirmation before approving. While it is still pending,
+the original client — the TUI or desktop app attached to the same session —
+remains the place to inspect it. A request with no card target at all cannot
+offer that fallback; cola settles it with the refusal card, so it is not left
+pending forever.
 
 An **Auto-Accept** session keeps its own rule: it answers every permission
 unseen and logs each approval, including an over-budget target. See

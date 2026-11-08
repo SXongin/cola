@@ -3959,6 +3959,46 @@ async fn an_over_budget_permission_without_a_reply_target_gets_the_fallback_card
     );
 }
 
+/// With no card target at all — the request's session is not mapped, so there
+/// is no message to reply under and no chat to send into — the fallback cannot
+/// be offered and the refusal path settles the request. It is rejected on the
+/// server rather than left pending invisibly (#1013's last resort).
+#[tokio::test]
+async fn an_over_budget_permission_without_a_card_target_is_refused() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!("echo {}", "x".repeat(5_000));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_unmapped".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    // The directory stays listable through another mapped session; the
+    // request's own session has no entry, so no card target resolves.
+    seed_session(&app, "ses_other", "/work").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the last resort refuses the request instead of leaving it pending"
+    );
+    assert!(
+        platform.sent_cards().await.is_empty() && platform.replied_cards().await.is_empty(),
+        "with no card target there is nowhere to post the reason card"
+    );
+}
+
 /// A Rich Text send that DEFINITELY did not land falls to the File Message
 /// lane, as ADR-0083 §5's ladder dictates.
 #[tokio::test]
