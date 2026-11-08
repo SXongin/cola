@@ -188,6 +188,7 @@ pub(crate) async fn ensure_permission_companion(
     surfaces: &Surfaces,
     p: &crate::backend::types::PermissionRequest,
     directory: &str,
+    target_timeout_ms: u64,
 ) -> CompanionOutcome {
     let digest = companion_target_digest(p);
     if let Some(existing) = surfaces.matching_companion(&p.request_id, digest) {
@@ -200,16 +201,33 @@ pub(crate) async fn ensure_permission_companion(
     // A record for a different digest is stale: replace it, never trust it.
     surfaces.remove_companion(&p.request_id);
     let session_id = p.session_id.as_deref().unwrap_or("");
-    let Some(target) = resolve_card_target(
-        &handles.sessions,
-        &handles.cards,
-        &handles.backend,
-        &handles.platform,
-        session_id,
-        directory,
+    // The walk itself can call `session_info`, which has no timeout of its own;
+    // it runs in the sweep for every over-budget request before the flow's
+    // deliberately bounded host walk, while `seen` is held across the sweep. A
+    // half-open server would otherwise freeze permission surfacing for every
+    // session. A timeout is a failed delivery: the caller then surfaces the
+    // fallback card (ADR-0102).
+    let target = crate::bridge::bounded_call(
+        &format!("permission {} companion target", p.request_id),
+        target_timeout_ms,
+        async {
+            Ok::<_, crate::error::BridgeError>(
+                resolve_card_target(
+                    &handles.sessions,
+                    &handles.cards,
+                    &handles.backend,
+                    &handles.platform,
+                    session_id,
+                    directory,
+                )
+                .await,
+            )
+        },
     )
     .await
-    else {
+    .and_then(Result::ok)
+    .flatten();
+    let Some(target) = target else {
         tracing::warn!(
             "permission {} companion: no reply target on session {session_id}",
             p.request_id

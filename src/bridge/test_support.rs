@@ -2234,9 +2234,12 @@ impl MockBackend {
     /// Scenario: `request` is pending on the server (appends to the pending
     /// list `list_permissions` serves).
     pub(crate) fn ask_permission(&mut self, request: crate::backend::types::PermissionRequest) -> &mut Self {
-        Arc::get_mut(&mut self.permissions)
-            .expect("the permission list is uniquely owned during setup")
-            .get_mut()
+        // Mutate through the lock, not `Arc::get_mut`: a test may hold a clone
+        // of the pending list (five do) and still script a later request. The
+        // setup phase is single-threaded, so the lock must be free.
+        self.permissions
+            .try_lock()
+            .expect("the permission list is not contended during setup")
             .push(request);
         self
     }
@@ -2246,9 +2249,12 @@ impl MockBackend {
         &mut self,
         requests: Vec<crate::backend::types::PermissionRequest>,
     ) -> &mut Self {
-        *Arc::get_mut(&mut self.permissions)
-            .expect("the permission list is uniquely owned during setup")
-            .get_mut() = requests;
+        // See `ask_permission`: cloning the Arc must not make a later setup
+        // mutation panic.
+        *self
+            .permissions
+            .try_lock()
+            .expect("the permission list is not contended during setup") = requests;
         self
     }
 

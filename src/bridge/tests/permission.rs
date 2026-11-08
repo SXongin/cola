@@ -3693,6 +3693,80 @@ async fn an_over_budget_permission_surfaces_with_a_post_companion_and_approves()
     );
 }
 
+/// A rendered-body overflow is the one companion proof whose digest covers the
+/// full description (including the render chrome), while the card's button
+/// carries the **target** digest. An allow must still match the delivered
+/// companion: the proof is over the text the companion really carried.
+#[tokio::test]
+async fn a_body_overflow_summary_allow_is_proven_by_the_delivered_description() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let request = crate::backend::types::PermissionRequest {
+        request_id: "per_body".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["x".repeat(2_900)],
+        metadata: Some(serde_json::json!({ "command": "y".repeat(200) })),
+        always: Vec::new(),
+        always_supported: true,
+    };
+    assert_eq!(
+        crate::bridge::request::kind::permission_overflow(&request),
+        Some(crate::bridge::request::kind::PermissionOverflow::Body),
+        "the target fits; the rendered body does not"
+    );
+    assert_ne!(
+        crate::bridge::request::companion::companion_target_digest(&request),
+        crate::bridge::request::companion::patterns_target_digest(&request),
+        "the two proofs must differ for this test to exercise the body digest"
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![request.clone()]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        posted_companions(&platform).await.len(),
+        1,
+        "the body overflow's full description is delivered once"
+    );
+    let record = app
+        .permission
+        .surfaces
+        .companion("per_body")
+        .expect("the full rendered description was delivered as a companion");
+    assert!(!record.is_uncertain(), "the delivery is confirmed");
+    let card = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let allow = button_with_label(&card, "✅ 允许一次");
+    assert_eq!(allow["summary"], true, "the card is a summary surface");
+
+    let result = app
+        .host_action_on_message(allow, "om_live")
+        .await
+        .expect("the summary allow returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_body".to_string(), "once".to_string())],
+        "the delivered description proves the body overflow, not just its target"
+    );
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains("已允许一次"),
+        "the result names the decision: {text}"
+    );
+    assert!(
+        !text.contains(crate::feishu::card::question::MISSING_PERMISSION_CLICK_LABEL),
+        "a confirmed body digest is never a missing-companion refusal: {text}"
+    );
+}
+
 /// A companion record whose digest does not match the pending request it is
 /// meant to prove — a target that changed after the delivery — is no proof. The
 /// click guard refuses the approval and the result names the missing delivery.
@@ -4539,6 +4613,13 @@ async fn a_failed_companion_caption_does_not_block_the_file() {
 
     assert!(replies.lock().await.is_empty(), "never declined");
     let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyText { text, .. } if text.contains("per_huge")
+        )),
+        "the caption was attempted (and failed) rather than skipped: {calls:?}"
+    );
     assert!(
         calls.iter().any(|call| matches!(
             call,

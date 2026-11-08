@@ -1375,7 +1375,15 @@ impl RequestFlow {
             && let Some(overflow) = permission_overflow(p)
             && self.companion_for(req).is_none()
         {
-            match ensure_permission_companion(handles, &self.surfaces, p, dir).await {
+            match ensure_permission_companion(
+                handles,
+                &self.surfaces,
+                p,
+                dir,
+                self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .await
+            {
                 CompanionOutcome::Delivered => {}
                 CompanionOutcome::Uncertain => {
                     fallback_cause = Some(DeclineReason::CompanionUncertain);
