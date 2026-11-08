@@ -73,6 +73,14 @@ impl CompanionLane {
             Self::File => "文件消息（File Message）",
         }
     }
+
+    /// The short name a bounded Interaction Receipt can carry.
+    pub(crate) fn short_label(self) -> &'static str {
+        match self {
+            Self::RichText => "富文本消息",
+            Self::File => "文件消息",
+        }
+    }
 }
 
 /// One companion message that carried a permission request's full content —

@@ -12,10 +12,13 @@
 //! - `delivery` — the card-delivery helpers: `resolve_blocks` (the one
 //!   resolution seam), the callback-ack settling, and the neutral receipt
 //!   vocabulary.
+//! - `companion` — the over-budget permission companion lane (ADR-0083 §5):
+//!   Rich Text → File delivery, its 30 KB sizing, caption and persisted marker.
 //!
 //! Callers name the owning module (`request::flow::…`, `request::kind::…`,
 //! `request::delivery::…`); the submodules are the API, not a re-export shim.
 
+pub(crate) mod companion;
 pub(crate) mod delivery;
 pub(crate) mod flow;
 pub(crate) mod kind;

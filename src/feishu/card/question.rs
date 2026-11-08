@@ -325,7 +325,7 @@ pub(crate) const UNCERTAIN_PERMISSION_HEADER: &str = "🚫 权限请求已拒绝
 pub(crate) fn uncertain_permission_note() -> &'static str {
     "该权限请求的完整内容超过卡片显示预算，cola 已尝试通过伴随消息发送，但发送结果未知——它可能已送达，也可能没有。\
      在无法确认完整内容已送达之前，不能提供批准操作；该请求已按拒绝处理，在服务端已结清。\
-     请重试，或在原始客户端查看该请求；也可以先开启自动授权（`/autoaccept on`）再让它执行。"
+     如需继续，请让 AI 重新发起该操作；也可以先开启自动授权（`/autoaccept on`）再执行。"
 }
 
 /// The non-interactive card that explains an unknown companion outcome.
@@ -350,12 +350,19 @@ pub(crate) const UNCERTAIN_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（完�
 /// request, so the wording says the click was declined.
 pub(crate) const MISSING_PERMISSION_CLICK_LABEL: &str = "🚫 已拒绝（完整内容未送达）";
 
+/// The receipt a clicked block collapses to when no confirmed companion exists
+/// for it: the user's click was refused, nobody auto-declined the request, and
+/// the bound may be the rendered body rather than a target length.
+pub(crate) const MISSING_PERMISSION_RECEIPT: &str = "🚫 已拒绝：完整内容未送达";
+
 /// Why the click guard refuses an over-budget approval whose confirmed
 /// companion delivery is missing or stale (ADR-0102): the full content never
-/// landed, so there is nothing the user could have reviewed to approve.
+/// landed, so there is nothing the user could have reviewed to approve. The
+/// click itself rejects the request, so it is settled server-side.
 pub(crate) fn missing_permission_click_note() -> String {
     "该权限请求的完整内容超过卡片显示预算，且没有找到已送达的伴随消息（或内容已变化）。\
-     为了不让你批准没有完整看到的内容，本次点击已拒绝。请重试，或在原始客户端查看该请求。"
+     为了不让你批准没有完整看到的内容，本次点击已拒绝，该请求在服务端已结清。\
+     如需继续，请让 AI 重新发起该操作；也可以先开启自动授权（`/autoaccept on`）再执行。"
         .to_string()
 }
 
@@ -1870,7 +1877,7 @@ mod tests {
             lane: CompanionLane::RichText,
             target_digest: 0,
         };
-        let summary = crate::bridge::request::kind::describe_permission_summary(&long, &delivery);
+        let summary = crate::bridge::request::companion::describe_permission_summary(&long, &delivery);
         let summary_card = build_permission_card("ses", "n:1", &summary, "/tmp/proj", true);
         let len = summary_card.to_string().len();
         assert!(

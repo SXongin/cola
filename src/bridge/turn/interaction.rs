@@ -102,8 +102,8 @@ impl Turn {
         let block = state::InteractionBlock::Permission(state::PendingPermission {
             session_id: p.session_id.clone().unwrap_or_default(),
             request_id: p.request_id.clone(),
-            body: crate::bridge::request::kind::describe_permission_for(p, companion.as_ref()),
-            target: crate::bridge::request::kind::permission_target(p),
+            body: crate::bridge::request::companion::describe_permission_for(p, companion.as_ref()),
+            target: crate::bridge::request::kind::permission_receipt_target(p, companion.as_ref()),
             directory: directory.to_string(),
             always_supported: p.always_supported,
         });
