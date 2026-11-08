@@ -550,8 +550,9 @@ neither approves unseen text nor drops the request: the card explains the risk
 and asks for a second confirmation before approving. While it is still pending,
 the original client — the TUI or desktop app attached to the same session —
 remains the place to inspect it. A request with no card target at all cannot
-offer that fallback; cola settles it with the refusal card, so it is not left
-pending forever.
+offer that fallback: cola declines it on the server, and no card can be
+delivered — the reason card itself needs a target — so it is settled without
+one rather than left pending.
 
 An **Auto-Accept** session keeps its own rule: it answers every permission
 unseen and logs each approval, including an over-budget target. See
