@@ -29,6 +29,11 @@ pub struct ExternalFlow {
     /// External poll cadence (ms). Defaults to today's 8 s; tests store a small
     /// value so every loop branch runs without sleeping real seconds.
     pub poll_interval_ms: std::sync::atomic::AtomicU64,
+    /// Test-only proof-of-pass: the sync passes this loop has completed, for
+    /// `test_support::wait_for_poll_passes` (issue #958). Never read in
+    /// production.
+    #[cfg(test)]
+    pub(crate) poll_passes: std::sync::atomic::AtomicUsize,
     /// How long (ms) one backend call in the poll loop may take before it is
     /// abandoned and retried on the next tick. Bounds a request stuck on a
     /// half-open connection (e.g. across a server restart) so one hung call
@@ -100,6 +105,8 @@ impl ExternalFlow {
         Self {
             last_user_msg_epoch: Arc::new(Mutex::new(HashMap::new())),
             poll_interval_ms: std::sync::atomic::AtomicU64::new(8_000),
+            #[cfg(test)]
+            poll_passes: std::sync::atomic::AtomicUsize::new(0),
             request_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             render_poll_ms: std::sync::atomic::AtomicU64::new(1_500),
             render_idle_timeout_ms: std::sync::atomic::AtomicU64::new(600_000),
@@ -140,6 +147,10 @@ impl ExternalFlow {
             || !handles.backend.base_url().is_empty(),
             move || async move {
                 self.sync_sessions(handles).await;
+                // Proof-of-pass for the tests waiting on this loop (#958).
+                #[cfg(test)]
+                self.poll_passes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Per-session failures were logged inside `sync_sessions`;
                 // nothing tick-level to latch (see the doc above).
                 Ok(())

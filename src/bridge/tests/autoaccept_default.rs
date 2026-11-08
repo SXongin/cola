@@ -61,7 +61,7 @@ async fn configured_default_marks_a_fresh_session_and_answers_permissions() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     assert_eq!(
         perm_calls.lock().await.clone(),

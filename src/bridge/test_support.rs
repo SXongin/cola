@@ -4777,6 +4777,69 @@ pub(crate) async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, sessio
         .unwrap_or_else(|_| panic!("the flow never read {session_id}'s transcript {n} times"));
 }
 
+/// Wait until `condition` holds, polling every 5 ms — a state predicate used
+/// instead of a fixed sleep (issue #958). The bound is [`SETTLE_DEADLINE`], the
+/// same one every other fixture wait uses: a spawned task can take minutes to be
+/// scheduled on a loaded runner, and that risk is what these waits exist to
+/// absorb. The price is paid only when a fixture is genuinely broken — each such
+/// site then burns one deadline before reporting.
+pub(crate) async fn wait_until<F, Fut>(label: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let probe = async {
+        loop {
+            if condition().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(SETTLE_DEADLINE, probe)
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {SETTLE_DEADLINE:?} waiting until {label}"));
+}
+
+/// Wait until a background poll loop has completed `count` passes past
+/// `baseline` — the load-independent replacement for "spawn the loop, sleep,
+/// then assert" (issue #958).
+///
+/// A test asserting on what a pass did, or that it did nothing, is racing the
+/// loop's schedule, and a fixed sleep cannot settle that race: on a loaded
+/// runner the first pass can start after any short span, so the assertion sees
+/// the pre-pass world and fails. A completed pass is the invariant these tests
+/// actually need.
+///
+/// One pass is the unit: a flow decides inside a single pass, so "no card was
+/// sent" means *that* pass decided not to send one. A test asks for a later pass
+/// only when the flow does not consume the state it decided on — the external
+/// sync, for one, re-baselines a cleared watermark on its next pass, so that
+/// assertion is made after exactly one.
+pub(crate) async fn wait_for_poll_passes(
+    passes: &std::sync::atomic::AtomicUsize,
+    baseline: usize,
+    count: usize,
+    label: &str,
+) {
+    wait_until(&format!("{label} completes {count} pass(es)"), || async {
+        passes.load(std::sync::atomic::Ordering::Relaxed) >= baseline + count
+    })
+    .await;
+}
+
+/// [`wait_for_poll_passes`] for the common case: a freshly spawned loop's first
+/// pass, whose counter starts at zero.
+pub(crate) async fn wait_for_first_poll_pass(passes: &std::sync::atomic::AtomicUsize, label: &str) {
+    wait_for_poll_passes(passes, 0, 1, label).await;
+}
+
+/// Whether a card's header shows the terminal Done state (完成 / ✓).
+pub(crate) fn card_is_done(card: &serde_json::Value) -> bool {
+    let header = card_header(card);
+    header.contains("完成") || header.contains("✓")
+}
+
 /// Every button element on a card, in walk order (buttons nest in column sets
 /// and action blocks) — for assertions on a button's `value` payload or label
 /// without string-matching the card's JSON dump.
@@ -5340,6 +5403,37 @@ mod tests {
     use super::*;
     use crate::backend::Backend;
     use crate::backend::{MessageRole, Part, SessionTranscript};
+
+    /// The proof-of-pass wait counts from `baseline`, not from zero: one pass
+    /// already on the counter does not satisfy a wait for two, and a wait set up
+    /// for a later pass settles only when that later pass lands. Without this,
+    /// `passes.load() >= count` (baseline ignored) would still pass every poll
+    /// test that exists today (review, PR #1021).
+    #[tokio::test]
+    async fn a_poll_pass_wait_counts_from_its_baseline() {
+        let passes = std::sync::atomic::AtomicUsize::new(1);
+        // baseline 0, count 1: the pass already there satisfies it.
+        wait_for_first_poll_pass(&passes, "a pass").await;
+        // baseline 0, count 2: one pass is not enough, so it must still wait.
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_poll_passes(&passes, 0, 2, "a second pass"),
+        )
+        .await;
+        assert!(early.is_err(), "one of two passes must not settle the wait");
+        // The second pass lands; the wait settles.
+        passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        wait_for_poll_passes(&passes, 0, 2, "a second pass").await;
+        // A baseline at the current count asks for one MORE pass, not any.
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_poll_passes(&passes, 2, 1, "the next pass"),
+        )
+        .await;
+        assert!(early.is_err(), "a baseline must exclude the passes below it");
+        passes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        wait_for_poll_passes(&passes, 2, 1, "the next pass").await;
+    }
 
     /// A scripted transcript is served as-is, so a test can describe cola's
     /// domain instead of the backend's wire format (spec #332).

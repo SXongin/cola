@@ -736,6 +736,9 @@ struct State {
     model_list_calls: AtomicUsize,
     /// One-shot: leave the next `model/list` unanswered (a stalled catalog).
     silent_model_list: std::sync::atomic::AtomicBool,
+    /// Leave every `model/list` AFTER the first `n` unanswered: a catalog whose
+    /// first page lands and whose next page hangs (issue #958).
+    silent_model_list_after: AtomicUsize,
     /// How long each `model/list` answer waits before it is written (a slow,
     /// paginated catalog).
     model_list_delay: std::sync::Mutex<std::time::Duration>,
@@ -818,6 +821,7 @@ impl Default for State {
             read_returns: std::sync::Mutex::new(None),
             model_list_calls: AtomicUsize::new(0),
             silent_model_list: std::sync::atomic::AtomicBool::new(false),
+            silent_model_list_after: AtomicUsize::new(usize::MAX),
             model_list_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             page_size: 2,
             start_params: std::sync::Mutex::new(Vec::new()),
@@ -1477,6 +1481,15 @@ impl FakeServer {
     /// Leave the next `model/list` unanswered: a stalled catalog read.
     pub(crate) fn silence_next_model_list(&self) {
         self.state.silent_model_list.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer the first `answered` `model/list` calls, then leave every later
+    /// one unanswered: the first page lands and the next hangs, so a read that
+    /// is capped keeps exactly what it read.
+    pub(crate) fn silence_model_list_after(&self, answered: usize) {
+        self.state
+            .silent_model_list_after
+            .store(answered, Ordering::SeqCst);
     }
 
     /// Hold each `model/list` answer for `delay`: a slow, paginated catalog.
@@ -2167,8 +2180,10 @@ where
             true
         }
         Some("model/list") => {
-            state.model_list_calls.fetch_add(1, Ordering::SeqCst);
-            if state.silent_model_list.swap(false, Ordering::SeqCst) {
+            let calls = state.model_list_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if state.silent_model_list.swap(false, Ordering::SeqCst)
+                || calls > state.silent_model_list_after.load(Ordering::SeqCst)
+            {
                 return true;
             }
             let delay = *state.model_list_delay.lock().expect("model list delay");

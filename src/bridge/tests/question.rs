@@ -1297,7 +1297,7 @@ async fn inline_question_answered_on_streaming_card() {
             let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep").await;
 
     let pending = Turn::live_questions(&app.cards_handle(), "ses_test").await;
     assert_eq!(pending.len(), 1, "question should be inlined");
@@ -1894,7 +1894,7 @@ async fn inline_question_submit_and_reject_leave_receipts() {
             let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep").await;
     assert_eq!(
         Turn::live_questions(&app.cards_handle(), "ses_test").await.len(),
         2,
@@ -2037,7 +2037,7 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
             let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep").await;
 
     let result = app
         .host_action(serde_json::json!({

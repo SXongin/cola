@@ -158,7 +158,7 @@ async fn external_message_from_shared_store_notifies_feishu() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls.iter().find_map(|c| match c {
@@ -236,7 +236,7 @@ async fn a_client_authored_message_never_notifies_the_chat() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     let notifications: Vec<serde_json::Value> = platform
         .calls
@@ -338,7 +338,7 @@ async fn a_compaction_carrier_is_never_the_external_message() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls.iter().find_map(|c| match c {
@@ -408,7 +408,7 @@ async fn external_file_message_notifies_with_the_record_line() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls
@@ -581,11 +581,7 @@ async fn external_reply_completion_comes_from_the_transcript() {
     // the final update instead of a fixed sleep — a loaded runner can delay
     // the poll's first pass past any short sleep (this test flaked on
     // Windows CI with zero recorded updates).
-    wait_for_card_update(&platform, "the finalized card", CardUpdates::Latest, |card| {
-        let header = card["header"]["title"]["content"].as_str().unwrap_or("");
-        header.contains("完成") || header.contains("✓")
-    })
-    .await;
+    wait_for_card_update(&platform, "the finalized card", CardUpdates::Latest, card_is_done).await;
 }
 
 /// ADR-0026 regression (observed 2026-09-09): when a server dies mid-turn and
@@ -645,7 +641,7 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     // No external-message card: cola's own round is recognised, not echoed.
     let calls = platform.calls.lock().await.clone();
@@ -725,7 +721,7 @@ async fn newer_external_message_after_cola_own_still_notifies() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     let calls = platform.calls.lock().await.clone();
     let notify = calls.iter().find_map(|c| match c {
@@ -824,7 +820,7 @@ async fn external_message_to_historical_session_is_not_notified() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     // No notification card at all: the only external message is on the
     // historical session, which must be suppressed.
@@ -931,7 +927,7 @@ async fn reactivated_session_resyncs_silently() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     // No notification: the external message was marked read on first
     // observation (silent re-sync), not replayed as stale.
@@ -1012,7 +1008,7 @@ async fn external_message_to_topic_session_notifies_into_thread() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     let calls = platform.calls.lock().await.clone();
     assert!(
@@ -1107,9 +1103,10 @@ async fn external_message_reply_renders_into_notification_card() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    // First poll tick (8s) sends the notification and arms the renderer;
-    // a few render-loop ticks then run while the reply is still absent.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The pass sends the notification and arms the renderer. The renderer's
+    // first tick is a whole poll interval away (its own cadence), so the card
+    // is still exactly as sent.
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     // The renderer must NOT have touched the card yet — the reply hasn't
     // arrived, so the notification card stays as sent.
@@ -1130,9 +1127,19 @@ async fn external_message_reply_renders_into_notification_card() {
     // The turn's work: the AI switched branches before its reply landed —
     // the final card must show where it landed (ADR-0019 end refresh).
     git_in(repo.path(), &["switch", "-c", "feat/ext"]);
-    // Now the model replies; the renderer picks it up on the next poll.
+    // Now the model replies; the renderer picks it up on its next poll. Wait
+    // for the card that carries the ending (footer included) rather than
+    // assuming a fixed span is enough on a loaded runner.
     reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    wait_for_card_update(&platform, "the finalized card", CardUpdates::Latest, |card| {
+        // Every field the assertions below read: the ending, the end footer and
+        // the settled work-state index can land in different PATCHes.
+        let text = card.to_string();
+        text.contains("✅")
+            && text.contains("feat/ext")
+            && text.contains("📝 本轮期间工作区变化 · 1 files · +2 −1")
+    })
+    .await;
 
     let calls = platform.calls.lock().await.clone();
     let sent_card = calls.iter().find_map(|c| match c {
@@ -1366,7 +1373,9 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The renderer is its own task, so the pass alone does not finalize the
+    // card: wait for the update that carries the ending.
+    wait_for_card_update(&platform, "the finalized card", CardUpdates::Latest, card_is_done).await;
 
     // The partial content was rendered AND the card finalized as Done (the
     // final update carries the terminal state).
@@ -2599,9 +2608,15 @@ async fn external_reply_keeps_the_user_message_above_it() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
     reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    wait_for_card_update(
+        &platform,
+        "the reply above the user's message",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("目录里有 src。"),
+    )
+    .await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -2724,9 +2739,12 @@ async fn external_reply_renders_its_user_message_as_a_separate_block() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
     reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    wait_for_card_update(&platform, "the reply on the card", CardUpdates::Latest, |card| {
+        card_text(card).contains("这是一个把 OpenCode 接进飞书的桥接项目。")
+    })
+    .await;
 
     let calls = platform.calls.lock().await.clone();
     let card = calls
@@ -2809,7 +2827,7 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
             let _ = app.external.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
 
     // No notification for the old session, and its watermark is gone.
     let calls = platform.calls.lock().await.clone();
@@ -2832,7 +2850,15 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
     );
 
     // Switch back: the pending is replaced, and the first poll re-baselines
-    // silently instead of replaying the stale external message.
+    // silently instead of replaying the stale external message. The baseline is
+    // captured first so the wait cannot be satisfied by a pass that ran before
+    // the switch; the watermark is written MID-pass, so requiring a completed
+    // pass beyond the baseline is what orders the no-notification assertion
+    // after the rest of that pass.
+    let baseline = app
+        .external
+        .poll_passes
+        .load(std::sync::atomic::Ordering::Relaxed);
     send_command_in(
         &app,
         "/switch ses_old",
@@ -2847,7 +2873,22 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
         "switching back makes the old session active again"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_until(
+        "the reactivated session's watermark is re-baselined after a completed pass",
+        || async {
+            app.external
+                .poll_passes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > baseline
+                && app
+                    .external
+                    .last_user_msg_epoch
+                    .lock()
+                    .await
+                    .contains_key("ses_old")
+        },
+    )
+    .await;
     let calls = platform.calls.lock().await.clone();
     assert!(
         !calls.iter().any(|c| match c {
