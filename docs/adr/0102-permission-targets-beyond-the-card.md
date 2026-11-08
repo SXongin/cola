@@ -3,8 +3,8 @@
 ## Context
 
 A permission request whose target cannot be shown in full on a card used to be
-refused **before any surface** (`PermissionKind::refuse`): `reject` settles it
-server-side, so no client can approve it afterwards. #1009 asked for a way to
+declined **before any surface**: `reject` settled it
+server-side, so no client could approve it afterwards. #1009 asked for a way to
 approve the text anyway; #1010 is the parent spec, and #1012 is the interactive
 half. #892 / ADR-0101 already removed the refusal for Auto-Accept sessions.
 
@@ -34,18 +34,22 @@ process surfaced, and the persisted state is client-scoped (ADR-0091).
 The completeness proof's authority is the **surface**: an over-budget approval
 is allowed only when the full content was delivered for that request.
 
-- **No refusal on the way in.** `PermissionKind::refuse` no longer declines an
-  over-budget fresh request. The sweep surfaces it with a summary. The refusal
-  path remains for the shapes that must not be offered: a companion that could
-  not be delivered, and a recovered card with no companion record.
-- **One proof, two renderings.** The summary card, the inline block and the
-  Interaction Receipt share one summary form: the action, the summed target
-  length, the first 120 characters of the target, and where the
-  full content lives. The full description stays for in-budget requests.
+- **No refusal on the way in.** A fresh over-budget permission is not declined;
+  the sweep surfaces it with a summary and delivers its full content first. The
+  flow's `decline_permission` path remains for a companion that could not be
+  delivered or whose outcome is unknown. A recovered card without a usable
+  companion is withdrawn and takes the fresh path, not a refusal.
+- **One proof, two renderings.** The summary card and the inline block show the
+  action, the summed target length, the first 120 characters of the target, and
+  where the full content lives. The Interaction Receipt names the action, the
+  summed length and the companion lane with a short (60-character) target line,
+  clipped to the receipt budget. The full description stays for in-budget
+  requests.
 - **ADR-0083 §5's ladder.** The full content goes out as one Rich Text Message
   (`post` with an `md` tag); a body past the 30 KB `post` cap, or a send that
   definitely did not land, falls to one File Message (an uploaded `.txt` whose
-  name and following caption name the request). An ambiguous send is terminal:
+  name and following caption name the request; the caption is sent after the
+  file lands). An ambiguous send is terminal:
   it is never retried into a duplicate, but it is **not** a delivery. It leaves
   a non-proof marker and the request follows the refusal path; the copy names
   the unknown outcome instead of claiming either delivery or a definite failure.
