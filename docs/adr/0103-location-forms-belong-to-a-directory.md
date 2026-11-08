@@ -40,12 +40,13 @@ and Agent Client — using that conversation's topic anchor when it is a topic.
 The card names the asking MCP server and its message, and shows the directory,
 so the answerer knows what is being asked and whom the answer commits; the V2
 adapter carries `metadata.server` and `metadata.message` into the neutral
-request (the same upstream file writes those keys; today's `RawForm` in
-`src/opencode/v2/wire.rs` drops metadata). The new neutral fields stay optional,
-so session-backed forms keep the normal Question path. A send that fails definitively is
-not recorded as pushed, so the next complete sweep with a mapped conversation
-retries it; a timed-out send can duplicate the card exactly as every standalone
-send can today, and this record does not claim to fix that ambiguity. If the
+request (OpenCode's `packages/core/src/mcp/index.ts` writes those keys; today's
+`RawForm` in `src/opencode/v2/wire.rs` drops metadata). The new neutral fields
+stay optional, so session-backed forms keep the normal Question path. A send
+that fails definitively is not recorded as pushed, so the next complete sweep
+with a mapped conversation retries it; a timed-out send can duplicate the card
+exactly as every standalone send can today, and this record does not claim to
+fix that ambiguity. If the
 mapping disappears between listing and delivery, nothing is sent and nothing is
 suppressed. The card never rides an inline block, never enters
 `pending_sessions`, and never drives the Instant Reminder: that surface needs a
