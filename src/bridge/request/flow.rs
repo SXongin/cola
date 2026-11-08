@@ -1603,15 +1603,7 @@ impl RequestFlow {
             .clone()
             .unwrap_or_else(|| self.kind.summary(self, req));
         if self
-            .send_standalone_surface(
-                handles,
-                req,
-                dir,
-                target,
-                &card,
-                &summary,
-                self.surfaces.client_id(),
-            )
+            .send_standalone_surface(handles, req, dir, target, &card, &summary)
             .await
         {
             // The card landed: this request is surfaced from now on. A failed
@@ -1626,7 +1618,6 @@ impl RequestFlow {
     /// Send and record one standalone request card. The caller holds the
     /// owning Session's write lock across the send and the surface record, so
     /// no follow can commit between them. Returns whether the card landed.
-    #[allow(clippy::too_many_arguments)] // the send context is the helper's whole point
     async fn send_standalone_surface(
         &self,
         handles: &FlowHandles,
@@ -1635,7 +1626,6 @@ impl RequestFlow {
         target: Option<CardTarget>,
         card: &serde_json::Value,
         summary: &str,
-        client_id: &str,
     ) -> bool {
         let sent_id = match target {
             Some(CardTarget::ReplyTo(msg_id)) => handles.platform.reply_card(&msg_id, card).await.ok(),
@@ -1673,7 +1663,7 @@ impl RequestFlow {
         self.surfaces.set_standalone(
             req.id(),
             StandaloneSurface {
-                client_id: client_id.to_string(),
+                client_id: String::new(),
                 kind: self.kind.interaction_kind(),
                 message_id: mid,
                 summary: summary.to_string(),
@@ -1738,19 +1728,13 @@ impl RequestFlow {
             loss,
         );
         let req = PendingRequest::Permission(p.clone());
-        // Keep the client scope the existing record (or this process) owns.
-        let client_id = self
-            .surfaces
-            .standalone(&p.request_id)
-            .map(|surface| surface.client_id)
-            .unwrap_or_else(|| self.surfaces.client_id().to_string());
         let owning_lock = handles
             .cards
             .write_lock(p.session_id.as_deref().unwrap_or(""))
             .await;
         let guard = owning_lock.lock().await;
         let landed = self
-            .send_standalone_surface(handles, &req, dir, target, &card, &stored_summary, &client_id)
+            .send_standalone_surface(handles, &req, dir, target, &card, &stored_summary)
             .await;
         drop(guard);
         landed

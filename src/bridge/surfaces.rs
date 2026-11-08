@@ -339,12 +339,6 @@ impl Surfaces {
         self.lock().view(&self.client_id)
     }
 
-    /// This client's id (ADR-0091), so a surface writer can keep the scope it
-    /// read instead of minting an empty one.
-    pub(crate) fn client_id(&self) -> &str {
-        &self.client_id
-    }
-
     /// Record (or refresh) the card rendering `request_id`'s live block.
     pub fn set_inline(&self, request_id: &str, mut surface: InlineSurface) {
         surface.client_id = self.client_id.clone();
@@ -407,12 +401,6 @@ impl Surfaces {
     /// Forget a standalone card's record — it resolved or was marked stale.
     pub fn remove_standalone(&self, request_id: &str) {
         self.mutate(|state| state.standalone.remove(&self.client_id, request_id).is_some());
-    }
-
-    /// This client's standalone record for `request_id`, when one exists. The
-    /// risk-mismatch recovery re-records it with the same client scope.
-    pub fn standalone(&self, request_id: &str) -> Option<StandaloneSurface> {
-        self.lock().standalone.get(&self.client_id, request_id).cloned()
     }
 
     /// Record the companion message that delivered `request_id`'s full target.
