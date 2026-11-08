@@ -20,7 +20,10 @@ use crate::bridge::question::{QuestionState, stale_question_card};
 use crate::bridge::surfaces::{CompanionDelivery, StandaloneSurface, Surfaces};
 use crate::bridge::turn::Turn;
 
-use super::companion::{CompanionOutcome, companion_target_digest, ensure_permission_companion};
+use super::companion::{
+    CompanionOutcome, companion_target_digest, ensure_permission_companion, fallback_permission_summary,
+    patterns_target_digest,
+};
 use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
     vanished_receipt,
@@ -1350,11 +1353,15 @@ impl RequestFlow {
         }
         // An over-budget permission's full content must land BEFORE the inline
         // block or standalone card becomes interactive (ADR-0102). Auto-Accept
-        // returned above, so a delegated session still renders nothing. A
-        // failed companion follows the refusal path: no approval is offered for
-        // content that was not delivered. An UNCERTAIN send is not a proof: it
-        // is kept only as a no-duplicate marker, no interactive approval is
-        // offered, and the request follows the uncertain refusal path.
+        // returned above, so a delegated session still renders nothing. When
+        // the companion cannot be delivered — a definite failure, or an
+        // uncertain outcome that is not a proof — the request is NOT refused:
+        // a standalone fallback card names the risk and offers a two-step
+        // approval (#1013). It is built below, after any stale block has been
+        // withdrawn, and is always a standalone surface so its click ack can
+        // replace it without touching a streaming card.
+        let mut fallback_summary: Option<String> = None;
+        let mut fallback_cause: Option<DeclineReason> = None;
         if let PendingRequest::Permission(p) = req
             && let Some(overflow) = permission_overflow(p)
             && self.companion_for(req).is_none()
@@ -1362,22 +1369,12 @@ impl RequestFlow {
             match ensure_permission_companion(handles, &self.surfaces, p, dir).await {
                 CompanionOutcome::Delivered => {}
                 CompanionOutcome::Uncertain => {
-                    let handled = self
-                        .settle_decline(handles, p, dir, DeclineReason::CompanionUncertain)
-                        .await;
-                    if handled {
-                        seen.insert(req.id().to_string());
-                    }
-                    return handled;
+                    fallback_cause = Some(DeclineReason::CompanionUncertain);
+                    fallback_summary = Some(fallback_permission_summary(p));
                 }
                 CompanionOutcome::Failed => {
-                    let handled = self
-                        .settle_decline(handles, p, dir, DeclineReason::Overflow(overflow))
-                        .await;
-                    if handled {
-                        seen.insert(req.id().to_string());
-                    }
-                    return handled;
+                    fallback_cause = Some(DeclineReason::Overflow(overflow));
+                    fallback_summary = Some(fallback_permission_summary(p));
                 }
             }
         }
@@ -1417,6 +1414,26 @@ impl RequestFlow {
             dir,
         )
         .await;
+        // A fallback card needs somewhere to land. With no reply target and no
+        // chat, no card can ever show the risk, so the request must not stay
+        // pending invisibly: keep the old refusal path as the last resort and
+        // log why the fallback could not be offered.
+        if fallback_summary.is_some() && target.is_none() {
+            tracing::warn!(
+                "{} {}: no reply target or chat for the fallback card; following the refusal path",
+                self.kind.label(),
+                req.id()
+            );
+            if let PendingRequest::Permission(p) = req
+                && let Some(reason) = fallback_cause
+            {
+                let handled = self.settle_decline(handles, p, dir, reason).await;
+                if handled {
+                    seen.insert(req.id().to_string());
+                }
+                return handled;
+            }
+        }
         // Resolve the inline host BEFORE the lock too, and BOUND it by the
         // flow's read timeout: the parent-chain walk calls `session_info`,
         // which has no timeout of its own, so a half-open connection would
@@ -1438,22 +1455,31 @@ impl RequestFlow {
         .await
         .and_then(Result::ok)
         .flatten();
+        // A fallback card is standalone: withdraw any block a previous pass
+        // already inserted for this request before posting it, so exactly one
+        // surface carries the controls (ADR-0102 / #1013).
+        if fallback_summary.is_some() {
+            self.withdraw_block_for_fallback(handles, req, resolved_host.as_deref())
+                .await;
+        }
         // Inline path: take the HOST's write lock — never the request
         // Session's while also holding the host's, and never the reverse. A
         // sub-task child has no card of its own, so its lock would serialize
         // nothing with `/card` or the follow (which take the host's); the
         // host's lock is what makes the liveness check and the insert one
         // critical section (ADR-0038's amendment, ADR-0100).
-        if let Some(host) = resolved_host {
-            let host_lock = handles.cards.write_lock(&host).await;
+        if fallback_summary.is_none()
+            && let Some(host) = resolved_host.as_deref()
+        {
+            let host_lock = handles.cards.write_lock(host).await;
             let host_guard = host_lock.lock().await;
             // Re-check under the host's lock: the parent may have ended and
             // `/card` installed an Idle card during the bounded host walk. An
             // insert must never land on a card that stopped being live.
-            if Turn::is_running(&handles.cards, &host).await {
+            if Turn::is_running(&handles.cards, host).await {
                 let pushed = self
                     .kind
-                    .add_inline_locked(self, &handles.cards, &host, req, dir)
+                    .add_inline_locked(self, &handles.cards, host, req, dir)
                     .await;
                 if pushed {
                     // The block landed: this request is surfaced from now on.
@@ -1467,7 +1493,7 @@ impl RequestFlow {
                     // Flush so the inline section appears NOW — the render loop
                     // only flushes on new parts, and a blocked prompt produces
                     // none.
-                    Turn::flush_card_locked(&handles.cards, &host).await;
+                    Turn::flush_card_locked(&handles.cards, host).await;
                     return false;
                 }
                 // `add_inline_locked` false is ambiguous: the card session
@@ -1477,7 +1503,7 @@ impl RequestFlow {
                 // the card — falling through here would post a duplicate
                 // standalone card. Only a card that still carries the request
                 // is "already surfaced"; a vanished one still needs its own.
-                if Turn::has_interaction_in(&handles.cards, &host, req.id()).await {
+                if Turn::has_interaction_in(&handles.cards, host, req.id()).await {
                     seen.insert(req.id().to_string());
                     tracing::info!(
                         "{} {} already carried by session {} card",
@@ -1501,8 +1527,8 @@ impl RequestFlow {
         // A card may have appeared on the request Session itself during the
         // walk (a follow that committed after host resolution). Re-check under
         // its own lock so the standalone send cannot duplicate a block that
-        // just landed there.
-        if Turn::is_running(&handles.cards, req.session_id()).await {
+        // just landed there. A fallback stays standalone by construction.
+        if fallback_summary.is_none() && Turn::is_running(&handles.cards, req.session_id()).await {
             let pushed = self
                 .kind
                 .add_inline_locked(self, &handles.cards, req.session_id(), req, dir)
@@ -1529,7 +1555,19 @@ impl RequestFlow {
                 return false;
             }
         }
-        let card = self.kind.build_card(self, req, dir);
+        let card = match (&fallback_summary, req) {
+            (Some(summary), PendingRequest::Permission(p)) => {
+                crate::feishu::card::question::build_fallback_permission_card(
+                    p.session_id.as_deref().unwrap_or(""),
+                    &p.request_id,
+                    dir,
+                    summary,
+                    p.always_supported,
+                    patterns_target_digest(p),
+                )
+            }
+            _ => self.kind.build_card(self, req, dir),
+        };
         // Reply to the message that triggered the prompt for this session; fall
         // back to sending into the chat when the accumulator is gone (e.g.
         // after a cola restart). Sub-task sessions resolve up the parent chain;
@@ -1555,7 +1593,9 @@ impl RequestFlow {
             // or impossible send (no mapping/reply target yet) stays unmarked
             // so the next sweep retries it (ADR-0100).
             seen.insert(req.id().to_string());
-            let summary = self.kind.summary(self, req);
+            let summary = fallback_summary
+                .clone()
+                .unwrap_or_else(|| self.kind.summary(self, req));
             self.sent_cards.lock().await.insert(
                 req.id().to_string(),
                 SentCard {
@@ -1802,6 +1842,57 @@ impl RequestFlow {
             }
         }
         outcome
+    }
+
+    /// Withdraw a live inline block for `id` before a standalone fallback card
+    /// replaces it (ADR-0102 / #1013). The request stays pending, so this is not
+    /// a decision: the block collapses to a neutral "moved" receipt, its handle
+    /// is forgotten, and the cached card is patched so no control lingers. The
+    /// companion marker (if any) is deliberately **not** touched — it is the
+    /// no-duplicate guarantee for the failed send.
+    async fn withdraw_block_for_fallback(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        host: Option<&str>,
+    ) {
+        let id = req.id();
+        let Some(message_id) = handles
+            .cards
+            .card_handles
+            .lock()
+            .await
+            .message_of(id)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let session = host.unwrap_or(req.session_id());
+        let receipt = crate::feishu::card::question::FALLBACK_PERMISSION_MOVED_RECEIPT;
+        // The same write lock the flush takes: the block's disappearance and
+        // the cached card's edit must not race a render pass.
+        let write_lock = handles.cards.write_lock(session).await;
+        let _guard = write_lock.lock().await;
+        let residue = crate::bridge::turn::InlineResidue::PerBlock(&|_: &str| receipt.to_string());
+        crate::bridge::turn::Turn::resolve_interactions(&handles.cards, session, &[id.to_string()], &residue)
+            .await;
+        let card = {
+            let mut registry = handles.cards.card_handles.lock().await;
+            let card = registry.resolve_on(&message_id, id, receipt);
+            registry.forget(id);
+            card
+        };
+        if let Some(card) = card
+            && let Err(e) = handles.platform.update_message(&message_id, &card).await
+        {
+            tracing::warn!(
+                "fallback {}: could not withdraw its block on {}: {}",
+                id,
+                message_id,
+                e
+            );
+        }
+        tracing::info!("withdrew {} inline block for the standalone fallback card", id);
     }
 
     /// Patch every stored surface for `id` with the replacement `receipt` and

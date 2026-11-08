@@ -36,9 +36,10 @@ is allowed only when the full content was delivered for that request.
 
 - **No refusal on the way in.** A fresh over-budget permission is not declined;
   the sweep surfaces it with a summary and delivers its full content first. The
-  flow's `decline_permission` path remains for a companion that could not be
-  delivered or whose outcome is unknown. A recovered card without a usable
-  companion is withdrawn and takes the fresh path, not a refusal.
+  flow's `decline_permission` path remains for a request that resolves no card
+  target at all; a failed or uncertain companion takes the fallback card below.
+  A recovered card without a usable companion is withdrawn and takes the fresh
+  path, not a refusal.
 - **One proof, two renderings.** The summary card and the inline block show the
   action, the summed target length, the first 120 characters of the target, and
   where the full content lives. The Interaction Receipt names the action, the
@@ -82,9 +83,26 @@ is allowed only when the full content was delivered for that request.
   failed companion follows the refusal path. The old decision is never silently
   taken over (ADR-0101), and a card from an older build cannot approve text a
   newer build never delivered.
-- **Fallback is out of scope here.** If neither lane delivers, this ticket keeps
-  the existing refusal path. A fallback card is a later ticket and this ADR does
-  not pre-decide its controls or confirmation steps.
+- **Fallback names the risk and confirms twice.** If neither lane delivers — a
+  definite failure, or an uncertain marker that is not a proof — the surfacing
+  path renders a **standalone** fallback card instead of replying `reject`: the
+  target summary, the risk paragraph ("完整目标未能送达；批准即批准未能在卡片上完整
+  显示的完整命令。建议先在原始客户端查看详情"), and the four controls 允许一次 /
+  始终允许 / 拒绝 / 开启自动授权. A block already inserted for the request is
+  withdrawn first, and the card is standalone so its click ack replaces it
+  without destroying a streaming card. The allow buttons are **first-step
+  only**: their click acks a confirmation card (the same risk and summary,
+  确认批准 / 取消), and neither replies nor claims the request. 确认批准 carries
+  `risk_confirmed`, the original decision and a digest over the request's
+  **patterns**; the click guard allows an over-budget approval without a
+  companion only when that digest matches the request it re-reads, and a
+  mismatch is refused with a card naming the reason and **no reply at all**.
+  Deny and Auto-Accept stay one click; Auto-Accept still renders no companion.
+  A risk-confirmed approval logs at WARN with the request id, the target length
+  and the fact that the user confirmed unseen text. The risk digest differs
+  from the companion digest on a rendered-body overflow on purpose: the
+  companion proof covers exactly the rendered content it carried, while the
+  user is confirming the **target** (the commands), not the render chrome.
 
 ## Consequences
 
@@ -101,9 +119,10 @@ is allowed only when the full content was delivered for that request.
   id) and never retried. It is not a completeness proof: no interactive
   approval is offered, the request follows the refusal path, and the copy names
   the unknown outcome.
-- The refusal copy, the reason card and the retry behaviour stay in use for a
-  failed companion delivery, an uncertain one, and a legacy card without a
-  record.
+- The refusal copy, the reason card and the retry behaviour stay in use only for
+  a request that resolves no card target at all; a failed or uncertain companion
+  takes the fallback card instead.
 - A target with only a chat reply target (no message to reply under) cannot take
-  either companion lane, so it follows the refusal path. This is safer than
-  offering an approval for an undelivered target.
+  either companion lane, so it takes the standalone fallback card sent into the
+  chat. Only a request that resolves no card target at all follows the refusal
+  path.
