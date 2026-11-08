@@ -299,6 +299,12 @@ enum Withdrawal {
 /// neutralization later, so a timeout is a retry, not a failure to record.
 const WITHDRAWAL_PATCH_TIMEOUT_MS: u64 = 5_000;
 
+/// The budget for one standalone card send (`reply_card`/`send_card`). A card
+/// callback runs on a deadline, and the sweep must not hang on a stalled
+/// Feishu call either: a timeout is a retry next sweep, exactly like a send
+/// error. It matches the companion lane's own send budget.
+const STANDALONE_SEND_TIMEOUT_MS: u64 = 10_000;
+
 /// The total time one sweep's withdrawal-retry phase may spend. Kept below the
 /// per-PATCH budget and near one poll interval: the phase runs before the
 /// listing, so a pile of hung PATCHes must not push permission polling back by
@@ -1623,22 +1629,34 @@ impl RequestFlow {
         false
     }
 
-    /// Send and record one standalone request card. The caller holds the
-    /// owning Session's write lock across the send and the surface record, so
-    /// no follow can commit between them. Returns whether the card landed.
-    async fn send_standalone_surface(
+    /// Send one standalone request card, bounded by [`STANDALONE_SEND_TIMEOUT_MS`].
+    /// Returns the message id, or `None` on a failed or timed-out send. No
+    /// Session lock is held here: the caller commits the surface record under
+    /// the owning Session's write lock, so a slow Feishu call never pins it.
+    async fn send_standalone_card(
         &self,
         handles: &FlowHandles,
         req: &PendingRequest,
-        dir: &str,
         target: Option<CardTarget>,
         card: &serde_json::Value,
-        summary: &str,
-    ) -> bool {
-        let sent_id = match target {
-            Some(CardTarget::ReplyTo(msg_id)) => handles.platform.reply_card(&msg_id, card).await.ok(),
+    ) -> Option<String> {
+        let what = format!("{} card send on {}", self.kind.label(), req.session_id());
+        let sent = match target {
+            Some(CardTarget::ReplyTo(msg_id)) => {
+                crate::bridge::bounded_call(
+                    &what,
+                    STANDALONE_SEND_TIMEOUT_MS,
+                    handles.platform.reply_card(&msg_id, card),
+                )
+                .await
+            }
             Some(CardTarget::Chat(chat_id)) => {
-                handles.platform.send_card("chat_id", &chat_id, card).await.ok()
+                crate::bridge::bounded_call(
+                    &what,
+                    STANDALONE_SEND_TIMEOUT_MS,
+                    handles.platform.send_card("chat_id", &chat_id, card),
+                )
+                .await
             }
             None => {
                 tracing::warn!(
@@ -1646,21 +1664,36 @@ impl RequestFlow {
                     self.kind.label(),
                     req.session_id()
                 );
-                None
+                return None;
             }
         };
-        let Some(mid) = sent_id else {
-            tracing::warn!(
-                "{} card send failed on session {}",
-                self.kind.label(),
-                req.session_id()
-            );
-            return false;
-        };
+        match sent {
+            Some(Ok(mid)) => Some(mid),
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "{} card send failed on session {}: {e}",
+                    self.kind.label(),
+                    req.session_id()
+                );
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Commit one standalone card's surface record. The caller holds the
+    /// owning Session's write lock so no follow can commit over it.
+    async fn record_standalone_surface(
+        &self,
+        req: &PendingRequest,
+        dir: &str,
+        message_id: String,
+        summary: &str,
+    ) {
         self.sent_cards.lock().await.insert(
             req.id().to_string(),
             SentCard {
-                message_id: mid.clone(),
+                message_id: message_id.clone(),
                 summary: summary.to_string(),
                 directory: dir.to_string(),
                 session_id: req.session_id().to_string(),
@@ -1673,12 +1706,32 @@ impl RequestFlow {
             StandaloneSurface {
                 client_id: String::new(),
                 kind: self.kind.interaction_kind(),
-                message_id: mid,
+                message_id,
                 summary: summary.to_string(),
                 directory: dir.to_string(),
                 session_id: req.session_id().to_string(),
             },
         );
+    }
+
+    /// Send and record one standalone request card. The caller holds the
+    /// owning Session's write lock across the send and the surface record, so
+    /// no follow can commit between them. The send itself is bounded, so the
+    /// lock is never held on a stalled Feishu call forever. Returns whether
+    /// the card landed.
+    async fn send_standalone_surface(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+        target: Option<CardTarget>,
+        card: &serde_json::Value,
+        summary: &str,
+    ) -> bool {
+        let Some(mid) = self.send_standalone_card(handles, req, target, card).await else {
+            return false;
+        };
+        self.record_standalone_surface(req, dir, mid, summary).await;
         true
     }
 
@@ -1721,31 +1774,43 @@ impl RequestFlow {
             );
             return false;
         }
-        let target_summary = describe_permission_target_summary(p);
-        let stored_summary =
-            crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, false);
-        let card_summary =
-            crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, changed);
-        let card = crate::feishu::card::question::build_fallback_permission_card(
-            p.session_id.as_deref().unwrap_or(""),
-            &p.request_id,
-            dir,
-            &card_summary,
-            p.always_supported,
-            patterns_target_digest(p),
-            loss,
-        );
-        let req = PendingRequest::Permission(p.clone());
         let owning_lock = handles
             .cards
             .write_lock(p.session_id.as_deref().unwrap_or(""))
             .await;
-        let guard = owning_lock.lock().await;
-        let landed = self
-            .send_standalone_surface(handles, &req, dir, target, &card, &stored_summary)
+        // Compute the card, its stored summary and the request record under the
+        // lock, then release it for the send. A card callback runs on a
+        // deadline: the send is bounded by [`STANDALONE_SEND_TIMEOUT_MS`] and
+        // never holds the Session write lock (a stalled Feishu call would
+        // otherwise block flushes, `/card` and install for that Session). The
+        // record is committed under the lock after the send lands, following
+        // the preview → commit pattern the withdrawal PATCHes use. A timed-out
+        // send returns `false`, which the click turns into a retry ack.
+        let (req, card, stored_summary) = {
+            let _guard = owning_lock.lock().await;
+            let target_summary = describe_permission_target_summary(p);
+            let stored_summary =
+                crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, false);
+            let card_summary =
+                crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, changed);
+            let card = crate::feishu::card::question::build_fallback_permission_card(
+                p.session_id.as_deref().unwrap_or(""),
+                &p.request_id,
+                dir,
+                &card_summary,
+                p.always_supported,
+                patterns_target_digest(p),
+                loss,
+            );
+            (PendingRequest::Permission(p.clone()), card, stored_summary)
+        };
+        let Some(message_id) = self.send_standalone_card(handles, &req, target, &card).await else {
+            return false;
+        };
+        let _guard = owning_lock.lock().await;
+        self.record_standalone_surface(&req, dir, message_id, &stored_summary)
             .await;
-        drop(guard);
-        landed
+        true
     }
 
     /// Re-host a still-pending inline block onto the session's current card
@@ -2308,11 +2373,9 @@ impl RequestFlow {
     /// phase is cut off at `withdrawal_retry_budget_ms`. Entries not reached (or
     /// cut off mid-PATCH) are left untouched for the next sweep — the
     /// cancellation is safe because a withdrawal only mutates state after a
-    /// landed PATCH.
-    /// Retry up to the per-sweep cap of decided-but-undelivered withdrawals.
-    /// Returns every id the map held at the start of the phase: the per-request
-    /// pass must not re-attempt them in the same sweep, or the budget would be
-    /// defeated by the request loop.
+    /// landed PATCH. Returns every id the map held at the start of the phase:
+    /// the per-request pass must not re-attempt them in the same sweep, or the
+    /// budget would be defeated by the request loop.
     async fn retry_pending_withdrawals(&self, handles: &FlowHandles) -> std::collections::HashSet<String> {
         let all: Vec<(String, PendingWithdrawal)> = self
             .pending_withdrawals
