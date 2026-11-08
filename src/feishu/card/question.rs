@@ -552,6 +552,12 @@ pub(crate) fn uncollectable_note(reason: UncollectableReason) -> &'static str {
     }
 }
 
+/// Why an over-budget request is refused instead of taking the companion lane:
+/// there is no usable card target at all (neither a message to reply under nor
+/// a chat). Shared by the reason copy, the retry copy and the receipt, so they
+/// cannot drift.
+pub(crate) const NO_COMPANION_TARGET: &str = "没有可用的聊天目标，无法送达完整内容";
+
 /// The header of the card that records a permission cola auto-declined because
 /// its target cannot be rendered in full and no chat target can carry the
 /// companion. Pinned beside the note below, so the decision and its explanation
@@ -564,10 +570,11 @@ pub(crate) const UNSHOWABLE_PERMISSION_HEADER: &str = "🔐 权限请求已自�
 pub(crate) fn unshowable_permission_note(budget: usize) -> String {
     format!(
         "该权限请求在卡片上需要显示的内容超过 **{budget}** 字符，卡片无法完整显示，\
-         而且这里没有可用于送达完整内容的聊天目标。为了不让你批准只看到一部分的内容，\
+         而且{}。为了不让你批准只看到一部分的内容，\
          cola 已自动拒绝，该请求在服务端已结清——其他客户端也无法再批准。\
          请让 AI 把这条操作拆成更短的步骤后重试；或先开启自动授权（`/autoaccept on`）再让它执行，\
-         自动授权不需要逐条查看。"
+         自动授权不需要逐条查看。",
+        NO_COMPANION_TARGET
     )
 }
 
@@ -593,9 +600,12 @@ pub(crate) const UNSHOWABLE_PERMISSION_RETRY_RECEIPT: &str = "⏳ 目标无法�
 pub(crate) const UNSHOWABLE_PERMISSION_RETRY_HEADER: &str = "⏳ 权限请求待重试";
 
 /// Why that card carries no controls.
-pub(crate) fn unshowable_permission_retry_note() -> &'static str {
-    "该权限请求的目标过长，卡片无法完整显示，也没有可用的聊天目标来送达完整内容；\
-     cola 暂时无法自动拒绝，稍后会自动重试。这张卡片不提供批准操作。"
+pub(crate) fn unshowable_permission_retry_note() -> String {
+    format!(
+        "该权限请求的目标过长，卡片无法完整显示，{}；\
+         cola 暂时无法自动拒绝，稍后会自动重试。这张卡片不提供批准操作。",
+        NO_COMPANION_TARGET
+    )
 }
 
 /// The card that replaces a standalone permission card while the refusal is
@@ -716,7 +726,9 @@ pub(crate) fn missing_permission_click_note() -> String {
 /// in full, so approving it would approve unseen text. Pinned with the refusal
 /// header/note above, so the block, the standalone card and the chat notice
 /// cannot drift.
-pub(crate) const UNSHOWABLE_PERMISSION_RECEIPT: &str = "🚫 已自动拒绝：目标过长，且没有可用的聊天目标";
+pub(crate) fn unshowable_permission_receipt() -> String {
+    format!("🚫 已自动拒绝：目标过长，{NO_COMPANION_TARGET}")
+}
 
 /// The header of a standalone card whose request cannot be collected at all.
 pub(crate) const UNCOLLECTABLE_HEADER: &str = "❓ 无法在卡片上作答";
@@ -1371,6 +1383,18 @@ pub fn build_uncollectable_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three refusal surfaces share one clause for a missing companion
+    /// target, so the reason card, the retry card and the receipt cannot drift.
+    #[test]
+    fn unshowable_permission_copy_pins_the_missing_companion_target() {
+        let note = unshowable_permission_note(crate::backend::PERMISSION_TARGET_MAX_CHARS);
+        assert!(note.contains(NO_COMPANION_TARGET), "{note}");
+        let retry = unshowable_permission_retry_note();
+        assert!(retry.contains(NO_COMPANION_TARGET), "{retry}");
+        let receipt = unshowable_permission_receipt();
+        assert!(receipt.contains(NO_COMPANION_TARGET), "{receipt}");
+    }
 
     #[test]
     fn question_card_has_option_buttons_with_answer_payload() {
@@ -2248,24 +2272,25 @@ mod tests {
         assert!(summary.contains("Rich Text Message"));
     }
 
-    /// The JSON worst case the body ceiling names: a body at
-    /// [`crate::backend::types::PERMISSION_BODY_MAX_CHARS`] characters where
-    /// every character is outside a code span, so the sanitizer expands each
-    /// `<` to `&#60;` (five bytes). The card still serializes under its own
-    /// budget.
+    /// The JSON worst case the render invariant bounds: a body at
+    /// [`crate::backend::types::PERMISSION_BODY_MAX_CHARS`] **sanitized**
+    /// characters where every character is a JSON control escape (`\u0000`,
+    /// six bytes). The card still serializes under its own budget. A raw `<`
+    /// is far cheaper: the proof counts sanitized characters, and a target sits
+    /// inside an inline code span where `<` stays one byte.
     #[test]
-    fn a_permission_card_at_the_angle_expansion_worst_case_fits_the_card_budget() {
-        let body = "<".repeat(crate::backend::types::PERMISSION_BODY_MAX_CHARS);
+    fn a_permission_card_at_the_json_escape_worst_case_fits_the_card_budget() {
+        let body = "\u{0}".repeat(crate::backend::types::PERMISSION_BODY_MAX_CHARS);
         let card = build_permission_card("ses_abc", "n:1", &body, "/tmp/proj", true, None);
         let len = card.to_string().len();
         assert!(
             len <= crate::feishu::card::MAX_CARD_JSON_CHARS,
-            "the `<`-expansion worst case is {len} bytes, over the {} budget",
+            "the JSON control-escape worst case is {len} bytes, over the {} budget",
             crate::feishu::card::MAX_CARD_JSON_CHARS
         );
         assert!(
-            len >= 15_000,
-            "the sanitized ceiling's five-byte case is ~15 KB, got {len}"
+            len >= 18_000,
+            "the six-byte JSON escape case is ~18 KB, got {len}"
         );
     }
 

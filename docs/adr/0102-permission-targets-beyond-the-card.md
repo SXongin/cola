@@ -19,17 +19,22 @@ over-budget target; its Auto-Accept decision is unchanged.
 **Why 3,000.** The platform documents no per-element text cap; cola measured
 that one markdown element of **8,000 ASCII / 3,060 CJK characters** renders
 fully (`docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md`).
-The summed target budget takes the CJK figure as the widest script, rounds it
-down to **3,000**, and leaves the remainder for the renderer's scaffolding
-(header, reason, metadata lines and footer) while several targets share the one
+The summed target budget takes the CJK figure as the widest script and rounds it
+down to **3,000** — one display number, shared by every target in the one
 element. `PERMISSION_TARGET_MAX_CHARS = 3000` is therefore the only **display**
-budget — the number an adapter or user tunes. `PERMISSION_BODY_MAX_CHARS = 3060`
-is not a second display budget but a **render invariant**: the measured
-single-element ceiling for the whole rendered body, targets plus scaffolding;
-`src/backend/types.rs` carries both derivations. A 3,000-character CJK target is
-about 9 KB of JSON; because one sanitized character can cost five bytes (`<` →
-`&#60;` outside a code span), the body's JSON worst case is ~15 KB, inside
-the card's JSON budget.
+budget, a compile-time constant a developer tunes, not a user knob. The fixed
+markdown scaffolding around a bare target (header, labels and footer) is
+charged inside the same measured render point — 3,000 target characters plus
+that chrome are not promised to fit. `PERMISSION_BODY_MAX_CHARS = 3060` is the
+**render invariant**, not a second display budget: it bounds the whole rendered
+body, targets plus scaffolding, and any body that passes it — reason and
+metadata chrome included — is `PermissionOverflow::Body` and takes the companion
+lane, never the card.
+
+The proof counts **sanitized** characters, and a sanitized character is at most
+six JSON bytes (`\u0000`); a 3,060-character body is therefore ≈18 KB, inside
+`MAX_CARD_JSON_CHARS` (25 KB). The JSON bound is a consequence of the render
+invariant, not a second byte budget.
 
 The parent spec directs this ticket to reuse **ADR-0083 §5**'s existing
 Rich Text Message → File Message ladder as the one overflow mechanism. That
@@ -133,9 +138,10 @@ is allowed only when the full content was delivered for that request.
   block logs/retries.
   Deny and Auto-Accept stay one click; Auto-Accept still renders no companion.
   This two-step confirmation is the **one deliberate exception** to the delivery
-  proof: it is the only way an over-budget target is approved without a
-  confirmed companion, and it requires the user to read the risk statement and
-  confirm again against the request the click re-reads.
+  proof: it is the only way an over-budget target is approved from an
+  interactive surface without a confirmed companion, and it requires the user
+  to read the risk statement and confirm again against the request the click
+  re-reads.
   A risk-confirmed approval logs at WARN with the request id, the target length
   and the fact that the user confirmed unseen text. The risk digest differs
   from the companion digest on a rendered-body overflow on purpose: the

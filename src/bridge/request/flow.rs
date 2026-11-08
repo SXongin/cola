@@ -1899,9 +1899,7 @@ impl RequestFlow {
         let id = p.request_id.as_str();
         self.recovered.lock().await.remove(id);
         let receipt = match how {
-            Withdrawal::Refused(_) => {
-                crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT.to_string()
-            }
+            Withdrawal::Refused(_) => crate::feishu::card::question::unshowable_permission_receipt(),
             Withdrawal::ResolvedElsewhere => handled_elsewhere_receipt(&permission_target(p)),
             Withdrawal::CompanionUncertain => {
                 crate::feishu::card::question::UNCERTAIN_PERMISSION_RECEIPT.to_string()

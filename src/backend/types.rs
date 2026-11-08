@@ -682,46 +682,29 @@ impl SessionStatus {
 }
 
 /// The permission **target** display budget — the only budget an adapter or a
-/// user tunes.
+/// developer tunes.
 ///
 /// The card renders every target of a request in one markdown element, so the
 /// budget is charged against the **sum** of their character counts
 /// ([`PermissionRequest::targets_are_fully_shown`]), never against one target
-/// at a time. 3,000 is chosen to stay under the platform's measured
-/// single-element full-render point (8,000 ASCII / 3,060 CJK characters,
-/// `docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md`) while
-/// leaving room for the renderer's scaffolding. A 3,000-character CJK target is
-/// ~9 KB of JSON; the wire worst case is the body ceiling below, ~15 KB
-/// because one sanitized character can cost five bytes (`<` → `&#60;`).
+/// at a time. ADR-0102 derives the value from the platform's measured
+/// single-element render point.
 ///
 /// This is not the whole proof: the card also has to fit its ONE element, and
 /// the renderer adds a header, reason, metadata lines and a footer. That is the
 /// separate render invariant [`PERMISSION_BODY_MAX_CHARS`]; the two bounds
-/// together answer "shown in full". Because the chrome consumes the remaining
-/// room, a real near-budget bash request (a 3,000-char command plus
-/// `metadata.command`) exceeds the render ceiling: ADR-0102 surfaces it with a
-/// summary and delivers the full target in a companion message.
+/// together answer "shown in full". A body past the render invariant takes the
+/// companion lane (ADR-0102), not a refusal.
 pub const PERMISSION_TARGET_MAX_CHARS: usize = 3000;
 
 /// The measured single-element render ceiling for a permission card, in
 /// **characters** — a render invariant, not a second display budget.
 ///
-/// The platform documents no per-element text cap; cola measured that one
-/// markdown element of 8,000 ASCII / 3,060 CJK characters renders fully. A CJK
-/// glyph is the widest, so 3,060 characters stays inside both measured points
-/// **whatever the script**. The converse is the practical cost: the ceiling
-/// applies the CJK floor to every script, so a near-budget ASCII command plus
-/// its chrome is unshowable even though the platform would render up to 8,000
-/// ASCII characters. That is the safe direction — never approve text the element
-/// may clip — and ADR-0102's companion lane protects the lost agency by
-/// surfacing the summary and delivering the full target separately.
-///
-/// [`PERMISSION_TARGET_MAX_CHARS`] remains the sole *target* display budget;
-/// this ceiling bounds the whole rendered body — targets plus the renderer's
-/// scaffolding. The proof measures the **sanitized** body in characters, while
-/// the card's JSON budget ([`crate::feishu::card::MAX_CARD_JSON_CHARS`]) counts
-/// bytes: one sanitized character can cost five bytes (`<` → `&#60;` outside a
-/// code span), so the 3,060-character ceiling is at most ~15 KB of JSON.
+/// ADR-0102 carries the derivation: cola applies the widest-script (CJK)
+/// measured full-render point as the safe bound for every script. This ceiling
+/// bounds the whole rendered body — targets plus the renderer's scaffolding —
+/// and the proof measures the **sanitized** body in characters. A body past it
+/// is `PermissionOverflow::Body` and takes the companion lane.
 ///
 /// A body that actually renders a diff is exempt (its own escaped-byte cap and
 /// truncation note, #792/#794). The exemption is keyed on the diff being present

@@ -1,5 +1,8 @@
 # Auto-Accept approves an unshowable target
 
+> **Superseded by ADR-0102** for the interactive surface; Auto-Accept is
+> unchanged.
+
 ## Context
 
 A permission request whose card cannot be rendered in full — its targets summed
@@ -70,10 +73,10 @@ decisions. It stands aside wherever no card is rendered:
   error would retire a still-pending request with no card at all. The retry
   failure follows ADR-0048's warn-once cadence (WARN, then DEBUG for identical
   repeats, INFO on recovery).
-- An interactive surface is unchanged: `refuse` still declines an over-budget
-  target, the click-time guard still refuses to approve one, and the refusal
-  copy now names the two paths that exist — ask the model to split the
-  operation, or enable Auto-Accept and retry.
+- An interactive surface is **superseded by ADR-0102**: `refuse` no longer
+  declines an over-budget target on the way in; the companion lane surfaces it
+  with a summary and the full target, and only a request with no usable card
+  target follows the refusal path.
 - `/autoaccept`'s help, the user guides, the toggle's result card and the
   Auto-Accept receipt no longer claim over-budget targets are declined.
 
