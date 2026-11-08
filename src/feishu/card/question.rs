@@ -570,11 +570,10 @@ pub(crate) const UNSHOWABLE_PERMISSION_HEADER: &str = "🔐 权限请求已自�
 pub(crate) fn unshowable_permission_note(budget: usize) -> String {
     format!(
         "该权限请求在卡片上需要显示的内容超过 **{budget}** 字符，卡片无法完整显示，\
-         而且{}。为了不让你批准只看到一部分的内容，\
+         完整内容也未能送达。为了不让你批准只看到一部分的内容，\
          cola 已自动拒绝，该请求在服务端已结清——其他客户端也无法再批准。\
          请让 AI 把这条操作拆成更短的步骤后重试；或先开启自动授权（`/autoaccept on`）再让它执行，\
-         自动授权不需要逐条查看。",
-        NO_COMPANION_TARGET
+         自动授权不需要逐条查看。"
     )
 }
 
@@ -1384,12 +1383,17 @@ pub fn build_uncollectable_card(
 mod tests {
     use super::*;
 
-    /// The three refusal surfaces share one clause for a missing companion
-    /// target, so the reason card, the retry card and the receipt cannot drift.
+    /// The reason card is itself a surface, so it names the undelivered
+    /// companion without claiming there is no chat target; the retry note and
+    /// receipt keep the shared no-target clause.
     #[test]
-    fn unshowable_permission_copy_pins_the_missing_companion_target() {
+    fn unshowable_permission_copy_distinguishes_the_reason_from_the_no_target_clause() {
         let note = unshowable_permission_note(crate::backend::PERMISSION_TARGET_MAX_CHARS);
-        assert!(note.contains(NO_COMPANION_TARGET), "{note}");
+        assert!(
+            !note.contains(NO_COMPANION_TARGET),
+            "the reason card is shown on a surface: {note}"
+        );
+        assert!(note.contains("完整内容也未能送达"), "{note}");
         let retry = unshowable_permission_retry_note();
         assert!(retry.contains(NO_COMPANION_TARGET), "{retry}");
         let receipt = unshowable_permission_receipt();
