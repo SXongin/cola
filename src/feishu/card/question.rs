@@ -41,14 +41,16 @@ pub fn permission_buttons(
     request_id: &str,
     directory: &str,
     always_supported: bool,
+    target_digest: Option<u64>,
 ) -> Vec<serde_json::Value> {
     // The callback carries routing plus the decision and its display labels —
     // never the body. The body is the largest part of the block, and echoing it
     // into every button multiplied the card's JSON by the button count; a click
     // rebuilds the result body from what it already has (the verified pending
     // request, or the block's recorded target).
+    let summary_digest = target_digest.map(target_digest_hex);
     permission_control_elements(always_supported, |reply, _decision, label, color| {
-        json!({
+        let mut value = json!({
             "action": "perm",
             "reply": reply,
             "session_id": session_id,
@@ -56,7 +58,15 @@ pub fn permission_buttons(
             "directory": directory,
             "perm_label": label,
             "perm_color": color,
-        })
+        });
+        if let Some(digest) = &summary_digest {
+            // A summary surface proves itself again at the click: the marker
+            // and the digest let the guard reject a request whose target
+            // changed after the companion was delivered.
+            value["summary"] = json!(true);
+            value["target_digest"] = json!(digest);
+        }
+        value
     })
 }
 
@@ -115,6 +125,7 @@ pub fn build_permission_card(
     body: &str,
     directory: &str,
     always_supported: bool,
+    target_digest: Option<u64>,
 ) -> serde_json::Value {
     let body = super::sanitize::CardMarkdown::new().clean(body);
     let mut elements = vec![json!({ "tag": "markdown", "content": body })];
@@ -123,6 +134,7 @@ pub fn build_permission_card(
         request_id,
         directory,
         always_supported,
+        target_digest,
     ));
     card_shell("🔐 权限请求", "orange", elements)
 }
@@ -132,7 +144,8 @@ pub fn build_permission_card(
 /// explicit that approval approves the command the card could not show, and
 /// points at the original client where the full request can be read.
 pub(crate) fn fallback_permission_risk_note() -> &'static str {
-    "完整目标未能送达；批准即批准未能在卡片上完整显示的完整命令。建议先在原始客户端查看详情。"
+    "完整目标未能送达；批准即批准未能在卡片上完整显示的完整命令。\
+     建议先在原始客户端查看详情。"
 }
 
 /// The risk paragraph for the cause at hand: the definite wording above, or a
@@ -142,7 +155,8 @@ fn fallback_permission_risk_note_for(loss: FallbackLoss) -> &'static str {
     match loss {
         FallbackLoss::NotDelivered => fallback_permission_risk_note(),
         FallbackLoss::OutcomeUnknown => {
-            "完整目标未能确认送达；批准即批准未能在卡片上完整显示的完整命令。建议先在原始客户端查看详情。"
+            "完整目标未能确认送达；批准即批准未能在卡片上完整显示的完整命令。\
+             建议先在原始客户端查看详情。"
         }
     }
 }
@@ -152,7 +166,7 @@ fn fallback_permission_risk_note_for(loss: FallbackLoss) -> &'static str {
 pub(crate) const FALLBACK_PERMISSION_HEADER: &str = "🔐 权限请求（目标未完整展示）";
 
 /// The header of the second-step confirmation card. The risk is named in the
-/// body by [`fallback_permission_risk_note`].
+/// body by [`fallback_permission_risk_note_for`].
 pub(crate) const FALLBACK_PERMISSION_CONFIRM_HEADER: &str = "⚠️ 确认批准（目标未完整展示）";
 
 /// Why the full target is absent from the fallback card. The distinction is
@@ -203,17 +217,22 @@ impl FallbackLoss {
 /// from the bridge ([`crate::bridge::request::companion::describe_permission_target_summary`]);
 /// this copy table adds the content claim, the risk and — when the user comes
 /// back after a digest mismatch — the changed-target note.
-pub(crate) fn fallback_permission_summary(target_summary: &str, loss: FallbackLoss, changed: bool) -> String {
+#[rustfmt::skip]
+pub(crate) fn fallback_permission_summary(
+    target_summary: &str,
+    loss: FallbackLoss,
+    changed: bool,
+) -> String {
     let mut summary = format!(
         "{target_summary}\n**完整内容**: {}\n\n**风险**: {}",
         loss.content_line(),
         fallback_permission_risk_note_for(loss)
     );
     if changed {
-        summary.push_str(
-            "\n\n**目标已变化**: 在你确认之后目标发生了变化，原来的确认不再有效；\
-             请重新查看并再次确认。",
-        );
+        summary.push_str(concat!(
+            "\n\n**目标已变化**: 在你确认之后目标发生了变化，原来的确认不再有效；",
+            "请重新查看并再次确认。"
+        ));
     }
     summary
 }
@@ -324,13 +343,18 @@ pub(crate) fn build_fallback_permission_confirm_card(
         super::sanitize::CardMarkdown::new().clean(summary)
     );
     let digest = target_digest_hex(target_digest);
+    let perm_label = if decision == "always" {
+        "✅ 已始终允许（目标未完整展示）"
+    } else {
+        "✅ 已允许一次（目标未完整展示）"
+    };
     let confirm = json!({
         "action": "perm",
         "reply": decision,
         "session_id": session_id,
         "request_id": request_id,
         "directory": directory,
-        "perm_label": if decision == "always" { "✅ 已始终允许（目标未完整展示）" } else { "✅ 已允许一次（目标未完整展示）" },
+        "perm_label": perm_label,
         "perm_color": "green",
         "fallback": true,
         "risk_confirmed": true,
@@ -356,8 +380,18 @@ pub(crate) fn build_fallback_permission_confirm_card(
         "red",
         vec![
             json!({ "tag": "markdown", "content": body }),
-            json!({ "tag": "button", "text": { "tag": "plain_text", "content": "✅ 确认批准" }, "type": "danger", "value": confirm }),
-            json!({ "tag": "button", "text": { "tag": "plain_text", "content": "取消" }, "type": "default", "value": cancel }),
+            json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "✅ 确认批准" },
+                "type": "danger",
+                "value": confirm,
+            }),
+            json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "取消" },
+                "type": "default",
+                "value": cancel,
+            }),
         ],
     )
 }
@@ -2041,7 +2075,14 @@ mod tests {
 
     #[test]
     fn permission_card_carries_reply_payload() {
-        let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash", "/tmp/proj/lib", true);
+        let card = build_permission_card(
+            "ses_abc",
+            "per_123",
+            "AI 想要执行 bash",
+            "/tmp/proj/lib",
+            true,
+            None,
+        );
         assert_eq!(
             card["header"]["title"]["content"].as_str().unwrap(),
             "🔐 权限请求"
@@ -2097,6 +2138,7 @@ mod tests {
             "AI 想要申请额外权限",
             "/tmp/proj/lib",
             false,
+            None,
         );
         let elements = card["body"]["elements"].as_array().unwrap();
         let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
@@ -2125,7 +2167,7 @@ mod tests {
         let command = "啊".repeat(budget);
         let body =
             format!("⚡ **执行 Shell 命令**\n**对象**:\n- `{command}`\n\nAI 想要执行这个操作，是否允许？");
-        let card = build_permission_card("ses_abc", "n:1", &body, "/tmp/proj", true);
+        let card = build_permission_card("ses_abc", "n:1", &body, "/tmp/proj", true, None);
         let len = card.to_string().len();
         assert!(
             len <= crate::feishu::card::MAX_CARD_JSON_CHARS,
@@ -2157,7 +2199,7 @@ mod tests {
         // chrome. The target budget's worst case must still serialize.
         let cjk = request("啊".repeat(PERMISSION_TARGET_MAX_CHARS));
         let full_body = crate::bridge::request::kind::describe_permission(&cjk);
-        let full_card = build_permission_card("ses", "n:1", &full_body, "/tmp/proj", true);
+        let full_card = build_permission_card("ses", "n:1", &full_body, "/tmp/proj", true, None);
         assert!(
             full_card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
             "a full-budget CJK card is {} bytes",
@@ -2173,7 +2215,9 @@ mod tests {
             target_digest: 0,
         };
         let summary = crate::bridge::request::companion::describe_permission_summary(&long, &delivery);
-        let summary_card = build_permission_card("ses", "n:1", &summary, "/tmp/proj", true);
+        let summary_digest = crate::bridge::request::companion::patterns_target_digest(&long);
+        let summary_card =
+            build_permission_card("ses", "n:1", &summary, "/tmp/proj", true, Some(summary_digest));
         let len = summary_card.to_string().len();
         assert!(
             len <= crate::feishu::card::MAX_CARD_JSON_CHARS,
@@ -2181,6 +2225,10 @@ mod tests {
         );
         assert!(!summary_card.to_string().contains(&"x".repeat(1_000)));
         assert!(summary.contains("目标长度"));
+        assert!(
+            summary_card.to_string().contains("\"summary\":true"),
+            "a summary card's buttons carry the surface marker"
+        );
         assert!(summary.contains("Rich Text Message"));
     }
 
@@ -2192,7 +2240,7 @@ mod tests {
     #[test]
     fn a_permission_card_at_the_angle_expansion_worst_case_fits_the_card_budget() {
         let body = "<".repeat(crate::backend::types::PERMISSION_BODY_MAX_CHARS);
-        let card = build_permission_card("ses_abc", "n:1", &body, "/tmp/proj", true);
+        let card = build_permission_card("ses_abc", "n:1", &body, "/tmp/proj", true, None);
         let len = card.to_string().len();
         assert!(
             len <= crate::feishu::card::MAX_CARD_JSON_CHARS,
@@ -2219,18 +2267,38 @@ mod tests {
             "⚡ **执行 Shell 命令**\n**原因**: {}\n**对象**:\n- `ls`\n\nAI 想要执行这个操作，是否允许？",
             "<".repeat(150)
         );
-        for (body, always, directory) in [
-            ("⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n", true, "/d"),
-            ("⚡ **执行 Shell 命令**\n**对象**:\n- `cargo test`\n", false, "/d"),
-            (&"啊\"\\\n".repeat(250), true, "/d"),
+        for (body, always, directory, digest) in [
+            ("⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n", true, "/d", None),
+            (
+                "⚡ **执行 Shell 命令**\n**对象**:\n- `cargo test`\n",
+                false,
+                "/d",
+                None,
+            ),
+            (&"啊\"\\\n".repeat(250), true, "/d", None),
             (
                 "⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n",
                 true,
                 long_directory.as_str(),
+                None,
             ),
-            (angle_reason.as_str(), true, "/d"),
+            (angle_reason.as_str(), true, "/d", None),
+            // A summary block's buttons carry the surface marker and digest;
+            // the estimate must still cover the rendered JSON.
+            (
+                "⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n",
+                true,
+                "/d",
+                Some(42),
+            ),
+            (
+                "⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n",
+                true,
+                long_directory.as_str(),
+                Some(42),
+            ),
         ] {
-            let card = build_permission_card("ses", "n:1", body, directory, always);
+            let card = build_permission_card("ses", "n:1", body, directory, always, digest);
             let elements = card["body"]["elements"].as_array().expect("body elements");
             let rendered: usize = elements.iter().map(|element| element.to_string().len()).sum();
             let estimate = permission_block_estimate(body, always, "n:1", "ses", directory);
@@ -2259,7 +2327,7 @@ mod tests {
             body.len() - 150 + 150 * "&#60;".len(),
             "the sanitizer expands every '<'"
         );
-        let card = build_permission_card("ses", "n:1", &body, "/d", true);
+        let card = build_permission_card("ses", "n:1", &body, "/d", true, None);
         let elements = card["body"]["elements"].as_array().expect("body elements");
         let rendered: usize = elements.iter().map(|element| element.to_string().len()).sum();
         let estimate = permission_block_estimate(&body, true, "n:1", "ses", "/d");

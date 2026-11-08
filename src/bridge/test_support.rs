@@ -1502,7 +1502,7 @@ pub(crate) struct ModelSurfaceQueryRecord {
 pub struct MockBackend {
     /// The parts the default assistant turn carries: reasoning → tool → text.
     pub parts: Vec<Part>,
-    pub permissions: Vec<crate::backend::types::PermissionRequest>,
+    pub permissions: Arc<tokio::sync::Mutex<Vec<crate::backend::types::PermissionRequest>>>,
     /// Number of initial `list_permissions` calls to hang forever — simulates
     /// an in-flight request stuck on a half-open connection while the server
     /// restarts. Each hung call decrements the counter; once it reaches zero
@@ -2055,7 +2055,7 @@ impl MockBackend {
     pub fn new(parts: Vec<Part>) -> Self {
         Self {
             parts,
-            permissions: Vec::new(),
+            permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             hang_list_permissions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_list_questions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_transcript: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2234,7 +2234,10 @@ impl MockBackend {
     /// Scenario: `request` is pending on the server (appends to the pending
     /// list `list_permissions` serves).
     pub(crate) fn ask_permission(&mut self, request: crate::backend::types::PermissionRequest) -> &mut Self {
-        self.permissions.push(request);
+        Arc::get_mut(&mut self.permissions)
+            .expect("the permission list is uniquely owned during setup")
+            .get_mut()
+            .push(request);
         self
     }
 
@@ -2243,7 +2246,9 @@ impl MockBackend {
         &mut self,
         requests: Vec<crate::backend::types::PermissionRequest>,
     ) -> &mut Self {
-        self.permissions = requests;
+        *Arc::get_mut(&mut self.permissions)
+            .expect("the permission list is uniquely owned during setup")
+            .get_mut() = requests;
         self
     }
 
@@ -3589,8 +3594,8 @@ impl crate::backend::Backend for MockBackend {
             ));
         }
         let replied = self.replied_permissions.lock().await;
-        let out: Vec<_> = self
-            .permissions
+        let permissions = self.permissions.lock().await;
+        let out: Vec<_> = permissions
             .iter()
             .filter(|p| !replied.contains(&p.request_id))
             .cloned()

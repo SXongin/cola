@@ -403,6 +403,12 @@ impl Surfaces {
         self.mutate(|state| state.standalone.remove(&self.client_id, request_id).is_some());
     }
 
+    /// This client's standalone record for `request_id`, when one exists. The
+    /// risk-mismatch recovery re-records it with the same client scope.
+    pub fn standalone(&self, request_id: &str) -> Option<StandaloneSurface> {
+        self.lock().standalone.get(&self.client_id, request_id).cloned()
+    }
+
     /// Record the companion message that delivered `request_id`'s full target.
     /// Written only after the send landed, so the record is never a promise
     /// (ADR-0102).

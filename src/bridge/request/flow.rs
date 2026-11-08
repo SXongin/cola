@@ -1591,10 +1591,38 @@ impl RequestFlow {
         // the target was resolved before the lock. The send and the surface
         // record stay under the owning Session's lock so no follow can commit
         // between them.
+        let summary = fallback_summary
+            .clone()
+            .unwrap_or_else(|| self.kind.summary(self, req));
+        if self
+            .send_standalone_surface(handles, req, dir, target, &card, &summary)
+            .await
+        {
+            // The card landed: this request is surfaced from now on. A failed
+            // or impossible send stays unmarked so the next sweep retries it
+            // (ADR-0100).
+            seen.insert(req.id().to_string());
+        }
+        drop(guard);
+        false
+    }
+
+    /// Send and record one standalone request card. The caller holds the
+    /// owning Session's write lock across the send and the surface record, so
+    /// no follow can commit between them. Returns whether the card landed.
+    async fn send_standalone_surface(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+        target: Option<CardTarget>,
+        card: &serde_json::Value,
+        summary: &str,
+    ) -> bool {
         let sent_id = match target {
-            Some(CardTarget::ReplyTo(msg_id)) => handles.platform.reply_card(&msg_id, &card).await.ok(),
+            Some(CardTarget::ReplyTo(msg_id)) => handles.platform.reply_card(&msg_id, card).await.ok(),
             Some(CardTarget::Chat(chat_id)) => {
-                handles.platform.send_card("chat_id", &chat_id, &card).await.ok()
+                handles.platform.send_card("chat_id", &chat_id, card).await.ok()
             }
             None => {
                 tracing::warn!(
@@ -1605,45 +1633,92 @@ impl RequestFlow {
                 None
             }
         };
-        if let Some(mid) = sent_id {
-            // The card landed: this request is surfaced from now on. A failed
-            // or impossible send (no mapping/reply target yet) stays unmarked
-            // so the next sweep retries it (ADR-0100).
-            seen.insert(req.id().to_string());
-            let summary = fallback_summary
-                .clone()
-                .unwrap_or_else(|| self.kind.summary(self, req));
-            self.sent_cards.lock().await.insert(
-                req.id().to_string(),
-                SentCard {
-                    message_id: mid.clone(),
-                    summary: summary.clone(),
-                    directory: dir.to_string(),
-                    session_id: req.session_id().to_string(),
-                },
-            );
-            // Persist the standalone surface so a restart re-adopts it instead
-            // of posting a second card (ADR-0038 restart re-adoption).
-            self.surfaces.set_standalone(
-                req.id(),
-                StandaloneSurface {
-                    client_id: String::new(),
-                    kind: self.kind.interaction_kind(),
-                    message_id: mid,
-                    summary,
-                    directory: dir.to_string(),
-                    session_id: req.session_id().to_string(),
-                },
-            );
-        } else {
+        let Some(mid) = sent_id else {
             tracing::warn!(
                 "{} card send failed on session {}",
                 self.kind.label(),
                 req.session_id()
             );
+            return false;
+        };
+        self.sent_cards.lock().await.insert(
+            req.id().to_string(),
+            SentCard {
+                message_id: mid.clone(),
+                summary: summary.to_string(),
+                directory: dir.to_string(),
+                session_id: req.session_id().to_string(),
+            },
+        );
+        // Persist the standalone surface so a restart re-adopts it instead of
+        // posting a second card (ADR-0038 restart re-adoption).
+        self.surfaces.set_standalone(
+            req.id(),
+            StandaloneSurface {
+                client_id: String::new(),
+                kind: self.kind.interaction_kind(),
+                message_id: mid,
+                summary: summary.to_string(),
+                directory: dir.to_string(),
+                session_id: req.session_id().to_string(),
+            },
+        );
+        true
+    }
+
+    /// Send a fresh standalone fallback card for a request whose surface proof
+    /// changed after it was shown (a summary card whose target changed, or a
+    /// legacy digest that no longer parses). The stored summary omits the
+    /// ephemeral changed-target note; only the sent card carries it.
+    pub(crate) async fn post_fallback_card(
+        &self,
+        handles: &FlowHandles,
+        p: &crate::backend::types::PermissionRequest,
+        dir: &str,
+        loss: crate::feishu::card::question::FallbackLoss,
+        changed: bool,
+    ) -> bool {
+        let target = resolve_card_target(
+            &handles.sessions,
+            &handles.cards,
+            &handles.backend,
+            &handles.platform,
+            p.session_id.as_deref().unwrap_or(""),
+            dir,
+        )
+        .await;
+        if target.is_none() {
+            tracing::warn!(
+                "permission {}: no reply target or chat for its replacement fallback card",
+                p.request_id
+            );
+            return false;
         }
+        let target_summary = describe_permission_target_summary(p);
+        let stored_summary =
+            crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, false);
+        let card_summary =
+            crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, changed);
+        let card = crate::feishu::card::question::build_fallback_permission_card(
+            p.session_id.as_deref().unwrap_or(""),
+            &p.request_id,
+            dir,
+            &card_summary,
+            p.always_supported,
+            patterns_target_digest(p),
+            loss,
+        );
+        let req = PendingRequest::Permission(p.clone());
+        let owning_lock = handles
+            .cards
+            .write_lock(p.session_id.as_deref().unwrap_or(""))
+            .await;
+        let guard = owning_lock.lock().await;
+        let landed = self
+            .send_standalone_surface(handles, &req, dir, target, &card, &stored_summary)
+            .await;
         drop(guard);
-        false
+        landed
     }
 
     /// Re-host a still-pending inline block onto the session's current card
@@ -1873,7 +1948,7 @@ impl RequestFlow {
     /// [`Self::patch_stored_surfaces`]. A failed PATCH keeps the handle so the
     /// next sweep can retry; the caller then leaves the request unmarked and
     /// offers no second surface.
-    async fn withdraw_block_for_fallback(
+    pub(crate) async fn withdraw_block_for_fallback(
         &self,
         handles: &FlowHandles,
         req: &PendingRequest,
@@ -2258,7 +2333,7 @@ impl RequestFlow {
     /// An over-budget permission is re-adopted only when a matching confirmed
     /// companion record proves its full content was delivered. Without one the
     /// card is withdrawn neutrally and the request takes the normal fresh path
-    /// — prepare (Auto-Accept), the companion lane, or the refusal path — in
+    /// — prepare (Auto-Accept), the companion lane, or the fallback card — in
     /// this same sweep; the old decision is never approved or declined in place
     /// (ADR-0101, ADR-0102). [`ReadoptDecision::NotAdopted`] means the card is
     /// gone, unusable, or was withdrawn for that reason, so the caller surfaces
