@@ -499,7 +499,7 @@ async fn an_external_message_observation_carries_its_session_chat_and_topic() {
         tokio::spawn(async move {
             let _ = poller.external.poll_loop(&poller.flow_handles()).await;
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_first_poll_pass(&app.external.poll_passes, "the external sync pass").await;
     })
     .await;
 

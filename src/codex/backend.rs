@@ -6544,10 +6544,19 @@ mod tests {
         );
     }
 
-    /// A paginated-but-alive catalog is capped by the deadline as well: the
-    /// page loop keeps what it read and does not spend 64 pages of the budget.
+    /// A catalog whose NEXT page hangs keeps the page it already read: the loop
+    /// stops at the bound and renders the partial catalog plus the hand-write
+    /// hint instead of discarding it or spending all 64 pages.
+    ///
+    /// The timing race that made this flake (issue #958) is removed from the
+    /// shape instead of tuned: the first page answers immediately and every
+    /// later one hangs, so the loop only needs one mock round trip, not the 24
+    /// round trips a scripted 150 ms delay squeezed into exactly the slice. The
+    /// callback-deadline path itself is pinned without a wall clock by
+    /// `an_expired_catalog_deadline_sends_no_page_request` and by
+    /// `callback_read_slice`'s unit test in `model_surface`.
     #[tokio::test]
-    async fn a_slow_paginated_catalog_is_capped_by_the_callback_budget() {
+    async fn a_hung_next_page_keeps_the_catalog_pages_already_read() {
         let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_models(
             (0..100)
@@ -6555,7 +6564,8 @@ mod tests {
                 .collect(),
         );
         server.set_model_page_size(1);
-        server.set_model_list_delay(Duration::from_millis(150));
+        // Page 1 answers; page 2 never does.
+        server.silence_model_list_after(1);
         let client = connect(&url).await;
 
         let started = Instant::now();
@@ -6563,27 +6573,20 @@ mod tests {
             &client,
             crate::backend::types::ModelSurfaceQuery {
                 directory: Some("/work/cola"),
-                // Generous enough that a loaded full-suite run still completes
-                // a page before the slice expires; the uncapped read is ~15 s
-                // (100 pages × 150 ms), so the page-count bound below stays
-                // meaningful.
-                ack_budget: Some(Duration::from_secs(5)),
+                ack_budget: Some(Duration::from_secs(3)),
                 ..Default::default()
             },
         )
         .await;
         let elapsed = started.elapsed();
 
+        // Exactly two requests: the page that landed and the page that hung.
         let calls = server.model_list_calls();
-        assert!(calls >= 1, "the first page was read");
-        assert!(
-            calls < 100,
-            "the deadline stopped the 100-page catalog after {calls} pages"
-        );
-        // The page-count bound above is the load-independent assertion (an
-        // uncapped read would take ~15 s here). The wall-clock bound is only a
-        // sanity net: a loaded full-suite run can delay the sliced read well
-        // past 600 ms, so it must not be tight enough to flake.
+        assert_eq!(calls, 2, "the first page was read, the second hung");
+        // The load assumption, recorded next to the assertion: one mock round
+        // trip (page 1, no injected delay) must fit inside the bound. The
+        // real-time assertion is only a guard against the whole call running
+        // away, not the decision.
         assert!(
             elapsed < Duration::from_secs(10),
             "a paginated catalog took {elapsed:?}; the deadline did not cap it"
@@ -6593,12 +6596,48 @@ mod tests {
                 .scopes
                 .iter()
                 .flat_map(|scope| scope.options.iter())
-                .any(|option| option.id.starts_with("model-")),
-            "the partial catalog is shown, not discarded"
+                .any(|option| option.id == "model-0"),
+            "the page that landed is shown, not discarded"
         );
         assert!(
             surface.scopes[0].free_text.is_some(),
             "the page still offers the hand-write hint"
+        );
+    }
+
+    /// A catalog read whose deadline has already passed sends NO page request:
+    /// the page loop's bound is checked before its first page, so a callback
+    /// budget bounds the read itself and not merely each request (issue #958).
+    /// The contrast is the undated read below, which does send one — this is the
+    /// callback-deadline path, pinned without a wall clock.
+    #[tokio::test]
+    async fn an_expired_catalog_deadline_sends_no_page_request() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.set_models(
+            (0..100)
+                .map(|index| json!({ "id": format!("model-{index}"), "supportedReasoningEfforts": [] }))
+                .collect(),
+        );
+        server.set_model_page_size(1);
+        let client = connect(&url).await;
+
+        let models = client.list_models_within(Some(tokio::time::Instant::now())).await;
+        assert!(
+            models.is_empty(),
+            "an expired budget reads no catalog: {models:?}"
+        );
+        assert_eq!(
+            server.model_list_calls(),
+            0,
+            "the deadline is checked before the first page is requested"
+        );
+
+        // The same call WITHOUT a deadline does request pages.
+        let models = client.list_models_within(None).await;
+        assert!(!models.is_empty(), "an undated read serves the catalog");
+        assert!(
+            server.model_list_calls() > 0,
+            "an undated read is not cut before its first page"
         );
     }
 

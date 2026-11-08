@@ -40,7 +40,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     // The parent session has a live streaming card, so the child's
     // permission is INLINED on it (one-card-per-turn), not sent as a
@@ -278,7 +278,7 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     // No inline host: the permission becomes a separate card delivered into
     // the parent's chat (the child has no card of its own to host it).

@@ -65,6 +65,11 @@ pub struct RequestFlow {
     /// to today's 3 s cadence; tests store a small value so every branch is
     /// exercisable without sleeping real seconds.
     pub poll_interval_ms: std::sync::atomic::AtomicU64,
+    /// Test-only proof-of-pass: the sweeps this loop has completed, for
+    /// `test_support::wait_for_poll_passes` (issue #958). Never read in
+    /// production.
+    #[cfg(test)]
+    pub(crate) poll_passes: std::sync::atomic::AtomicUsize,
     /// How long (milliseconds) one pending-request list call may take before
     /// the poll loop gives up on it and retries next tick. Bounds a request
     /// stuck on a half-open connection (e.g. across a server restart) so one
@@ -412,6 +417,8 @@ impl RequestFlow {
         Self {
             kind,
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
+            #[cfg(test)]
+            poll_passes: std::sync::atomic::AtomicUsize::new(0),
             list_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             withdrawal_timeout_ms: std::sync::atomic::AtomicU64::new(WITHDRAWAL_PATCH_TIMEOUT_MS),
             withdrawal_retry_budget_ms: std::sync::atomic::AtomicU64::new(WITHDRAWAL_RETRY_PHASE_BUDGET_MS),
@@ -805,6 +812,10 @@ impl RequestFlow {
                 async move {
                     let mut seen = seen.lock().await;
                     self.sweep(handles, &mut seen).await;
+                    // Proof-of-pass for the tests waiting on this loop (#958).
+                    #[cfg(test)]
+                    self.poll_passes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // Per-item failures were logged inside `sweep`; nothing
                     // tick-level to latch (see the doc above).
                     Ok(())

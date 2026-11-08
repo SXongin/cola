@@ -31,7 +31,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     // The session has an active streaming card, so the permission is surfaced
     // INLINE on it (one-card-per-turn) — not as a separate card.
@@ -404,7 +404,7 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
     assert!(
         !Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
@@ -736,7 +736,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     // Permission inlined on the streaming card, auto_accept still off.
     assert_eq!(
@@ -1226,7 +1226,7 @@ async fn auto_accept_session_answers_permission_without_card() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     // Auto-accepted: reply_permission called with "once", no card sent.
     let calls = perm_calls.lock().await.clone();
@@ -1394,7 +1394,7 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     let calls = platform.calls.lock().await.clone();
     let stale = calls.iter().find_map(|c| match c {
@@ -1553,7 +1553,7 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     // The separate card must be reply'd to the topic anchor (not sent to
     // the chat top level).
@@ -2927,7 +2927,7 @@ async fn permission_click_variants_leave_their_receipts() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
     assert_eq!(
         Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await
@@ -3089,7 +3089,7 @@ async fn inline_permission_click_after_remote_resolution_gets_receipt() {
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    wait_for_first_poll_pass(&app.permission.poll_passes, "the request sweep").await;
 
     let result = app
         .host_action(serde_json::json!({

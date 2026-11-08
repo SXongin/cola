@@ -1271,15 +1271,32 @@ async fn a_supplement_steers_the_live_turn_and_renders_once() {
     assert_eq!(steers[0]["expectedTurnId"].as_str(), Some(live.as_str()));
     assert_eq!(steers[0]["input"][0]["text"], "extra context");
 
-    // The turn ends after the steer: the answer and the completion.
+    // The turn ends after the steer: the answer and the completion. The answer
+    // opens with `item/started` so it carries its OWN clock: the adapter times a
+    // message from the item's start and falls back to the turn's start without
+    // one, and a supplement the drain cannot see as answered by a later item
+    // loops the turn forever (issue #958). The start is stamped a second ahead
+    // so the ordering against the supplement's echo — a whole-second stamp from
+    // the server's clock — is explicit, not a same-second coin flip.
     let now = chrono::Utc::now().timestamp();
+    let answer_at_ms = (now + 1) * 1000;
+    server.push_to_thread(
+        THREAD,
+        "item/started",
+        json!({
+            "threadId": THREAD,
+            "turnId": live,
+            "startedAtMs": answer_at_ms,
+            "item": { "type": "agentMessage", "id": "agent-after-steer", "text": "" },
+        }),
+    );
     server.push_to_thread(
         THREAD,
         "item/completed",
         json!({
             "threadId": THREAD,
             "turnId": live,
-            "completedAtMs": now * 1000,
+            "completedAtMs": answer_at_ms,
             "item": { "type": "agentMessage", "id": "agent-after-steer", "text": "the steered answer" },
         }),
     );
