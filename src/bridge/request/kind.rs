@@ -1234,9 +1234,9 @@ pub(crate) fn permission_target(p: &crate::backend::types::PermissionRequest) ->
 }
 
 /// The block's receipt target for an over-budget request: the action and first
-/// target, the summed length and the companion lane, clipped to the one-line
-/// receipt budget. The card and its Interaction Receipt then carry the same
-/// summary form (ADR-0102).
+/// target (its 60-character line), the summed length and the companion lane,
+/// clipped to the one-line receipt budget. The card uses the longer summary;
+/// the receipt carries this shorter budget-clipped form (ADR-0102).
 pub(crate) fn permission_receipt_target(
     p: &crate::backend::types::PermissionRequest,
     companion: Option<&CompanionDelivery>,

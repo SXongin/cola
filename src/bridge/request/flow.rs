@@ -2106,8 +2106,8 @@ impl RequestFlow {
                             .neutralize_stored_surface_preview(
                                 handles,
                                 id,
-                                crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT,
-                                &crate::feishu::card::question::build_unshowable_permission_retry_card(),
+                                crate::feishu::card::question::SUPERSEDED_PERMISSION_PREVIEW_RECEIPT,
+                                &crate::feishu::card::question::build_superseded_permission_preview_card(),
                             )
                             .await;
                         ReadoptDecision::Retry

@@ -316,6 +316,34 @@ pub(crate) fn build_superseded_permission_card() -> serde_json::Value {
     )
 }
 
+/// The receipt an inline block shows while its superseded withdrawal is
+/// retried: the old card is no longer valid, but the request is being
+/// REPROCESSED, not auto-refused.
+pub(crate) const SUPERSEDED_PERMISSION_PREVIEW_RECEIPT: &str = "🔄 旧卡片已失效，正在重新处理";
+
+/// The header of the standalone preview card shown while the superseded
+/// withdrawal is retried.
+pub(crate) const SUPERSEDED_PERMISSION_PREVIEW_HEADER: &str = "🔄 权限请求正在重新处理";
+
+/// Why the preview card carries no controls.
+pub(crate) fn superseded_permission_preview_note() -> &'static str {
+    "这张卡片来自旧的进程，已不再提供操作；该请求正在由当前进程重新处理，\
+     稍后会以自动授权或新的权限卡片呈现。"
+}
+
+/// The non-interactive preview card shown while the superseded withdrawal is
+/// retried.
+pub(crate) fn build_superseded_permission_preview_card() -> serde_json::Value {
+    card_shell(
+        SUPERSEDED_PERMISSION_PREVIEW_HEADER,
+        "grey",
+        vec![json!({
+            "tag": "markdown",
+            "content": superseded_permission_preview_note()
+        })],
+    )
+}
+
 /// The header of the card that explains a permission whose companion send
 /// outcome is unknown. An unconfirmed delivery is not a completeness proof, so
 /// the request was declined and no interactive approval is offered.
