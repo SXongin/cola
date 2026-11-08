@@ -5251,9 +5251,9 @@ async fn an_unknown_auto_accept_flag_never_declines_an_unshowable_permission() {
     );
 }
 
-/// The unknown flag must also retry on a SHOWABLE target, where `refuse` does
-/// not consult the flag at all: `prepare` is the only reader, and it must not
-/// surface a card the session's Auto-Accept may have replaced.
+/// The unknown flag must also retry on a SHOWABLE target, where the old refusal
+/// path did not consult the flag: `prepare` is the only reader now, and it must
+/// not surface a card the session's Auto-Accept may have replaced.
 #[tokio::test]
 async fn an_unknown_auto_accept_flag_retries_a_showable_permission() {
     let _wd = test_work_dir();

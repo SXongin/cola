@@ -882,8 +882,8 @@ async fn sweep_records_pending_sessions_for_liveness() {
 }
 
 /// The over-budget request an older build could have surfaced: its command is
-/// past the card's display budget, so the current process must decline it
-/// rather than re-adopt the persisted card.
+/// past the card's display budget, so the current process must withdraw a
+/// persisted card and reprocess rather than re-adopt it (ADR-0102).
 fn over_budget_perm(request_id: &str, session_id: &str) -> crate::backend::types::PermissionRequest {
     let command = format!(
         "echo {}",
@@ -893,9 +893,10 @@ fn over_budget_perm(request_id: &str, session_id: &str) -> crate::backend::types
 }
 
 /// The persisted surface an older build left for `over_budget_perm` — the file
-/// is written directly because this build refuses such a request before any
-/// card exists, so it can no longer produce one. `inline` picks the shape: an
-/// inline block on a streaming card, or a standalone request card.
+/// is written directly because the current build no longer produces the
+/// pre-companion shape: it surfaces a summary card or its own fallback instead.
+/// `inline` picks the shape: an inline block on a streaming card, or a
+/// standalone request card.
 fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: bool, message_id: &str) {
     use crate::bridge::request::kind::InteractionKind;
     use crate::bridge::surfaces::{InlineSurface, StandaloneSurface, Surfaces};
