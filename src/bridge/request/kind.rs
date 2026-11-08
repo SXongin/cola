@@ -777,6 +777,11 @@ impl RequestKind for PermissionKind {
         // longer carries it.
         let mut proof = ClickProof::None;
         if approval && let Some(dir) = directory {
+            // A standalone fallback/summary card is the request's only surface:
+            // a failed verification read must not replace it with a buttonless
+            // result (the request stays `seen`, so nothing would resurface it).
+            // Ack with no card and a retry toast instead, leaving the controls.
+            let keep_surface_on_unverified = inline || fallback_click || summary_click;
             let listed = crate::bridge::bounded_call(
                 "permission click: list pending",
                 flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -875,7 +880,7 @@ impl RequestKind for PermissionKind {
                 Some(Err(e)) => {
                     tracing::warn!("permission {req_id}: could not verify its target: {e}");
                     return Some(failed_result_card(
-                        inline,
+                        keep_surface_on_unverified,
                         "无法校验该权限请求的目标，未批准；请重试。",
                         "无法校验目标，未批准",
                     ));
@@ -883,7 +888,7 @@ impl RequestKind for PermissionKind {
                 None => {
                     tracing::warn!("permission {req_id}: verifying its target timed out; not approved");
                     return Some(failed_result_card(
-                        inline,
+                        keep_surface_on_unverified,
                         "无法校验该权限请求的目标，未批准；请重试。",
                         "无法校验目标，未批准",
                     ));
@@ -1118,19 +1123,43 @@ async fn should_auto_accept(
     session_id: &str,
     directory: &str,
 ) -> AutoAcceptFlag {
-    let found =
-        crate::bridge::pollers::walk_parent_chain_result(backend, session_id, Some(directory), |current| {
-            let current = current.to_string();
-            async move {
-                sessions
-                    .store
-                    .lock()
-                    .await
-                    .entry_for_session(&current)
-                    .map(|e| e.auto_accept)
-            }
-        })
-        .await;
+    // The walk calls `session_info`, which has no timeout of its own; it runs in
+    // the sweep before any surface exists, so a half-open server would freeze
+    // permission surfacing for every session. Bound it like the companion and
+    // host walks; a timeout is UNKNOWN, not "off" (ADR-0048/ADR-0102).
+    let found = crate::bridge::bounded_call(
+        &format!("auto-accept {session_id} parent walk"),
+        flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+        async {
+            Ok::<_, crate::error::BridgeError>(
+                crate::bridge::pollers::walk_parent_chain_result(
+                    backend,
+                    session_id,
+                    Some(directory),
+                    |current| {
+                        let current = current.to_string();
+                        async move {
+                            sessions
+                                .store
+                                .lock()
+                                .await
+                                .entry_for_session(&current)
+                                .map(|e| e.auto_accept)
+                        }
+                    },
+                )
+                .await,
+            )
+        },
+    )
+    .await;
+    let Some(Ok(found)) = found else {
+        tracing::warn!(
+            "auto-accept: {session_id}'s parent walk timed out; treating it as unknown and \
+             retrying next sweep"
+        );
+        return AutoAcceptFlag::Unknown;
+    };
     match found {
         Ok(Some(true)) => {
             flow.note_autoaccept_read_success(session_id).await;
