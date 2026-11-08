@@ -1548,8 +1548,12 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
         .expect("the persisted card is neutralized even on failure");
     let text = card_text(&neutral);
     assert!(
-        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT),
-        "the block says it will retry: {text}"
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_PREVIEW_RECEIPT),
+        "the block says the old card is being reprocessed: {text}"
+    );
+    assert!(
+        !text.contains("自动拒绝") && !text.contains("目标过长"),
+        "a reprocess preview must not borrow the refusal copy: {text}"
     );
     assert!(
         !text.contains("允许一次") && !text.contains("始终允许"),
@@ -1583,6 +1587,120 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
             .any(|card| card_text(card)
                 .contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
         "the landed refusal is explained"
+    );
+}
+
+/// A standalone unbacked card is previewed with the reprocess copy while its
+/// superseded PATCH is retried, then painted with the final SUPERSEDED card —
+/// never left on the refusal-copy placeholder.
+#[tokio::test]
+async fn restart_previews_a_standalone_card_before_its_superseded_retry() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", false, "om_standalone");
+
+    let (app, platform, _backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    sweep(&app.permission, &app).await;
+
+    let preview = last_update_of(&platform, "om_standalone")
+        .await
+        .expect("the standalone card is previewed");
+    let text = card_text(&preview);
+    assert!(
+        text.contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_PREVIEW_HEADER),
+        "the card says it is being reprocessed: {text}"
+    );
+    assert!(
+        !text.contains("自动拒绝") && !text.contains("目标过长"),
+        "the preview must not borrow the refusal copy: {text}"
+    );
+    assert!(
+        app.permission.sent_cards.lock().await.contains_key("per_long"),
+        "the standalone record is kept for the retry"
+    );
+
+    // The retry paints the final SUPERSEDED card, then the fresh path declines.
+    sweep(&app.permission, &app).await;
+    let final_card = last_update_of(&platform, "om_standalone")
+        .await
+        .expect("the retry paints the final card");
+    assert!(
+        card_text(&final_card).contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_HEADER),
+        "the final card is the reprocessed one: {}",
+        card_text(&final_card)
+    );
+    assert!(
+        !app.permission.sent_cards.lock().await.contains_key("per_long"),
+        "the settled withdrawal forgets the standalone record"
+    );
+    assert!(
+        posted_cards(&platform).await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)
+        }),
+        "the fresh path explains the refusal"
+    );
+}
+
+/// If the standalone preview PATCH also fails, the record and card stay for the
+/// next sweep, which then paints the final SUPERSEDED card.
+#[tokio::test]
+async fn a_failed_standalone_preview_keeps_the_record_for_the_retry() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", false, "om_standalone");
+
+    let (app, platform, _backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    // The superseded PATCH and its preview both fail.
+    platform
+        .fail_update_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+
+    sweep(&app.permission, &app).await;
+
+    assert!(
+        app.permission.sent_cards.lock().await.contains_key("per_long"),
+        "a failed preview keeps the standalone record"
+    );
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        1,
+        "the superseded withdrawal stays queued"
+    );
+
+    sweep(&app.permission, &app).await;
+    let final_card = last_update_of(&platform, "om_standalone")
+        .await
+        .expect("the retry paints the final card");
+    assert!(
+        card_text(&final_card).contains(crate::feishu::card::question::SUPERSEDED_PERMISSION_HEADER),
+        "the final card is the reprocessed one: {}",
+        card_text(&final_card)
+    );
+    assert!(
+        !app.permission.sent_cards.lock().await.contains_key("per_long"),
+        "the settled withdrawal forgets the standalone record"
     );
 }
 
