@@ -69,7 +69,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::backend::PERMISSION_TARGET_MAX_CHARS;
 use crate::backend::types::{
     FormAnswer, FormFieldKind, FormValue, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
 };
@@ -1105,17 +1104,16 @@ fn permission_from_patch(approval: &PatchApproval) -> PermissionRequest {
 /// not the client's schema.
 const PROFILE_UNEXPRESSIBLE: &str = "the requested permission profile has a grant the card cannot show";
 
-/// A requested permission profile whose summed paths are longer than the card
-/// can show.
-const PROFILE_TOO_LONG: &str = "the requested permission paths are longer than the card can show in total";
-
 /// Whether the card can render every part of a requested permission profile.
 /// `permission_patterns` is the renderer; this is its completeness proof, so an
 /// `once` grant can echo the profile without hiding a field.
 ///
-/// The budget is charged against the **sum** of the rendered patterns, exactly
-/// like the bridge's `targets_are_fully_shown`: two paths that each fit can
-/// still overflow the one element the card renders them in.
+/// This is a **structural** proof only. Length is deliberately not charged
+/// here: an overlong profile is still fully expressible, and the bridge owns
+/// the display budget. Its [`crate::bridge::request::kind::permission_overflow`]
+/// then routes the request to the companion lane (and, failing that, the
+/// two-step fallback card) instead of letting the adapter turn a browsable
+/// profile into a silent server-side refusal (ADR-0102 / #1011).
 fn expressible_permission_profile(profile: &Value) -> std::result::Result<(), Decode> {
     let Some(object) = profile.as_object() else {
         return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE));
@@ -1127,13 +1125,6 @@ fn expressible_permission_profile(profile: &Value) -> std::result::Result<(), De
             _ if value.is_null() => {}
             _ => return Err(Decode::CannotExpress(PROFILE_UNEXPRESSIBLE)),
         }
-    }
-    let total: usize = permission_patterns(profile)
-        .iter()
-        .map(|pattern| pattern.chars().count())
-        .sum();
-    if total > PERMISSION_TARGET_MAX_CHARS {
-        return Err(Decode::CannotExpress(PROFILE_TOO_LONG));
     }
     Ok(())
 }
@@ -2154,11 +2145,12 @@ mod tests {
     }
 
     /// Two paths that each fit the target budget can still overflow the one
-    /// element the card renders them in: the adapter's expressibility gate is
-    /// summed, exactly like the bridge's `targets_are_fully_shown`, so it fires
-    /// `PROFILE_TOO_LONG` instead of letting the bridge refuse a card later.
+    /// element the card renders them in. The adapter must NOT turn that into a
+    /// silent server-side refusal: the profile is structurally expressible, so
+    /// it decodes and the bridge's overflow proof routes it to the companion
+    /// lane (or the fallback card) with the full target delivered.
     #[test]
-    fn a_profile_with_two_paths_over_the_summed_budget_is_refused() {
+    fn a_profile_with_two_paths_over_the_summed_budget_reaches_the_bridge() {
         let path = "a".repeat(2_000);
         let params = json!({
             "threadId": "thread-1",
@@ -2169,16 +2161,22 @@ mod tests {
                 "fileSystem": { "write": [path.clone(), path] }
             }
         });
-        match decode_request(
+        let Decoded { permission, .. } = decode_request(
             "item/permissions/requestApproval",
             &params,
             &Projections::default(),
             &pinned_decisions(),
-        ) {
-            Err(Decode::CannotExpress(PROFILE_TOO_LONG)) => {}
-            Err(other) => panic!("expected the summed path refusal, got {other:?}"),
-            Ok(_) => panic!("two 2,000-char paths exceed the 3,000-char sum"),
-        }
+        )
+        .expect("a structurally expressible profile decodes even when it is long");
+        let permission = permission.expect("a permission");
+        assert!(
+            !permission.targets_are_fully_shown(),
+            "the bridge still sees the summed over-budget target and owns the decision"
+        );
+        assert!(
+            permission.patterns.iter().all(|pattern| pattern.len() > 2_000),
+            "the adapter hands the bridge the full paths, not a clipped form"
+        );
     }
 
     /// The legacy family is subject to the same neutral proof: its target is
