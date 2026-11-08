@@ -106,6 +106,9 @@ impl Turn {
             target: crate::bridge::request::kind::permission_receipt_target(p, companion.as_ref()),
             directory: directory.to_string(),
             always_supported: p.always_supported,
+            summary_digest: companion
+                .as_ref()
+                .map(|_| crate::bridge::request::companion::patterns_target_digest(p)),
         });
         match cards.cards.lock().await.get_mut(session_id) {
             Some(card) => card.acc.add_interaction(block),

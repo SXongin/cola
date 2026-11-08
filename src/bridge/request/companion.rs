@@ -3,6 +3,7 @@
 //! before any interactive permission surface exists. The request-kind module
 //! asks for the outcome; the transport policy lives here.
 
+use crate::backend::types::PermissionRequest;
 use crate::bridge::handles::FlowHandles;
 use crate::bridge::pollers::{CardTarget, resolve_card_target};
 use crate::bridge::surfaces::{CompanionDelivery, CompanionLane, Surfaces};
@@ -61,7 +62,7 @@ fn text_digest(text: &str) -> u64 {
 /// the full content lives, or why it is not on the card — differs by surface.
 /// Keeping the head here means the delivered summary and the fallback summary
 /// cannot describe the same request differently.
-pub(crate) fn describe_permission_target_summary(p: &crate::backend::types::PermissionRequest) -> String {
+pub(crate) fn describe_permission_target_summary(p: &PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
     // The excerpt is the target text, not the rendered body: the body's first

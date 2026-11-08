@@ -309,6 +309,32 @@ fn toast_for(reply: &str) -> String {
     }
 }
 
+/// The companion delivery proof for a request whose card showed a summary.
+/// ANY overflow — the summed target budget or the rendered-body ceiling — needs
+/// the one companion proof; neither is exempt. A stale record is `Missing`, an
+/// uncertain marker is `Uncertain`; the caller turns either into a forced
+/// refusal.
+fn companion_proof(
+    flow: &RequestFlow,
+    req_id: &str,
+    p: &crate::backend::types::PermissionRequest,
+) -> ClickProof {
+    let digest = companion_target_digest(p);
+    match flow.surfaces.delivered_companion(req_id, digest) {
+        Some(delivery) => ClickProof::Confirmed {
+            request: p.clone(),
+            delivery: Some(delivery),
+        },
+        None => {
+            if flow.surfaces.matching_companion(req_id, digest).is_some() {
+                ClickProof::Uncertain
+            } else {
+                ClickProof::Missing
+            }
+        }
+    }
+}
+
 /// What [`RequestKind::prepare`] did for one listed request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Prepared {
@@ -450,12 +476,14 @@ impl RequestKind for PermissionKind {
         };
         let companion = flow.companion_for(req);
         let body = describe_permission_for(p, companion.as_ref());
+        let summary_digest = companion.as_ref().map(|_| patterns_target_digest(p));
         crate::feishu::card::question::build_permission_card(
             p.session_id.as_deref().unwrap_or(""),
             &p.request_id,
             &body,
             dir,
             p.always_supported,
+            summary_digest,
         )
     }
 
@@ -521,6 +549,11 @@ impl RequestKind for PermissionKind {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         let fallback_loss = FallbackLoss::from_key(value.get("loss").and_then(|v| v.as_str()));
+        let summary_click = value.get("summary").and_then(|v| v.as_bool()).unwrap_or(false);
+        // The risk path is the fallback confirmation only: `risk_confirmed`
+        // without the fallback marker is a forged / malformed callback and
+        // must take the ordinary proof.
+        let risk_surface = risk_confirmed && fallback_click;
         // The digest rides the callback as lowercase hex: `value` is only
         // guaranteed to be a JSON object, and a u64 above 2^53 does not survive
         // a double/string round-trip. A missing or malformed digest is a
@@ -538,6 +571,24 @@ impl RequestKind for PermissionKind {
                 Some("always") => "always",
                 _ => "once",
             };
+            // A card from an older build carries a numeric digest (or none):
+            // re-read the request and rebuild an actionable fallback card
+            // instead of ending on a buttonless ack.
+            if risk_digest.is_none() {
+                return Some(
+                    rebuild_fallback_from_server(
+                        flow,
+                        handles,
+                        req_id,
+                        directory,
+                        session_id,
+                        host,
+                        fallback_loss,
+                        inline,
+                    )
+                    .await,
+                );
+            }
             let confirmation = async {
                 let dir = directory?;
                 fallback_confirmation_card(
@@ -554,11 +605,19 @@ impl RequestKind for PermissionKind {
             }
             .await;
             let Some(card) = confirmation else {
-                return Some(failed_result_card(
-                    inline,
-                    "无法重建确认卡片，请重试。",
-                    "无法重建确认卡片",
-                ));
+                return Some(
+                    rebuild_fallback_from_server(
+                        flow,
+                        handles,
+                        req_id,
+                        directory,
+                        session_id,
+                        host,
+                        fallback_loss,
+                        inline,
+                    )
+                    .await,
+                );
             };
             return Some(CardActionResult {
                 card: Some(card),
@@ -569,6 +628,21 @@ impl RequestKind for PermissionKind {
         // 取消 on the confirmation card returns to the fallback card. Like the
         // first step it replies nothing and claims nothing.
         if reply == "cancel_confirm" {
+            if risk_digest.is_none() {
+                return Some(
+                    rebuild_fallback_from_server(
+                        flow,
+                        handles,
+                        req_id,
+                        directory,
+                        session_id,
+                        host,
+                        fallback_loss,
+                        inline,
+                    )
+                    .await,
+                );
+            }
             let summary = flow
                 .sent_cards
                 .lock()
@@ -576,11 +650,19 @@ impl RequestKind for PermissionKind {
                 .get(req_id)
                 .map(|c| c.summary.clone());
             let Some(summary) = summary.filter(|s| !s.is_empty()) else {
-                return Some(failed_result_card(
-                    inline,
-                    "无法重建权限卡片，请重试。",
-                    "无法重建权限卡片",
-                ));
+                return Some(
+                    rebuild_fallback_from_server(
+                        flow,
+                        handles,
+                        req_id,
+                        directory,
+                        session_id,
+                        host,
+                        fallback_loss,
+                        inline,
+                    )
+                    .await,
+                );
             };
             let card = crate::feishu::card::question::build_fallback_permission_card(
                 session_id,
@@ -699,57 +781,80 @@ impl RequestKind for PermissionKind {
             match listed {
                 Some(Ok(perms)) => {
                     if let Some(p) = perms.iter().find(|p| p.request_id == req_id) {
-                        proof = match permission_overflow(p) {
-                            None => ClickProof::Confirmed {
-                                request: p.clone(),
-                                delivery: None,
-                            },
-                            Some(_) if risk_confirmed => {
-                                // The one deliberate exception to the delivery
-                                // proof: the user pressed 确认批准 on the
-                                // fallback card. Accept only when the digest
-                                // the button carried still matches the request
-                                // the server holds; a changed target is never
-                                // approved, and the click is answered with a
-                                // rebuilt fallback card (fresh digest, all four
-                                // controls) rather than a dead end.
-                                let expected = patterns_target_digest(p);
-                                if risk_digest == Some(expected) {
-                                    ClickProof::RiskConfirmed { request: p.clone() }
-                                } else {
-                                    return Some(
-                                        recover_from_risk_mismatch(
-                                            flow,
-                                            p,
-                                            dir,
-                                            session_id,
-                                            req_id,
-                                            fallback_loss,
-                                        )
-                                        .await,
-                                    );
-                                }
+                        let expected = patterns_target_digest(p);
+                        if risk_surface || summary_click {
+                            // A surface that carried a digest must still match
+                            // the re-read request — regardless of whether the
+                            // request is over budget NOW. Otherwise a shrunk
+                            // target would borrow the surface's approval.
+                            if risk_digest != Some(expected) {
+                                return Some(
+                                    recover_from_risk_mismatch(
+                                        flow,
+                                        handles,
+                                        p,
+                                        dir,
+                                        session_id,
+                                        host,
+                                        req_id,
+                                        fallback_loss,
+                                        risk_digest.is_some(),
+                                        inline,
+                                    )
+                                    .await,
+                                );
                             }
-                            Some(_) => {
-                                // ANY overflow — the summed target budget or
-                                // the rendered-body ceiling — needs the one
-                                // companion proof; neither is exempt.
-                                let digest = companion_target_digest(p);
-                                match flow.surfaces.delivered_companion(req_id, digest) {
-                                    Some(delivery) => ClickProof::Confirmed {
-                                        request: p.clone(),
-                                        delivery: Some(delivery),
-                                    },
-                                    None => {
-                                        if flow.surfaces.matching_companion(req_id, digest).is_some() {
-                                            ClickProof::Uncertain
-                                        } else {
-                                            ClickProof::Missing
+                            proof = if risk_surface {
+                                ClickProof::RiskConfirmed { request: p.clone() }
+                            } else {
+                                // A summary card's plain allow still needs the
+                                // companion delivery proof for this text.
+                                companion_proof(flow, req_id, p)
+                            };
+                        } else if permission_overflow(p).is_none() {
+                            // A legacy summary card (no button digest) whose
+                            // request now fits: a companion record still proves
+                            // the card was a summary, so its delivery must
+                            // match. A stale one offers the fallback card
+                            // rather than approving unseen text.
+                            if flow.surfaces.companion(req_id).is_some() {
+                                match flow
+                                    .surfaces
+                                    .delivered_companion(req_id, companion_target_digest(p))
+                                {
+                                    Some(delivery) => {
+                                        proof = ClickProof::Confirmed {
+                                            request: p.clone(),
+                                            delivery: Some(delivery),
                                         }
                                     }
+                                    None => {
+                                        return Some(
+                                            recover_from_risk_mismatch(
+                                                flow,
+                                                handles,
+                                                p,
+                                                dir,
+                                                session_id,
+                                                host,
+                                                req_id,
+                                                fallback_loss,
+                                                true,
+                                                inline,
+                                            )
+                                            .await,
+                                        );
+                                    }
                                 }
+                            } else {
+                                proof = ClickProof::Confirmed {
+                                    request: p.clone(),
+                                    delivery: None,
+                                };
                             }
-                        };
+                        } else {
+                            proof = companion_proof(flow, req_id, p);
+                        }
                     }
                 }
                 // The target is unknown, so the approval is not verifiable:
@@ -860,16 +965,15 @@ impl RequestKind for PermissionKind {
                 let uncertain_receipt =
                     |_target: &str| crate::feishu::card::question::UNCERTAIN_PERMISSION_RECEIPT.to_string();
                 let normal_receipt = |target: &str| permission_receipt(target, reply);
-                let risk_receipt = |target: &str| risk_permission_receipt(target, reply);
                 let residue = match proof {
                     ClickProof::Uncertain => Residue::PerBlock(&uncertain_receipt),
                     ClickProof::Missing => Residue::PerBlock(&missing_receipt),
-                    ClickProof::RiskConfirmed { .. } => Residue::PerBlock(&risk_receipt),
-                    ClickProof::Confirmed { .. } => Residue::PerBlock(&normal_receipt),
-                    // A fallback card's deny is a one-click decision; its
-                    // residue still says the target was not fully shown.
-                    ClickProof::None if fallback_click => Residue::PerBlock(&risk_receipt),
-                    ClickProof::None => Residue::PerBlock(&normal_receipt),
+                    // A fallback decision has no inline block (the surface is
+                    // withdrawn before the standalone card is posted), so its
+                    // result card is the decision record (ADR-0102).
+                    ClickProof::RiskConfirmed { .. } | ClickProof::Confirmed { .. } | ClickProof::None => {
+                        Residue::PerBlock(&normal_receipt)
+                    }
                 };
                 resolve_blocks(
                     flow,
@@ -1308,16 +1412,6 @@ pub(crate) const AUTOACCEPT_RECEIPT: &str =
 /// clocks on one card (#183 follow-up). Its timeline position already places
 /// it between what the Host could see and what followed.
 fn permission_receipt(target: &str, reply: &str) -> String {
-    permission_receipt_with(target, reply, "")
-}
-
-/// [`permission_receipt`] for a fallback-card decision, where the target was
-/// not fully shown: `✅ 已允许一次（目标未完整展示）：⚡ 执行 Shell 命令 …`.
-fn risk_permission_receipt(target: &str, reply: &str) -> String {
-    permission_receipt_with(target, reply, "（目标未完整展示）")
-}
-
-fn permission_receipt_with(target: &str, reply: &str, suffix: &str) -> String {
     let line = match reply {
         once @ ("once" | "always") => {
             let prefix = if once == "once" {
@@ -1326,12 +1420,12 @@ fn permission_receipt_with(target: &str, reply: &str, suffix: &str) -> String {
                 "✅ 已始终允许"
             };
             if target.is_empty() {
-                format!("{prefix}{suffix}")
+                prefix.to_string()
             } else {
-                format!("{prefix}{suffix}：{target}")
+                format!("{prefix}：{target}")
             }
         }
-        _ => return receipt_line(&format!("{DENIED_PREFIX}{suffix}"), target),
+        _ => return receipt_line(DENIED_PREFIX, target),
     };
     truncate(&line, RECEIPT_MAX_CHARS)
 }
@@ -1369,57 +1463,156 @@ async fn fallback_confirmation_card(
     )
 }
 
-/// Answer a risk confirmation whose digest no longer matches the re-read
-/// request. The ack replaces the clicked card with a FRESH fallback card: all
-/// four controls, the new target's summary and digest, and a note that the
-/// target changed. Nothing is replied or claimed, so the request stays
-/// actionable and the user can confirm again (ADR-0102 / #1013).
+/// Re-read a request whose surface digest did not parse (a card from an older
+/// build, or a malformed callback) and rebuild an actionable fallback card with
+/// a fresh digest. This keeps a legacy card from ending on a buttonless ack.
+#[allow(clippy::too_many_arguments)]
+async fn rebuild_fallback_from_server(
+    flow: &RequestFlow,
+    handles: &FlowHandles,
+    req_id: &str,
+    directory: Option<&str>,
+    session_id: &str,
+    host: &Option<String>,
+    loss: FallbackLoss,
+    inline: bool,
+) -> CardActionResult {
+    let Some(dir) = directory else {
+        return failed_result_card(
+            inline,
+            "无法校验该权限请求的目标，未批准；请重试。",
+            "无法校验目标，未批准",
+        );
+    };
+    let listed = crate::bridge::bounded_call(
+        "permission fallback: list pending",
+        flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+        handles.backend.clone().for_directory(dir).list_permissions(),
+    )
+    .await;
+    match listed {
+        Some(Ok(perms)) => match perms.iter().find(|p| p.request_id == req_id) {
+            Some(p) => {
+                recover_from_risk_mismatch(
+                    flow, handles, p, dir, session_id, host, req_id, loss, false, inline,
+                )
+                .await
+            }
+            None => already_handled_result("权限", inline, "该权限已处理"),
+        },
+        Some(Err(e)) => {
+            tracing::warn!("permission {req_id}: could not verify its target: {e}");
+            failed_result_card(
+                inline,
+                "无法校验该权限请求的目标，未批准；请重试。",
+                "无法校验目标，未批准",
+            )
+        }
+        None => {
+            tracing::warn!("permission {req_id}: verifying its target timed out; not approved");
+            failed_result_card(
+                inline,
+                "无法校验该权限请求的目标，未批准；请重试。",
+                "无法校验目标，未批准",
+            )
+        }
+    }
+}
+
+/// Answer a risk confirmation (or a summary allow) whose surface proof no
+/// longer matches the re-read request. The ack replaces the clicked card with a
+/// FRESH fallback card — all four controls, the new target's summary and digest,
+/// and (when the target changed) a note saying so. Nothing is replied or
+/// claimed, so the request stays actionable and the user can confirm again
+/// (ADR-0102 / #1013).
 #[allow(clippy::too_many_arguments)] // the click context is the helper's whole point
 async fn recover_from_risk_mismatch(
     flow: &RequestFlow,
+    handles: &FlowHandles,
     p: &crate::backend::types::PermissionRequest,
     dir: &str,
     session_id: &str,
+    host: &Option<String>,
     req_id: &str,
     loss: FallbackLoss,
+    changed: bool,
+    inline: bool,
 ) -> CardActionResult {
     let target_summary = describe_permission_target_summary(p);
-    let summary = crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, true);
+    // The changed-target note is ephemeral to the card that says it: the
+    // stored summary (which seeds the next confirmation) stays clean.
+    let stored_summary =
+        crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, false);
+    let card_summary =
+        crate::feishu::card::question::fallback_permission_summary(&target_summary, loss, changed);
     let digest = patterns_target_digest(p);
-    // Refresh the standalone record's summary so the next first-step click
-    // seeds the confirmation from the changed target, not the old one.
-    let sent = flow.sent_cards.lock().await.get(req_id).cloned();
+    // Refresh the standalone record once, preserving its client scope.
+    let sent = {
+        let mut cards = flow.sent_cards.lock().await;
+        cards.get_mut(req_id).map(|entry| {
+            entry.summary = stored_summary.clone();
+            entry.clone()
+        })
+    };
     if let Some(sent) = sent {
-        if let Some(entry) = flow.sent_cards.lock().await.get_mut(req_id) {
-            entry.summary = summary.clone();
-        }
+        let client_id = flow
+            .surfaces
+            .standalone(req_id)
+            .map(|surface| surface.client_id)
+            .unwrap_or_default();
         flow.surfaces.set_standalone(
             req_id,
             crate::bridge::surfaces::StandaloneSurface {
-                client_id: String::new(),
+                client_id,
                 kind: InteractionKind::Permission,
                 message_id: sent.message_id,
-                summary: summary.clone(),
+                summary: stored_summary,
                 directory: sent.directory,
                 session_id: sent.session_id,
             },
         );
     }
     tracing::warn!(
-        "permission {req_id}: risk confirmation digest no longer matches the pending request; \
-         rebuilt the fallback card without approving or rejecting"
+        "permission {req_id}: the surface's target proof no longer matches the pending request; \
+         rebuilding the fallback card without approving or rejecting"
     );
+    let toast = if changed {
+        "目标已变化，请查看新的确认卡片".to_string()
+    } else {
+        "请查看新的确认卡片".to_string()
+    };
+    if inline {
+        // The old controls live on a streaming card: withdrawing them and
+        // posting a NEW standalone card is the only way to keep the click's ack
+        // from replacing that streaming card.
+        let req = PendingRequest::Permission(p.clone());
+        if !flow
+            .withdraw_block_for_fallback(handles, &req, host.as_deref())
+            .await
+        {
+            return failed_result_card(inline, "无法更新权限卡片，请重试。", "无法更新权限卡片");
+        }
+        if !flow.post_fallback_card(handles, p, dir, loss, changed).await {
+            return failed_result_card(inline, "无法发送新的权限卡片，请重试。", "无法发送新的权限卡片");
+        }
+        return CardActionResult {
+            // The ack leaves the streaming card in place (its block now carries
+            // the move receipt); the new fallback card is its own message.
+            card: None,
+            toast: Some(toast),
+        };
+    }
     CardActionResult {
         card: Some(crate::feishu::card::question::build_fallback_permission_card(
             session_id,
             req_id,
             dir,
-            &summary,
+            &card_summary,
             p.always_supported,
             digest,
             loss,
         )),
-        toast: Some("目标已变化，请重新确认".to_string()),
+        toast: Some(toast),
     }
 }
 
@@ -2664,31 +2857,6 @@ mod tests {
             always: vec![],
             always_supported: true,
         }
-    }
-
-    /// A fallback decision's receipt says the target was not fully shown, while
-    /// an ordinary decision's receipt is unchanged. One prefix definition, so
-    /// the two cannot drift.
-    #[test]
-    fn a_risk_receipt_names_the_target_as_not_fully_shown() {
-        let target = "⚡ 执行 Shell 命令 `echo …`";
-        assert_eq!(
-            risk_permission_receipt(target, "once"),
-            format!("✅ 已允许一次（目标未完整展示）：{target}")
-        );
-        assert_eq!(
-            risk_permission_receipt(target, "always"),
-            format!("✅ 已始终允许（目标未完整展示）：{target}")
-        );
-        assert_eq!(
-            risk_permission_receipt(target, "reject"),
-            format!("🚫 已拒绝（目标未完整展示）：{target}")
-        );
-        assert_eq!(
-            permission_receipt(target, "once"),
-            format!("✅ 已允许一次：{target}"),
-            "the ordinary receipt is unchanged"
-        );
     }
 
     /// A switch click's toast names what happened — including the arms a stale

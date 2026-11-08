@@ -736,6 +736,10 @@ pub(super) struct PendingPermission {
     /// Whether the backend advertised a session-scoped Always reply for this
     /// request; the block then offers the button and its scope copy.
     pub(super) always_supported: bool,
+    /// The patterns digest of a summary surface (a confirmed companion
+    /// delivered the full content). `None` for an ordinary in-budget block,
+    /// which does not need the surface proof.
+    pub(super) summary_digest: Option<u64>,
 }
 
 /// A `question` tool request surfaced inline on the streaming card. `answers[i]`
@@ -5008,6 +5012,7 @@ impl StreamAccumulator {
                             &p.request_id,
                             &p.directory,
                             p.always_supported,
+                            p.summary_digest,
                         ) {
                             builder = builder.with_element(btn);
                         }
@@ -7946,6 +7951,7 @@ mod tests {
             target: "⚡ 执行 Shell 命令 `ls -la`".into(),
             directory: "/w".into(),
             always_supported: true,
+            summary_digest: None,
         }));
         assert!(
             !acc.awaits_typed_answer(),
@@ -8111,6 +8117,7 @@ mod tests {
             target: "⚡ 执行 Shell 命令 `ls -la`".into(),
             directory: "/w".into(),
             always_supported: true,
+            summary_digest: None,
         }));
         assert_eq!(acc.awaiting_action(), AwaitingAction::Both);
         assert!(

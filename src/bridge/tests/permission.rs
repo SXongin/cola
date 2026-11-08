@@ -1966,6 +1966,261 @@ async fn a_fallback_confirmation_with_a_stale_digest_keeps_the_request_actionabl
     );
 }
 
+/// A genuinely changed target: the server now holds a shorter, in-budget
+/// request under the same id. The old confirmation digest must still be
+/// compared even though the request no longer overflows — otherwise the click
+/// would approve text the user never saw.
+#[tokio::test]
+async fn a_fallback_confirmation_refuses_a_shrunk_target() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![long_permission("per_long", "ses_test", 5_000)]);
+    let pending = Arc::clone(&backend.permissions);
+    let replies = Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .fail_send_message_definite_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    let once = button_with_label(&card, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the first step returns the confirmation card")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+
+    // The server now holds a completely different, in-budget target.
+    {
+        let mut pending = pending.lock().await;
+        pending[0].patterns = vec!["echo short".into()];
+        pending[0].metadata = None;
+    }
+
+    let result = app
+        .host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the stale confirmation returns a result");
+    assert!(
+        replies.lock().await.is_empty(),
+        "the shrunk target must never borrow the old confirmation"
+    );
+    let rebuilt = result.card.as_ref().expect("the rebuilt fallback card");
+    let text = card_text(rebuilt);
+    assert!(text.contains("目标已变化"), "the card says why: {text}");
+    assert!(text.contains("✅ 允许一次"), "and stays actionable: {text}");
+
+    // The rebuilt card's fresh digest matches the current target.
+    let once = button_with_label(rebuilt, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the rebuilt card's first step")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    app.host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the corrected confirmation returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the user can still approve the target they were shown"
+    );
+}
+
+/// The same bypass on a plain allow from a companion-summary card: the request
+/// shrinks to an in-budget target after the summary was shown, so the guard
+/// must compare the summary button's digest instead of trusting the current
+/// (non-)overflow.
+#[tokio::test]
+async fn a_summary_allow_refuses_a_target_that_shrank() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![long_permission("per_long", "ses_test", 5_000)]);
+    let pending = Arc::clone(&backend.permissions);
+    let replies = Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    // The summary block is on the streaming card; its allow button carries the
+    // surface digest.
+    let streaming = Turn::rendered_card(&app.cards_handle(), "ses_test")
+        .await
+        .expect("the streaming card renders");
+    let allow = button_with_label(&streaming, "✅ 允许一次");
+    assert_eq!(allow["summary"], true, "the summary surface is marked");
+
+    // The server now holds a shorter, in-budget target under the same id.
+    {
+        let mut pending = pending.lock().await;
+        pending[0].patterns = vec!["echo short".into()];
+        pending[0].metadata = None;
+    }
+
+    let result = app
+        .host_action_on_message(allow, "om_live")
+        .await
+        .expect("the summary allow returns a result");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("目标已变化，请查看新的确认卡片"),
+        "the ack points at the new fallback card"
+    );
+    assert!(
+        replies.lock().await.is_empty(),
+        "the summary surface must not approve the shrunk target"
+    );
+    assert!(
+        platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyCard { card, .. }
+                | PlatformCall::SendCard { card, .. }
+                if card_text(card)
+                    .contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER)
+        )),
+        "the click posts a fresh fallback card"
+    );
+    assert!(
+        Turn::rendered_card(&app.cards_handle(), "ses_test")
+            .await
+            .is_some_and(|card| card_text(&card)
+                .contains(crate::feishu::card::question::FALLBACK_PERMISSION_MOVED_RECEIPT)),
+        "the old summary block is withdrawn to its move receipt"
+    );
+
+    let (message_id, fallback) = fallback_surface(&app, &platform, "per_long").await;
+    let once = button_with_label(&fallback, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the fallback first step")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    app.host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the confirmation returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the fallback lets the user approve the new target after confirming it"
+    );
+}
+
+/// A legacy numeric digest (the previous build's callback) cannot be compared:
+/// the first step must re-read the request and rebuild an actionable fallback
+/// card, never a buttonless failure ack.
+#[tokio::test]
+async fn a_legacy_numeric_digest_rebuilds_the_fallback_card() {
+    let _wd = test_work_dir();
+    let (app, platform, replies, _dir) = fallback_app().await;
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    let mut once = button_with_label(&card, "✅ 允许一次");
+    once["target_digest"] = serde_json::json!(42);
+
+    let result = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the legacy first step returns a result");
+    assert!(
+        replies.lock().await.is_empty(),
+        "the legacy first step never replies"
+    );
+    let rebuilt = result.card.as_ref().expect("the rebuilt fallback card");
+    let text = card_text(rebuilt);
+    assert!(
+        text.contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER),
+        "the ack is a fallback card, not a failure card: {text}"
+    );
+    assert!(text.contains("✅ 允许一次"), "the card stays actionable: {text}");
+
+    let once = button_with_label(rebuilt, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the rebuilt card's first step")
+        .card
+        .expect("the confirmation card");
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    app.host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the confirmation returns a result");
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the rebuilt card has a usable hex digest"
+    );
+}
+
+/// The unknown-outcome copy must travel through the confirmation and the
+/// result card, not revert to the definite-failure wording on the second step.
+#[tokio::test]
+async fn an_uncertain_fallback_keeps_the_unknown_copy_through_confirmation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![long_permission("per_long", "ses_test", 5_000)]);
+    let replies = Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    platform
+        .ambiguous_send_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let (message_id, card) = fallback_surface(&app, &platform, "per_long").await;
+    assert!(
+        card_text(&card).contains("发送结果未知，可能已送达"),
+        "the fallback names the unknown outcome"
+    );
+    let once = button_with_label(&card, "✅ 允许一次");
+    let confirmation = app
+        .host_action_on_message(once, &message_id)
+        .await
+        .expect("the first step returns the confirmation card")
+        .card
+        .expect("the confirmation card");
+    let confirmation_text = card_text(&confirmation);
+    assert!(
+        confirmation_text.contains("发送结果未知，可能已送达"),
+        "the confirmation keeps the unknown copy: {confirmation_text}"
+    );
+    assert!(
+        !confirmation_text.contains("**完整内容**: 未能送达。"),
+        "the confirmation must not turn the unknown send into a definite failure: {confirmation_text}"
+    );
+
+    let confirm = button_with_label(&confirmation, "✅ 确认批准");
+    let result = app
+        .host_action_on_message(confirm, &message_id)
+        .await
+        .expect("the confirmation returns a result");
+    let result_text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        result_text.contains("发送结果未知，可能已送达"),
+        "the result keeps the unknown copy: {result_text}"
+    );
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "once".to_string())],
+        "the unknown-outcome fallback can still be approved after confirmation"
+    );
+}
+
 /// 拒绝 on the fallback card stays one click.
 #[tokio::test]
 async fn a_fallback_deny_replies_on_one_click() {
@@ -2108,10 +2363,11 @@ async fn a_fallback_withdraws_an_existing_block_to_its_move_receipt() {
     let request = long_permission("per_long", "ses_test", 5_000);
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![request.clone()]);
+    let replies = Arc::clone(&backend.reply_permission_calls);
     let (app, platform) = build_app(cfg, backend).await;
     platform
         .fail_send_message_definite_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+        .store(4, std::sync::atomic::Ordering::SeqCst);
     seed_live_card(&app, "ses_test", "om_live").await;
     assert!(
         Turn::add_permission(&app.cards_handle(), "ses_test", &request, "/work").await,
@@ -2119,9 +2375,38 @@ async fn a_fallback_withdraws_an_existing_block_to_its_move_receipt() {
     );
     Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
+    // The first withdrawal PATCH fails: the old block and its handle stay, no
+    // fallback card is posted, and the request stays retryable.
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
 
+    assert!(
+        replies.lock().await.is_empty(),
+        "the failed withdrawal never decides the request"
+    );
+    assert!(
+        !app.permission.sent_cards.lock().await.contains_key("per_long"),
+        "no fallback surface is recorded before the withdrawal lands"
+    );
+    assert!(
+        !platform.replied_cards().await.iter().any(|card| {
+            card_text(card).contains(crate::feishu::card::question::FALLBACK_PERMISSION_HEADER)
+        }),
+        "no fallback card is posted before the withdrawal lands"
+    );
+    assert_eq!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .len(),
+        1,
+        "the old block is still live for the retry"
+    );
+
+    // The retry lands the withdrawal, then the standalone fallback card.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
     assert!(
         Turn::live_permissions(&app.cards_handle(), "ses_test")
             .await

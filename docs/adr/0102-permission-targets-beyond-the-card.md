@@ -99,7 +99,11 @@ is allowed only when the full content was delivered for that request.
   `risk_confirmed`, the original decision and a digest over the request's
   **patterns** (a lowercase hex string, so a 64-bit value survives the callback's
   JSON round-trip); the click guard allows an over-budget approval without a
-  companion only when that digest matches the request it re-reads. A mismatch
+  companion only when that digest matches the request it re-reads. A summary
+  card's buttons carry the same patterns digest plus a `summary` marker, and the
+  guard compares it **regardless of the request's current overflow** — a target
+  that shrank out of the budget after the card was shown cannot borrow the old
+  surface's approval. A mismatch
   sends **no reply at all** and acks a rebuilt fallback card — the changed
   target's summary, a fresh digest, all four controls, and a note that the
   target changed and must be confirmed again — so the pending request never
