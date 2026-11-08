@@ -553,8 +553,9 @@ pub(crate) fn uncollectable_note(reason: UncollectableReason) -> &'static str {
 }
 
 /// The header of the card that records a permission cola auto-declined because
-/// its target cannot be rendered in full. Pinned beside the note below, so the
-/// decision and its explanation cannot diverge.
+/// its target cannot be rendered in full and no chat target can carry the
+/// companion. Pinned beside the note below, so the decision and its explanation
+/// cannot diverge.
 pub(crate) const UNSHOWABLE_PERMISSION_HEADER: &str = "🔐 权限请求已自动拒绝";
 
 /// Why such a request is declined, and what the user can do. The permission
@@ -562,7 +563,8 @@ pub(crate) const UNSHOWABLE_PERMISSION_HEADER: &str = "🔐 权限请求已自�
 /// the card below renders the same text, so the two never disagree.
 pub(crate) fn unshowable_permission_note(budget: usize) -> String {
     format!(
-        "该权限请求在卡片上需要显示的内容超过 **{budget}** 字符，卡片无法完整显示。为了不让你批准只看到一部分的内容，\
+        "该权限请求在卡片上需要显示的内容超过 **{budget}** 字符，卡片无法完整显示，\
+         而且这里没有可用于送达完整内容的聊天目标。为了不让你批准只看到一部分的内容，\
          cola 已自动拒绝，该请求在服务端已结清——其他客户端也无法再批准。\
          请让 AI 把这条操作拆成更短的步骤后重试；或先开启自动授权（`/autoaccept on`）再让它执行，\
          自动授权不需要逐条查看。"
@@ -592,8 +594,8 @@ pub(crate) const UNSHOWABLE_PERMISSION_RETRY_HEADER: &str = "⏳ 权限请求待
 
 /// Why that card carries no controls.
 pub(crate) fn unshowable_permission_retry_note() -> &'static str {
-    "该权限请求的目标过长，卡片无法完整显示；cola 暂时无法自动拒绝，稍后会自动重试。\
-     这张卡片不提供批准操作。"
+    "该权限请求的目标过长，卡片无法完整显示，也没有可用的聊天目标来送达完整内容；\
+     cola 暂时无法自动拒绝，稍后会自动重试。这张卡片不提供批准操作。"
 }
 
 /// The card that replaces a standalone permission card while the refusal is
@@ -714,7 +716,7 @@ pub(crate) fn missing_permission_click_note() -> String {
 /// in full, so approving it would approve unseen text. Pinned with the refusal
 /// header/note above, so the block, the standalone card and the chat notice
 /// cannot drift.
-pub(crate) const UNSHOWABLE_PERMISSION_RECEIPT: &str = "🚫 已自动拒绝：目标过长，卡片无法完整显示";
+pub(crate) const UNSHOWABLE_PERMISSION_RECEIPT: &str = "🚫 已自动拒绝：目标过长，且没有可用的聊天目标";
 
 /// The header of a standalone card whose request cannot be collected at all.
 pub(crate) const UNCOLLECTABLE_HEADER: &str = "❓ 无法在卡片上作答";

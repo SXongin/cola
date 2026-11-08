@@ -691,17 +691,16 @@ impl SessionStatus {
 /// single-element full-render point (8,000 ASCII / 3,060 CJK characters,
 /// `docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md`) while
 /// leaving room for the renderer's scaffolding. A 3,000-character CJK target is
-/// ~9 KB of JSON; the wire worst case is bounded by
-/// [`PERMISSION_BODY_MAX_CHARS`] below.
+/// ~9 KB of JSON; the wire worst case is the body ceiling below, ~15 KB
+/// because one sanitized character can cost five bytes (`<` → `&#60;`).
 ///
 /// This is not the whole proof: the card also has to fit its ONE element, and
 /// the renderer adds a header, reason, metadata lines and a footer. That is the
 /// separate render invariant [`PERMISSION_BODY_MAX_CHARS`]; the two bounds
 /// together answer "shown in full". Because the chrome consumes the remaining
 /// room, a real near-budget bash request (a 3,000-char command plus
-/// `metadata.command`) exceeds the render ceiling and is refused before any
-/// surface today — #1012's companion lane replaces that refusal for such
-/// targets with a surfaced summary plus the full target in a companion message.
+/// `metadata.command`) exceeds the render ceiling: ADR-0102 surfaces it with a
+/// summary and delivers the full target in a companion message.
 pub const PERMISSION_TARGET_MAX_CHARS: usize = 3000;
 
 /// The measured single-element render ceiling for a permission card, in
@@ -712,10 +711,10 @@ pub const PERMISSION_TARGET_MAX_CHARS: usize = 3000;
 /// glyph is the widest, so 3,060 characters stays inside both measured points
 /// **whatever the script**. The converse is the practical cost: the ceiling
 /// applies the CJK floor to every script, so a near-budget ASCII command plus
-/// its chrome is refused even though the platform would render up to 8,000 ASCII
-/// characters. That is the safe direction — never approve text the element may
-/// clip — and #1012's companion lane removes the lost agency by surfacing the
-/// summary and delivering the full target separately.
+/// its chrome is unshowable even though the platform would render up to 8,000
+/// ASCII characters. That is the safe direction — never approve text the element
+/// may clip — and ADR-0102's companion lane protects the lost agency by
+/// surfacing the summary and delivering the full target separately.
 ///
 /// [`PERMISSION_TARGET_MAX_CHARS`] remains the sole *target* display budget;
 /// this ceiling bounds the whole rendered body — targets plus the renderer's
@@ -768,14 +767,16 @@ impl PermissionRequest {
     /// element sees both the same way. This is the only target rule; the bridge's
     /// `permission_overflow` adds the rendered-body render invariant around it.
     ///
-    /// `false` means the card would have to clip something, so the request must
-    /// never be offered for **approval on a card**: the buttons approve what
-    /// the card shows, and a clipped target would approve text the user never
-    /// saw. Every client is covered here rather than in its adapter — the card
-    /// is the shared decision surface, so the completeness proof belongs to the
-    /// same layer as the renderer that clips. An Auto-Accept session renders no
-    /// card; it approves the request unseen and records its length (ADR-0101),
-    /// so this proof has nothing to guard there.
+    /// `false` means the card would have to clip something, so the request
+    /// cannot be approved from the card alone: the buttons must not approve
+    /// text the user never saw. ADR-0102 delivers the full target as a
+    /// **companion message** and the card carries a summary; a companion that
+    /// cannot be delivered takes the fallback card's explicit risk
+    /// confirmation. Every client is covered here rather than in its adapter —
+    /// the card is the shared decision surface, so the completeness proof
+    /// belongs to the same layer as the renderer that clips. An Auto-Accept
+    /// session renders no card; it approves the request unseen and records its
+    /// length (ADR-0101), so this proof has nothing to guard there.
     pub fn targets_are_fully_shown(&self) -> bool {
         self.total_target_len() <= PERMISSION_TARGET_MAX_CHARS
     }
