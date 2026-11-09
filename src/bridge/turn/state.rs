@@ -4036,6 +4036,15 @@ impl StreamAccumulator {
         self.order_seq
     }
 
+    /// The next POSITION after everything already on the card, with no wall
+    /// clock in it: the key a part takes when it must land after the content
+    /// shown before it but still inside the transcript's own range (issue
+    /// #1022). Unlike [`Self::next_order`] it cannot jump past a later message's
+    /// server times; the caller bounds it to the message's ceiling.
+    pub(super) fn next_position(&self) -> i64 {
+        self.last_key.saturating_add(1)
+    }
+
     /// Append a text chunk, keeping it in the chronological timeline (merging
     /// consecutive text chunks so the card doesn't produce one element each).
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
@@ -5734,14 +5743,9 @@ impl StreamAccumulator {
         key_at: Option<i64>,
         shown_at: Option<i64>,
     ) {
+        let key = self.entry_key_of(source).or(key_at);
         self.drop_source_run(source);
-        self.push_text_at_key(
-            key_at,
-            shown_at,
-            Some(self.rewrite_source(source, text)),
-            text,
-            None,
-        );
+        self.push_text_at_key(key, shown_at, Some(self.rewrite_source(source, text)), text, None);
     }
 
     /// [`Self::replace_text_run`] for a rewritten reasoning part.
@@ -5752,14 +5756,9 @@ impl StreamAccumulator {
         key_at: Option<i64>,
         shown_at: Option<i64>,
     ) {
+        let key = self.entry_key_of(source).or(key_at);
         self.drop_source_run(source);
-        self.push_reasoning_at_key(
-            key_at,
-            shown_at,
-            Some(self.rewrite_source(source, text)),
-            text,
-            None,
-        );
+        self.push_reasoning_at_key(key, shown_at, Some(self.rewrite_source(source, text)), text, None);
     }
 
     /// The source a rewritten part's fresh run carries: its position with the
