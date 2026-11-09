@@ -17,6 +17,7 @@ use crate::bridge::test_support::*;
 use crate::backend::types::{
     FormFieldKind, QuestionInfo, QuestionOption, QuestionRequest, UncollectableReason,
 };
+use crate::bridge::request::kind::PendingRequest;
 use crate::config::{SessionEntry, ThreadKey};
 
 /// A Location Form with one option-only field (a click answers it, no typed
@@ -115,6 +116,14 @@ struct Fixture {
     backend: Arc<MockBackend>,
 }
 
+impl Fixture {
+    /// The session mapping (and the surface sidecar beside it) a restarted
+    /// process loads.
+    fn session_file(&self) -> std::path::PathBuf {
+        self._state.path().join("sessions.json")
+    }
+}
+
 async fn fixture(
     instant_reminder: bool,
     forms: &[(&str, QuestionRequest)],
@@ -160,6 +169,31 @@ async fn sweep_with(fixture: &Fixture, seen: &mut std::collections::HashSet<Stri
 async fn sweep(fixture: &Fixture) {
     let mut seen = std::collections::HashSet::new();
     sweep_with(fixture, &mut seen).await;
+}
+
+/// Build the restarted process on the same store: fresh flows and registries,
+/// the same pending forms served, and an empty platform so any new card is a
+/// duplicate the restart should not create.
+async fn restart_fixture(
+    session_file: &std::path::Path,
+    forms: &[(&str, QuestionRequest)],
+) -> (Arc<App>, Arc<RecordingPlatform>, Arc<MockBackend>) {
+    let mut backend = MockBackend::new(realistic_parts());
+    for (directory, form) in forms {
+        backend.ask_question_in(directory, form.clone());
+    }
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(
+        App::new(test_config(session_file), backend.clone(), platform.clone())
+            .expect("the restarted app builds"),
+    );
+    (app, platform, backend)
+}
+
+/// One deterministic sweep of a restarted app.
+async fn sweep_app(app: &Arc<App>, seen: &mut std::collections::HashSet<String>) {
+    app.question.sweep(&app.flow_handles(), seen).await;
 }
 
 /// Every button value on a card whose `reply` matches.
@@ -1082,5 +1116,359 @@ async fn an_empty_session_id_card_action_never_probes_session_info() {
             .iter()
             .any(String::is_empty),
         "an empty session id must never reach session_info"
+    );
+}
+
+/// A restart that finds a live Location Form card re-adopts it: no second
+/// card is posted, and a click on the persisted card still answers through the
+/// directory route.
+#[tokio::test]
+async fn a_restart_readopts_a_live_location_form_card() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_live"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let session_file = fixture.session_file();
+
+    let (app, platform, backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_live"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "a live card is re-adopted, not duplicated"
+    );
+
+    let answer = button_with_reply(&card, "answer").expect("an answer control");
+    let result = app.host_action(answer).await.expect("a click result");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已回答")),
+        "the re-adopted card still answers"
+    );
+    assert_eq!(
+        backend.location_reply_calls.lock().await.len(),
+        1,
+        "the re-adopted click reaches the Location route"
+    );
+}
+
+/// A restart does not re-push a form the Host deferred: the persisted
+/// dismissal is authoritative until it is reopened.
+#[tokio::test]
+async fn a_restart_does_not_repush_a_deferred_location_form() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_deferred_restart"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+    let session_file = fixture.session_file();
+
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_deferred_restart"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "the persisted dismissal keeps a deferred form withdrawn"
+    );
+}
+
+/// A failed directory list never reads a pending form as gone: the dismissal
+/// survives, and the recovered directory does not re-push the suppressed form.
+#[tokio::test]
+async fn a_suppressed_form_survives_a_failed_sweep_and_a_recovered_directory() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_suppressed"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
+
+    // The form resolves while the directory's list is failing. The failed
+    // sweep cannot speak for the request, so the record must not be pruned.
+    fixture
+        .backend
+        .question_resolved_by_another("frm_suppressed")
+        .await;
+    fixture
+        .app
+        .question
+        .list_timeout_ms
+        .store(25, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .backend
+        .hang_list_questions
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    sweep(&fixture).await;
+
+    // The directory recovers and lists the same form again: the dismissal is
+    // still there, so nothing is pushed.
+    fixture.backend.replied_questions.lock().await.clear();
+    sweep(&fixture).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        1,
+        "a failed list must not read the suppressed form as gone"
+    );
+}
+
+/// The record is pruned once a complete sweep can speak for the request: a
+/// form that resolved loses its dismissal, so a later pending form with the
+/// same id is pushed again.
+#[tokio::test]
+async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_prune"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    // Gone, and this sweep lists every directory successfully: the record is
+    // pruned.
+    fixture.backend.question_resolved_by_another("frm_prune").await;
+    sweep(&fixture).await;
+
+    // The id is pending again with no dismissal left behind.
+    fixture.backend.replied_questions.lock().await.clear();
+    sweep(&fixture).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        2,
+        "a complete sweep prunes the resolved form's record"
+    );
+}
+
+/// A reopen sends the fresh card first, then clears the dismissal and rewrites
+/// the standalone surface: no later sweep duplicates it, and a restart
+/// re-adopts the fresh card.
+#[tokio::test]
+async fn reopening_a_dismissed_form_sends_a_fresh_card_and_clears_the_dismissal() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_reopen"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    let req = PendingRequest::Question(location_form("frm_reopen"));
+    let handles = fixture.app.flow_handles();
+    assert!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        "a dismissed form reopens"
+    );
+    let mut cards = posted_cards(&fixture.platform).await;
+    assert_eq!(cards.len(), 2, "the reopen posts one fresh card");
+
+    // The push decision now sees the fresh record and does not duplicate it.
+    sweep(&fixture).await;
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 2);
+
+    // The fresh card is the persisted surface: a restart re-adopts it.
+    let reopened = cards.pop().unwrap();
+    let session_file = fixture.session_file();
+    let (app, platform, backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_reopen"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "the fresh card is re-adopted"
+    );
+    let answer = button_with_reply(&reopened, "answer").expect("an answer control");
+    let result = app.host_action(answer).await.expect("a click result");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已回答")),
+        "the reopened card answers"
+    );
+    assert_eq!(backend.location_reply_calls.lock().await.len(), 1);
+}
+
+/// A failed reopen send leaves the form dismissed and retryable: the clear is
+/// committed only after the fresh card lands.
+#[tokio::test]
+async fn a_failed_reopen_leaves_the_form_dismissed_and_retryable() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_failed_reopen"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    let req = PendingRequest::Question(location_form("frm_failed_reopen"));
+    let handles = fixture.app.flow_handles();
+    fixture
+        .platform
+        .fail_send_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        !fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        "a failed send does not clear the dismissal"
+    );
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
+
+    // Still dismissed: a sweep does not re-push it, and the retry can succeed.
+    sweep(&fixture).await;
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
+    assert!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        "the retry lands"
+    );
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 2);
+}
+
+/// A dismissal that lands during a reopen's in-flight send survives: the
+/// reopen clears only the generation it read, and the form stays withdrawn.
+#[tokio::test]
+async fn a_dismissal_that_lands_during_a_reopen_survives() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_reopen_race"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture
+        .app
+        .host_action(defer.clone())
+        .await
+        .expect("a first defer result");
+
+    let (entered, release) = fixture.platform.pause("send", "chat_1");
+    let app = fixture.app.clone();
+    let handles = app.flow_handles();
+    let req = PendingRequest::Question(location_form("frm_reopen_race"));
+    let reopen =
+        tokio::spawn(async move { app.question.reopen_location_form(&handles, &req, "/work").await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the reopen send is in flight");
+
+    // A second 「稍后」 lands while the reopen is sending.
+    let result = fixture
+        .app
+        .host_action(defer)
+        .await
+        .expect("a second defer result");
+    assert_eq!(result.toast.as_deref(), Some("已稍后处理"));
+    release.notify_one();
+    assert!(
+        !reopen.await.expect("the reopen task ran"),
+        "the newer dismissal wins"
+    );
+
+    // The dismissal is still authoritative: the fresh card is withdrawn, no
+    // sweep re-pushes it, and a restart does not resurrect the form.
+    sweep(&fixture).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        2,
+        "only the original card and the withdrawn reopen card were sent"
+    );
+    let session_file = fixture.session_file();
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_reopen_race"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "the dismissal survived the in-flight reopen"
+    );
+}
+
+/// KNOWN LIMIT (ADR-0103): the pushed/dismissed record and the standalone
+/// surface share one best-effort write. When that write fails, a restart can
+/// lose both and post one duplicate card; the feature does not claim to
+/// prevent that.
+#[tokio::test]
+async fn a_failed_combined_write_may_duplicate_the_card_after_a_restart() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_write_fail"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    // A directory at the sidecar path makes the atomic replace fail, so neither
+    // half of the combined write lands.
+    let surfaces_path = fixture
+        .session_file()
+        .parent()
+        .expect("the state directory")
+        .join("interactive_surfaces.json");
+    std::fs::create_dir(&surfaces_path).unwrap();
+
+    sweep(&fixture).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        1,
+        "the card is sent even though its mirror failed"
+    );
+    std::fs::remove_dir(&surfaces_path).unwrap();
+
+    let session_file = fixture.session_file();
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_write_fail"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert_eq!(
+        posted_cards(&platform).await.len(),
+        1,
+        "the lost mirror costs exactly one duplicate card after a restart"
     );
 }

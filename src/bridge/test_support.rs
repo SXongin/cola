@@ -404,6 +404,9 @@ pub struct RecordingPlatform {
     pub chat_names: std::collections::HashMap<String, String>,
     /// When true, `send_card` fails (tests the topic-cover fallback path).
     pub fail_send_card: bool,
+    /// The next N `send_card` calls fail definitely (a Location Form reopen's
+    /// failed send leaves the dismissal in place).
+    pub fail_send_card_count: std::sync::atomic::AtomicUsize,
     /// When true, `reply_card` fails (tests the restart-announce fallback).
     pub fail_reply_card: bool,
     /// When true, `reply_in_thread` fails (tests that a failed in-topic
@@ -555,6 +558,7 @@ impl RecordingPlatform {
             user_names: std::collections::HashMap::new(),
             chat_names: std::collections::HashMap::new(),
             fail_send_card: false,
+            fail_send_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card: false,
             fail_reply_in_thread: false,
             no_topic_messages: std::sync::atomic::AtomicBool::new(false),
@@ -972,7 +976,18 @@ impl feishu::Platform for RecordingPlatform {
         receive_id: &str,
         card: &serde_json::Value,
     ) -> crate::error::Result<String> {
-        if self.fail_send_card {
+        if let Some(gate) = self.take_gate("send", receive_id) {
+            wait_gate(gate).await;
+        }
+        let scripted_failure = self
+            .fail_send_card_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if scripted_failure {
+            self.fail_send_card_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self.fail_send_card || scripted_failure {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated send_card failure".into(),
             ));
