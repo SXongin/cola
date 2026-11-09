@@ -455,18 +455,20 @@ const MAX_WITHDRAWAL_RETRIES_PER_SWEEP: usize = 4;
 /// lost).
 const MAX_PENDING_WITHDRAWALS: usize = 32;
 
-/// Whether `value` is answer state cola may persist for a Location Form: a
-/// clicked option's wire value (or a boolean button's fixed value). A typed
-/// custom answer, a numeric input and any other free text are deliberately
-/// excluded — the card-repaints rule and ADR-0103's no-typed-text rule keep it
-/// out of the mirror.
-fn persisted_option_value(field: &crate::backend::types::QuestionInfo, value: &str) -> bool {
+/// Whether `value` is answer state cola may persist for a Location Form.
+///
+/// A **multi-select** value is always persisted: its entries are deliberate
+/// toggles, including a custom one the Host added to the selection (which the
+/// card renders as a checked chip and a confirm will submit). A `String`
+/// field stores only its clicked option values; a custom typed answer is
+/// free text and stays client-side. A numeric input is likewise typed text.
+/// A boolean is the fixed `"true"`/`"false"` button value.
+fn persisted_field_value(field: &crate::backend::types::QuestionInfo, value: &str) -> bool {
     use crate::backend::types::FormFieldKind;
     match field.kind {
         FormFieldKind::Boolean => matches!(value, "true" | "false"),
-        FormFieldKind::String | FormFieldKind::Multiselect => {
-            field.options.iter().any(|option| option.answer_value() == value)
-        }
+        FormFieldKind::Multiselect => true,
+        FormFieldKind::String => field.options.iter().any(|option| option.answer_value() == value),
         FormFieldKind::Number | FormFieldKind::Integer | FormFieldKind::External => false,
     }
 }
@@ -701,14 +703,14 @@ impl RequestFlow {
                         continue;
                     };
                     let before = values.len();
-                    // Only a clicked option's wire value is answer state we
-                    // persist. A typed custom answer and a numeric input are
-                    // text the Host entered, which the card-repaints rule keeps
-                    // client-side; dropping it here can require a reselect but
-                    // must never submit an empty list in its place.
+                    // A multi-select entry is a deliberate toggle (including a
+                    // custom one the card shows as a checked chip), so it is
+                    // persisted. A typed single-select/free-text answer and a
+                    // numeric input are not: the card-repaints rule keeps that
+                    // text client-side.
                     let kept: Vec<String> = values
                         .into_iter()
-                        .filter(|value| persisted_option_value(field, value))
+                        .filter(|value| persisted_field_value(field, value))
                         .collect();
                     if kept.len() != before {
                         done[index] = false;
