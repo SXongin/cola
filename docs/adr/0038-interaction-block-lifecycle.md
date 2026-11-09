@@ -311,6 +311,38 @@ slow response could orphan a card that did land and a retry would post a second
 (ADR-0100). The sweep patches that target standalone or superseded cards — the
 ones Rule 8 already calls lock-free — stay exactly that.
 
+## Amendment (2026-11-09): V2's timeless text sorts by the transcript's own part order
+
+Rule 4 orders the timeline by each part's own server-side start time. V2 breaks
+that premise for text: `AssistantText` carries **no time at all** (only
+`AssistantReasoning` and `AssistantTool` do, and reasoning's is optional), so
+cola decoded every V2 text part with no start time and keyed its timeline entry
+by `next_order()` — cola's wall clock. Two clocks then shared one ordering key.
+A text part first read together with the tool call it precedes got a "now" key
+*after* the tool's server `time.created`, so the tool panel sorted above the text
+it followed (issue #1022; the question tool made it visible: the Host was asked
+before the model's explanation of why, and the explanation stayed below the
+question panel after it settled).
+
+The order key is now **the transcript's**, not a clock:
+
+- A part with no server time takes the start time of the previous timed part in
+  the same message, or the message's own `time.created` when it has none. V2's
+  `content[]` is in output order, so this is the position the server wrote; for
+  a timed part the rule is a no-op.
+- Equal keys (a text borrowing a still-running panel's start time) order by
+  **allocation**, not settle order: a live panel allocates its `seq` where its
+  part stands in the read and joins the timeline only when it settles, so the
+  equal-key run keeps the panel at that position instead of appending it after
+  text already pushed at the same key.
+
+`shown_at` — what a panel header displays and what the Rendered Cursor frontier
+records as the part's start — is unchanged: it still carries only the time the
+server reported, so a borrowed key never becomes a fake clock or perturbs a
+cursor. The rule applies to every walk that places transcript parts (the Turn
+window, the seed scope and the pending gap); synthetic content (receipts, wake
+markers) keeps `next_order()`.
+
 ## Amendment (2026-11-09): a dismissed Location Form is a deliberately surface-less pending request
 
 Rule 6 assumes a still-pending request has exactly one live surface, and re-posts
