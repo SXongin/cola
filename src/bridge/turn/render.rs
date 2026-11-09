@@ -5114,6 +5114,30 @@ Index: /x/src/main.rs
         );
     }
 
+    /// The advisory-live opening line heads the card even though the run's V2
+    /// text carries no server time: it is keyed at the head, not at cola's
+    /// clock, so a part ordered by its own (older) server position can never
+    /// sort above it (issue #1022; ADR-0062).
+    #[test]
+    fn a_head_receipt_stays_above_an_untimed_v2_text() {
+        let anchor = 2_000;
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        // The merge opening is pushed before any part can render.
+        acc.push_receipt_at(Some(0), "📨 已收到，将并入当前运行");
+
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message("a1", anchor, vec![text_part("回答")]),
+        ]);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("已收到").unwrap() < text.find("回答").unwrap(),
+            "the opening heads the card: {text}"
+        );
+    }
+
     /// An untimed reasoning part sorts by the same floor and keeps showing no
     /// clock: its order key is borrowed, its `shown_at` is not (issue #1022).
     #[test]
