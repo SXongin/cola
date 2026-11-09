@@ -337,11 +337,18 @@ The order key is now **the transcript's**, not a clock:
   part stands in the read and joins the timeline only when it settles, so the
   equal-key run keeps the panel at that position instead of appending it after
   text already pushed at the same key.
+- A part with no time that follows a **completed** tool call takes `Now`: it was
+  produced after that call's result, so a borrowed position would sort it above
+  the Interaction Receipt the answer left (Rule 4). The walk's floor advances
+  across it, so no later part of the same message sorts back above it.
 - A position key is **pinned**: when a later read finally reports a start time
   for a part that had none, that time updates the panel's clock but not its
   place. Only a `next_order()` fallback (a message with no time at all) may be
   replaced, because moving a pinned panel would cross text the read already
   placed after it.
+- A part already on the timeline **keeps the key it was placed at**: a later
+  read's `Now` or borrowed floor can differ, and re-keying would split a growing
+  part into two entries.
 
 `shown_at` — what a panel header displays and what the Rendered Cursor frontier
 records as the part's start — is unchanged: it still carries only the time the
@@ -349,12 +356,6 @@ server reported, so a borrowed key never becomes a fake clock or perturbs a
 cursor. The rule applies to every walk that places transcript parts (the Turn
 window, the seed scope and the pending gap); synthetic content (receipts, wake
 markers) keeps `next_order()`.
-
-Known limit: a text that follows a tool call in the **same** message borrows that
-call's key, so it sorts above a receipt written between the two — Rule 4 wants
-the receipt above what follows the click. OpenCode mints one assistant message
-per step (a step ends at its tool calls), so no wire shape produces that pair;
-the shape is left for the ordering rule rather than special-cased.
 
 ## Amendment (2026-11-09): a dismissed Location Form is a deliberately surface-less pending request
 
