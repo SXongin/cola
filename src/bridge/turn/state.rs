@@ -483,6 +483,12 @@ pub(super) enum SeedCut {
 #[derive(Debug, Clone)]
 struct LiveTool {
     key: i64,
+    /// Whether `key` is the read's own position (a part time or a borrowed
+    /// floor) rather than a `next_order()` fallback. A pinned key is never
+    /// replaced by a later-arriving server time: the read order outranks the
+    /// clock, and moving the panel would cross text already placed at the
+    /// floor (issue #1022).
+    pinned: bool,
     shown_at: Option<i64>,
     seq: u64,
     source: Option<PartSource>,
@@ -4311,6 +4317,7 @@ impl StreamAccumulator {
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
+            let pinned = key_at.is_some();
             let key = key_at.unwrap_or_else(|| self.next_order());
             if live {
                 // Unfinished: TAIL content. Allocate its identity and key now,
@@ -4321,6 +4328,7 @@ impl StreamAccumulator {
                     call_id.to_string(),
                     LiveTool {
                         key,
+                        pinned,
                         shown_at,
                         seq: self.item_seq,
                         source,
@@ -4332,12 +4340,16 @@ impl StreamAccumulator {
         } else if self.live_tools.contains_key(call_id) {
             // A later sighting may carry the server start time the first one
             // lacked (a pending call with no time). The panel is not on
-            // the timeline yet, so the real start time REPLACES the synthetic
-            // fallback key — the settle move must land where the call started.
+            // the timeline yet, so an UNPINNED fallback key is replaced by
+            // that real start time — the settle move must land where the call
+            // started. A pinned (read-position) key stays: moving it would
+            // cross text the read already placed after it (issue #1022).
             if let Some(at) = shown_at {
                 let entry = self.live_tools.get_mut(call_id).expect("checked");
                 entry.shown_at = entry.shown_at.or(shown_at);
-                entry.key = at;
+                if !entry.pinned {
+                    entry.key = at;
+                }
             }
             if let Some(source) = source
                 && let Some(entry) = self.live_tools.get_mut(call_id)
