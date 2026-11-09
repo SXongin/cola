@@ -71,6 +71,7 @@ use serde_json::{Map, Value, json};
 
 use crate::backend::types::{
     FormAnswer, FormFieldKind, FormValue, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
+    UncollectableReason,
 };
 use crate::error::{BridgeError, Result};
 
@@ -1359,6 +1360,13 @@ fn question_from_elicitation(elicitation: &Elicitation) -> Option<QuestionReques
             required.iter().any(|key| *key == name),
         )?);
     }
+    // A secret-format field is uncollectable whichever owner the form has: the
+    // card is a shared surface either way (ADR-0103's 2026-11-09 update), and
+    // the renderer refuses `secret` fields independently.
+    let uncollectable = questions
+        .iter()
+        .any(|question| question.secret)
+        .then_some(UncollectableReason::SecretInput);
     Some(QuestionRequest {
         id: String::new(),
         session_id: elicitation.thread_id.clone(),
@@ -1371,7 +1379,7 @@ fn question_from_elicitation(elicitation: &Elicitation) -> Option<QuestionReques
             elicitation.message.clone()
         },
         questions,
-        uncollectable: None,
+        uncollectable,
         // Codex elicitations are thread-backed: they keep the session path.
         owner: crate::backend::types::RequestOwner::Session,
         server: None,
@@ -1410,6 +1418,13 @@ fn elicitation_field(name: &str, field: &Value, required: bool) -> Option<Questi
     } else {
         title.to_string()
     };
+    // The MCP schema has no `password` format today; the guard covers the
+    // shape the protocol permits, matching the V2 decoder (`password`, and
+    // defensively `secret`) and the renderer's own refusal.
+    let secret = field
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| matches!(format, "password" | "secret"));
     Some(QuestionInfo {
         key: name.to_string(),
         question,
@@ -1419,7 +1434,7 @@ fn elicitation_field(name: &str, field: &Value, required: bool) -> Option<Questi
         custom: Some(custom),
         required,
         url: None,
-        secret: false,
+        secret,
     })
 }
 
@@ -2652,6 +2667,46 @@ mod tests {
             permission.expect("a permission").always_supported,
             "the method whose schema kept the variant still offers it"
         );
+    }
+
+    /// ADR-0103's secret refusal is owner-agnostic: a Codex elicitation with a
+    /// secret-format field is uncollectable too, never projected as a text
+    /// field. `secret` is the defensive spelling beside the protocol's
+    /// `password`.
+    #[test]
+    fn a_secret_format_elicitation_is_uncollectable() {
+        for format in ["password", "secret"] {
+            let params = json!({
+                "serverName": "vault",
+                "threadId": "thread-1",
+                "message": "Sign in",
+                "mode": "form",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "token": { "type": "string", "format": format }
+                    },
+                    "required": ["token"]
+                }
+            });
+            let Decoded { question, .. } = decode_request(
+                "mcpServer/elicitation/request",
+                &params,
+                &Projections::default(),
+                &pinned_decisions(),
+            )
+            .expect("decodes");
+            let question = question.expect("a refusal form");
+            assert_eq!(
+                question.uncollectable,
+                Some(UncollectableReason::SecretInput),
+                "{format}: the whole form is uncollectable"
+            );
+            assert!(
+                question.questions.iter().any(|field| field.secret),
+                "{format}: the field carries the secret marker"
+            );
+        }
     }
 
     #[test]

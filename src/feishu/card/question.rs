@@ -1471,13 +1471,19 @@ pub fn build_location_form_card(
         open,
         drafts,
     );
-    let defer = location_defer_button(&req.id, directory);
-    match body
-        .iter()
-        .position(|element| element.get("tag").and_then(|tag| tag.as_str()) == Some("form"))
-    {
-        Some(form_at) => body.insert(form_at, defer),
-        None => body.push(defer),
+    // A form cola cannot collect at all (a secret field) is decline-only: the
+    // ADR-0103 rule is that the only decision is an explicit 「取消」, so it
+    // never offers 「稍后」 (a withdrawal would leave an unanswerable form with
+    // no way back except `/mcp`).
+    if req.uncollectable.is_none() {
+        let defer = location_defer_button(&req.id, directory);
+        match body
+            .iter()
+            .position(|element| element.get("tag").and_then(|tag| tag.as_str()) == Some("form"))
+        {
+            Some(form_at) => body.insert(form_at, defer),
+            None => body.push(defer),
+        }
     }
     elements.extend(body);
     let header = if req.uncollectable.is_some() {
@@ -1532,7 +1538,7 @@ pub fn build_location_form_deferred_card(server: Option<&str>, message: Option<&
         detail.push_str(message);
         detail.push_str("\n\n");
     }
-    detail.push_str("该请求仍然待处理；需要处理时再作答即可。");
+    detail.push_str("该请求仍然待处理；稍后可在 `/mcp` 中重新打开，再作答即可。");
     card_shell(
         "💤 已稍后处理",
         "grey",
