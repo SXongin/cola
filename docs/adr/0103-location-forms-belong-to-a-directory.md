@@ -88,9 +88,11 @@ already deferred. The record is pruned only when a complete sweep can speak for
 the request — the #130 rule: a failed list never reads as gone. A restart that
 finds the card still live re-adopts it through ADR-0038 rather than posting a
 second; one that finds it withdrawn keeps it withdrawn until `/mcp` reopens it.
-The file is a best-effort mirror (ADR-0038): a failed suppression write can cost
-one duplicate card after a restart, which is the existing re-adoption trade
-rather than a new guarantee.
+The pushed/dismissed record and the standalone surface are committed in one
+mutation, so a restart cannot see one without the other. The mirror is still
+best-effort (ADR-0038): a failed combined write is a known limit that may cost
+one duplicate card after a restart, and the failure path is tested rather than
+claimed absolute.
 
 **Pull surface.** `/mcp` is the read-only counterpart: the current directory's
 MCP server statuses plus **only** Location Forms (session-backed forms already
@@ -100,18 +102,30 @@ before the form can be answered. `/mcp` can reopen a dismissed form. The
 capability is an adapter method. OpenCode V1 publishes a status read (`/mcp`,
 replaced by `/api/mcp*` in V2; `docs/research/opencode-v2/r2-api-protocol-delta.md`)
 but has no elicitation-form surface; Codex publishes `mcpServerStatus/list` but
-has no location-owned forms. Neither offers
-the full surface — statuses plus Location Forms — so both answer "unavailable"
-rather than shipping a status-only variant.
+has no location-owned forms. Neither offers the full surface — statuses plus
+Location Forms — so both answer "unavailable" rather than shipping a
+status-only variant.
 
 **Answering.** Any **Principal** admitted by the Access List may answer in the
 target Chat/Topic, matching every other Permission/Question card; the default
 single-Host model means that is normally the Host. The card states that the
-answer applies to the whole directory. Reply and cancel use the session route
-with the literal `global` session id — `POST /api/session/global/form/{id}/reply`
-and `DELETE /api/session/global/form/{id}` — plus `location[directory]`, where
-the directory is the one whose form list produced the request; a reply sent to
-the wrong location is refused upstream while that form keeps waiting. A losing
+answer commits the whole directory, and may also commit other directories
+sharing the MCP connection: the wire carries no caller marker, so cola cannot
+tell a caller-less pooled form from a caller-attributed one and puts that caveat
+on every Location Form card. Reply and cancel use the session route with the
+literal `global` session id — `POST /api/session/global/form/{id}/reply` and
+`DELETE /api/session/global/form/{id}` — plus `location[directory]`, where the
+directory is the one whose form list produced the request.
+
+The two failure statuses are not interchangeable. A **409**
+(`Form.AlreadySettledError`) is benign — the form settled, and the card takes
+the handled path. A **404** (`Form.NotFoundError`) on a Location Form is a
+**retryable refusal**: it can mean the reply reached the wrong location while
+the form keeps waiting there, so cola
+keeps the standalone surface and the pushed/dismissed record, tells the user the
+answer did not land, and lets the next complete sweep withdraw the card only if
+the form is genuinely gone. A wrong-location 404 is never read as a successful
+answer, and it never deletes the only surface the waiting form has. A losing
 copy on a pooled no-caller request is already cancelled, so its reply takes the
 benign already-handled path and shows the same resolved-elsewhere card as any
 settled request — the accepted copy for that rare case.
@@ -128,7 +142,12 @@ permits, not for a case in the current wire.
 
 - A new suppression record in the surface file, scoped by Agent Client. The
   file's format and version are ADR-0091's; a file from an older build loads
-  with an empty suppression, so no migration is needed.
+  with an empty suppression, so no migration is needed. The record and the
+  standalone surface are written in one mutation.
+- A Location Form reply's 404 is a retryable refusal, not the generic
+  already-handled path: the surface and record survive, and only a complete
+  sweep withdraws a form that is genuinely gone. A 409 keeps the benign handled
+  path. Every Location Form card carries the shared-directory caveat.
 - A new Backend capability method for the MCP status read. An adapter without
   the surface returns `None`, not an error — the Backend trait's rule that a
   default shape means "not applicable to this client", never a failed read
