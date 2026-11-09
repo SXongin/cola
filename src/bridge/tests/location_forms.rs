@@ -99,9 +99,9 @@ fn multi_location_form(request_id: &str) -> QuestionRequest {
     )
 }
 
-/// A Location Form whose option's submitted value differs from its display
-/// label, with a custom entry allowed: proves a String field's record stores
-/// clicked wire values, never display labels or typed free text.
+/// A multi-select Location Form whose option's submitted value differs from
+/// its display label, with a custom entry allowed: proves a clicked wire value
+/// is persisted, never the display label.
 fn wire_value_location_form(request_id: &str) -> QuestionRequest {
     QuestionRequest::location(
         request_id,
@@ -119,6 +119,41 @@ fn wire_value_location_form(request_id: &str) -> QuestionRequest {
             custom: Some(true),
             ..Default::default()
         }],
+        Some("deploy".into()),
+        Some("选择部署目标".into()),
+        None,
+    )
+}
+
+/// A two-field Location Form whose first question is a single-select `String`
+/// with a wire value different from its label: answering it leaves the request
+/// pending so the record can be restarted and the remaining answer submitted.
+fn string_wire_value_location_form(request_id: &str) -> QuestionRequest {
+    QuestionRequest::location(
+        request_id,
+        "选择部署目标".into(),
+        vec![
+            QuestionInfo {
+                key: "target".into(),
+                question: "要部署到哪个目标？".into(),
+                header: "目标".into(),
+                kind: FormFieldKind::String,
+                options: vec![QuestionOption {
+                    value: "wire_deploy".into(),
+                    label: "Deploy".into(),
+                    description: String::new(),
+                }],
+                custom: Some(false),
+                ..Default::default()
+            },
+            QuestionInfo {
+                key: "confirm".into(),
+                question: "确认？".into(),
+                header: "确认".into(),
+                kind: FormFieldKind::Boolean,
+                ..Default::default()
+            },
+        ],
         Some("deploy".into()),
         Some("选择部署目标".into()),
         None,
@@ -1083,6 +1118,67 @@ async fn a_location_form_record_stores_clicked_wire_values() {
     );
 }
 
+/// A single-select `String` option's wire value survives a restart and is what
+/// the eventual submit carries — the positive branch of
+/// `persisted_field_value`, not just its multi-select arm.
+#[tokio::test]
+async fn a_string_wire_value_survives_restart_and_is_submitted() {
+    let fixture = fixture(
+        false,
+        &[("/work", string_wire_value_location_form("frm_string_wire"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let option = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "wire_deploy")
+        .map(|button| button["value"].clone())
+        .expect("the option's wire value");
+    let result = fixture
+        .app
+        .host_action(option)
+        .await
+        .expect("a single-select answer");
+    let card_after = result.card.expect("the next question's card");
+    let persisted = persisted_location_form(&fixture.session_file(), "frm_string_wire").expect("the record");
+    assert_eq!(
+        persisted["partial"]["display"][0],
+        serde_json::json!(["wire_deploy"]),
+        "the String option's wire value is persisted"
+    );
+    assert!(
+        !persisted.to_string().contains("Deploy"),
+        "its display label is not persisted"
+    );
+
+    let session_file = fixture.session_file();
+    let (app, platform, backend) = restart_fixture(
+        &session_file,
+        &[("/work", string_wire_value_location_form("frm_string_wire"))],
+    )
+    .await;
+    platform.given_card_view("msg_sent", serde_json::json!({ "body": { "elements": [] } }));
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+
+    let confirm = card_buttons(&card_after)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "true")
+        .map(|button| button["value"].clone())
+        .expect("the boolean answer");
+    app.host_action(confirm).await.expect("the final answer");
+    let calls = backend.location_reply_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].1.as_ref().expect("answers")[0].value,
+        Some(crate::backend::types::FormValue::Text("wire_deploy".into())),
+        "the submit carries the clicked wire value, not the label"
+    );
+}
+
 /// A boolean answer is the renderer's literal `"true"`/`"false"` button value,
 /// which the persisted-value filter accepts.
 #[tokio::test]
@@ -1897,11 +1993,13 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
     );
 }
 
-/// Regression for the dismissed-record prune: a transient omission prunes the
-/// dismissal, and the form's reappearance must post a card rather than be
-/// suppressed by the push-once `seen` entry (ADR-0103).
+/// Regression for the dismissed-record prune: a **complete sweep that
+/// transiently omits an upstream-still-pending form** prunes the dismissal, and
+/// the form's reappearance must post a card rather than be suppressed by the
+/// push-once `seen` entry (ADR-0103). This is an omission, not another client's
+/// resolution.
 #[tokio::test]
-async fn a_pruned_dismissed_form_is_repushed_when_it_reappears() {
+async fn a_dismissed_form_omitted_by_a_complete_sweep_is_repushed() {
     let fixture = fixture(
         false,
         &[("/work", location_form("frm_prune_reappear"))],
@@ -1917,18 +2015,27 @@ async fn a_pruned_dismissed_form_is_repushed_when_it_reappears() {
     let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
     fixture.app.host_action(defer).await.expect("a click result");
 
-    // A complete sweep transiently omits it: the dismissal is pruned.
+    // A complete sweep transiently omits it while it is still pending upstream
+    // (an omission, not a resolution): the dismissal is pruned and `seen` must
+    // release the id.
     fixture
         .backend
-        .question_resolved_by_another("frm_prune_reappear")
+        .omit_question_from_list("frm_prune_reappear")
         .await;
     sweep_with(&fixture, &mut seen).await;
     assert!(
         persisted_location_form(&fixture.session_file(), "frm_prune_reappear").is_none(),
-        "the dismissal record is gone"
+        "the complete sweep's omission pruned the dismissal"
+    );
+    assert!(
+        fixture.backend.replied_questions.lock().await.is_empty(),
+        "the form was omitted, never resolved"
     );
 
-    fixture.backend.replied_questions.lock().await.clear();
+    fixture
+        .backend
+        .restore_question_to_list("frm_prune_reappear")
+        .await;
     sweep_with(&fixture, &mut seen).await;
     assert_eq!(
         posted_cards(&fixture.platform).await.len(),
