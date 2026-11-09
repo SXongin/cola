@@ -583,8 +583,10 @@ Use **稍后** to withdraw the card without declining: the form stays pending an
 the tool call is not failed, and the card's message pin is released. Only an
 explicit **取消** declines. cola never declines a Location Form on a timer. A
 URL-mode elicitation shows its link plus an acknowledgement; a secret field
-(password or token) cannot be collected on a shared card, so the card shows the
-secret-input reason and offers only a decline.
+(password or token) is never collected on a shared card — the refusal applies
+to **every** elicitation form, session-backed or directory-owned — so the card
+shows the secret-input reason and offers only a decline. A session-backed form
+without such a field keeps its ordinary Question card.
 
 A reply that fails because the form is gone (404) is **retryable**: the card
 and its record stay, and cola tells you the answer did not land. Only a later

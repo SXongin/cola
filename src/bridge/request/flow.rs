@@ -354,6 +354,13 @@ const WITHDRAWAL_PATCH_TIMEOUT_MS: u64 = 5_000;
 /// The budget for the 「稍后」 card PATCH, which runs inside a card callback
 /// (a ~2 s ack budget) rather than the sweep. A timeout keeps the card and its
 /// record, so the user can retry; it must never spend the whole ack budget.
+///
+/// KNOWN LIMIT (until #1019's dismissal record): a card PATCH is
+/// at-least-once, so a timeout can mean the write DID land. That leaves the
+/// withdrawn card tracked by a live sent-card/surface record — the opposite
+/// ambiguity from a missed write. Keeping the record is the conservative
+/// choice (a live card stays pinned and re-deferrable) and #1019's durable
+/// dismissal record is what resolves the ambiguity permanently.
 const DEFER_WITHDRAWAL_TIMEOUT_MS: u64 = 1_500;
 
 /// The budget for one standalone card send (`reply_card`/`send_card`). A card

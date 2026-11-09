@@ -205,3 +205,24 @@ permits, not for a case in the current wire.
 - **Aggregate every pending Location Form into one card.** Rejected: it breaks
   the per-request surface and settlement machinery, and ADR-0093 allows only one
   open typed input per card anyway.
+
+## Update (2026-11-09): the secret-input refusal applies to every elicitation form
+
+The **Shape** decision's secret guard is intentionally owner-agnostic. A V2
+form whose field names a secret format makes the whole request uncollectable
+with `UncollectableReason::SecretInput` whether the form is Session-owned or
+Location-owned: the Feishu card is a shared surface either way, and the value
+would otherwise be visible in the card's answered-state markdown and its
+Interaction Receipt. This matches the Codex path's own rule (`src/codex/approvals.rs`),
+which applies the refusal inside its ordinary Question path rather than
+treating it as a Location-only concern. The renderer enforces the same rule
+independently of the adapter (`question_elements` refuses any `QuestionInfo`
+whose `secret` marker is set), so a caller that forgets the request-level
+marker still cannot render the field as an input.
+
+This is the one explicit exception to “a Session-owned elicitation takes the
+normal Question path unchanged”: a session-backed form keeps its ordinary
+Question route, card and reminder — only one carrying a secret-format
+(`password`, and defensively `secret`) field becomes decline-only. The rest of
+the ownership split is unchanged; the exception narrows collection, never
+routing.
