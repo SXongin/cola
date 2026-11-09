@@ -126,30 +126,35 @@ The mirror remains best-effort (ADR-0038) for the **push** and for every other
 surface: a failed push write can cost one duplicate card after a restart, and a
 timed-out **send** may duplicate exactly as every standalone send can today.
 Neither is claimed atomic, and neither changes the dismissal ordering above.
-`/mcp` treats a dismissed record as reopenable, and the sweep treats it as
-authoritative suppression until a reopen clears it.
+`/mcp` treats a dismissed record as reopenable **while the form remains
+pending**. The sweep suppresses a dismissed form only while that record exists:
+a complete sweep that no longer lists the form prunes the decision (the #130
+rule), and a later re-listing is a new request that may be delivered again. The
+dismissal is authoritative against a re-push, not a permanent tombstone.
 
 **Partial answer state is persisted, and the recovered card is not repainted.**
 A Location Form's card-action state — each question's **clicked option wire
-values**, whether the slot is final, plus the open question — is written into
-the same client-scoped record (`partial`, serde-default, no format-version bump)
-whenever a card action changes it. Text the Host typed is deliberately not
-persisted: an unsubmitted draft, a custom-answer entry and a numeric input all
-stay client-side (the card-repaints rule). A slot that carried such a value is
-persisted as a live selection of only its clicked options (or nothing), never as
-a final answer, so the restore can never submit an empty list in place of text it
-could not write. On restart `readopt_location_form` still only **reads** the
-live card: a repaint would wipe an unanswered typed field (ADR-0038's
-card-repaints rule, ADR-0091). Instead, `remember_question` restores the
-persisted paint into `QuestionState`, so the card's visible clicked selections
-and the answer its next confirm/submit sends agree — the invariant the restart
-test pins. `/mcp`'s reopen after a restart builds the fresh card from the same
-restored state, so a reselect is not needed for clicked options; a typed custom
-answer may have to be re-entered. The write shares the surface mirror's
-best-effort nature (ADR-0038): a failed partial write can lose the selection
-across a restart, and the recovered live card then keeps markers the new process
-cannot toggle. Consistency after a **successful** write is the guarantee;
-surviving a lost mirror write is not claimed.
+values**, its **multi-select toggles** (including a custom entry the Host
+deliberately added and the card shows as a checked chip), whether the slot is
+final, plus the open question — is written into the same client-scoped record
+(`partial`, serde-default, no format-version bump) whenever a card action
+changes it. An unsubmitted draft, a single-select free-text answer and numeric
+input are not toggles and stay client-side (the card-repaints rule). A slot that
+carried only such non-toggle text is persisted as a live selection of its
+clicked options (or nothing), never as a false final answer. On restart
+`readopt_location_form` still only **reads** the live card: a repaint would wipe
+an unanswered typed field (ADR-0038's card-repaints rule, ADR-0091). Instead,
+`remember_question` restores the persisted paint into `QuestionState`, so the
+card's visible selections and the answer its next confirm/submit sends agree —
+including a custom multi-select token, which a confirm still submits. `/mcp`'s
+reopen after a restart builds the fresh card from the same restored state, so a
+reselect is not needed for clicked options or multi-select toggles; a
+single-select free-text answer or numeric input may have to be re-entered. The
+write shares the surface mirror's best-effort nature (ADR-0038): a failed
+partial write can lose the selection across a restart, and the recovered live
+card then keeps markers the new process cannot toggle. Consistency after a
+**successful** write is the guarantee; surviving a lost mirror write is not
+claimed.
 
 Two accepted residuals, recorded rather than solved:
 
@@ -218,10 +223,11 @@ permits, not for a case in the current wire.
   with an empty suppression, so no migration is needed. The record and the
   standalone surface are written in one mutation.
 - The same record carries the form's partial answer paint (clicked option wire
-  values, final slots and the open question; never text the Host typed) so a
-  restart restores what the un-repainted live card shows. The field is
-  serde-default on the record, so older files load without it and need no
-  format-version bump; a card action that changes the state writes it through.
+  values, multi-select toggles including custom entries, final slots and the
+  open question; never a draft or single-select/numeric text) so a restart
+  restores what the un-repainted live card shows. The field is serde-default on
+  the record, so older files load without it and need no format-version bump; a
+  card action that changes the state writes it through.
 - A Location Form reply's 404 is a retryable refusal, not the generic
   already-handled path: the surface and record survive, and only a complete
   sweep withdraws a form that is genuinely gone. A 409 keeps the benign handled
