@@ -580,8 +580,9 @@ connection. The card always carries that warning; the wire gives cola no way to
 tell a caller-attributed request from a shared one.
 
 Use **稍后** to withdraw the card without declining: the form stays pending and
-the tool call is not failed, and the card's message pin is released. Only an
-explicit **取消** declines. cola never declines a Location Form on a timer. A
+the tool call is not failed, and the card's message pin is released. The
+withdrawn card says you can reopen it later with `/mcp`. Only an explicit
+**取消** declines. cola never declines a Location Form on a timer. A
 URL-mode elicitation shows its link plus an acknowledgement; a secret field
 (password or token) is never collected on a shared card — the refusal applies
 to **every** elicitation form, session-backed or directory-owned — so the card
@@ -590,11 +591,17 @@ without such a field keeps its ordinary Question card.
 
 Push and dismissal decisions survive a cola restart. A restart re-adopts a card
 that is still live instead of posting a second one; a form you deferred with
-**稍后** stays withdrawn — it is not pushed again — until you reopen it. Once a
-form has left the pending list and cola can still speak for its directory, its
-record is dropped; a directory whose listing failed, or that is no longer
-mapped, is never treated as gone, so a directory that recovers does not re-push
-a form you already deferred.
+**稍后** stays withdrawn — it is not pushed again — until you reopen it. The
+「稍后」 decision is written before the card is withdrawn, so a failed record
+write leaves the card live and answerable rather than leaving a terminal card
+that no longer says it is waiting; a failed or timed-out withdrawal after that
+point is still reopenable through `/mcp`. Recovery is best-effort: a failed push
+record or a timed-out send can still duplicate a card after a restart, exactly
+as any standalone card can, and cola does not claim otherwise. Once a form has
+left the pending list and cola can still speak for its directory, its record is
+dropped; a directory whose listing failed, or that is no longer mapped, is never
+treated as gone, so a directory that recovers does not re-push a form you
+already deferred.
 
 A reply that fails because the form is gone (404) is **retryable**: the card
 and its record stay, and cola tells you the answer did not land. Only a later

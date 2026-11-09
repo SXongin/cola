@@ -431,7 +431,7 @@ individually removable. Distinct from an option, which the backend supplied.
 _Avoid_: Free-text answer, custom option, note
 
 **Elicitation** (MCP 输入请求):
-A structured input request raised by an MCP server while it serves a tool, a resource, or its own connection — distinct from a **Question**, which the model asks. It names the server asking, and its answer supplies data to that server connection: a Session-owned elicitation takes the ordinary Question path, while one owned only by a directory belongs to a **Location Form**. Distinct from a **Permission**, which decides whether a tool may act rather than asking for data (ADR-0103).
+A structured input request raised by an MCP server while it serves a tool, a resource, or its own connection — distinct from a **Question**, which the model asks. It names the server asking, and its answer supplies data to that server connection: a Session-owned elicitation takes the ordinary Question path, while one owned only by a directory belongs to a **Location Form**. The one exception is a secret-format field (`password`, and defensively `secret`): a form carrying one is decline-only whichever owner it has, because the Feishu card is a shared surface either way (ADR-0103's 2026-11-09 update). Distinct from a **Permission**, which decides whether a tool may act rather than asking for data (ADR-0103).
 _Avoid_: Question (that is the model's prompt), permission (that is a tool's access decision)
 
 **Location Form** (目录级输入请求):

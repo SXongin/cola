@@ -89,9 +89,10 @@ reopen serializes with 「稍后」 on the per-form write lock, and the clear is
 conditional on the dismissal generation read before the send, so a dismissal
 that lands while the send is in flight survives. A landed reopen rewrites the
 standalone-surface record, so the two records never disagree about what the chat
-currently shows. Only an explicit 「取消」 declines it, and cola never
-auto-declines on a timer: turning a hesitation into a failed tool call is worse
-than waiting.
+currently shows. A clear write that fails is rolled back in memory and the
+fresh card is withdrawn again; the form stays dismissed and retryable. Only an
+explicit 「取消」 declines it, and cola never auto-declines on a timer: turning a
+hesitation into a failed tool call is worse than waiting.
 
 **Persistence.** "Pushed" and "dismissed" are recorded in the client-scoped
 surface file (ADR-0038, ADR-0091), so a restart does not re-push a form the Host
@@ -102,13 +103,43 @@ second; one that finds it withdrawn keeps it withdrawn until `/mcp` reopens it.
 That withdrawal-before-restart rule is ADR-0038's 2026-11-09 amendment, the one
 explicit exception to its "every still-pending request keeps one live surface".
 The pushed/dismissed record and the standalone surface are committed in one
-mutation, so a restart cannot see one without the other. The mirror is still
-best-effort (ADR-0038): a failed combined write is a known limit, and the
-failure path is tested rather than claimed absolute. A failed **push** write can
-cost one duplicate card after a restart; a failed **dismissal** write instead
-leaves the previously written live surface and pushed record on disk, so the
-restart re-adopts that surface — the dismissal is lost, not turned into a
-duplicate.
+mutation, so a restart cannot see one without the other.
+
+**The dismissal is committed before the card becomes terminal.** A terminal
+card (the 「稍后」 replacement has no controls) must never sit over a record that
+still says `Pushed`: that state is the one that strands a still-pending form,
+because `/mcp` reads the record and offers no reopen. 「稍后」 therefore writes
+the dismissal first and **checks that the write is durable**, then PATCHes the
+card. The two failure directions are then both recoverable:
+
+- a failed **dismissal write** leaves the live, answerable card and the
+  previously written pushed record exactly as they were; the click reports that
+  it did not land, and a later sweep or `/mcp` still sees a form that was never
+  withdrawn;
+- a failed or timed-out **card PATCH** after the durable dismissal leaves a
+  live card with a dismissed record. A definite error is answered from that
+  live card; an ambiguous timeout may have landed, leaving a terminal card —
+  either way the record says dismissed, so `/mcp` reopens it instead of the form
+  being stranded.
+
+The mirror remains best-effort (ADR-0038) for the **push** and for every other
+surface: a failed push write can cost one duplicate card after a restart, and a
+timed-out **send** may duplicate exactly as every standalone send can today.
+Neither is claimed atomic, and neither changes the dismissal ordering above.
+`/mcp` treats a dismissed record as reopenable, and the sweep treats it as
+authoritative suppression until a reopen clears it.
+
+Known limitation, recorded rather than solved: **partial state does not survive
+a restart**. Within one process, a reopen repaints from the remembered
+`QuestionState`, so a multi-select selection made before 「稍后」 is visible on
+the fresh card and the next toggle acts on what the card shows. After a restart
+that state is gone: `readopt_location_form` deliberately reads the card without
+repainting it, because a repaint would wipe an unanswered typed field (ADR-0038's
+card-repaints rule, ADR-0091), so the recovered card may still display a
+pre-restart selection that this process cannot toggle; `/mcp`'s reopen paints a
+blank card. The safe direction is preserved — a click never acts on a hidden
+selection the card does not show — but the Host may have to re-select after a
+restart.
 
 **Pull surface.** `/mcp` is the read-only counterpart: the current directory's
 MCP server statuses plus **only** Location Forms (session-backed forms already
