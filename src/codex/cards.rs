@@ -1275,11 +1275,12 @@ async fn a_supplement_steers_the_live_turn_and_renders_once() {
     // opens with `item/started` so it carries its OWN clock: the adapter times a
     // message from the item's start and falls back to the turn's start without
     // one, and a supplement the drain cannot see as answered by a later item
-    // loops the turn forever (issue #958). The start is stamped a second ahead
-    // so the ordering against the supplement's echo — a whole-second stamp from
-    // the server's clock — is explicit, not a same-second coin flip.
+    // loops the turn forever (issue #958). The server stamps the supplement's
+    // echo with its own clock *after* answering `turn/steer`, so the answer is
+    // stamped an hour ahead — a sentinel no independently-read wall clock can
+    // overtake — rather than a second ahead, which a loaded runner could cross.
     let now = chrono::Utc::now().timestamp();
-    let answer_at_ms = (now + 1) * 1000;
+    let answer_at_ms = (now + 3_600) * 1000;
     server.push_to_thread(
         THREAD,
         "item/started",

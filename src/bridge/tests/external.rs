@@ -1032,7 +1032,15 @@ async fn external_message_to_topic_session_notifies_into_thread() {
 /// poll: the renderer must idle (no card update) while the reply is absent,
 /// then stream reasoning/tools/text in and finalize Done when the turn
 /// completes.
-#[tokio::test]
+///
+/// The clock is paused (issue #958): the renderer's first tick is a poll
+/// interval away, and a real 1.5 s span under load could let it tick — and
+/// PATCH the header — between the completed sync pass and the "no update yet"
+/// assertion below. With tokio's clock paused the tick cannot happen until the
+/// test advances time, so the assertion is a statement about the state, not a
+/// race against a span. Everything here is in-memory (no real I/O), so pausing
+/// cannot starve a round trip the way it can for a TCP fixture.
+#[tokio::test(start_paused = true)]
 async fn external_message_reply_renders_into_notification_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
