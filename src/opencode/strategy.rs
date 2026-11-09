@@ -23,8 +23,8 @@ use crate::error::Result;
 
 use super::transport::Transport;
 use crate::backend::types::{
-    AgentInfo, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels, QuestionRequest,
-    SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, FormAnswer, McpServerStatus, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
+    QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// One protocol generation's wire contract.
@@ -101,7 +101,7 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         &self,
         _http: &Transport,
         _directory: Option<&str>,
-    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+    ) -> Result<Option<Vec<McpServerStatus>>> {
         Ok(None)
     }
 

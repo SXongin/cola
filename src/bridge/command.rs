@@ -3600,8 +3600,14 @@ mod tests {
     fn parse_agent_model_no_arg_is_card() {
         assert_eq!(parse_command("/model"), Some(Command::ModelCard));
         assert_eq!(parse_command("/status"), Some(Command::Status));
-        assert_eq!(parse_command("/mcp"), Some(Command::Mcp));
         assert_eq!(parse_command("/agent"), Some(Command::AgentCard));
+    }
+
+    #[test]
+    fn parse_mcp_is_its_own_command() {
+        assert_eq!(parse_command("/mcp"), Some(Command::Mcp));
+        assert_eq!(parse_command("/MCP"), Some(Command::Mcp));
+        assert_eq!(parse_command("/mcp extra"), Some(Command::Mcp));
     }
 
     #[test]
@@ -4284,6 +4290,18 @@ mod tests {
         assert!(cat.contains("相对") || cat.contains("Path Scope"), "{cat}");
         assert!(command_help("version").unwrap().contains("/version"));
         assert!(command_help("status").unwrap().contains("/status"));
+        let mcp = command_help("mcp").expect("mcp has a help topic");
+        assert!(mcp.contains("/mcp"), "{mcp}");
+        assert!(mcp.contains("needs_auth"), "{mcp}");
+        assert!(
+            mcp.contains("只读") || mcp.contains("read-only") || mcp.contains("Read-only"),
+            "{mcp}"
+        );
+        assert!(
+            help_text().contains("/mcp"),
+            "the command index lists `/mcp`: {}",
+            help_text()
+        );
         assert!(command_help("sub").unwrap().contains("/sub list"));
         assert!(
             command_help("sub").unwrap().contains("/sub attach"),

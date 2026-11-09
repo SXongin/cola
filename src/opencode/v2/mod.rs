@@ -46,8 +46,8 @@ use crate::error::Result;
 use super::strategy::GenerationStrategy;
 use super::transport::{Transport, body_preview, read_failure, read_failure_quiet};
 use crate::backend::types::{
-    AgentInfo, FormAnswer, FormValue, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
-    QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, FormAnswer, FormValue, McpServerStatus, ModelInfo, PermissionRequest, PromptFile,
+    ProviderModels, QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// The session root: list, get, update (PATCH), delete, and the per-session
@@ -482,7 +482,7 @@ impl GenerationStrategy for V2Strategy {
         &self,
         http: &Transport,
         directory: Option<&str>,
-    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+    ) -> Result<Option<Vec<McpServerStatus>>> {
         let url = location_url(&http.url(MCP), directory)?;
         let resp = http.client().get(url).send().await?;
         if !resp.status().is_success() {

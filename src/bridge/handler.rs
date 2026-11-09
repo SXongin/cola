@@ -3195,7 +3195,7 @@ impl App {
                 "think" => self.handle_think_card_action(&self.core, &value, false).await,
                 "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
                 "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
-                "mcp" => crate::bridge::mcp::handle_action(&self.command_handles(), &value).await,
+                "mcp" => crate::bridge::mcp::handle_action(&self.command_handles(), &value, deadline).await,
                 "skill" => self.handle_skill_card_action(&value).await,
                 _ => None,
             }

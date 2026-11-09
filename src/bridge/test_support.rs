@@ -1755,6 +1755,12 @@ pub struct MockBackend {
     /// has no MCP pull surface at all, exactly like OpenCode V1 and Codex; a
     /// directory without an entry sees the server's default location list.
     pub mcp_statuses: Option<std::collections::HashMap<String, Vec<crate::backend::types::McpServerStatus>>>,
+    /// When set, `mcp_server_statuses` fails with a transport-shaped error, so
+    /// `/mcp` must answer a clear error instead of an empty card.
+    pub fail_mcp_statuses: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, `list_questions` fails (the `/mcp` form read and the reopen's
+    /// live re-read both surface their own clear message).
+    pub fail_list_questions: Arc<std::sync::atomic::AtomicBool>,
     /// Records `reply_question` calls: (request_id, answers). The answers are
     /// the positional string form the keyed neutral answers flatten to, so the
     /// existing click assertions read the submitted selection.
@@ -2216,6 +2222,8 @@ impl MockBackend {
             questions: Vec::new(),
             questions_by_directory: std::collections::HashMap::new(),
             mcp_statuses: None,
+            fail_mcp_statuses: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_list_questions: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_routes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -3817,6 +3825,11 @@ impl crate::backend::Backend for MockBackend {
         self.list_question_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         hang_if_scripted(&self.hang_list_questions).await;
+        if self.fail_list_questions.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::error::BridgeError::OpenCode(
+                "simulated form list failure".into(),
+            ));
+        }
         let replied = self.replied_questions.lock().await;
         // The real V2 read is location-scoped: a directory with its own
         // script sees only those forms, so a shared-connection test can prove
@@ -3833,6 +3846,11 @@ impl crate::backend::Backend for MockBackend {
         &self,
         directory: Option<&str>,
     ) -> crate::error::Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        if self.fail_mcp_statuses.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::error::BridgeError::OpenCode(
+                "simulated MCP status failure".into(),
+            ));
+        }
         let Some(map) = &self.mcp_statuses else {
             return Ok(None);
         };

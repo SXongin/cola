@@ -47,9 +47,9 @@ use async_trait::async_trait;
 use crate::error::Result;
 
 use types::{
-    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, ModelSurface, ModelSurfaceQuery, PermissionRequest,
-    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
-    SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, McpServerStatus, ModelInfo, ModelSurface, ModelSurfaceQuery,
+    PermissionRequest, PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo,
+    SessionSelection, SessionStatus,
 };
 
 /// One skill a caller attaches to a prompt (spec #652): a small generation-neutral
@@ -744,10 +744,7 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// `/mcp` answers "unavailable" rather than shipping a status-only card.
     /// A client with the surface overrides this and still reports a failed
     /// read as `Err`.
-    async fn mcp_server_statuses(
-        &self,
-        _directory: Option<&str>,
-    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+    async fn mcp_server_statuses(&self, _directory: Option<&str>) -> Result<Option<Vec<McpServerStatus>>> {
         Ok(None)
     }
 

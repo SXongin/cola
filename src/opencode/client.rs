@@ -20,9 +20,9 @@ use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
 use crate::backend::parsing::parse_model;
 use crate::backend::types::{
-    AgentInfo, ChangeScope, CreateSessionInput, CreateSessionResponse, FormAnswer, Location, ModelInfo,
-    ModelOption, ModelScope, ModelSurface, ModelSurfaceQuery, PermissionRequest, PromptFile, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, ChangeScope, CreateSessionInput, CreateSessionResponse, FormAnswer, Location, McpServerStatus,
+    ModelInfo, ModelOption, ModelScope, ModelSurface, ModelSurfaceQuery, PermissionRequest, PromptFile,
+    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// Session creation, on the `/api` surface both generations serve. It is a
@@ -420,7 +420,7 @@ impl OpenCodeBackend {
     pub async fn mcp_server_statuses(
         &self,
         directory: Option<&str>,
-    ) -> crate::error::Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+    ) -> crate::error::Result<Option<Vec<McpServerStatus>>> {
         self.strategy()
             .mcp_server_statuses(&self.transport, directory)
             .await

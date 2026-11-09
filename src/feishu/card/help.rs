@@ -140,6 +140,7 @@ mod tests {
             "/stop",
             "/compact",
             "/card",
+            "/mcp",
             "/help",
             "/restart",
             "/restart-opencode",
