@@ -129,17 +129,37 @@ Neither is claimed atomic, and neither changes the dismissal ordering above.
 `/mcp` treats a dismissed record as reopenable, and the sweep treats it as
 authoritative suppression until a reopen clears it.
 
-Known limitation, recorded rather than solved: **partial state does not survive
-a restart**. Within one process, a reopen repaints from the remembered
-`QuestionState`, so a multi-select selection made before 「稍后」 is visible on
-the fresh card and the next toggle acts on what the card shows. After a restart
-that state is gone: `readopt_location_form` deliberately reads the card without
-repainting it, because a repaint would wipe an unanswered typed field (ADR-0038's
-card-repaints rule, ADR-0091), so the recovered card may still display a
-pre-restart selection that this process cannot toggle; `/mcp`'s reopen paints a
-blank card. The safe direction is preserved — a click never acts on a hidden
-selection the card does not show — but the Host may have to re-select after a
-restart.
+**Partial answer state is persisted, and the recovered card is not repainted.**
+A Location Form's card-action state — each question's displayed selection and
+whether it is final, plus the open question — is written into the same
+client-scoped record (`partial`, serde-default, no format-version bump)
+whenever a card action changes it. Unsubmitted typed text is deliberately not
+persisted: it stays client-side (the card-repaints rule) and a submit carries it
+as the form value it arrives with. On restart `readopt_location_form`
+still only **reads** the live card: a repaint would wipe an unanswered typed
+field (ADR-0038's card-repaints rule, ADR-0091). Instead, `remember_question`
+restores the persisted paint into `QuestionState`, so the card's visible 已选
+markers and the answer its next confirm/submit sends agree — the invariant the
+restart test pins. `/mcp`'s reopen after a restart builds the fresh card from the
+same restored state, so a reselect is not needed. The write shares the surface
+mirror's best-effort nature (ADR-0038): a failed partial write can lose the
+selection across a restart, and the recovered live card then keeps markers the
+new process cannot toggle. Consistency after a **successful** write is the
+guarantee; surviving a lost mirror write is not claimed.
+
+Two accepted residuals, recorded rather than solved:
+
+- a definite PATCH failure after a durable dismissal leaves the old card live
+  while `/mcp` can reopen the form. The reopen sends and records a fresh card,
+  overwriting `sent_cards`, so the old live card is no longer tracked (it stays
+  answerable until the form resolves). This is a duplicate/orphan card, not a
+  stranded form, and the same shape a timed-out-but-landed PATCH leaves.
+- `/mcp`'s reopen performs its send inside the card action. The WS loop detaches
+  an action that exceeds the 2 s ack budget and drops the late result, so the
+  `/mcp` card's repaint may not land; the fresh Location Form card and the
+  cleared dismissal are already committed, and the next `/mcp` shows the new
+  state. This is the bounded-detached behaviour every ack-budget-exceeding
+  action has (ADR-0038's 2026-09-18 update).
 
 **Pull surface.** `/mcp` is the read-only counterpart: the current directory's
 MCP server statuses plus **only** Location Forms (session-backed forms already
@@ -193,6 +213,11 @@ permits, not for a case in the current wire.
   file's format and version are ADR-0091's; a file from an older build loads
   with an empty suppression, so no migration is needed. The record and the
   standalone surface are written in one mutation.
+- The same record carries the form's partial answer paint (selections, final
+  slots and the open question; never unsubmitted typed text) so a restart
+  restores what the un-repainted live card shows. The field is serde-default on
+  the record, so older files load without it and need no format-version bump; a
+  card action that changes the state writes it through.
 - A Location Form reply's 404 is a retryable refusal, not the generic
   already-handled path: the surface and record survive, and only a complete
   sweep withdraws a form that is genuinely gone. A 409 keeps the benign handled
