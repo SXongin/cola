@@ -2328,6 +2328,17 @@ impl ServerLifecycle for CodexClient {
     }
 }
 
+/// The earlier of the read's overall deadline and this page's own bound: a page
+/// never outlives the callback slice, and a long slice still caps one request
+/// ([`CATALOG_REQUEST_TIMEOUT`]).
+fn page_request_deadline(
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+    request_timeout: Duration,
+) -> tokio::time::Instant {
+    deadline.min(now + request_timeout)
+}
+
 impl CodexClient {
     /// `model/list` paged to exhaustion, or until `deadline` (a card
     /// callback's slice) leaves no time for the next page.
@@ -2344,11 +2355,26 @@ impl CodexClient {
         deadline: Option<tokio::time::Instant>,
     ) -> Vec<ProviderModels> {
         let deadline = deadline.unwrap_or_else(|| tokio::time::Instant::now() + CATALOG_READ_TIMEOUT);
+        self.list_models_page_loop(deadline, tokio::time::Instant::now)
+            .await
+    }
+
+    /// [`Self::list_models_within`]'s page loop, with its wall clock injected.
+    ///
+    /// The deadline check and the per-request bound are both computed from
+    /// `now`, so a test can place the deadline and step past it between pages
+    /// instead of racing a real span (issue #958).
+    async fn list_models_page_loop(
+        &self,
+        deadline: tokio::time::Instant,
+        now: impl Fn() -> tokio::time::Instant,
+    ) -> Vec<ProviderModels> {
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::HashSet::new();
         let mut models = Vec::new();
         for page in 0..MAX_MODEL_PAGES {
-            if tokio::time::Instant::now() >= deadline {
+            let at = now();
+            if at >= deadline {
                 tracing::warn!("codex model/list reached its read deadline; showing the catalog read so far");
                 break;
             }
@@ -2359,7 +2385,7 @@ impl CodexClient {
             let request = self.connection().request("model/list", params);
             // A callback's slice may be shorter than one request's own bound;
             // the earlier of the two wins.
-            let request_deadline = deadline.min(tokio::time::Instant::now() + CATALOG_REQUEST_TIMEOUT);
+            let request_deadline = page_request_deadline(deadline, at, CATALOG_REQUEST_TIMEOUT);
             let result = match tokio::time::timeout_at(request_deadline, request).await {
                 Ok(result) => result,
                 Err(_) => {
@@ -2424,6 +2450,134 @@ impl CodexClient {
             provider: MODEL_PROVIDER.to_string(),
             models,
         }]
+    }
+
+    /// [`Backend::model_surface`] with its catalog clock injected, so a test
+    /// can drive the catalog deadline instead of racing it (issue #958).
+    ///
+    /// A card-callback read's slice becomes one absolute `deadline`, and the
+    /// page loop is handed the same clock, so the catalog read's stop is
+    /// decided by the injected view of "now". The config read keeps its own
+    /// real-time bound.
+    async fn model_surface_at(
+        &self,
+        query: ModelSurfaceQuery<'_>,
+        now: impl Fn() -> tokio::time::Instant,
+    ) -> ModelSurface {
+        // `/think`'s variant lookup is the one caller that asks for the bare
+        // catalog (`catalog_only`): it runs on a card callback's short ack
+        // budget and needs only the advertised variants. Every card page — the
+        // root page, a Pending Session's page included — keeps the full
+        // config/provider shape.
+        let fast = query.catalog_only;
+        // A callback-originated read carries its budget; a command's page does
+        // not. `catalog_only` never reaches the config/probe path.
+        let callback = query.ack_budget.is_some();
+        // One slice, used by both concurrent reads. The catalog's own page loop
+        // is bounded by this deadline too, so a paginated-but-alive server
+        // cannot spend the whole budget.
+        let catalog_deadline =
+            super::model_surface::callback_read_slice(query.ack_budget).map(|slice| now() + slice);
+        // With a deadline the catalog is read through the page loop's bounded
+        // form; without one it stays the trait's read (the declared catalog
+        // source). Both produce the same `ProviderModels`.
+        let catalog = async {
+            match catalog_deadline {
+                Some(deadline) => self.list_models_page_loop(deadline, &now).await,
+                None => Backend::list_models(self).await,
+            }
+        };
+        let (catalog, config) = if fast {
+            (catalog.await, super::model_surface::CodexModelConfig::default())
+        } else {
+            let (catalog, config) = tokio::join!(
+                catalog,
+                super::model_surface::read_config(
+                    self.connection(),
+                    query.directory,
+                    super::model_surface::config_read_timeout(query.ack_budget),
+                )
+            );
+            let config = config.unwrap_or_else(|error| {
+                tracing::debug!(
+                    "codex config/read failed; the model surface shows the catalog only: {error}"
+                );
+                super::model_surface::CodexModelConfig {
+                    read_failed: true,
+                    ..Default::default()
+                }
+            });
+            // A successful read is the pick path's cached channel fact: a text
+            // `/model <provider>/<model>` can then reject a wrong prefix without
+            // a request (spec #930). An unknown read leaves the last fact alone.
+            if !config.read_failed {
+                self.configured_provider_fact
+                    .record(query.directory, config.configured_provider());
+            }
+            (catalog, config)
+        };
+        let probes = if fast {
+            Default::default()
+        } else if callback {
+            // A callback must not start a probe: 2 s of network on top of the
+            // config read would miss the ack budget. The previous root open
+            // already warmed this cache; a cold click simply omits the groups.
+            self.model_probes.cached(&config.providers)
+        } else {
+            self.model_probes.probe_all(&config.providers).await
+        };
+        // The thread's own pair is the current line (issue #908): a recorded
+        // but unapplied pair is shown separately, so the footer (the thread
+        // fact) and this line stay same-source. A neutral provider fact names
+        // no channel, so it keeps the caller's resolved line.
+        let thread_model = self
+            .thread_model_fact(query.session_id, query.ack_budget.is_none())
+            .await;
+        let thread_provider = thread_model.as_ref().map(|model| model.provider_id.clone());
+        let mut effective_query = query.clone();
+        if let Some(model) = &thread_model
+            && model.provider_id != MODEL_PROVIDER
+        {
+            let reference = crate::backend::parsing::join_model(&model.provider_id, &model.model_id);
+            // The thread read carries no `/think` level; the resolved selection
+            // does (`provider/model@variant`). Compose the label from the thread's
+            // pair plus that level when it names this **model** — the resolved ref
+            // may sit on the neutral bucket (`codex/<id>`) while the thread runs a
+            // real provider — and fall back to the fact's own variant (issue
+            // #908).
+            let resolved_variant = query.current.as_ref().and_then(|current| {
+                let (base, variant) = current.label.split_once('@')?;
+                let same_model = crate::backend::parsing::parse_model(base)
+                    .is_some_and(|resolved| resolved.id == model.model_id);
+                same_model.then(|| variant.to_string())
+            });
+            let label = match resolved_variant.or_else(|| model.variant.clone()) {
+                Some(variant) => format!("{reference}@{variant}"),
+                None => reference.clone(),
+            };
+            effective_query.current = Some(crate::backend::types::ModelSelection { label, reference });
+        }
+        let mut surface = super::model_surface::build_surface(
+            &catalog,
+            &config,
+            &probes,
+            thread_provider.as_deref(),
+            &effective_query,
+        );
+        // The recorded pair is unapplied even when it spells the current pair:
+        // a one-shot pick equal to what the thread runs still rides the next
+        // new turn, so it must be visible (spec #922). It rides the one model
+        // page (#931).
+        if let Some(pending) = query.pending
+            && let Some(scope) = surface.scopes.first_mut()
+        {
+            let line = format!("待应用：`{pending}`（下一条新消息生效）");
+            scope.note = Some(match scope.note.take() {
+                Some(note) => format!("{note}　{line}"),
+                None => line,
+            });
+        }
+        surface
     }
 }
 
@@ -3139,120 +3293,7 @@ impl Backend for CodexClient {
     /// hand-write hint, never a hung card. A cold callback read therefore shows
     /// the providers without their probed models; the next root open fills them.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
-        // `/think`'s variant lookup is the one caller that asks for the bare
-        // catalog (`catalog_only`): it runs on a card callback's short ack
-        // budget and needs only the advertised variants. Every card page — the
-        // root page, a Pending Session's page included — keeps the full
-        // config/provider shape.
-        let fast = query.catalog_only;
-        // A callback-originated read carries its budget; a command's page does
-        // not. `catalog_only` never reaches the config/probe path.
-        let callback = query.ack_budget.is_some();
-        // One slice, used by both concurrent reads. The catalog's own page loop
-        // is bounded by this deadline too, so a paginated-but-alive server
-        // cannot spend the whole budget.
-        let catalog_deadline = super::model_surface::callback_read_slice(query.ack_budget)
-            .map(|slice| tokio::time::Instant::now() + slice);
-        // With a deadline the catalog is read through the page loop's bounded
-        // form; without one it stays the trait's read (the declared catalog
-        // source). Both produce the same `ProviderModels`.
-        let catalog = async {
-            match catalog_deadline {
-                Some(deadline) => self.list_models_within(Some(deadline)).await,
-                None => Backend::list_models(self).await,
-            }
-        };
-        let (catalog, config) = if fast {
-            (catalog.await, super::model_surface::CodexModelConfig::default())
-        } else {
-            let (catalog, config) = tokio::join!(
-                catalog,
-                super::model_surface::read_config(
-                    self.connection(),
-                    query.directory,
-                    super::model_surface::config_read_timeout(query.ack_budget),
-                )
-            );
-            let config = config.unwrap_or_else(|error| {
-                tracing::debug!(
-                    "codex config/read failed; the model surface shows the catalog only: {error}"
-                );
-                super::model_surface::CodexModelConfig {
-                    read_failed: true,
-                    ..Default::default()
-                }
-            });
-            // A successful read is the pick path's cached channel fact: a text
-            // `/model <provider>/<model>` can then reject a wrong prefix without
-            // a request (spec #930). An unknown read leaves the last fact alone.
-            if !config.read_failed {
-                self.configured_provider_fact
-                    .record(query.directory, config.configured_provider());
-            }
-            (catalog, config)
-        };
-        let probes = if fast {
-            Default::default()
-        } else if callback {
-            // A callback must not start a probe: 2 s of network on top of the
-            // config read would miss the ack budget. The previous root open
-            // already warmed this cache; a cold click simply omits the groups.
-            self.model_probes.cached(&config.providers)
-        } else {
-            self.model_probes.probe_all(&config.providers).await
-        };
-        // The thread's own pair is the current line (issue #908): a recorded
-        // but unapplied pair is shown separately, so the footer (the thread
-        // fact) and this line stay same-source. A neutral provider fact names
-        // no channel, so it keeps the caller's resolved line.
-        let thread_model = self
-            .thread_model_fact(query.session_id, query.ack_budget.is_none())
-            .await;
-        let thread_provider = thread_model.as_ref().map(|model| model.provider_id.clone());
-        let mut effective_query = query.clone();
-        if let Some(model) = &thread_model
-            && model.provider_id != MODEL_PROVIDER
-        {
-            let reference = crate::backend::parsing::join_model(&model.provider_id, &model.model_id);
-            // The thread read carries no `/think` level; the resolved selection
-            // does (`provider/model@variant`). Compose the label from the thread's
-            // pair plus that level when it names this **model** — the resolved ref
-            // may sit on the neutral bucket (`codex/<id>`) while the thread runs a
-            // real provider — and fall back to the fact's own variant (issue
-            // #908).
-            let resolved_variant = query.current.as_ref().and_then(|current| {
-                let (base, variant) = current.label.split_once('@')?;
-                let same_model = crate::backend::parsing::parse_model(base)
-                    .is_some_and(|resolved| resolved.id == model.model_id);
-                same_model.then(|| variant.to_string())
-            });
-            let label = match resolved_variant.or_else(|| model.variant.clone()) {
-                Some(variant) => format!("{reference}@{variant}"),
-                None => reference.clone(),
-            };
-            effective_query.current = Some(crate::backend::types::ModelSelection { label, reference });
-        }
-        let mut surface = super::model_surface::build_surface(
-            &catalog,
-            &config,
-            &probes,
-            thread_provider.as_deref(),
-            &effective_query,
-        );
-        // The recorded pair is unapplied even when it spells the current pair:
-        // a one-shot pick equal to what the thread runs still rides the next
-        // new turn, so it must be visible (spec #922). It rides the one model
-        // page (#931).
-        if let Some(pending) = query.pending
-            && let Some(scope) = surface.scopes.first_mut()
-        {
-            let line = format!("待应用：`{pending}`（下一条新消息生效）");
-            scope.note = Some(match scope.note.take() {
-                Some(note) => format!("{note}　{line}"),
-                None => line,
-            });
-        }
-        surface
+        self.model_surface_at(query, tokio::time::Instant::now).await
     }
 
     async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
@@ -6544,19 +6585,18 @@ mod tests {
         );
     }
 
-    /// A catalog whose NEXT page hangs keeps the page it already read: the loop
-    /// stops at the bound and renders the partial catalog plus the hand-write
-    /// hint instead of discarding it or spending all 64 pages.
+    /// A paginated catalog read stops at its callback slice and keeps the page
+    /// it already read: the loop re-checks the deadline before every page, so
+    /// the partial catalog and the hand-write hint still render.
     ///
-    /// The timing race that made this flake (issue #958) is removed from the
-    /// shape instead of tuned: the first page answers immediately and every
-    /// later one hangs, so the loop only needs one mock round trip, not the 24
-    /// round trips a scripted 150 ms delay squeezed into exactly the slice. The
-    /// callback-deadline path itself is pinned without a wall clock by
-    /// `an_expired_catalog_deadline_sends_no_page_request` and by
-    /// `callback_read_slice`'s unit test in `model_surface`.
+    /// The clock is injected (issue #958): it starts a day out — no real tokio
+    /// timer can fire inside the test — and jumps past the deadline once page 1
+    /// has been requested. The 3 s budget leaves a 1.6 s slice, so page 1 sits
+    /// inside it and page 2 is past it. No wall-clock value decides anything
+    /// here; a broken deadline check would page through the whole catalog and
+    /// the call count would say so.
     #[tokio::test]
-    async fn a_hung_next_page_keeps_the_catalog_pages_already_read() {
+    async fn the_catalog_deadline_stops_between_pages_and_keeps_what_it_read() {
         let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_models(
             (0..100)
@@ -6564,32 +6604,35 @@ mod tests {
                 .collect(),
         );
         server.set_model_page_size(1);
-        // Page 1 answers; page 2 never does.
-        server.silence_model_list_after(1);
         let client = connect(&url).await;
 
-        let started = Instant::now();
-        let surface = Backend::model_surface(
-            &client,
-            crate::backend::types::ModelSurfaceQuery {
-                directory: Some("/work/cola"),
-                ack_budget: Some(Duration::from_secs(3)),
-                ..Default::default()
-            },
-        )
-        .await;
-        let elapsed = started.elapsed();
+        let base = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+        // Keyed to the requests the server saw, not to how many times
+        // production happens to read its clock: before page 1's request the
+        // clock sits at `base`; once page 1 is in flight it is past the slice.
+        let clock = || {
+            if server.model_list_calls() == 0 {
+                base
+            } else {
+                base + Duration::from_secs(2)
+            }
+        };
 
-        // Exactly two requests: the page that landed and the page that hung.
-        let calls = server.model_list_calls();
-        assert_eq!(calls, 2, "the first page was read, the second hung");
-        // The load assumption, recorded next to the assertion: one mock round
-        // trip (page 1, no injected delay) must fit inside the bound. The
-        // real-time assertion is only a guard against the whole call running
-        // away, not the decision.
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "a paginated catalog took {elapsed:?}; the deadline did not cap it"
+        let surface = client
+            .model_surface_at(
+                crate::backend::types::ModelSurfaceQuery {
+                    directory: Some("/work/cola"),
+                    ack_budget: Some(Duration::from_secs(3)),
+                    ..Default::default()
+                },
+                clock,
+            )
+            .await;
+
+        assert_eq!(
+            server.model_list_calls(),
+            1,
+            "page 1 was read; the deadline stopped the loop before page 2"
         );
         assert!(
             surface
@@ -6605,11 +6648,31 @@ mod tests {
         );
     }
 
+    /// A page is cut by the earlier of the read's slice and its own bound: a
+    /// callback slice shorter than [`CATALOG_REQUEST_TIMEOUT`] wins, and a long
+    /// slice still caps a single request. This is the `deadline.min(…)` that the
+    /// `cfg(test)` request bound would otherwise mask (issue #958).
+    #[test]
+    fn a_page_is_cut_by_the_earlier_of_the_slice_and_its_own_bound() {
+        let now = tokio::time::Instant::from_std(Instant::now());
+        let slice = now + Duration::from_millis(600);
+        assert_eq!(
+            page_request_deadline(slice, now, Duration::from_secs(2)),
+            slice,
+            "the callback slice is earlier than the request bound"
+        );
+        assert_eq!(
+            page_request_deadline(now + Duration::from_secs(10), now, Duration::from_millis(200)),
+            now + Duration::from_millis(200),
+            "the request bound is earlier than a long slice"
+        );
+    }
+
     /// A catalog read whose deadline has already passed sends NO page request:
     /// the page loop's bound is checked before its first page, so a callback
     /// budget bounds the read itself and not merely each request (issue #958).
-    /// The contrast is the undated read below, which does send one — this is the
-    /// callback-deadline path, pinned without a wall clock.
+    /// The contrast is a live deadline below, which does send one — both halves
+    /// run on an injected clock, so no span decides them.
     #[tokio::test]
     async fn an_expired_catalog_deadline_sends_no_page_request() {
         let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
@@ -6632,12 +6695,18 @@ mod tests {
             "the deadline is checked before the first page is requested"
         );
 
-        // The same call WITHOUT a deadline does request pages.
-        let models = client.list_models_within(None).await;
-        assert!(!models.is_empty(), "an undated read serves the catalog");
+        // The same page loop with its deadline still ahead does request pages.
+        // The clock stays below a day-out deadline, so only the loop's own
+        // check decides — and its request timer is a day away too.
+        server.set_model_page_size(200);
+        let base = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+        let models = client
+            .list_models_page_loop(base, || base - Duration::from_secs(1))
+            .await;
+        assert!(!models.is_empty(), "a live deadline serves the catalog");
         assert!(
             server.model_list_calls() > 0,
-            "an undated read is not cut before its first page"
+            "a live deadline is not cut before its first page"
         );
     }
 
