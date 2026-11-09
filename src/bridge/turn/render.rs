@@ -185,6 +185,29 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
     }
 }
 
+/// The timeline order key of every part in `message` (issue #1022). A part's
+/// own server start time when it reports one; otherwise — V2's text item
+/// carries no time at all, and its reasoning time is optional — the start time
+/// of the previous timed part in the same message, or the message's own
+/// `time.created`. V2's `content[]` is in output order, so borrowing the
+/// previous key keeps the card in the transcript's order without inventing a
+/// clock: the entry's `shown_at` (and so the Rendered Cursor frontier) still
+/// carries only the time the server actually reported.
+fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<Option<i64>> {
+    let mut previous = message.time.as_ref().map(|time| time.created);
+    message
+        .parts
+        .iter()
+        .map(|part| {
+            let own = part.started_at();
+            if own.is_some() {
+                previous = own;
+            }
+            own.or(previous)
+        })
+        .collect()
+}
+
 /// Render one typed part into the accumulator, applying the dedup rules
 /// ([`renders_part`]): text and reasoning are tracked by their content
 /// (OpenCode part payloads carry NO `id`, AGENTS.md pitfall `wire-shapes`), and a tool call
@@ -195,9 +218,16 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
 /// Turn's own answer — still renders. `source` is the part's own position in
 /// the transcript, recorded on text/reasoning timeline
 /// entries for the Rendered Cursor frontier (spec #561); callers without one
-/// (synthetic batches, the seeded live-set join) pass `None`. Returns true when
-/// the part rendered (not skipped as duplicate/empty).
-fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &Part) -> bool {
+/// (synthetic batches, the seeded live-set join) pass `None`. `order_at` is the
+/// position's timeline key ([`part_order_times`]): the part's own server time,
+/// or the previous part's when it reports none. Returns true when the part
+/// rendered (not skipped as duplicate/empty).
+fn render_part(
+    acc: &mut StreamAccumulator,
+    source: Option<PartSource>,
+    part: &Part,
+    order_at: Option<i64>,
+) -> bool {
     if let Some(source) = source.as_ref()
         && acc.part_seeded_delivered(&source.message_id, part)
     {
@@ -216,10 +246,10 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 // The server rewrote the part: replace its entry run (spec
                 // #561, review #569) — appending the new snapshot would
                 // double-count the part and leave the cursor digestless.
-                acc.replace_text_run(rewritten, &text.text, text.started_at);
+                acc.replace_text_run(rewritten, &text.text, order_at, text.started_at);
             } else {
                 let (source, chunk) = source_chunk(acc, source, &text.text, None);
-                acc.push_text_from(text.started_at, source, &chunk);
+                acc.push_text_at_key(order_at, text.started_at, source, &chunk, None);
             }
             acc.mark_streaming();
         }
@@ -229,7 +259,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 .as_ref()
                 .filter(|source| acc.source_rewritten(source, &reasoning.text))
             {
-                acc.replace_reasoning_run(rewritten, &reasoning.text, reasoning.started_at);
+                acc.replace_reasoning_run(rewritten, &reasoning.text, order_at, reasoning.started_at);
             } else {
                 let (source, chunk) = source_chunk(
                     acc,
@@ -237,7 +267,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                     &reasoning.text,
                     Some(crate::feishu::card::REASONING_TEXT_CAP),
                 );
-                acc.push_reasoning_from(reasoning.started_at, source, &chunk);
+                acc.push_reasoning_at_key(order_at, reasoning.started_at, source, &chunk, None);
             }
             acc.mark_reasoning();
         }
@@ -255,7 +285,7 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 // assembles the output text and status icon from it (ADR-0042,
                 // ADR-0053).
                 let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
-                acc.push_tool_from(call.started_at, &call.identity.call_id, panel, source);
+                acc.push_tool_at_key(order_at, call.started_at, &call.identity.call_id, panel, source);
             }
             if call.status == ToolStatus::Running {
                 acc.mark_streaming();
@@ -355,7 +385,7 @@ fn source_chunk(
 pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &[Part]) -> bool {
     let mut rendered_any = false;
     for part in parts {
-        if render_part(acc, None, part) {
+        if render_part(acc, None, part, None) {
             rendered_any = true;
         }
     }
@@ -1689,6 +1719,9 @@ pub(super) fn render_turn_parts(
         // A message the server created after a receipt's ask is post-click
         // content: every part of it sorts after the receipt (issue #1023).
         acc.set_message_floor(message_floor_time(message));
+        // The part order keys this message's card entries sort by (issue #1022):
+        // V2 text parts carry no time, so they borrow the previous part's.
+        let order_times = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             let cut = match (seed.as_ref(), message_pos) {
                 (Some(seed), Some(pos)) => seed.cut(pos, index),
@@ -1703,7 +1736,14 @@ pub(super) fn render_turn_parts(
                 // — only a position the window actually renders retires it.
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
-                    if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
+                    if render_seeded_part(
+                        acc,
+                        message.id.clone(),
+                        index,
+                        part,
+                        delivered,
+                        order_times[index],
+                    ) {
                         rendered_any = true;
                     }
                 }
@@ -1721,7 +1761,7 @@ pub(super) fn render_turn_parts(
                     // pitfall `wire-shapes`), so the message identity plus the
                     // ordinal is the whole position.
                     let source = PartSource::at(message.id.clone(), index);
-                    if render_part(acc, Some(source), part) {
+                    if render_part(acc, Some(source), part, order_times[index]) {
                         rendered_any = true;
                     }
                 }
@@ -1816,6 +1856,7 @@ fn render_pending_gap(
             continue;
         }
         acc.set_message_floor(message_floor_time(message));
+        let order_times = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => {
@@ -1827,7 +1868,14 @@ fn render_pending_gap(
                     // never be built from these entries, while the gap's own
                     // progress is read from them.
                     acc.mark_gap_message(message.id.clone());
-                    if render_gap_part(acc, message.id.clone(), index, part, delivered) {
+                    if render_gap_part(
+                        acc,
+                        message.id.clone(),
+                        index,
+                        part,
+                        delivered,
+                        order_times[index],
+                    ) {
                         rendered = true;
                     }
                 }
@@ -1840,7 +1888,7 @@ fn render_pending_gap(
                         acc.retire_seeded_call(&call.identity.call_id);
                     }
                     let source = PartSource::at(message.id.clone(), index);
-                    if render_part(acc, Some(source), part) {
+                    if render_part(acc, Some(source), part, order_times[index]) {
                         rendered = true;
                     }
                 }
@@ -1885,6 +1933,7 @@ fn render_gap_part(
     index: usize,
     part: &Part,
     delivered: usize,
+    order_at: Option<i64>,
 ) -> bool {
     let (full, started_at, is_text) = match part {
         Part::Text(text) => (text.text.as_str(), text.started_at, true),
@@ -1893,7 +1942,7 @@ fn render_gap_part(
         // render's own dedup decides.
         _ => {
             let source = PartSource::at(message_id, index);
-            return render_part(acc, Some(source), part);
+            return render_part(acc, Some(source), part, order_at);
         }
     };
     let full_len = full.chars().count();
@@ -1927,10 +1976,10 @@ fn render_gap_part(
         )),
     };
     if is_text {
-        acc.push_text_lead(started_at, Some(source), &suffix, lead);
+        acc.push_text_at_key(order_at, started_at, Some(source), &suffix, lead);
         acc.mark_streaming();
     } else {
-        acc.push_reasoning_lead(started_at, Some(source), &suffix, lead);
+        acc.push_reasoning_at_key(order_at, started_at, Some(source), &suffix, lead);
         acc.mark_reasoning();
     }
     true
@@ -1982,6 +2031,7 @@ fn render_seed_scope(
             continue;
         };
         acc.set_message_floor(message_floor_time(message));
+        let order_times = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
@@ -1989,7 +2039,14 @@ fn render_seed_scope(
                     if gap_scope {
                         acc.mark_gap_message(message.id.clone());
                     }
-                    if render_seeded_part(acc, message.id.clone(), index, part, delivered) {
+                    if render_seeded_part(
+                        acc,
+                        message.id.clone(),
+                        index,
+                        part,
+                        delivered,
+                        order_times[index],
+                    ) {
                         rendered = true;
                     }
                 }
@@ -2004,7 +2061,7 @@ fn render_seed_scope(
                         acc.mark_gap_message(message.id.clone());
                     }
                     let source = PartSource::at(message.id.clone(), index);
-                    if render_part(acc, Some(source), part) {
+                    if render_part(acc, Some(source), part, order_times[index]) {
                         rendered = true;
                     }
                 }
@@ -2160,6 +2217,7 @@ fn render_seeded_part(
     index: usize,
     part: &Part,
     delivered: usize,
+    order_at: Option<i64>,
 ) -> bool {
     let (full, started_at, is_text) = match part {
         Part::Text(text) => (text.text.as_str(), text.started_at, true),
@@ -2189,10 +2247,10 @@ fn render_seeded_part(
     if held > 0 && !acc.source_prefix_holds(&source, full, held) {
         acc.mark_delivered_part(&message_id, part);
         if is_text {
-            acc.replace_text_run(&source, full, started_at);
+            acc.replace_text_run(&source, full, order_at, started_at);
             acc.mark_streaming();
         } else {
-            acc.replace_reasoning_run(&source, full, started_at);
+            acc.replace_reasoning_run(&source, full, order_at, started_at);
             acc.mark_reasoning();
         }
         acc.record_seed_frontier_delivered(full_len);
@@ -2233,10 +2291,10 @@ fn render_seeded_part(
             )),
         };
         if is_text {
-            acc.push_text_lead(started_at, Some(source), &suffix, lead);
+            acc.push_text_at_key(order_at, started_at, Some(source), &suffix, lead);
             acc.mark_streaming();
         } else {
-            acc.push_reasoning_lead(started_at, Some(source), &suffix, lead);
+            acc.push_reasoning_at_key(order_at, started_at, Some(source), &suffix, lead);
             acc.mark_reasoning();
         }
     }
@@ -2287,6 +2345,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                 acc,
                 Some(PartSource::at(message_id, index)),
                 &Part::Tool(call.clone()),
+                call.started_at,
             ) {
                 rendered = true;
             }
@@ -4591,6 +4650,134 @@ Index: /x/src/main.rs
         assert!(!acc.reasoning().contains("old reasoning"));
 
         assert!(!render_new_turn_parts(&mut acc, &transcript));
+    }
+
+    /// A V2 text part carries no server time (its schema has none; only tools
+    /// and reasoning do), so the card must order it by the transcript's own part
+    /// order: here it precedes the tool call that follows it (issue #1022).
+    #[test]
+    fn a_v2_text_part_renders_before_the_tool_call_that_follows_it() {
+        let anchor = 2_000;
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message(
+                "a1",
+                anchor,
+                vec![
+                    text_part("先解释背景。"),
+                    tool(
+                        "bash",
+                        "call_1",
+                        ToolStatus::Completed,
+                        Some(anchor + 100),
+                        Some(serde_json::json!({"command": "ls"})),
+                        Some("tool-output"),
+                    ),
+                ],
+            ),
+        ]);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("先解释背景。").unwrap() < text.find("tool-output").unwrap(),
+            "the text precedes the tool call in the transcript: {text}"
+        );
+    }
+
+    /// The same read order survives a LIVE panel's settlement (issue #1022): the
+    /// question panel rides the card tail while it runs, then joins the timeline
+    /// at its server start time — which is later than the text before it, so the
+    /// text must stay above it.
+    #[test]
+    fn a_settled_tool_panel_stays_below_the_v2_text_that_precedes_it() {
+        let anchor = 2_000;
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+                message(
+                    "a1",
+                    anchor,
+                    vec![
+                        text_part("先解释背景。"),
+                        tool(
+                            "bash",
+                            "call_1",
+                            status,
+                            Some(anchor + 100),
+                            Some(serde_json::json!({"command": "ls"})),
+                            output,
+                        ),
+                    ],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Running, None)
+        ));
+        assert!(acc.tools()["call_1"].is_live());
+
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some("tool-output"))
+        ));
+        assert!(!acc.tools()["call_1"].is_live());
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("先解释背景。").unwrap() < text.find("tool-output").unwrap(),
+            "the settled panel keeps the transcript's position: {text}"
+        );
+    }
+
+    /// A text part with no time borrows the key of the part before it, so it can
+    /// share a still-running panel's server start key. When that panel settles it
+    /// must sort at its own (earlier) allocation position — equal keys order by
+    /// allocation, not by settle time (issue #1022).
+    #[test]
+    fn a_settled_panel_inserts_before_equal_key_text_that_followed_it() {
+        let anchor = 2_000;
+        let transcript = |status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+                message(
+                    "a1",
+                    anchor,
+                    vec![
+                        tool(
+                            "bash",
+                            "call_1",
+                            status,
+                            Some(anchor + 100),
+                            Some(serde_json::json!({"command": "ls"})),
+                            output,
+                        ),
+                        text_part("回答"),
+                    ],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Running, None)
+        ));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some("tool-output"))
+        ));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("tool-output").unwrap() < text.find("回答").unwrap(),
+            "the settled panel sorts at its allocation position: {text}"
+        );
     }
 
     /// The live Turn card does NOT render a skill fold (spec #652, ticket #655,

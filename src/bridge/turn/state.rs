@@ -3167,7 +3167,7 @@ impl StreamAccumulator {
     /// would otherwise be missed by a later chunk still asking for the part's
     /// raw server key, and every render read would start a second entry (a new
     /// reasoning panel, a split text run).
-    fn part_order_key(&mut self, at_ms: Option<i64>, source: Option<&PartSource>) -> i64 {
+    fn part_order_key(&mut self, key_at: Option<i64>, source: Option<&PartSource>) -> i64 {
         // A part already on the timeline keeps the key it was placed at: an
         // untimed V2 part (and a timed one whose floor/clamp differs on a later
         // read) must keep merging into its own entry, or a growing part splits
@@ -3175,7 +3175,7 @@ impl StreamAccumulator {
         if let Some(key) = source.and_then(|source| self.placed_source_key(source)) {
             return key;
         }
-        let key = match at_ms {
+        let key = match key_at {
             Some(at) => self.message_floor.map_or(at, |floor| at.max(floor)),
             None => self.next_order(),
         };
@@ -3809,7 +3809,12 @@ impl StreamAccumulator {
     /// deliver parts out of order (a panel whose content lands after later
     /// parts), so appending would put it after content that follows it — the
     /// ordering bug that moved a gated command below its receipt. Equal keys
-    /// keep insertion order.
+    /// keep ALLOCATION order ([`TimelineItem::seq`]), not settle order: a live
+    /// tool panel is allocated where its part stands in the read and joins the
+    /// timeline only when it settles, by which point a later part of the same
+    /// message may already sit at that key. Sequencing the equal-key run keeps
+    /// the panel at its transcript position (issue #1022: V2 text parts carry no
+    /// time, so they borrow the previous part's key).
     ///
     /// A key behind the live slice inserts at its start: the finalized card
     /// that owned that position is already sent, and the top of the live card
@@ -3867,7 +3872,13 @@ impl StreamAccumulator {
         // the receipt (issue #1023, [`ReceiptCut`]). The receipt's own key is
         // the floor; equal keys keep this entry after it.
         let key = self.message_floor.map_or(key, |floor| key.max(floor));
-        let idx = self.timeline.partition_point(|item| item.key <= key);
+        // Equal keys keep ALLOCATION order (`seq`): a live tool panel is
+        // allocated at its transcript position and joins the timeline only when
+        // it settles, after a later part of the same message may have been
+        // pushed at the same key (issue #1022).
+        let idx = self
+            .timeline
+            .partition_point(|item| item.key < key || (item.key == key && item.seq < seq));
         let (idx, key) = if idx < self.render_from {
             (
                 self.render_from,
@@ -4048,7 +4059,24 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = self.part_order_key(at_ms, source.as_ref());
+        self.push_text_at_key(at_ms, at_ms, source, chunk, lead);
+    }
+
+    /// [`Self::push_text_lead`] for a part whose timeline ORDER key is not the
+    /// server time it may show (issue #1022): V2 decodes text parts without a
+    /// time at all, so the card sorts them by the transcript's own order while
+    /// the Rendered Cursor frontier must keep the part's real (absent) start
+    /// time. `key_at` positions the entries; `shown_at` is what the entry
+    /// displays and what the cursor records.
+    pub(super) fn push_text_at_key(
+        &mut self,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        chunk: &str,
+        lead: Option<String>,
+    ) {
+        let key = self.part_order_key(key_at, source.as_ref());
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
@@ -4076,14 +4104,14 @@ impl StreamAccumulator {
                     Some(idx) => self.insert_kind_after(
                         idx,
                         key,
-                        at_ms,
+                        shown_at,
                         pushed,
                         TimelineKind::Text(take.clone()),
                         lead.take(),
                     ),
                     None => self.insert_kind_lead(
                         key,
-                        at_ms,
+                        shown_at,
                         pushed,
                         TimelineKind::Text(take.clone()),
                         lead.take(),
@@ -4121,7 +4149,7 @@ impl StreamAccumulator {
                     target = Some(self.insert_kind_after(
                         idx,
                         key,
-                        at_ms,
+                        shown_at,
                         source.clone(),
                         TimelineKind::Text(take.clone()),
                         lead.take(),
@@ -4152,7 +4180,9 @@ impl StreamAccumulator {
 
     /// [`Self::push_reasoning_at`] carrying the typed transcript part this
     /// chunk rendered from (spec #561's cursor frontier). Synthetic pushes
-    /// pass `None`.
+    /// pass `None`. Test-only: a production render that needs an order key
+    /// apart from the displayed time calls [`Self::push_reasoning_at_key`].
+    #[cfg(test)]
     pub(super) fn push_reasoning_from(
         &mut self,
         at_ms: Option<i64>,
@@ -4164,7 +4194,8 @@ impl StreamAccumulator {
 
     /// [`Self::push_reasoning_from`] with a markdown lead emitted before the
     /// chunk's content (spec #561's cut tail), exactly like
-    /// [`Self::push_text_lead`].
+    /// [`Self::push_text_lead`]. Test-only; see [`Self::push_reasoning_at_key`].
+    #[cfg(test)]
     pub(super) fn push_reasoning_lead(
         &mut self,
         at_ms: Option<i64>,
@@ -4172,7 +4203,22 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = self.part_order_key(at_ms, source.as_ref());
+        self.push_reasoning_at_key(at_ms, at_ms, source, chunk, lead);
+    }
+
+    /// [`Self::push_reasoning_lead`] for a part whose timeline ORDER key is not
+    /// the server time it may show: V2's reasoning time is optional, so an
+    /// untimed part sorts by the transcript's own order while the entry (and
+    /// its cursor frontier) keeps the absent server clock (issue #1022).
+    pub(super) fn push_reasoning_at_key(
+        &mut self,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        chunk: &str,
+        lead: Option<String>,
+    ) {
+        let key = self.part_order_key(key_at, source.as_ref());
         self.reasoning.push_str(chunk);
         // The entry THIS part merges into, never another part's at the same
         // server time (spec #561, review #569).
@@ -4204,7 +4250,7 @@ impl StreamAccumulator {
             _ => {
                 self.insert_kind_lead(
                     key,
-                    at_ms,
+                    shown_at,
                     source,
                     TimelineKind::Reasoning(chunk.to_string()),
                     lead,
@@ -4235,10 +4281,27 @@ impl StreamAccumulator {
 
     /// [`Self::push_tool_at`] carrying the typed transcript part the call
     /// rendered from (spec #561, review #569): a settled panel's timeline entry
-    /// keeps it, so it can become the Rendered Cursor frontier.
+    /// keeps it, so it can become the Rendered Cursor frontier. Test-only: a
+    /// production render that needs an order key apart from the displayed time
+    /// calls [`Self::push_tool_at_key`].
+    #[cfg(test)]
     pub(super) fn push_tool_from(
         &mut self,
         at_ms: Option<i64>,
+        call_id: &str,
+        panel: ToolPanel,
+        source: Option<PartSource>,
+    ) {
+        self.push_tool_at_key(at_ms, at_ms, call_id, panel, source);
+    }
+
+    /// [`Self::push_tool_from`] for a call whose timeline ORDER key is not the
+    /// server time it may show (issue #1022): an untimed part borrows the
+    /// previous part's key while the panel keeps showing no clock.
+    pub(super) fn push_tool_at_key(
+        &mut self,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
         call_id: &str,
         panel: ToolPanel,
         source: Option<PartSource>,
@@ -4247,7 +4310,7 @@ impl StreamAccumulator {
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
-            let key = at_ms.unwrap_or_else(|| self.next_order());
+            let key = key_at.unwrap_or_else(|| self.next_order());
             if live {
                 // Unfinished: TAIL content. Allocate its identity and key now,
                 // but do not join the timeline — a split must never finalize a
@@ -4257,22 +4320,22 @@ impl StreamAccumulator {
                     call_id.to_string(),
                     LiveTool {
                         key,
-                        shown_at: at_ms,
+                        shown_at,
                         seq: self.item_seq,
                         source,
                     },
                 );
             } else {
-                self.insert_kind_src(key, at_ms, source, TimelineKind::Tool(call_id.to_string()));
+                self.insert_kind_src(key, shown_at, source, TimelineKind::Tool(call_id.to_string()));
             }
         } else if self.live_tools.contains_key(call_id) {
             // A later sighting may carry the server start time the first one
             // lacked (a pending call with no time). The panel is not on
             // the timeline yet, so the real start time REPLACES the synthetic
             // fallback key — the settle move must land where the call started.
-            if let Some(at) = at_ms {
+            if let Some(at) = shown_at {
                 let entry = self.live_tools.get_mut(call_id).expect("checked");
-                entry.shown_at = entry.shown_at.or(at_ms);
+                entry.shown_at = entry.shown_at.or(shown_at);
                 entry.key = at;
             }
             if let Some(source) = source
@@ -4296,13 +4359,13 @@ impl StreamAccumulator {
                     None,
                 );
             }
-        } else if at_ms.is_some()
+        } else if shown_at.is_some()
             && let Some(item) = self
                 .timeline
                 .iter_mut()
                 .find(|i| matches!(&i.kind, TimelineKind::Tool(id) if id == call_id))
         {
-            item.shown_at = item.shown_at.or(at_ms);
+            item.shown_at = item.shown_at.or(shown_at);
         }
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.
@@ -5624,18 +5687,42 @@ impl StreamAccumulator {
     /// Replace `source`'s timeline entries with a fresh run of `text` (spec
     /// #561, review #569) — the server rewrote the part, so the replacement is
     /// its whole content now. The new run lands where the old one began
-    /// (chunked like any push, keyed at the part's start time), its source
-    /// carrying the new content's prefix digest and no offset: the cursor
-    /// records the part's new full extent, and a restart resolves it.
-    pub(super) fn replace_text_run(&mut self, source: &PartSource, text: &str, at_ms: Option<i64>) {
+    /// (chunked like any push, ordered at `key_at` and displaying `shown_at`),
+    /// its source carrying the new content's prefix digest and no offset: the
+    /// cursor records the part's new full extent, and a restart resolves it.
+    pub(super) fn replace_text_run(
+        &mut self,
+        source: &PartSource,
+        text: &str,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+    ) {
         self.drop_source_run(source);
-        self.push_text_lead(at_ms, Some(self.rewrite_source(source, text)), text, None);
+        self.push_text_at_key(
+            key_at,
+            shown_at,
+            Some(self.rewrite_source(source, text)),
+            text,
+            None,
+        );
     }
 
     /// [`Self::replace_text_run`] for a rewritten reasoning part.
-    pub(super) fn replace_reasoning_run(&mut self, source: &PartSource, text: &str, at_ms: Option<i64>) {
+    pub(super) fn replace_reasoning_run(
+        &mut self,
+        source: &PartSource,
+        text: &str,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+    ) {
         self.drop_source_run(source);
-        self.push_reasoning_lead(at_ms, Some(self.rewrite_source(source, text)), text, None);
+        self.push_reasoning_at_key(
+            key_at,
+            shown_at,
+            Some(self.rewrite_source(source, text)),
+            text,
+            None,
+        );
     }
 
     /// The source a rewritten part's fresh run carries: its position with the
