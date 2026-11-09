@@ -1507,7 +1507,7 @@ pub fn build_location_form_deferred_card(server: Option<&str>, message: Option<&
         detail.push_str(message);
         detail.push_str("\n\n");
     }
-    detail.push_str("该请求仍然待处理，稍后可以重新处理。");
+    detail.push_str("该请求仍然待处理，稍后可以在 `/mcp` 中重新打开。");
     card_shell(
         "💤 已稍后处理",
         "grey",

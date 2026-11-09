@@ -100,11 +100,6 @@ const SESSION_DIFF_SUFFIX: &str = "/diff";
 const PERMISSION_REQUEST: &str = "/api/permission/request";
 /// The location-scoped pending-form list (`GET /api/form?location[directory]=…`).
 const FORM: &str = "/api/form";
-/// The session placeholder a directory-owned elicitation is answered under
-/// (`POST /api/session/global/form/{id}/reply`). This is the WIRE's spelling,
-/// owned by this adapter: the neutral model maps it to `RequestOwner::Location`
-/// at decode, and the bridge never reads it (ADR-0103).
-const LOCATION_FORM_SESSION: &str = "global";
 /// The agent catalog (`GET /api/agent`) the `/agent` picker reads.
 const AGENT: &str = "/api/agent";
 /// The skill catalog (`GET /api/skill`) the `/skill` picker and the
@@ -178,6 +173,56 @@ fn answer_json(value: &FormValue) -> serde_json::Value {
         FormValue::Bool(flag) => serde_json::Value::Bool(*flag),
         FormValue::List(values) => serde_json::json!(values),
     }
+}
+
+/// Encode the keyed `{"answer": {key: value}}` body every V2 form reply
+/// carries — session-backed and Location Form alike.
+fn answer_object(answers: &[FormAnswer]) -> serde_json::Map<String, serde_json::Value> {
+    answers
+        .iter()
+        .filter_map(|answer| {
+            answer
+                .value
+                .as_ref()
+                .map(|value| (answer.key.clone(), answer_json(value)))
+        })
+        .collect()
+}
+
+/// POST one V2 form answer and map its failure with the owner's policy. Shared
+/// by the session and location routes: only the URL and the mapping differ.
+async fn post_form_reply(
+    http: &Transport,
+    url: reqwest::Url,
+    answers: &[FormAnswer],
+    request_id: &str,
+    location_form: bool,
+) -> Result<()> {
+    let response = http
+        .client()
+        .post(url)
+        .json(&serde_json::json!({ "answer": answer_object(answers) }))
+        .send()
+        .await?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(reply_failure(response, "form", request_id, location_form).await)
+}
+
+/// DELETE one V2 form (the cancel route) and map its failure with the owner's
+/// policy. Shared by the session and location routes.
+async fn delete_form(
+    http: &Transport,
+    url: reqwest::Url,
+    request_id: &str,
+    location_form: bool,
+) -> Result<()> {
+    let response = http.client().delete(url).send().await?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(reply_failure(response, "form", request_id, location_form).await)
 }
 
 /// Consume a failed form reply into the neutral error. The mapping splits by
@@ -435,25 +480,8 @@ impl GenerationStrategy for V2Strategy {
         answers: &[FormAnswer],
         _directory: Option<&str>,
     ) -> Result<()> {
-        let answer: serde_json::Map<String, serde_json::Value> = answers
-            .iter()
-            .filter_map(|answer| {
-                answer
-                    .value
-                    .as_ref()
-                    .map(|value| (answer.key.clone(), answer_json(value)))
-            })
-            .collect();
-        let response = http
-            .client()
-            .post(http.url(&format!("{SESSION}/{session_id}/form/{request_id}/reply")))
-            .json(&serde_json::json!({ "answer": answer }))
-            .send()
-            .await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Err(reply_failure(response, "form", request_id, false).await)
+        let url = reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}/form/{request_id}/reply")))?;
+        post_form_reply(http, url, answers, request_id, false).await
     }
 
     /// Cancel a pending form (`DELETE /api/session/{id}/form/{formID}`) — V2's
@@ -466,15 +494,8 @@ impl GenerationStrategy for V2Strategy {
         request_id: &str,
         _directory: Option<&str>,
     ) -> Result<()> {
-        let response = http
-            .client()
-            .delete(http.url(&format!("{SESSION}/{session_id}/form/{request_id}")))
-            .send()
-            .await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Err(reply_failure(response, "form", request_id, false).await)
+        let url = reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}/form/{request_id}")))?;
+        delete_form(http, url, request_id, false).await
     }
 
     /// Answer a directory-owned Location Form: the session route with the
@@ -487,31 +508,14 @@ impl GenerationStrategy for V2Strategy {
         answers: &[FormAnswer],
         directory: Option<&str>,
     ) -> Result<()> {
-        let answer: serde_json::Map<String, serde_json::Value> = answers
-            .iter()
-            .filter_map(|answer| {
-                answer
-                    .value
-                    .as_ref()
-                    .map(|value| (answer.key.clone(), answer_json(value)))
-            })
-            .collect();
         let url = location_url(
             &http.url(&format!(
-                "{SESSION}/{LOCATION_FORM_SESSION}/form/{request_id}/reply"
+                "{SESSION}/{}/form/{request_id}/reply",
+                wire::GLOBAL_ELICITATION_SESSION_ID
             )),
             directory,
         )?;
-        let response = http
-            .client()
-            .post(url)
-            .json(&serde_json::json!({ "answer": answer }))
-            .send()
-            .await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Err(reply_failure(response, "form", request_id, true).await)
+        post_form_reply(http, url, answers, request_id, true).await
     }
 
     /// Cancel a directory-owned Location Form: `DELETE` on the same
@@ -524,14 +528,13 @@ impl GenerationStrategy for V2Strategy {
         directory: Option<&str>,
     ) -> Result<()> {
         let url = location_url(
-            &http.url(&format!("{SESSION}/{LOCATION_FORM_SESSION}/form/{request_id}")),
+            &http.url(&format!(
+                "{SESSION}/{}/form/{request_id}",
+                wire::GLOBAL_ELICITATION_SESSION_ID
+            )),
             directory,
         )?;
-        let response = http.client().delete(url).send().await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Err(reply_failure(response, "form", request_id, true).await)
+        delete_form(http, url, request_id, true).await
     }
 
     /// Fetch one session's Session Transcript through the V2 projected-message

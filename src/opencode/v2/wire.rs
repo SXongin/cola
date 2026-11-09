@@ -490,24 +490,31 @@ impl RawForm {
             .unwrap_or_default();
         let location = session_id == GLOBAL_ELICITATION_SESSION_ID && metadata.is_mcp_elicitation();
         let questions: Vec<QuestionInfo> = fields.into_iter().map(RawFormField::into_neutral).collect();
-        // A secret field can never be collected on a shared card: the whole
-        // request is uncollectable with the existing secret-input reason, so
-        // every surface offers only a decline (ADR-0103).
-        let uncollectable = questions
-            .iter()
-            .any(|field| field.secret)
+        // A secret field can never be collected on a SHARED card: a Location
+        // Form is uncollectable with the existing secret-input reason, so its
+        // surface offers only a decline (ADR-0103). A session-backed form is
+        // deliberately unchanged.
+        let uncollectable = (location && questions.iter().any(|field| field.secret))
             .then_some(UncollectableReason::SecretInput);
+        if location {
+            // The owner constructor owns the "no Session" invariant, so the
+            // adapter cannot pair a Location owner with an id.
+            return QuestionRequest::location(
+                id,
+                title,
+                questions,
+                metadata.server,
+                metadata.message,
+                uncollectable,
+            );
+        }
         QuestionRequest {
             id,
-            session_id: if location { String::new() } else { session_id },
+            session_id,
             title,
             questions,
             uncollectable,
-            owner: if location {
-                crate::backend::types::RequestOwner::Location
-            } else {
-                crate::backend::types::RequestOwner::Session
-            },
+            owner: crate::backend::types::RequestOwner::Session,
             server: metadata.server,
             message: metadata.message,
         }
@@ -627,7 +634,7 @@ impl RawFormField {
                 );
                 // The MCP schema has no `password` format today; the guard
                 // covers the shape the protocol permits (ADR-0103).
-                field.secret = matches!(format.as_deref(), Some("password" | "secret"));
+                field.secret = format.as_deref() == Some("password");
                 field
             }
             RawFormField::Number {

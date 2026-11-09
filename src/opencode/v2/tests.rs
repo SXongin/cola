@@ -2363,6 +2363,42 @@ async fn a_secret_format_field_makes_the_form_uncollectable() {
     assert!(form.questions[0].secret);
 }
 
+/// A session-backed form with a secret-format field keeps the ordinary
+/// Question path: the shared-card secret guard applies only to a Location Form
+/// (ADR-0103's "session-backed elicitations are unchanged").
+#[tokio::test]
+async fn a_session_backed_secret_form_keeps_the_ordinary_question_shape() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/form",
+        200,
+        serde_json::json!({
+            "data": [{
+                "id": "frm_session_secret",
+                "sessionID": "ses_1",
+                "title": "Token",
+                "fields": [{
+                    "key": "token",
+                    "type": "string",
+                    "title": "API token",
+                    "format": "password",
+                }],
+            }],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let forms = client.list_questions(None).await.unwrap();
+    let form = &forms[0];
+    assert_eq!(
+        form.uncollectable, None,
+        "a session-backed form keeps its ordinary card"
+    );
+    assert!(form.questions[0].secret);
+}
+
 /// ADR-0103's reply-error split: a session-backed form keeps 404/409 as
 /// handled, while a Location Form maps only 409 to handled and treats 404 as a
 /// retryable refusal (never `NotFound`).

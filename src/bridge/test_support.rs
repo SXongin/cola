@@ -413,6 +413,9 @@ pub struct RecordingPlatform {
     /// anchor (a Location Form push defers rather than falling back to the
     /// Chat lobby).
     pub no_topic_messages: std::sync::atomic::AtomicBool,
+    /// The next N `list_messages` calls hang: the Location Form target walk
+    /// must be bounded like every other sweep read.
+    pub hang_topic_messages: std::sync::atomic::AtomicUsize,
     /// The next N `reply_in_thread` calls fail, then the call succeeds — a
     /// transient failure a test can retry past.
     pub fail_reply_in_thread_count: std::sync::atomic::AtomicUsize,
@@ -555,6 +558,7 @@ impl RecordingPlatform {
             fail_reply_card: false,
             fail_reply_in_thread: false,
             no_topic_messages: std::sync::atomic::AtomicBool::new(false),
+            hang_topic_messages: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_in_thread_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1284,6 +1288,7 @@ impl feishu::Platform for RecordingPlatform {
         _container_id_type: &str,
         _container_id: &str,
     ) -> crate::error::Result<Vec<crate::feishu::client::ChatMessage>> {
+        hang_if_scripted(&self.hang_topic_messages).await;
         if self.no_topic_messages.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(Vec::new());
         }
@@ -1729,11 +1734,12 @@ pub struct MockBackend {
     pub location_reply_calls: Arc<tokio::sync::Mutex<Vec<LocationFormReply>>>,
     /// When true, a Location Form reply/cancel fails with the adapter's
     /// retryable 404 shape (`FormNotFoundError` mapped to a plain error, NOT
-    /// `BridgeError::NotFound`), as a real V2 adapter does.
-    pub location_form_retryable_404: bool,
+    /// `BridgeError::NotFound`), as a real V2 adapter does. Flippable mid-test
+    /// through the `Arc`.
+    pub location_form_retryable_404: std::sync::atomic::AtomicBool,
     /// When true, a Location Form reply/cancel reports the form already
     /// settled (409) — the benign handled path.
-    pub location_form_settled: bool,
+    pub location_form_settled: std::sync::atomic::AtomicBool,
     /// Question ids cola answered/submitted/rejected via `reply_question` —
     /// filtered out of `list_questions` like the real server drops a replied
     /// request. A test simulating resolution by ANOTHER client inserts the id
@@ -2175,8 +2181,8 @@ impl MockBackend {
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_routes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             location_reply_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            location_form_retryable_404: false,
-            location_form_settled: false,
+            location_form_retryable_404: std::sync::atomic::AtomicBool::new(false),
+            location_form_settled: std::sync::atomic::AtomicBool::new(false),
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -2371,14 +2377,16 @@ impl MockBackend {
     /// `FormNotFoundError` (404), which the adapter maps to a RETRYABLE error
     /// (never `NotFound`): the card/surface/record must survive.
     pub(crate) fn location_form_reply_404_retryable(&mut self) -> &mut Self {
-        self.location_form_retryable_404 = true;
+        self.location_form_retryable_404
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
     /// Scenario: the addressed Location Form was already settled (409) — the
     /// benign handled path.
     pub(crate) fn location_form_already_settled(&mut self) -> &mut Self {
-        self.location_form_settled = true;
+        self.location_form_settled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3966,8 +3974,10 @@ impl crate::backend::Backend for MockBackend {
             d.map(str::to_string),
         ));
         Self::location_form_outcome(
-            self.location_form_retryable_404,
-            self.location_form_settled,
+            self.location_form_retryable_404
+                .load(std::sync::atomic::Ordering::SeqCst),
+            self.location_form_settled
+                .load(std::sync::atomic::Ordering::SeqCst),
             request_id,
             &self.replied_questions,
         )
@@ -3980,8 +3990,10 @@ impl crate::backend::Backend for MockBackend {
             .await
             .push((request_id.to_string(), None, d.map(str::to_string)));
         Self::location_form_outcome(
-            self.location_form_retryable_404,
-            self.location_form_settled,
+            self.location_form_retryable_404
+                .load(std::sync::atomic::Ordering::SeqCst),
+            self.location_form_settled
+                .load(std::sync::atomic::Ordering::SeqCst),
             request_id,
             &self.replied_questions,
         )
