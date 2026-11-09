@@ -185,79 +185,50 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
     }
 }
 
-/// One part's timeline order instruction (issue #1022).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PartOrder {
-    /// The read's own floor: the part's server time, the previous timed
-    /// part's, or the message's `time.created`.
-    At(Option<i64>),
-    /// After everything the card already shows. A part with no server time
-    /// that follows a SETTLED tool call was produced after that call's result
-    /// — and so after any Interaction Receipt the answer left — where a
-    /// borrowed position would sort it above that receipt (ADR-0038 rule 4).
-    Now,
-}
-
-/// The order instruction for every part in `message` (issue #1022). V2's text
+/// The timeline order key of every part in `message` (issue #1022). V2's text
 /// item carries no time at all, so the read's own order supplies it: a part
-/// without a time borrows the floor, a timed part behind the floor takes the
-/// floor too, and a part after a settled tool takes [`PartOrder::Now`]. Every
-/// entry's `shown_at` (and so the Rendered Cursor frontier) still carries only
-/// the time the server actually reported.
-fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<PartOrder> {
+/// without a time borrows the floor — the previous timed part's start, or the
+/// message's `time.created` — and a timed part behind the floor takes the floor
+/// too, so the read's order wins within the message. A part with no time that
+/// FOLLOWS a tool call keeps the pre-#1022 fallback (`None` → `next_order`, the
+/// render moment): it was produced after that call's result, and the resolution
+/// receipt's own ordering stays untouched. Every entry's `shown_at` (and so the
+/// Rendered Cursor frontier) still carries only the server's time.
+fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<Option<i64>> {
     let mut floor = message.time.as_ref().map(|time| time.created);
-    let mut after_settled_tool = false;
-    message
-        .parts
-        .iter()
-        .map(|part| {
-            let order = match part.started_at() {
-                Some(own) => PartOrder::At(Some(floor.map_or(own, |floor| floor.max(own)))),
-                None if after_settled_tool => PartOrder::Now,
-                None => PartOrder::At(floor),
-            };
-            if let PartOrder::At(at) = order {
-                floor = at;
+    let mut after_tool = false;
+    let mut orders = Vec::with_capacity(message.parts.len());
+    for part in &message.parts {
+        let order = match part {
+            Part::Tool(call) => {
+                let own = call.started_at;
+                let order = match own {
+                    Some(own) => Some(floor.map_or(own, |floor| floor.max(own))),
+                    None if after_tool => None,
+                    None => floor,
+                };
+                after_tool = true;
+                order
             }
-            // Only a content part moves the boundary: a step boundary, patch or
-            // unknown part between a settled tool and its continuation text
-            // must not turn the text back into a borrowed pre-call position.
-            match part {
-                Part::Tool(call) => after_settled_tool = !call.status.is_live(),
-                Part::Text(_) | Part::Reasoning(_) => after_settled_tool = false,
-                _ => {}
+            Part::Text(_) | Part::Reasoning(_) => {
+                let own = part.started_at();
+                let order = match own {
+                    Some(own) => Some(floor.map_or(own, |floor| floor.max(own))),
+                    None if after_tool => None,
+                    None => floor,
+                };
+                after_tool = false;
+                order
             }
-            order
-        })
-        .collect()
-}
-
-/// Materialize each [`PartOrder`] into the key this render places the part at:
-/// `Now` takes `next_position` (after everything already placed, a live panel
-/// included), and `floor` — carried across the walk's messages, so a `Now` in
-/// one message never leaves a later message's part above it — advances past
-/// both. No later part of the walk sorts back above content already placed.
-fn resolve_part_orders(
-    acc: &mut StreamAccumulator,
-    orders: &[PartOrder],
-    floor: &mut Option<i64>,
-) -> Vec<Option<i64>> {
+            _ => {
+                orders.push(None);
+                continue;
+            }
+        };
+        floor = order;
+        orders.push(order);
+    }
     orders
-        .iter()
-        .map(|order| {
-            let key = match order {
-                PartOrder::Now => Some(acc.next_position()),
-                PartOrder::At(at) => *at,
-            };
-            let key = match (key, *floor) {
-                (Some(key), Some(floor)) => Some(key.max(floor)),
-                (Some(key), None) => Some(key),
-                (None, floor) => floor,
-            };
-            *floor = key.or(*floor);
-            key
-        })
-        .collect()
 }
 
 /// Render one typed part into the accumulator, applying the dedup rules
@@ -271,9 +242,10 @@ fn resolve_part_orders(
 /// the transcript, recorded on text/reasoning timeline
 /// entries for the Rendered Cursor frontier (spec #561); callers without one
 /// (synthetic batches, the seeded live-set join) pass `None`. `order_at` is the
-/// position's timeline key from [`resolve_part_orders`]; the seeded live-set
-/// join resolves its part's order the same way, so every placement shares one
-/// policy. Returns true when the part rendered (not skipped as duplicate/empty).
+/// position's timeline key from [`part_order_times`] (`None` → the render-order
+/// fallback); the seeded live-set join resolves its part the same way, so every
+/// placement shares one policy. Returns true when the part rendered (not
+/// skipped as duplicate/empty).
 fn render_part(
     acc: &mut StreamAccumulator,
     source: Option<PartSource>,
@@ -1744,7 +1716,7 @@ pub(super) fn render_turn_parts(
     }
     // The order floor carries across the whole walk: a `Now` in an earlier
     // message must not leave a later message's part above it (issue #1022).
-    let mut order_floor: Option<i64> = None;
+
     let messages = &turn.messages;
     for message in messages.iter().copied() {
         // A message the seed's own scope already walked is done: walking it
@@ -1777,7 +1749,7 @@ pub(super) fn render_turn_parts(
         acc.set_message_floor(message_floor_time(message));
         // The part order keys this message's card entries sort by (issue #1022):
         // V2 text parts carry no time, so they borrow the previous part's.
-        let order_keys = resolve_part_orders(acc, &part_order_times(message), &mut order_floor);
+        let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             let cut = match (seed.as_ref(), message_pos) {
                 (Some(seed), Some(pos)) => seed.cut(pos, index),
@@ -1896,7 +1868,7 @@ fn render_pending_gap(
         .and_then(|bound| message_positions.get(bound.as_str()).copied())
         .or_else(|| next_user_position(transcript, &message_positions, anchor));
     let mut rendered = false;
-    let mut order_floor: Option<i64> = None;
+
     let messages = transcript.turn_for_user(anchor).messages;
     for message in messages.iter().copied() {
         let Some(pos) = message_positions.get(message.id.as_str()).copied() else {
@@ -1908,7 +1880,7 @@ fn render_pending_gap(
             continue;
         }
         acc.set_message_floor(message_floor_time(message));
-        let order_keys = resolve_part_orders(acc, &part_order_times(message), &mut order_floor);
+        let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => {
@@ -2070,7 +2042,7 @@ fn render_seed_scope(
         .pending_gap()
         .is_some_and(|gap| gap.anchor.message_id == scope.message_id);
     let mut rendered = false;
-    let mut order_floor: Option<i64> = None;
+
     let messages = transcript.turn_for_user(scope).messages;
     for message in messages.iter().copied() {
         walked.insert(message.id.clone());
@@ -2078,7 +2050,7 @@ fn render_seed_scope(
             continue;
         };
         acc.set_message_floor(message_floor_time(message));
-        let order_keys = resolve_part_orders(acc, &part_order_times(message), &mut order_floor);
+        let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
@@ -2397,10 +2369,8 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             acc.set_message_floor(message_floor_time(message));
             // The call's READ POSITION orders it, exactly like the window walk
             // (issue #1022): the seeded set is resolved by identity, not by a
-            // clock, but its key still comes from the message's part order,
-            // bounded by the next message's start.
-            let mut floor = None;
-            let order_at = resolve_part_orders(acc, &part_order_times(message), &mut floor)
+            // clock, but its key still comes from the message's part order.
+            let order_at = part_order_times(message)
                 .get(index)
                 .copied()
                 .flatten();
@@ -4803,13 +4773,9 @@ Index: /x/src/main.rs
         );
     }
 
-    /// A text part with no time borrows the key of the part before it, so it can
-    /// share a still-running panel's server start key. When that panel settles it
-    /// must sort at its own (earlier) allocation position — equal keys order by
-    /// allocation, not by settle time (issue #1022). This shape isolates the
-    /// tie-break: on the base the text was keyed *after* the panel, so only a
-    /// reverted tie-break regresses it; the two tests above are the base
-    /// regressions.
+    /// A TIMED text sharing a still-running panel's server start key sorts by
+    /// allocation when the panel settles: on the base the text was keyed after
+    /// the panel, so only a reverted tie-break regresses it (issue #1022).
     #[test]
     fn a_settled_panel_inserts_before_equal_key_text_that_followed_it() {
         let anchor = 2_000;
@@ -4828,7 +4794,10 @@ Index: /x/src/main.rs
                             Some(serde_json::json!({"command": "ls"})),
                             output,
                         ),
-                        text_part("回答"),
+                        Part::Text(crate::backend::TextPart {
+                            text: "回答".to_string(),
+                            started_at: Some(anchor + 100),
+                        }),
                     ],
                 ),
             ])
@@ -4849,28 +4818,12 @@ Index: /x/src/main.rs
             text.find("tool-output").unwrap() < text.find("回答").unwrap(),
             "the settled panel sorts at its allocation position: {text}"
         );
-        // The borrowed order key never becomes the Rendered Cursor's start:
-        // V2's text has no server time, so the frontier still records none.
-        let built = acc.build_card_with_info();
-        assert_eq!(
-            built.cursor.frontier,
-            Some(CursorFrontier {
-                message_id: MessageId::new("a1"),
-                part_index: 1,
-                kind: CursorPartKind::Text,
-                started_at: None,
-                delivered_chars: "回答".chars().count(),
-                prefix_digest: Some(cursor_prefix_digest("回答")),
-            }),
-            "a borrowed key is not a server start"
-        );
     }
 
-    /// The order instruction each part of a message gets (`part_order_times`): a
-    /// part's own server time, or the read's floor, and the message's
-    /// `time.created` before any timed part (issue #1022). An untimed message
-    /// keeps `At(None)`, so the caller falls back to `next_order()`; a part after
-    /// a COMPLETED tool takes `Now` so it lands after any receipt.
+    /// The order key each part of a message gets (`part_order_times`): a part's
+    /// own server time, or the read's floor, and the message's `time.created`
+    /// before any timed part (issue #1022). An untimed message stays `None`
+    /// (the render-order fallback), and so does a part that follows a tool.
     #[test]
     fn part_order_times_borrows_the_previous_timed_part() {
         let ordered = message(
@@ -4886,13 +4839,7 @@ Index: /x/src/main.rs
         );
         assert_eq!(
             part_order_times(&ordered),
-            vec![
-                PartOrder::At(Some(1_000)),
-                PartOrder::At(Some(1_100)),
-                PartOrder::At(Some(1_100)),
-                PartOrder::At(Some(1_100)),
-                PartOrder::At(Some(1_100)),
-            ]
+            vec![Some(1_000), Some(1_100), Some(1_100), Some(1_100), None]
         );
 
         // A timed part behind the floor takes the floor instead of jumping
@@ -4906,18 +4853,12 @@ Index: /x/src/main.rs
                 tool("bash", "call_2", ToolStatus::Completed, Some(2_050), None, None),
             ],
         );
-        assert_eq!(
-            part_order_times(&behind),
-            vec![
-                PartOrder::At(Some(2_100)),
-                PartOrder::At(Some(2_100)),
-                PartOrder::At(Some(2_100)),
-            ]
-        );
+        assert_eq!(part_order_times(&behind), vec![Some(2_100), None, Some(2_050)]);
 
-        // A text after a COMPLETED tool is content produced after that call's
-        // result: it takes `Now`, so a receipt the answer left stays above it.
-        let after_completed = message(
+        // A text after a tool keeps the pre-#1022 render-order fallback: it was
+        // produced after that call's result, so the resolution receipt's own
+        // ordering must stay untouched.
+        let after_tool = message(
             "a4",
             1_000,
             vec![
@@ -4925,13 +4866,10 @@ Index: /x/src/main.rs
                 text_part("回答"),
             ],
         );
-        assert_eq!(
-            part_order_times(&after_completed),
-            vec![PartOrder::At(Some(2_100)), PartOrder::Now]
-        );
+        assert_eq!(part_order_times(&after_tool), vec![Some(2_100), None]);
 
         let timeless = typed_message("a2", MessageRole::Assistant, None, vec![text_part("?")]);
-        assert_eq!(part_order_times(&timeless), vec![PartOrder::At(None)]);
+        assert_eq!(part_order_times(&timeless), vec![None]);
     }
 
     /// A text that follows a COMPLETED tool is placed after everything the card
@@ -4965,152 +4903,25 @@ Index: /x/src/main.rs
             ),
         ]);
         assert!(render_new_turn_parts(&mut acc, &transcript));
-        let text = card_text(&acc.build_card_with_info().card);
+        let built = acc.build_card_with_info();
+        let text = card_text(&built.card);
         assert!(
             text.find("先前的回执").unwrap() < text.find("回答").unwrap(),
             "the post-tool text stays below the receipt: {text}"
         );
-    }
-
-    /// A timed part behind the floor cannot jump above an untimed part placed
-    /// from the same message: the walk's floor advances across `Now` too
-    /// (issue #1022).
-    #[test]
-    fn a_floor_moved_by_now_keeps_the_next_part_below_the_text() {
-        let anchor = 2_000;
-        let mut acc = StreamAccumulator::new("test");
-        acc.repoint_turn_anchor(&turn_anchor(anchor));
-        let transcript = SessionTranscript::new(vec![
-            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
-            message(
-                "a1",
-                anchor,
-                vec![
-                    tool(
-                        "bash",
-                        "call_1",
-                        ToolStatus::Completed,
-                        Some(anchor + 200),
-                        Some(serde_json::json!({"command": "one"})),
-                        Some("tool-one"),
-                    ),
-                    text_part("回答"),
-                    tool(
-                        "bash",
-                        "call_2",
-                        ToolStatus::Completed,
-                        Some(anchor + 100),
-                        Some(serde_json::json!({"command": "two"})),
-                        Some("tool-two"),
-                    ),
-                ],
-            ),
-        ]);
-        assert!(render_new_turn_parts(&mut acc, &transcript));
-        let text = card_text(&acc.build_card_with_info().card);
-        assert!(
-            text.find("tool-one").unwrap() < text.find("回答").unwrap()
-                && text.find("回答").unwrap() < text.find("tool-two").unwrap(),
-            "the read order survives the floor: {text}"
-        );
-    }
-
-    /// A receipt is positional (issue #1022): a post-answer text delivered by a
-    /// later read stays BELOW the receipt even when cola's clock runs ahead of
-    /// the server's, and the continuation message stays below the text
-    /// (ADR-0038 rule 4).
-    #[test]
-    fn a_receipt_stays_above_the_text_a_later_read_delivers() {
-        let anchor = 2_000;
-        let mut acc = StreamAccumulator::new("test");
-        acc.repoint_turn_anchor(&turn_anchor(anchor));
-        // The settled tool lands first (the Host answers it), then its receipt.
-        let tool_only = SessionTranscript::new(vec![
-            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
-            message(
-                "a1",
-                anchor,
-                vec![tool(
-                    "bash",
-                    "call_1",
-                    ToolStatus::Completed,
-                    Some(anchor + 100),
-                    Some(serde_json::json!({"command": "ls"})),
-                    Some("tool-output"),
-                )],
-            ),
-        ]);
-        assert!(render_new_turn_parts(&mut acc, &tool_only));
-        acc.push_receipt("已处理");
-        // The receipt's cut is the newest SERVER time on the card: the tool.
-        assert_eq!(acc.receipt_floor(&tool_only.messages[1]), None);
-
-        // The continuation is a new, TIMED message: its own server time is far
-        // behind cola's receipt key, so only the receipt cut keeps it below.
-        let later = SessionTranscript::new(vec![
-            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
-            message(
-                "a1",
-                anchor,
-                vec![tool(
-                    "bash",
-                    "call_1",
-                    ToolStatus::Completed,
-                    Some(anchor + 100),
-                    Some(serde_json::json!({"command": "ls"})),
-                    Some("tool-output"),
-                )],
-            ),
-            message(
-                "a2",
-                anchor + 110,
-                vec![Part::Text(crate::backend::TextPart {
-                    text: "回答".to_string(),
-                    started_at: Some(anchor + 110),
-                })],
-            ),
-        ]);
-        assert!(render_new_turn_parts(&mut acc, &later));
-        let text = card_text(&acc.build_card_with_info().card);
-        assert!(
-            text.find("已处理").unwrap() < text.find("回答").unwrap(),
-            "the receipt stays above the continuation: {text}"
-        );
-    }
-
-    /// A `Now` in one message is bounded by the next message's start, so a later
-    /// message's text never jumps above it: `Now` is a position, not a
-    /// render-time clock, and the floor carries across the walk (issue #1022).
-    #[test]
-    fn a_now_key_never_leaves_a_later_message_above_it() {
-        let anchor = 2_000;
-        let mut acc = StreamAccumulator::new("test");
-        acc.repoint_turn_anchor(&turn_anchor(anchor));
-        let transcript = SessionTranscript::new(vec![
-            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
-            message(
-                "a1",
-                anchor,
-                vec![
-                    tool(
-                        "bash",
-                        "call_1",
-                        ToolStatus::Completed,
-                        Some(anchor + 100),
-                        Some(serde_json::json!({"command": "ls"})),
-                        Some("tool-output"),
-                    ),
-                    text_part("解释"),
-                ],
-            ),
-            message("a2", anchor + 100, vec![text_part("回答")]),
-        ]);
-
-        assert!(render_new_turn_parts(&mut acc, &transcript));
-        let text = card_text(&acc.build_card_with_info().card);
-        assert!(
-            text.find("解释").unwrap() < text.find("回答").unwrap(),
-            "the later message stays below the earlier message's Now text: {text}"
+        // The render-order fallback key is not the Rendered Cursor's start:
+        // V2's text reports no server time, so the frontier records none.
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: MessageId::new("a1"),
+                part_index: 1,
+                kind: CursorPartKind::Text,
+                started_at: None,
+                delivered_chars: "回答".chars().count(),
+                prefix_digest: Some(cursor_prefix_digest("回答")),
+            }),
+            "a fallback key is not a server start"
         );
     }
 
