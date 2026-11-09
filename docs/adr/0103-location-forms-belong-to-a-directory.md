@@ -81,8 +81,10 @@ other wait (ADR-0043): resolving, cancelling, dismissing, or staling the card
 removes it from the waiting set and releases the pin.
 
 **Dismissal.** 「稍后」 withdraws the card — and releases its Message Pin —
-without declining the request. The form stays pending and `/mcp` can reopen it
-as a fresh card; reopening sends the fresh card first and commits the cleared
+without declining the request. The dismissal is the durable decision: once it is
+written, the sent-card entry is dropped and the pin is released even when the
+card PATCH fails or its response is lost; a card left live is the accepted
+orphan. The form stays pending and `/mcp` can reopen it as a fresh card; reopening sends the fresh card first and commits the cleared
 dismissal only after the send lands, so a failed send leaves the form dismissed
 and `/mcp` can retry rather than leaving it unsuppressed with no card. The
 reopen serializes with 「稍后」 on the per-form write lock, and the clear is
@@ -163,11 +165,13 @@ claimed.
 
 Two accepted residuals, recorded rather than solved:
 
-- a definite PATCH failure after a durable dismissal leaves the old card live
-  while `/mcp` can reopen the form. The reopen sends and records a fresh card,
-  overwriting `sent_cards`, so the old live card is no longer tracked (it stays
-  answerable until the form resolves). This is a duplicate/orphan card, not a
-  stranded form, and the same shape a timed-out-but-landed PATCH leaves.
+- a definite or ambiguous PATCH failure after a durable dismissal leaves the
+  old card live while the dismissal itself still stands: `sent_cards` is
+  dropped and the Message Pin is released regardless of the PATCH result, and
+  `/mcp` can reopen the form. The reopen sends and records a fresh card, so the
+  old live card is no longer tracked (it stays answerable until the form
+  resolves). This is a duplicate/orphan card, not a stranded form, and the same
+  shape a timed-out-but-landed PATCH leaves.
 - `/mcp`'s reopen performs its send inside the card action. The WS loop detaches
   an action that exceeds the 2 s ack budget and drops the late result, so the
   `/mcp` card's repaint may not land; the fresh Location Form card and the
