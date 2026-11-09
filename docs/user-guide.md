@@ -17,7 +17,7 @@ All runtime state defaults to `~/.cola/`:
 | `cola.log` | logs (append, daily rotation) | `cola --log-file <path>` |
 | `sessions.json` | Feishu thread ↔ Session mapping | `[bridge] session_file` |
 | `chain_records.json` | durable Chain Record: live cards, wake watermarks, Task Endings, delivered positions | beside `session_file` |
-| `interactive_surfaces.json` | Permission/Question cards re-adopted after a restart (ADR-0038) | beside `session_file` |
+| `interactive_surfaces.json` | Permission/Question and directory-owned Location Form cards re-adopted after a restart (ADR-0038, ADR-0103) | beside `session_file` |
 | `authored_turns.json` | turns cola started, so a client that assigns its own ids still tells its own messages from external ones (ADR-0092) | beside `session_file` |
 | `pinned_chats.json` | persisted Instant Reminder pins | beside `session_file` |
 | `terminal-runs/` | Terminal Run Records for live/settled `/run` cards | beside `session_file` |
@@ -478,7 +478,10 @@ each; the fourth is Codex's own refusal.
   the Feishu client offers no cancel; marking the conversation 完成 dismisses
   it, but new activity pins it again. The waiting card
   is also message-pinned under the same opt-in, so opening the chat leads to
-  it.
+  it. A directory-owned **Location Form** takes that message pin too, without
+  an Instant Reminder: it has no Turn to own one, but the pin keeps the
+  waiting card findable, and it is released when the card is answered,
+  cancelled, deferred or goes stale.
 - **`long_task_notice`** — **off by default**: in p2p, reply to the requester's
   message when a turn ran at least 5 minutes, so a long task's end is announced
   by a new message. The streaming card is patched in place, which neither
@@ -557,6 +560,41 @@ one rather than left pending.
 An **Auto-Accept** session keeps its own rule: it answers every permission
 unseen and logs each approval, including an over-budget target. See
 `/autoaccept` below for the command form.
+
+## Directory-owned MCP requests
+
+An MCP server attached to a directory can ask for input while it serves a tool.
+OpenCode raises that request without a Session — the server belongs to the
+directory, not to any one conversation — so cola calls it a **Location Form**.
+It is delivered once as its own card into the **newest mapped Session** of the
+directory that raised it: a Chat gets a message at the chat's top level, and a
+Topic gets a reply inside the topic (if the topic's anchor cannot be found, the
+push waits for the next sweep rather than posting in the Chat lobby). With no
+mapped Chat/Topic, nothing is sent.
+
+The card names the asking MCP server, its message and the directory. Any
+Principal on the Access List may answer in that Chat/Topic. The answer commits
+the **whole directory** — every Session using it — and, because a pooled MCP
+connection may be shared, it may also commit other directories using the same
+connection. The card always carries that warning; the wire gives cola no way to
+tell a caller-attributed request from a shared one.
+
+Use **稍后** to withdraw the card without declining: the form stays pending and
+the tool call is not failed, and the card's message pin is released. Only an
+explicit **取消** declines. cola never declines a Location Form on a timer. A
+URL-mode elicitation shows its link plus an acknowledgement; a secret field
+(password or token) cannot be collected on a shared card, so the card shows the
+secret-input reason and offers only a decline.
+
+A reply that fails because the form is gone (404) is **retryable**: the card
+and its record stay, and cola tells you the answer did not land. Only a later
+sweep that no longer lists the form withdraws the card. A form already settled
+by another client (409) is the ordinary "handled" path. A failed push is
+retried on the next complete sweep.
+
+Session-backed elicitations keep their normal Question card and reminder. A
+session-less form that is not marked as an MCP elicitation, and a permission
+with no Session, keep the old one-warning-and-skip behaviour.
 
 ## Multi-client sync
 

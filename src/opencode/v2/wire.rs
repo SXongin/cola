@@ -31,6 +31,7 @@ use serde_json::Value;
 use crate::backend::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
     QuestionRequest, SessionInfo, SessionListInfo, SessionModel, SessionSelection, SessionTime,
+    UncollectableReason,
 };
 use crate::backend::{
     BackgroundLaunch, BackgroundTask, ChildEvidence, Compaction, CompactionReason, CompactionStatus,
@@ -422,6 +423,32 @@ impl RawPermission {
     }
 }
 
+/// The session sentinel an OpenCode location-owned MCP elicitation carries
+/// (`GLOBAL_ELICITATION_SESSION_ID`). It is the *wire's* spelling: the neutral
+/// model maps it to [`crate::backend::types::RequestOwner::Location`], and the
+/// bridge never reads this string.
+pub(super) const GLOBAL_ELICITATION_SESSION_ID: &str = "global";
+
+/// The metadata an MCP elicitation carries (`metadata.kind`, `server`,
+/// `message`). A form without it is an ordinary session-backed form; an
+/// unmarked session-less form keeps #489's WARN-and-skip.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct RawFormMetadata {
+    #[serde(default)]
+    pub(super) kind: Option<String>,
+    #[serde(default)]
+    pub(super) server: Option<String>,
+    #[serde(default)]
+    pub(super) message: Option<String>,
+}
+
+impl RawFormMetadata {
+    /// Whether this metadata marks the form as an MCP elicitation (ADR-0103).
+    fn is_mcp_elicitation(&self) -> bool {
+        self.kind.as_deref() == Some("mcp-elicitation")
+    }
+}
+
 /// `GET /api/form` — `{location, data: Form.Info[]}`.
 #[derive(Debug, Deserialize)]
 pub(super) struct RawForm {
@@ -432,6 +459,10 @@ pub(super) struct RawForm {
     pub(super) title: String,
     #[serde(default)]
     pub(super) fields: Vec<RawFormField>,
+    /// Kept raw and decoded leniently: a malformed/unknown metadata shape must
+    /// never fail the whole form list, it only loses the elicitation marker.
+    #[serde(default)]
+    pub(super) metadata: Option<Value>,
 }
 
 impl RawForm {
@@ -439,13 +470,46 @@ impl RawForm {
     /// answer key and typed kind. The `when` visibility conditions are
     /// deliberately not carried — cola renders every field (spec #364, out of
     /// scope: V2-only form behaviour beyond parity).
+    ///
+    /// Ownership is decided HERE, at the adapter boundary: a form whose
+    /// metadata marks it `mcp-elicitation` **and** whose session is the
+    /// `global` sentinel is a Location Form. Its session id is cleared, so no
+    /// bridge path can mistake the wire sentinel for a Session. Every other
+    /// form keeps its Session (including an unmarked session-less one, which
+    /// #489 then skips).
     pub(super) fn into_neutral(self) -> QuestionRequest {
+        let RawForm {
+            id,
+            session_id,
+            title,
+            fields,
+            metadata,
+        } = self;
+        let metadata = metadata
+            .and_then(|value| serde_json::from_value::<RawFormMetadata>(value).ok())
+            .unwrap_or_default();
+        let location = session_id == GLOBAL_ELICITATION_SESSION_ID && metadata.is_mcp_elicitation();
+        let questions: Vec<QuestionInfo> = fields.into_iter().map(RawFormField::into_neutral).collect();
+        // A secret field can never be collected on a shared card: the whole
+        // request is uncollectable with the existing secret-input reason, so
+        // every surface offers only a decline (ADR-0103).
+        let uncollectable = questions
+            .iter()
+            .any(|field| field.secret)
+            .then_some(UncollectableReason::SecretInput);
         QuestionRequest {
-            id: self.id,
-            session_id: self.session_id,
-            title: self.title,
-            questions: self.fields.into_iter().map(RawFormField::into_neutral).collect(),
-            uncollectable: None,
+            id,
+            session_id: if location { String::new() } else { session_id },
+            title,
+            questions,
+            uncollectable,
+            owner: if location {
+                crate::backend::types::RequestOwner::Location
+            } else {
+                crate::backend::types::RequestOwner::Session
+            },
+            server: metadata.server,
+            message: metadata.message,
         }
     }
 }
@@ -468,6 +532,10 @@ pub(super) enum RawFormField {
         custom: Option<bool>,
         #[serde(default)]
         options: Vec<RawFormOption>,
+        /// The field's wire format (`email`, `uri`, …). A secret format
+        /// (`password`) makes the whole form uncollectable.
+        #[serde(default)]
+        format: Option<String>,
     },
     Number {
         key: String,
@@ -536,6 +604,7 @@ impl RawFormField {
             custom,
             required,
             url: None,
+            secret: false,
         };
         match self {
             RawFormField::String {
@@ -545,15 +614,22 @@ impl RawFormField {
                 required,
                 custom,
                 options,
-            } => field(
-                key,
-                title,
-                description,
-                FormFieldKind::String,
-                options,
-                custom,
-                required,
-            ),
+                format,
+            } => {
+                let mut field = field(
+                    key,
+                    title,
+                    description,
+                    FormFieldKind::String,
+                    options,
+                    custom,
+                    required,
+                );
+                // The MCP schema has no `password` format today; the guard
+                // covers the shape the protocol permits (ADR-0103).
+                field.secret = matches!(format.as_deref(), Some("password" | "secret"));
+                field
+            }
             RawFormField::Number {
                 key,
                 title,
@@ -626,6 +702,7 @@ impl RawFormField {
                 custom: None,
                 required: false,
                 url: Some(url),
+                secret: false,
             },
         }
     }

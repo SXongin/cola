@@ -103,6 +103,13 @@ pub trait DirectoryBackend: Send + Sync {
 
     async fn reject_question(&self, session_id: &str, request_id: &str) -> Result<()>;
 
+    /// Answer a directory-owned **Location Form** (ADR-0103): no Session owns
+    /// it, so the route carries the owning directory instead.
+    async fn reply_location_form(&self, request_id: &str, answers: &[FormAnswer]) -> Result<()>;
+
+    /// Cancel a directory-owned **Location Form** (ADR-0103).
+    async fn reject_location_form(&self, request_id: &str) -> Result<()>;
+
     async fn session_info(&self, session_id: &str) -> Result<SessionInfo>;
 }
 
@@ -146,6 +153,18 @@ impl DirectoryBackend for BackendDirectory {
     async fn reject_question(&self, session_id: &str, request_id: &str) -> Result<()> {
         self.backend
             .reject_question(session_id, request_id, Some(&self.directory))
+            .await
+    }
+
+    async fn reply_location_form(&self, request_id: &str, answers: &[FormAnswer]) -> Result<()> {
+        self.backend
+            .reply_location_form(request_id, answers, Some(&self.directory))
+            .await
+    }
+
+    async fn reject_location_form(&self, request_id: &str) -> Result<()> {
+        self.backend
+            .reject_location_form(request_id, Some(&self.directory))
             .await
     }
 
@@ -745,6 +764,31 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         request_id: &str,
         directory: Option<&str>,
     ) -> Result<()>;
+
+    /// Answer a directory-owned **Location Form** (ADR-0103) — an MCP
+    /// elicitation whose owner is a directory, not a Session. The route carries
+    /// `directory` and the generation's own location placeholder; no Session
+    /// id exists to pass. The default answers an error: a client without an
+    /// elicitation-form surface cannot have a pending Location Form, so this is
+    /// **not applicable** rather than a silently guessed route.
+    async fn reply_location_form(
+        &self,
+        _request_id: &str,
+        _answers: &[FormAnswer],
+        _directory: Option<&str>,
+    ) -> Result<()> {
+        Err(crate::error::BridgeError::OpenCode(
+            "location forms are not supported by this client".into(),
+        ))
+    }
+
+    /// Cancel a directory-owned **Location Form** (ADR-0103). The same
+    /// not-applicable default as [`Self::reply_location_form`].
+    async fn reject_location_form(&self, _request_id: &str, _directory: Option<&str>) -> Result<()> {
+        Err(crate::error::BridgeError::OpenCode(
+            "location forms are not supported by this client".into(),
+        ))
+    }
 
     /// Read one Session as a neutral [`SessionTranscript`] — the read model the
     /// Bridge consumes (ADR-0053). The adapter's wire envelope never reaches

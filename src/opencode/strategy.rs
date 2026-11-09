@@ -112,6 +112,35 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         directory: Option<&str>,
     ) -> Result<()>;
 
+    /// Answer a directory-owned **Location Form** (ADR-0103). V2 routes it
+    /// through the location route with the wire's `global` session placeholder
+    /// and the owning directory; a generation without elicitation forms has no
+    /// such surface, so the default is an error rather than a guessed route.
+    async fn reply_location_form(
+        &self,
+        _http: &Transport,
+        _request_id: &str,
+        _answers: &[FormAnswer],
+        _directory: Option<&str>,
+    ) -> Result<()> {
+        Err(crate::error::BridgeError::OpenCode(
+            "location forms are not supported by this client".into(),
+        ))
+    }
+
+    /// Cancel a directory-owned **Location Form** (ADR-0103). Same capability
+    /// rule as [`Self::reply_location_form`].
+    async fn reject_location_form(
+        &self,
+        _http: &Transport,
+        _request_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<()> {
+        Err(crate::error::BridgeError::OpenCode(
+            "location forms are not supported by this client".into(),
+        ))
+    }
+
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript>;
 
     /// One Turn's file diff (`GET /api/session/{id}/diff` on V2): each changed

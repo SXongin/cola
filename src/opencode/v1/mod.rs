@@ -796,9 +796,15 @@ impl WireQuestion {
                     custom: question.custom,
                     required: false,
                     url: None,
+                    secret: false,
                 })
                 .collect(),
             uncollectable: None,
+            // V1 questions are always session-backed: it has no MCP
+            // elicitation-form surface (ADR-0103).
+            owner: crate::backend::types::RequestOwner::Session,
+            server: None,
+            message: None,
         }
     }
 }

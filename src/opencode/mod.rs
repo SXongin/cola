@@ -138,6 +138,19 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::reject_question(self, session_id, request_id, directory).await
     }
 
+    async fn reply_location_form(
+        &self,
+        request_id: &str,
+        answers: &[FormAnswer],
+        directory: Option<&str>,
+    ) -> Result<()> {
+        OpenCodeBackend::reply_location_form(self, request_id, answers, directory).await
+    }
+
+    async fn reject_location_form(&self, request_id: &str, directory: Option<&str>) -> Result<()> {
+        OpenCodeBackend::reject_location_form(self, request_id, directory).await
+    }
+
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {
         OpenCodeBackend::transcript(self, session_id).await
     }

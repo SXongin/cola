@@ -227,6 +227,7 @@ async fn form_reply_submits_keyed_answers_and_keeps_custom_verbatim() {
                     field("many", crate::backend::types::FormFieldKind::Multiselect),
                 ],
                 uncollectable: None,
+                ..Default::default()
             },
             "/work",
         )

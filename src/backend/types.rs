@@ -454,6 +454,10 @@ pub struct QuestionInfo {
     pub required: bool,
     /// The link of an `external` field (not answerable; acknowledged).
     pub url: Option<String>,
+    /// The wire marked this field as a secret (`format: "password"`): its
+    /// value must never be collected on a shared card, so the whole request
+    /// is uncollectable with [`UncollectableReason::SecretInput`].
+    pub secret: bool,
 }
 
 impl QuestionInfo {
@@ -624,6 +628,22 @@ pub enum UncollectableReason {
     SecretInput,
 }
 
+/// Who owns a pending form/question request. A Session-owned request belongs
+/// to the Session that asked; a Location-owned one belongs to a directory
+/// (an MCP elicitation from a directory-owned server, ADR-0103), so no
+/// Session — and no Turn — can own its surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestOwner {
+    /// The ordinary case: the request names the asking Session.
+    #[default]
+    Session,
+    /// The request belongs to the directory that listed it; there is no
+    /// Session. `QuestionRequest::session_id` is empty for one of these — the
+    /// adapter maps its wire sentinel to this owner, and the bridge never
+    /// reads that sentinel.
+    Location,
+}
+
 /// A pending question (V1) / form (V2) request: the AI asks the user one or
 /// more typed fields and blocks until answered or cancelled.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -637,9 +657,23 @@ pub struct QuestionRequest {
     /// the reason and offer only a decline. The neutral shape carries the
     /// reason, never the user-facing copy.
     pub uncollectable: Option<UncollectableReason>,
+    /// Who owns the request. A Location Form carries no Session; its surface
+    /// belongs to the directory's Chat/Topic (ADR-0103).
+    pub owner: RequestOwner,
+    /// The asking MCP server of an elicitation (`metadata.server`); `None` on
+    /// a session-backed form and every V1 question.
+    pub server: Option<String>,
+    /// The elicitation's message (`metadata.message`); `None` unless the wire
+    /// carried one.
+    pub message: Option<String>,
 }
 
 impl QuestionRequest {
+    /// Whether this request belongs to a directory rather than a Session.
+    pub fn is_location(&self) -> bool {
+        self.owner == RequestOwner::Location
+    }
+
     /// A request cola cannot safely collect at all — a secret input, which
     /// would be visible on a shared card. The shape is a request with no
     /// fields and a named reason, so every surface can show its own copy and
@@ -651,6 +685,9 @@ impl QuestionRequest {
             title: String::new(),
             questions: Vec::new(),
             uncollectable: Some(UncollectableReason::SecretInput),
+            owner: RequestOwner::Session,
+            server: None,
+            message: None,
         }
     }
 }

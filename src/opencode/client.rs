@@ -437,6 +437,30 @@ impl OpenCodeBackend {
             .await
     }
 
+    /// Answer a directory-owned Location Form (ADR-0103): the generation's
+    /// location route, scoped by the owning directory.
+    pub async fn reply_location_form(
+        &self,
+        request_id: &str,
+        answers: &[FormAnswer],
+        directory: Option<&str>,
+    ) -> crate::error::Result<()> {
+        self.strategy()
+            .reply_location_form(&self.transport, request_id, answers, directory)
+            .await
+    }
+
+    /// Cancel a directory-owned Location Form (ADR-0103).
+    pub async fn reject_location_form(
+        &self,
+        request_id: &str,
+        directory: Option<&str>,
+    ) -> crate::error::Result<()> {
+        self.strategy()
+            .reject_location_form(&self.transport, request_id, directory)
+            .await
+    }
+
     /// The session transcript, with this cola life's Background Task liveness
     /// tier applied ([`TasksHandle::apply`], issue #454, review #588): a
     /// Background Task the runtime confirmed ended leaves the live list here,

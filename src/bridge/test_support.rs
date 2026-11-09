@@ -256,6 +256,18 @@ type QuestionReplyRecord = (String, Vec<Vec<String>>);
 /// A recorded keyed `reply_question` call: (request_id, form answers).
 type KeyedQuestionReply = (String, Vec<crate::backend::types::FormAnswer>);
 
+/// A recorded Location Form reply/cancel: `(request_id, answers, directory)`;
+/// `answers` is `None` for a cancel.
+type LocationFormReply = (
+    String,
+    Option<Vec<crate::backend::types::FormAnswer>>,
+    Option<String>,
+);
+
+/// A recorded session-backed question route: `(request_id, session_id,
+/// directory)`.
+type QuestionRouteRecord = (String, String, Option<String>);
+
 /// One `session_diff` read's arguments, in call order: `(session_id, from,
 /// to, context)` (#801).
 pub(crate) type SessionDiffCall = (String, Option<String>, Option<String>, Option<u32>);
@@ -397,6 +409,10 @@ pub struct RecordingPlatform {
     /// When true, `reply_in_thread` fails (tests that a failed in-topic
     /// confirmation is propagated instead of adopting with no anchor).
     pub fail_reply_in_thread: bool,
+    /// When true, `list_messages` returns nothing: a topic with no reachable
+    /// anchor (a Location Form push defers rather than falling back to the
+    /// Chat lobby).
+    pub no_topic_messages: std::sync::atomic::AtomicBool,
     /// The next N `reply_in_thread` calls fail, then the call succeeds — a
     /// transient failure a test can retry past.
     pub fail_reply_in_thread_count: std::sync::atomic::AtomicUsize,
@@ -538,6 +554,7 @@ impl RecordingPlatform {
             fail_send_card: false,
             fail_reply_card: false,
             fail_reply_in_thread: false,
+            no_topic_messages: std::sync::atomic::AtomicBool::new(false),
             fail_reply_in_thread_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1267,6 +1284,9 @@ impl feishu::Platform for RecordingPlatform {
         _container_id_type: &str,
         _container_id: &str,
     ) -> crate::error::Result<Vec<crate::feishu::client::ChatMessage>> {
+        if self.no_topic_messages.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Vec::new());
+        }
         Ok(vec![crate::feishu::client::ChatMessage {
             message_id: "msg_in_topic_anchor".into(),
             msg_type: "interactive".into(),
@@ -1681,8 +1701,17 @@ pub struct MockBackend {
     /// serves normally) — a wedged or failed read on one arm of a caller that
     /// must degrade without failing the whole turn. Armable through `&self`.
     pub fail_transcript_reads: Arc<std::sync::atomic::AtomicUsize>,
-    /// Pending questions served by `list_questions`.
+    /// Pending questions served by `list_questions` when the directory has no
+    /// override. Existing tests script this; Location Form tests use
+    /// [`Self::ask_question_in`] so the same form is not listed in every
+    /// directory.
     pub questions: Vec<crate::backend::types::QuestionRequest>,
+    /// Directory → pending questions, served instead of [`Self::questions`]
+    /// for that directory. The real V2 list is location-scoped; this is what
+    /// lets a pooled/shared-connection test prove two directories see their
+    /// own listings.
+    pub questions_by_directory:
+        std::collections::HashMap<String, Vec<crate::backend::types::QuestionRequest>>,
     /// Records `reply_question` calls: (request_id, answers). The answers are
     /// the positional string form the keyed neutral answers flatten to, so the
     /// existing click assertions read the submitted selection.
@@ -1690,6 +1719,21 @@ pub struct MockBackend {
     /// The keyed answers each `reply_question` carried, in call order — the
     /// form-model assertion (V2 submits `Form.Answer` objects).
     pub reply_question_keyed_calls: Arc<tokio::sync::Mutex<Vec<KeyedQuestionReply>>>,
+    /// `(request_id, session_id, directory)` each session-backed question
+    /// reply/cancel was routed with, in call order: asserts the session path
+    /// is unchanged.
+    pub reply_question_routes: Arc<tokio::sync::Mutex<Vec<QuestionRouteRecord>>>,
+    /// Location Form replies/cancels: `(request_id, answers, directory)`.
+    /// `answers` is `None` for a cancel. The directory is the one whose form
+    /// list produced the request.
+    pub location_reply_calls: Arc<tokio::sync::Mutex<Vec<LocationFormReply>>>,
+    /// When true, a Location Form reply/cancel fails with the adapter's
+    /// retryable 404 shape (`FormNotFoundError` mapped to a plain error, NOT
+    /// `BridgeError::NotFound`), as a real V2 adapter does.
+    pub location_form_retryable_404: bool,
+    /// When true, a Location Form reply/cancel reports the form already
+    /// settled (409) — the benign handled path.
+    pub location_form_settled: bool,
     /// Question ids cola answered/submitted/rejected via `reply_question` —
     /// filtered out of `list_questions` like the real server drops a replied
     /// request. A test simulating resolution by ANOTHER client inserts the id
@@ -2126,8 +2170,13 @@ impl MockBackend {
             hang_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             fail_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             questions: Vec::new(),
+            questions_by_directory: std::collections::HashMap::new(),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            reply_question_routes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            location_reply_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            location_form_retryable_404: false,
+            location_form_settled: false,
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -2300,6 +2349,36 @@ impl MockBackend {
         requests: Vec<crate::backend::types::QuestionRequest>,
     ) -> &mut Self {
         self.questions = requests;
+        self
+    }
+
+    /// Scenario: `request` is pending in `directory` only — the location-scoped
+    /// shape a Location Form is listed in. Other directories keep their own
+    /// override (or the default `questions` list).
+    pub(crate) fn ask_question_in(
+        &mut self,
+        directory: &str,
+        request: crate::backend::types::QuestionRequest,
+    ) -> &mut Self {
+        self.questions_by_directory
+            .entry(directory.to_string())
+            .or_default()
+            .push(request);
+        self
+    }
+
+    /// Scenario: the addressed Location Form reply/cancel hits the V2 wire's
+    /// `FormNotFoundError` (404), which the adapter maps to a RETRYABLE error
+    /// (never `NotFound`): the card/surface/record must survive.
+    pub(crate) fn location_form_reply_404_retryable(&mut self) -> &mut Self {
+        self.location_form_retryable_404 = true;
+        self
+    }
+
+    /// Scenario: the addressed Location Form was already settled (409) — the
+    /// benign handled path.
+    pub(crate) fn location_form_already_settled(&mut self) -> &mut Self {
+        self.location_form_settled = true;
         self
     }
 
@@ -3017,6 +3096,28 @@ impl MockBackend {
         self.replied_questions.lock().await.insert(request_id.to_string());
         Ok(())
     }
+    /// The location reply/cancel outcome both mock methods share.
+    async fn location_form_outcome(
+        retryable_404: bool,
+        settled: bool,
+        request_id: &str,
+        replied: &tokio::sync::Mutex<std::collections::HashSet<String>>,
+    ) -> crate::error::Result<()> {
+        if retryable_404 {
+            // The adapter's Location mapping: a 404 is an ordinary error (the
+            // wire cannot distinguish a wrong location from a cancelled pooled
+            // loser), NOT `NotFound`.
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "form reply {request_id} failed: HTTP 404 — FormNotFoundError"
+            )));
+        }
+        if settled {
+            return Err(crate::error::BridgeError::NotFound(format!("form {request_id}")));
+        }
+        replied.lock().await.insert(request_id.to_string());
+        Ok(())
+    }
+
     /// The default transcript shape `transcript` serves when the test scripts
     /// no transcript for the session: cola's own or an external user message
     /// when modeled, otherwise the assistant side of cola's own turn.
@@ -3649,18 +3750,21 @@ impl crate::backend::Backend for MockBackend {
 
     async fn list_questions(
         &self,
-        _d: Option<&str>,
+        d: Option<&str>,
     ) -> crate::error::Result<Vec<crate::backend::types::QuestionRequest>> {
         self.list_question_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         hang_if_scripted(&self.hang_list_questions).await;
         let replied = self.replied_questions.lock().await;
-        Ok(self
-            .questions
-            .iter()
-            .filter(|q| !replied.contains(&q.id))
-            .cloned()
-            .collect())
+        // The real V2 read is location-scoped: a directory with its own
+        // script sees only those forms, so a shared-connection test can prove
+        // each holder is listed separately. A directory without one keeps the
+        // legacy global `questions` (existing tests script that).
+        let source = match d.and_then(|dir| self.questions_by_directory.get(dir)) {
+            Some(forms) => forms.clone(),
+            None => self.questions.clone(),
+        };
+        Ok(source.into_iter().filter(|q| !replied.contains(&q.id)).collect())
     }
 
     async fn model_context_window(&self, _provider: &str, _model: &str) -> crate::error::Result<Option<i64>> {
@@ -3800,11 +3904,16 @@ impl crate::backend::Backend for MockBackend {
 
     async fn reply_question(
         &self,
-        _session_id: &str,
+        session_id: &str,
         request_id: &str,
         answers: &[crate::backend::types::FormAnswer],
-        _d: Option<&str>,
+        d: Option<&str>,
     ) -> crate::error::Result<()> {
+        self.reply_question_routes.lock().await.push((
+            request_id.to_string(),
+            session_id.to_string(),
+            d.map(str::to_string),
+        ));
         let positional = answers
             .iter()
             .map(|answer| {
@@ -3832,12 +3941,51 @@ impl crate::backend::Backend for MockBackend {
 
     async fn reject_question(
         &self,
-        _session_id: &str,
+        session_id: &str,
         request_id: &str,
-        _d: Option<&str>,
+        d: Option<&str>,
     ) -> crate::error::Result<()> {
+        self.reply_question_routes.lock().await.push((
+            request_id.to_string(),
+            session_id.to_string(),
+            d.map(str::to_string),
+        ));
         self.record_question_reply(request_id, vec![vec!["__reject__".to_string()]], Vec::new())
             .await
+    }
+
+    async fn reply_location_form(
+        &self,
+        request_id: &str,
+        answers: &[crate::backend::types::FormAnswer],
+        d: Option<&str>,
+    ) -> crate::error::Result<()> {
+        self.location_reply_calls.lock().await.push((
+            request_id.to_string(),
+            Some(answers.to_vec()),
+            d.map(str::to_string),
+        ));
+        Self::location_form_outcome(
+            self.location_form_retryable_404,
+            self.location_form_settled,
+            request_id,
+            &self.replied_questions,
+        )
+        .await
+    }
+
+    async fn reject_location_form(&self, request_id: &str, d: Option<&str>) -> crate::error::Result<()> {
+        self.location_reply_calls
+            .lock()
+            .await
+            .push((request_id.to_string(), None, d.map(str::to_string)));
+        Self::location_form_outcome(
+            self.location_form_retryable_404,
+            self.location_form_settled,
+            request_id,
+            &self.replied_questions,
+        )
+        .await
     }
 
     async fn reply_permission(
