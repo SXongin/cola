@@ -4162,8 +4162,9 @@ impl StreamAccumulator {
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
     /// (chunks of the same part merge into one panel; a part keyed apart is
-    /// its own panel). Production renders go through [`Self::push_reasoning_from`];
-    /// this convenience form is for tests and synthetic content.
+    /// its own panel). Production renders go through
+    /// [`Self::push_reasoning_at_key`]; this convenience form is for tests and
+    /// synthetic content.
     #[cfg(test)]
     pub(super) fn push_reasoning(&mut self, chunk: &str) {
         self.push_reasoning_at(None, chunk);
@@ -4172,7 +4173,7 @@ impl StreamAccumulator {
     /// [`Self::push_reasoning`] for a reasoning part that started at `at_ms`
     /// (the server's `time.start`); `None` keys it by fallback and shows no
     /// clock. Test-only like [`Self::push_reasoning`]: production renders go
-    /// through [`Self::push_reasoning_from`].
+    /// through [`Self::push_reasoning_at_key`].
     #[cfg(test)]
     pub(super) fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
         self.push_reasoning_from(at_ms, None, chunk);
