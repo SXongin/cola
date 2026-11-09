@@ -45,8 +45,9 @@ would mean anything.
 
 **Delivery.** A Location Form is pushed once, as a standalone card, into the
 conversation of the directory's newest mapped Session in the SessionStore's
-activation order — the order `/switch` already maintains, filtered by directory
-and Agent Client — using that conversation's topic anchor when it is a topic.
+activation order — the newest mapped entry first, filtered by directory and
+Agent Client; this is the store's local activation order, not `/switch`'s
+server-time sort — using that conversation's topic anchor when it is a topic.
 The card names the asking MCP server and its message, and shows the directory,
 so the answerer knows what is being asked and whom the answer commits; the V2
 adapter carries `metadata.server` and `metadata.message` into the neutral
@@ -117,18 +118,18 @@ literal `global` session id — `POST /api/session/global/form/{id}/reply` and
 `DELETE /api/session/global/form/{id}` — plus `location[directory]`, where the
 directory is the one whose form list produced the request.
 
-The two failure statuses are not interchangeable. A **409**
-(`Form.AlreadySettledError`) is benign — the form settled, and the card takes
-the handled path. A **404** (`Form.NotFoundError`) on a Location Form is a
-**retryable refusal**: it can mean the reply reached the wrong location while
-the form keeps waiting there, so cola
-keeps the standalone surface and the pushed/dismissed record, tells the user the
-answer did not land, and lets the next complete sweep withdraw the card only if
-the form is genuinely gone. A wrong-location 404 is never read as a successful
-answer, and it never deletes the only surface the waiting form has. A losing
-copy on a pooled no-caller request is already cancelled, so its reply takes the
-benign already-handled path and shows the same resolved-elsewhere card as any
-settled request — the accepted copy for that rare case.
+The two failure statuses are not interchangeable, and there is no third case.
+A **409** (`Form.AlreadySettledError`) is benign — the form settled, and the
+card takes the handled path. A **404** (`Form.NotFoundError`) on a Location Form
+is **always a retryable refusal**, because the wire carries no marker that
+distinguishes a wrong location from a cancelled pooled loser: cola keeps the
+standalone surface and the pushed/dismissed record, tells the user the answer
+did not land, and lets the next complete sweep withdraw the card once the form
+is genuinely gone. A wrong-location 404 is never read as a successful answer,
+and it never deletes the only surface the waiting form has. A losing copy on a
+pooled no-caller request is already cancelled upstream, so a late reply to it
+takes the same retryable 404 path and the next complete sweep withdraws the
+card.
 
 **Shape.** Both elicitation modes are delivered. An `external` field renders as
 its link plus an acknowledgement. A secret field is marked uncollectable with
@@ -148,6 +149,12 @@ permits, not for a case in the current wire.
   already-handled path: the surface and record survive, and only a complete
   sweep withdraws a form that is genuinely gone. A 409 keeps the benign handled
   path. Every Location Form card carries the shared-directory caveat.
+- The reply-error mapping splits by owner: a session-backed form keeps the
+  existing 404/409-as-handled mapping, while a Location Form maps 409 to handled
+  and 404 to retryable. The existing V2 form-reply tests are updated to pin the
+  split.
+- Both user guides gain the location-form behaviour and the `/mcp` command,
+  including the shared-directory caveat and the retryable-404 rule.
 - A new Backend capability method for the MCP status read. An adapter without
   the surface returns `None`, not an error — the Backend trait's rule that a
   default shape means "not applicable to this client", never a failed read
