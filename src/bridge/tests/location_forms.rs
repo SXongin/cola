@@ -100,15 +100,15 @@ fn multi_location_form(request_id: &str) -> QuestionRequest {
 }
 
 /// A Location Form whose option's submitted value differs from its display
-/// label, with a custom entry allowed: proves the record stores clicked wire
-/// values, never display labels or typed text.
+/// label, with a custom entry allowed: proves a String field's record stores
+/// clicked wire values, never display labels or typed free text.
 fn wire_value_location_form(request_id: &str) -> QuestionRequest {
     QuestionRequest::location(
         request_id,
         "选择部署目标".into(),
         vec![QuestionInfo {
-            key: "targets".into(),
-            question: "要部署到哪些目标？".into(),
+            key: "target".into(),
+            question: "要部署到哪个目标？".into(),
             header: "目标".into(),
             kind: FormFieldKind::Multiselect,
             options: vec![QuestionOption {
@@ -121,6 +121,70 @@ fn wire_value_location_form(request_id: &str) -> QuestionRequest {
         }],
         Some("deploy".into()),
         Some("选择部署目标".into()),
+        None,
+    )
+}
+
+/// A boolean Location Form: its buttons carry the literal `"true"`/`"false"`
+/// strings the persisted-value filter accepts.
+fn boolean_location_form(request_id: &str) -> QuestionRequest {
+    QuestionRequest::location(
+        request_id,
+        "确认部署".into(),
+        vec![QuestionInfo {
+            key: "confirm".into(),
+            question: "现在部署吗？".into(),
+            header: "确认".into(),
+            kind: FormFieldKind::Boolean,
+            ..Default::default()
+        }],
+        Some("deploy".into()),
+        Some("确认部署".into()),
+        None,
+    )
+}
+
+/// A free-text Location Form: its typed value is not a toggle and must never
+/// reach the mirror.
+fn free_text_location_form(request_id: &str) -> QuestionRequest {
+    QuestionRequest::location(
+        request_id,
+        "输入备注".into(),
+        vec![QuestionInfo {
+            key: "note".into(),
+            question: "备注".into(),
+            header: "备注".into(),
+            kind: FormFieldKind::String,
+            custom: Some(true),
+            ..Default::default()
+        }],
+        Some("deploy".into()),
+        Some("输入备注".into()),
+        None,
+    )
+}
+
+/// A multi-select whose options are clicked, with custom entries allowed: the
+/// custom entry is a deliberate toggle, not an unsubmitted draft.
+fn custom_multi_location_form(request_id: &str) -> QuestionRequest {
+    QuestionRequest::location(
+        request_id,
+        "选择标签".into(),
+        vec![QuestionInfo {
+            key: "tags".into(),
+            question: "要附加哪些标签？".into(),
+            header: "标签".into(),
+            kind: FormFieldKind::Multiselect,
+            options: vec![QuestionOption {
+                value: String::new(),
+                label: "staging".into(),
+                description: String::new(),
+            }],
+            custom: Some(true),
+            ..Default::default()
+        }],
+        Some("deploy".into()),
+        Some("选择标签".into()),
         None,
     )
 }
@@ -905,11 +969,91 @@ async fn a_restart_restores_a_partial_multi_select_before_confirm() {
     );
 }
 
-/// A Location Form's persisted partial state holds the clicked option's WIRE
-/// value, never its display label and never text the Host typed into a custom
-/// answer box: typed text stays client-side (ADR-0103).
+/// A custom multi-select entry is a deliberate toggle, not a draft: it is
+/// persisted, and after a restart the card's confirm submits that token rather
+/// than an empty list (ADR-0103).
 #[tokio::test]
-async fn a_location_form_record_stores_clicked_wire_values_not_typed_text() {
+async fn a_custom_multi_select_toggle_survives_restart_and_confirm_submits_it() {
+    let fixture = fixture(
+        false,
+        &[("/work", custom_multi_location_form("frm_custom_restart"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let custom = serde_json::json!({
+        "action": "question",
+        "reply": "custom",
+        "request_id": "frm_custom_restart",
+        "session_id": "",
+        "directory": "/work",
+        "question_index": 0,
+        "answer": "custom-token",
+        "location_form": true,
+    });
+    let result = fixture
+        .app
+        .host_action(custom)
+        .await
+        .expect("a custom toggle result");
+    let card = result.card.expect("the re-rendered card");
+    assert!(
+        card_text(&card).contains("custom-token"),
+        "the card shows the custom selection: {}",
+        card_text(&card)
+    );
+
+    let persisted =
+        persisted_location_form(&fixture.session_file(), "frm_custom_restart").expect("the record");
+    assert_eq!(
+        persisted["partial"]["display"][0],
+        serde_json::json!(["custom-token"]),
+        "the custom toggle is persisted with the wire selection"
+    );
+
+    let session_file = fixture.session_file();
+    let (app, platform, backend) = restart_fixture(
+        &session_file,
+        &[("/work", custom_multi_location_form("frm_custom_restart"))],
+    )
+    .await;
+    platform.given_card_view("msg_sent", serde_json::json!({ "body": { "elements": [] } }));
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "the live card is re-adopted, never repainted"
+    );
+
+    let confirm = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["reply"] == "confirm")
+        .map(|button| button["value"].clone())
+        .expect("a confirm control");
+    let result = app.host_action(confirm).await.expect("a confirm result");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已回答")),
+        "the confirm submits"
+    );
+    let calls = backend.location_reply_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].1.as_ref().expect("answers")[0].value,
+        Some(crate::backend::types::FormValue::List(vec![
+            "custom-token".into()
+        ])),
+        "the restored custom toggle is the submitted answer"
+    );
+}
+
+/// A Location Form's persisted partial state holds a clicked option's WIRE
+/// value, never its display label (ADR-0103).
+#[tokio::test]
+async fn a_location_form_record_stores_clicked_wire_values() {
     let fixture = fixture(
         false,
         &[("/work", wire_value_location_form("frm_wire"))],
@@ -932,10 +1076,55 @@ async fn a_location_form_record_stores_clicked_wire_values_not_typed_text() {
         "the clicked wire value is persisted, not its display label"
     );
 
+    let raw = persisted.to_string();
+    assert!(
+        !raw.contains("Deploy"),
+        "the display label is not persisted: {raw}"
+    );
+}
+
+/// A boolean answer is the renderer's literal `"true"`/`"false"` button value,
+/// which the persisted-value filter accepts.
+#[tokio::test]
+async fn a_boolean_location_answer_is_persisted_as_its_literal_value() {
+    let fixture = fixture(
+        false,
+        &[("/work", boolean_location_form("frm_boolean"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let yes = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "true")
+        .map(|button| button["value"].clone())
+        .expect("the 是 button");
+    fixture.app.host_action(yes).await.expect("a boolean answer");
+    let persisted = persisted_location_form(&fixture.session_file(), "frm_boolean").expect("the record");
+    assert_eq!(
+        persisted["partial"]["display"][0],
+        serde_json::json!(["true"]),
+        "the literal boolean value is persisted"
+    );
+}
+
+/// Free-text answers are not toggles: a typed value never reaches the record.
+#[tokio::test]
+async fn a_location_form_record_drops_free_text_answers() {
+    let fixture = fixture(
+        false,
+        &[("/work", free_text_location_form("frm_free_text"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
     let custom = serde_json::json!({
         "action": "question",
-        "reply": "custom",
-        "request_id": "frm_wire",
+        "reply": "answer",
+        "request_id": "frm_free_text",
         "session_id": "",
         "directory": "/work",
         "question_index": 0,
@@ -943,19 +1132,14 @@ async fn a_location_form_record_stores_clicked_wire_values_not_typed_text() {
         "location_form": true,
     });
     fixture.app.host_action(custom).await.expect("a custom result");
-    let persisted = persisted_location_form(&fixture.session_file(), "frm_wire").expect("the record");
-    let values = persisted["partial"]["display"][0]
-        .as_array()
-        .expect("the persisted selection");
-    assert_eq!(values, &vec![serde_json::json!("wire_deploy")]);
-    let raw = persisted.to_string();
+    let persisted = persisted_location_form(&fixture.session_file(), "frm_free_text").expect("the record");
     assert!(
-        !raw.contains("a value I typed"),
-        "typed text is not persisted: {raw}"
+        persisted.get("partial").is_none_or(serde_json::Value::is_null),
+        "a free-text answer leaves no partial selection: {persisted}"
     );
     assert!(
-        !raw.contains("Deploy"),
-        "the display label is not persisted: {raw}"
+        !persisted.to_string().contains("a value I typed"),
+        "typed text is not persisted: {persisted}"
     );
 }
 
