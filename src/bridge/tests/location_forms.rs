@@ -816,6 +816,69 @@ async fn a_partial_multi_select_round_trips_through_defer_and_reopen() {
     );
 }
 
+/// A restart restores a Location Form's partial multi-select into its state
+/// WITHOUT repainting the live card: confirming the visible card then submits
+/// the visible selection, not an empty list (ADR-0103).
+#[tokio::test]
+async fn a_restart_restores_a_partial_multi_select_before_confirm() {
+    let fixture = fixture(
+        false,
+        &[("/work", multi_location_form("frm_multi_restart"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let staging = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "staging")
+        .map(|button| button["value"].clone())
+        .expect("a staging option");
+    fixture.app.host_action(staging).await.expect("a toggle result");
+
+    let persisted =
+        persisted_location_form(&fixture.session_file(), "frm_multi_restart").expect("the push record");
+    assert_eq!(persisted["partial"]["display"][0][0], "staging");
+
+    let session_file = fixture.session_file();
+    let (app, platform, backend) = restart_fixture(
+        &session_file,
+        &[("/work", multi_location_form("frm_multi_restart"))],
+    )
+    .await;
+    // The read succeeds, so this is a real live-card re-adoption (not the
+    // unknown-read fallback).
+    platform.given_card_view("msg_sent", serde_json::json!({ "body": { "elements": [] } }));
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "a live card is re-adopted, never repainted or duplicated"
+    );
+
+    let confirm = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["reply"] == "confirm")
+        .map(|button| button["value"].clone())
+        .expect("a confirm control");
+    let result = app.host_action(confirm).await.expect("a confirm result");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已回答")),
+        "the confirm submits"
+    );
+    let calls = backend.location_reply_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].1.as_ref().expect("answers")[0].value,
+        Some(crate::backend::types::FormValue::List(vec!["staging".into()])),
+        "the submitted answer is the selection the card showed"
+    );
+}
+
 /// A card PATCH that fails after the durable dismissal keeps the card, its pin
 /// and its answerability: the record already says dismissed, so `/mcp` can
 /// reopen it, while the live card is not a dead end.
@@ -1286,11 +1349,14 @@ async fn a_reappearing_form_after_staling_is_pushed_again() {
         |_| {},
     )
     .await;
-    sweep(&fixture).await;
+    // Production reuses ONE poll-loop `seen` set across sweeps; sharing it
+    // here proves the stale path really frees a genuinely reappearing id.
+    let mut seen = std::collections::HashSet::new();
+    sweep_with(&fixture, &mut seen).await;
     assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
 
     fixture.backend.question_resolved_by_another("frm_reappear").await;
-    sweep(&fixture).await;
+    sweep_with(&fixture, &mut seen).await;
     assert!(
         persisted_location_form(&fixture.session_file(), "frm_reappear").is_none(),
         "the stale pass removed the decision"
@@ -1302,7 +1368,7 @@ async fn a_reappearing_form_after_staling_is_pushed_again() {
         .lock()
         .await
         .remove("frm_reappear");
-    sweep(&fixture).await;
+    sweep_with(&fixture, &mut seen).await;
     assert_eq!(
         posted_cards(&fixture.platform).await.len(),
         2,
@@ -2103,23 +2169,47 @@ async fn a_failed_dismissal_write_leaves_a_live_answerable_card() {
     );
     std::fs::remove_dir(&temp_path).unwrap();
 
-    // The form is still answerable from the same live card.
-    let answer = button_with_reply(&card, "answer").expect("an answer control");
-    fixture.app.host_action(answer).await.expect("a click result");
-    assert_eq!(
-        fixture.backend.location_reply_calls.lock().await.len(),
-        1,
-        "the retained card still answers"
+    // The card and its surface survived: the form is still pending, and the
+    // restart below must re-adopt the same card rather than post a new one.
+    assert!(
+        fixture.app.question.has_question("frm_dismiss_fail").await,
+        "the live card still has its pending state"
+    );
+    assert!(
+        persisted_location_form(&session_file, "frm_dismiss_fail").is_some(),
+        "the failed dismissal did not disturb the push record"
     );
 
-    // And a restart re-adopts the live card rather than duplicating it.
-    let (app, platform, _backend) =
+    // And a restart re-adopts the live card rather than duplicating it. The
+    // scripted read proves the re-adoption path, and the click proves the
+    // adopted card is the live, answerable surface — not merely a suppressed
+    // record over a fresh mock's re-listed form.
+    let (app, platform, backend) =
         restart_fixture(&session_file, &[("/work", location_form("frm_dismiss_fail"))]).await;
+    platform.given_card_view("msg_sent", serde_json::json!({ "body": { "elements": [] } }));
     let mut seen = std::collections::HashSet::new();
     sweep_app(&app, &mut seen).await;
     assert!(
         posted_cards(&platform).await.is_empty(),
         "the live card is re-adopted, never duplicated"
+    );
+    assert!(
+        !platform.card_view_reads.lock().unwrap().is_empty(),
+        "the restart actually read the persisted card"
+    );
+    let answer = button_with_reply(&card, "answer").expect("an answer control");
+    let result = app.host_action(answer).await.expect("a click result");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已回答")),
+        "the re-adopted card is answerable"
+    );
+    assert_eq!(
+        backend.location_reply_calls.lock().await.len(),
+        1,
+        "the answer reaches the restarted process's backend"
     );
 }
 

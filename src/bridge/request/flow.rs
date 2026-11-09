@@ -627,14 +627,59 @@ impl RequestFlow {
     /// (routing a reply whose callback no longer carries one). Refreshing an
     /// already-remembered request keeps its recorded answers/toggles.
     pub(crate) async fn remember_question(&self, req: &crate::backend::types::QuestionRequest, dir: &str) {
+        // A Location Form's partial answer state is persisted with its surface
+        // record (ADR-0103): a restart re-adopts the live card WITHOUT
+        // repainting it (that would wipe a typed answer), so the state the
+        // card's next confirm/submit reads must be restored from disk or the
+        // visible 已选 markers and the submitted answer disagree.
+        let partial = req
+            .is_location()
+            .then(|| self.surfaces.location_form_partial(&req.id))
+            .flatten();
         let mut states = self.question_state.lock().await;
         match states.entry(req.id.clone()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().refresh(req, dir);
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(QuestionState::new(req.clone(), dir.to_string()));
+                let mut state = QuestionState::new(req.clone(), dir.to_string());
+                if let Some(partial) = partial {
+                    state.restore_paint(crate::bridge::question::QuestionPaint {
+                        display: partial.display,
+                        done: partial.done,
+                        open: partial.open,
+                        // Typed text is never persisted: it stays in the
+                        // client (the card-repaints rule), and a submit
+                        // carries it as the form value it arrives with.
+                        drafts: Vec::new(),
+                    });
+                }
+                entry.insert(state);
             }
+        }
+    }
+
+    /// Persist the partial answer state a Location Form's card currently
+    /// shows, for the restart re-adoption that must not repaint the card
+    /// (ADR-0103). A no-op for a session-backed question, or for a form whose
+    /// state is no longer remembered; an empty selection clears the entry.
+    pub(crate) async fn persist_location_form_partial(&self, req_id: &str) {
+        let partial = self
+            .with_question_state(req_id, |state| {
+                if !state.request().is_location() {
+                    return None;
+                }
+                let paint = state.paint();
+                Some(crate::bridge::surfaces::LocationFormPartial {
+                    display: paint.display,
+                    done: paint.done,
+                    open: paint.open,
+                })
+            })
+            .await
+            .flatten();
+        if let Some(partial) = partial {
+            self.surfaces.set_location_form_partial(req_id, partial);
         }
     }
 
@@ -1367,6 +1412,7 @@ impl RequestFlow {
             &self.surfaces,
             self.kind.label(),
             &dead,
+            seen,
         )
         .await;
         let dropped = handles.cards.card_handles.lock().await.drop_vanished(
@@ -1993,6 +2039,13 @@ impl RequestFlow {
             .send_standalone_surface(handles, req, dir, Some(target), &card, &summary)
             .await
         {
+            // The card just sent is built from the remembered state; persist
+            // that state beside its new record so a restart restores it (the
+            // recovered card is not repainted — ADR-0103). This also covers a
+            // re-surface after the persisted card was deleted, where the
+            // partial entry was captured into `QuestionState` before the old
+            // record was removed.
+            self.persist_location_form_partial(req.id()).await;
             tracing::info!(
                 "{} ({}): {} delivered as a directory-owned form card",
                 self.kind.label(),
@@ -2109,6 +2162,10 @@ impl RequestFlow {
                 _ => return ReopenOutcome::NotDismissed,
             }
         };
+        // Restore the partial answer state BEFORE building the card: after a
+        // restart this is the first time the reopen has seen the form, and the
+        // fresh card must paint what the restored state will submit.
+        self.kind.remember_surfaced(self, req, dir).await;
         let Some(target) = self.resolve_location_target(handles, req, dir).await else {
             return ReopenOutcome::NoTarget;
         };
@@ -2186,7 +2243,6 @@ impl RequestFlow {
                 ReopenOutcome::SendFailed
             };
         }
-        self.kind.remember_surfaced(self, req, dir).await;
         tracing::info!(
             "{} ({}): {} reopened as a fresh directory-owned form card",
             self.kind.label(),
@@ -3344,6 +3400,10 @@ impl RequestFlow {
                     sent.message_id,
                     e
                 );
+                // Capture the persisted partial state into the in-memory state
+                // BEFORE the record goes, so the fresh card this sweep posts
+                // (and the state its controls submit) still agree.
+                self.kind.remember_surfaced(self, req, dir).await;
                 self.sent_cards.lock().await.remove(id);
                 self.surfaces.remove_location_form(id);
                 ReadoptDecision::NotAdopted

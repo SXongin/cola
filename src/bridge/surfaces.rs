@@ -164,6 +164,42 @@ pub struct LocationFormRecord {
     /// that lands during the send survives.
     #[serde(default)]
     pub dismissal_generation: u64,
+    /// The partial answer state the live card shows, so a restart restores
+    /// what the visible card's controls will submit (ADR-0103). `None` means
+    /// nothing was selected yet; a record from an older build loads with it.
+    #[serde(default)]
+    pub partial: Option<LocationFormPartial>,
+}
+
+/// The partial answer state a Location Form's card displays. It persists the
+/// paint's selections, final markers and open question (never unsubmitted
+/// drafts, which stay client-side); a restart restores it into `QuestionState`
+/// without repainting the live card, so the card's visible selections and the
+/// next confirm/submit agree (ADR-0103).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocationFormPartial {
+    /// `Some(values)` for a question's displayed selection (final or live),
+    /// `None` while it is untouched.
+    #[serde(default)]
+    pub display: Vec<Option<Vec<String>>>,
+    /// Whether each question's displayed answer is FINAL (a single-select
+    /// click or a confirmed multi-select) rather than a live toggle.
+    #[serde(default)]
+    pub done: Vec<bool>,
+    /// The question the card renders open.
+    #[serde(default)]
+    pub open: usize,
+}
+
+impl LocationFormPartial {
+    /// Whether the card shows nothing worth persisting: no selection and the
+    /// first question open. A fresh Location Form never writes a partial
+    /// entry, and clearing every selection clears it again. Unsubmitted typed
+    /// text is deliberately absent: it stays client-side (ADR-0038's
+    /// card-repaints rule) and the form submit carries it when it lands.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.open == 0 && self.display.iter().all(Option::is_none)
+    }
 }
 
 impl LocationFormRecord {
@@ -482,6 +518,33 @@ impl Surfaces {
             .location_forms
             .get(&self.client_id, request_id)
             .cloned()
+    }
+
+    /// The partial answer state the live card shows, when one was persisted.
+    pub fn location_form_partial(&self, request_id: &str) -> Option<LocationFormPartial> {
+        self.lock()
+            .location_forms
+            .get(&self.client_id, request_id)
+            .and_then(|record| record.partial.clone())
+    }
+
+    /// Persist (or clear) the partial answer state a Location Form's card
+    /// shows, so a restart restores it into `QuestionState` without repainting
+    /// the live card (ADR-0103). A no-op when the form has no record yet, and
+    /// an empty state clears the entry rather than storing a blank.
+    pub fn set_location_form_partial(&self, request_id: &str, partial: LocationFormPartial) {
+        let partial = (!partial.is_empty()).then_some(partial);
+        self.mutate(|state| {
+            let Some(mut record) = state.location_forms.get(&self.client_id, request_id).cloned() else {
+                return false;
+            };
+            if record.partial == partial {
+                return false;
+            }
+            record.partial = partial;
+            state.location_forms.insert(&self.client_id, request_id, record);
+            true
+        });
     }
 
     /// Record that a Location Form's card was pushed: the standalone surface
@@ -938,23 +1001,35 @@ mod tests {
     fn location_form_push_and_dismissal_round_trip_together() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("interactive_surfaces.json");
+        let partial = LocationFormPartial {
+            display: vec![Some(vec!["staging".into()]), None],
+            done: vec![false, false],
+            open: 0,
+        };
         {
             let surfaces = Surfaces::load(path.clone());
             surfaces.set_location_form_pushed("frm_1", standalone("om_card"), "/work");
+            surfaces.set_location_form_partial("frm_1", partial.clone());
             let record = surfaces.location_form("frm_1").expect("a pushed record");
             assert_eq!(record.state, LocationFormState::Pushed);
             assert_eq!(record.client_id, crate::config::DEFAULT_CLIENT_ID);
+            assert_eq!(record.partial, Some(partial.clone()));
             assert_eq!(
                 surfaces.snapshot().standalone.get("frm_1").unwrap().message_id,
                 "om_card"
             );
-            surfaces.dismiss_location_form("frm_1", "/work");
+            assert!(surfaces.dismiss_location_form("frm_1", "/work"));
         }
 
         let surfaces = Surfaces::load(path);
         let record = surfaces.location_form("frm_1").expect("the dismissal persisted");
         assert_eq!(record.state, LocationFormState::Dismissed);
         assert_eq!(record.dismissal_generation, 1);
+        assert_eq!(
+            surfaces.location_form_partial("frm_1"),
+            Some(partial),
+            "the partial answer state survives a dismissal and a restart"
+        );
         assert!(
             !surfaces.snapshot().standalone.contains_key("frm_1"),
             "the withdrawn surface is forgotten in the same mutation"

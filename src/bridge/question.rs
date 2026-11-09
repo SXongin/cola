@@ -178,6 +178,35 @@ impl QuestionState {
         }
     }
 
+    /// Restore a persisted [`QuestionPaint`] without repainting the card. A
+    /// Location Form's live card keeps its 已选 markers across a restart; this
+    /// rebuilds the split the card's next confirm/submit reads, so the answer
+    /// it sends agrees with what the Host sees (ADR-0103). A paint whose shape
+    /// does not match this request is discarded wholesale rather than partially
+    /// applied: a state built for another request must never become this one's.
+    pub(crate) fn restore_paint(&mut self, paint: QuestionPaint) {
+        let n = self.answers.len();
+        if paint.display.len() != n || paint.done.len() != n {
+            return;
+        }
+        for index in 0..n {
+            if paint.done[index] {
+                // A finalized slot: the displayed values ARE the final answer
+                // (an empty list is a confirmed "不选").
+                self.answers[index] = Some(paint.display[index].clone().unwrap_or_default());
+                self.toggles[index] = None;
+            } else {
+                self.answers[index] = None;
+                self.toggles[index] = paint.display[index].clone();
+            }
+        }
+        self.open = paint.open.min(n.saturating_sub(1));
+        self.drafts = (0..n)
+            .map(|index| paint.drafts.get(index).cloned().unwrap_or_default())
+            .collect();
+        self.revision += 1;
+    }
+
     /// The owning directory, used as the delivery fallback when a card
     /// callback carries none.
     pub(crate) fn dir(&self) -> &str {
