@@ -361,7 +361,11 @@ receipt is an event in cola's world, and its key orders only. A message whose
 `time.created` is later than the newest server time the card showed when the
 receipt was written is post-click, so the walk floors its parts at that receipt
 key; a pre-click message keeps its historical keys, so parts the server wrote
-before the click still land above the receipt. The rule applies to every walk
+before the click still land above the receipt. A receipt written before any
+timed part has rendered records no cut — there is no server time to compare
+against — so a message the next read delivers has no floor; that window is the
+#1023 surfacing half (the block should not land before the content is drained),
+not an ordering decision this amendment can make. The rule applies to every walk
 that places transcript parts (the Turn window, the seed scope and the pending
 gap); synthetic content (wake markers) keeps `next_order()`.
 

@@ -536,7 +536,10 @@ impl Turn {
         // live run, whether the read was stale (this Turn runs it) or true
         // (the run merges it through the steer delivery).
         if advisory_live {
-            acc.push_receipt(MERGE_OPENING);
+            // Keyed at the card's head (0), not at cola's "now": a V2 text
+            // part is ordered by its own server position (issue #1022), and a
+            // wall-clock key would let the run's older content sort above it.
+            acc.push_receipt_at(Some(0), MERGE_OPENING);
         }
         acc.set_reply_target(Some(message_id.clone()));
         acc.set_session(&session_id);
