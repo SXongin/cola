@@ -1,4 +1,4 @@
-# Location forms belong to a directory conversation
+# Location forms belong to a directory Chat/Topic
 
 ## Context
 
@@ -28,7 +28,7 @@ server's in-memory form cache until answered, cancelled, its connection aborts,
 or the server process exits — so silence can last indefinitely.
 
 cola sweeps forms only for directories in the SessionStore, so every visible
-Location Form already has at least one mapped conversation to deliver into. But
+Location Form already has at least one mapped Chat/Topic to deliver into. But
 the form is owned by the directory, not by any one Session: it carries no
 requester and no Turn, and whoever answers speaks for everyone using that
 directory. That is the fact every decision below hangs off.
@@ -44,10 +44,10 @@ session, keeps #489's one-WARN-and-skip: cola has no evidence that surfacing it
 would mean anything.
 
 **Delivery.** A Location Form is pushed once, as a standalone card, into the
-conversation of the directory's newest mapped Session in the SessionStore's
+Chat/Topic of the directory's newest mapped Session in the SessionStore's
 activation order — the newest mapped entry first, filtered by directory and
 Agent Client; this is the store's local activation order, not `/switch`'s
-server-time sort — using that conversation's topic anchor when it is a topic.
+server-time sort — using that Chat/Topic's topic anchor when it is a topic.
 The card names the asking MCP server and its message, and shows the directory,
 so the answerer knows what is being asked and whom the answer commits; the V2
 adapter carries `metadata.server` and `metadata.message` into the neutral
@@ -55,7 +55,7 @@ request (OpenCode's `packages/core/src/mcp/index.ts` writes those keys; today's
 `RawForm` in `src/opencode/v2/wire.rs` drops metadata). The new neutral fields
 stay optional, so session-backed forms keep the normal Question path. A send
 that fails definitively is not recorded as pushed, so the next complete sweep
-with a mapped conversation retries it; a timed-out send can duplicate the card
+with a mapped Chat/Topic retries it; a timed-out send can duplicate the card
 exactly as every standalone send can today, and this record does not claim to
 fix that ambiguity. If the
 mapping disappears between listing and delivery, nothing is sent and nothing is
@@ -77,9 +77,11 @@ pin is keyed by message.
 
 **Dismissal.** 「稍后」 withdraws the card — and releases its Message Pin —
 without declining the request. The form stays pending and `/mcp` can reopen it
-as a fresh card; reopening clears the dismissal and rewrites the
-standalone-surface record, so the two records never disagree about what the chat
-currently shows. Only an explicit 「取消」 declines it, and cola never
+as a fresh card; reopening sends the fresh card first and commits the cleared
+dismissal only after the send lands, so a failed send leaves the form dismissed
+and `/mcp` can retry rather than leaving it unsuppressed with no card. A landed
+reopen rewrites the standalone-surface record, so the two records never disagree
+about what the chat currently shows. Only an explicit 「取消」 declines it, and cola never
 auto-declines on a timer: turning a hesitation into a failed tool call is worse
 than waiting.
 
@@ -118,17 +120,19 @@ literal `global` session id — `POST /api/session/global/form/{id}/reply` and
 `DELETE /api/session/global/form/{id}` — plus `location[directory]`, where the
 directory is the one whose form list produced the request.
 
-The two failure statuses are not interchangeable, and there is no third case.
-A **409** (`Form.AlreadySettledError`) is benign — the form settled, and the
-card takes the handled path. A **404** (`Form.NotFoundError`) on a Location Form
-is **always a retryable refusal**, because the wire carries no marker that
-distinguishes a wrong location from a cancelled pooled loser: cola keeps the
-standalone surface and the pushed/dismissed record, tells the user the answer
-did not land, and lets the next complete sweep withdraw the card once the form
-is genuinely gone. A wrong-location 404 is never read as a successful answer,
-and it never deletes the only surface the waiting form has. A losing copy on a
-pooled no-caller request is already cancelled upstream, so a late reply to it
-takes the same retryable 404 path and the next complete sweep withdraws the
+The two **distinguished** failure statuses are not interchangeable; every other
+failure is retryable too. A **409** (`FormAlreadySettledError`) is benign — the
+form settled, and the card takes the handled path. A **404**
+(`FormNotFoundError`) on a Location Form is **always a retryable refusal**,
+because the wire carries no marker that distinguishes a wrong location from a
+cancelled pooled loser: cola keeps the standalone surface and the
+pushed/dismissed record, tells the user the answer did not land, and lets the
+next complete sweep withdraw the card once the form is genuinely gone. A
+wrong-location 404 is never read as a successful answer, and it never deletes
+the only surface the waiting form has. Any other outcome — a 401, 408, 5xx, or a
+transport timeout — is a retryable error and never a handled one. A losing copy
+on a pooled no-caller request is already cancelled upstream, so a late reply to
+it takes the same retryable 404 path and the next complete sweep withdraws the
 card.
 
 **Shape.** Both elicitation modes are delivered. An `external` field renders as
@@ -182,7 +186,7 @@ permits, not for a case in the current wire.
 
 - **Wait for session ownership.** Rejected: location-owned servers keep the
   sentinel permanently, so waiting never ends.
-- **Fan out to every mapped conversation, or require a configured admin chat.**
+- **Fan out to every mapped Chat/Topic, or require a configured admin chat.**
   Rejected: the answer commits the whole directory, so one deterministic target
   with no new configuration is enough; fan-out multiplies cards that all speak
   for the same connection.
