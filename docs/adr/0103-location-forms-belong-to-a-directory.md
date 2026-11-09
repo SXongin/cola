@@ -130,22 +130,26 @@ Neither is claimed atomic, and neither changes the dismissal ordering above.
 authoritative suppression until a reopen clears it.
 
 **Partial answer state is persisted, and the recovered card is not repainted.**
-A Location Form's card-action state — each question's displayed selection and
-whether it is final, plus the open question — is written into the same
-client-scoped record (`partial`, serde-default, no format-version bump)
-whenever a card action changes it. Unsubmitted typed text is deliberately not
-persisted: it stays client-side (the card-repaints rule) and a submit carries it
-as the form value it arrives with. On restart `readopt_location_form`
-still only **reads** the live card: a repaint would wipe an unanswered typed
-field (ADR-0038's card-repaints rule, ADR-0091). Instead, `remember_question`
-restores the persisted paint into `QuestionState`, so the card's visible 已选
-markers and the answer its next confirm/submit sends agree — the invariant the
-restart test pins. `/mcp`'s reopen after a restart builds the fresh card from the
-same restored state, so a reselect is not needed. The write shares the surface
-mirror's best-effort nature (ADR-0038): a failed partial write can lose the
-selection across a restart, and the recovered live card then keeps markers the
-new process cannot toggle. Consistency after a **successful** write is the
-guarantee; surviving a lost mirror write is not claimed.
+A Location Form's card-action state — each question's **clicked option wire
+values**, whether the slot is final, plus the open question — is written into
+the same client-scoped record (`partial`, serde-default, no format-version bump)
+whenever a card action changes it. Text the Host typed is deliberately not
+persisted: an unsubmitted draft, a custom-answer entry and a numeric input all
+stay client-side (the card-repaints rule). A slot that carried such a value is
+persisted as a live selection of only its clicked options (or nothing), never as
+a final answer, so the restore can never submit an empty list in place of text it
+could not write. On restart `readopt_location_form` still only **reads** the
+live card: a repaint would wipe an unanswered typed field (ADR-0038's
+card-repaints rule, ADR-0091). Instead, `remember_question` restores the
+persisted paint into `QuestionState`, so the card's visible clicked selections
+and the answer its next confirm/submit sends agree — the invariant the restart
+test pins. `/mcp`'s reopen after a restart builds the fresh card from the same
+restored state, so a reselect is not needed for clicked options; a typed custom
+answer may have to be re-entered. The write shares the surface mirror's
+best-effort nature (ADR-0038): a failed partial write can lose the selection
+across a restart, and the recovered live card then keeps markers the new process
+cannot toggle. Consistency after a **successful** write is the guarantee;
+surviving a lost mirror write is not claimed.
 
 Two accepted residuals, recorded rather than solved:
 
@@ -213,11 +217,11 @@ permits, not for a case in the current wire.
   file's format and version are ADR-0091's; a file from an older build loads
   with an empty suppression, so no migration is needed. The record and the
   standalone surface are written in one mutation.
-- The same record carries the form's partial answer paint (selections, final
-  slots and the open question; never unsubmitted typed text) so a restart
-  restores what the un-repainted live card shows. The field is serde-default on
-  the record, so older files load without it and need no format-version bump; a
-  card action that changes the state writes it through.
+- The same record carries the form's partial answer paint (clicked option wire
+  values, final slots and the open question; never text the Host typed) so a
+  restart restores what the un-repainted live card shows. The field is
+  serde-default on the record, so older files load without it and need no
+  format-version bump; a card action that changes the state writes it through.
 - A Location Form reply's 404 is a retryable refusal, not the generic
   already-handled path: the surface and record survive, and only a complete
   sweep withdraws a form that is genuinely gone. A 409 keeps the benign handled
