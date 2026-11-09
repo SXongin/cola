@@ -154,8 +154,10 @@ pub struct RequestFlow {
     /// request_ids whose reopen is between its generation read and its commit.
     /// The second click of a double-click sees the first in flight and does not
     /// send a second fresh card; the send itself still runs outside the
-    /// per-form write lock, as ADR-0103 requires.
-    location_reopens: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// per-form write lock, as ADR-0103 requires. A [`ReopenClaim`] owns its
+    /// entry, so a cancelled/failed task releases it on drop instead of
+    /// wedging the form forever.
+    location_reopens: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// request_id → owning directory of the surfaces a PREVIOUS process
     /// persisted (ADR-0038 restart re-adoption). The first sweep that lists
     /// such a request re-adopts its card instead of posting a second one; an
@@ -234,14 +236,13 @@ enum ReadoptDecision {
 }
 
 /// What one `/mcp` reopen attempt did. The caller renders a truthful toast per
-/// outcome: only [`Self::SendFailed`] means the form is still deferred and
-/// retryable, and only [`Self::Reopened`] means a fresh card now exists.
+/// outcome: only [`Self::Reopened`] means a fresh card now exists;
+/// [`Self::SendFailed`] and [`Self::NoTarget`] leave the dismissal in place and
+/// retryable; [`Self::LostToDismissal`] keeps the newer 「稍后」.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReopenOutcome {
     /// The fresh card landed and its record replaced the dismissal.
     Reopened,
-    /// The form is no longer a Location Form.
-    NotLocation,
     /// No dismissal exists (already pushed, already reopened, or never
     /// pushed): there is nothing to reopen.
     NotDismissed,
@@ -255,6 +256,38 @@ pub(crate) enum ReopenOutcome {
     /// A 「稍后」 landed during the send: the fresh card was withdrawn again
     /// and the newer dismissal survives.
     LostToDismissal,
+}
+
+/// An in-flight reopen claim. Its `Drop` releases the id on every exit —
+/// including a cancelled task — so a dropped send cannot leave the form
+/// permanently "already reopening". The claim is inserted under the per-form
+/// write lock and held until the reopen finishes.
+struct ReopenClaim {
+    id: String,
+    claims: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl ReopenClaim {
+    fn claim(claims: &Arc<std::sync::Mutex<std::collections::HashSet<String>>>, id: &str) -> Option<Self> {
+        let mut guard = claims.lock().unwrap_or_else(|error| error.into_inner());
+        if !guard.insert(id.to_string()) {
+            return None;
+        }
+        drop(guard);
+        Some(Self {
+            id: id.to_string(),
+            claims: Arc::clone(claims),
+        })
+    }
+}
+
+impl Drop for ReopenClaim {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
+    }
 }
 
 /// Tell the chat why a permission was declined before it could be offered.
@@ -494,7 +527,7 @@ impl RequestFlow {
             )),
             surfaces,
             location_locks: Arc::new(Mutex::new(HashMap::new())),
-            location_reopens: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            location_reopens: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             recovered: Arc::new(Mutex::new(recovered)),
             session_less: Arc::new(Mutex::new(HashMap::new())),
             pending_withdrawals: Arc::new(Mutex::new(HashMap::new())),
@@ -1460,10 +1493,6 @@ impl RequestFlow {
         {
             let mut locks = self.location_locks.lock().await;
             locks.retain(|id, _| pending.contains(id) || self.surfaces.location_form(id).is_some());
-            // A reopen in flight is transient, but a dropped task must not leak
-            // its id forever: retain only ids a pending form still names.
-            let mut reopens = self.location_reopens.lock().await;
-            reopens.retain(|id| pending.contains(id));
         }
         // #489: the same rule for the session-less registry — a request that
         // left the pending list, or a directory that said nothing, keeps its
@@ -2038,32 +2067,24 @@ impl RequestFlow {
         req: &PendingRequest,
         dir: &str,
     ) -> ReopenOutcome {
-        if !req.is_location() {
-            return ReopenOutcome::NotLocation;
-        }
         let id = req.id();
         let lock = self.location_form_lock(id).await;
         // Read the generation this reopen may clear, under the lock, and claim
         // the in-flight slot. The send happens outside the lock: a network
         // call must not serialize every 「稍后」 click behind it, and the
-        // generation check is what makes that safe. The in-flight claim is
-        // what stops a double-click from sending two fresh cards.
-        let generation = {
+        // generation check is what makes that safe. The claim's Drop releases
+        // the slot on every exit, including a cancelled task.
+        let (_claim, generation) = {
             let _guard = lock.lock().await;
-            let mut reopens = self.location_reopens.lock().await;
-            if !reopens.insert(id.to_string()) {
+            let Some(claim) = ReopenClaim::claim(&self.location_reopens, id) else {
                 return ReopenOutcome::AlreadyReopening;
-            }
+            };
             match self.surfaces.location_form(id) {
-                Some(record) if record.is_dismissed() => record.dismissal_generation,
-                _ => {
-                    reopens.remove(id);
-                    return ReopenOutcome::NotDismissed;
-                }
+                Some(record) if record.is_dismissed() => (claim, record.dismissal_generation),
+                _ => return ReopenOutcome::NotDismissed,
             }
         };
         let Some(target) = self.resolve_location_target(handles, req, dir).await else {
-            self.location_reopens.lock().await.remove(id);
             return ReopenOutcome::NoTarget;
         };
         let card = self.kind.build_card(self, req, dir);
@@ -2074,7 +2095,6 @@ impl RequestFlow {
                 self.kind.label(),
                 id
             );
-            self.location_reopens.lock().await.remove(id);
             return ReopenOutcome::SendFailed;
         };
         let surface = self.standalone_surface(req, dir, message_id.clone(), &summary);
@@ -2108,10 +2128,8 @@ impl RequestFlow {
             );
             self.withdraw_location_card(handles, req, &message_id, "reopen lost to a dismissal")
                 .await;
-            self.location_reopens.lock().await.remove(id);
             return ReopenOutcome::LostToDismissal;
         }
-        self.location_reopens.lock().await.remove(id);
         self.kind.remember_surfaced(self, req, dir).await;
         tracing::info!(
             "{} ({}): {} reopened as a fresh directory-owned form card",

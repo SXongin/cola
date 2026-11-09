@@ -136,7 +136,6 @@ fn form_state(handles: &CommandHandles, form: &QuestionRequest) -> McpFormState 
 fn outcome_toast(outcome: ReopenOutcome) -> &'static str {
     match outcome {
         ReopenOutcome::Reopened => "已重新打开，请在新的卡片上作答。",
-        ReopenOutcome::NotLocation => "该请求不是 Location Form，无法重新打开。",
         ReopenOutcome::NotDismissed => "该表单已有一张卡片或已重新打开，无需再打开。",
         ReopenOutcome::AlreadyReopening => "正在重新打开，请稍候。",
         ReopenOutcome::NoTarget => "无法重新打开：该目录当前没有已映射的聊天/话题。",
@@ -165,24 +164,45 @@ pub(crate) async fn handle_action(
     if request_id.is_empty() || directory.is_empty() {
         return Some(toast("这条重新打开请求缺少表单或目录信息。"));
     }
-    // Re-read the directory's current pending list: the form may have resolved
-    // since the `/mcp` card was rendered, and the fresh card must be built
-    // from the live request. The click's own deadline bounds the read.
-    let forms =
-        match tokio::time::timeout_at(deadline, handles.flow.backend.list_questions(Some(directory))).await {
-            Ok(Ok(forms)) => forms,
-            Ok(Err(error)) => {
-                tracing::warn!("mcp reopen: listing {directory} failed: {error}");
-                return Some(toast("读取待处理表单失败，请稍后重试。"));
-            }
-            Err(_) => {
-                tracing::warn!("mcp reopen: listing {directory} timed out");
-                return Some(toast("读取待处理表单超时，请稍后重试。"));
-            }
-        };
+    // One bounded listing read for both the live request and the repaint: the
+    // form list is re-read (the form may have resolved since the card was
+    // rendered) and the statuses ride along so a successful reopen can rebuild
+    // the clicked card without a second post-action read. Both share the
+    // click's deadline.
+    let (forms, statuses) = tokio::join!(
+        tokio::time::timeout_at(deadline, handles.flow.backend.list_questions(Some(directory))),
+        tokio::time::timeout_at(
+            deadline,
+            handles.flow.backend.mcp_server_statuses(Some(directory)),
+        ),
+    );
+    let forms = match forms {
+        Ok(Ok(forms)) => forms,
+        Ok(Err(error)) => {
+            tracing::warn!("mcp reopen: listing {directory} failed: {error}");
+            return Some(toast("读取待处理表单失败，请稍后重试。"));
+        }
+        Err(_) => {
+            tracing::warn!("mcp reopen: listing {directory} timed out");
+            return Some(toast("读取待处理表单超时，请稍后重试。"));
+        }
+    };
+    let statuses = match statuses {
+        Ok(Ok(Some(statuses))) => Some(statuses),
+        Ok(Ok(None)) => None,
+        Ok(Err(error)) => {
+            tracing::warn!("mcp reopen: status listing {directory} failed: {error}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("mcp reopen: status listing {directory} timed out");
+            None
+        }
+    };
     let Some(form) = forms
-        .into_iter()
+        .iter()
         .find(|form| form.id == request_id && form.is_location())
+        .cloned()
     else {
         return Some(toast("该 Location Form 已不在待处理列表中。"));
     };
@@ -190,7 +210,41 @@ pub(crate) async fn handle_action(
         .question
         .reopen_location_form(&handles.flow, &PendingRequest::Question(form), directory)
         .await;
-    Some(toast(outcome_toast(outcome)))
+    let thread_key = ThreadKey::new(
+        value
+            .get("chat_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        value
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    );
+    // Reopened and NotDismissed both changed the row the clicked card shows;
+    // rebuild it from the listing already read. A failed status read leaves
+    // the old card in place rather than spending another read after the ack.
+    let card = matches!(outcome, ReopenOutcome::Reopened | ReopenOutcome::NotDismissed)
+        .then(|| {
+            statuses.map(|statuses| {
+                let rows: Vec<McpFormRow<'_>> = forms
+                    .iter()
+                    .filter(|form| form.is_location())
+                    .map(|form| McpFormRow {
+                        request: form,
+                        state: form_state(handles, form),
+                    })
+                    .collect();
+                build_mcp_card(&thread_key, directory, &statuses, &rows)
+            })
+        })
+        .flatten()
+        .filter(|_| !thread_key.chat_id.is_empty());
+    Some(CardActionResult {
+        card,
+        toast: Some(outcome_toast(outcome).to_string()),
+    })
 }
 
 fn toast(text: &str) -> CardActionResult {

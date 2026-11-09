@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::backend::types::{McpServerState, McpServerStatus, QuestionRequest};
 use crate::config::ThreadKey;
 
-use super::question::location_form_summary_text;
+use super::question::location_form_summary_raw;
 use super::sanitize::{CardMarkdown, serialized_len};
 use super::shell::card_shell;
 use super::{MAX_CARD_COMPONENTS, MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, truncate_md};
@@ -62,17 +62,13 @@ fn status_label(status: &McpServerStatus) -> String {
         .filter(|error| !error.trim().is_empty())
         .map(|error| format!("：{error}"))
         .unwrap_or_default();
-    let state = if status.needs_auth() {
-        "🔐 需要登录授权（needs_auth）"
-    } else {
-        match status.state {
-            McpServerState::Connected => "✅ 已连接",
-            McpServerState::Pending => "⏳ 连接中",
-            McpServerState::Disabled => "⏸️ 已禁用",
-            McpServerState::Failed => "❌ 连接失败",
-            McpServerState::NeedsAuth => "🔐 需要登录授权（needs_auth）",
-            McpServerState::Unknown => "❔ 状态未知",
-        }
+    let state = match status.state {
+        McpServerState::Connected => "✅ 已连接",
+        McpServerState::Pending => "⏳ 连接中",
+        McpServerState::Disabled => "⏸️ 已禁用",
+        McpServerState::Failed => "❌ 连接失败",
+        McpServerState::NeedsAuth => "🔐 需要登录授权（needs_auth）",
+        McpServerState::Unknown => "❔ 状态未知",
     };
     format!("{state}{detail}")
 }
@@ -173,11 +169,13 @@ impl BoundedBody {
     }
 }
 
-/// Build the `/mcp` card. The body is read-only: statuses first (the fact a
-/// Host may need to fix before answering a form), then the directory's pending
-/// Location Forms, then a short read-only-scope note. A session-backed form is
-/// never rendered, even if a caller passes one in — only `is_location()` rows
-/// reach the body.
+/// Build the `/mcp` card. The body is read-only. Location Forms come BEFORE
+/// the server statuses so the recovery controls survive a cap: a dismissed
+/// form's reopen button is the one thing this surface exists to offer, while a
+/// status row can be dropped when the directory is extreme. Within the form
+/// section, dismissed rows sort first for the same reason. A session-backed
+/// form is never rendered, even if a caller passes one in — only
+/// `is_location()` rows reach the body.
 pub(crate) fn build_mcp_card(
     thread_key: &ThreadKey,
     directory: &str,
@@ -191,28 +189,23 @@ pub(crate) fn build_mcp_card(
 只读：不会连接/断开、增删 MCP 服务器，也不会登录或浏览资源。"
     ));
 
-    body.push("**MCP 服务器**");
     let mut omitted = 0;
-    if statuses.is_empty() {
-        body.push("当前目录没有配置 MCP 服务器。");
-    } else {
-        for status in statuses {
-            let row = format!("- **{}** · {}", status.name, status_label(status));
-            if !body.push(&row) {
-                omitted += 1;
-            }
-        }
-    }
-
     body.push("**待处理的 Location Form**");
-    let location_forms: Vec<&McpFormRow<'_>> =
+    let mut location_forms: Vec<&McpFormRow<'_>> =
         forms.iter().filter(|form| form.request.is_location()).collect();
+    // Stable sort: a dismissed form's control outranks every status and every
+    // non-dismissed row when the card budget runs out.
+    location_forms.sort_by_key(|form| match form.state {
+        McpFormState::Dismissed => 0,
+        McpFormState::Unpushed => 1,
+        McpFormState::Pushed => 2,
+    });
     if location_forms.is_empty() {
         body.push("当前目录没有待处理的 Location Form。会话自有的提问不会列在这里。");
     } else {
         body.push("重新打开会把表单作为一张新卡片发到该目录当前映射的聊天/话题。");
         for form in location_forms {
-            let summary = location_form_summary_text(form.request);
+            let summary = location_form_summary_raw(form.request);
             let state = match form.state {
                 McpFormState::Dismissed => "已稍后，可重新打开",
                 McpFormState::Pushed => "已推送，见原卡片",
@@ -225,8 +218,23 @@ pub(crate) fn build_mcp_card(
             }
         }
     }
+
+    body.push("**MCP 服务器**");
+    if statuses.is_empty() {
+        body.push("当前目录没有配置 MCP 服务器。");
+    } else {
+        for status in statuses {
+            let row = format!("- **{}** · {}", status.name, status_label(status));
+            if !body.push(&row) {
+                omitted += 1;
+            }
+        }
+    }
     if omitted > 0 {
-        body.push_tail(&format!(
+        // The element/byte reserve above leaves room for this note; if a
+        // future change exhausts it too, the listing is already truncated as
+        // far as it can be and dropping the note is the only remaining option.
+        let _ = body.push_tail(&format!(
             "…列表过长，还有 {omitted} 项未显示；可直接处理上方已列出的项。"
         ));
     }
@@ -432,6 +440,14 @@ mod tests {
             "tables past the one shared budget are fenced, not native: {text}"
         );
         assert!(text.contains("列表过长"), "the omitted rows are reported: {text}");
+        assert!(
+            reopen(&card).is_some(),
+            "a dismissed form's recovery control survives the cap: {text}"
+        );
+        assert!(
+            text.find("已稍后").unwrap_or(usize::MAX) < text.find("server-0").unwrap_or(usize::MAX),
+            "the form section precedes the droppable status rows: {text}"
+        );
         assert!(
             text.chars().count() < 100_000,
             "the listing is truncated, not fully rendered"

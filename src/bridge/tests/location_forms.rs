@@ -2144,11 +2144,22 @@ async fn mcp_reopen_after_success_is_not_reported_as_still_deferred() {
         .expect("the /mcp card");
     let reopen = button_with_action_op(&listing, "mcp", "reopen").expect("a reopen control");
 
-    fixture
+    let first = fixture
         .app
         .host_action(reopen.clone())
         .await
         .expect("the first reopen has a result");
+    let repainted = first.card.expect("a successful reopen repaints the /mcp card");
+    let repainted_text = card_text(&repainted);
+    assert!(
+        repainted_text.contains("已推送，见原卡片"),
+        "the reopened row is marked pushed: {repainted_text}"
+    );
+    assert!(
+        button_with_action_op(&repainted, "mcp", "reopen").is_none(),
+        "the repainted card no longer offers reopen: {repainted}"
+    );
+
     let second = fixture
         .app
         .host_action(reopen)
@@ -2309,5 +2320,52 @@ async fn mcp_form_read_timeout_is_spoken() {
     assert!(
         posted_cards(&fixture.platform).await.is_empty(),
         "a timeout must never become a partial card"
+    );
+}
+
+/// A reopen task cancelled while its send is in flight releases the in-flight
+/// claim on drop: the next click is not told "already reopening" forever.
+#[tokio::test]
+async fn a_cancelled_reopen_releases_its_in_flight_claim() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_mcp_cancelled"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |backend| {
+            backend.with_mcp_statuses_in("/work", vec![status("context7", McpServerState::Connected)]);
+        },
+    )
+    .await;
+    sweep(&fixture).await;
+    let original = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&original, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    let req = PendingRequest::Question(location_form("frm_mcp_cancelled"));
+    let handles = fixture.app.flow_handles();
+    let (entered, release) = fixture.platform.pause("send", "chat_1");
+    let app = fixture.app.clone();
+    let task_handles = handles.clone();
+    let task_req = req.clone();
+    let task = tokio::spawn(async move {
+        app.question
+            .reopen_location_form(&task_handles, &task_req, "/work")
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the reopen send is in flight");
+    task.abort();
+    let _ = task.await;
+    release.notify_one();
+
+    assert_eq!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        ReopenOutcome::Reopened,
+        "the cancelled task's claim is released, so the retry can land"
     );
 }
