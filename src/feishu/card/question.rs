@@ -533,11 +533,17 @@ fn one_line_label(text: &str, max_chars: usize) -> String {
 
 /// A one-line-per-question summary of a `question` request, for the stale card.
 pub fn question_summary(questions: &[crate::backend::types::QuestionInfo]) -> String {
+    super::sanitize::CardMarkdown::new().clean(&question_summary_text(questions))
+}
+
+/// [`question_summary`] before markdown hygiene, for a caller that threads one
+/// card-wide [`super::sanitize::CardMarkdown`].
+fn question_summary_text(questions: &[crate::backend::types::QuestionInfo]) -> String {
     let mut s = String::new();
     for (i, q) in questions.iter().enumerate() {
         s.push_str(&format!("{}. {}\n", i + 1, q.question));
     }
-    super::sanitize::CardMarkdown::new().clean(&s)
+    s
 }
 
 /// The card copy for a question cola cannot collect at all. The neutral model
@@ -1490,6 +1496,14 @@ pub fn build_location_form_card(
 /// and message (or the form's title), so the "handled elsewhere" card still
 /// says what the form was about.
 pub fn location_form_summary(req: &crate::backend::types::QuestionRequest) -> String {
+    super::sanitize::CardMarkdown::new().clean(&location_form_summary_text(req))
+}
+
+/// [`location_form_summary`] before markdown hygiene: the raw server/message
+/// (or title, else the question text). A caller building a multi-element card
+/// threads one [`super::sanitize::CardMarkdown`] and cleans this itself, so
+/// the card's one table budget is not spent by a per-summary instance.
+pub(crate) fn location_form_summary_text(req: &crate::backend::types::QuestionRequest) -> String {
     let mut text = String::new();
     if let Some(server) = req.server.as_deref().filter(|s| !s.is_empty()) {
         text.push_str(&format!("{server}："));
@@ -1501,9 +1515,9 @@ pub fn location_form_summary(req: &crate::backend::types::QuestionRequest) -> St
         .or_else(|| Some(req.title.as_str()).filter(|t| !t.is_empty()));
     match what {
         Some(what) => text.push_str(what),
-        None => text.push_str(&question_summary(&req.questions)),
+        None => text.push_str(&question_summary_text(&req.questions)),
     }
-    super::sanitize::CardMarkdown::new().clean(&text)
+    text
 }
 
 /// The card a Location Form's 「稍后」 click leaves in place of the withdrawn

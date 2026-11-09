@@ -122,7 +122,7 @@ impl Backend for OpenCodeBackend {
     async fn mcp_server_statuses(
         &self,
         directory: Option<&str>,
-    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+    ) -> Result<Option<Vec<types::McpServerStatus>>> {
         OpenCodeBackend::mcp_server_statuses(self, directory).await
     }
 

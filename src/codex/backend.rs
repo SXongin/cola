@@ -9301,4 +9301,17 @@ mod tests {
         assert_eq!(params[0]["model"], "gpt-5.1-codex");
         assert_eq!(params[0]["effort"], "high");
     }
+    /// Codex publishes `mcpServerStatus/list` but has no location-owned form
+    /// surface, so the full `/mcp` capability is **not applicable**: the trait
+    /// default answers `None` without a connection or a request (ADR-0103).
+    #[tokio::test]
+    async fn mcp_surface_is_not_applicable_to_codex() {
+        let (_server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        let client = connect(&url).await;
+        assert_eq!(
+            client.mcp_server_statuses(Some("/work")).await.unwrap(),
+            None,
+            "Codex has no full MCP pull surface"
+        );
+    }
 }
