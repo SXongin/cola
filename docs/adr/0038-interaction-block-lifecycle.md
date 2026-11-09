@@ -324,7 +324,8 @@ it followed (issue #1022; the question tool made it visible: the Host was asked
 before the model's explanation of why, and the explanation stayed below the
 question panel after it settled).
 
-The order key is now **the transcript's**, not a clock:
+The order key is now **the transcript's**, not a clock, for the parts that were
+mis-ordered:
 
 - A part with no server time takes the start time of the previous timed part in
   the same message, or the message's own `time.created` when it has none. V2's
@@ -332,42 +333,31 @@ The order key is now **the transcript's**, not a clock:
   a timed part the rule is a no-op. The walk is a **floor**: a timed part whose
   own start is behind it takes the floor instead, so no part of a message sorts
   before content already placed from that message.
-- Equal keys (a text borrowing a still-running panel's start time) order by
-  **allocation**, not settle order: a live panel allocates its `seq` where its
-  part stands in the read and joins the timeline only when it settles, so the
-  equal-key run keeps the panel at that position instead of appending it after
-  text already pushed at the same key.
-- A part with no time that follows a **settled** tool call (any non-live status,
-  so a refused or failed interaction counts) takes `Now`: it was produced after
-  that call's result, so a borrowed position would sort it above the Interaction
-  Receipt the answer left (Rule 4). `Now` is a POSITION — the next key after the
-  last placed entry (a live panel included), never a render-time clock — and the
-  walk's floor carries across messages, so no later part sorts back above it.
-- A position key is **pinned**: when a later read finally reports a start time
-  for a part that had none, that time updates the panel's clock but not its
-  place. Only a `next_order()` fallback (a message with no time at all) may be
-  replaced, because moving a pinned panel would cross text the read already
-  placed after it.
+- A part with no time that **follows a tool call** keeps the pre-#1022 render
+  order (`next_order()`): it was produced after that call's result, and moving it
+  onto the transcript's position would carry it above the Interaction Receipt the
+  answer wrote at the click (Rule 4). This boundary is the tool part, live or
+  settled; the receipt and late-part rules are otherwise untouched.
+- Equal keys order by **allocation**, not settle order: a live panel allocates
+  its position where its part stands in the read and joins the timeline only
+  when it settles, so the equal-key run keeps the panel at that position instead
+  of appending it after a part already pushed at the same key. The sort uses an
+  internal `order`, which equals the entry's `seq` except at the render-boundary
+  clamp: that clamp lowers `order` alone, never the identity `seq` (ADR-0040).
 - A part already on the timeline **keeps the key it was placed at** — a rewrite
-  captures the old key before it drops the run — because a later read's `Now` or
-  borrowed floor can differ, and re-keying would split a growing part into two
-  entries.
+  captures the old key before it drops the run — because a later read's floor can
+  differ, and re-keying would split a growing part into two entries. A live
+  panel's position key is likewise pinned once the read placed it; only a
+  `next_order()` fallback (a message with no time) may still be replaced by a
+  later-arriving start time, which updates its clock but not its place.
 
 `shown_at` — what a panel header displays and what the Rendered Cursor frontier
 records as the part's start — is unchanged: it still carries only the time the
 server reported, so a borrowed key never becomes a fake clock or perturbs a
-cursor. **Interaction Receipts keep Rule 4's resolution key** (`next_order`): a
-receipt is an event in cola's world, and its key orders only. A message whose
-`time.created` is later than the newest server time the card showed when the
-receipt was written is post-click, so the walk floors its parts at that receipt
-key; a pre-click message keeps its historical keys, so parts the server wrote
-before the click still land above the receipt. A receipt written before any
-timed part has rendered records no cut — there is no server time to compare
-against — so a message the next read delivers has no floor; that window is the
-#1023 surfacing half (the block should not land before the content is drained),
-not an ordering decision this amendment can make. The rule applies to every walk
-that places transcript parts (the Turn window, the seed scope and the pending
-gap); synthetic content (wake markers) keeps `next_order()`.
+cursor. Interaction Receipts keep Rule 4's resolution key (`next_order`): a
+receipt is an event in cola's world, and its key orders only. The rule applies to
+every walk that places transcript parts (the Turn window, the seed scope and the
+pending gap); synthetic content (receipts, wake markers) keeps `next_order()`.
 
 ## Amendment (2026-11-09): a dismissed Location Form is a deliberately surface-less pending request
 
