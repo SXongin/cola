@@ -2634,11 +2634,6 @@ mod tests {
         assert!(long > short, "a longer directory can never estimate less");
     }
 
-    /// A V2 form's typed fields render as their own controls: a string field's
-    /// options show the display label but submit the option value; a boolean
-    /// gets 是/否 buttons whose values are JSON booleans; a number gets a typed
-    /// input form; an external field shows its link and an acknowledgement
-    /// button.
     /// Defence in depth: a caller that forgot to mark the request
     /// uncollectable must still never render a secret field as an input.
     #[test]
@@ -2664,6 +2659,11 @@ mod tests {
         );
     }
 
+    /// A V2 form's typed fields render as their own controls: a string field's
+    /// options show the display label but submit the option value; a boolean
+    /// gets 是/否 buttons whose values are JSON booleans; a number gets a typed
+    /// input form; an external field shows its link and an acknowledgement
+    /// button.
     #[test]
     fn form_card_renders_typed_fields() {
         use crate::backend::types::{FormFieldKind, QuestionInfo, QuestionOption};
