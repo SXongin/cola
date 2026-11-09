@@ -186,40 +186,32 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
 }
 
 /// The timeline order key of every part in `message` (issue #1022). V2's text
-/// item carries no time at all, so the read's own order supplies it: a part
-/// without a time borrows the floor — the previous timed part's start, or the
-/// message's `time.created` — and a timed part behind the floor takes the floor
-/// too, so the read's order wins within the message. A part with no time that
-/// FOLLOWS a tool call keeps the pre-#1022 fallback (`None` → `next_order`, the
-/// render moment): it was produced after that call's result, and the resolution
-/// receipt's own ordering stays untouched. Every entry's `shown_at` (and so the
-/// Rendered Cursor frontier) still carries only the server's time.
+/// item carries no time at all, so — for the parts BEFORE the message's first
+/// tool call — the read's own order supplies it: a part without a time borrows
+/// the floor (the previous timed part's start, or the message's `time.created`),
+/// and a timed part behind the floor takes the floor too. The first tool call
+/// and everything after it keep the pre-#1022 order (the part's own time, or the
+/// render-order fallback): a part after a tool was produced after that call's
+/// result, and the resolution receipt's own ordering (ADR-0038 rule 4) stays
+/// untouched. Every entry's `shown_at` (and so the Rendered Cursor frontier)
+/// still carries only the server's time.
 fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<Option<i64>> {
+    let first_tool = message
+        .parts
+        .iter()
+        .position(|part| matches!(part, Part::Tool(_)));
     let mut floor = message.time.as_ref().map(|time| time.created);
-    let mut after_tool = false;
     let mut orders = Vec::with_capacity(message.parts.len());
-    for part in &message.parts {
+    for (index, part) in message.parts.iter().enumerate() {
+        if first_tool.is_none_or(|first| index >= first) {
+            orders.push(part.started_at());
+            continue;
+        }
         let order = match part {
-            Part::Tool(call) => {
-                let own = call.started_at;
-                let order = match own {
-                    Some(own) => Some(floor.map_or(own, |floor| floor.max(own))),
-                    None if after_tool => None,
-                    None => floor,
-                };
-                after_tool = true;
-                order
-            }
-            Part::Text(_) | Part::Reasoning(_) => {
-                let own = part.started_at();
-                let order = match own {
-                    Some(own) => Some(floor.map_or(own, |floor| floor.max(own))),
-                    None if after_tool => None,
-                    None => floor,
-                };
-                after_tool = false;
-                order
-            }
+            Part::Text(_) | Part::Reasoning(_) => match part.started_at() {
+                Some(own) => Some(floor.map_or(own, |floor| floor.max(own))),
+                None => floor,
+            },
             _ => {
                 orders.push(None);
                 continue;
@@ -4820,10 +4812,10 @@ Index: /x/src/main.rs
         );
     }
 
-    /// The order key each part of a message gets (`part_order_times`): a part's
-    /// own server time, or the read's floor, and the message's `time.created`
-    /// before any timed part (issue #1022). An untimed message stays `None`
-    /// (the render-order fallback), and so does a part that follows a tool.
+    /// The order key each part of a message gets (`part_order_times`): before
+    /// the message's first tool, a part's own server time or the read's floor
+    /// (issue #1022); the first tool and everything after take the pre-#1022
+    /// order — their own time, or `None` (the render-order fallback).
     #[test]
     fn part_order_times_borrows_the_previous_timed_part() {
         let ordered = message(
@@ -4839,12 +4831,12 @@ Index: /x/src/main.rs
         );
         assert_eq!(
             part_order_times(&ordered),
-            vec![Some(1_000), Some(1_100), Some(1_100), Some(1_100), None]
+            vec![Some(1_000), Some(1_100), Some(1_100), None, None]
         );
 
-        // A timed part behind the floor takes the floor instead of jumping
-        // back over content already placed from the same message.
-        let behind = message(
+        // The first tool owns its server time, and a part after it keeps its
+        // own time too — no borrow crosses the tool boundary.
+        let after_tool = message(
             "a3",
             1_000,
             vec![
@@ -4853,20 +4845,25 @@ Index: /x/src/main.rs
                 tool("bash", "call_2", ToolStatus::Completed, Some(2_050), None, None),
             ],
         );
-        assert_eq!(part_order_times(&behind), vec![Some(2_100), None, Some(2_050)]);
+        assert_eq!(
+            part_order_times(&after_tool),
+            vec![Some(2_100), None, Some(2_050)]
+        );
 
-        // A text after a tool keeps the pre-#1022 render-order fallback: it was
-        // produced after that call's result, so the resolution receipt's own
-        // ordering must stay untouched.
-        let after_tool = message(
+        // Inside the prefix a timed part behind the floor still takes it.
+        let behind = message(
             "a4",
             1_000,
             vec![
-                tool("bash", "call_1", ToolStatus::Completed, Some(2_100), None, None),
-                text_part("回答"),
+                text_part("前置"),
+                reasoning_at("想想", 900),
+                tool("bash", "call_1", ToolStatus::Running, Some(2_100), None, None),
             ],
         );
-        assert_eq!(part_order_times(&after_tool), vec![Some(2_100), None]);
+        assert_eq!(
+            part_order_times(&behind),
+            vec![Some(1_000), Some(1_000), Some(2_100)]
+        );
 
         let timeless = typed_message("a2", MessageRole::Assistant, None, vec![text_part("?")]);
         assert_eq!(part_order_times(&timeless), vec![None]);
@@ -4974,12 +4971,12 @@ Index: /x/src/main.rs
         );
     }
 
-    /// A pending call that first appears without a server time is keyed by its
-    /// read position; a later read that reports the time must not move it past
-    /// the text the read already placed after it (issue #1022). The panel's
-    /// displayed clock still picks the real time up.
+    /// A pending call that first appears without a server time is keyed by the
+    /// render-order fallback; a later read that reports the time re-keys it to
+    /// the call's real start, which still precedes the text the read placed
+    /// after it (issue #1022). The panel's displayed clock picks the time up.
     #[test]
-    fn a_late_start_time_never_moves_a_pinned_panel_past_its_following_text() {
+    fn a_late_start_time_still_settles_before_the_text_that_followed_it() {
         let anchor = 2_000;
         let transcript = |started: Option<i64>, status: ToolStatus, output: Option<&str>| {
             SessionTranscript::new(vec![
