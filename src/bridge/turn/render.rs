@@ -219,9 +219,10 @@ fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<Option<i
 /// the transcript, recorded on text/reasoning timeline
 /// entries for the Rendered Cursor frontier (spec #561); callers without one
 /// (synthetic batches, the seeded live-set join) pass `None`. `order_at` is the
-/// position's timeline key ([`part_order_times`]): the part's own server time,
-/// or the previous part's when it reports none. Returns true when the part
-/// rendered (not skipped as duplicate/empty).
+/// position's timeline key: a walk that places parts from a read passes
+/// [`part_order_times`]' entry, while the seeded live-set join passes the
+/// call's own server time — it is resolved by identity, not by a read position.
+/// Returns true when the part rendered (not skipped as duplicate/empty).
 fn render_part(
     acc: &mut StreamAccumulator,
     source: Option<PartSource>,
@@ -4722,6 +4723,11 @@ Index: /x/src/main.rs
             &transcript(ToolStatus::Running, None)
         ));
         assert!(acc.tools()["call_1"].is_live());
+        let live = card_text(&acc.build_card_with_info().card);
+        assert!(
+            live.find("先解释背景。").unwrap() < live.find("⏳ bash").unwrap(),
+            "the text is above the panel while it is live too: {live}"
+        );
 
         assert!(render_new_turn_parts(
             &mut acc,
@@ -4778,6 +4784,47 @@ Index: /x/src/main.rs
             text.find("tool-output").unwrap() < text.find("回答").unwrap(),
             "the settled panel sorts at its allocation position: {text}"
         );
+        // The borrowed order key never becomes the Rendered Cursor's start:
+        // V2's text has no server time, so the frontier still records none.
+        let built = acc.build_card_with_info();
+        assert_eq!(
+            built.cursor.frontier,
+            Some(CursorFrontier {
+                message_id: MessageId::new("a1"),
+                part_index: 1,
+                kind: CursorPartKind::Text,
+                started_at: None,
+                delivered_chars: "回答".chars().count(),
+                prefix_digest: Some(cursor_prefix_digest("回答")),
+            }),
+            "a borrowed key is not a server start"
+        );
+    }
+
+    /// The order key each part of a message sorts by (`part_order_times`): a
+    /// part's own server time, or the previous timed part's, and the message's
+    /// `time.created` before any timed part (issue #1022). An untimed message
+    /// keeps `None`, so the caller falls back to `next_order()`.
+    #[test]
+    fn part_order_times_borrows_the_previous_timed_part() {
+        let ordered = message(
+            "a1",
+            1_000,
+            vec![
+                text_part("首段"),
+                reasoning_at("想想", 1_100),
+                text_part("中段"),
+                tool("bash", "call_1", ToolStatus::Running, None, None, None),
+                text_part("尾段"),
+            ],
+        );
+        assert_eq!(
+            part_order_times(&ordered),
+            vec![Some(1_000), Some(1_100), Some(1_100), Some(1_100), Some(1_100)]
+        );
+
+        let timeless = typed_message("a2", MessageRole::Assistant, None, vec![text_part("?")]);
+        assert_eq!(part_order_times(&timeless), vec![None]);
     }
 
     /// The live Turn card does NOT render a skill fold (spec #652, ticket #655,
