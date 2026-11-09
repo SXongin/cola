@@ -490,6 +490,9 @@ pub struct RecordingPlatform {
     /// (a parked read still counts). The reap's stamp tests count the reads a
     /// settled key must never repeat (spec #571, ticket #575).
     pub card_view_reads: std::sync::Mutex<Vec<String>>,
+    /// Message ids a test deleted: `get_card_view` reports Feishu's
+    /// `230002: message not found` for them, the proven-gone signal.
+    pub deleted_messages: std::sync::Mutex<std::collections::HashSet<String>>,
     /// One-shot mid-send pause installed by a concurrency test (absent in
     /// every other test). Taken by the first matching call.
     pub pause_call: std::sync::Mutex<Option<CallGate>>,
@@ -580,6 +583,7 @@ impl RecordingPlatform {
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             card_views: std::sync::Mutex::new(std::collections::HashMap::new()),
             card_view_reads: std::sync::Mutex::new(Vec::new()),
+            deleted_messages: std::sync::Mutex::new(std::collections::HashSet::new()),
             pause_call: std::sync::Mutex::new(None),
             reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
             keyed_ticket_await: std::sync::Mutex::new(crate::feishu::delivery::KEYED_TICKET_AWAIT),
@@ -692,6 +696,16 @@ impl RecordingPlatform {
             .lock()
             .unwrap()
             .insert(message_id.to_string(), view);
+    }
+
+    /// Mark `message_id` deleted: `get_card_view` returns Feishu's `230002`
+    /// "message not found", the signal the Location Form re-adoption treats as
+    /// proven-gone.
+    pub fn delete_message(&self, message_id: &str) {
+        self.deleted_messages
+            .lock()
+            .unwrap()
+            .insert(message_id.to_string());
     }
 
     /// Take the installed gate when this call matches it.
@@ -1339,6 +1353,11 @@ impl feishu::Platform for RecordingPlatform {
         self.card_view_reads.lock().unwrap().push(message_id.to_string());
         if let Some(gate) = self.take_gate("card_view", message_id) {
             wait_gate(gate).await;
+        }
+        if self.deleted_messages.lock().unwrap().contains(message_id) {
+            return Err(crate::error::BridgeError::Feishu(
+                "get card view error 230002: message not found".into(),
+            ));
         }
         // Scripted via `given_card_view`; a missing entry is a hard failure
         // (like a real read of a deleted or non-card message), so the reap's

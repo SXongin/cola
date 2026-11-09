@@ -145,23 +145,44 @@ pub struct StandaloneSurface {
 /// empty suppression and needs no format-version bump (ADR-0091).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LocationFormRecord {
+    /// The Agent Client that owns the form (ADR-0091). Written on every
+    /// mutation and repaired from the client scope on load when an
+    /// intermediate build left it empty.
+    #[serde(default)]
+    pub client_id: String,
     /// The directory that owns the form. A sweep can speak for a request only
     /// while that directory is still mapped and listed, so an unmapped
     /// directory's record is retained instead of pruned.
     #[serde(default)]
     pub directory: String,
-    /// A standalone card was delivered and has not been dismissed.
+    /// The one decision this record carries: a delivered card, or a withdrawn
+    /// one. No record at all means the form was never pushed.
     #[serde(default)]
-    pub pushed: bool,
-    /// 「稍后」 withdrew the card. The form stays pending but must not be
-    /// pushed again until a reopen clears this.
-    #[serde(default)]
-    pub dismissed: bool,
+    pub state: LocationFormState,
     /// Monotonic dismissal generation. A reopen reads it before sending and
     /// clears the dismissal only if it is unchanged afterwards, so a dismissal
     /// that lands during the send survives.
     #[serde(default)]
     pub dismissal_generation: u64,
+}
+
+impl LocationFormRecord {
+    /// Whether 「稍后」 withdrew the form; a restart must not re-push it.
+    pub(crate) fn is_dismissed(&self) -> bool {
+        self.state == LocationFormState::Dismissed
+    }
+}
+
+/// The three-state decision a Location Form can carry. The absence of a
+/// [`LocationFormRecord`] is the third state ("never pushed").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocationFormState {
+    /// A card was delivered and has not been dismissed.
+    #[default]
+    Pushed,
+    /// 「稍后」 withdrew the card; the form stays pending but must not be
+    /// pushed again until a reopen clears this.
+    Dismissed,
 }
 
 /// One active client's view of the persisted record — what the startup
@@ -349,6 +370,14 @@ impl Surfaces {
                             }
                         }
                     }
+                    for (client, records) in file.location_forms.clients_mut() {
+                        for record in records.values_mut() {
+                            if record.client_id.is_empty() {
+                                record.client_id = client.clone();
+                                repaired = true;
+                            }
+                        }
+                    }
                     file
                 }
                 Err(error) => {
@@ -456,28 +485,42 @@ impl Surfaces {
     }
 
     /// Record that a Location Form's card was pushed: the standalone surface
-    /// and the `pushed` decision land in **one** mutation (ADR-0103), so a
-    /// restart never sees one without the other.
+    /// and the state land in **one** mutation (ADR-0103), so a restart never
+    /// sees one without the other.
+    ///
+    /// Returns `false` without writing when a dismissal already exists: a
+    /// 「稍后」 that raced the push's commit wins, and the caller must not
+    /// resurrect the card (it withdrew the fresh send instead).
     pub fn set_location_form_pushed(
         &self,
         request_id: &str,
         mut surface: StandaloneSurface,
         directory: &str,
-    ) {
+    ) -> bool {
         surface.client_id = self.client_id.clone();
+        let mut recorded = false;
         self.mutate(|state| {
+            if state
+                .location_forms
+                .get(&self.client_id, request_id)
+                .is_some_and(LocationFormRecord::is_dismissed)
+            {
+                return false;
+            }
             let mut record = state
                 .location_forms
                 .get(&self.client_id, request_id)
                 .cloned()
                 .unwrap_or_default();
+            record.client_id = self.client_id.clone();
             record.directory = directory.to_string();
-            record.pushed = true;
-            record.dismissed = false;
+            record.state = LocationFormState::Pushed;
             state.location_forms.insert(&self.client_id, request_id, record);
             state.standalone.insert(&self.client_id, request_id, surface);
+            recorded = true;
             true
         });
+        recorded
     }
 
     /// Record a 「稍后」 dismissal and forget the withdrawn standalone card in
@@ -490,11 +533,11 @@ impl Surfaces {
                 .get(&self.client_id, request_id)
                 .cloned()
                 .unwrap_or_default();
+            record.client_id = self.client_id.clone();
             if !directory.is_empty() {
                 record.directory = directory.to_string();
             }
-            record.pushed = true;
-            record.dismissed = true;
+            record.state = LocationFormState::Dismissed;
             record.dismissal_generation = record.dismissal_generation.wrapping_add(1);
             state.location_forms.insert(&self.client_id, request_id, record);
             state.standalone.remove(&self.client_id, request_id);
@@ -506,6 +549,10 @@ impl Surfaces {
     /// standalone card in the same mutation. Returns whether it cleared: a
     /// dismissal recorded after `generation` was read (a 「稍后」 that landed
     /// during the send) leaves the record dismissed and returns `false`.
+    ///
+    /// Test-only until `/mcp` (#1018) wires the reopen caller; the flow seam
+    /// and this method are promoted together then.
+    #[cfg(test)]
     pub fn clear_location_form_dismissal(
         &self,
         request_id: &str,
@@ -518,17 +565,28 @@ impl Surfaces {
             let Some(mut record) = state.location_forms.get(&self.client_id, request_id).cloned() else {
                 return false;
             };
-            if !record.dismissed || record.dismissal_generation != generation {
+            if !record.is_dismissed() || record.dismissal_generation != generation {
                 return false;
             }
-            record.dismissed = false;
-            record.pushed = true;
+            record.client_id = self.client_id.clone();
+            record.state = LocationFormState::Pushed;
             state.location_forms.insert(&self.client_id, request_id, record);
             state.standalone.insert(&self.client_id, request_id, surface);
             cleared = true;
             true
         });
         cleared
+    }
+
+    /// Forget a Location Form's decision and its standalone surface in one
+    /// mutation. Used when the persisted card is proven gone (a deleted
+    /// message): the next sweep re-surfaces the still-pending form.
+    pub fn remove_location_form(&self, request_id: &str) {
+        self.mutate(|state| {
+            let record = state.location_forms.remove(&self.client_id, request_id);
+            let surface = state.standalone.remove(&self.client_id, request_id);
+            record.is_some() || surface.is_some()
+        });
     }
 
     /// Forget every Location Form record `keep` does not name. The sweep calls
@@ -795,18 +853,42 @@ mod tests {
     fn an_empty_embedded_client_is_repaired_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("interactive_surfaces.json");
-        std::fs::write(
-            &path,
-            format!(
-                r#"{{"version":{},"inline":{{"default":{{"per_1":{{"client_id":"","message_id":"om_1","kind":"Permission","session_id":"ses_1","directory":"/work","target":"ls"}}}}}},"cards":{{}},"standalone":{{}}}}"#,
-                crate::state::STATE_FORMAT_VERSION
-            ),
-        )
-        .unwrap();
+        let value = serde_json::json!({
+            "version": crate::state::STATE_FORMAT_VERSION,
+            "inline": {
+                "default": {
+                    "per_1": {
+                        "client_id": "",
+                        "message_id": "om_1",
+                        "kind": "Permission",
+                        "session_id": "ses_1",
+                        "directory": "/work",
+                        "target": "ls"
+                    }
+                }
+            },
+            "cards": {},
+            "standalone": {},
+            "location_forms": {
+                "default": {
+                    "frm_1": {
+                        "client_id": "",
+                        "directory": "/work",
+                        "state": "Dismissed",
+                        "dismissal_generation": 1
+                    }
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
 
         let surfaces = Surfaces::open(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
         assert_eq!(
             surfaces.snapshot().inline.get("per_1").unwrap().client_id,
+            crate::config::DEFAULT_CLIENT_ID
+        );
+        assert_eq!(
+            surfaces.location_form("frm_1").unwrap().client_id,
             crate::config::DEFAULT_CLIENT_ID
         );
         let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -814,6 +896,11 @@ mod tests {
             raw["inline"]["default"]["per_1"]["client_id"],
             crate::config::DEFAULT_CLIENT_ID,
             "the repair is on disk"
+        );
+        assert_eq!(
+            raw["location_forms"]["default"]["frm_1"]["client_id"],
+            crate::config::DEFAULT_CLIENT_ID,
+            "the Location Form record is repaired on disk too"
         );
 
         let before = std::fs::read(&path).unwrap();
@@ -832,7 +919,8 @@ mod tests {
             let surfaces = Surfaces::load(path.clone());
             surfaces.set_location_form_pushed("frm_1", standalone("om_card"), "/work");
             let record = surfaces.location_form("frm_1").expect("a pushed record");
-            assert!(record.pushed && !record.dismissed);
+            assert_eq!(record.state, LocationFormState::Pushed);
+            assert_eq!(record.client_id, crate::config::DEFAULT_CLIENT_ID);
             assert_eq!(
                 surfaces.snapshot().standalone.get("frm_1").unwrap().message_id,
                 "om_card"
@@ -842,7 +930,7 @@ mod tests {
 
         let surfaces = Surfaces::load(path);
         let record = surfaces.location_form("frm_1").expect("the dismissal persisted");
-        assert!(record.pushed && record.dismissed);
+        assert_eq!(record.state, LocationFormState::Dismissed);
         assert_eq!(record.dismissal_generation, 1);
         assert!(
             !surfaces.snapshot().standalone.contains_key("frm_1"),
@@ -866,7 +954,7 @@ mod tests {
             !surfaces.clear_location_form_dismissal("frm_1", generation, standalone("om_new")),
             "a newer dismissal survives the reopen"
         );
-        assert!(surfaces.location_form("frm_1").unwrap().dismissed);
+        assert!(surfaces.location_form("frm_1").unwrap().is_dismissed());
         assert!(
             !surfaces.snapshot().standalone.contains_key("frm_1"),
             "no surface is recorded for a reopen that lost the race"
@@ -874,7 +962,7 @@ mod tests {
 
         let current = surfaces.location_form("frm_1").unwrap().dismissal_generation;
         assert!(surfaces.clear_location_form_dismissal("frm_1", current, standalone("om_new")));
-        assert!(!surfaces.location_form("frm_1").unwrap().dismissed);
+        assert!(!surfaces.location_form("frm_1").unwrap().is_dismissed());
     }
 
     /// An older file has no `location_forms` section: it loads with empty
