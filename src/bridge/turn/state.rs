@@ -52,6 +52,11 @@ pub(super) enum RenderedPart {
 pub(super) struct TimelineItem {
     pub(super) key: i64,
     pub(super) shown_at: Option<i64>,
+    /// The entry's position within an equal-`key` run. It matches `seq` for
+    /// every ordinary insert; only the render-boundary clamp lowers it, so a
+    /// late entry keeps the timeline sorted by `(key, order)` without
+    /// renumbering the identity below (issue #1022).
+    pub(super) order: u64,
     /// Identity of this entry, assigned once at insertion and never reused.
     /// It names the entry's panel on the card (`reason_{seq}`; a tool panel
     /// uses the call's own id, `tool_{call_id}`, so the takeover's per-call
@@ -3878,28 +3883,29 @@ impl StreamAccumulator {
         // the receipt (issue #1023, [`ReceiptCut`]). The receipt's own key is
         // the floor; equal keys keep this entry after it.
         let key = self.message_floor.map_or(key, |floor| key.max(floor));
-        // Equal keys keep ALLOCATION order (`seq`): a live tool panel is
+        // Equal keys keep ALLOCATION order (`order`): a live tool panel is
         // allocated at its transcript position and joins the timeline only when
         // it settles, after a later part of the same message may have been
-        // pushed at the same key (issue #1022).
+        // pushed at the same key (issue #1022). `order` matches `seq` for every
+        // ordinary insert; the clamp below may lower it without touching the
+        // entry's identity.
         let idx = self
             .timeline
-            .partition_point(|item| item.key < key || (item.key == key && item.seq < seq));
-        let (idx, key, seq) = if idx < self.render_from {
+            .partition_point(|item| item.key < key || (item.key == key && item.order < seq));
+        let (idx, key, order) = if idx < self.render_from {
             let idx = self.render_from;
             let key = self.timeline.get(idx).map_or(key, |item| item.key);
             // The clamp puts the entry at the top of the live slice, which can
-            // land inside an equal-key run. Renumber it ahead of that run so
-            // the (key, seq) order the search above assumes still holds; the
-            // seq is a timeline position, never a fold identity (a tool's
-            // element is keyed by its call id).
-            let seq = self.timeline[idx..]
+            // land inside an equal-key run. Lower its ORDER ahead of that run so
+            // the (key, order) sort the search above assumes still holds; `seq`
+            // — the panel identity — is untouched.
+            let order = self.timeline[idx..]
                 .iter()
                 .take_while(|item| item.key == key)
-                .map(|item| item.seq)
+                .map(|item| item.order)
                 .min()
                 .map_or(seq, |first| first.saturating_sub(1));
-            (idx, key, seq)
+            (idx, key, order)
         } else {
             (idx, key, seq)
         };
@@ -3909,6 +3915,7 @@ impl StreamAccumulator {
             TimelineItem {
                 key,
                 shown_at,
+                order,
                 seq,
                 kind,
                 source,
@@ -3999,19 +4006,30 @@ impl StreamAccumulator {
         // [`Self::insert_item`], and a chunk left at the part's raw key would
         // break the timeline's key order.
         let key = self.message_floor.map_or(key, |floor| key.max(floor));
-        let (idx, key) = if after + 1 < self.render_from {
-            (
-                self.render_from,
-                self.timeline.get(self.render_from).map_or(key, |item| item.key),
-            )
+        // A continuation stays beside its own part's entry: it shares that
+        // entry's position order (the identity `seq` stays its own). The clamp
+        // to the live slice lowers the order like [`Self::insert_item`] does,
+        // never the identity.
+        let order = self.timeline.get(after).map_or(seq, |item| item.order);
+        let (idx, key, order) = if after + 1 < self.render_from {
+            let idx = self.render_from;
+            let key = self.timeline.get(idx).map_or(key, |item| item.key);
+            let order = self.timeline[idx..]
+                .iter()
+                .take_while(|item| item.key == key)
+                .map(|item| item.order)
+                .min()
+                .map_or(order, |first| first.saturating_sub(1));
+            (idx, key, order)
         } else {
-            (after + 1, key)
+            (after + 1, key, order)
         };
         self.timeline.insert(
             idx,
             TimelineItem {
                 key,
                 shown_at,
+                order,
                 seq,
                 kind,
                 source,
@@ -6201,6 +6219,7 @@ mod tests {
         let item = TimelineItem {
             key: 1,
             shown_at: None,
+            order: 1,
             seq: 1,
             kind: TimelineKind::Tool("call_1".into()),
             source: None,
@@ -8231,6 +8250,30 @@ mod tests {
             vec!["tool_call_bash".to_string()],
             "the panel's id names its call"
         );
+    }
+
+    /// The render-boundary clamp puts a late entry at the top of the live slice
+    /// and lowers only its ORDER, never the identity `seq` a panel's element id
+    /// is built from (ADR-0040; issue #1022).
+    #[test]
+    fn a_clamped_entry_keeps_its_identity_seq() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text_at(Some(1_000), "前");
+        acc.push_text_at(Some(2_000), "后");
+        // Finalize the first entry: the live slice starts at the second, and an
+        // entry keyed behind it must clamp to the slice's first key.
+        acc.skip_rejected_slice(0, 1);
+        assert_eq!(acc.render_from, 1);
+
+        // An older identity (7) with a key behind the slice.
+        acc.insert_item(500, None, None, 7, TimelineKind::Text("迟到".into()), None);
+        let clamped = &acc.timeline[acc.render_from];
+        assert_eq!(clamped.seq, 7, "the identity is never renumbered");
+        assert!(
+            clamped.order < acc.timeline[acc.render_from + 1].order,
+            "the order sorts it ahead of the equal-key run"
+        );
+        assert_eq!(clamped.key, acc.timeline[acc.render_from + 1].key);
     }
 
     /// The header phase (ADR-0014) follows state transitions: Loading until the
