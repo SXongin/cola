@@ -716,6 +716,41 @@ impl QuestionRequest {
     }
 }
 
+/// One MCP server's connection state (ADR-0103's `/mcp` pull surface). The
+/// neutral shape carries the wire's states, not its JSON: `needs_auth` in
+/// particular is the fact a Host must see before a Location Form naming that
+/// server can be answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerState {
+    Connected,
+    Pending,
+    Disabled,
+    Failed,
+    /// The server has no usable credential: the Host must sign in before it
+    /// can serve tools or an elicitation.
+    NeedsAuth,
+    /// A status this build does not know. Never treated as connected.
+    Unknown,
+}
+
+/// One MCP server as the pull surface lists it: the configured name and its
+/// connection state. `error` carries the wire's detail for `failed` and
+/// `needs_auth` when the server supplied one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub state: McpServerState,
+    pub error: Option<String>,
+}
+
+impl McpServerStatus {
+    /// Whether the server needs authentication before it can be used. The
+    /// card's `needs_auth` indication reads this, never the raw wire string.
+    pub fn needs_auth(&self) -> bool {
+        self.state == McpServerState::NeedsAuth
+    }
+}
+
 /// A session's run state as reported by the server (`GET /session/status`).
 /// cola consumes the server's own status service (ADR-0028): idle/busy/retry
 /// per session. A read this client cannot interpret is never guessed — it

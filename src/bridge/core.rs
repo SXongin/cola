@@ -503,6 +503,7 @@ impl SharedCore {
     pub(crate) fn command_handles(&self) -> crate::bridge::handles::CommandHandles {
         crate::bridge::handles::CommandHandles {
             flow: self.flow_handles(),
+            question: Arc::clone(&self.question),
             config: self.turn_config(),
             external: Arc::clone(&self.external),
             diff_cooldown: Arc::clone(&self.diff_cooldown),

@@ -19,9 +19,9 @@
 //!   needs.
 //! - [`TopicHandles`] — [`FlowHandles`] plus the external flow the topic
 //!   opening settles an adopted snapshot through.
-//! - [`CommandHandles`] — [`FlowHandles`] plus the turn config (the default
-//!   session directory) and the external flow the adoption tails settle
-//!   through.
+//! - [`CommandHandles`] — [`FlowHandles`] plus the question flow (the `/mcp`
+//!   Location Form reads), the turn config (the default session directory) and
+//!   the external flow the adoption tails settle through.
 //! - [`TurnHandles`] — the Turn's bundle (A1).
 
 use std::collections::{HashMap, HashSet};
@@ -2956,11 +2956,15 @@ impl TopicHandles {
     }
 }
 
-/// The command bundle: the flow handles plus the turn config (the default
-/// session directory a bare `/topic`/`/new` falls back to).
+/// The command bundle: the flow handles, the question flow (whose durable
+/// Location Form decisions `/mcp` reads and reopens) and the turn config (the
+/// default session directory a bare `/topic`/`/new` falls back to).
 #[derive(Clone)]
 pub(crate) struct CommandHandles {
     pub(crate) flow: FlowHandles,
+    /// The question flow, for the command-layer reads that need its durable
+    /// Location Form decisions (`/mcp`'s dismissal state and reopen).
+    pub(crate) question: Arc<crate::bridge::request::flow::RequestFlow>,
     pub(crate) config: TurnConfig,
     /// The external flow, which owns the busy follow `/card` arms on a read
     /// whose Session is still running (ADR-0100): its renderer cadences and

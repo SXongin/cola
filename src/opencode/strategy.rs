@@ -91,6 +91,20 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     async fn list_questions(&self, http: &Transport, directory: Option<&str>)
     -> Result<Vec<QuestionRequest>>;
 
+    /// The MCP server statuses for one location (V2's `GET /api/mcp`). A
+    /// generation without the full pull surface — statuses **and** Location
+    /// Forms — answers `Ok(None)` without a request: V1 publishes a status
+    /// read but has no elicitation-form surface, so a status-only answer would
+    /// make `/mcp` pretend. See
+    /// [`crate::backend::Backend::mcp_server_statuses`].
+    async fn mcp_server_statuses(
+        &self,
+        _http: &Transport,
+        _directory: Option<&str>,
+    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        Ok(None)
+    }
+
     /// Answer a pending form (V2) / question (V1). V1 takes positional string
     /// arrays; V2 takes a keyed answer object assembled from the same neutral
     /// [`FormAnswer`] list, so the strategy owns the generation's body shape.

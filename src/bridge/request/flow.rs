@@ -610,6 +610,21 @@ impl RequestFlow {
             .is_some_and(|state| state.request().is_location())
     }
 
+    /// Whether `req_id`'s Location Form is durably withdrawn by 「稍后」 — the
+    /// state `/mcp` lists as reopenable. A live card and a never-pushed form
+    /// both answer `false`.
+    pub(crate) fn location_form_dismissed(&self, req_id: &str) -> bool {
+        self.surfaces
+            .location_form(req_id)
+            .is_some_and(|record| record.is_dismissed())
+    }
+
+    /// Whether any durable push/dismissal decision exists for `req_id`. A
+    /// never-pushed form has none; a pushed or dismissed one does.
+    pub(crate) fn location_form_known(&self, req_id: &str) -> bool {
+        self.surfaces.location_form(req_id).is_some()
+    }
+
     /// Whether `req_id` is a remembered (pending) question request. Test-only
     /// today: the production poll loop tracks self-surfaced ids in its own
     /// `seen` set.
@@ -1986,9 +2001,8 @@ impl RequestFlow {
     /// The dismissal generation is read under the per-form write lock (shared
     /// with 「稍后」) and released for the send; the commit clears only that
     /// generation, so a dismissal that lands during the send survives. The
-    /// fresh card is withdrawn again in that race. `/mcp` (#1018) is the
-    /// caller; until it lands this is a test-only seam.
-    #[cfg(test)]
+    /// fresh card is withdrawn again in that race. `/mcp`'s reopen control is
+    /// the caller.
     pub(crate) async fn reopen_location_form(
         &self,
         handles: &FlowHandles,

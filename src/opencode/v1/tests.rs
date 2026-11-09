@@ -1324,6 +1324,27 @@ async fn session_diff_is_none_without_a_v1_request() {
     );
 }
 
+/// V1 publishes an MCP status read but no elicitation-form surface, so the
+/// full `/mcp` pull surface is **not applicable**: the capability answers
+/// `None` without a request rather than offering a status-only variant
+/// (ADR-0103).
+#[tokio::test]
+async fn mcp_server_statuses_are_not_applicable_on_v1() {
+    let server = TestHttpServer::start().await;
+    let client = v1_wire_client(&server, None);
+
+    assert_eq!(
+        client.mcp_server_statuses(Some("/work")).await.unwrap(),
+        None,
+        "V1 has no full MCP pull surface"
+    );
+    assert!(
+        server.requests().is_empty(),
+        "the capability must not reach the wire: {:?}",
+        server.requests()
+    );
+}
+
 /// V1 carries no Background Tasks (no child sessions), so the child-evidence
 /// read answers no evidence without a request (#591, issue #464). The caller's
 /// subagent list is empty there anyway; this arm exists so the trait has no

@@ -14,8 +14,10 @@ use std::sync::Arc;
 
 use crate::bridge::test_support::*;
 
+use crate::backend::Backend;
 use crate::backend::types::{
-    FormFieldKind, QuestionInfo, QuestionOption, QuestionRequest, UncollectableReason,
+    FormFieldKind, McpServerState, McpServerStatus, QuestionInfo, QuestionOption, QuestionRequest,
+    UncollectableReason,
 };
 use crate::bridge::request::kind::PendingRequest;
 use crate::config::{SessionEntry, ThreadKey};
@@ -1725,4 +1727,318 @@ async fn a_failed_combined_write_during_a_dismissal_loses_the_dismissal_after_a_
         platform.updated_cards().await.is_empty(),
         "the stale surface is re-adopted as-is, never repainted"
     );
+}
+
+// ===== /mcp: the read-only pull surface (ticket #1018) =====
+
+/// Every button value on a card whose `action` and `op` match. `/mcp`'s
+/// reopen control is the only action of its kind.
+fn button_with_action_op(card: &serde_json::Value, action: &str, op: &str) -> Option<serde_json::Value> {
+    fn walk(value: &serde_json::Value, action: &str, op: &str, found: &mut Option<serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(payload) = map.get("value")
+                    && payload.get("action").and_then(|v| v.as_str()) == Some(action)
+                    && payload.get("op").and_then(|v| v.as_str()) == Some(op)
+                {
+                    *found = Some(payload.clone());
+                }
+                for child in map.values() {
+                    walk(child, action, op, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for child in items {
+                    walk(child, action, op, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = None;
+    walk(card, action, op, &mut found);
+    found
+}
+
+fn status(name: &str, state: McpServerState) -> McpServerStatus {
+    McpServerStatus {
+        name: name.into(),
+        state,
+        error: None,
+    }
+}
+
+#[tokio::test]
+async fn mcp_lists_statuses_and_only_location_forms() {
+    let fixture = fixture(
+        false,
+        &[
+            ("/work", location_form("frm_mcp_list")),
+            ("/work", session_form("frm_session_mcp", "ses_1")),
+        ],
+        &[entry("chat_1", "ses_1", "/work")],
+        |backend| {
+            backend.with_mcp_statuses_in(
+                "/work",
+                vec![
+                    status("codegraph", McpServerState::Connected),
+                    McpServerStatus {
+                        name: "context7".into(),
+                        state: McpServerState::NeedsAuth,
+                        error: Some("no credential".into()),
+                    },
+                ],
+            );
+        },
+    )
+    .await;
+
+    send_command(&fixture.app, "/mcp", "msg_mcp").await;
+
+    let cards = posted_cards(&fixture.platform).await;
+    assert_eq!(cards.len(), 1, "the command renders one card");
+    let text = card_text(&cards[0]);
+    assert!(text.contains("/work"), "the card names the directory: {text}");
+    assert!(text.contains("codegraph") && text.contains("已连接"), "{text}");
+    assert!(
+        text.contains("context7") && text.contains("needs_auth"),
+        "a needs_auth server is unmistakable: {text}"
+    );
+    assert!(
+        text.contains("context7：请先登录 Context7 再继续"),
+        "the Location Form is listed: {text}"
+    );
+    assert!(
+        !text.contains("继续吗？"),
+        "a session-backed question is not duplicated here: {text}"
+    );
+    assert!(
+        text.contains("只读"),
+        "the card states its read-only scope: {text}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_empty_state_lists_no_servers_and_no_forms() {
+    let fixture = fixture(false, &[], &[entry("chat_1", "ses_1", "/work")], |backend| {
+        backend.with_mcp_statuses_in("/work", Vec::new());
+    })
+    .await;
+
+    send_command(&fixture.app, "/mcp", "msg_mcp_empty").await;
+
+    let card = posted_card(&fixture.platform).await;
+    let text = card_text(&card);
+    assert!(text.contains("没有配置 MCP 服务器"), "{text}");
+    assert!(text.contains("没有待处理的 Location Form"), "{text}");
+}
+
+#[tokio::test]
+async fn mcp_uses_the_pending_sessions_directory_over_the_active_one() {
+    let mut pending_form = location_form("frm_pending_dir");
+    pending_form.server = Some("pending-server".into());
+    pending_form.message = Some("pending form".into());
+    let mut active_form = location_form("frm_active_dir");
+    active_form.server = Some("active-server".into());
+    active_form.message = Some("active form".into());
+    let fixture = fixture(
+        false,
+        &[("/pending", pending_form), ("/active", active_form)],
+        &[entry("chat_1", "ses_1", "/active")],
+        |backend| {
+            backend.with_mcp_statuses_in(
+                "/pending",
+                vec![status("pending-server", McpServerState::Connected)],
+            );
+            backend.with_mcp_statuses_in(
+                "/active",
+                vec![status("active-server", McpServerState::Connected)],
+            );
+        },
+    )
+    .await;
+    seed_pending(
+        &fixture.app,
+        crate::bridge::session::PendingEntry::new(
+            ThreadKey::new("chat_1".into(), "chat_1".into()),
+            "/pending",
+        ),
+    )
+    .await;
+
+    send_command(&fixture.app, "/mcp", "msg_mcp_dir").await;
+
+    let text = card_text(&posted_card(&fixture.platform).await);
+    assert!(text.contains("/pending"), "the pending directory wins: {text}");
+    assert!(text.contains("pending-server"), "{text}");
+    assert!(text.contains("pending form"), "{text}");
+    assert!(
+        !text.contains("active-server") && !text.contains("active form"),
+        "another directory's surface must not leak in: {text}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_answers_unavailable_without_the_pull_surface() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_mcp_unsupported"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+
+    send_command(&fixture.app, "/mcp", "msg_mcp_unavailable").await;
+
+    let texts = fixture.platform.texts().await;
+    assert_eq!(texts.len(), 1, "one clear sentence, not a card: {texts:?}");
+    assert!(texts[0].contains("不可用"), "{texts:?}");
+    assert!(
+        posted_cards(&fixture.platform).await.is_empty(),
+        "an unsupported client gets no status-only card"
+    );
+}
+
+#[tokio::test]
+async fn mcp_reopen_sends_a_fresh_card_then_clears_the_dismissal() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_mcp_reopen"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |backend| {
+            backend.with_mcp_statuses_in("/work", vec![status("context7", McpServerState::NeedsAuth)]);
+        },
+    )
+    .await;
+    sweep(&fixture).await;
+    let original = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&original, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    send_command(&fixture.app, "/mcp", "msg_mcp_reopen").await;
+    let listing = posted_cards(&fixture.platform)
+        .await
+        .pop()
+        .expect("the /mcp card");
+    assert!(
+        card_text(&listing).contains("已稍后"),
+        "the dismissed form is listed as reopenable: {}",
+        card_text(&listing)
+    );
+    let reopen =
+        button_with_action_op(&listing, "mcp", "reopen").expect("a dismissed form has a reopen control");
+    assert_eq!(
+        reopen.get("directory").and_then(|v| v.as_str()),
+        Some("/work"),
+        "the control carries the exact directory that listed the form"
+    );
+
+    let result = fixture
+        .app
+        .host_action(reopen)
+        .await
+        .expect("the reopen click has a result");
+    assert!(
+        result
+            .toast
+            .as_deref()
+            .is_some_and(|toast| toast.contains("已重新打开")),
+        "the click reports the reopen: {:?}",
+        result.toast
+    );
+
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        3,
+        "the original, the /mcp listing, and the fresh card"
+    );
+    assert_eq!(
+        persisted_location_form(&fixture.session_file(), "frm_mcp_reopen").expect("the record survives")["state"],
+        "Pushed",
+        "the dismissal is cleared only after the fresh card lands"
+    );
+    // A later sweep sees the fresh surface and does not duplicate it.
+    sweep(&fixture).await;
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 3);
+}
+
+#[tokio::test]
+async fn mcp_reopen_failure_leaves_the_form_dismissed_and_retryable() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_mcp_reopen_fail"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |backend| {
+            backend.with_mcp_statuses_in("/work", vec![status("context7", McpServerState::Connected)]);
+        },
+    )
+    .await;
+    sweep(&fixture).await;
+    let original = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&original, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    send_command(&fixture.app, "/mcp", "msg_mcp_reopen_fail").await;
+    let listing = posted_cards(&fixture.platform)
+        .await
+        .pop()
+        .expect("the /mcp card");
+    let reopen = button_with_action_op(&listing, "mcp", "reopen").expect("a reopen control");
+
+    fixture
+        .platform
+        .fail_send_card_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let failed = fixture
+        .app
+        .host_action(reopen.clone())
+        .await
+        .expect("the failing click has a result");
+    assert!(
+        failed
+            .toast
+            .as_deref()
+            .is_some_and(|toast| toast.contains("失败")),
+        "the failure is spoken: {:?}",
+        failed.toast
+    );
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        2,
+        "the failed send posts no fresh card"
+    );
+    assert_eq!(
+        persisted_location_form(&fixture.session_file(), "frm_mcp_reopen_fail")
+            .expect("the dismissal survives")["state"],
+        "Dismissed",
+        "a failed send leaves the form dismissed and retryable"
+    );
+
+    let retried = fixture
+        .app
+        .host_action(reopen)
+        .await
+        .expect("the retry has a result");
+    assert!(
+        retried
+            .toast
+            .as_deref()
+            .is_some_and(|toast| toast.contains("已重新打开")),
+        "the retry lands: {:?}",
+        retried.toast
+    );
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 3);
+    assert_eq!(
+        persisted_location_form(&fixture.session_file(), "frm_mcp_reopen_fail").expect("the record survives")
+            ["state"],
+        "Pushed"
+    );
+}
+
+#[tokio::test]
+async fn mcp_command_capability_defaults_to_none_on_a_client_without_the_surface() {
+    // The mock's default is the same not-applicable shape as OpenCode V1 and
+    // Codex: no MCP pull surface, not a failed read.
+    let backend = MockBackend::new(realistic_parts());
+    assert_eq!(backend.mcp_server_statuses(Some("/work")).await.unwrap(), None);
 }

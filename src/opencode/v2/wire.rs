@@ -29,9 +29,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::backend::types::{
-    AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
-    QuestionRequest, SessionInfo, SessionListInfo, SessionModel, SessionSelection, SessionTime,
-    UncollectableReason,
+    AgentInfo, FormFieldKind, McpServerState, McpServerStatus, ModelInfo, ModelOption, PermissionRequest,
+    QuestionInfo, QuestionOption, QuestionRequest, SessionInfo, SessionListInfo, SessionModel,
+    SessionSelection, SessionTime, UncollectableReason,
 };
 use crate::backend::{
     BackgroundLaunch, BackgroundTask, ChildEvidence, Compaction, CompactionReason, CompactionStatus,
@@ -419,6 +419,45 @@ impl RawPermission {
             metadata: self.metadata,
             always: self.save,
             always_supported: true,
+        }
+    }
+}
+
+/// `GET /api/mcp` — `{location, data: Mcp.Server[]}`: the MCP pull surface's
+/// server list. The status is a tagged union (`connected`, `pending`,
+/// `disabled`, `failed`, `needs_auth`), and `failed`/`needs_auth` carry an
+/// `error`. The wire's `status` string is kept as the tag while decoding so an
+/// unknown future state degrades to `Unknown` instead of failing the whole
+/// read.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawMcpServer {
+    pub(super) name: String,
+    pub(super) status: RawMcpStatus,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RawMcpStatus {
+    pub(super) status: String,
+    #[serde(default)]
+    pub(super) error: Option<String>,
+}
+
+impl RawMcpServer {
+    /// The neutral status row. `needs_auth` is the fact `/mcp` must make
+    /// unmistakable; an unknown tag is never read as connected.
+    pub(super) fn into_neutral(self) -> McpServerStatus {
+        let state = match self.status.status.as_str() {
+            "connected" => McpServerState::Connected,
+            "pending" => McpServerState::Pending,
+            "disabled" => McpServerState::Disabled,
+            "failed" => McpServerState::Failed,
+            "needs_auth" => McpServerState::NeedsAuth,
+            _ => McpServerState::Unknown,
+        };
+        McpServerStatus {
+            name: self.name,
+            state,
+            error: self.status.error,
         }
     }
 }
