@@ -592,14 +592,19 @@ without such a field keeps its ordinary Question card.
 Push and dismissal decisions survive a cola restart. A restart re-adopts a card
 that is still live instead of posting a second one; a form you deferred with
 **稍后** stays withdrawn — it is not pushed again — until you reopen it. A
-partway selection, including a multi-select you have toggled but not yet
-confirmed, is remembered across a restart, so the live card and what its
-confirm/submit sends stay in agreement — you do not have to reselect. That
-memory is best-effort like the rest of the card mirror. The
+partway selection of clicked options, including a multi-select you have toggled
+but not yet confirmed, is remembered across a restart, so the live card and what
+its confirm/submit sends stay in agreement — you do not have to reselect those.
+Text you typed yourself (a custom answer or a numeric box) is never written to
+disk, so it may need re-entering after a restart. That memory is best-effort like
+the rest of the card mirror: a failed mirror write can require a reselect. The
 「稍后」 decision is written before the card is withdrawn, so a failed record
 write leaves the card live and answerable rather than leaving a terminal card
 that no longer says it is waiting; a failed or timed-out withdrawal after that
-point is still reopenable through `/mcp`. Recovery is best-effort: a failed push
+point is still reopenable through `/mcp`. If the card PATCH failed definitely
+after the dismissal was saved, that leaves the old card live while `/mcp`
+reopens a fresh card — two live cards, a duplicate rather than a stranded form;
+answering either settles the form. Recovery is best-effort: a failed push
 record or a timed-out send can still duplicate a card after a restart, exactly
 as any standalone card can, and cola does not claim otherwise. Once a form has
 left the pending list and cola can still speak for its directory, its record is
@@ -620,8 +625,10 @@ be answered — and **only** its pending Location Forms. Session-backed question
 keep their own cards and never appear there. A form you deferred with 「稍后」
 gets a 「重新打开」 control: it sends a fresh card first and clears the dismissal
 only after the send lands, so a failed send leaves the form withdrawn and
-retryable. `/mcp` never connects, disconnects, adds, removes or signs in to an
-MCP server, and never browses resources. On an Agent Client without the full
+retryable. The reopen sends inside the click; if it outlives cola's callback
+budget, only the `/mcp` card's repaint may be lost — the fresh form card and the
+cleared dismissal are already committed. `/mcp` never connects, disconnects,
+adds, removes or signs in to an MCP server, and never browses resources. On an Agent Client without the full
 status + Location Form surface it answers 不可用 rather than pretending.
 
 Session-backed elicitations keep their normal Question card and reminder. A
