@@ -30,8 +30,8 @@ use super::delivery::{
     vanished_receipt,
 };
 use super::kind::{
-    DeclineReason, PendingRequest, PermissionOverflow, Prepared, Refusal, RequestKind, decline_permission,
-    permission_overflow, permission_target,
+    DeclineReason, InteractionKind, PendingRequest, PermissionOverflow, Prepared, Refusal, RequestKind,
+    decline_permission, permission_overflow, permission_target,
 };
 
 /// One question request's captured reply inputs (spec #364, S6): the request's
@@ -408,7 +408,7 @@ impl RequestFlow {
         let dismissed: std::collections::HashSet<&str> = state
             .location_forms
             .iter()
-            .filter(|(_, record)| record.dismissed)
+            .filter(|(_, record)| record.is_dismissed())
             .map(|(id, _)| id.as_str())
             .collect();
         let sent_cards: HashMap<String, SentCard> = state
@@ -657,40 +657,13 @@ impl RequestFlow {
         let lock = self.location_form_lock(req_id).await;
         let _guard = lock.lock().await;
         let sent = self.sent_cards.lock().await.get(req_id).cloned();
-        if let Some(sent) = sent {
-            // A card callback has a ~2 s ack budget: leave it room, while still
-            // letting tests lower the bound. A timeout keeps the record.
-            let timeout_ms = self
-                .withdrawal_timeout_ms
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .min(DEFER_WITHDRAWAL_TIMEOUT_MS);
-            let patched = crate::bridge::bounded_call(
-                &format!("{} {} defer withdrawal", self.kind.label(), req_id),
-                timeout_ms,
-                handles.platform.update_message(&sent.message_id, replacement),
-            )
-            .await;
-            match patched {
-                Some(Ok(())) => {}
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        "withdrawing {} deferred card on {} failed: {}; keeping its record",
-                        req_id,
-                        sent.message_id,
-                        e
-                    );
-                    return false;
-                }
-                None => {
-                    tracing::warn!(
-                        "withdrawing {} deferred card on {} timed out after {}ms; keeping its record",
-                        req_id,
-                        sent.message_id,
-                        timeout_ms
-                    );
-                    return false;
-                }
-            }
+        if let Some(sent) = sent
+            && !self
+                .withdraw_card(handles, req_id, &sent.message_id, replacement, "defer withdrawal")
+                .await
+        {
+            // A failed or timed-out PATCH keeps the card and its record.
+            return false;
         }
         self.sent_cards.lock().await.remove(req_id);
         // Durable dismissal and surface removal share one mutation, so a
@@ -1428,13 +1401,25 @@ impl RequestFlow {
             .retain(|id, dir| pending.contains(id) || failed_dirs.contains(dir));
         // ADR-0103: a Location Form's push/dismissal record is pruned only when
         // every mapped directory listed, so a failed list never reads the form
-        // as gone. A record whose directory is no longer mapped is retained
-        // too: the directory may return still holding the suppressed form, and
-        // a re-push would undo the Host's 「稍后」.
-        if failed_dirs.is_empty() {
+        // as gone. Only the Question flow owns Location Forms: the Permission
+        // flow's `pending` never contains their ids, so an ungated prune would
+        // delete every decision on each healthy permission tick. A record whose
+        // directory is no longer mapped is retained too: the directory may
+        // return still holding the suppressed form, and a re-push would undo
+        // the Host's 「稍后」. An empty directory is not a mapped one and is
+        // pruned with the request, so it cannot be retained forever.
+        if self.kind.interaction_kind() == InteractionKind::Question && failed_dirs.is_empty() {
             self.surfaces.retain_location_forms(|id, record| {
-                pending.contains(id) || !directories.contains(&record.directory)
+                pending.contains(id)
+                    || (!record.directory.is_empty() && !directories.contains(&record.directory))
             });
+        }
+        // The per-form write locks are keyed by the same ids as the records:
+        // forget one once neither a pending form nor a retained record names it
+        // (each map here is pruned, and this one must not grow unbounded).
+        {
+            let mut locks = self.location_locks.lock().await;
+            locks.retain(|id, _| pending.contains(id) || self.surfaces.location_form(id).is_some());
         }
         // #489: the same rule for the session-less registry — a request that
         // left the pending list, or a directory that said nothing, keeps its
@@ -1898,11 +1883,7 @@ impl RequestFlow {
         if seen.contains(req.id()) || self.sent_cards.lock().await.contains_key(req.id()) {
             return false;
         }
-        if self
-            .surfaces
-            .location_form(req.id())
-            .is_some_and(|record| record.pushed || record.dismissed)
-        {
+        if self.surfaces.location_form(req.id()).is_some() {
             return false;
         }
         let Some(target) = self.resolve_location_target(handles, req, dir).await else {
@@ -2006,9 +1987,8 @@ impl RequestFlow {
     /// with 「稍后」) and released for the send; the commit clears only that
     /// generation, so a dismissal that lands during the send survives. The
     /// fresh card is withdrawn again in that race. `/mcp` (#1018) is the
-    /// caller; the command itself is not part of this seam, so until it lands
-    /// this method has no production caller.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// caller; until it lands this is a test-only seam.
+    #[cfg(test)]
     pub(crate) async fn reopen_location_form(
         &self,
         handles: &FlowHandles,
@@ -2027,7 +2007,7 @@ impl RequestFlow {
         let generation = {
             let _guard = lock.lock().await;
             match self.surfaces.location_form(id) {
-                Some(record) if record.dismissed => record.dismissal_generation,
+                Some(record) if record.is_dismissed() => record.dismissal_generation,
                 _ => return false,
             }
         };
@@ -2044,18 +2024,28 @@ impl RequestFlow {
             );
             return false;
         };
-        let surface = StandaloneSurface {
-            client_id: String::new(),
-            kind: self.kind.interaction_kind(),
-            message_id: message_id.clone(),
-            summary: summary.clone(),
-            directory: dir.to_string(),
-            session_id: req.session_id().to_string(),
-        };
+        let surface = self.standalone_surface(req, dir, message_id.clone(), &summary);
+        // Clear the dismissal and register the new surface in ONE lock
+        // acquisition: a 「稍后」 either lands before this (mismatched
+        // generation, clear refused) or after it (it finds the registered
+        // card and withdraws it). It can never slip between the two writes.
         let cleared = {
             let _guard = lock.lock().await;
-            self.surfaces
-                .clear_location_form_dismissal(id, generation, surface)
+            let cleared = self
+                .surfaces
+                .clear_location_form_dismissal(id, generation, surface);
+            if cleared {
+                self.sent_cards.lock().await.insert(
+                    id.to_string(),
+                    SentCard {
+                        message_id: message_id.clone(),
+                        summary: summary.clone(),
+                        directory: dir.to_string(),
+                        session_id: req.session_id().to_string(),
+                    },
+                );
+            }
+            cleared
         };
         if !cleared {
             tracing::info!(
@@ -2063,33 +2053,10 @@ impl RequestFlow {
                 self.kind.label(),
                 id
             );
-            if let PendingRequest::Question(q) = req {
-                let deferred = crate::feishu::card::question::build_location_form_deferred_card(
-                    q.server.as_deref(),
-                    q.message.as_deref(),
-                );
-                let timeout_ms = self
-                    .withdrawal_timeout_ms
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .min(DEFER_WITHDRAWAL_TIMEOUT_MS);
-                let _ = crate::bridge::bounded_call(
-                    &format!("{} {} reopen withdrawal", self.kind.label(), id),
-                    timeout_ms,
-                    handles.platform.update_message(&message_id, &deferred),
-                )
+            self.withdraw_location_card(handles, req, &message_id, "reopen lost to a dismissal")
                 .await;
-            }
             return false;
         }
-        self.sent_cards.lock().await.insert(
-            id.to_string(),
-            SentCard {
-                message_id,
-                summary,
-                directory: dir.to_string(),
-                session_id: req.session_id().to_string(),
-            },
-        );
         self.kind.remember_surfaced(self, req, dir).await;
         tracing::info!(
             "{} ({}): {} reopened as a fresh directory-owned form card",
@@ -2168,48 +2135,139 @@ impl RequestFlow {
         }
     }
 
-    /// Commit one standalone card's surface record. The caller holds the
-    /// owning Session's write lock so no follow can commit over it.
-    async fn record_standalone_surface(
+    /// The persisted companion of one standalone card, shared by the push and
+    /// reopen paths so the two cannot drift.
+    fn standalone_surface(
         &self,
         req: &PendingRequest,
         dir: &str,
         message_id: String,
         summary: &str,
-    ) {
-        self.sent_cards.lock().await.insert(
-            req.id().to_string(),
-            SentCard {
-                message_id: message_id.clone(),
-                summary: summary.to_string(),
-                directory: dir.to_string(),
-                session_id: req.session_id().to_string(),
-            },
-        );
-        // Persist the standalone surface so a restart re-adopts it instead of
-        // posting a second card (ADR-0038 restart re-adoption). A Location Form
-        // writes its push decision and the surface in ONE mutation, so a
-        // restart cannot see one without the other (ADR-0103).
-        let surface = StandaloneSurface {
+    ) -> StandaloneSurface {
+        StandaloneSurface {
             client_id: String::new(),
             kind: self.kind.interaction_kind(),
             message_id,
             summary: summary.to_string(),
             directory: dir.to_string(),
             session_id: req.session_id().to_string(),
+        }
+    }
+
+    /// Commit one standalone card's surface record. The caller holds the
+    /// owning Session's write lock so no follow can commit over it.
+    ///
+    /// A Location Form's commit takes the per-form lock, and refuses to
+    /// overwrite a dismissal that landed while the send was in flight: the
+    /// caller then withdraws the fresh card. Returns whether the record was
+    /// written (always true for a Session-backed request).
+    async fn record_standalone_surface(
+        &self,
+        req: &PendingRequest,
+        dir: &str,
+        message_id: String,
+        summary: &str,
+    ) -> bool {
+        let surface = self.standalone_surface(req, dir, message_id.clone(), summary);
+        let sent = SentCard {
+            message_id,
+            summary: summary.to_string(),
+            directory: dir.to_string(),
+            session_id: req.session_id().to_string(),
         };
         if req.is_location() {
-            self.surfaces.set_location_form_pushed(req.id(), surface, dir);
-        } else {
-            self.surfaces.set_standalone(req.id(), surface);
+            let lock = self.location_form_lock(req.id()).await;
+            let _guard = lock.lock().await;
+            if !self.surfaces.set_location_form_pushed(req.id(), surface, dir) {
+                return false;
+            }
+            self.sent_cards.lock().await.insert(req.id().to_string(), sent);
+            return true;
         }
+        self.sent_cards.lock().await.insert(req.id().to_string(), sent);
+        // Persist the standalone surface so a restart re-adopts it instead of
+        // posting a second card (ADR-0038 restart re-adoption).
+        self.surfaces.set_standalone(req.id(), surface);
+        true
+    }
+
+    /// Withdraw one already-sent card by PATCHing `replacement` onto it. The
+    /// single bounded write both the 「稍后」 control and every "the send lost a
+    /// race, do not leave it live" path share. A failed or timed-out PATCH is
+    /// logged and reported, never silently dropped.
+    async fn withdraw_card(
+        &self,
+        handles: &FlowHandles,
+        req_id: &str,
+        message_id: &str,
+        replacement: &serde_json::Value,
+        purpose: &str,
+    ) -> bool {
+        // A card callback has a ~2 s ack budget: leave it room, while still
+        // letting tests lower the bound.
+        let timeout_ms = self
+            .withdrawal_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(DEFER_WITHDRAWAL_TIMEOUT_MS);
+        let patched = crate::bridge::bounded_call(
+            &format!("{} {} {}", self.kind.label(), req_id, purpose),
+            timeout_ms,
+            handles.platform.update_message(message_id, replacement),
+        )
+        .await;
+        match patched {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "withdrawing {} ({purpose}) on {message_id} failed: {e}; the record decides",
+                    req_id
+                );
+                false
+            }
+            None => {
+                tracing::warn!(
+                    "withdrawing {} ({purpose}) on {message_id} timed out after {timeout_ms}ms; \
+                     the record decides",
+                    req_id
+                );
+                false
+            }
+        }
+    }
+
+    /// The deferred replacement card for a Location Form request, or `None` for
+    /// a session-backed request (which never takes this path).
+    fn deferred_card(req: &PendingRequest) -> Option<serde_json::Value> {
+        let PendingRequest::Question(q) = req else {
+            return None;
+        };
+        Some(crate::feishu::card::question::build_location_form_deferred_card(
+            q.server.as_deref(),
+            q.message.as_deref(),
+        ))
+    }
+
+    /// Withdraw a fresh Location Form card that must not stay live: the send
+    /// lost a race to a dismissal, or a reopen lost its generation check.
+    async fn withdraw_location_card(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        message_id: &str,
+        purpose: &str,
+    ) -> bool {
+        let Some(deferred) = Self::deferred_card(req) else {
+            return false;
+        };
+        self.withdraw_card(handles, req.id(), message_id, &deferred, purpose)
+            .await
     }
 
     /// Send and record one standalone request card. The caller holds the
     /// owning Session's write lock across the send and the surface record, so
     /// no follow can commit between them. The send itself is bounded, so the
     /// lock is never held on a stalled Feishu call forever. Returns whether
-    /// the card landed.
+    /// the card landed and its record was committed.
     async fn send_standalone_surface(
         &self,
         handles: &FlowHandles,
@@ -2222,8 +2280,17 @@ impl RequestFlow {
         let Some(mid) = self.send_standalone_card(handles, req, target, card).await else {
             return false;
         };
-        self.record_standalone_surface(req, dir, mid, summary).await;
-        true
+        if self
+            .record_standalone_surface(req, dir, mid.clone(), summary)
+            .await
+        {
+            return true;
+        }
+        // A 「稍后」 landed while this send was in flight. The dismissal is
+        // authoritative, so the fresh card must not stay live and untracked.
+        self.withdraw_location_card(handles, req, &mid, "push losing to defer")
+            .await;
+        false
     }
 
     /// Send a fresh standalone fallback card for a request whose surface proof
@@ -2939,9 +3006,15 @@ impl RequestFlow {
         if self
             .surfaces
             .location_form(id)
-            .is_some_and(|record| record.dismissed)
+            .is_some_and(|record| record.is_dismissed())
         {
             return ReadoptDecision::NotAdopted;
+        }
+        // A Location Form's standalone card is not in the card-handle registry,
+        // so it takes its own re-adoption path: repaint the persisted card and
+        // prove it still exists (a deleted card must be re-surfaced, ADR-0038).
+        if req.is_location() {
+            return self.readopt_location_form(handles, req, dir).await;
         }
         if let PendingRequest::Permission(p) = req
             && permission_overflow(p).is_some()
@@ -3065,6 +3138,88 @@ impl RequestFlow {
             ReadoptDecision::Adopted
         } else {
             ReadoptDecision::NotAdopted
+        }
+    }
+
+    /// Re-adopt a persisted Location Form card by reading it: the read proves
+    /// the message still exists without repainting it, so an unanswered typed
+    /// field keeps the text the Host already entered (the card-repaint rule).
+    /// A proven-gone card (Feishu `230002`) forgets its surface record and lets
+    /// the caller post a fresh one in the same sweep (ADR-0038); any other
+    /// failure is unknown, never read as deletion, so the live surface is kept
+    /// and no duplicate is posted.
+    async fn readopt_location_form(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> ReadoptDecision {
+        let id = req.id();
+        let Some(sent) = self.sent_cards.lock().await.get(id).cloned() else {
+            // No persisted card to adopt: let the push path decide.
+            return ReadoptDecision::NotAdopted;
+        };
+        let timeout_ms = self
+            .withdrawal_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let read = crate::bridge::bounded_call(
+            &format!(
+                "{} {} re-adopt read on {}",
+                self.kind.label(),
+                id,
+                sent.message_id
+            ),
+            timeout_ms,
+            handles.platform.get_card_view(&sent.message_id),
+        )
+        .await;
+        match read {
+            Some(Ok(_)) => {
+                self.kind.remember_surfaced(self, req, dir).await;
+                tracing::info!(
+                    "{} {} re-adopted on card {} after restart",
+                    self.kind.label(),
+                    id,
+                    sent.message_id
+                );
+                ReadoptDecision::Adopted
+            }
+            Some(Err(e)) if e.is_message_gone() => {
+                tracing::warn!(
+                    "{} {}: recovered card {} was deleted ({}); forgetting it and surfacing the form anew",
+                    self.kind.label(),
+                    id,
+                    sent.message_id,
+                    e
+                );
+                self.sent_cards.lock().await.remove(id);
+                self.surfaces.remove_location_form(id);
+                ReadoptDecision::NotAdopted
+            }
+            Some(Err(e)) => {
+                // Unknown is never read as gone (#130): a transient failure
+                // must not post a second card over a live one.
+                tracing::warn!(
+                    "{} {}: re-adoption read on {} failed ({}); keeping the surface",
+                    self.kind.label(),
+                    id,
+                    sent.message_id,
+                    e
+                );
+                self.kind.remember_surfaced(self, req, dir).await;
+                ReadoptDecision::Adopted
+            }
+            None => {
+                tracing::warn!(
+                    "{} {}: re-adoption read on {} timed out after {}ms; keeping the surface",
+                    self.kind.label(),
+                    id,
+                    sent.message_id,
+                    timeout_ms
+                );
+                self.kind.remember_surfaced(self, req, dir).await;
+                ReadoptDecision::Adopted
+            }
         }
     }
 

@@ -2544,8 +2544,15 @@ impl RequestKind for QuestionKind {
                 // The replacement card is PATCHed BEFORE the records go, so a
                 // failed withdrawal keeps the card and its record in step. The
                 // durable dismissal makes 「稍后」 survive a restart (ADR-0103).
+                // The owning directory is required for the record's prune
+                // predicate: fall back to the remembered one rather than
+                // persisting an empty directory (which cannot be mapped).
+                let owner_dir = match directory {
+                    Some(dir) if !dir.is_empty() => dir.to_string(),
+                    _ => flow.question_dir(req_id).await.unwrap_or_default(),
+                };
                 let withdrawn = flow
-                    .defer_standalone_surface(handles, req_id, directory.unwrap_or(""), &card)
+                    .defer_standalone_surface(handles, req_id, &owner_dir, &card)
                     .await;
                 // A defer is not an answer: release the claim so a reopened
                 // (or still-clickable) card can answer later.

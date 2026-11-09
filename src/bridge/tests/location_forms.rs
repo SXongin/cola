@@ -157,11 +157,7 @@ async fn fixture(
 /// One sweep with a caller-owned `seen` (the poll loop's own set survives
 /// sweeps; reusing it is what makes an in-process dismissal stable).
 async fn sweep_with(fixture: &Fixture, seen: &mut std::collections::HashSet<String>) {
-    fixture
-        .app
-        .question
-        .sweep(&fixture.app.flow_handles(), seen)
-        .await;
+    sweep_app(&fixture.app, seen).await;
 }
 
 /// One sweep with a fresh `seen` (the standalone push-once safety net is the
@@ -194,6 +190,21 @@ async fn restart_fixture(
 /// One deterministic sweep of a restarted app.
 async fn sweep_app(app: &Arc<App>, seen: &mut std::collections::HashSet<String>) {
     app.question.sweep(&app.flow_handles(), seen).await;
+}
+
+/// Whether the persisted record names a Location Form decision for `id`. A
+/// missing file is the empty record, so `None` covers both "no record" and
+/// "the last record pruned the file away".
+fn persisted_location_form(session_file: &std::path::Path, id: &str) -> Option<serde_json::Value> {
+    let path = crate::state::StateLayout::beside(session_file, "interactive_surfaces.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.get("location_forms").and_then(|clients| {
+        clients
+            .as_object()?
+            .values()
+            .find_map(|records| records.get(id).cloned())
+    })
 }
 
 /// Every button value on a card whose `reply` matches.
@@ -1134,6 +1145,10 @@ async fn a_restart_readopts_a_live_location_form_card() {
     sweep(&fixture).await;
     let card = posted_card(&fixture.platform).await;
     let session_file = fixture.session_file();
+    assert!(
+        persisted_location_form(&session_file, "frm_live").is_some(),
+        "the push decision is persisted with the surface"
+    );
 
     let (app, platform, backend) =
         restart_fixture(&session_file, &[("/work", location_form("frm_live"))]).await;
@@ -1143,6 +1158,19 @@ async fn a_restart_readopts_a_live_location_form_card() {
     assert!(
         posted_cards(&platform).await.is_empty(),
         "a live card is re-adopted, not duplicated"
+    );
+    assert!(
+        platform
+            .card_view_reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id == "msg_sent"),
+        "re-adoption reads the persisted card to prove it still exists"
+    );
+    assert!(
+        platform.updated_cards().await.is_empty(),
+        "a live card is not repainted, so an unanswered typed field keeps its text"
     );
 
     let answer = button_with_reply(&card, "answer").expect("an answer control");
@@ -1161,8 +1189,42 @@ async fn a_restart_readopts_a_live_location_form_card() {
     );
 }
 
-/// A restart does not re-push a form the Host deferred: the persisted
-/// dismissal is authoritative until it is reopened.
+/// A persisted Location Form card deleted while cola was down is proven gone by
+/// the re-adoption read (Feishu `230002`) and re-surfaced as a fresh card in
+/// the same sweep — ADR-0038's fallback, which ADR-0103 excepts only for a
+/// dismissed form.
+#[tokio::test]
+async fn a_restart_resurfaces_a_deleted_location_form_card() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_deleted"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let session_file = fixture.session_file();
+
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_deleted"))]).await;
+    // The re-adoption read is the existence proof; make it report the message
+    // deleted, as Feishu does for a removed card.
+    platform.delete_message("msg_sent");
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+
+    let cards = posted_cards(&platform).await;
+    assert_eq!(
+        cards.len(),
+        1,
+        "a proven-gone card is re-surfaced instead of staying lost"
+    );
+    assert!(
+        card_text(&cards[0]).contains("Context7"),
+        "the fresh card is the Location Form, not a stale receipt"
+    );
+}
+
 #[tokio::test]
 async fn a_restart_does_not_repush_a_deferred_location_form() {
     let fixture = fixture(
@@ -1250,11 +1312,28 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
     let card = posted_card(&fixture.platform).await;
     let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
     fixture.app.host_action(defer).await.expect("a click result");
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_prune").is_some(),
+        "the dismissal is persisted"
+    );
+
+    // A fresh sweep (a new `seen`, as after a restart) honours the durable
+    // dismissal instead of re-pushing the still-pending form.
+    sweep(&fixture).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        1,
+        "the persisted dismissal suppresses the fresh sweep"
+    );
 
     // Gone, and this sweep lists every directory successfully: the record is
     // pruned.
     fixture.backend.question_resolved_by_another("frm_prune").await;
     sweep(&fixture).await;
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_prune").is_none(),
+        "a complete sweep prunes the resolved form's record"
+    );
 
     // The id is pending again with no dismissal left behind.
     fixture.backend.replied_questions.lock().await.clear();
@@ -1264,6 +1343,111 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
         2,
         "a complete sweep prunes the resolved form's record"
     );
+}
+
+/// The shared `Surfaces` record is pruned only by the flow that owns the kind:
+/// a healthy Permission sweep must not delete a Question Location Form's
+/// decision (its `pending` never contains a form id).
+#[tokio::test]
+async fn a_permission_sweep_does_not_prune_a_location_form_decision() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_cross_flow"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+    let session_file = fixture.session_file();
+    assert!(persisted_location_form(&session_file, "frm_cross_flow").is_some());
+
+    // A healthy permission tick shares `Surfaces` but owns no Location Form.
+    let mut permissions = std::collections::HashSet::new();
+    fixture
+        .app
+        .permission
+        .sweep(&fixture.app.flow_handles(), &mut permissions)
+        .await;
+    assert!(
+        persisted_location_form(&session_file, "frm_cross_flow").is_some(),
+        "the Permission flow must not prune the Question flow's decision"
+    );
+
+    // After a restart the dismissal is still authoritative: no re-push.
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_cross_flow"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "the cross-flow decision survived to the restart"
+    );
+}
+
+/// A 「稍后」 that lands while the first push's send is in flight wins: the
+/// push commit refuses to overwrite the dismissal and withdraws the fresh card
+/// instead of leaving it live and untracked.
+#[tokio::test]
+async fn a_defer_during_the_push_send_wins() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_push_defer"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    let (entered, release) = fixture.platform.pause("send", "chat_1");
+    let app = fixture.app.clone();
+    let push = tokio::spawn(async move {
+        let mut seen = std::collections::HashSet::new();
+        app.question.sweep(&app.flow_handles(), &mut seen).await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the first push is in flight");
+
+    let deferred = crate::feishu::card::question::build_location_form_deferred_card(
+        Some("context7"),
+        Some("请先登录 Context7 再继续"),
+    );
+    let handles = fixture.app.flow_handles();
+    assert!(
+        fixture
+            .app
+            .question
+            .defer_standalone_surface(&handles, "frm_push_defer", "/work", &deferred)
+            .await,
+        "the dismissal records before the push commits"
+    );
+    release.notify_one();
+    push.await.expect("the push sweep ran");
+
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
+    let record = persisted_location_form(&fixture.session_file(), "frm_push_defer")
+        .expect("the dismissal is the durable decision");
+    assert_eq!(record["state"], "Dismissed");
+    assert!(
+        fixture
+            .platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("已稍后处理")),
+        "the push withdraws the fresh card it can no longer record"
+    );
+
+    // Neither a later sweep nor a restart resurrects it.
+    sweep(&fixture).await;
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
+    let session_file = fixture.session_file();
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_push_defer"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(posted_cards(&platform).await.is_empty());
 }
 
 /// A reopen sends the fresh card first, then clears the dismissal and rewrites
@@ -1388,6 +1572,7 @@ async fn a_dismissal_that_lands_during_a_reopen_survives() {
         .host_action(defer.clone())
         .await
         .expect("a first defer result");
+    let updates_before = fixture.platform.updated_cards().await.len();
 
     let (entered, release) = fixture.platform.pause("send", "chat_1");
     let app = fixture.app.clone();
@@ -1414,6 +1599,13 @@ async fn a_dismissal_that_lands_during_a_reopen_survives() {
 
     // The dismissal is still authoritative: the fresh card is withdrawn, no
     // sweep re-pushes it, and a restart does not resurrect the form.
+    let updates = fixture.platform.updated_cards().await;
+    assert!(
+        updates
+            .get(updates_before..)
+            .is_some_and(|after| after.iter().any(|card| card_text(card).contains("已稍后处理"))),
+        "the reopen's fresh card is PATCHed to the deferred state: {updates:?}"
+    );
     sweep(&fixture).await;
     assert_eq!(
         posted_cards(&fixture.platform).await.len(),
@@ -1470,5 +1662,67 @@ async fn a_failed_combined_write_may_duplicate_the_card_after_a_restart() {
         posted_cards(&platform).await.len(),
         1,
         "the lost mirror costs exactly one duplicate card after a restart"
+    );
+    assert!(
+        persisted_location_form(&session_file, "frm_write_fail").is_some(),
+        "the restarted push writes the durable record its predecessor lost"
+    );
+}
+
+/// KNOWN LIMIT (ADR-0103): a failed **dismissal** write is a different
+/// consequence — disk still holds the live surface and the pushed record, so a
+/// restart repaints the deferred card live instead of keeping it withdrawn.
+/// The feature does not claim to prevent that; the test pins the limit.
+#[tokio::test]
+async fn a_failed_combined_write_during_a_dismissal_loses_the_dismissal_after_a_restart() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_dismiss_fail"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let session_file = fixture.session_file();
+    assert!(
+        persisted_location_form(&session_file, "frm_dismiss_fail").is_some(),
+        "the successful push wrote its durable record"
+    );
+
+    // A directory at the writer's temp path makes the atomic replace fail
+    // while the previously written file stays intact; the deferred card PATCH
+    // still lands.
+    let surfaces_path = fixture
+        .session_file()
+        .parent()
+        .expect("the state directory")
+        .join("interactive_surfaces.json");
+    let temp_path = surfaces_path.with_extension("tmp");
+    std::fs::create_dir(&temp_path).unwrap();
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    let result = fixture.app.host_action(defer).await.expect("a click result");
+    assert_eq!(result.toast.as_deref(), Some("已稍后处理"));
+    std::fs::remove_dir(&temp_path).unwrap();
+
+    // Disk still says Pushed + the live surface: the restart re-adopts it as-is
+    // rather than re-pushing a duplicate. The dismissal is lost, not turned
+    // into a duplicate.
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_dismiss_fail"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "a lost dismissal does not duplicate the card"
+    );
+    assert_eq!(
+        persisted_location_form(&session_file, "frm_dismiss_fail").unwrap()["state"],
+        "Pushed",
+        "the failed dismissal left the previously written push decision on disk"
+    );
+    assert!(
+        platform.updated_cards().await.is_empty(),
+        "the stale surface is re-adopted as-is, never repainted"
     );
 }
