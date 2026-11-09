@@ -591,8 +591,8 @@ without such a field keeps its ordinary Question card.
 
 Push and dismissal decisions survive a cola restart. A restart re-adopts a card
 that is still live instead of posting a second one; a form you deferred with
-**稍后** stays withdrawn — it is not pushed again — while the form remains
-pending. A complete sweep that no longer lists it drops the decision, and a
+**稍后** stays withdrawn — it is not pushed again — while cola lists the form
+pending. A complete sweep that no longer includes it drops the decision, and a
 later re-listing is treated as a new request that may be delivered again. A
 partway selection of clicked options and multi-select toggles — including a
 custom entry you added to a multi-select — is remembered across a restart, so
