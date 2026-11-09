@@ -126,11 +126,12 @@ The mirror remains best-effort (ADR-0038) for the **push** and for every other
 surface: a failed push write can cost one duplicate card after a restart, and a
 timed-out **send** may duplicate exactly as every standalone send can today.
 Neither is claimed atomic, and neither changes the dismissal ordering above.
-`/mcp` treats a dismissed record as reopenable **while the form remains
+`/mcp` treats a dismissed record as reopenable **while cola lists the form
 pending**. The sweep suppresses a dismissed form only while that record exists:
-a complete sweep that no longer lists the form prunes the decision (the #130
+a complete sweep that no longer includes the form prunes the decision (the #130
 rule), and a later re-listing is a new request that may be delivered again. The
-dismissal is authoritative against a re-push, not a permanent tombstone.
+dismissal is authoritative against a re-push while the listing carries the
+form, not a permanent tombstone.
 
 **Partial answer state is persisted, and the recovered card is not repainted.**
 A Location Form's card-action state — each question's **clicked option wire
