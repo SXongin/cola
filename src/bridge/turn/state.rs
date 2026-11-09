@@ -4036,13 +4036,20 @@ impl StreamAccumulator {
         self.order_seq
     }
 
-    /// The next POSITION after everything already on the card, with no wall
-    /// clock in it: the key a part takes when it must land after the content
+    /// The next POSITION after everything already on the card — the timeline's
+    /// last key and any live tool panel's allocated key — with no wall clock in
+    /// it: the key a part or a receipt takes when it must land after the content
     /// shown before it but still inside the transcript's own range (issue
     /// #1022). Unlike [`Self::next_order`] it cannot jump past a later message's
     /// server times; the caller bounds it to the message's ceiling.
     pub(super) fn next_position(&self) -> i64 {
-        self.last_key.saturating_add(1)
+        let live = self
+            .live_tools
+            .values()
+            .map(|tool| tool.key)
+            .max()
+            .unwrap_or(i64::MIN);
+        self.last_key.max(live).saturating_add(1)
     }
 
     /// Append a text chunk, keeping it in the chronological timeline (merging
