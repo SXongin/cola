@@ -103,9 +103,12 @@ That withdrawal-before-restart rule is ADR-0038's 2026-11-09 amendment, the one
 explicit exception to its "every still-pending request keeps one live surface".
 The pushed/dismissed record and the standalone surface are committed in one
 mutation, so a restart cannot see one without the other. The mirror is still
-best-effort (ADR-0038): a failed combined write is a known limit that may cost
-one duplicate card after a restart, and the failure path is tested rather than
-claimed absolute.
+best-effort (ADR-0038): a failed combined write is a known limit, and the
+failure path is tested rather than claimed absolute. A failed **push** write can
+cost one duplicate card after a restart; a failed **dismissal** write instead
+leaves the previously written live surface and pushed record on disk, so the
+restart re-adopts that surface — the dismissal is lost, not turned into a
+duplicate.
 
 **Pull surface.** `/mcp` is the read-only counterpart: the current directory's
 MCP server statuses plus **only** Location Forms (session-backed forms already
