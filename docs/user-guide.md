@@ -591,13 +591,16 @@ without such a field keeps its ordinary Question card.
 
 Push and dismissal decisions survive a cola restart. A restart re-adopts a card
 that is still live instead of posting a second one; a form you deferred with
-**稍后** stays withdrawn — it is not pushed again — until you reopen it. A
-partway selection of clicked options, including a multi-select you have toggled
-but not yet confirmed, is remembered across a restart, so the live card and what
-its confirm/submit sends stay in agreement — you do not have to reselect those.
-Text you typed yourself (a custom answer or a numeric box) is never written to
-disk, so it may need re-entering after a restart. That memory is best-effort like
-the rest of the card mirror: a failed mirror write can require a reselect. The
+**稍后** stays withdrawn — it is not pushed again — while the form remains
+pending. A complete sweep that no longer lists it drops the decision, and a
+later re-listing is treated as a new request that may be delivered again. A
+partway selection of clicked options and multi-select toggles — including a
+custom entry you added to a multi-select — is remembered across a restart, so
+the live card and what its confirm/submit sends stay in agreement; you do not
+have to reselect those. A free-text single-select answer or numeric box is not a
+toggle and is never written to disk, so it may need re-entering after a restart.
+That memory is best-effort like the rest of the card mirror: a failed mirror
+write can require a reselect. The
 「稍后」 decision is written before the card is withdrawn, so a failed record
 write leaves the card live and answerable rather than leaving a terminal card
 that no longer says it is waiting; a failed or timed-out withdrawal after that
