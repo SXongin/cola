@@ -16,7 +16,7 @@
 | `cola.log` | 日志（追加写入，按日轮转） | `cola --log-file <path>` |
 | `sessions.json` | 飞书话题 ↔ 会话映射 | `[bridge] session_file` |
 | `chain_records.json` | 持久链记录：实时卡片、唤醒水位、任务结束、已送达位置 | 与 `session_file` 同目录 |
-| `interactive_surfaces.json` | 重启后重新接管的权限/问答卡片与目录级 Location Form 卡片（ADR-0038、ADR-0103） | 与 `session_file` 同目录 |
+| `interactive_surfaces.json` | 重启后重新接管的权限/问答卡片（ADR-0038） | 与 `session_file` 同目录 |
 | `authored_turns.json` | cola 自己发起的轮次；让自行分配 id 的客户端也能区分自己的消息与外部消息（ADR-0092） | 与 `session_file` 同目录 |
 | `pinned_chats.json` | 持久化的即时提醒置顶 | 与 `session_file` 同目录 |
 | `terminal-runs/` | 实时/已结束 `/run` 卡片的终端运行记录 | 与 `session_file` 同目录 |
@@ -460,7 +460,7 @@ Principal 都可以在该聊天/话题中作答。这个回答代表**整个目�
 cola 区分「工具调用方归属的请求」与「共享请求」的标记。
 
 用 **稍后** 收回卡片而不拒绝：请求仍然待处理，工具调用不会失败，卡片的消息
-置顶会被释放。只有明确点击 **取消** 才会拒绝。cola 绝不会按计时器自动拒绝
+置顶会被释放，`/mcp` 仍会列出它并可重新打开。只有明确点击 **取消** 才会拒绝。cola 绝不会按计时器自动拒绝
 Location Form。URL 模式的请求会显示链接和「我已了解」；密码或 token 这类秘密
 字段无法在共享卡片上收集，卡片会显示私密输入的原因，并且只提供拒绝。
 

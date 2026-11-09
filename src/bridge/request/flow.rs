@@ -351,6 +351,11 @@ enum Withdrawal {
 /// neutralization later, so a timeout is a retry, not a failure to record.
 const WITHDRAWAL_PATCH_TIMEOUT_MS: u64 = 5_000;
 
+/// The budget for the 「稍后」 card PATCH, which runs inside a card callback
+/// (a ~2 s ack budget) rather than the sweep. A timeout keeps the card and its
+/// record, so the user can retry; it must never spend the whole ack budget.
+const DEFER_WITHDRAWAL_TIMEOUT_MS: u64 = 1_500;
+
 /// The budget for one standalone card send (`reply_card`/`send_card`). A card
 /// callback runs on a deadline, and the sweep must not hang on a stalled
 /// Feishu call either: a timeout is a retry next sweep, exactly like a send
@@ -611,22 +616,57 @@ impl RequestFlow {
     }
 
     /// Withdraw a request's standalone card **without settling it**: the
-    /// Location Form 「稍后」 control. The in-flight state stays (the form is
-    /// still pending), while the sent-card registry and the persisted surface
-    /// record are cleared so the sweep stops pinning and never marks the
-    /// withdrawn card stale on its own behalf. Returns the withdrawn card's
-    /// message id, if one was recorded. The next sweep does not push it again
-    /// while the poll loop's `seen` remembers it (in-process dismissal; durable
-    /// dismissal is #1019).
-    pub(crate) async fn withdraw_standalone_for_defer(&self, req_id: &str) -> Option<String> {
-        let message_id = self
-            .sent_cards
-            .lock()
-            .await
-            .remove(req_id)
-            .map(|card| card.message_id);
+    /// Location Form 「稍后」 control. The replacement card is PATCHed first,
+    /// and only a landed write clears the sent-card registry and the persisted
+    /// surface record — so a failed or timed-out withdrawal leaves both in
+    /// place instead of leaving a clickable card with no record behind it.
+    /// Returns whether the withdrawal landed (or there was no card to patch).
+    /// The in-flight state stays: the form is still pending.
+    pub(crate) async fn defer_standalone_surface(
+        &self,
+        handles: &FlowHandles,
+        req_id: &str,
+        replacement: &serde_json::Value,
+    ) -> bool {
+        let sent = self.sent_cards.lock().await.get(req_id).cloned();
+        if let Some(sent) = sent {
+            // A card callback has a ~2 s ack budget: leave it room, while still
+            // letting tests lower the bound. A timeout keeps the record.
+            let timeout_ms = self
+                .withdrawal_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(DEFER_WITHDRAWAL_TIMEOUT_MS);
+            let patched = crate::bridge::bounded_call(
+                &format!("{} {} defer withdrawal", self.kind.label(), req_id),
+                timeout_ms,
+                handles.platform.update_message(&sent.message_id, replacement),
+            )
+            .await;
+            match patched {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        "withdrawing {} deferred card on {} failed: {}; keeping its record",
+                        req_id,
+                        sent.message_id,
+                        e
+                    );
+                    return false;
+                }
+                None => {
+                    tracing::warn!(
+                        "withdrawing {} deferred card on {} timed out after {}ms; keeping its record",
+                        req_id,
+                        sent.message_id,
+                        timeout_ms
+                    );
+                    return false;
+                }
+            }
+        }
+        self.sent_cards.lock().await.remove(req_id);
         self.surfaces.remove_standalone(req_id);
-        message_id
+        true
     }
 
     /// The remembered questions and their current answers, captured for the
@@ -1806,9 +1846,38 @@ impl RequestFlow {
         if seen.contains(req.id()) || self.sent_cards.lock().await.contains_key(req.id()) {
             return false;
         }
-        let target = match resolve_location_form_target(&handles.sessions, &handles.platform, dir).await {
-            LocationTarget::Target(target) => target,
-            LocationTarget::NoMapping => {
+        // Bound the target walk like every other sweep read: it reaches
+        // Feishu's `list_messages` (a topic's anchor fallback) and a half-open
+        // call must not wedge the whole request sweep. A timeout is UNKNOWN,
+        // so the push is deferred and retried next sweep.
+        let timeout_ms = self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let walk_condition = format!("{} location target", self.kind.label());
+        let resolved = crate::bridge::bounded_call(
+            &format!("{} {} location target ({})", self.kind.label(), req.id(), dir),
+            timeout_ms,
+            async {
+                Ok::<_, crate::error::BridgeError>(
+                    resolve_location_form_target(&handles.sessions, &handles.platform, dir).await,
+                )
+            },
+        )
+        .await;
+        let Some(resolved) = resolved else {
+            self.target_walk_failures.lock().await.failed(
+                dir,
+                &walk_condition,
+                "",
+                format!("timed out after {timeout_ms}ms"),
+            );
+            return false;
+        };
+        self.target_walk_failures
+            .lock()
+            .await
+            .succeeded(dir, &walk_condition);
+        let target = match resolved {
+            Ok(LocationTarget::Target(target)) => target,
+            Ok(LocationTarget::NoMapping) => {
                 tracing::debug!(
                     "{} {}: directory {} has no mapped Chat/Topic; nothing sent",
                     self.kind.label(),
@@ -1817,12 +1886,23 @@ impl RequestFlow {
                 );
                 return false;
             }
-            LocationTarget::Deferred => {
+            Ok(LocationTarget::Deferred) => {
                 tracing::debug!(
                     "{} {}: directory {}'s topic anchor could not be resolved; deferring the push",
                     self.kind.label(),
                     req.id(),
                     dir
+                );
+                return false;
+            }
+            Err(e) => {
+                // The target walk only reports Ok today; a future failure is
+                // unknown, never "no target".
+                tracing::warn!(
+                    "{} {}: location target walk failed ({}); deferring the push",
+                    self.kind.label(),
+                    req.id(),
+                    e
                 );
                 return false;
             }
@@ -2842,6 +2922,11 @@ impl RequestFlow {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
             || self.is_location_question(req_id).await;
+        let owner = if location_form {
+            crate::backend::types::RequestOwner::Location
+        } else {
+            crate::backend::types::RequestOwner::Session
+        };
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
         // The card the click landed on, so its handle can update THAT card
         // atomically in the ack (ADR-0038, rule 3) — the callback context
@@ -2877,17 +2962,7 @@ impl RequestFlow {
 
         self.kind
             .handle_action(
-                self,
-                handles,
-                session_id,
-                req_id,
-                reply,
-                value,
-                directory,
-                inline,
-                &host,
-                clicked,
-                location_form,
+                self, handles, session_id, req_id, reply, value, directory, inline, &host, clicked, owner,
             )
             .await
     }

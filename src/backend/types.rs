@@ -669,6 +669,30 @@ pub struct QuestionRequest {
 }
 
 impl QuestionRequest {
+    /// Build the neutral request for a directory-owned **Location Form**
+    /// (ADR-0103). The session id is empty BY CONSTRUCTION: the wire sentinel
+    /// is an adapter spelling, never a Session, so the bridge has no session
+    /// to route or walk.
+    pub fn location(
+        id: impl Into<String>,
+        title: String,
+        questions: Vec<QuestionInfo>,
+        server: Option<String>,
+        message: Option<String>,
+        uncollectable: Option<UncollectableReason>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            session_id: String::new(),
+            title,
+            questions,
+            uncollectable,
+            owner: RequestOwner::Location,
+            server,
+            message,
+        }
+    }
+
     /// Whether this request belongs to a directory rather than a Session.
     pub fn is_location(&self) -> bool {
         self.owner == RequestOwner::Location

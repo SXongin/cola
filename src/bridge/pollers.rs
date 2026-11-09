@@ -277,20 +277,49 @@ pub(crate) async fn resolve_card_target(
             // back to sending into the chat top level.
             let entry = sessions.entry_for_session(&current).await;
             if let Some(entry) = entry {
-                let anchor = if entry.thread_key.thread_id != entry.thread_key.chat_id {
-                    resolve_topic_anchor(sessions, platform, &entry.thread_key).await
-                } else {
-                    None
-                };
-                if let Some(anchor) = anchor {
-                    return Some(CardTarget::ReplyTo(anchor));
-                }
-                return Some(CardTarget::Chat(entry.thread_key.chat_id));
+                return Some(
+                    match target_for_thread(sessions, platform, &entry.thread_key).await {
+                        ThreadTarget::ReplyTo(anchor) => CardTarget::ReplyTo(anchor),
+                        // An unresolved topic falls back to the Chat lobby here.
+                        ThreadTarget::Chat(chat_id) | ThreadTarget::UnresolvedTopic(chat_id) => {
+                            CardTarget::Chat(chat_id)
+                        }
+                    },
+                );
             }
             None
         }
     })
     .await
+}
+
+/// How one mapped Chat/Topic is reached.
+enum ThreadTarget {
+    /// A topic's in-topic anchor message.
+    ReplyTo(String),
+    /// A non-topic chat's top level.
+    Chat(String),
+    /// A topic whose anchor could not be resolved, with its chat id. The
+    /// CALLER decides the fallback: ordinary cards use the lobby, while a
+    /// Location Form must defer (ADR-0103).
+    UnresolvedTopic(String),
+}
+
+/// Resolve one mapped Chat/Topic's delivery shape. Shared by the ordinary card
+/// target and the Location Form target so the topic-anchor rule is written
+/// once.
+async fn target_for_thread(
+    sessions: &SessionsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
+    thread_key: &crate::config::ThreadKey,
+) -> ThreadTarget {
+    if thread_key.thread_id == thread_key.chat_id {
+        return ThreadTarget::Chat(thread_key.chat_id.clone());
+    }
+    match resolve_topic_anchor(sessions, platform, thread_key).await {
+        Some(anchor) => ThreadTarget::ReplyTo(anchor),
+        None => ThreadTarget::UnresolvedTopic(thread_key.chat_id.clone()),
+    }
 }
 
 /// Where a **Location Form** card should be delivered (ADR-0103).
@@ -327,12 +356,12 @@ pub(crate) async fn resolve_location_form_target(
     let Some(thread_key) = mapped else {
         return LocationTarget::NoMapping;
     };
-    if thread_key.thread_id == thread_key.chat_id {
-        return LocationTarget::Target(CardTarget::Chat(thread_key.chat_id));
-    }
-    match resolve_topic_anchor(sessions, platform, &thread_key).await {
-        Some(anchor) => LocationTarget::Target(CardTarget::ReplyTo(anchor)),
-        None => LocationTarget::Deferred,
+    match target_for_thread(sessions, platform, &thread_key).await {
+        ThreadTarget::ReplyTo(anchor) => LocationTarget::Target(CardTarget::ReplyTo(anchor)),
+        ThreadTarget::Chat(chat_id) => LocationTarget::Target(CardTarget::Chat(chat_id)),
+        // Never the Chat lobby: the request belongs to the topic, so wait for
+        // its anchor instead.
+        ThreadTarget::UnresolvedTopic(_) => LocationTarget::Deferred,
     }
 }
 
