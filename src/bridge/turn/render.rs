@@ -189,21 +189,26 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
 /// own server start time when it reports one; otherwise — V2's text item
 /// carries no time at all, and its reasoning time is optional — the start time
 /// of the previous timed part in the same message, or the message's own
-/// `time.created`. V2's `content[]` is in output order, so borrowing the
-/// previous key keeps the card in the transcript's order without inventing a
-/// clock: the entry's `shown_at` (and so the Rendered Cursor frontier) still
-/// carries only the time the server actually reported.
+/// `time.created`. V2's `content[]` is in output order, so the walk is a floor:
+/// a part without a time borrows it, and a timed part behind it takes it too —
+/// neither may sort before content already placed from the same message. The
+/// entry's `shown_at` (and so the Rendered Cursor frontier) still carries only
+/// the time the server actually reported.
 fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<Option<i64>> {
-    let mut previous = message.time.as_ref().map(|time| time.created);
+    let mut floor = message.time.as_ref().map(|time| time.created);
     message
         .parts
         .iter()
         .map(|part| {
-            let own = part.started_at();
-            if own.is_some() {
-                previous = own;
-            }
-            own.or(previous)
+            // The read is in output order, so no part sorts before content
+            // already placed from this message: a timed part behind the floor
+            // takes the floor instead of jumping back over it (issue #1022).
+            let order = match part.started_at() {
+                Some(own) => Some(floor.map_or(own, |floor| floor.max(own))),
+                None => floor,
+            };
+            floor = order;
+            order
         })
         .collect()
 }
@@ -2333,20 +2338,19 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
         if let Some(call) = transcript.tool_call(&call_id)
             && let Some((message_id, index)) = position.clone()
         {
+            let message = transcript.messages.iter().find(|message| message.id == message_id);
             // The call's message carries the floor its settlement takes
             // (issue #1023): a post-click message's parts follow the receipt.
-            acc.set_message_floor(
-                transcript
-                    .messages
-                    .iter()
-                    .find(|message| message.id == message_id)
-                    .and_then(message_floor_time),
-            );
+            acc.set_message_floor(message.and_then(message_floor_time));
+            // The call's READ POSITION orders it, exactly like the window walk
+            // (issue #1022): the seeded set is resolved by identity, not by a
+            // clock, but its key still comes from the message's part order.
+            let order_at = message.and_then(|message| part_order_times(message).get(index).copied().flatten());
             if render_part(
                 acc,
                 Some(PartSource::at(message_id, index)),
                 &Part::Tool(call.clone()),
-                call.started_at,
+                order_at,
             ) {
                 rendered = true;
             }
@@ -4744,7 +4748,10 @@ Index: /x/src/main.rs
     /// A text part with no time borrows the key of the part before it, so it can
     /// share a still-running panel's server start key. When that panel settles it
     /// must sort at its own (earlier) allocation position — equal keys order by
-    /// allocation, not by settle time (issue #1022).
+    /// allocation, not by settle time (issue #1022). This shape isolates the
+    /// tie-break: on the base the text was keyed *after* the panel, so only a
+    /// reverted tie-break regresses it; the two tests above are the base
+    /// regressions.
     #[test]
     fn a_settled_panel_inserts_before_equal_key_text_that_followed_it() {
         let anchor = 2_000;
@@ -4823,8 +4830,98 @@ Index: /x/src/main.rs
             vec![Some(1_000), Some(1_100), Some(1_100), Some(1_100), Some(1_100)]
         );
 
+        // A timed part behind the floor takes the floor instead of jumping
+        // back over content already placed from the same message.
+        let behind = message(
+            "a3",
+            1_000,
+            vec![
+                tool("bash", "call_1", ToolStatus::Running, Some(2_100), None, None),
+                text_part("回答"),
+                tool("bash", "call_2", ToolStatus::Completed, Some(2_050), None, None),
+            ],
+        );
+        assert_eq!(
+            part_order_times(&behind),
+            vec![Some(2_100), Some(2_100), Some(2_100)]
+        );
+
         let timeless = typed_message("a2", MessageRole::Assistant, None, vec![text_part("?")]);
         assert_eq!(part_order_times(&timeless), vec![None]);
+    }
+
+    /// An untimed reasoning part sorts by the same floor and keeps showing no
+    /// clock: its order key is borrowed, its `shown_at` is not (issue #1022).
+    #[test]
+    fn an_untimed_reasoning_part_keeps_its_position() {
+        let anchor = 2_000;
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message(
+                "a1",
+                anchor,
+                vec![text_part("先解释"), reasoning_part("想想"), text_part("再回答")],
+            ),
+        ]);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("先解释").unwrap() < text.find("想想").unwrap()
+                && text.find("想想").unwrap() < text.find("再回答").unwrap(),
+            "the untimed reasoning keeps its transcript position: {text}"
+        );
+    }
+
+    /// A pending call that first appears without a server time is keyed by its
+    /// read position; a later read that reports the time must not move it past
+    /// the text the read already placed after it (issue #1022). The panel's
+    /// displayed clock still picks the real time up.
+    #[test]
+    fn a_late_start_time_never_moves_a_pinned_panel_past_its_following_text() {
+        let anchor = 2_000;
+        let transcript = |started: Option<i64>, status: ToolStatus, output: Option<&str>| {
+            SessionTranscript::new(vec![
+                typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+                message(
+                    "a1",
+                    anchor,
+                    vec![
+                        tool(
+                            "bash",
+                            "call_1",
+                            status,
+                            started,
+                            Some(serde_json::json!({"command": "ls"})),
+                            output,
+                        ),
+                        text_part("回答"),
+                    ],
+                ),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(None, ToolStatus::Running, None)
+        ));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(Some(anchor + 100), ToolStatus::Running, None)
+        ));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(Some(anchor + 100), ToolStatus::Completed, Some("tool-output"))
+        ));
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("tool-output").unwrap() < text.find("回答").unwrap(),
+            "the pinned panel stays before the text the read placed after it: {text}"
+        );
     }
 
     /// The live Turn card does NOT render a skill fold (spec #652, ticket #655,

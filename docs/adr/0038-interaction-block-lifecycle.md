@@ -329,12 +329,19 @@ The order key is now **the transcript's**, not a clock:
 - A part with no server time takes the start time of the previous timed part in
   the same message, or the message's own `time.created` when it has none. V2's
   `content[]` is in output order, so this is the position the server wrote; for
-  a timed part the rule is a no-op.
+  a timed part the rule is a no-op. The walk is a **floor**: a timed part whose
+  own start is behind it takes the floor instead, so no part of a message sorts
+  before content already placed from that message.
 - Equal keys (a text borrowing a still-running panel's start time) order by
   **allocation**, not settle order: a live panel allocates its `seq` where its
   part stands in the read and joins the timeline only when it settles, so the
   equal-key run keeps the panel at that position instead of appending it after
   text already pushed at the same key.
+- A position key is **pinned**: when a later read finally reports a start time
+  for a part that had none, that time updates the panel's clock but not its
+  place. Only a `next_order()` fallback (a message with no time at all) may be
+  replaced, because moving a pinned panel would cross text the read already
+  placed after it.
 
 `shown_at` — what a panel header displays and what the Rendered Cursor frontier
 records as the part's start — is unchanged: it still carries only the time the
