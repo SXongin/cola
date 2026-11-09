@@ -2567,30 +2567,31 @@ impl RequestKind for QuestionKind {
                     Some(dir) if !dir.is_empty() => dir.to_string(),
                     _ => flow.question_dir(req_id).await.unwrap_or_default(),
                 };
-                let withdrawn = flow
+                let committed = flow
                     .defer_standalone_surface(handles, req_id, &owner_dir, &card)
                     .await;
                 // A defer is not an answer: release the claim so a reopened
                 // (or still-clickable) card can answer later.
                 flow.unmark_answered(&handles.requests, req_id).await;
-                if withdrawn {
-                    // Release the message pin now, bounded so it cannot spend
-                    // the callback's ack budget; a timed-out release is
-                    // retried by the next sweep, which no longer sees the
-                    // sent-card record.
+                if committed {
+                    // The dismissal is committed, so the form is no longer a
+                    // waiting push even when the card PATCH failed or timed
+                    // out: release the pin now, bounded so it cannot spend the
+                    // callback's ack budget; a timed-out release is retried by
+                    // the next sweep, which no longer sees the sent-card
+                    // record.
                     let _ = tokio::time::timeout(
                         std::time::Duration::from_millis(DEFER_PIN_RELEASE_TIMEOUT_MS),
                         handles.waits.message_pins.release(&handles.platform, req_id),
                     )
                     .await;
                 }
-                // The card was already PATCHed above (or the write failed and
-                // must NOT be replaced): never return a replacement card here,
-                // or a failed withdrawal's ack would paint the terminal
-                // "稍后处理" card over a still-live one.
+                // Never return a replacement card here: the explicit PATCH
+                // owns the card update, and a failed/unlanded PATCH's ack must
+                // not paint a terminal card over a still-live one.
                 return Some(CardActionResult {
                     card: None,
-                    toast: Some(if withdrawn {
+                    toast: Some(if committed {
                         "已稍后处理".to_string()
                     } else {
                         "稍后处理未完成，请重试".to_string()

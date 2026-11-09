@@ -1338,11 +1338,11 @@ async fn a_location_form_record_drops_free_text_answers() {
     );
 }
 
-/// A card PATCH that fails after the durable dismissal keeps the card, its pin
-/// and its answerability: the record already says dismissed, so `/mcp` can
-/// reopen it, while the live card is not a dead end.
+/// A card PATCH that fails after the durable dismissal still commits the
+/// defer: the pin is released and the old card is an accepted live orphan
+/// (answerable, but no longer the tracked surface; `/mcp` reopens).
 #[tokio::test]
-async fn a_failed_defer_keeps_the_card_and_pin() {
+async fn a_failed_card_patch_still_commits_the_defer_and_releases_the_pin() {
     let fixture = fixture(
         true,
         &[("/work", location_form("frm_defer_fail"))],
@@ -1364,30 +1364,38 @@ async fn a_failed_defer_keeps_the_card_and_pin() {
     let card = posted_card(&fixture.platform).await;
     let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
     let result = fixture.app.host_action(defer).await.expect("a click result");
-    assert!(
-        result
-            .toast
-            .as_deref()
-            .is_some_and(|toast| toast.contains("未完成")),
-        "a failed withdrawal says it did not fully land: {:?}",
-        result.toast
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已稍后处理"),
+        "the durable dismissal commits even when its card PATCH fails"
     );
     assert!(
         result.card.is_none(),
-        "a failed withdrawal must not let the ack replace the still-live card"
+        "the ack must not replace the still-live card"
     );
     assert_eq!(
         fixture.platform.message_pins().await,
-        vec![("msg_sent".to_string(), true)],
-        "the pin is kept while the card is still the tracked surface"
+        vec![("msg_sent".to_string(), true), ("msg_sent".to_string(), false)],
+        "a committed defer releases the pin even when the PATCH did not land"
     );
-    // The form is still answerable: a later click settles it.
+    // The old live card remains answerable (the accepted orphan), but it is no
+    // longer the sent-card record the sweep tracks.
+    assert!(
+        !fixture
+            .app
+            .question
+            .sent_cards
+            .lock()
+            .await
+            .contains_key("frm_defer_fail"),
+        "the promised dismissal drops the sent-card entry"
+    );
     let answer = button_with_reply(&card, "answer").expect("an answer control");
     fixture.app.host_action(answer).await.expect("a click result");
     assert_eq!(
         fixture.backend.location_reply_calls.lock().await.len(),
         1,
-        "the retained card still answers"
+        "the old live card still answers"
     );
 }
 
@@ -2776,13 +2784,18 @@ async fn a_failed_dismissal_write_leaves_a_live_answerable_card() {
 #[tokio::test]
 async fn a_timed_out_but_landed_withdrawal_is_reopenable() {
     let fixture = fixture(
-        false,
+        true,
         &[("/work", location_form("frm_defer_timeout"))],
         &[entry("chat_1", "ses_1", "/work")],
         |_| {},
     )
     .await;
     sweep(&fixture).await;
+    assert_eq!(
+        fixture.platform.message_pins().await,
+        vec![("msg_sent".to_string(), true)],
+        "the waiting card is pinned"
+    );
     let card = posted_card(&fixture.platform).await;
     fixture
         .app
@@ -2803,13 +2816,15 @@ async fn a_timed_out_but_landed_withdrawal_is_reopenable() {
         .expect("the bounded PATCH does not wedge the click")
         .expect("the click task ran")
         .expect("a click result");
-    assert!(
-        result
-            .toast
-            .as_deref()
-            .is_some_and(|toast| toast.contains("未完成")),
-        "an ambiguous PATCH says it did not fully land: {:?}",
-        result.toast
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已稍后处理"),
+        "the durable dismissal commits even when the PATCH response is lost"
+    );
+    assert_eq!(
+        fixture.platform.message_pins().await,
+        vec![("msg_sent".to_string(), true), ("msg_sent".to_string(), false)],
+        "an ambiguous-but-committed defer releases the pin"
     );
     release.notify_waiters();
     // The call was accepted before its response was lost: the card is terminal

@@ -829,14 +829,17 @@ impl RequestFlow {
     ///   way: the live card still answers, and `/mcp` can reopen it. A
     ///   timed-out PATCH that actually landed is the same state — the record
     ///   already says dismissed, so the terminal card is reopenable rather
-    ///   than stranded behind a `Pushed` record.
+    ///   than stranded behind a `Pushed` record. Once the dismissal is durable
+    ///   the form is no longer a waiting push, so its `sent_cards` entry is
+    ///   dropped and its Message Pin released regardless of the PATCH result;
+    ///   a live card left by an unlanded PATCH is the accepted orphan.
     ///
     /// The per-form write lock serializes this with a reopen (ADR-0103): a
     /// reopen reads the dismissal generation under the lock, sends outside it,
     /// and clears only that generation, so a dismissal that lands during the
-    /// send survives. Returns whether the withdrawal fully landed (the durable
-    /// record was written and the card was withdrawn); the in-flight state
-    /// stays, because the form is still pending.
+    /// send survives. Returns whether the **dismissal is committed** — not
+    /// whether the card PATCH landed; the in-flight state stays, because the
+    /// form is still pending.
     pub(crate) async fn defer_standalone_surface(
         &self,
         handles: &FlowHandles,
@@ -864,12 +867,16 @@ impl RequestFlow {
                 .withdraw_card(handles, req_id, &sent.message_id, replacement, "defer withdrawal")
                 .await
         {
-            // The record is dismissed either way. A definite failure leaves the
-            // live card answerable; an ambiguous one may have landed. Both are
-            // reopenable through `/mcp`, which is why the dismissal was
-            // committed first. Keep the sent-card record so a live card stays
-            // tracked until a reopen replaces it.
-            return false;
+            // The dismissal is committed, so the form is no longer a waiting
+            // push: drop the sent-card entry and let the caller release the
+            // pin. A definite failure leaves the live card answerable; an
+            // ambiguous one may have landed. Either way the old card is now an
+            // accepted orphan/duplicate and `/mcp` reopens the form.
+            tracing::warn!(
+                "{} {}: dismissal committed but the card PATCH did not land; the live card is no longer tracked",
+                self.kind.label(),
+                req_id
+            );
         }
         self.sent_cards.lock().await.remove(req_id);
         true
