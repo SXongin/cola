@@ -219,7 +219,14 @@ fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<PartOrde
             if let PartOrder::At(at) = order {
                 floor = at;
             }
-            after_settled_tool = matches!(part, Part::Tool(call) if !call.status.is_live());
+            // Only a content part moves the boundary: a step boundary, patch or
+            // unknown part between a settled tool and its continuation text
+            // must not turn the text back into a borrowed pre-call position.
+            match part {
+                Part::Tool(call) => after_settled_tool = !call.status.is_live(),
+                Part::Text(_) | Part::Reasoning(_) => after_settled_tool = false,
+                _ => {}
+            }
             order
         })
         .collect()
@@ -5035,34 +5042,39 @@ Index: /x/src/main.rs
         ]);
         assert!(render_new_turn_parts(&mut acc, &tool_only));
         acc.push_receipt("已处理");
+        // The receipt's cut is the newest SERVER time on the card: the tool.
+        assert_eq!(acc.receipt_floor(&tool_only.messages[1]), None);
 
-        // The post-answer text arrives in a later read; the continuation is a
-        // new message.
+        // The continuation is a new, TIMED message: its own server time is far
+        // behind cola's receipt key, so only the receipt cut keeps it below.
         let later = SessionTranscript::new(vec![
             typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
             message(
                 "a1",
                 anchor,
-                vec![
-                    tool(
-                        "bash",
-                        "call_1",
-                        ToolStatus::Completed,
-                        Some(anchor + 100),
-                        Some(serde_json::json!({"command": "ls"})),
-                        Some("tool-output"),
-                    ),
-                    text_part("解释"),
-                ],
+                vec![tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Completed,
+                    Some(anchor + 100),
+                    Some(serde_json::json!({"command": "ls"})),
+                    Some("tool-output"),
+                )],
             ),
-            message("a2", anchor + 110, vec![text_part("回答")]),
+            message(
+                "a2",
+                anchor + 110,
+                vec![Part::Text(crate::backend::TextPart {
+                    text: "回答".to_string(),
+                    started_at: Some(anchor + 110),
+                })],
+            ),
         ]);
         assert!(render_new_turn_parts(&mut acc, &later));
         let text = card_text(&acc.build_card_with_info().card);
         assert!(
-            text.find("已处理").unwrap() < text.find("解释").unwrap()
-                && text.find("解释").unwrap() < text.find("回答").unwrap(),
-            "the receipt stays above the post-answer text: {text}"
+            text.find("已处理").unwrap() < text.find("回答").unwrap(),
+            "the receipt stays above the continuation: {text}"
         );
     }
 
@@ -5091,7 +5103,7 @@ Index: /x/src/main.rs
                     text_part("解释"),
                 ],
             ),
-            message("a2", anchor + 110, vec![text_part("回答")]),
+            message("a2", anchor + 100, vec![text_part("回答")]),
         ]);
 
         assert!(render_new_turn_parts(&mut acc, &transcript));
