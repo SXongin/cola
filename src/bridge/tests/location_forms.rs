@@ -99,6 +99,32 @@ fn multi_location_form(request_id: &str) -> QuestionRequest {
     )
 }
 
+/// A Location Form whose option's submitted value differs from its display
+/// label, with a custom entry allowed: proves the record stores clicked wire
+/// values, never display labels or typed text.
+fn wire_value_location_form(request_id: &str) -> QuestionRequest {
+    QuestionRequest::location(
+        request_id,
+        "选择部署目标".into(),
+        vec![QuestionInfo {
+            key: "targets".into(),
+            question: "要部署到哪些目标？".into(),
+            header: "目标".into(),
+            kind: FormFieldKind::Multiselect,
+            options: vec![QuestionOption {
+                value: "wire_deploy".into(),
+                label: "Deploy".into(),
+                description: String::new(),
+            }],
+            custom: Some(true),
+            ..Default::default()
+        }],
+        Some("deploy".into()),
+        Some("选择部署目标".into()),
+        None,
+    )
+}
+
 /// A plain session-backed form (the ordinary Question path).
 fn session_form(request_id: &str, session_id: &str) -> QuestionRequest {
     QuestionRequest {
@@ -879,6 +905,60 @@ async fn a_restart_restores_a_partial_multi_select_before_confirm() {
     );
 }
 
+/// A Location Form's persisted partial state holds the clicked option's WIRE
+/// value, never its display label and never text the Host typed into a custom
+/// answer box: typed text stays client-side (ADR-0103).
+#[tokio::test]
+async fn a_location_form_record_stores_clicked_wire_values_not_typed_text() {
+    let fixture = fixture(
+        false,
+        &[("/work", wire_value_location_form("frm_wire"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let option = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "wire_deploy")
+        .map(|button| button["value"].clone())
+        .expect("the option's wire value");
+    fixture.app.host_action(option).await.expect("a toggle result");
+    let persisted = persisted_location_form(&fixture.session_file(), "frm_wire").expect("the record");
+    assert_eq!(
+        persisted["partial"]["display"][0],
+        serde_json::json!(["wire_deploy"]),
+        "the clicked wire value is persisted, not its display label"
+    );
+
+    let custom = serde_json::json!({
+        "action": "question",
+        "reply": "custom",
+        "request_id": "frm_wire",
+        "session_id": "",
+        "directory": "/work",
+        "question_index": 0,
+        "answer": "a value I typed",
+        "location_form": true,
+    });
+    fixture.app.host_action(custom).await.expect("a custom result");
+    let persisted = persisted_location_form(&fixture.session_file(), "frm_wire").expect("the record");
+    let values = persisted["partial"]["display"][0]
+        .as_array()
+        .expect("the persisted selection");
+    assert_eq!(values, &vec![serde_json::json!("wire_deploy")]);
+    let raw = persisted.to_string();
+    assert!(
+        !raw.contains("a value I typed"),
+        "typed text is not persisted: {raw}"
+    );
+    assert!(
+        !raw.contains("Deploy"),
+        "the display label is not persisted: {raw}"
+    );
+}
+
 /// A card PATCH that fails after the durable dismissal keeps the card, its pin
 /// and its answerability: the record already says dismissed, so `/mcp` can
 /// reopen it, while the live card is not a dead end.
@@ -1591,7 +1671,11 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
         |_| {},
     )
     .await;
-    sweep(&fixture).await;
+    // Production reuses ONE poll-loop `seen` set for the process's lifetime;
+    // every sweep here shares it so the prune/seen interaction is real, not
+    // reset by the test helper.
+    let mut seen = std::collections::HashSet::new();
+    sweep_with(&fixture, &mut seen).await;
     let card = posted_card(&fixture.platform).await;
     let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
     fixture.app.host_action(defer).await.expect("a click result");
@@ -1600,31 +1684,72 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
         "the dismissal is persisted"
     );
 
-    // A fresh sweep (a new `seen`, as after a restart) honours the durable
-    // dismissal instead of re-pushing the still-pending form.
-    sweep(&fixture).await;
+    // The durable dismissal suppresses the still-pending form, even though
+    // the shared `seen` set remembers the original push.
+    sweep_with(&fixture, &mut seen).await;
     assert_eq!(
         posted_cards(&fixture.platform).await.len(),
         1,
-        "the persisted dismissal suppresses the fresh sweep"
+        "the persisted dismissal suppresses the next sweep"
     );
 
     // Gone, and this sweep lists every directory successfully: the record is
-    // pruned.
+    // pruned, and the prune must release the id from `seen`.
     fixture.backend.question_resolved_by_another("frm_prune").await;
-    sweep(&fixture).await;
+    sweep_with(&fixture, &mut seen).await;
     assert!(
         persisted_location_form(&fixture.session_file(), "frm_prune").is_none(),
         "a complete sweep prunes the resolved form's record"
     );
 
-    // The id is pending again with no dismissal left behind.
+    // The id is pending again with no dismissal left behind and no stale
+    // `seen` entry: it must be pushed again.
     fixture.backend.replied_questions.lock().await.clear();
-    sweep(&fixture).await;
+    sweep_with(&fixture, &mut seen).await;
     assert_eq!(
         posted_cards(&fixture.platform).await.len(),
         2,
-        "a complete sweep prunes the resolved form's record"
+        "a re-listed form is pushed after its pruned record released `seen`"
+    );
+}
+
+/// Regression for the dismissed-record prune: a transient omission prunes the
+/// dismissal, and the form's reappearance must post a card rather than be
+/// suppressed by the push-once `seen` entry (ADR-0103).
+#[tokio::test]
+async fn a_pruned_dismissed_form_is_repushed_when_it_reappears() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_prune_reappear"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_with(&fixture, &mut seen).await;
+
+    // 「稍后」 leaves no standalone card, so only the record and `seen` remain.
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    // A complete sweep transiently omits it: the dismissal is pruned.
+    fixture
+        .backend
+        .question_resolved_by_another("frm_prune_reappear")
+        .await;
+    sweep_with(&fixture, &mut seen).await;
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_prune_reappear").is_none(),
+        "the dismissal record is gone"
+    );
+
+    fixture.backend.replied_questions.lock().await.clear();
+    sweep_with(&fixture, &mut seen).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        2,
+        "the re-listed form is pushed despite the original push being in `seen`"
     );
 }
 
