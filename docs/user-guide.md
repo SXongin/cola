@@ -17,7 +17,7 @@ All runtime state defaults to `~/.cola/`:
 | `cola.log` | logs (append, daily rotation) | `cola --log-file <path>` |
 | `sessions.json` | Feishu thread ↔ Session mapping | `[bridge] session_file` |
 | `chain_records.json` | durable Chain Record: live cards, wake watermarks, Task Endings, delivered positions | beside `session_file` |
-| `interactive_surfaces.json` | Permission/Question cards re-adopted after a restart (ADR-0038) | beside `session_file` |
+| `interactive_surfaces.json` | Permission/Question cards and directory-owned Location Form surfaces re-adopted after a restart (ADR-0038, ADR-0103) | beside `session_file` |
 | `authored_turns.json` | turns cola started, so a client that assigns its own ids still tells its own messages from external ones (ADR-0092) | beside `session_file` |
 | `pinned_chats.json` | persisted Instant Reminder pins | beside `session_file` |
 | `terminal-runs/` | Terminal Run Records for live/settled `/run` cards | beside `session_file` |
@@ -580,8 +580,8 @@ connection. The card always carries that warning; the wire gives cola no way to
 tell a caller-attributed request from a shared one.
 
 Use **稍后** to withdraw the card without declining: the form stays pending and
-the tool call is not failed, the card's message pin is released, and `/mcp`
-lists it again so it can be reopened. Only an explicit **取消** declines. cola never declines a Location Form on a timer. A
+the tool call is not failed, and the card's message pin is released. Only an
+explicit **取消** declines. cola never declines a Location Form on a timer. A
 URL-mode elicitation shows its link plus an acknowledgement; a secret field
 (password or token) cannot be collected on a shared card, so the card shows the
 secret-input reason and offers only a decline.

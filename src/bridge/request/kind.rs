@@ -33,6 +33,12 @@ use super::delivery::{
 };
 use super::flow::{RequestFlow, session_belongs_to};
 
+/// How long the 「稍后」 handler waits for its best-effort Message Pin release.
+/// The explicit card PATCH is the withdrawal; a timed-out unpin is retried by
+/// the next sweep (the sent-card record is already gone), so this must never
+/// spend the card callback's ack budget.
+const DEFER_PIN_RELEASE_TIMEOUT_MS: u64 = 300;
+
 /// Which interaction-block kind a live card section belongs to (ADR-0038). One
 /// registry holds both kinds' blocks, and each flow's poll sweep only touches
 /// blocks of its own kind.
@@ -1787,11 +1793,10 @@ pub(crate) fn permission_receipt_target(
 /// question) cannot pick a different shape.
 fn question_surface(
     req: &crate::backend::types::QuestionRequest,
-    location_form: bool,
     directory: &str,
     paint: &crate::bridge::question::QuestionPaint,
 ) -> serde_json::Value {
-    if location_form {
+    if req.is_location() {
         crate::feishu::card::question::build_location_form_card(
             req,
             directory,
@@ -1983,7 +1988,7 @@ impl RequestKind for QuestionKind {
             );
         }
         let paint = crate::bridge::question::QuestionPaint::blank(q.questions.len());
-        question_surface(q, q.is_location(), dir, &paint)
+        question_surface(q, dir, &paint)
     }
 
     fn summary(&self, _flow: &RequestFlow, req: &PendingRequest) -> String {
@@ -2258,7 +2263,7 @@ impl RequestKind for QuestionKind {
                     let Some(req) = req else {
                         return Some(flow.missing_question_result(directory, inline).await);
                     };
-                    let card = question_surface(&req, location_form, directory.unwrap_or(""), &paint);
+                    let card = question_surface(&req, directory.unwrap_or(""), &paint);
                     let mut r = CardActionResult {
                         card: Some(card),
                         toast: None,
@@ -2396,7 +2401,7 @@ impl RequestKind for QuestionKind {
                         toast: Some(toast),
                     });
                 }
-                let card = question_surface(&req, location_form, directory.unwrap_or(""), &paint);
+                let card = question_surface(&req, directory.unwrap_or(""), &paint);
                 Some(CardActionResult {
                     card: Some(card),
                     toast: Some(toast),
@@ -2512,10 +2517,16 @@ impl RequestKind for QuestionKind {
                 // defer racing a reply cannot withdraw a card that is being
                 // settled (and leave it claiming "still pending" forever).
                 if !flow.try_mark_answered(&handles.requests, req_id).await {
+                    // The winner may still be in flight. Do NOT claim it was
+                    // answered: a defer can abort and leave the form pending,
+                    // so the truthful answer is "processing, retry".
                     return Some(
                         flow.answered_result(req_id)
                             .await
-                            .unwrap_or_else(|| question_replay_card(inline)),
+                            .unwrap_or_else(|| CardActionResult {
+                                card: None,
+                                toast: Some("正在处理，请稍后重试".to_string()),
+                            }),
                     );
                 }
                 // The claim does not pin the state: re-validate so a sweep
@@ -2537,17 +2548,22 @@ impl RequestKind for QuestionKind {
                 // (or still-clickable) card can answer later.
                 flow.unmark_answered(&handles.requests, req_id).await;
                 if withdrawn {
-                    // Release the message pin now; the next sweep's sync would
-                    // release it too, but a dismissed card must not stay pinned
-                    // until then.
-                    handles
-                        .waits
-                        .message_pins
-                        .release(&handles.platform, req_id)
-                        .await;
+                    // Release the message pin now, bounded so it cannot spend
+                    // the callback's ack budget; a timed-out release is
+                    // retried by the next sweep, which no longer sees the
+                    // sent-card record.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(DEFER_PIN_RELEASE_TIMEOUT_MS),
+                        handles.waits.message_pins.release(&handles.platform, req_id),
+                    )
+                    .await;
                 }
+                // The card was already PATCHed above (or the write failed and
+                // must NOT be replaced): never return a replacement card here,
+                // or a failed withdrawal's ack would paint the terminal
+                // "稍后处理" card over a still-live one.
                 return Some(CardActionResult {
-                    card: Some(card),
+                    card: None,
                     toast: Some(if withdrawn {
                         "已稍后处理".to_string()
                     } else {

@@ -780,6 +780,16 @@ pub fn question_elements(
 ) -> Vec<serde_json::Value> {
     use crate::backend::types::FormFieldKind;
 
+    // Defence in depth: even a caller that forgot to mark the request
+    // uncollectable must never render a secret field as an input. The neutral
+    // model carries the marker on the field, and this renderer is the one place
+    // an answer could be typed.
+    let uncollectable = uncollectable.or_else(|| {
+        questions
+            .iter()
+            .any(|question| question.secret)
+            .then_some(UncollectableReason::SecretInput)
+    });
     let is_done = |i: usize| -> bool { done.get(i).copied().unwrap_or(false) };
     let selected = |i: usize| -> Option<&Vec<String>> { answered.get(i).and_then(|slot| slot.as_ref()) };
     let mut elements: Vec<serde_json::Value> = Vec::new();
@@ -1507,7 +1517,7 @@ pub fn build_location_form_deferred_card(server: Option<&str>, message: Option<&
         detail.push_str(message);
         detail.push_str("\n\n");
     }
-    detail.push_str("该请求仍然待处理，稍后可以在 `/mcp` 中重新打开。");
+    detail.push_str("该请求仍然待处理；需要处理时再作答即可。");
     card_shell(
         "💤 已稍后处理",
         "grey",
@@ -2629,6 +2639,31 @@ mod tests {
     /// gets 是/否 buttons whose values are JSON booleans; a number gets a typed
     /// input form; an external field shows its link and an acknowledgement
     /// button.
+    /// Defence in depth: a caller that forgot to mark the request
+    /// uncollectable must still never render a secret field as an input.
+    #[test]
+    fn a_secret_field_never_renders_an_input() {
+        use crate::backend::types::{FormFieldKind, QuestionInfo};
+        let secret = QuestionInfo {
+            key: "token".into(),
+            question: "API token".into(),
+            header: "Token".into(),
+            kind: FormFieldKind::String,
+            secret: true,
+            ..Default::default()
+        };
+        let card = build_question_card("", "req", "ses", &[secret], "/work", &[], &[], 0, &[]);
+        let json = card.to_string();
+        assert!(
+            !json.contains("\"tag\":\"input\""),
+            "a secret field is never an input: {json}"
+        );
+        assert!(
+            json.contains("私密输入"),
+            "the secret refusal is rendered: {json}"
+        );
+    }
+
     #[test]
     fn form_card_renders_typed_fields() {
         use crate::backend::types::{FormFieldKind, QuestionInfo, QuestionOption};

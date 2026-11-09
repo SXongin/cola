@@ -1924,6 +1924,22 @@ impl RequestFlow {
         false
     }
 
+    /// Test-only: drive the Location Form push decision for one request
+    /// directly. The sweep only lists directories it found in the SessionStore,
+    /// so the no-mapped-target branch is otherwise reachable only as a
+    /// listing→delivery race; this exposes the real surface path so a test can
+    /// prove "no send, no suppression" observably.
+    #[cfg(test)]
+    pub(crate) async fn surface_location_form_for_test(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        self.surface_location_form(handles, req, dir, seen).await
+    }
+
     /// Send one standalone request card, bounded by [`STANDALONE_SEND_TIMEOUT_MS`].
     /// Returns the message id, or `None` on a failed or timed-out send. No
     /// Session lock is held here: the caller commits the surface record under

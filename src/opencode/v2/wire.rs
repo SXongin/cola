@@ -490,11 +490,14 @@ impl RawForm {
             .unwrap_or_default();
         let location = session_id == GLOBAL_ELICITATION_SESSION_ID && metadata.is_mcp_elicitation();
         let questions: Vec<QuestionInfo> = fields.into_iter().map(RawFormField::into_neutral).collect();
-        // A secret field can never be collected on a SHARED card: a Location
-        // Form is uncollectable with the existing secret-input reason, so its
-        // surface offers only a decline (ADR-0103). A session-backed form is
-        // deliberately unchanged.
-        let uncollectable = (location && questions.iter().any(|field| field.secret))
+        // A secret field can never be collected on a shared card — the card is
+        // a shared surface whether the request is session-backed or owned by a
+        // directory (the Codex path's same rule, and ADR-0103's rationale), so
+        // the whole request is uncollectable with the existing secret-input
+        // reason and every surface offers only a decline.
+        let uncollectable = questions
+            .iter()
+            .any(|field| field.secret)
             .then_some(UncollectableReason::SecretInput);
         if location {
             // The owner constructor owns the "no Session" invariant, so the
@@ -634,7 +637,7 @@ impl RawFormField {
                 );
                 // The MCP schema has no `password` format today; the guard
                 // covers the shape the protocol permits (ADR-0103).
-                field.secret = format.as_deref() == Some("password");
+                field.secret = matches!(format.as_deref(), Some("password" | "secret"));
                 field
             }
             RawFormField::Number {

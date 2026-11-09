@@ -15,21 +15,17 @@ use std::sync::Arc;
 use crate::bridge::test_support::*;
 
 use crate::backend::types::{
-    FormFieldKind, QuestionInfo, QuestionOption, QuestionRequest, RequestOwner, UncollectableReason,
+    FormFieldKind, QuestionInfo, QuestionOption, QuestionRequest, UncollectableReason,
 };
 use crate::config::{SessionEntry, ThreadKey};
 
 /// A Location Form with one option-only field (a click answers it, no typed
 /// input), naming an asking server and message.
 fn location_form(request_id: &str) -> QuestionRequest {
-    QuestionRequest {
-        id: request_id.into(),
-        session_id: String::new(),
-        title: "Context7 登录".into(),
-        owner: RequestOwner::Location,
-        server: Some("context7".into()),
-        message: Some("请先登录 Context7 再继续".into()),
-        questions: vec![QuestionInfo {
+    QuestionRequest::location(
+        request_id,
+        "Context7 登录".into(),
+        vec![QuestionInfo {
             key: "choice".into(),
             question: "是否现在登录？".into(),
             header: "登录".into(),
@@ -42,21 +38,19 @@ fn location_form(request_id: &str) -> QuestionRequest {
             custom: Some(false),
             ..Default::default()
         }],
-        ..Default::default()
-    }
+        Some("context7".into()),
+        Some("请先登录 Context7 再继续".into()),
+        None,
+    )
 }
 
 /// A Location Form whose only field is a free-text input (the primary
 /// elicitation shape: a typed answer submitted through the card's form).
 fn typed_location_form(request_id: &str) -> QuestionRequest {
-    QuestionRequest {
-        id: request_id.into(),
-        session_id: String::new(),
-        title: "Context7 登录".into(),
-        owner: RequestOwner::Location,
-        server: Some("context7".into()),
-        message: Some("请输入访问令牌".into()),
-        questions: vec![QuestionInfo {
+    QuestionRequest::location(
+        request_id,
+        "Context7 登录".into(),
+        vec![QuestionInfo {
             key: "token".into(),
             question: "令牌".into(),
             header: "令牌".into(),
@@ -64,8 +58,10 @@ fn typed_location_form(request_id: &str) -> QuestionRequest {
             custom: Some(true),
             ..Default::default()
         }],
-        ..Default::default()
-    }
+        Some("context7".into()),
+        Some("请输入访问令牌".into()),
+        None,
+    )
 }
 
 /// A plain session-backed form (the ordinary Question path).
@@ -374,20 +370,43 @@ async fn a_hung_topic_anchor_read_defers_the_push_without_wedging_the_sweep() {
 }
 
 /// A form whose directory has no mapped Chat/Topic has no target: nothing is
-/// sent and nothing suppressed. A mapped directory normally guarantees one, so
-/// this is the target resolver's own boundary (the mapping can disappear
-/// between the list and the delivery).
+/// sent and nothing suppressed. The sweep only lists mapped directories, so
+/// this branch is otherwise reachable only as a listing→delivery race; the
+/// test drives the real surface path directly, then proves a later mapping
+/// still delivers (no suppression was recorded).
 #[tokio::test]
-async fn a_directory_without_a_mapped_chat_has_no_delivery_target() {
-    let fixture = fixture(false, &[], &[entry("chat_1", "ses_1", "/elsewhere")], |_| {}).await;
+async fn a_directory_without_a_mapped_chat_sends_nothing_and_suppresses_nothing() {
+    use crate::bridge::request::kind::PendingRequest;
 
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_unmapped"))],
+        &[entry("chat_1", "ses_1", "/elsewhere")],
+        |_| {},
+    )
+    .await;
     let handles = fixture.app.flow_handles();
-    let platform: Arc<dyn crate::feishu::Platform> = fixture.platform.clone();
-    let target =
-        crate::bridge::pollers::resolve_location_form_target(&handles.sessions, &platform, "/work").await;
+    let req = PendingRequest::Question(location_form("frm_unmapped"));
+    let mut seen = std::collections::HashSet::new();
+    fixture
+        .app
+        .question
+        .surface_location_form_for_test(&handles, &req, "/work", &mut seen)
+        .await;
+
     assert!(
-        matches!(target, crate::bridge::pollers::LocationTarget::NoMapping),
-        "an unmapped directory must read as no target, never a guessed chat"
+        posted_cards(&fixture.platform).await.is_empty(),
+        "an unmapped directory must not guess a chat"
+    );
+
+    // The mapping appears: the next sweep must still deliver, proving the
+    // first attempt recorded nothing and suppressed nothing.
+    seed_entry(&fixture.app, entry("chat_1", "ses_1", "/work")).await;
+    sweep(&fixture).await;
+    assert_eq!(
+        sent_to(&fixture.platform).await.as_deref(),
+        Some("chat_1"),
+        "a later mapping still delivers the form"
     );
 }
 
@@ -569,6 +588,10 @@ async fn defer_withdraws_the_card_and_releases_the_pin_without_declining() {
     let result = fixture.app.host_action(defer).await.expect("a click result");
     assert_eq!(result.toast.as_deref(), Some("已稍后处理"), "the defer landed");
     assert!(
+        result.card.is_none(),
+        "the explicit PATCH owns the card update; the ack must not double-write it"
+    );
+    assert!(
         fixture
             .platform
             .updated_cards()
@@ -652,6 +675,10 @@ async fn a_failed_defer_keeps_the_card_and_pin() {
             .is_some_and(|toast| toast.contains("未完成")),
         "a failed withdrawal says it did not fully land: {:?}",
         result.toast
+    );
+    assert!(
+        result.card.is_none(),
+        "a failed withdrawal must not let the ack replace the still-live card"
     );
     assert_eq!(
         fixture.platform.message_pins().await,
