@@ -605,10 +605,11 @@ write can require a reselect. The
 「稍后」 decision is written before the card is withdrawn, so a failed record
 write leaves the card live and answerable rather than leaving a terminal card
 that no longer says it is waiting; a failed or timed-out withdrawal after that
-point is still reopenable through `/mcp`. If the card PATCH failed definitely
-after the dismissal was saved, that leaves the old card live while `/mcp`
-reopens a fresh card — two live cards, a duplicate rather than a stranded form;
-answering either settles the form. Recovery is best-effort: a failed push
+point is still reopenable through `/mcp`. If the card PATCH failed or its
+response was lost after the dismissal was saved, the defer still stands and its
+pin is released; the old card may remain live while `/mcp` reopens a fresh card
+— two live cards, a duplicate rather than a stranded form; answering either
+settles the form. Recovery is best-effort: a failed push
 record or a timed-out send can still duplicate a card after a restart, exactly
 as any standalone card can, and cola does not claim otherwise. Once a form has
 left the pending list and cola can still speak for its directory, its record is
