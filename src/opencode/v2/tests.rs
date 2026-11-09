@@ -6,7 +6,7 @@
 //! 204 mutations, the run-state derivation, the admit-then-return prompt, the
 //! session-scoped switches, and the permission/form surface.
 
-use crate::backend::types::{PromptFile, SessionStatus};
+use crate::backend::types::{McpServerState, PromptFile, SessionStatus};
 use crate::backend::{ChildEvidence, ChildRuntime, ShellEnd, ShellRuntime, TurnDiff, TurnDiffFile};
 use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
@@ -2557,6 +2557,51 @@ async fn reject_location_form_deletes_the_global_route_with_the_directory() {
     assert!(
         settled.is_not_found(),
         "a Location Form 409 is handled: {settled:?}"
+    );
+}
+
+/// `/mcp`'s status read (`GET /api/mcp`): the location-scoped envelope decodes
+/// every wire state, keeps `needs_auth` distinguishable from `failed`, and an
+/// unknown future tag is never mistaken for connected.
+#[tokio::test]
+async fn mcp_server_statuses_decode_the_location_scoped_statuses() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/mcp",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": [
+                {"name": "codegraph", "status": {"status": "connected"}},
+                {"name": "context7", "status": {"status": "needs_auth", "error": "no credential"}},
+                {"name": "broken", "status": {"status": "failed", "error": "spawn failed"}},
+                {"name": "future", "status": {"status": "hibernating"}},
+            ],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let statuses = client
+        .mcp_server_statuses(Some("/work/cola"))
+        .await
+        .unwrap()
+        .expect("V2 serves the MCP pull surface");
+
+    assert_eq!(statuses.len(), 4);
+    assert_eq!(statuses[0].name, "codegraph");
+    assert_eq!(statuses[0].state, McpServerState::Connected);
+    assert!(statuses[1].needs_auth(), "needs_auth stays its own state");
+    assert_eq!(statuses[1].error.as_deref(), Some("no credential"));
+    assert_eq!(statuses[2].state, McpServerState::Failed);
+    assert_eq!(statuses[2].error.as_deref(), Some("spawn failed"));
+    assert_eq!(statuses[3].state, McpServerState::Unknown);
+    let request = last_request(&server);
+    assert_eq!(
+        request.query_param("location[directory]").as_deref(),
+        Some("/work/cola"),
+        "the status read is scoped by the current directory"
     );
 }
 

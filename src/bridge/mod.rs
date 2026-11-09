@@ -8,6 +8,7 @@ pub mod external;
 pub mod failure_latch;
 pub mod handler;
 pub(crate) mod handles;
+pub(crate) mod mcp;
 pub mod message_pins;
 pub mod poll;
 pub mod pollers;

@@ -1751,6 +1751,10 @@ pub struct MockBackend {
     /// own listings.
     pub questions_by_directory:
         std::collections::HashMap<String, Vec<crate::backend::types::QuestionRequest>>,
+    /// Directory → MCP server statuses. `None` (the default) means the mock
+    /// has no MCP pull surface at all, exactly like OpenCode V1 and Codex; a
+    /// directory without an entry sees the server's default location list.
+    pub mcp_statuses: Option<std::collections::HashMap<String, Vec<crate::backend::types::McpServerStatus>>>,
     /// Records `reply_question` calls: (request_id, answers). The answers are
     /// the positional string form the keyed neutral answers flatten to, so the
     /// existing click assertions read the submitted selection.
@@ -2211,6 +2215,7 @@ impl MockBackend {
             fail_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             questions: Vec::new(),
             questions_by_directory: std::collections::HashMap::new(),
+            mcp_statuses: None,
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_routes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2404,6 +2409,21 @@ impl MockBackend {
             .entry(directory.to_string())
             .or_default()
             .push(request);
+        self
+    }
+
+    /// Scenario: the client has the `/mcp` pull surface and serves `statuses`
+    /// for `directory` (a directory with no script sees the default-location
+    /// list). Without this call the mock has no MCP surface — V1/Codex's
+    /// not-applicable default.
+    pub(crate) fn with_mcp_statuses_in(
+        &mut self,
+        directory: &str,
+        statuses: Vec<crate::backend::types::McpServerStatus>,
+    ) -> &mut Self {
+        self.mcp_statuses
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(directory.to_string(), statuses);
         self
     }
 
@@ -3807,6 +3827,21 @@ impl crate::backend::Backend for MockBackend {
             None => self.questions.clone(),
         };
         Ok(source.into_iter().filter(|q| !replied.contains(&q.id)).collect())
+    }
+
+    async fn mcp_server_statuses(
+        &self,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        let Some(map) = &self.mcp_statuses else {
+            return Ok(None);
+        };
+        let statuses = directory
+            .and_then(|dir| map.get(dir))
+            .or_else(|| map.get(""))
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some(statuses))
     }
 
     async fn model_context_window(&self, _provider: &str, _model: &str) -> crate::error::Result<Option<i64>> {

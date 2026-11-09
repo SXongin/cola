@@ -414,6 +414,18 @@ impl OpenCodeBackend {
         self.strategy().list_questions(&self.transport, directory).await
     }
 
+    /// The MCP server statuses for one directory — `None` on a generation
+    /// without the pull surface (V1). See
+    /// [`crate::backend::Backend::mcp_server_statuses`].
+    pub async fn mcp_server_statuses(
+        &self,
+        directory: Option<&str>,
+    ) -> crate::error::Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        self.strategy()
+            .mcp_server_statuses(&self.transport, directory)
+            .await
+    }
+
     pub async fn reply_question(
         &self,
         session_id: &str,

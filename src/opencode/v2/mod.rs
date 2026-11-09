@@ -110,6 +110,10 @@ const SKILL: &str = "/api/skill";
 /// context-window lookup read. It serves the enabled models only, so the
 /// picker needs no credential/`connected` filter like V1's `GET /provider`.
 const MODEL: &str = "/api/model";
+/// The MCP server list (`GET /api/mcp`): the adapter's read half of `/mcp`
+/// (ADR-0103). Its `{location, data: Mcp.Server[]}` envelope is the pull
+/// surface's statuses; connect/disconnect/add/remove stay out of scope.
+const MCP: &str = "/api/mcp";
 
 /// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
 /// misbehaving server must not spin the client forever. The server's default
@@ -467,6 +471,30 @@ impl GenerationStrategy for V2Strategy {
         }
         let page: wire::DataEnvelope<Vec<wire::RawForm>> = resp.json().await?;
         Ok(page.data.into_iter().map(wire::RawForm::into_neutral).collect())
+    }
+
+    /// The MCP server statuses for one location (`GET /api/mcp?location[directory]=…`):
+    /// the read half of `/mcp` (ADR-0103). The response is V2's
+    /// `{location, data: Mcp.Server[]}` envelope; the neutral row keeps the
+    /// server name, its tagged state and any error/detail. Only the read is
+    /// wired — connect/disconnect/add/remove stay out of scope.
+    async fn mcp_server_statuses(
+        &self,
+        http: &Transport,
+        directory: Option<&str>,
+    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        let url = location_url(&http.url(MCP), directory)?;
+        let resp = http.client().get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(read_failure_quiet(resp, "MCP server list").await);
+        }
+        let page: wire::DataEnvelope<Vec<wire::RawMcpServer>> = resp.json().await?;
+        Ok(Some(
+            page.data
+                .into_iter()
+                .map(wire::RawMcpServer::into_neutral)
+                .collect(),
+        ))
     }
 
     /// Answer a pending form (`POST /api/session/{id}/form/{formID}/reply`)

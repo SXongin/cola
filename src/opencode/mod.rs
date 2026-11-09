@@ -119,6 +119,13 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::list_questions(self, directory).await
     }
 
+    async fn mcp_server_statuses(
+        &self,
+        directory: Option<&str>,
+    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        OpenCodeBackend::mcp_server_statuses(self, directory).await
+    }
+
     async fn reply_question(
         &self,
         session_id: &str,

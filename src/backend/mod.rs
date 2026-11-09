@@ -193,13 +193,14 @@ impl DirectoryBackend for BackendDirectory {
 /// client has. They carry a default body stating **this client has no such
 /// surface**, in the vocabulary the trait already uses: `Ok(None)`, `false`,
 /// the no-op `Ok(())`, `Ok(TaskRuntime::default())`,
-/// `Ok(ChildEvidence::Unfinished)`. The thirteen are
+/// `Ok(ChildEvidence::Unfinished)`. The fourteen are
 /// [`Self::session_selection`], [`Self::session_last_run_model`],
 /// [`Self::switch_session_model`], [`Self::switch_session_agent`],
 /// [`Self::keeps_session_selection`], [`Self::reuse_continues_an_admitted_turn`],
 /// [`Self::resume_supported`], [`Self::resume`], [`Self::session_diff`],
 /// [`Self::task_runtime`], [`Self::background_tasks_supported`],
-/// [`Self::shell_output`] and [`Self::child_evidence`].
+/// [`Self::shell_output`], [`Self::child_evidence`] and
+/// [`Self::mcp_server_statuses`].
 ///
 /// One more default is structural rather than a missing surface:
 /// [`Self::is_addressable_session_id`] answers the `ses…` id shape both
@@ -207,7 +208,7 @@ impl DirectoryBackend for BackendDirectory {
 /// thread UUIDs) overrides it so its requests are not filtered out as
 /// unaddressable.
 ///
-/// A future adapter (spec #860) is expected to leave all thirteen defaulted when
+/// A future adapter (spec #860) is expected to leave all fourteen defaulted when
 /// the runtime it attaches to publishes no equivalent surface, and to override
 /// the ones it does publish; the rest of the trait — session lifecycle,
 /// [`Self::prompt`], [`Self::transcript`], permissions/questions,
@@ -735,6 +736,20 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// List the pending forms/questions for one directory/instance (the same
     /// per-directory read as [`Self::list_permissions`]).
     async fn list_questions(&self, directory: Option<&str>) -> Result<Vec<QuestionRequest>>;
+
+    /// The MCP server statuses for one directory — the read half of the
+    /// `/mcp` pull surface (ADR-0103). `None` is **not applicable to this
+    /// client**: OpenCode V1 publishes a status read but no
+    /// elicitation-form surface, and Codex publishes neither the full pair, so
+    /// `/mcp` answers "unavailable" rather than shipping a status-only card.
+    /// A client with the surface overrides this and still reports a failed
+    /// read as `Err`.
+    async fn mcp_server_statuses(
+        &self,
+        _directory: Option<&str>,
+    ) -> Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        Ok(None)
+    }
 
     /// Whether `id` can name a Session on this client at all. Every OpenCode
     /// generation mints `ses…` ids, so the default preserves the structural

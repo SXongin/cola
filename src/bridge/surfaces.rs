@@ -549,10 +549,6 @@ impl Surfaces {
     /// standalone card in the same mutation. Returns whether it cleared: a
     /// dismissal recorded after `generation` was read (a 「稍后」 that landed
     /// during the send) leaves the record dismissed and returns `false`.
-    ///
-    /// Test-only until `/mcp` (#1018) wires the reopen caller; the flow seam
-    /// and this method are promoted together then.
-    #[cfg(test)]
     pub fn clear_location_form_dismissal(
         &self,
         request_id: &str,

@@ -602,6 +602,17 @@ sweep that no longer lists the form withdraws the card. A form already settled
 by another client (409) is the ordinary "handled" path. A failed push is
 retried on the next complete sweep.
 
+`/mcp` is the read-only pull surface for the current project directory: it
+lists that directory's MCP server statuses — including `needs_auth`, which means
+the server has no usable credential and must be signed in before its form can
+be answered — and **only** its pending Location Forms. Session-backed questions
+keep their own cards and never appear there. A form you deferred with 「稍后」
+gets a 「重新打开」 control: it sends a fresh card first and clears the dismissal
+only after the send lands, so a failed send leaves the form withdrawn and
+retryable. `/mcp` never connects, disconnects, adds, removes or signs in to an
+MCP server, and never browses resources. On an Agent Client without the full
+status + Location Form surface it answers 不可用 rather than pretending.
+
 Session-backed elicitations keep their normal Question card and reminder. A
 session-less form that is not marked as an MCP elicitation, and a permission
 with no Session, keep the old one-warning-and-skip behaviour.
@@ -885,6 +896,7 @@ detailed help for any of these.
 | `/update` | Update cola via its install channel (GitHub Releases self-update, or the cargo command for `cargo install`/`cargo binstall` installs) |
 | `/version` | Show cola version and build provenance (release / crates.io / dev build) |
 | `/status` | Show the current model/level, next-turn pending pick, and a short session summary |
+| `/mcp` | Read-only: the current project directory's MCP server statuses (including a clear `needs_auth` sign-in indication) and **only** that directory's pending Location Forms. A form deferred with 「稍后」 has a 「重新打开」 control that sends it as a fresh card first and clears the dismissal only after the send lands, so a failed send leaves it withdrawn and retryable. It never connects, disconnects, adds, removes, signs in to or browses MCP servers/resources. Unavailable on an Agent Client without the status + Location Form surface |
 | `/help [command]` | List commands, or show detailed help for one |
 
 Notes:

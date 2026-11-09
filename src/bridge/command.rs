@@ -113,6 +113,9 @@ pub enum Command {
     /// Show this conversation's current model/effort, any next-turn pending,
     /// and a short session summary (spec #922). A text reply, no card.
     Status,
+    /// `/mcp` — the current directory's MCP server statuses plus only its
+    /// pending Location Forms, as one read-only card (ADR-0103's pull surface).
+    Mcp,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
     /// Load one or more OpenCode skills into the prompt (spec #652, tickets
@@ -543,6 +546,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/update" => Some(Command::Update),
         "/version" => Some(Command::Version),
         "/status" => Some(Command::Status),
+        "/mcp" => Some(Command::Mcp),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),
         // `/skill <id> [/skill <id> …] [text]` — load the named skills into the
         // prompt (spec #652). Each `/skill` token takes the token that follows
@@ -826,6 +830,7 @@ pub fn help_text() -> String {
 `/update` · Update cola (GitHub Releases self-update; cargo installs get the cargo command)
 `/version` · Show cola version & build provenance (release / crates.io / dev build)
 `/status` · Show this conversation's current model/effort, next-turn pending, and session summary
+`/mcp` · Read-only: this directory's MCP server statuses and pending Location Forms
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
 话题规则：已绑定会话的话题里，`/switch`、`/switch <关键词>`、`/switch <id> --force`、`/new`、`/dir`、`/sub attach` 被拒绝，请回主对话操作；`/switch forget` 例外——它只解绑、不选会话，已绑定话题正是该用它丢掉自己映射的地方（服务器会话保留，之后话题回到未绑定状态）。从未绑定过会话的话题可以用上面那些命令绑定该话题的唯一会话。
@@ -910,6 +915,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "status" => {
             "/status\nShow this conversation's current model and thinking level, the next-turn pending pick (if any), and a short session summary (session, directory, agent, auto-accept). On a Pending Session the creation model is shown instead of a 待应用 line. Codex's live pending is one-shot: it applies to the next new message. A model/level pick does not change 当前 until that turn runs.\nExample: `/status`"
+        }
+        "mcp" => {
+            "/mcp\nRead-only view of the current project directory's MCP servers and pending Location Forms, as one card. It lists every configured server's connection status — `connected`, `pending`, `disabled`, `failed` and especially `needs_auth` (the server has no usable credential and must be signed in before its form can be answered) — and only directory-owned Location Forms; a session-backed question keeps its own Question card and never appears here. A dismissed form (「稍后」) carries a 「重新打开」 control that sends it again as a fresh card into the directory's mapped Chat/Topic; the dismissal is cleared only after the send lands, so a failed send stays retryable. The command never connects, disconnects, adds, removes, signs in to, or browses resources from any MCP server. On an Agent Client without the status + Location Form surface it answers 不可用 rather than showing a status-only view.\nExample: `/mcp`"
         }
         "help" => {
             "/help [command]\nList all commands, or show detailed help for one.\nExample: `/help model`"
@@ -2625,6 +2633,9 @@ pub(crate) async fn handle_command(
                 .reply_text(message_id, &lines.join("\n"))
                 .await?;
         }
+        Command::Mcp => {
+            crate::bridge::mcp::run(handles, &thread_key, message_id).await?;
+        }
         Command::Forward(_) => {
             // Unreachable: the message coordinator intercepts `Command::Forward`
             // and routes it into the prompt pipeline itself (that pipeline is the
@@ -3589,6 +3600,7 @@ mod tests {
     fn parse_agent_model_no_arg_is_card() {
         assert_eq!(parse_command("/model"), Some(Command::ModelCard));
         assert_eq!(parse_command("/status"), Some(Command::Status));
+        assert_eq!(parse_command("/mcp"), Some(Command::Mcp));
         assert_eq!(parse_command("/agent"), Some(Command::AgentCard));
     }
 
