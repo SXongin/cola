@@ -62,13 +62,20 @@ fn status_label(status: &McpServerStatus) -> String {
         .filter(|error| !error.trim().is_empty())
         .map(|error| format!("：{error}"))
         .unwrap_or_default();
-    let state = match status.state {
-        McpServerState::Connected => "✅ 已连接",
-        McpServerState::Pending => "⏳ 连接中",
-        McpServerState::Disabled => "⏸️ 已禁用",
-        McpServerState::Failed => "❌ 连接失败",
-        McpServerState::NeedsAuth => "🔐 需要登录授权（needs_auth）",
-        McpServerState::Unknown => "❔ 状态未知",
+    // The `needs_auth` predicate is the card's one source for the sign-in
+    // indication (never the raw wire string), so its own accessor is what the
+    // label reads.
+    let state = if status.needs_auth() {
+        "🔐 需要登录授权（needs_auth）"
+    } else {
+        match status.state {
+            McpServerState::Connected => "✅ 已连接",
+            McpServerState::Pending => "⏳ 连接中",
+            McpServerState::Disabled => "⏸️ 已禁用",
+            McpServerState::Failed => "❌ 连接失败",
+            // `NeedsAuth` is handled above; the arm keeps the match exhaustive.
+            McpServerState::NeedsAuth | McpServerState::Unknown => "❔ 状态未知",
+        }
     };
     format!("{state}{detail}")
 }

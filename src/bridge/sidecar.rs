@@ -211,26 +211,34 @@ where
 }
 
 /// Write `record` to `path` atomically (temp file + rename), best-effort: a
-/// failure logs under `what` and changes nothing else — the in-memory state is
-/// authoritative. `empty` records remove the file instead of writing one.
-pub(crate) fn store<T: Serialize>(path: &Path, what: &str, record: &T, empty: bool) {
+/// failure logs under `what` and changes nothing else. `empty` records remove
+/// the file instead of writing one. Returns whether the record is now durable —
+/// a caller whose in-memory state must never outrun the disk (a Location Form
+/// dismissal, ADR-0103) checks it; every other caller ignores it because its
+/// in-memory state stays authoritative.
+pub(crate) fn store<T: Serialize>(path: &Path, what: &str, record: &T, empty: bool) -> bool {
     if empty {
         if let Err(e) = std::fs::remove_file(path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!("{what}: could not remove {}: {}", path.display(), e);
+            return false;
         }
-        return;
+        return true;
     }
     let data = match serde_json::to_string(record) {
         Ok(data) => data,
         Err(e) => {
             tracing::warn!("{what}: could not serialize the record: {e}");
-            return;
+            return false;
         }
     };
-    if let Err(e) = write_atomic(path, data.as_bytes()) {
-        tracing::warn!("{what}: could not write {}: {}", path.display(), e);
+    match write_atomic(path, data.as_bytes()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("{what}: could not write {}: {}", path.display(), e);
+            false
+        }
     }
 }
 

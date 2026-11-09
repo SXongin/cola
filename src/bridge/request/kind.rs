@@ -2541,9 +2541,12 @@ impl RequestKind for QuestionKind {
                     req.server.as_deref(),
                     req.message.as_deref(),
                 );
-                // The replacement card is PATCHed BEFORE the records go, so a
-                // failed withdrawal keeps the card and its record in step. The
-                // durable dismissal makes 「稍后」 survive a restart (ADR-0103).
+                // The durable dismissal is written BEFORE the replacement card
+                // is PATCHed, so a terminal card can never sit over a record
+                // that still says pushed: the record is what a restart and
+                // `/mcp` trust (ADR-0103). A failed record write keeps the
+                // live card answerable; a failed card write leaves the form
+                // reopenable. The dismissal makes 「稍后」 survive a restart.
                 // The owning directory is required for the record's prune
                 // predicate: fall back to the remembered one rather than
                 // persisting an empty directory (which cannot be mapped).

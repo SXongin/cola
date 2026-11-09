@@ -488,6 +488,12 @@ pub(crate) async fn mark_stale_cards(
     for (rid, card) in stale {
         sent.lock().await.remove(&rid);
         surfaces.remove_standalone(&rid);
+        // A stale Location Form has left the pending list, so its push/
+        // dismissal decision describes a form that no longer exists. Leaving
+        // the record behind would make a later reappearance (or `/mcp`) read
+        // "已推送，见原卡片" with no card and no reopen control; the stale pass
+        // is the one place that knows the card is gone.
+        surfaces.remove_location_form(&rid);
         surfaces.remove_companion(&rid);
         let over = !card.session_id.is_empty() && dead.contains(&card.session_id);
         let card_json = if over {

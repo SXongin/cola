@@ -1084,13 +1084,23 @@ impl feishu::Platform for RecordingPlatform {
             self.fail_update_http_404_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
-        if let Some(gate) = self.take_gate("update", message_id) {
+        let gate = self.take_gate("update", message_id);
+        let accepted_before_reply = gate.as_ref().is_some_and(|gate| gate.accepted_before_reply);
+        if accepted_before_reply {
+            self.calls.lock().await.push(PlatformCall::UpdateMessage {
+                message_id: message_id.into(),
+                card: card.clone(),
+            });
+        }
+        if let Some(gate) = gate {
             wait_gate(gate).await;
         }
-        self.calls.lock().await.push(PlatformCall::UpdateMessage {
-            message_id: message_id.into(),
-            card: card.clone(),
-        });
+        if !accepted_before_reply {
+            self.calls.lock().await.push(PlatformCall::UpdateMessage {
+                message_id: message_id.into(),
+                card: card.clone(),
+            });
+        }
         if targeted {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated card update failure".into(),

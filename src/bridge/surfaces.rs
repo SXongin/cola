@@ -212,7 +212,7 @@ impl SurfaceState {
 /// The version-1 file (ADR-0091): every map is scoped by Agent Client first,
 /// because request and message ids are minted per client and two clients could
 /// otherwise collide on one key.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SurfaceFile {
     version: u32,
     #[serde(default)]
@@ -526,8 +526,14 @@ impl Surfaces {
     /// Record a 「稍后」 dismissal and forget the withdrawn standalone card in
     /// one mutation. The form stays pending; the persisted dismissal is what
     /// stops a later sweep (or a restart) from pushing it again.
-    pub fn dismiss_location_form(&self, request_id: &str, directory: &str) {
-        self.mutate(|state| {
+    ///
+    /// Returns whether the dismissal is **durable**: the card write that
+    /// follows must only make a card terminal once the record on disk says so,
+    /// or a restart could re-adopt a terminal card as pushed and strand the
+    /// form (ADR-0103). A failed write rolls the in-memory record back, leaving
+    /// the live card and its pushed record untouched.
+    pub fn dismiss_location_form(&self, request_id: &str, directory: &str) -> bool {
+        self.mutate_durable(|state| {
             let mut record = state
                 .location_forms
                 .get(&self.client_id, request_id)
@@ -542,13 +548,15 @@ impl Surfaces {
             state.location_forms.insert(&self.client_id, request_id, record);
             state.standalone.remove(&self.client_id, request_id);
             true
-        });
+        })
     }
 
     /// Clear the dismissal a reopen read before sending, and record the fresh
-    /// standalone card in the same mutation. Returns whether it cleared: a
-    /// dismissal recorded after `generation` was read (a 「稍后」 that landed
-    /// during the send) leaves the record dismissed and returns `false`.
+    /// standalone card in the same mutation. Returns whether it cleared:
+    /// a dismissal recorded after `generation` was read (a 「稍后」 that landed
+    /// during the send) leaves the record dismissed and returns `false`, as
+    /// does a failed write (the in-memory state is rolled back, so the caller
+    /// can withdraw the fresh card and retry).
     pub fn clear_location_form_dismissal(
         &self,
         request_id: &str,
@@ -557,7 +565,7 @@ impl Surfaces {
     ) -> bool {
         surface.client_id = self.client_id.clone();
         let mut cleared = false;
-        self.mutate(|state| {
+        let durable = self.mutate_durable(|state| {
             let Some(mut record) = state.location_forms.get(&self.client_id, request_id).cloned() else {
                 return false;
             };
@@ -571,7 +579,7 @@ impl Surfaces {
             cleared = true;
             true
         });
-        cleared
+        cleared && durable
     }
 
     /// Forget a Location Form's decision and its standalone surface in one
@@ -666,16 +674,35 @@ impl Surfaces {
     }
 
     /// Apply `f` under the lock and persist only when it reports a change.
-    fn mutate(&self, f: impl FnOnce(&mut SurfaceFile) -> bool) {
+    /// Returns whether the requested state is durable — a no-op change already
+    /// is; every caller but the Location Form transitions ignores the answer.
+    fn mutate(&self, f: impl FnOnce(&mut SurfaceFile) -> bool) -> bool {
         let mut state = self.lock();
         if !f(&mut state) {
-            return;
+            return true;
         }
-        self.persist(&state);
+        self.persist(&state)
     }
 
-    fn persist(&self, state: &SurfaceFile) {
-        sidecar::store(&self.path, "surface record", state, state.is_empty());
+    /// [`Self::mutate`] for a transition whose in-memory state must never
+    /// outrun the disk: a failed write restores the previous record (including
+    /// the standalone surface), so a caller that sees `false` still holds the
+    /// state the last successful write described.
+    fn mutate_durable(&self, f: impl FnOnce(&mut SurfaceFile) -> bool) -> bool {
+        let mut state = self.lock();
+        let previous = state.clone();
+        if !f(&mut state) {
+            return true;
+        }
+        if self.persist(&state) {
+            return true;
+        }
+        *state = previous;
+        false
+    }
+
+    fn persist(&self, state: &SurfaceFile) -> bool {
+        sidecar::store(&self.path, "surface record", state, state.is_empty())
     }
 }
 

@@ -95,15 +95,17 @@ fn migrate_pins_file(path: &Path) -> Option<String> {
             match serde_json::from_str::<PinnedChatsFile>(&raw) {
                 // A migration lands the version even for an empty pin set; the
                 // normal writer removes an empty file only for later mutations.
-                Ok(file) => crate::bridge::sidecar::store(
-                    path,
-                    "instant reminder",
-                    &PinnedChatsFile {
-                        version: crate::state::STATE_FORMAT_VERSION,
-                        pins: file.pins,
-                    },
-                    false,
-                ),
+                Ok(file) => {
+                    crate::bridge::sidecar::store(
+                        path,
+                        "instant reminder",
+                        &PinnedChatsFile {
+                            version: crate::state::STATE_FORMAT_VERSION,
+                            pins: file.pins,
+                        },
+                        false,
+                    );
+                }
                 Err(e) => tracing::warn!(
                     "instant reminder: could not parse {} ({e}); leaving it untouched",
                     path.display()

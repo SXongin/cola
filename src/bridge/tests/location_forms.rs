@@ -67,6 +67,38 @@ fn typed_location_form(request_id: &str) -> QuestionRequest {
     )
 }
 
+/// A Location Form whose only field is a multi-select: the partial-selection
+/// shape 「稍后」 must preserve through a reopen.
+fn multi_location_form(request_id: &str) -> QuestionRequest {
+    QuestionRequest::location(
+        request_id,
+        "选择环境".into(),
+        vec![QuestionInfo {
+            key: "envs".into(),
+            question: "部署到哪些环境？".into(),
+            header: "环境".into(),
+            kind: FormFieldKind::Multiselect,
+            options: vec![
+                QuestionOption {
+                    value: String::new(),
+                    label: "staging".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    value: String::new(),
+                    label: "production".into(),
+                    description: String::new(),
+                },
+            ],
+            custom: Some(false),
+            ..Default::default()
+        }],
+        Some("deploy".into()),
+        Some("选择部署目标".into()),
+        None,
+    )
+}
+
 /// A plain session-backed form (the ordinary Question path).
 fn session_form(request_id: &str, session_id: &str) -> QuestionRequest {
     QuestionRequest {
@@ -644,8 +676,8 @@ async fn defer_withdraws_the_card_and_releases_the_pin_without_declining() {
             .updated_cards()
             .await
             .iter()
-            .any(|card| card_text(card).contains("已稍后处理")),
-        "the clicked/stored card is PATCHed before its record is cleared"
+            .any(|card| { card_text(card).contains("已稍后处理") && card_text(card).contains("/mcp") }),
+        "the deferred card names the way back through /mcp"
     );
 
     assert!(
@@ -689,9 +721,104 @@ async fn defer_withdraws_the_card_and_releases_the_pin_without_declining() {
     );
 }
 
-/// A failed defer keeps the card, its record and its pin: the withdrawal is
-/// PATCHed before the records go, so a failed card write cannot leave a
-/// clickable card with nothing tracking it.
+/// A partial multi-select survives 「稍后」 → reopen → submit: the fresh card
+/// paints the remembered selection, and the next toggle acts on what the card
+/// shows rather than on a hidden, undisplayed set.
+#[tokio::test]
+async fn a_partial_multi_select_round_trips_through_defer_and_reopen() {
+    let fixture = fixture(
+        false,
+        &[("/work", multi_location_form("frm_multi"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let staging = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "staging")
+        .map(|button| button["value"].clone())
+        .expect("a staging option");
+    fixture
+        .app
+        .host_action(staging.clone())
+        .await
+        .expect("a toggle result");
+
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a defer result");
+
+    let req = PendingRequest::Question(multi_location_form("frm_multi"));
+    let handles = fixture.app.flow_handles();
+    assert_eq!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        ReopenOutcome::Reopened
+    );
+    let reopened = posted_cards(&fixture.platform)
+        .await
+        .into_iter()
+        .last()
+        .expect("the reopened card");
+    let text = card_text(&reopened);
+    assert!(
+        text.contains("已选：staging"),
+        "the reopen paints the remembered selection: {text}"
+    );
+    assert!(
+        card_buttons(&reopened)
+            .iter()
+            .any(|button| button["value"]["answer"] == "staging"
+                && button["text"]["content"] == "✅ staging"),
+        "the selected option renders checked: {reopened}"
+    );
+
+    // Clicking production ADDS to the visible selection (it does not act on an
+    // empty hidden set and leave staging unshown).
+    let production = card_buttons(&reopened)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "production")
+        .map(|button| button["value"].clone())
+        .expect("a production option");
+    let added = fixture
+        .app
+        .host_action(production)
+        .await
+        .expect("a toggle result");
+    assert!(
+        added
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已选：staging、production")),
+        "both selections are visible: {:?}",
+        added.card
+    );
+
+    let confirm = card_buttons(&reopened)
+        .into_iter()
+        .find(|button| button["value"]["reply"] == "confirm")
+        .map(|button| button["value"].clone())
+        .expect("a confirm control");
+    fixture.app.host_action(confirm).await.expect("a confirm result");
+    let calls = fixture.backend.location_reply_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1, "the confirmed selection is submitted");
+    assert_eq!(
+        calls[0].1.as_ref().expect("answers")[0].value,
+        Some(crate::backend::types::FormValue::List(vec![
+            "staging".into(),
+            "production".into()
+        ])),
+        "the submitted answer is the selection the card showed"
+    );
+}
+
+/// A card PATCH that fails after the durable dismissal keeps the card, its pin
+/// and its answerability: the record already says dismissed, so `/mcp` can
+/// reopen it, while the live card is not a dead end.
 #[tokio::test]
 async fn a_failed_defer_keeps_the_card_and_pin() {
     let fixture = fixture(
@@ -951,8 +1078,8 @@ async fn a_secret_location_form_is_uncollectable_and_only_declinable() {
         "the only decision is an explicit decline"
     );
     assert!(
-        button_with_reply(&card, "defer").is_some(),
-        "稍后 may still withdraw it without declining"
+        button_with_reply(&card, "defer").is_none(),
+        "a secret form is decline-only: 「稍后」 would leave an unanswerable form with no card"
     );
 }
 
@@ -1005,6 +1132,54 @@ async fn per_holder_listings_each_get_a_card() {
         posted_cards(&fixture.platform).await.len(),
         2,
         "one card per holder"
+    );
+}
+
+/// A pooled no-caller form's losing holder goes stale through the existing
+/// resolved-elsewhere path, and its record is removed with its card: the
+/// winner's card is untouched.
+#[tokio::test]
+async fn a_pooled_losers_stale_card_drops_its_record() {
+    let mut first = location_form("frm_win");
+    first.server = Some("shared".into());
+    let mut second = location_form("frm_lose");
+    second.server = Some("shared".into());
+    let fixture = fixture(
+        false,
+        &[("/work/a", first), ("/work/b", second)],
+        &[
+            entry("chat_a", "ses_a", "/work/a"),
+            entry("chat_b", "ses_b", "/work/b"),
+        ],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 2);
+
+    // Answering the winner cancels the other holder upstream.
+    let cards = posted_cards(&fixture.platform).await;
+    let winner = cards
+        .iter()
+        .find(|card| card_text(card).contains("/work/a"))
+        .expect("the winner's card");
+    let answer = button_with_reply(winner, "answer").expect("an answer control");
+    fixture.app.host_action(answer).await.expect("a click result");
+    fixture.backend.question_resolved_by_another("frm_lose").await;
+    sweep(&fixture).await;
+
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_lose").is_none(),
+        "the losing holder's record is dropped with its stale card"
+    );
+    assert!(
+        fixture
+            .platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("已处理")),
+        "the losing card is marked handled"
     );
 }
 
@@ -1092,6 +1267,46 @@ async fn staling_releases_the_location_form_pin() {
             .iter()
             .any(|card| card_text(card).contains("已处理")),
         "the card goes stale through the resolved-elsewhere path"
+    );
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_pin_stale").is_none(),
+        "the stale card's Location Form record is removed with its surface"
+    );
+}
+
+/// A stale Location Form's record must not survive: the form left the pending
+/// list, so a later reappearance (the same id listed again) can be pushed
+/// instead of being suppressed by a decision that describes a dead card.
+#[tokio::test]
+async fn a_reappearing_form_after_staling_is_pushed_again() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_reappear"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
+
+    fixture.backend.question_resolved_by_another("frm_reappear").await;
+    sweep(&fixture).await;
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_reappear").is_none(),
+        "the stale pass removed the decision"
+    );
+
+    fixture
+        .backend
+        .replied_questions
+        .lock()
+        .await
+        .remove("frm_reappear");
+    sweep(&fixture).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        2,
+        "a reappearing form is pushed again once its stale record is gone"
     );
 }
 
@@ -1558,6 +1773,161 @@ async fn a_failed_reopen_leaves_the_form_dismissed_and_retryable() {
     assert_eq!(posted_cards(&fixture.platform).await.len(), 2);
 }
 
+/// A failed **conditional clear** write withdraws the fresh card and keeps the
+/// form dismissed: the reopen's commit is the durability point, so a fresh
+/// card must not stay live over a record that still says dismissed.
+#[tokio::test]
+async fn a_failed_clear_write_withdraws_the_reopen_card_and_stays_retryable() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_clear_fail"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+    assert_eq!(
+        persisted_location_form(&fixture.session_file(), "frm_clear_fail").unwrap()["state"],
+        "Dismissed"
+    );
+
+    let surfaces_path = fixture
+        .session_file()
+        .parent()
+        .expect("the state directory")
+        .join("interactive_surfaces.json");
+    let temp_path = surfaces_path.with_extension("tmp");
+    std::fs::create_dir(&temp_path).unwrap();
+    let req = PendingRequest::Question(location_form("frm_clear_fail"));
+    let handles = fixture.app.flow_handles();
+    assert_eq!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        ReopenOutcome::SendFailed,
+        "a failed clear is a failed reopen, not a lost race"
+    );
+    assert!(
+        fixture
+            .platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("已稍后处理")),
+        "the fresh card is withdrawn back to the deferred state"
+    );
+    std::fs::remove_dir(&temp_path).unwrap();
+    assert_eq!(
+        persisted_location_form(&fixture.session_file(), "frm_clear_fail").unwrap()["state"],
+        "Dismissed",
+        "the rollback keeps the in-memory and on-disk records agreeing"
+    );
+
+    // The retry succeeds and the fresh card is the recorded one.
+    assert_eq!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        ReopenOutcome::Reopened,
+        "the retry lands"
+    );
+    assert_eq!(
+        fixture.app.question.location_form_state("frm_clear_fail"),
+        Some(crate::bridge::surfaces::LocationFormState::Pushed)
+    );
+}
+
+/// A reopen with no mapped Chat/Topic (the directory was unmapped after the
+/// dismissal) refuses with `NoTarget` and keeps the dismissal untouched.
+#[tokio::test]
+async fn a_reopen_without_a_mapped_chat_reports_no_target() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_reopen_unmapped"))],
+        &[entry("chat_1", "ses_1", "/elsewhere")],
+        |_| {},
+    )
+    .await;
+    let deferred = crate::feishu::card::question::build_location_form_deferred_card(
+        Some("context7"),
+        Some("请先登录 Context7 再继续"),
+    );
+    let handles = fixture.app.flow_handles();
+    assert!(
+        fixture
+            .app
+            .question
+            .defer_standalone_surface(&handles, "frm_reopen_unmapped", "/work", &deferred)
+            .await,
+        "the dismissal records"
+    );
+    let req = PendingRequest::Question(location_form("frm_reopen_unmapped"));
+    assert_eq!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        ReopenOutcome::NoTarget,
+        "no mapped Chat/Topic means no card, and the dismissal stays"
+    );
+    assert_eq!(
+        fixture.app.question.location_form_state("frm_reopen_unmapped"),
+        Some(crate::bridge::surfaces::LocationFormState::Dismissed)
+    );
+}
+
+/// A reopen whose mapped Session is in a Topic with no resolvable anchor
+/// defers too — it must never fall back to posting in the Chat lobby.
+#[tokio::test]
+async fn a_reopen_with_an_unresolved_topic_anchor_reports_no_target() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_reopen_topic"))],
+        &[topic_entry("omt_topic", "ses_topic", "/work", None)],
+        |_| {},
+    )
+    .await;
+    fixture
+        .platform
+        .no_topic_messages
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let deferred = crate::feishu::card::question::build_location_form_deferred_card(
+        Some("context7"),
+        Some("请先登录 Context7 再继续"),
+    );
+    let handles = fixture.app.flow_handles();
+    assert!(
+        fixture
+            .app
+            .question
+            .defer_standalone_surface(&handles, "frm_reopen_topic", "/work", &deferred)
+            .await,
+        "the dismissal records"
+    );
+    let req = PendingRequest::Question(location_form("frm_reopen_topic"));
+    assert_eq!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        ReopenOutcome::NoTarget,
+        "an unresolvable topic anchor sends nothing"
+    );
+    assert!(
+        posted_cards(&fixture.platform).await.is_empty(),
+        "never posted into the Chat lobby"
+    );
+}
+
 /// A dismissal that lands during a reopen's in-flight send survives: the
 /// reopen clears only the generation it read, and the form stays withdrawn.
 #[tokio::test]
@@ -1675,12 +2045,13 @@ async fn a_failed_combined_write_may_duplicate_the_card_after_a_restart() {
     );
 }
 
-/// KNOWN LIMIT (ADR-0103): a failed **dismissal** write is a different
-/// consequence — disk still holds the live surface and the pushed record, so a
-/// restart repaints the deferred card live instead of keeping it withdrawn.
-/// The feature does not claim to prevent that; the test pins the limit.
+/// A failed **dismissal** write must not make the card terminal: the durable
+/// record is written first and checked, so the live card and its pushed record
+/// stay exactly as they were and the form remains answerable. This test fails
+/// if the dismissal write is skipped (the card would then be withdrawn while
+/// disk still says pushed — the stranded shape ADR-0103 forbids).
 #[tokio::test]
-async fn a_failed_combined_write_during_a_dismissal_loses_the_dismissal_after_a_restart() {
+async fn a_failed_dismissal_write_leaves_a_live_answerable_card() {
     let fixture = fixture(
         false,
         &[("/work", location_form("frm_dismiss_fail"))],
@@ -1695,10 +2066,10 @@ async fn a_failed_combined_write_during_a_dismissal_loses_the_dismissal_after_a_
         persisted_location_form(&session_file, "frm_dismiss_fail").is_some(),
         "the successful push wrote its durable record"
     );
+    let updates_before = fixture.platform.updated_cards().await.len();
 
     // A directory at the writer's temp path makes the atomic replace fail
-    // while the previously written file stays intact; the deferred card PATCH
-    // still lands.
+    // while the previously written file stays intact.
     let surfaces_path = fixture
         .session_file()
         .parent()
@@ -1708,28 +2079,125 @@ async fn a_failed_combined_write_during_a_dismissal_loses_the_dismissal_after_a_
     std::fs::create_dir(&temp_path).unwrap();
     let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
     let result = fixture.app.host_action(defer).await.expect("a click result");
-    assert_eq!(result.toast.as_deref(), Some("已稍后处理"));
-    std::fs::remove_dir(&temp_path).unwrap();
-
-    // Disk still says Pushed + the live surface: the restart re-adopts it as-is
-    // rather than re-pushing a duplicate. The dismissal is lost, not turned
-    // into a duplicate.
-    let (app, platform, _backend) =
-        restart_fixture(&session_file, &[("/work", location_form("frm_dismiss_fail"))]).await;
-    let mut seen = std::collections::HashSet::new();
-    sweep_app(&app, &mut seen).await;
     assert!(
-        posted_cards(&platform).await.is_empty(),
-        "a lost dismissal does not duplicate the card"
+        result
+            .toast
+            .as_deref()
+            .is_some_and(|toast| toast.contains("未完成")),
+        "the durable write failed, so 稍后 did not land: {:?}",
+        result.toast
+    );
+    assert!(
+        result.card.is_none(),
+        "the ack must not replace the still-live card"
+    );
+    assert_eq!(
+        fixture.platform.updated_cards().await.len(),
+        updates_before,
+        "the card was not PATCHed terminal before the record was durable"
     );
     assert_eq!(
         persisted_location_form(&session_file, "frm_dismiss_fail").unwrap()["state"],
         "Pushed",
         "the failed dismissal left the previously written push decision on disk"
     );
+    std::fs::remove_dir(&temp_path).unwrap();
+
+    // The form is still answerable from the same live card.
+    let answer = button_with_reply(&card, "answer").expect("an answer control");
+    fixture.app.host_action(answer).await.expect("a click result");
+    assert_eq!(
+        fixture.backend.location_reply_calls.lock().await.len(),
+        1,
+        "the retained card still answers"
+    );
+
+    // And a restart re-adopts the live card rather than duplicating it.
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_dismiss_fail"))]).await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
     assert!(
-        platform.updated_cards().await.is_empty(),
-        "the stale surface is re-adopted as-is, never repainted"
+        posted_cards(&platform).await.is_empty(),
+        "the live card is re-adopted, never duplicated"
+    );
+}
+
+/// A PATCH that times out **after landing** must not strand the form: the
+/// dismissal is already durable, so the terminal card is reopenable through
+/// `/mcp` instead of sitting under a `Pushed` record with no control.
+#[tokio::test]
+async fn a_timed_out_but_landed_withdrawal_is_reopenable() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_defer_timeout"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    fixture
+        .app
+        .question
+        .withdrawal_timeout_ms
+        .store(25, std::sync::atomic::Ordering::Relaxed);
+    // The PATCH is recorded as accepted, then held past the caller's bound:
+    // exactly a timed-out response for a landed write.
+    let (entered, release) = fixture.platform.pause_after_accept("update", "msg_sent");
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    let app = fixture.app.clone();
+    let click = tokio::spawn(async move { app.host_action(defer).await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the withdrawal PATCH is in flight");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), click)
+        .await
+        .expect("the bounded PATCH does not wedge the click")
+        .expect("the click task ran")
+        .expect("a click result");
+    assert!(
+        result
+            .toast
+            .as_deref()
+            .is_some_and(|toast| toast.contains("未完成")),
+        "an ambiguous PATCH says it did not fully land: {:?}",
+        result.toast
+    );
+    release.notify_waiters();
+    // The call was accepted before its response was lost: the card is terminal
+    // on Feishu's side.
+    assert!(
+        fixture
+            .platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("已稍后处理")),
+        "the withdrawal landed despite the timeout"
+    );
+    assert_eq!(
+        persisted_location_form(&fixture.session_file(), "frm_defer_timeout").unwrap()["state"],
+        "Dismissed",
+        "the durable dismissal was written before the card became terminal"
+    );
+
+    // `/mcp` sees a dismissed form and can reopen it: the terminal card is not
+    // stranded behind a pushed record.
+    let req = PendingRequest::Question(location_form("frm_defer_timeout"));
+    let handles = fixture.app.flow_handles();
+    assert_eq!(
+        fixture.app.question.location_form_state("frm_defer_timeout"),
+        Some(crate::bridge::surfaces::LocationFormState::Dismissed)
+    );
+    assert_eq!(
+        fixture
+            .app
+            .question
+            .reopen_location_form(&handles, &req, "/work")
+            .await,
+        ReopenOutcome::Reopened,
+        "the terminal card is reopenable"
     );
 }
 

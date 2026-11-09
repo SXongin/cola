@@ -710,16 +710,28 @@ impl RequestFlow {
     }
 
     /// Withdraw a request's standalone card **without settling it**: the
-    /// Location Form 「稍后」 control. The replacement card is PATCHed first,
-    /// then the durable dismissal and the forgotten standalone surface are one
-    /// mutation — so a failed or timed-out withdrawal leaves both in place
-    /// instead of leaving a clickable card with no record behind it.
+    /// Location Form 「稍后」 control.
+    ///
+    /// The durable dismissal is written **first**, and the card is only made
+    /// terminal once the record on disk says dismissed (ADR-0103). Two
+    /// failures follow from that order:
+    ///
+    /// - a failed dismissal write leaves the live card and its pushed record
+    ///   untouched — still answerable, and a later `/mcp`/sweep sees a form
+    ///   that was never withdrawn;
+    /// - a failed (or timed-out) card PATCH after a durable dismissal leaves a
+    ///   live card with a dismissed record. The form is recoverable either
+    ///   way: the live card still answers, and `/mcp` can reopen it. A
+    ///   timed-out PATCH that actually landed is the same state — the record
+    ///   already says dismissed, so the terminal card is reopenable rather
+    ///   than stranded behind a `Pushed` record.
     ///
     /// The per-form write lock serializes this with a reopen (ADR-0103): a
     /// reopen reads the dismissal generation under the lock, sends outside it,
     /// and clears only that generation, so a dismissal that lands during the
-    /// send survives. Returns whether the withdrawal landed (or there was no
-    /// card to patch). The in-flight state stays: the form is still pending.
+    /// send survives. Returns whether the withdrawal fully landed (the durable
+    /// record was written and the card was withdrawn); the in-flight state
+    /// stays, because the form is still pending.
     pub(crate) async fn defer_standalone_surface(
         &self,
         handles: &FlowHandles,
@@ -729,19 +741,32 @@ impl RequestFlow {
     ) -> bool {
         let lock = self.location_form_lock(req_id).await;
         let _guard = lock.lock().await;
+        // The decision that must never be missing comes first, and its write
+        // is checked: a card must not become control-less while the record
+        // still says it is live (a restart would re-adopt the terminal card
+        // and leave the form unreachable).
+        if !self.surfaces.dismiss_location_form(req_id, directory) {
+            tracing::warn!(
+                "{} {}: the durable dismissal write failed; keeping the live card and its record",
+                self.kind.label(),
+                req_id
+            );
+            return false;
+        }
         let sent = self.sent_cards.lock().await.get(req_id).cloned();
         if let Some(sent) = sent
             && !self
                 .withdraw_card(handles, req_id, &sent.message_id, replacement, "defer withdrawal")
                 .await
         {
-            // A failed or timed-out PATCH keeps the card and its record.
+            // The record is dismissed either way. A definite failure leaves the
+            // live card answerable; an ambiguous one may have landed. Both are
+            // reopenable through `/mcp`, which is why the dismissal was
+            // committed first. Keep the sent-card record so a live card stays
+            // tracked until a reopen replaces it.
             return false;
         }
         self.sent_cards.lock().await.remove(req_id);
-        // Durable dismissal and surface removal share one mutation, so a
-        // restart cannot see a withdrawn card still marked pushed (ADR-0103).
-        self.surfaces.dismiss_location_form(req_id, directory);
         true
     }
 
@@ -1962,7 +1987,7 @@ impl RequestFlow {
         let Some(target) = self.resolve_location_target(handles, req, dir).await else {
             return false;
         };
-        let card = self.kind.build_card(self, req, dir);
+        let card = self.location_form_card(req, dir).await;
         let summary = self.kind.summary(self, req);
         if self
             .send_standalone_surface(handles, req, dir, Some(target), &card, &summary)
@@ -2087,7 +2112,15 @@ impl RequestFlow {
         let Some(target) = self.resolve_location_target(handles, req, dir).await else {
             return ReopenOutcome::NoTarget;
         };
-        let card = self.kind.build_card(self, req, dir);
+        // Reopen from the remembered question state (ADR-0103): 「稍后」 never
+        // clears the Host's partial answer, so a fresh card that painted
+        // `QuestionPaint::blank` would hide selections the hidden state still
+        // holds — and the next toggle would act on a selection the card never
+        // showed. The post-restart case has no remembered state and stays
+        // blank; `readopt_location_form` deliberately does not repaint there,
+        // because a repaint would wipe an unanswered typed field (ADR-0038's
+        // card-repaints rule).
+        let card = self.location_form_card(req, dir).await;
         let summary = self.kind.summary(self, req);
         let Some(message_id) = self.send_standalone_card(handles, req, Some(target), &card).await else {
             tracing::warn!(
@@ -2121,14 +2154,37 @@ impl RequestFlow {
             cleared
         };
         if !cleared {
-            tracing::info!(
-                "{} {}: a dismissal landed during the reopen; withdrawing the fresh card",
-                self.kind.label(),
-                id
-            );
-            self.withdraw_location_card(handles, req, &message_id, "reopen lost to a dismissal")
+            // A newer dismissal (generation moved) wins; otherwise the clear
+            // write itself failed and the rollback left the form dismissed.
+            // Either way the fresh card must not stay live over a dismissed
+            // record, or `/mcp` would offer a reopen for a card that already
+            // exists.
+            let lost_to_dismissal = self
+                .surfaces
+                .location_form(id)
+                .is_some_and(|record| record.is_dismissed() && record.dismissal_generation != generation);
+            let purpose = if lost_to_dismissal {
+                tracing::info!(
+                    "{} {}: a dismissal landed during the reopen; withdrawing the fresh card",
+                    self.kind.label(),
+                    id
+                );
+                "reopen lost to a dismissal"
+            } else {
+                tracing::warn!(
+                    "{} {}: the cleared-dismissal write failed; withdrawing the fresh card and keeping the form dismissed",
+                    self.kind.label(),
+                    id
+                );
+                "reopen clear write failed"
+            };
+            self.withdraw_location_card(handles, req, &message_id, purpose)
                 .await;
-            return ReopenOutcome::LostToDismissal;
+            return if lost_to_dismissal {
+                ReopenOutcome::LostToDismissal
+            } else {
+                ReopenOutcome::SendFailed
+            };
         }
         self.kind.remember_surfaced(self, req, dir).await;
         tracing::info!(
@@ -2306,6 +2362,29 @@ impl RequestFlow {
                 false
             }
         }
+    }
+
+    /// Build a Location Form card from the question state this process holds:
+    /// its partial selections, finalized slots, open question and drafts. A
+    /// fresh push and a reopen share this seam, so neither can paint a blank
+    /// card over state the next click will act on (ADR-0103). Request state
+    /// that is not remembered (the post-restart reopen) falls back to blank.
+    async fn location_form_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
+        let PendingRequest::Question(q) = req else {
+            return serde_json::json!({});
+        };
+        let paint = self
+            .with_question_state(&q.id, |state| state.paint())
+            .await
+            .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
+        crate::feishu::card::question::build_location_form_card(
+            q,
+            dir,
+            &paint.display,
+            &paint.done,
+            paint.open,
+            &paint.drafts,
+        )
     }
 
     /// The deferred replacement card for a Location Form request, or `None` for
