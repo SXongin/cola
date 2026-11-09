@@ -341,9 +341,8 @@ The order key is now **the transcript's**, not a clock:
   so a refused or failed interaction counts) takes `Now`: it was produced after
   that call's result, so a borrowed position would sort it above the Interaction
   Receipt the answer left (Rule 4). `Now` is a POSITION — the next key after the
-  last placed entry, capped one millisecond before the next message's start —
-  never a render-time clock, and the walk's floor carries across messages so no
-  later part sorts back above it.
+  last placed entry (a live panel included), never a render-time clock — and the
+  walk's floor carries across messages, so no later part sorts back above it.
 - A position key is **pinned**: when a later read finally reports a start time
   for a part that had none, that time updates the panel's clock but not its
   place. Only a `next_order()` fallback (a message with no time at all) may be
@@ -357,9 +356,14 @@ The order key is now **the transcript's**, not a clock:
 `shown_at` — what a panel header displays and what the Rendered Cursor frontier
 records as the part's start — is unchanged: it still carries only the time the
 server reported, so a borrowed key never becomes a fake clock or perturbs a
-cursor. The rule applies to every walk that places transcript parts (the Turn
-window, the seed scope and the pending gap); synthetic content (receipts, wake
-markers) keeps `next_order()`.
+cursor. **Interaction Receipts keep Rule 4's resolution key** (`next_order`): a
+receipt is an event in cola's world, and its key orders only. A message whose
+`time.created` is later than the newest server time the card showed when the
+receipt was written is post-click, so the walk floors its parts at that receipt
+key; a pre-click message keeps its historical keys, so parts the server wrote
+before the click still land above the receipt. The rule applies to every walk
+that places transcript parts (the Turn window, the seed scope and the pending
+gap); synthetic content (wake markers) keeps `next_order()`.
 
 ## Amendment (2026-11-09): a dismissed Location Form is a deliberately surface-less pending request
 
