@@ -523,6 +523,27 @@ mod tests {
         assert_eq!(state.merge().0, 0);
     }
 
+    /// A persisted paint whose shape does not match the request is discarded
+    /// wholesale: a state built for another form must never partially become
+    /// this one's.
+    #[test]
+    fn restore_paint_rejects_a_shape_mismatch() {
+        let mut state = state_with(&[false, false]);
+        state.record_answer(1, "kept");
+        state.restore_paint(QuestionPaint {
+            display: vec![Some(vec!["wrong".into()])],
+            done: vec![true],
+            open: 0,
+            drafts: vec!["draft".into()],
+        });
+        assert_eq!(
+            state.answers,
+            vec![None, Some(vec!["kept".to_string()])],
+            "no slot is overwritten by a mismatched paint"
+        );
+        assert_eq!(state.toggles, vec![None, None]);
+    }
+
     #[test]
     fn remember_refresh_keeps_recorded_answers() {
         // A re-armed follow or re-claim refreshes request/dir in place; the

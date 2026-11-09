@@ -784,6 +784,40 @@ pub fn question_elements(
     open: usize,
     drafts: &[String],
 ) -> Vec<serde_json::Value> {
+    let mut md = super::sanitize::CardMarkdown::new();
+    question_elements_with(
+        &mut md,
+        title,
+        uncollectable,
+        request_id,
+        session_id,
+        questions,
+        directory,
+        answered,
+        done,
+        open,
+        drafts,
+    )
+}
+
+/// [`question_elements`] on a sanitizer the caller already owns, for a card
+/// that builds more than one model-text element: the [`CardMarkdown`] table
+/// budget is per CARD, not per element, so a Location Form's context and its
+/// question body must share one instance.
+#[allow(clippy::too_many_arguments)]
+fn question_elements_with(
+    md: &mut super::sanitize::CardMarkdown,
+    title: &str,
+    uncollectable: Option<UncollectableReason>,
+    request_id: &str,
+    session_id: &str,
+    questions: &[crate::backend::types::QuestionInfo],
+    directory: &str,
+    answered: &[Option<Vec<String>>],
+    done: &[bool],
+    open: usize,
+    drafts: &[String],
+) -> Vec<serde_json::Value> {
     use crate::backend::types::FormFieldKind;
 
     // Defence in depth: even a caller that forgot to mark the request
@@ -800,8 +834,8 @@ pub fn question_elements(
     let selected = |i: usize| -> Option<&Vec<String>> { answered.get(i).and_then(|slot| slot.as_ref()) };
     let mut elements: Vec<serde_json::Value> = Vec::new();
     // Question text comes from the model: sanitize it for the card dialect
-    // (one budget for the block; a question rarely carries tables).
-    let mut md = super::sanitize::CardMarkdown::new();
+    // through the caller's card-wide budget (the context and the block share
+    // one sanitizer, or a sixth table across them reaches Feishu).
 
     // The request's own title (an elicitation's message, for example) belongs
     // on every surface; the standalone card puts it in the header and passes
@@ -1386,8 +1420,11 @@ pub(crate) const LOCATION_FORM_SHARED_CAVEAT: &str =
 
 /// The context block of a Location Form: the asking server, its message and
 /// the directory the answer commits.
-fn location_form_context(req: &crate::backend::types::QuestionRequest, directory: &str) -> String {
-    let mut md = super::sanitize::CardMarkdown::new();
+fn location_form_context(
+    req: &crate::backend::types::QuestionRequest,
+    directory: &str,
+    md: &mut super::sanitize::CardMarkdown,
+) -> String {
     let mut text = format!("**📍 目录**：`{directory}`");
     if let Some(server) = req.server.as_deref().filter(|s| !s.is_empty()) {
         text.push_str(&format!("\n**🔌 MCP 服务器**：{server}"));
@@ -1455,9 +1492,13 @@ pub fn build_location_form_card(
     open: usize,
     drafts: &[String],
 ) -> serde_json::Value {
+    // One card build owns one table budget: the context and the question body
+    // must share this sanitizer, or five tables across them (six in total)
+    // reach Feishu and the card is rejected on every retry.
+    let mut md = super::sanitize::CardMarkdown::new();
     let mut elements = vec![json!({
         "tag": "markdown",
-        "content": location_form_context(req, directory),
+        "content": location_form_context(req, directory, &mut md),
     })];
     // The renderer enforces the secret refusal independently of the adapter's
     // request-level marker; the Location card's controls must read the same
@@ -1469,7 +1510,8 @@ pub fn build_location_form_card(
             .any(|question| question.secret)
             .then_some(UncollectableReason::SecretInput)
     });
-    let mut body = question_elements(
+    let mut body = question_elements_with(
+        &mut md,
         "",
         uncollectable,
         &req.id,
@@ -2318,6 +2360,68 @@ mod tests {
         assert!(
             text.contains("\"reply\":\"reject\""),
             "the explicit decline remains: {text}"
+        );
+    }
+
+    /// The context and the question body share ONE `CardMarkdown` budget: a
+    /// sixth table across the two is fenced, so Feishu never rejects the whole
+    /// card (`230099/11310`).
+    #[test]
+    fn a_location_form_context_and_body_share_one_table_budget() {
+        fn table(n: usize) -> String {
+            format!("| t{n} | b |\n|---|---|\n| 1 | 2 |")
+        }
+        fn collect(value: &serde_json::Value, out: &mut String) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if map.get("tag").and_then(|tag| tag.as_str()) == Some("markdown")
+                        && let Some(content) = map.get("content").and_then(|c| c.as_str())
+                    {
+                        out.push_str(content);
+                        out.push('\n');
+                    }
+                    for child in map.values() {
+                        collect(child, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        collect(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let request = crate::backend::types::QuestionRequest::location(
+            "frm_tables",
+            "Tables".into(),
+            vec![crate::backend::types::QuestionInfo {
+                key: "choice".into(),
+                question: format!("Pick\n\n{}\n\n{}\n\n{}", table(4), table(5), table(6)),
+                header: "Pick".into(),
+                kind: crate::backend::types::FormFieldKind::String,
+                options: vec![crate::backend::types::QuestionOption {
+                    value: "yes".into(),
+                    label: "Yes".into(),
+                    description: String::new(),
+                }],
+                ..Default::default()
+            }],
+            Some("context7".into()),
+            Some(format!("{}\n\n{}\n\n{}", table(1), table(2), table(3))),
+            None,
+        );
+        let card = build_location_form_card(&request, "/w", &[], &[], 0, &[]);
+        let mut content = String::new();
+        collect(&card, &mut content);
+        assert!(
+            content.contains("| t5 | b |\n|---|---|"),
+            "the fifth table renders natively: {content}"
+        );
+        assert!(
+            content.contains("```\n| t6 | b |\n|---|---|\n| 1 | 2 |\n```"),
+            "the sixth table (across context and body) is fenced: {content}"
         );
     }
 

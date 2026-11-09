@@ -164,6 +164,11 @@ pub struct LocationFormRecord {
     /// that lands during the send survives.
     #[serde(default)]
     pub dismissal_generation: u64,
+    /// Consecutive complete sweeps whose listing omitted this still-unresolved
+    /// form. A transient omission does not end a dismissal; only a run of
+    /// complete omissions does (ADR-0103). Reset whenever the form is listed.
+    #[serde(default)]
+    pub missing_sweeps: u32,
     /// The partial answer state the live card shows, so a restart restores
     /// what the visible card's controls will submit (ADR-0103). `None` means
     /// nothing was selected yet; a record from an older build loads with it.
@@ -209,6 +214,14 @@ impl LocationFormRecord {
     pub(crate) fn is_dismissed(&self) -> bool {
         self.state == LocationFormState::Dismissed
     }
+}
+
+/// What the sweep decides for one Location Form record: keep it (and maybe
+/// bump its omission counter) or prune it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationFormRetention {
+    Keep,
+    Prune,
 }
 
 /// The three-state decision a Location Form can carry. The absence of a
@@ -658,27 +671,46 @@ impl Surfaces {
         });
     }
 
-    /// Forget every Location Form record `keep` does not name, returning the
-    /// ids it removed. The sweep calls this only when every mapped directory
-    /// listed successfully, so "not pending" really means the request resolved
-    /// (#130). A dismissed form has no standalone card; the caller must forget
-    /// these ids in its push-once `seen` set too, or a form that is listed
-    /// again could never be pushed (ADR-0103).
-    pub fn retain_location_forms(&self, keep: impl Fn(&str, &LocationFormRecord) -> bool) -> Vec<String> {
+    /// Apply the sweep's retention decision to every Location Form record and
+    /// return the ids it pruned. The sweep calls this only when every mapped
+    /// directory listed successfully, so "not pending" can eventually mean the
+    /// request resolved (#130). The decision may bump
+    /// [`LocationFormRecord::missing_sweeps`]; a change is persisted even when
+    /// no record is pruned. A dismissed form has no standalone card, so the
+    /// caller must forget pruned ids in its push-once `seen` set too, or a form
+    /// that is listed again could never be pushed (ADR-0103).
+    pub fn retain_location_forms(
+        &self,
+        mut decide: impl FnMut(&str, &mut LocationFormRecord) -> LocationFormRetention,
+    ) -> Vec<String> {
         let mut state = self.lock();
-        let stale: Vec<String> = state
+        let ids: Vec<String> = state
             .location_forms
             .iter_client(&self.client_id)
-            .filter(|(id, record)| !keep(id, record))
             .map(|(id, _)| id.clone())
             .collect();
-        for id in &stale {
-            state.location_forms.remove(&self.client_id, id);
+        let mut pruned = Vec::new();
+        let mut changed = false;
+        for id in ids {
+            let Some(record) = state.location_forms.get_mut(&self.client_id, &id) else {
+                continue;
+            };
+            let before = record.missing_sweeps;
+            match decide(&id, record) {
+                LocationFormRetention::Keep => {
+                    changed |= record.missing_sweeps != before;
+                }
+                LocationFormRetention::Prune => {
+                    state.location_forms.remove(&self.client_id, &id);
+                    pruned.push(id);
+                    changed = true;
+                }
+            }
         }
-        if !stale.is_empty() {
+        if changed {
             self.persist(&state);
         }
-        stale
+        pruned
     }
 
     /// Record the companion message that delivered `request_id`'s full target.
@@ -1040,6 +1072,33 @@ mod tests {
         assert!(
             !surfaces.snapshot().standalone.contains_key("frm_1"),
             "the withdrawn surface is forgotten in the same mutation"
+        );
+    }
+
+    /// A failed retain write is reported by the returned prune (the caller must
+    /// release `seen` regardless), but the in-memory prune still holds; the
+    /// disk keeps the record because the mirror is best-effort.
+    #[test]
+    fn a_failed_retain_persist_reports_the_prune_and_rolls_nothing_into_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interactive_surfaces.json");
+        let surfaces = Surfaces::load(path.clone());
+        surfaces.set_location_form_pushed("frm_prune_write", standalone("om_card"), "/work");
+
+        let temp_path = path.with_extension("tmp");
+        std::fs::create_dir(&temp_path).unwrap();
+        let pruned = surfaces.retain_location_forms(|_, _| LocationFormRetention::Prune);
+        assert_eq!(pruned, vec!["frm_prune_write".to_string()]);
+        assert!(
+            surfaces.location_form("frm_prune_write").is_none(),
+            "the in-memory record is pruned even when the mirror write fails"
+        );
+        std::fs::remove_dir(&temp_path).unwrap();
+
+        let reloaded = Surfaces::load(path);
+        assert!(
+            reloaded.location_form("frm_prune_write").is_some(),
+            "the failed write leaves the last durable record on disk"
         );
     }
 

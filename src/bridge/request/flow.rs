@@ -422,9 +422,9 @@ const WITHDRAWAL_PATCH_TIMEOUT_MS: u64 = 5_000;
 /// record, so the user can retry; it must never spend the whole ack budget.
 ///
 /// A card PATCH is at-least-once, so a timeout can mean the write DID land.
-/// The stand-in card is not itself a durable promise: what persists is the
-/// dismissal record written only after the PATCH reports success, so a
-/// timed-out withdrawal is retried rather than read as delivered.
+/// The durable dismissal is written and checked BEFORE the PATCH (ADR-0103), so
+/// a timed-out card write leaves the form reopenable: a card that did not land
+/// stays live, and one that landed is terminal but already recorded dismissed.
 const DEFER_WITHDRAWAL_TIMEOUT_MS: u64 = 1_500;
 
 /// The budget for one standalone card send (`reply_card`/`send_card`). A card
@@ -455,6 +455,13 @@ const MAX_WITHDRAWAL_RETRIES_PER_SWEEP: usize = 4;
 /// lost).
 const MAX_PENDING_WITHDRAWALS: usize = 32;
 
+/// How many consecutive complete-sweep omissions a Location Form record
+/// tolerates before its decision is pruned. One transient omission (a listing
+/// that momentarily misses a still-pending form) must not end a 「稍后」; three
+/// is long enough to ride one out and short enough that a genuinely gone form's
+/// record does not leak (ADR-0103).
+pub(crate) const LOCATION_FORM_OMISSION_GRACE_SWEEPS: u32 = 3;
+
 /// Whether `value` is answer state cola may persist for a Location Form.
 ///
 /// A **multi-select** value is always persisted: its entries are deliberate
@@ -462,14 +469,17 @@ const MAX_PENDING_WITHDRAWALS: usize = 32;
 /// card renders as a checked chip and a confirm will submit). A `String`
 /// field stores only its clicked option values; a custom typed answer is
 /// free text and stays client-side. A numeric input is likewise typed text.
-/// A boolean is the fixed `"true"`/`"false"` button value.
+/// A boolean is the fixed `"true"`/`"false"` button value, and an external
+/// acknowledgement is the same fixed `"true"` — both are clicked button values,
+/// not text the Host typed.
 fn persisted_field_value(field: &crate::backend::types::QuestionInfo, value: &str) -> bool {
     use crate::backend::types::FormFieldKind;
     match field.kind {
-        FormFieldKind::Boolean => matches!(value, "true" | "false"),
+        FormFieldKind::Boolean => value == "true" || value == "false",
+        FormFieldKind::External => value == "true",
         FormFieldKind::Multiselect => true,
         FormFieldKind::String => field.options.iter().any(|option| option.answer_value() == value),
-        FormFieldKind::Number | FormFieldKind::Integer | FormFieldKind::External => false,
+        FormFieldKind::Number | FormFieldKind::Integer => false,
     }
 }
 
@@ -1603,9 +1613,23 @@ impl RequestFlow {
         // the Host's 「稍后」. An empty directory is not a mapped one and is
         // pruned with the request, so it cannot be retained forever.
         if self.kind.interaction_kind() == InteractionKind::Question && failed_dirs.is_empty() {
+            use crate::bridge::surfaces::LocationFormRetention;
             let pruned = self.surfaces.retain_location_forms(|id, record| {
-                pending.contains(id)
-                    || (!record.directory.is_empty() && !directories.contains(&record.directory))
+                if pending.contains(id) {
+                    record.missing_sweeps = 0;
+                    return LocationFormRetention::Keep;
+                }
+                if !record.directory.is_empty() && !directories.contains(&record.directory) {
+                    // The directory is no longer mapped, so this sweep cannot
+                    // speak for the form; neither count nor prune it.
+                    return LocationFormRetention::Keep;
+                }
+                record.missing_sweeps = record.missing_sweeps.saturating_add(1);
+                if record.missing_sweeps >= LOCATION_FORM_OMISSION_GRACE_SWEEPS {
+                    LocationFormRetention::Prune
+                } else {
+                    LocationFormRetention::Keep
+                }
             });
             // A dismissed form has NO standalone card, so this prune is the
             // only place that can reconcile its push-once `seen` entry. Left
