@@ -127,17 +127,21 @@ surface: a failed push write can cost one duplicate card after a restart, and a
 timed-out **send** may duplicate exactly as every standalone send can today.
 Neither is claimed atomic, and neither changes the dismissal ordering above.
 `/mcp` treats a dismissed record as reopenable **while cola lists the form
-pending**. The sweep suppresses a dismissed form only while that record exists:
-a complete sweep that no longer includes the form prunes the decision (the #130
-rule), and a later re-listing is a new request that may be delivered again. The
-dismissal is authoritative against a re-push while the listing carries the
-form, not a permanent tombstone.
+pending**. A transient complete-sweep omission does not end the dismissal: the
+record carries a `missing_sweeps` counter (serde-default, no format-version
+bump) that a listing resets and only a run of complete omissions advances; after
+`LOCATION_FORM_OMISSION_GRACE_SWEEPS` consecutive omissions it is pruned (the
+#130 rule), and a later re-listing is a new request that may be delivered again.
+The grace is bounded, so a genuinely gone form's record cannot leak. The
+dismissal is authoritative against a re-push while the listing carries the form
+or the omission is still inside that grace — not a permanent tombstone.
 
 **Partial answer state is persisted, and the recovered card is not repainted.**
 A Location Form's card-action state — each question's **clicked option wire
 values**, its **multi-select toggles** (including a custom entry the Host
-deliberately added and the card shows as a checked chip), whether the slot is
-final, plus the open question — is written into the same client-scoped record
+deliberately added and the card shows as a checked chip), an **external
+acknowledgement's fixed `true`**, whether the slot is final, plus the open
+question — is written into the same client-scoped record
 (`partial`, serde-default, no format-version bump) whenever a card action
 changes it. An unsubmitted draft, a single-select free-text answer and numeric
 input are not toggles and stay client-side (the card-repaints rule). A slot that
