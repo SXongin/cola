@@ -3885,13 +3885,23 @@ impl StreamAccumulator {
         let idx = self
             .timeline
             .partition_point(|item| item.key < key || (item.key == key && item.seq < seq));
-        let (idx, key) = if idx < self.render_from {
-            (
-                self.render_from,
-                self.timeline.get(self.render_from).map_or(key, |i| i.key),
-            )
+        let (idx, key, seq) = if idx < self.render_from {
+            let idx = self.render_from;
+            let key = self.timeline.get(idx).map_or(key, |item| item.key);
+            // The clamp puts the entry at the top of the live slice, which can
+            // land inside an equal-key run. Renumber it ahead of that run so
+            // the (key, seq) order the search above assumes still holds; the
+            // seq is a timeline position, never a fold identity (a tool's
+            // element is keyed by its call id).
+            let seq = self.timeline[idx..]
+                .iter()
+                .take_while(|item| item.key == key)
+                .map(|item| item.seq)
+                .min()
+                .map_or(seq, |first| first.saturating_sub(1));
+            (idx, key, seq)
         } else {
-            (idx, key)
+            (idx, key, seq)
         };
         self.item_seq = self.item_seq.max(seq);
         self.timeline.insert(
@@ -5573,6 +5583,20 @@ impl StreamAccumulator {
     /// the offset is counted once, never once per entry.
     pub(super) fn source_extent(&self, source: &PartSource) -> usize {
         self.source_extent_in(source, self.timeline.len())
+    }
+
+    /// The timeline key of the entry this accumulator already holds for
+    /// `source`, when it holds one. A part's key is fixed once it is placed: a
+    /// later read must not move it — a `Now` key or a borrowed floor can differ
+    /// between reads, and re-keying would split the part into two entries
+    /// (issue #1022).
+    fn entry_key_of(&self, source: &PartSource) -> Option<i64> {
+        self.timeline.iter().rev().find_map(|item| {
+            item.source
+                .as_ref()
+                .is_some_and(|item_source| item_source.same_part(source))
+                .then_some(item.key)
+        })
     }
 
     /// [`Self::source_extent`] over the timeline prefix `..end`: one body's
