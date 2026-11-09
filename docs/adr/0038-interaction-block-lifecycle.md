@@ -360,6 +360,14 @@ pending gap); synthetic content (receipts, wake markers) keeps `next_order()`,
 except the advisory-live opening line, which is keyed at the card head (`0`) so
 an older server position can never sort above it.
 
+**Known limit.** The borrow assumes cola's clock and the server's agree. Under
+skew, an untimed text in a message delivered *after* an Interaction Receipt can
+take a `time.created` below the receipt's `next_order()` key and sort above it;
+the pre-#1022 order (cola's clock for every untimed text) put it below. Closing
+that window needs a server-time anchor for the receipt — the request carries
+none — which is outside this ordering fix (#1023's surfacing work is the natural
+place to carry one).
+
 ## Amendment (2026-11-09): a dismissed Location Form is a deliberately surface-less pending request
 
 Rule 6 assumes a still-pending request has exactly one live surface, and re-posts
