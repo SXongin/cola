@@ -160,6 +160,42 @@ fn string_wire_value_location_form(request_id: &str) -> QuestionRequest {
     )
 }
 
+/// A Location Form with an external sign-in acknowledgement plus one remaining
+/// option: acknowledging the link leaves the request pending, so the persisted
+/// final slot can be checked across a restart.
+fn external_location_form(request_id: &str) -> QuestionRequest {
+    QuestionRequest::location(
+        request_id,
+        "登录服务".into(),
+        vec![
+            QuestionInfo {
+                key: "signin".into(),
+                question: "打开登录页".into(),
+                header: "登录".into(),
+                kind: FormFieldKind::External,
+                url: Some("https://example.com/oauth".into()),
+                ..Default::default()
+            },
+            QuestionInfo {
+                key: "choice".into(),
+                question: "是否继续？".into(),
+                header: "继续".into(),
+                kind: FormFieldKind::String,
+                options: vec![QuestionOption {
+                    value: "yes".into(),
+                    label: "继续".into(),
+                    description: String::new(),
+                }],
+                custom: Some(false),
+                ..Default::default()
+            },
+        ],
+        Some("context7".into()),
+        Some("请先登录".into()),
+        None,
+    )
+}
+
 /// A boolean Location Form: its buttons carry the literal `"true"`/`"false"`
 /// strings the persisted-value filter accepts.
 fn boolean_location_form(request_id: &str) -> QuestionRequest {
@@ -1001,6 +1037,69 @@ async fn a_restart_restores_a_partial_multi_select_before_confirm() {
         calls[0].1.as_ref().expect("answers")[0].value,
         Some(crate::backend::types::FormValue::List(vec!["staging".into()])),
         "the submitted answer is the selection the card showed"
+    );
+}
+
+/// An external acknowledgement is a fixed `"true"` final slot: after a restart
+/// the visible acknowledgement is still included when the Host submits the
+/// remaining (skipped) question.
+#[tokio::test]
+async fn an_external_acknowledgement_survives_restart_and_is_submitted() {
+    let fixture = fixture(
+        false,
+        &[("/work", external_location_form("frm_external_restart"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let ack = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "true")
+        .map(|button| button["value"].clone())
+        .expect("the external acknowledgement");
+    let result = fixture
+        .app
+        .host_action(ack)
+        .await
+        .expect("an acknowledgement result");
+    let card_after = result.card.expect("the remaining question's card");
+    let persisted =
+        persisted_location_form(&fixture.session_file(), "frm_external_restart").expect("the record");
+    assert_eq!(
+        persisted["partial"]["display"][0],
+        serde_json::json!(["true"]),
+        "the external acknowledgement is persisted as a final slot"
+    );
+    assert_eq!(persisted["partial"]["done"][0], true);
+
+    let session_file = fixture.session_file();
+    let (app, platform, backend) = restart_fixture(
+        &session_file,
+        &[("/work", external_location_form("frm_external_restart"))],
+    )
+    .await;
+    platform.given_card_view("msg_sent", serde_json::json!({ "body": { "elements": [] } }));
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+
+    let submit = button_with_reply(&card_after, "submit").expect("the skip/submit control");
+    let result = app.host_action(submit).await.expect("a submit result");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .is_some_and(|card| card_text(card).contains("已回答")),
+        "the submit settles the form"
+    );
+    let calls = backend.location_reply_calls.lock().await.clone();
+    assert_eq!(calls.len(), 1);
+    let answers = calls[0].1.as_ref().expect("answers");
+    assert_eq!(
+        answers[0].value,
+        Some(crate::backend::types::FormValue::Bool(true)),
+        "the visible external acknowledgement is in the submitted answers"
     );
 }
 
@@ -1973,13 +2072,16 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
         "the persisted dismissal suppresses the next sweep"
     );
 
-    // Gone, and this sweep lists every directory successfully: the record is
-    // pruned, and the prune must release the id from `seen`.
+    // Gone, and every one of these sweeps lists every directory successfully:
+    // the omission grace runs out, the record is pruned, and the prune must
+    // release the id from `seen`.
     fixture.backend.question_resolved_by_another("frm_prune").await;
-    sweep_with(&fixture, &mut seen).await;
+    for _ in 0..crate::bridge::request::flow::LOCATION_FORM_OMISSION_GRACE_SWEEPS {
+        sweep_with(&fixture, &mut seen).await;
+    }
     assert!(
         persisted_location_form(&fixture.session_file(), "frm_prune").is_none(),
-        "a complete sweep prunes the resolved form's record"
+        "consecutive complete sweeps prune the resolved form's record"
     );
 
     // The id is pending again with no dismissal left behind and no stale
@@ -1993,13 +2095,59 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
     );
 }
 
-/// Regression for the dismissed-record prune: a **complete sweep that
-/// transiently omits an upstream-still-pending form** prunes the dismissal, and
-/// the form's reappearance must post a card rather than be suppressed by the
-/// push-once `seen` entry (ADR-0103). This is an omission, not another client's
-/// resolution.
+/// A dismissed form survives a **transient** complete-sweep omission: the
+/// omission grace keeps the record (and `seen`) so the re-listed form stays
+/// withdrawn (ADR-0103). This is an omission, not another client's resolution.
 #[tokio::test]
-async fn a_dismissed_form_omitted_by_a_complete_sweep_is_repushed() {
+async fn a_transient_omission_keeps_a_dismissed_form_suppressed() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_transient_omission"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    let mut seen = std::collections::HashSet::new();
+    sweep_with(&fixture, &mut seen).await;
+    let card = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    fixture
+        .backend
+        .omit_question_from_list("frm_transient_omission")
+        .await;
+    sweep_with(&fixture, &mut seen).await;
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_transient_omission").is_some(),
+        "one complete-sweep omission does not prune the dismissal"
+    );
+    assert!(
+        fixture.backend.replied_questions.lock().await.is_empty(),
+        "the form was omitted, never resolved"
+    );
+
+    fixture
+        .backend
+        .restore_question_to_list("frm_transient_omission")
+        .await;
+    sweep_with(&fixture, &mut seen).await;
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_transient_omission").is_some(),
+        "the re-listed form's omission counter resets"
+    );
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        1,
+        "the still-dismissed form is not pushed again"
+    );
+}
+
+/// Only a run of complete-sweep omissions (the grace) ends a dismissal; the
+/// pruned id is released from `seen`, so a later re-listing is a new request
+/// and is pushed.
+#[tokio::test]
+async fn a_dismissed_form_pruned_after_the_omission_grace_is_repushed() {
     let fixture = fixture(
         false,
         &[("/work", location_form("frm_prune_reappear"))],
@@ -2009,27 +2157,20 @@ async fn a_dismissed_form_omitted_by_a_complete_sweep_is_repushed() {
     .await;
     let mut seen = std::collections::HashSet::new();
     sweep_with(&fixture, &mut seen).await;
-
-    // 「稍后」 leaves no standalone card, so only the record and `seen` remain.
     let card = posted_card(&fixture.platform).await;
     let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
     fixture.app.host_action(defer).await.expect("a click result");
 
-    // A complete sweep transiently omits it while it is still pending upstream
-    // (an omission, not a resolution): the dismissal is pruned and `seen` must
-    // release the id.
     fixture
         .backend
         .omit_question_from_list("frm_prune_reappear")
         .await;
-    sweep_with(&fixture, &mut seen).await;
+    for _ in 0..crate::bridge::request::flow::LOCATION_FORM_OMISSION_GRACE_SWEEPS {
+        sweep_with(&fixture, &mut seen).await;
+    }
     assert!(
         persisted_location_form(&fixture.session_file(), "frm_prune_reappear").is_none(),
-        "the complete sweep's omission pruned the dismissal"
-    );
-    assert!(
-        fixture.backend.replied_questions.lock().await.is_empty(),
-        "the form was omitted, never resolved"
+        "the omission grace ran out and pruned the dismissal"
     );
 
     fixture
@@ -2040,7 +2181,7 @@ async fn a_dismissed_form_omitted_by_a_complete_sweep_is_repushed() {
     assert_eq!(
         posted_cards(&fixture.platform).await.len(),
         2,
-        "the re-listed form is pushed despite the original push being in `seen`"
+        "the re-listed form is pushed after the pruned record released `seen`"
     );
 }
 
