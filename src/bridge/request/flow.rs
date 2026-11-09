@@ -147,6 +147,10 @@ pub struct RequestFlow {
     /// standalone card this flow sends is written through, and its persisted
     /// records seed [`Self::recovered`] at startup.
     pub(crate) surfaces: Arc<Surfaces>,
+    /// request_id → the per-form write lock a Location Form's 「稍后」 and its
+    /// reopen share (ADR-0103). They serialize their durable-state transitions
+    /// on it, so a dismissal cannot interleave with a reopen's commit.
+    location_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// request_id → owning directory of the surfaces a PREVIOUS process
     /// persisted (ADR-0038 restart re-adoption). The first sweep that lists
     /// such a request re-adopts its card instead of posting a second one; an
@@ -355,12 +359,10 @@ const WITHDRAWAL_PATCH_TIMEOUT_MS: u64 = 5_000;
 /// (a ~2 s ack budget) rather than the sweep. A timeout keeps the card and its
 /// record, so the user can retry; it must never spend the whole ack budget.
 ///
-/// KNOWN LIMIT (until #1019's dismissal record): a card PATCH is
-/// at-least-once, so a timeout can mean the write DID land. That leaves the
-/// withdrawn card tracked by a live sent-card/surface record — the opposite
-/// ambiguity from a missed write. Keeping the record is the conservative
-/// choice (a live card stays pinned and re-deferrable) and #1019's durable
-/// dismissal record is what resolves the ambiguity permanently.
+/// A card PATCH is at-least-once, so a timeout can mean the write DID land.
+/// The stand-in card is not itself a durable promise: what persists is the
+/// dismissal record written only after the PATCH reports success, so a
+/// timed-out withdrawal is retried rather than read as delivered.
 const DEFER_WITHDRAWAL_TIMEOUT_MS: u64 = 1_500;
 
 /// The budget for one standalone card send (`reply_card`/`send_card`). A card
@@ -398,10 +400,21 @@ impl RequestFlow {
         // re-adopt (both an inline block and a standalone card count).
         let state = surfaces.snapshot();
         let interaction_kind = kind.interaction_kind();
+        // A dismissed Location Form is a deliberately surface-less pending
+        // request (ADR-0038's 2026-11-09 amendment): its persisted decision is
+        // authoritative, so neither its card nor its recovery belongs in this
+        // process's state. The push decision reads the same record and will not
+        // re-post it.
+        let dismissed: std::collections::HashSet<&str> = state
+            .location_forms
+            .iter()
+            .filter(|(_, record)| record.dismissed)
+            .map(|(id, _)| id.as_str())
+            .collect();
         let sent_cards: HashMap<String, SentCard> = state
             .standalone
             .iter()
-            .filter(|(_, s)| s.kind == interaction_kind)
+            .filter(|(id, s)| s.kind == interaction_kind && !dismissed.contains(id.as_str()))
             .map(|(id, s)| {
                 (
                     id.clone(),
@@ -423,7 +436,7 @@ impl RequestFlow {
                 state
                     .standalone
                     .iter()
-                    .filter(|(_, s)| s.kind == interaction_kind)
+                    .filter(|(id, s)| s.kind == interaction_kind && !dismissed.contains(id.as_str()))
                     .map(|(id, s)| (id.clone(), s.directory.clone())),
             )
             .collect();
@@ -451,6 +464,7 @@ impl RequestFlow {
                 crate::bridge::failure_latch::FailureLatch::default(),
             )),
             surfaces,
+            location_locks: Arc::new(Mutex::new(HashMap::new())),
             recovered: Arc::new(Mutex::new(recovered)),
             session_less: Arc::new(Mutex::new(HashMap::new())),
             pending_withdrawals: Arc::new(Mutex::new(HashMap::new())),
@@ -624,17 +638,24 @@ impl RequestFlow {
 
     /// Withdraw a request's standalone card **without settling it**: the
     /// Location Form 「稍后」 control. The replacement card is PATCHed first,
-    /// and only a landed write clears the sent-card registry and the persisted
-    /// surface record — so a failed or timed-out withdrawal leaves both in
-    /// place instead of leaving a clickable card with no record behind it.
-    /// Returns whether the withdrawal landed (or there was no card to patch).
-    /// The in-flight state stays: the form is still pending.
+    /// then the durable dismissal and the forgotten standalone surface are one
+    /// mutation — so a failed or timed-out withdrawal leaves both in place
+    /// instead of leaving a clickable card with no record behind it.
+    ///
+    /// The per-form write lock serializes this with a reopen (ADR-0103): a
+    /// reopen reads the dismissal generation under the lock, sends outside it,
+    /// and clears only that generation, so a dismissal that lands during the
+    /// send survives. Returns whether the withdrawal landed (or there was no
+    /// card to patch). The in-flight state stays: the form is still pending.
     pub(crate) async fn defer_standalone_surface(
         &self,
         handles: &FlowHandles,
         req_id: &str,
+        directory: &str,
         replacement: &serde_json::Value,
     ) -> bool {
+        let lock = self.location_form_lock(req_id).await;
+        let _guard = lock.lock().await;
         let sent = self.sent_cards.lock().await.get(req_id).cloned();
         if let Some(sent) = sent {
             // A card callback has a ~2 s ack budget: leave it room, while still
@@ -672,8 +693,20 @@ impl RequestFlow {
             }
         }
         self.sent_cards.lock().await.remove(req_id);
-        self.surfaces.remove_standalone(req_id);
+        // Durable dismissal and surface removal share one mutation, so a
+        // restart cannot see a withdrawn card still marked pushed (ADR-0103).
+        self.surfaces.dismiss_location_form(req_id, directory);
         true
+    }
+
+    /// The per-form write lock a Location Form's 「稍后」 and reopen share.
+    async fn location_form_lock(&self, req_id: &str) -> Arc<Mutex<()>> {
+        self.location_locks
+            .lock()
+            .await
+            .entry(req_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// The remembered questions and their current answers, captured for the
@@ -1393,6 +1426,16 @@ impl RequestFlow {
             .lock()
             .await
             .retain(|id, dir| pending.contains(id) || failed_dirs.contains(dir));
+        // ADR-0103: a Location Form's push/dismissal record is pruned only when
+        // every mapped directory listed, so a failed list never reads the form
+        // as gone. A record whose directory is no longer mapped is retained
+        // too: the directory may return still holding the suppressed form, and
+        // a re-push would undo the Host's 「稍后」.
+        if failed_dirs.is_empty() {
+            self.surfaces.retain_location_forms(|id, record| {
+                pending.contains(id) || !directories.contains(&record.directory)
+            });
+        }
         // #489: the same rule for the session-less registry — a request that
         // left the pending list, or a directory that said nothing, keeps its
         // entry until a complete sweep can speak for it.
@@ -1847,16 +1890,54 @@ impl RequestFlow {
         dir: &str,
         seen: &mut std::collections::HashSet<String>,
     ) -> bool {
-        // Push-once: the poll loop's `seen` survives its sweeps, and the sent
-        // card registry survives a fresh `seen` (tests, and a restart whose
-        // recovered record was already re-adopted).
+        // Push-once: the poll loop's `seen` survives its sweeps, the sent-card
+        // registry survives a fresh `seen` (tests), and the durable record
+        // survives a restart. A dismissed form is deliberately surface-less
+        // (ADR-0038's 2026-11-09 amendment): its persisted decision is
+        // authoritative, so no sweep re-posts it.
         if seen.contains(req.id()) || self.sent_cards.lock().await.contains_key(req.id()) {
             return false;
         }
-        // Bound the target walk like every other sweep read: it reaches
-        // Feishu's `list_messages` (a topic's anchor fallback) and a half-open
-        // call must not wedge the whole request sweep. A timeout is UNKNOWN,
-        // so the push is deferred and retried next sweep.
+        if self
+            .surfaces
+            .location_form(req.id())
+            .is_some_and(|record| record.pushed || record.dismissed)
+        {
+            return false;
+        }
+        let Some(target) = self.resolve_location_target(handles, req, dir).await else {
+            return false;
+        };
+        let card = self.kind.build_card(self, req, dir);
+        let summary = self.kind.summary(self, req);
+        if self
+            .send_standalone_surface(handles, req, dir, Some(target), &card, &summary)
+            .await
+        {
+            tracing::info!(
+                "{} ({}): {} delivered as a directory-owned form card",
+                self.kind.label(),
+                dir,
+                req.id()
+            );
+            seen.insert(req.id().to_string());
+        }
+        false
+    }
+
+    /// Resolve a Location Form's delivery target, bounded like every sweep
+    /// read. `None` means "send nothing and suppress nothing": no mapped
+    /// Chat/Topic, an unresolved topic anchor, or an unknown walk result all
+    /// retry next sweep.
+    async fn resolve_location_target(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> Option<CardTarget> {
+        // The walk reaches Feishu's `list_messages` (a topic's anchor fallback)
+        // and a half-open call must not wedge the whole request sweep. A
+        // timeout is UNKNOWN, so the push is deferred and retried next sweep.
         let timeout_ms = self.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
         let walk_condition = format!("{} location target", self.kind.label());
         let resolved = crate::bridge::bounded_call(
@@ -1876,14 +1957,14 @@ impl RequestFlow {
                 "",
                 format!("timed out after {timeout_ms}ms"),
             );
-            return false;
+            return None;
         };
         self.target_walk_failures
             .lock()
             .await
             .succeeded(dir, &walk_condition);
-        let target = match resolved {
-            Ok(LocationTarget::Target(target)) => target,
+        match resolved {
+            Ok(LocationTarget::Target(target)) => Some(target),
             Ok(LocationTarget::NoMapping) => {
                 tracing::debug!(
                     "{} {}: directory {} has no mapped Chat/Topic; nothing sent",
@@ -1891,7 +1972,7 @@ impl RequestFlow {
                     req.id(),
                     dir
                 );
-                return false;
+                None
             }
             Ok(LocationTarget::Deferred) => {
                 tracing::debug!(
@@ -1900,7 +1981,7 @@ impl RequestFlow {
                     req.id(),
                     dir
                 );
-                return false;
+                None
             }
             Err(e) => {
                 // The target walk only reports Ok today; a future failure is
@@ -1911,24 +1992,112 @@ impl RequestFlow {
                     req.id(),
                     e
                 );
-                return false;
+                None
             }
+        }
+    }
+
+    /// Reopen a dismissed Location Form: send the fresh card **first**, then
+    /// clear the dismissal and record the new standalone surface in one
+    /// mutation. A failed send leaves the form dismissed and retryable, so the
+    /// two records cannot disagree.
+    ///
+    /// The dismissal generation is read under the per-form write lock (shared
+    /// with 「稍后」) and released for the send; the commit clears only that
+    /// generation, so a dismissal that lands during the send survives. The
+    /// fresh card is withdrawn again in that race. `/mcp` (#1018) is the
+    /// caller; the command itself is not part of this seam, so until it lands
+    /// this method has no production caller.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn reopen_location_form(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> bool {
+        if !req.is_location() {
+            return false;
+        }
+        let id = req.id();
+        let lock = self.location_form_lock(id).await;
+        // Read the generation this reopen may clear, under the lock. The send
+        // happens outside it: a network call must not serialize every
+        // 「稍后」 click behind it, and the generation check is what makes that
+        // safe.
+        let generation = {
+            let _guard = lock.lock().await;
+            match self.surfaces.location_form(id) {
+                Some(record) if record.dismissed => record.dismissal_generation,
+                _ => return false,
+            }
+        };
+        let Some(target) = self.resolve_location_target(handles, req, dir).await else {
+            return false;
         };
         let card = self.kind.build_card(self, req, dir);
         let summary = self.kind.summary(self, req);
-        if self
-            .send_standalone_surface(handles, req, dir, Some(target), &card, &summary)
-            .await
-        {
-            tracing::info!(
-                "{} ({}): {} delivered as a directory-owned form card",
+        let Some(message_id) = self.send_standalone_card(handles, req, Some(target), &card).await else {
+            tracing::warn!(
+                "{} {}: reopen send failed; the form stays dismissed and retryable",
                 self.kind.label(),
-                dir,
-                req.id()
+                id
             );
-            seen.insert(req.id().to_string());
+            return false;
+        };
+        let surface = StandaloneSurface {
+            client_id: String::new(),
+            kind: self.kind.interaction_kind(),
+            message_id: message_id.clone(),
+            summary: summary.clone(),
+            directory: dir.to_string(),
+            session_id: req.session_id().to_string(),
+        };
+        let cleared = {
+            let _guard = lock.lock().await;
+            self.surfaces
+                .clear_location_form_dismissal(id, generation, surface)
+        };
+        if !cleared {
+            tracing::info!(
+                "{} {}: a dismissal landed during the reopen; withdrawing the fresh card",
+                self.kind.label(),
+                id
+            );
+            if let PendingRequest::Question(q) = req {
+                let deferred = crate::feishu::card::question::build_location_form_deferred_card(
+                    q.server.as_deref(),
+                    q.message.as_deref(),
+                );
+                let timeout_ms = self
+                    .withdrawal_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .min(DEFER_WITHDRAWAL_TIMEOUT_MS);
+                let _ = crate::bridge::bounded_call(
+                    &format!("{} {} reopen withdrawal", self.kind.label(), id),
+                    timeout_ms,
+                    handles.platform.update_message(&message_id, &deferred),
+                )
+                .await;
+            }
+            return false;
         }
-        false
+        self.sent_cards.lock().await.insert(
+            id.to_string(),
+            SentCard {
+                message_id,
+                summary,
+                directory: dir.to_string(),
+                session_id: req.session_id().to_string(),
+            },
+        );
+        self.kind.remember_surfaced(self, req, dir).await;
+        tracing::info!(
+            "{} ({}): {} reopened as a fresh directory-owned form card",
+            self.kind.label(),
+            dir,
+            id
+        );
+        true
     }
 
     /// Test-only: drive the Location Form push decision for one request
@@ -2018,18 +2187,22 @@ impl RequestFlow {
             },
         );
         // Persist the standalone surface so a restart re-adopts it instead of
-        // posting a second card (ADR-0038 restart re-adoption).
-        self.surfaces.set_standalone(
-            req.id(),
-            StandaloneSurface {
-                client_id: String::new(),
-                kind: self.kind.interaction_kind(),
-                message_id,
-                summary: summary.to_string(),
-                directory: dir.to_string(),
-                session_id: req.session_id().to_string(),
-            },
-        );
+        // posting a second card (ADR-0038 restart re-adoption). A Location Form
+        // writes its push decision and the surface in ONE mutation, so a
+        // restart cannot see one without the other (ADR-0103).
+        let surface = StandaloneSurface {
+            client_id: String::new(),
+            kind: self.kind.interaction_kind(),
+            message_id,
+            summary: summary.to_string(),
+            directory: dir.to_string(),
+            session_id: req.session_id().to_string(),
+        };
+        if req.is_location() {
+            self.surfaces.set_location_form_pushed(req.id(), surface, dir);
+        } else {
+            self.surfaces.set_standalone(req.id(), surface);
+        }
     }
 
     /// Send and record one standalone request card. The caller holds the
@@ -2758,6 +2931,18 @@ impl RequestFlow {
         dir: &str,
     ) -> ReadoptDecision {
         let id = req.id();
+        // A dismissed Location Form must not be re-adopted: its persisted
+        // decision is authoritative and the card is deliberately withdrawn
+        // (ADR-0038's 2026-11-09 amendment). The push decision below also
+        // refuses it; this guard keeps the re-adoption path from repainting a
+        // card whose record says it is gone.
+        if self
+            .surfaces
+            .location_form(id)
+            .is_some_and(|record| record.dismissed)
+        {
+            return ReadoptDecision::NotAdopted;
+        }
         if let PendingRequest::Permission(p) = req
             && permission_overflow(p).is_some()
         {

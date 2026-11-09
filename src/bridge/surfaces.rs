@@ -134,6 +134,36 @@ pub struct StandaloneSurface {
     pub session_id: String,
 }
 
+/// The durable push/dismissal decision for a directory-owned **Location Form**
+/// (ADR-0103). A restart must remember both decisions so it neither re-pushes a
+/// form the Host deferred nor duplicates a live card. This record and the
+/// [`StandaloneSurface`] it describes are written in **one** mutation, so a
+/// restart cannot see one without the other.
+///
+/// The section is `#[serde(default)]` and its fields are too: an
+/// `interactive_surfaces.json` written before this record existed loads with
+/// empty suppression and needs no format-version bump (ADR-0091).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocationFormRecord {
+    /// The directory that owns the form. A sweep can speak for a request only
+    /// while that directory is still mapped and listed, so an unmapped
+    /// directory's record is retained instead of pruned.
+    #[serde(default)]
+    pub directory: String,
+    /// A standalone card was delivered and has not been dismissed.
+    #[serde(default)]
+    pub pushed: bool,
+    /// 「稍后」 withdrew the card. The form stays pending but must not be
+    /// pushed again until a reopen clears this.
+    #[serde(default)]
+    pub dismissed: bool,
+    /// Monotonic dismissal generation. A reopen reads it before sending and
+    /// clears the dismissal only if it is unchanged afterwards, so a dismissal
+    /// that lands during the send survives.
+    #[serde(default)]
+    pub dismissal_generation: u64,
+}
+
 /// One active client's view of the persisted record — what the startup
 /// hydration reads. The file itself is [`SurfaceFile`], scoped by client.
 #[derive(Debug, Default, Clone)]
@@ -144,12 +174,17 @@ pub struct SurfaceState {
     pub cards: HashMap<String, CachedSurface>,
     /// request_id → the standalone card sent for it.
     pub standalone: HashMap<String, StandaloneSurface>,
+    /// request_id → the durable push/dismissal decision for a Location Form.
+    pub location_forms: HashMap<String, LocationFormRecord>,
 }
 
 impl SurfaceState {
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.inline.is_empty() && self.cards.is_empty() && self.standalone.is_empty()
+        self.inline.is_empty()
+            && self.cards.is_empty()
+            && self.standalone.is_empty()
+            && self.location_forms.is_empty()
     }
 }
 
@@ -167,6 +202,8 @@ struct SurfaceFile {
     standalone: ClientScoped<StandaloneSurface>,
     #[serde(default)]
     companion: ClientScoped<CompanionDelivery>,
+    #[serde(default)]
+    location_forms: ClientScoped<LocationFormRecord>,
 }
 
 impl SurfaceFile {
@@ -175,6 +212,7 @@ impl SurfaceFile {
             && self.cards.is_empty()
             && self.standalone.is_empty()
             && self.companion.is_empty()
+            && self.location_forms.is_empty()
     }
 
     /// This client's maps, flattened for the startup hydration.
@@ -194,6 +232,11 @@ impl SurfaceFile {
                 .standalone
                 .iter_client(client)
                 .map(|(id, surface)| (id.clone(), surface.clone()))
+                .collect(),
+            location_forms: self
+                .location_forms
+                .iter_client(client)
+                .map(|(id, record)| (id.clone(), record.clone()))
                 .collect(),
         }
     }
@@ -271,6 +314,7 @@ impl Surfaces {
                         cards: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, file.cards),
                         standalone: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, standalone),
                         companion: ClientScoped::default(),
+                        location_forms: ClientScoped::default(),
                     }
                 }
                 Err(error) => {
@@ -403,6 +447,108 @@ impl Surfaces {
         self.mutate(|state| state.standalone.remove(&self.client_id, request_id).is_some());
     }
 
+    /// This client's durable push/dismissal decision for `request_id`.
+    pub fn location_form(&self, request_id: &str) -> Option<LocationFormRecord> {
+        self.lock()
+            .location_forms
+            .get(&self.client_id, request_id)
+            .cloned()
+    }
+
+    /// Record that a Location Form's card was pushed: the standalone surface
+    /// and the `pushed` decision land in **one** mutation (ADR-0103), so a
+    /// restart never sees one without the other.
+    pub fn set_location_form_pushed(
+        &self,
+        request_id: &str,
+        mut surface: StandaloneSurface,
+        directory: &str,
+    ) {
+        surface.client_id = self.client_id.clone();
+        self.mutate(|state| {
+            let mut record = state
+                .location_forms
+                .get(&self.client_id, request_id)
+                .cloned()
+                .unwrap_or_default();
+            record.directory = directory.to_string();
+            record.pushed = true;
+            record.dismissed = false;
+            state.location_forms.insert(&self.client_id, request_id, record);
+            state.standalone.insert(&self.client_id, request_id, surface);
+            true
+        });
+    }
+
+    /// Record a 「稍后」 dismissal and forget the withdrawn standalone card in
+    /// one mutation. The form stays pending; the persisted dismissal is what
+    /// stops a later sweep (or a restart) from pushing it again.
+    pub fn dismiss_location_form(&self, request_id: &str, directory: &str) {
+        self.mutate(|state| {
+            let mut record = state
+                .location_forms
+                .get(&self.client_id, request_id)
+                .cloned()
+                .unwrap_or_default();
+            if !directory.is_empty() {
+                record.directory = directory.to_string();
+            }
+            record.pushed = true;
+            record.dismissed = true;
+            record.dismissal_generation = record.dismissal_generation.wrapping_add(1);
+            state.location_forms.insert(&self.client_id, request_id, record);
+            state.standalone.remove(&self.client_id, request_id);
+            true
+        });
+    }
+
+    /// Clear the dismissal a reopen read before sending, and record the fresh
+    /// standalone card in the same mutation. Returns whether it cleared: a
+    /// dismissal recorded after `generation` was read (a 「稍后」 that landed
+    /// during the send) leaves the record dismissed and returns `false`.
+    pub fn clear_location_form_dismissal(
+        &self,
+        request_id: &str,
+        generation: u64,
+        mut surface: StandaloneSurface,
+    ) -> bool {
+        surface.client_id = self.client_id.clone();
+        let mut cleared = false;
+        self.mutate(|state| {
+            let Some(mut record) = state.location_forms.get(&self.client_id, request_id).cloned() else {
+                return false;
+            };
+            if !record.dismissed || record.dismissal_generation != generation {
+                return false;
+            }
+            record.dismissed = false;
+            record.pushed = true;
+            state.location_forms.insert(&self.client_id, request_id, record);
+            state.standalone.insert(&self.client_id, request_id, surface);
+            cleared = true;
+            true
+        });
+        cleared
+    }
+
+    /// Forget every Location Form record `keep` does not name. The sweep calls
+    /// this only when every mapped directory listed successfully, so "not
+    /// pending" really means the request resolved (#130).
+    pub fn retain_location_forms(&self, keep: impl Fn(&str, &LocationFormRecord) -> bool) {
+        self.mutate(|state| {
+            let stale: Vec<String> = state
+                .location_forms
+                .iter_client(&self.client_id)
+                .filter(|(id, record)| !keep(id, record))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &stale {
+                state.location_forms.remove(&self.client_id, id);
+            }
+            !stale.is_empty()
+        });
+    }
+
     /// Record the companion message that delivered `request_id`'s full target.
     /// Written only after the send landed, so the record is never a promise
     /// (ADR-0102).
@@ -499,6 +645,17 @@ mod tests {
             session_id: "ses_1".into(),
             directory: "/work".into(),
             target: "⚡ 执行 Shell 命令 `ls`".into(),
+        }
+    }
+
+    fn standalone(message_id: &str) -> StandaloneSurface {
+        StandaloneSurface {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            kind: InteractionKind::Question,
+            message_id: message_id.into(),
+            summary: "Context7 登录".into(),
+            directory: "/work".into(),
+            session_id: String::new(),
         }
     }
 
@@ -662,5 +819,81 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let _ = Surfaces::open(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
         assert_eq!(before, std::fs::read(&path).unwrap(), "the repair lands once");
+    }
+
+    /// ADR-0103: the push decision and its standalone surface are one record;
+    /// a dismissal withdraws the surface but keeps the decision, and the two
+    /// survive a reload.
+    #[test]
+    fn location_form_push_and_dismissal_round_trip_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interactive_surfaces.json");
+        {
+            let surfaces = Surfaces::load(path.clone());
+            surfaces.set_location_form_pushed("frm_1", standalone("om_card"), "/work");
+            let record = surfaces.location_form("frm_1").expect("a pushed record");
+            assert!(record.pushed && !record.dismissed);
+            assert_eq!(
+                surfaces.snapshot().standalone.get("frm_1").unwrap().message_id,
+                "om_card"
+            );
+            surfaces.dismiss_location_form("frm_1", "/work");
+        }
+
+        let surfaces = Surfaces::load(path);
+        let record = surfaces.location_form("frm_1").expect("the dismissal persisted");
+        assert!(record.pushed && record.dismissed);
+        assert_eq!(record.dismissal_generation, 1);
+        assert!(
+            !surfaces.snapshot().standalone.contains_key("frm_1"),
+            "the withdrawn surface is forgotten in the same mutation"
+        );
+    }
+
+    /// A reopen clears only the dismissal generation it read: a later dismissal
+    /// leaves the record dismissed and the fresh surface unwritten.
+    #[test]
+    fn a_reopen_clears_only_the_generation_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interactive_surfaces.json");
+        let surfaces = Surfaces::load(path);
+        surfaces.dismiss_location_form("frm_1", "/work");
+        let generation = surfaces.location_form("frm_1").unwrap().dismissal_generation;
+
+        // A dismissal lands between the read and the commit.
+        surfaces.dismiss_location_form("frm_1", "/work");
+        assert!(
+            !surfaces.clear_location_form_dismissal("frm_1", generation, standalone("om_new")),
+            "a newer dismissal survives the reopen"
+        );
+        assert!(surfaces.location_form("frm_1").unwrap().dismissed);
+        assert!(
+            !surfaces.snapshot().standalone.contains_key("frm_1"),
+            "no surface is recorded for a reopen that lost the race"
+        );
+
+        let current = surfaces.location_form("frm_1").unwrap().dismissal_generation;
+        assert!(surfaces.clear_location_form_dismissal("frm_1", current, standalone("om_new")));
+        assert!(!surfaces.location_form("frm_1").unwrap().dismissed);
+    }
+
+    /// An older file has no `location_forms` section: it loads with empty
+    /// suppression and no format-version bump is needed.
+    #[test]
+    fn an_older_file_without_the_location_form_section_loads_empty_suppression() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interactive_surfaces.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{},"inline":{{}},"cards":{{}},"standalone":{{}}}}"#,
+                crate::state::STATE_FORMAT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let surfaces = Surfaces::open(path, crate::config::DEFAULT_CLIENT_ID).unwrap();
+        assert!(surfaces.snapshot().location_forms.is_empty());
+        assert!(surfaces.location_form("frm_1").is_none());
     }
 }

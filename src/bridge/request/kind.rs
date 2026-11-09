@@ -2496,9 +2496,9 @@ impl RequestKind for QuestionKind {
             }
             // 「稍后」: withdraw the card WITHOUT declining (ADR-0103). The form
             // stays pending; only the explicit 「取消」 reject settles it. No
-            // timer ever auto-declines. In-process only: a later sweep does not
-            // re-push while `seen` remembers the request (durable dismissal is
-            // #1019).
+            // timer ever auto-declines. The dismissal is persisted, so a later
+            // sweep or a restart does not push the card again until a reopen
+            // clears it.
             "defer" => {
                 if !location_form {
                     return None;
@@ -2542,8 +2542,11 @@ impl RequestKind for QuestionKind {
                     req.message.as_deref(),
                 );
                 // The replacement card is PATCHed BEFORE the records go, so a
-                // failed withdrawal keeps the card and its record in step.
-                let withdrawn = flow.defer_standalone_surface(handles, req_id, &card).await;
+                // failed withdrawal keeps the card and its record in step. The
+                // durable dismissal makes 「稍后」 survive a restart (ADR-0103).
+                let withdrawn = flow
+                    .defer_standalone_surface(handles, req_id, directory.unwrap_or(""), &card)
+                    .await;
                 // A defer is not an answer: release the claim so a reopened
                 // (or still-clickable) card can answer later.
                 flow.unmark_answered(&handles.requests, req_id).await;
