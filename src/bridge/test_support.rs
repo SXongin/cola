@@ -1799,6 +1799,11 @@ pub struct MockBackend {
     /// request. A test simulating resolution by ANOTHER client inserts the id
     /// here directly.
     pub replied_questions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Question ids a **complete, successful** listing transiently omits
+    /// without resolving them. Reversible, so a test can model a form that is
+    /// still pending upstream but absent from one sweep's list (ADR-0103's
+    /// prune rule) rather than a form another client resolved.
+    pub omitted_questions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// When set, `prompt` fails with this message (simulates a provider 503).
     pub prompt_error: Option<String>,
     /// Number of initial `prompt` calls to fail (for testing retry-after-error).
@@ -2241,6 +2246,7 @@ impl MockBackend {
             location_form_retryable_404: std::sync::atomic::AtomicBool::new(false),
             location_form_settled: std::sync::atomic::AtomicBool::new(false),
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            omitted_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_interrupt_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -2881,6 +2887,22 @@ impl MockBackend {
             .lock()
             .await
             .insert(question_id.to_string());
+    }
+
+    /// Scenario: one complete listing transiently omits `question_id` while the
+    /// request is still pending upstream. Reversible with
+    /// [`Self::restore_question_to_list`], so this models a sweep omission
+    /// rather than another client's resolution.
+    pub(crate) async fn omit_question_from_list(&self, question_id: &str) {
+        self.omitted_questions
+            .lock()
+            .await
+            .insert(question_id.to_string());
+    }
+
+    /// Scenario: the next listing includes `question_id` again.
+    pub(crate) async fn restore_question_to_list(&self, question_id: &str) {
+        self.omitted_questions.lock().await.remove(question_id);
     }
 
     /// Scenario: the external message's server timestamp (captured on first
@@ -3841,6 +3863,7 @@ impl crate::backend::Backend for MockBackend {
             ));
         }
         let replied = self.replied_questions.lock().await;
+        let omitted = self.omitted_questions.lock().await;
         // The real V2 read is location-scoped: a directory with its own
         // script sees only those forms, so a shared-connection test can prove
         // each holder is listed separately. A directory without one keeps the
@@ -3849,7 +3872,10 @@ impl crate::backend::Backend for MockBackend {
             Some(forms) => forms.clone(),
             None => self.questions.clone(),
         };
-        Ok(source.into_iter().filter(|q| !replied.contains(&q.id)).collect())
+        Ok(source
+            .into_iter()
+            .filter(|q| !replied.contains(&q.id) && !omitted.contains(&q.id))
+            .collect())
     }
 
     async fn mcp_server_statuses(
