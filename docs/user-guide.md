@@ -588,6 +588,13 @@ to **every** elicitation form, session-backed or directory-owned — so the card
 shows the secret-input reason and offers only a decline. A session-backed form
 without such a field keeps its ordinary Question card.
 
+Push and dismissal decisions survive a cola restart. A restart re-adopts a card
+that is still live instead of posting a second one; a form you deferred with
+**稍后** stays withdrawn — it is not pushed again — until you reopen it. A form
+that has left the pending list loses its record, while a directory whose listing
+failed is never treated as gone, so a directory that recovers does not re-push a
+form you already deferred.
+
 A reply that fails because the form is gone (404) is **retryable**: the card
 and its record stay, and cola tells you the answer did not land. Only a later
 sweep that no longer lists the form withdraws the card. A form already settled
