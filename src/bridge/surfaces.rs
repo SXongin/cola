@@ -172,10 +172,11 @@ pub struct LocationFormRecord {
 }
 
 /// The partial answer state a Location Form's card displays. It persists the
-/// paint's selections, final markers and open question (never unsubmitted
-/// drafts, which stay client-side); a restart restores it into `QuestionState`
-/// without repainting the live card, so the card's visible selections and the
-/// next confirm/submit agree (ADR-0103).
+/// paint's clicked option values, final markers and open question; text the
+/// Host typed (drafts, custom answers, numeric input) stays client-side. A
+/// restart restores it into `QuestionState` without repainting the live card,
+/// so the card's visible clicked selections and the next confirm/submit agree
+/// (ADR-0103).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LocationFormPartial {
     /// `Some(values)` for a question's displayed selection (final or live),
@@ -192,13 +193,14 @@ pub struct LocationFormPartial {
 }
 
 impl LocationFormPartial {
-    /// Whether the card shows nothing worth persisting: no selection and the
-    /// first question open. A fresh Location Form never writes a partial
-    /// entry, and clearing every selection clears it again. Unsubmitted typed
-    /// text is deliberately absent: it stays client-side (ADR-0038's
-    /// card-repaints rule) and the form submit carries it when it lands.
+    /// Whether the card shows nothing worth persisting: no selected or final
+    /// slot and the first question open. A fresh Location Form never writes a
+    /// partial entry, and clearing every selection clears it again.
+    /// Unsubmitted typed text is deliberately absent: it stays client-side
+    /// (ADR-0038's card-repaints rule) and the form submit carries it when it
+    /// lands.
     pub(crate) fn is_empty(&self) -> bool {
-        self.open == 0 && self.display.iter().all(Option::is_none)
+        self.open == 0 && self.display.iter().all(Option::is_none) && self.done.iter().all(|done| !done)
     }
 }
 
@@ -656,22 +658,27 @@ impl Surfaces {
         });
     }
 
-    /// Forget every Location Form record `keep` does not name. The sweep calls
-    /// this only when every mapped directory listed successfully, so "not
-    /// pending" really means the request resolved (#130).
-    pub fn retain_location_forms(&self, keep: impl Fn(&str, &LocationFormRecord) -> bool) {
-        self.mutate(|state| {
-            let stale: Vec<String> = state
-                .location_forms
-                .iter_client(&self.client_id)
-                .filter(|(id, record)| !keep(id, record))
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in &stale {
-                state.location_forms.remove(&self.client_id, id);
-            }
-            !stale.is_empty()
-        });
+    /// Forget every Location Form record `keep` does not name, returning the
+    /// ids it removed. The sweep calls this only when every mapped directory
+    /// listed successfully, so "not pending" really means the request resolved
+    /// (#130). A dismissed form has no standalone card; the caller must forget
+    /// these ids in its push-once `seen` set too, or a form that is listed
+    /// again could never be pushed (ADR-0103).
+    pub fn retain_location_forms(&self, keep: impl Fn(&str, &LocationFormRecord) -> bool) -> Vec<String> {
+        let mut state = self.lock();
+        let stale: Vec<String> = state
+            .location_forms
+            .iter_client(&self.client_id)
+            .filter(|(id, record)| !keep(id, record))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            state.location_forms.remove(&self.client_id, id);
+        }
+        if !stale.is_empty() {
+            self.persist(&state);
+        }
+        stale
     }
 
     /// Record the companion message that delivered `request_id`'s full target.
