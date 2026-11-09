@@ -172,6 +172,25 @@ impl MessagePins {
         }
     }
 
+    /// Release one request's pin immediately — the Location Form 「稍后」
+    /// control withdraws its card without settling the form, so the next
+    /// sweep's `sync` would only see the wait it no longer surfaces. A failed
+    /// unpin keeps the hold so a later sweep retries (best-effort, ADR-0043).
+    pub(crate) async fn release(&self, feishu: &Arc<dyn Platform>, request_id: &str) {
+        if !self.enabled {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        let Some(message_id) = inner
+            .by_request
+            .get(request_id)
+            .map(|pinned| pinned.message_id.clone())
+        else {
+            return;
+        };
+        Self::release_locked(&mut inner, feishu, request_id, &message_id).await;
+    }
+
     /// Drop one request's hold on its card; the card is unpinned once no
     /// request relies on it any more. A failed unpin restores the hold so a
     /// later sweep retries instead of leaking the pin.

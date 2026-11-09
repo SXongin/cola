@@ -1315,6 +1315,7 @@ fn question_from_tool_input(input: &ToolInput) -> std::result::Result<QuestionRe
                 custom: Some(question.is_other || question.options.as_deref().is_none_or(|o| o.is_empty())),
                 required: false,
                 url: None,
+                secret: false,
             }
         })
         .collect();
@@ -1325,6 +1326,9 @@ fn question_from_tool_input(input: &ToolInput) -> std::result::Result<QuestionRe
         title: String::new(),
         questions,
         uncollectable: None,
+        owner: crate::backend::types::RequestOwner::Session,
+        server: None,
+        message: None,
     })
 }
 
@@ -1368,6 +1372,10 @@ fn question_from_elicitation(elicitation: &Elicitation) -> Option<QuestionReques
         },
         questions,
         uncollectable: None,
+        // Codex elicitations are thread-backed: they keep the session path.
+        owner: crate::backend::types::RequestOwner::Session,
+        server: None,
+        message: None,
     })
 }
 
@@ -1411,6 +1419,7 @@ fn elicitation_field(name: &str, field: &Value, required: bool) -> Option<Questi
         custom: Some(custom),
         required,
         url: None,
+        secret: false,
     })
 }
 
@@ -1620,6 +1629,7 @@ mod tests {
                     ..Default::default()
                 }],
                 uncollectable: None,
+                ..Default::default()
             }),
             replying: None,
         }
@@ -2334,6 +2344,7 @@ mod tests {
                 ..Default::default()
             }],
             uncollectable: None,
+            ..Default::default()
         };
         let pending = Pending {
             id: json!(1),

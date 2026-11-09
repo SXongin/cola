@@ -293,6 +293,49 @@ pub(crate) async fn resolve_card_target(
     .await
 }
 
+/// Where a **Location Form** card should be delivered (ADR-0103).
+pub(crate) enum LocationTarget {
+    /// The directory's newest mapped Chat/Topic, reached by a chat send (no
+    /// topic) or a reply to its topic anchor (a topic).
+    Target(CardTarget),
+    /// The directory has no mapped Chat/Topic: nothing may be sent and nothing
+    /// suppressed; the next sweep retries.
+    NoMapping,
+    /// The newest mapped Session is in a Topic whose anchor cannot be
+    /// resolved. The push is deferred — no card, no suppression — and retried
+    /// next sweep. A Location Form never falls back to the Chat lobby.
+    Deferred,
+}
+
+/// Resolve a Location Form's delivery target: the directory's **newest mapped
+/// Session in the SessionStore's activation order** (filtered by directory and
+/// Agent Client — `all_entries()` is client-scoped and newest-first), never a
+/// Session's live card and never the Chat lobby as a topic fallback.
+pub(crate) async fn resolve_location_form_target(
+    sessions: &SessionsHandle,
+    platform: &Arc<dyn crate::feishu::Platform>,
+    directory: &str,
+) -> LocationTarget {
+    let mapped = {
+        let store = sessions.store.lock().await;
+        store
+            .all_entries()
+            .into_iter()
+            .find(|entry| entry.directory == directory)
+            .map(|entry| entry.thread_key.clone())
+    };
+    let Some(thread_key) = mapped else {
+        return LocationTarget::NoMapping;
+    };
+    if thread_key.thread_id == thread_key.chat_id {
+        return LocationTarget::Target(CardTarget::Chat(thread_key.chat_id));
+    }
+    match resolve_topic_anchor(sessions, platform, &thread_key).await {
+        Some(anchor) => LocationTarget::Target(CardTarget::ReplyTo(anchor)),
+        None => LocationTarget::Deferred,
+    }
+}
+
 /// Find the session whose streaming card an inline permission/question should
 /// be shown on: `session_id` itself when it has a LIVE card, else the nearest
 /// ancestor that does. Sub-task child sessions carry their own id and have no
@@ -325,6 +368,11 @@ pub(crate) async fn inline_host_session_checked(
     session_id: &str,
     directory: Option<&str>,
 ) -> crate::error::Result<Option<String>> {
+    // An empty id names no Session at all (a Location Form has none): there is
+    // no parent chain to walk, and a `session_info("")` read is always doomed.
+    if session_id.is_empty() {
+        return Ok(None);
+    }
     let mut current = session_id.to_string();
     for _ in 0..8 {
         if Turn::is_running(cards, &current).await {

@@ -72,6 +72,15 @@ impl PendingRequest {
             PendingRequest::Question(_) => InteractionKind::Question,
         }
     }
+
+    /// Whether this request belongs to a directory (a Location Form) rather
+    /// than a Session (ADR-0103).
+    pub fn is_location(&self) -> bool {
+        match self {
+            PendingRequest::Permission(_) => false,
+            PendingRequest::Question(q) => q.is_location(),
+        }
+    }
 }
 
 /// The deltas that make a permission request and a question request different.
@@ -235,6 +244,10 @@ pub trait RequestKind: Send + Sync {
         inline: bool,
         host: &Option<String>,
         clicked: Option<&str>,
+        // Whether this click belongs to a directory-owned Location Form
+        // (ADR-0103): the reply/cancel route carries the directory, and a
+        // retryable refusal must keep the card instead of replacing it.
+        location_form: bool,
     ) -> Option<CardActionResult>;
 }
 
@@ -525,6 +538,7 @@ impl RequestKind for PermissionKind {
         inline: bool,
         host: &Option<String>,
         clicked: Option<&str>,
+        _location_form: bool,
     ) -> Option<CardActionResult> {
         let perm_label = value.get("perm_label").and_then(|v| v.as_str()).unwrap_or("");
         let perm_color = value
@@ -1920,6 +1934,20 @@ impl RequestKind for QuestionKind {
         let PendingRequest::Question(q) = req else {
             return serde_json::json!({});
         };
+        if q.is_location() {
+            // A Location Form card is always standalone and carries the
+            // server/message/directory context plus the shared-connection
+            // caveat (ADR-0103).
+            let paint = crate::bridge::question::QuestionPaint::blank(q.questions.len());
+            return crate::feishu::card::question::build_location_form_card(
+                q,
+                dir,
+                &paint.display,
+                &paint.done,
+                paint.open,
+                &paint.drafts,
+            );
+        }
         if let Some(reason) = q.uncollectable {
             return crate::feishu::card::question::build_uncollectable_card(
                 reason,
@@ -1944,6 +1972,9 @@ impl RequestKind for QuestionKind {
 
     fn summary(&self, _flow: &RequestFlow, req: &PendingRequest) -> String {
         match req {
+            PendingRequest::Question(q) if q.is_location() => {
+                crate::feishu::card::question::location_form_summary(q)
+            }
             PendingRequest::Question(q) => crate::feishu::card::question::question_summary(&q.questions),
             PendingRequest::Permission(_) => String::new(),
         }
@@ -1976,6 +2007,7 @@ impl RequestKind for QuestionKind {
         inline: bool,
         host: &Option<String>,
         clicked: Option<&str>,
+        location_form: bool,
     ) -> Option<CardActionResult> {
         match reply {
             // "answer" = an option click (single-select replaces, multi-select
@@ -2115,12 +2147,14 @@ impl RequestKind for QuestionKind {
                             req_id,
                             Some(&answers),
                             directory,
+                            location_form,
                         )
                         .await,
                         inline,
                         host,
                         session_id,
                         clicked,
+                        location_form,
                     )
                     .await
                     {
@@ -2206,17 +2240,28 @@ impl RequestKind for QuestionKind {
                     let Some(req) = req else {
                         return Some(flow.missing_question_result(directory, inline).await);
                     };
-                    let card = crate::feishu::card::question::build_question_card(
-                        &req.title,
-                        req_id,
-                        &req.session_id,
-                        &req.questions,
-                        directory.unwrap_or(""),
-                        &paint.display,
-                        &paint.done,
-                        paint.open,
-                        &paint.drafts,
-                    );
+                    let card = if location_form {
+                        crate::feishu::card::question::build_location_form_card(
+                            &req,
+                            directory.unwrap_or(""),
+                            &paint.display,
+                            &paint.done,
+                            paint.open,
+                            &paint.drafts,
+                        )
+                    } else {
+                        crate::feishu::card::question::build_question_card(
+                            &req.title,
+                            req_id,
+                            &req.session_id,
+                            &req.questions,
+                            directory.unwrap_or(""),
+                            &paint.display,
+                            &paint.done,
+                            paint.open,
+                            &paint.drafts,
+                        )
+                    };
                     let mut r = CardActionResult {
                         card: Some(card),
                         toast: None,
@@ -2354,8 +2399,17 @@ impl RequestKind for QuestionKind {
                         toast: Some(toast),
                     });
                 }
-                Some(CardActionResult {
-                    card: Some(crate::feishu::card::question::build_question_card(
+                let card = if location_form {
+                    crate::feishu::card::question::build_location_form_card(
+                        &req,
+                        directory.unwrap_or(""),
+                        &paint.display,
+                        &paint.done,
+                        paint.open,
+                        &paint.drafts,
+                    )
+                } else {
+                    crate::feishu::card::question::build_question_card(
                         &req.title,
                         req_id,
                         &req.session_id,
@@ -2365,7 +2419,10 @@ impl RequestKind for QuestionKind {
                         &paint.done,
                         paint.open,
                         &paint.drafts,
-                    )),
+                    )
+                };
+                Some(CardActionResult {
+                    card: Some(card),
                     toast: Some(toast),
                 })
             }
@@ -2408,12 +2465,20 @@ impl RequestKind for QuestionKind {
                     &handles.requests,
                     req_id,
                     self.label(),
-                    reply_question_scoped(&handles.backend, session_id, req_id, Some(&answers), directory)
-                        .await,
+                    reply_question_scoped(
+                        &handles.backend,
+                        session_id,
+                        req_id,
+                        Some(&answers),
+                        directory,
+                        location_form,
+                    )
+                    .await,
                     inline,
                     host,
                     session_id,
                     clicked,
+                    location_form,
                 )
                 .await
                 {
@@ -2446,6 +2511,44 @@ impl RequestKind for QuestionKind {
                 // Re-served verbatim to a losing double-click.
                 flow.remember_answered_result(req_id, &r).await;
                 Some(r)
+            }
+            // 「稍后」: withdraw the card WITHOUT declining (ADR-0103). The form
+            // stays pending; only the explicit 「取消」 reject settles it. No
+            // timer ever auto-declines. In-process only: a later sweep does not
+            // re-push while `seen` remembers the request (durable dismissal is
+            // #1019).
+            "defer" => {
+                if !location_form {
+                    return None;
+                }
+                if flow.is_answered(&handles.requests, req_id).await {
+                    return Some(
+                        flow.answered_result(req_id)
+                            .await
+                            .unwrap_or_else(|| question_replay_card(inline)),
+                    );
+                }
+                if let Some(result) = flow.question_gate(req_id, directory, inline).await {
+                    return Some(result);
+                }
+                let req = flow.question_request(req_id).await;
+                flow.withdraw_standalone_for_defer(req_id).await;
+                // Release the message pin now; the next sweep's sync would
+                // release it too, but a dismissed card must not stay pinned
+                // until then.
+                handles
+                    .waits
+                    .message_pins
+                    .release(&handles.platform, req_id)
+                    .await;
+                let card = crate::feishu::card::question::build_location_form_deferred_card(
+                    req.as_ref().and_then(|req| req.server.as_deref()),
+                    req.as_ref().and_then(|req| req.message.as_deref()),
+                );
+                return Some(CardActionResult {
+                    card: Some(card),
+                    toast: Some("已稍后处理".to_string()),
+                });
             }
             "reject" => {
                 if flow.is_answered(&handles.requests, req_id).await {
@@ -2488,11 +2591,20 @@ impl RequestKind for QuestionKind {
                     &handles.requests,
                     req_id,
                     self.label(),
-                    reply_question_scoped(&handles.backend, session_id, req_id, None, directory).await,
+                    reply_question_scoped(
+                        &handles.backend,
+                        session_id,
+                        req_id,
+                        None,
+                        directory,
+                        location_form,
+                    )
+                    .await,
                     inline,
                     host,
                     session_id,
                     clicked,
+                    location_form,
                 )
                 .await
                 {
@@ -2585,6 +2697,7 @@ async fn settle_question_reply(
     host: &Option<String>,
     session_id: &str,
     clicked: Option<&str>,
+    location_form: bool,
 ) -> Option<CardActionResult> {
     match result {
         Ok(()) => {
@@ -2617,6 +2730,20 @@ async fn settle_question_reply(
             flow.remember_answered_result(req_id, &r).await;
             Some(r)
         }
+        Err(e) if location_form => {
+            // A Location Form's 404 is ALWAYS retryable (the wire cannot tell
+            // a wrong location from a cancelled pooled loser), and every other
+            // failure is retryable too: the card, its surface and the
+            // pushed/dismissed record survive, and only a complete sweep that
+            // no longer lists the form withdraws it. Keep the clicked card
+            // (no replacement) and say the answer did not land.
+            tracing::warn!("location form reply did not land ({}): {}", req_id, e);
+            flow.unmark_answered(requests, req_id).await;
+            Some(CardActionResult {
+                card: None,
+                toast: Some("答复未送达，请稍后重试".to_string()),
+            })
+        }
         Err(e) => {
             tracing::error!("question reply failed: {}", e);
             flow.unmark_answered(requests, req_id).await;
@@ -2640,6 +2767,7 @@ async fn reply_question_scoped(
     req_id: &str,
     answers: Option<&[crate::backend::types::FormAnswer]>,
     directory: Option<&str>,
+    location_form: bool,
 ) -> crate::error::Result<()> {
     let Some(dir) = directory else {
         return Err(crate::error::BridgeError::OpenCode(
@@ -2647,6 +2775,15 @@ async fn reply_question_scoped(
         ));
     };
     let backend = backend.clone().for_directory(dir);
+    // A Location Form has no Session: its route carries the owning directory
+    // and the generation's own location placeholder, so the adapter owns both
+    // (ADR-0103). The bridge never reads the wire sentinel.
+    if location_form {
+        return match answers {
+            Some(answers) => backend.reply_location_form(req_id, answers).await,
+            None => backend.reject_location_form(req_id).await,
+        };
+    }
     match answers {
         Some(answers) => backend.reply_question(session_id, req_id, answers).await,
         None => backend.reject_question(session_id, req_id).await,

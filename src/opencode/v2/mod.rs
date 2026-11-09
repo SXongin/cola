@@ -100,6 +100,11 @@ const SESSION_DIFF_SUFFIX: &str = "/diff";
 const PERMISSION_REQUEST: &str = "/api/permission/request";
 /// The location-scoped pending-form list (`GET /api/form?location[directory]=…`).
 const FORM: &str = "/api/form";
+/// The session placeholder a directory-owned elicitation is answered under
+/// (`POST /api/session/global/form/{id}/reply`). This is the WIRE's spelling,
+/// owned by this adapter: the neutral model maps it to `RequestOwner::Location`
+/// at decode, and the bridge never reads it (ADR-0103).
+const LOCATION_FORM_SESSION: &str = "global";
 /// The agent catalog (`GET /api/agent`) the `/agent` picker reads.
 const AGENT: &str = "/api/agent";
 /// The skill catalog (`GET /api/skill`) the `/skill` picker and the
@@ -175,23 +180,36 @@ fn answer_json(value: &FormValue) -> serde_json::Value {
     }
 }
 
-/// Consume a failed permission/form reply into the neutral error. A 404 (the
-/// request, form or session is gone) and a 409 (the form is already settled)
-/// both mean "already handled" to the bridge's neutral card, so they become
-/// [`crate::error::BridgeError::NotFound`]; anything else is a real failure
-/// naming the operation and carrying a body preview. One mapping for both reply
-/// families, so their diagnostics cannot drift.
+/// Consume a failed form reply into the neutral error. The mapping splits by
+/// owner (ADR-0103):
+///
+/// - a **session-backed** form keeps 404 and 409 as "already handled"
+///   (`NotFound`);
+/// - a **Location Form** maps only 409 (`FormAlreadySettledError`) to
+///   `NotFound`; a 404 (`FormNotFoundError`) is ALWAYS retryable, because the
+///   wire cannot distinguish a wrong location from a cancelled pooled loser.
+///   It must keep the card, its surface and the pushed/dismissed record, so it
+///   is an ordinary error, never `NotFound`.
+///
+/// Anything else is a real failure naming the operation and carrying a body
+/// preview, retryable on both paths.
 async fn reply_failure(
     response: reqwest::Response,
     what: &str,
     request_id: &str,
+    location_form: bool,
 ) -> crate::error::BridgeError {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    if matches!(
-        status,
-        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT
-    ) {
+    let handled = if location_form {
+        status == reqwest::StatusCode::CONFLICT
+    } else {
+        matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::CONFLICT
+        )
+    };
+    if handled {
         return crate::error::BridgeError::NotFound(format!("{what} {request_id}"));
     }
     crate::error::BridgeError::OpenCode(format!(
@@ -362,7 +380,8 @@ impl GenerationStrategy for V2Strategy {
         if response.status().is_success() {
             return Ok(());
         }
-        Err(reply_failure(response, "permission", request_id).await)
+        // A permission is never a Location Form: its 404/409 stay handled.
+        Err(reply_failure(response, "permission", request_id, false).await)
     }
 
     /// List pending permissions for one location (`GET
@@ -434,7 +453,7 @@ impl GenerationStrategy for V2Strategy {
         if response.status().is_success() {
             return Ok(());
         }
-        Err(reply_failure(response, "form", request_id).await)
+        Err(reply_failure(response, "form", request_id, false).await)
     }
 
     /// Cancel a pending form (`DELETE /api/session/{id}/form/{formID}`) — V2's
@@ -455,7 +474,64 @@ impl GenerationStrategy for V2Strategy {
         if response.status().is_success() {
             return Ok(());
         }
-        Err(reply_failure(response, "form", request_id).await)
+        Err(reply_failure(response, "form", request_id, false).await)
+    }
+
+    /// Answer a directory-owned Location Form: the session route with the
+    /// wire's `global` placeholder plus `location[directory]`, so the reply
+    /// lands on the exact location whose list produced the request (ADR-0103).
+    async fn reply_location_form(
+        &self,
+        http: &Transport,
+        request_id: &str,
+        answers: &[FormAnswer],
+        directory: Option<&str>,
+    ) -> Result<()> {
+        let answer: serde_json::Map<String, serde_json::Value> = answers
+            .iter()
+            .filter_map(|answer| {
+                answer
+                    .value
+                    .as_ref()
+                    .map(|value| (answer.key.clone(), answer_json(value)))
+            })
+            .collect();
+        let url = location_url(
+            &http.url(&format!(
+                "{SESSION}/{LOCATION_FORM_SESSION}/form/{request_id}/reply"
+            )),
+            directory,
+        )?;
+        let response = http
+            .client()
+            .post(url)
+            .json(&serde_json::json!({ "answer": answer }))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(reply_failure(response, "form", request_id, true).await)
+    }
+
+    /// Cancel a directory-owned Location Form: `DELETE` on the same
+    /// `global`-session route, scoped to the owning directory. A 409 is the
+    /// benign handled path; a 404 is retryable (ADR-0103).
+    async fn reject_location_form(
+        &self,
+        http: &Transport,
+        request_id: &str,
+        directory: Option<&str>,
+    ) -> Result<()> {
+        let url = location_url(
+            &http.url(&format!("{SESSION}/{LOCATION_FORM_SESSION}/form/{request_id}")),
+            directory,
+        )?;
+        let response = http.client().delete(url).send().await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err(reply_failure(response, "form", request_id, true).await)
     }
 
     /// Fetch one session's Session Transcript through the V2 projected-message

@@ -14,7 +14,8 @@ use tracing::Instrument;
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
 use crate::bridge::pollers::{
-    CardTarget, inline_host_session, mark_stale_cards, resolve_card_target, run_is_over,
+    CardTarget, LocationTarget, inline_host_session, mark_stale_cards, resolve_card_target,
+    resolve_location_form_target, run_is_over,
 };
 use crate::bridge::question::{QuestionState, stale_question_card};
 use crate::bridge::surfaces::{CompanionDelivery, StandaloneSurface, Surfaces};
@@ -572,6 +573,17 @@ impl RequestFlow {
             .map(|s| s.request().clone())
     }
 
+    /// Whether `req_id` is a remembered directory-owned request (a Location
+    /// Form). A late click whose state is gone cannot say, and needs no answer:
+    /// it takes the neutral classification path instead of a reply.
+    pub(crate) async fn is_location_question(&self, req_id: &str) -> bool {
+        self.question_state
+            .lock()
+            .await
+            .get(req_id)
+            .is_some_and(|state| state.request().is_location())
+    }
+
     /// Whether `req_id` is a remembered (pending) question request. Test-only
     /// today: the production poll loop tracks self-surfaced ids in its own
     /// `seen` set.
@@ -596,6 +608,25 @@ impl RequestFlow {
     /// actually delivered as its own card.
     pub(crate) async fn remove_question(&self, req_id: &str) {
         self.question_state.lock().await.remove(req_id);
+    }
+
+    /// Withdraw a request's standalone card **without settling it**: the
+    /// Location Form 「稍后」 control. The in-flight state stays (the form is
+    /// still pending), while the sent-card registry and the persisted surface
+    /// record are cleared so the sweep stops pinning and never marks the
+    /// withdrawn card stale on its own behalf. Returns the withdrawn card's
+    /// message id, if one was recorded. The next sweep does not push it again
+    /// while the poll loop's `seen` remembers it (in-process dismissal; durable
+    /// dismissal is #1019).
+    pub(crate) async fn withdraw_standalone_for_defer(&self, req_id: &str) -> Option<String> {
+        let message_id = self
+            .sent_cards
+            .lock()
+            .await
+            .remove(req_id)
+            .map(|card| card.message_id);
+        self.surfaces.remove_standalone(req_id);
+        message_id
     }
 
     /// The remembered questions and their current answers, captured for the
@@ -956,6 +987,13 @@ impl RequestFlow {
                     listed_now.insert(dir.clone());
                     for req in &requests {
                         pending.insert(req.id().to_string());
+                        // A Location Form (ADR-0103) has no Session by
+                        // construction: its owner is the directory, and the
+                        // adapter already cleared the wire's session
+                        // placeholder. It never joins the per-session liveness
+                        // set, the Instant Reminder, or the inline-host walk —
+                        // only the message-pin registry, later.
+                        let location_form = req.is_location();
                         // #489: a session id that cannot name a session at all
                         // (the `global` sentinel, an empty optional id) is a
                         // structural, terminal condition — no parent chain and
@@ -963,8 +1001,11 @@ impl RequestFlow {
                         // pay a doomed session read. Warn once, naming the id,
                         // and skip the request: it is never surfaced, never
                         // pinned, never walked. `pending` still records it, so
-                        // unknown is never read as resolved (#130).
-                        if !handles.backend.is_addressable_session_id(req.session_id()) {
+                        // unknown is never read as resolved (#130). Only an
+                        // UNMARKED session-less request reaches this: a marked
+                        // MCP elicitation is a Location Form and takes its own
+                        // path below.
+                        if !location_form && !handles.backend.is_addressable_session_id(req.session_id()) {
                             let first = self
                                 .session_less
                                 .lock()
@@ -982,10 +1023,14 @@ impl RequestFlow {
                             }
                             continue;
                         }
-                        wait_candidates.push((req.id().to_string(), req.session_id().to_string()));
+                        if !location_form {
+                            wait_candidates.push((req.id().to_string(), req.session_id().to_string()));
+                        }
                         // Both pin surfaces need the listed candidates: the
                         // reminder's chat-level target and the waiting-card
-                        // registry's host message.
+                        // registry's host message. A Location Form is collected
+                        // here only for the message pin; the reminder loop below
+                        // skips it (it has no Turn to own a reminder).
                         if handles.waits.reminder.enabled() || handles.waits.message_pins.enabled() {
                             pin_candidates.push((req.clone(), dir.clone()));
                         }
@@ -1080,6 +1125,11 @@ impl RequestFlow {
             let mut pin_targets: Vec<crate::bridge::reminder::ReminderTarget> = Vec::new();
             for (req, dir) in &pin_candidates {
                 if auto_resolved.contains(req.id()) {
+                    continue;
+                }
+                // A Location Form has no Turn and no requester: it never owns
+                // an Instant Reminder (ADR-0103), only a Message Pin.
+                if req.is_location() {
                     continue;
                 }
                 // `None` (an external turn, or a request pending across a
@@ -1426,6 +1476,14 @@ impl RequestFlow {
             Prepared::Retry => return false,
             Prepared::NotHandled => {}
         }
+        // A Location Form (ADR-0103) has no Session to inline onto and no
+        // per-session pending/reminder surface: it is pushed ONCE as its own
+        // card into the directory's newest mapped Chat/Topic. Everything below
+        // this point (companion, inline host, per-session send) assumes a
+        // Session and must not run for it.
+        if req.is_location() {
+            return self.surface_location_form(handles, req, dir, seen).await;
+        }
         // A request that now fits the card has no companion surface: forget a
         // stale delivery record so an ordinary allow is not mistaken for a
         // summary surface (and bounced into a fallback card after a shrink).
@@ -1721,6 +1779,68 @@ impl RequestFlow {
             seen.insert(req.id().to_string());
         }
         drop(guard);
+        false
+    }
+
+    /// Push one **Location Form** as its own card (ADR-0103). The card goes to
+    /// the directory's newest mapped Chat/Topic — never inline, never into a
+    /// per-session set. Delivery outcomes:
+    ///
+    /// - no mapped Chat/Topic, or a topic whose anchor cannot be resolved:
+    ///   nothing is sent and nothing suppressed, so the next complete sweep
+    ///   retries;
+    /// - a failed or timed-out send: not recorded, retried next sweep (a
+    ///   timed-out send may duplicate, exactly like every standalone send);
+    /// - success: recorded in `sent_cards`/the surface file, and `seen`, so
+    ///   this process never pushes the same form twice.
+    async fn surface_location_form(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        // Push-once: the poll loop's `seen` survives its sweeps, and the sent
+        // card registry survives a fresh `seen` (tests, and a restart whose
+        // recovered record was already re-adopted).
+        if seen.contains(req.id()) || self.sent_cards.lock().await.contains_key(req.id()) {
+            return false;
+        }
+        let target = match resolve_location_form_target(&handles.sessions, &handles.platform, dir).await {
+            LocationTarget::Target(target) => target,
+            LocationTarget::NoMapping => {
+                tracing::debug!(
+                    "{} {}: directory {} has no mapped Chat/Topic; nothing sent",
+                    self.kind.label(),
+                    req.id(),
+                    dir
+                );
+                return false;
+            }
+            LocationTarget::Deferred => {
+                tracing::debug!(
+                    "{} {}: directory {}'s topic anchor could not be resolved; deferring the push",
+                    self.kind.label(),
+                    req.id(),
+                    dir
+                );
+                return false;
+            }
+        };
+        let card = self.kind.build_card(self, req, dir);
+        let summary = self.kind.summary(self, req);
+        if self
+            .send_standalone_surface(handles, req, dir, Some(target), &card, &summary)
+            .await
+        {
+            tracing::info!(
+                "{} ({}): {} delivered as a directory-owned form card",
+                self.kind.label(),
+                dir,
+                req.id()
+            );
+            seen.insert(req.id().to_string());
+        }
         false
     }
 
@@ -2712,6 +2832,16 @@ impl RequestFlow {
         };
         let directory = directory.as_deref();
 
+        // A Location Form has no Session to inline onto: its card is always
+        // standalone, so skip every host/inline probe (including the doomed
+        // `session_info("")` read). The card's own callback marker covers a
+        // plain click; the remembered owner covers a form submit whose routing
+        // was rebuilt from the button name without the extra field.
+        let location_form = value
+            .get("location_form")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || self.is_location_question(req_id).await;
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
         // The card the click landed on, so its handle can update THAT card
         // atomically in the ack (ADR-0038, rule 3) — the callback context
@@ -2726,25 +2856,38 @@ impl RequestFlow {
         // through its handle counts too: a re-adopted card after a restart has
         // no accumulator, but its cached JSON still carries the block and the
         // ack can edit it in place.
-        let host = if Turn::is_running(&handles.cards, session_id).await {
+        let host = if location_form {
+            None
+        } else if Turn::is_running(&handles.cards, session_id).await {
             Some(session_id.to_string())
         } else {
             inline_host_session(&handles.cards, &handles.backend, session_id, directory).await
         };
-        let inline = host.is_some()
-            || match clicked {
-                Some(message_id) => handles
-                    .cards
-                    .card_handles
-                    .lock()
-                    .await
-                    .renders(message_id, req_id),
-                None => false,
-            };
+        let inline = !location_form
+            && (host.is_some()
+                || match clicked {
+                    Some(message_id) => handles
+                        .cards
+                        .card_handles
+                        .lock()
+                        .await
+                        .renders(message_id, req_id),
+                    None => false,
+                });
 
         self.kind
             .handle_action(
-                self, handles, session_id, req_id, reply, value, directory, inline, &host, clicked,
+                self,
+                handles,
+                session_id,
+                req_id,
+                reply,
+                value,
+                directory,
+                inline,
+                &host,
+                clicked,
+                location_form,
             )
             .await
     }

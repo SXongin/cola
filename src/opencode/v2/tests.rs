@@ -2247,6 +2247,247 @@ async fn reject_question_deletes_the_session_scoped_form() {
     }
 }
 
+/// ADR-0103: the V2 decoder maps the `global` sentinel + `mcp-elicitation`
+/// metadata to the neutral `Location` owner, carries the asking server and
+/// message, and leaves every other form on its Session path — including an
+/// unmarked session-less one, which #489 still skips.
+#[tokio::test]
+async fn list_questions_maps_the_global_elicitation_to_a_location_owner() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/form",
+        200,
+        serde_json::json!({
+            "location": {"directory": "/work/cola"},
+            "data": [
+                {
+                    "id": "frm_location",
+                    "sessionID": "global",
+                    "title": "登录",
+                    "metadata": {
+                        "kind": "mcp-elicitation",
+                        "server": "context7",
+                        "message": "请先登录 Context7",
+                    },
+                    "fields": [{"key": "q0", "type": "string", "title": "账号"}],
+                },
+                {
+                    "id": "frm_unmarked",
+                    "sessionID": "global",
+                    "title": "Unmarked",
+                    "fields": [],
+                },
+                {
+                    "id": "frm_session",
+                    "sessionID": "ses_1",
+                    "title": "Session-backed",
+                    "metadata": {
+                        "kind": "mcp-elicitation",
+                        "server": "context7",
+                        "message": "session owns this",
+                    },
+                    "fields": [],
+                },
+            ],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let forms = client.list_questions(Some("/work/cola")).await.unwrap();
+
+    use crate::backend::types::RequestOwner;
+    let location = forms.iter().find(|form| form.id == "frm_location").unwrap();
+    assert_eq!(location.owner, RequestOwner::Location);
+    assert!(location.is_location());
+    assert_eq!(
+        location.session_id, "",
+        "the wire sentinel must never reach the bridge as a session id"
+    );
+    assert_eq!(location.server.as_deref(), Some("context7"));
+    assert_eq!(location.message.as_deref(), Some("请先登录 Context7"));
+
+    let unmarked = forms.iter().find(|form| form.id == "frm_unmarked").unwrap();
+    assert_eq!(
+        unmarked.owner,
+        RequestOwner::Session,
+        "only a MARKED elicitation takes the location path"
+    );
+    assert_eq!(
+        unmarked.session_id, "global",
+        "the unmarked form stays session-less for #489 to skip"
+    );
+
+    let session_backed = forms.iter().find(|form| form.id == "frm_session").unwrap();
+    assert_eq!(session_backed.owner, RequestOwner::Session);
+    assert_eq!(session_backed.session_id, "ses_1");
+    assert_eq!(session_backed.server.as_deref(), Some("context7"));
+    assert_eq!(session_backed.message.as_deref(), Some("session owns this"));
+}
+
+/// ADR-0103: a secret-format field can never be collected on a shared card —
+/// the whole request is uncollectable with the existing secret-input reason and
+/// the field is marked secret.
+#[tokio::test]
+async fn a_secret_format_field_makes_the_form_uncollectable() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/form",
+        200,
+        serde_json::json!({
+            "data": [{
+                "id": "frm_secret",
+                "sessionID": "global",
+                "title": "Token",
+                "metadata": {"kind": "mcp-elicitation", "server": "example"},
+                "fields": [{
+                    "key": "token",
+                    "type": "string",
+                    "title": "API token",
+                    "format": "password",
+                }],
+            }],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let forms = client.list_questions(None).await.unwrap();
+    let form = &forms[0];
+    assert_eq!(
+        form.uncollectable,
+        Some(crate::backend::types::UncollectableReason::SecretInput)
+    );
+    assert!(form.questions[0].secret);
+}
+
+/// ADR-0103's reply-error split: a session-backed form keeps 404/409 as
+/// handled, while a Location Form maps only 409 to handled and treats 404 as a
+/// retryable refusal (never `NotFound`).
+#[tokio::test]
+async fn location_form_reply_splits_404_from_409_by_owner() {
+    use crate::backend::types::{FormAnswer, FormValue};
+
+    let server = TestHttpServer::start().await;
+    server.route("POST", "/api/session/global/form/frm_1/reply", 204, "");
+    server.route(
+        "POST",
+        "/api/session/global/form/frm_wrong/reply",
+        404,
+        serde_json::json!({"_tag": "FormNotFoundError", "id": "frm_wrong", "message": "wrong location"})
+            .to_string(),
+    );
+    server.route(
+        "POST",
+        "/api/session/global/form/frm_settled/reply",
+        409,
+        serde_json::json!({"_tag": "FormAlreadySettledError", "id": "frm_settled", "message": "settled"})
+            .to_string(),
+    );
+    let client = v2_wire_client(&server);
+    let answers = vec![FormAnswer {
+        key: "q0".into(),
+        value: Some(FormValue::Text("value".into())),
+    }];
+
+    client
+        .reply_location_form("frm_1", &answers, Some("/work/cola"))
+        .await
+        .unwrap();
+    let request = last_request(&server);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/api/session/global/form/frm_1/reply");
+    assert_eq!(
+        request.query_param("location[directory]").as_deref(),
+        Some("/work/cola"),
+        "the reply must carry the directory whose list produced the form"
+    );
+
+    let wrong = client
+        .reply_location_form("frm_wrong", &answers, Some("/work/cola"))
+        .await
+        .unwrap_err();
+    assert!(
+        !wrong.is_not_found(),
+        "a Location Form's 404 is always retryable: {wrong:?}"
+    );
+
+    let settled = client
+        .reply_location_form("frm_settled", &answers, Some("/work/cola"))
+        .await
+        .unwrap_err();
+    assert!(
+        settled.is_not_found(),
+        "a Location Form's 409 is the benign handled path: {settled:?}"
+    );
+
+    // The session-backed mapping is unchanged: both statuses stay handled.
+    server.route(
+        "POST",
+        "/api/session/ses_1/form/frm_gone/reply",
+        404,
+        serde_json::json!({"_tag": "FormNotFoundError", "id": "frm_gone"}).to_string(),
+    );
+    let gone = client
+        .reply_question("ses_1", "frm_gone", &answers, None)
+        .await
+        .unwrap_err();
+    assert!(
+        gone.is_not_found(),
+        "a session-backed form keeps 404 as handled: {gone:?}"
+    );
+}
+
+/// The Location Form cancel routes through the same `global` session route and
+/// the owning directory, with the 404/409 split of a reply.
+#[tokio::test]
+async fn reject_location_form_deletes_the_global_route_with_the_directory() {
+    let server = TestHttpServer::start().await;
+    server.route("DELETE", "/api/session/global/form/frm_1", 204, "");
+    server.route(
+        "DELETE",
+        "/api/session/global/form/frm_gone",
+        404,
+        serde_json::json!({"_tag": "FormNotFoundError", "id": "frm_gone"}).to_string(),
+    );
+    server.route(
+        "DELETE",
+        "/api/session/global/form/frm_settled",
+        409,
+        serde_json::json!({"_tag": "FormAlreadySettledError", "id": "frm_settled"}).to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    client
+        .reject_location_form("frm_1", Some("/work/cola"))
+        .await
+        .unwrap();
+    let request = last_request(&server);
+    assert_eq!(request.method, "DELETE");
+    assert_eq!(request.path, "/api/session/global/form/frm_1");
+    assert_eq!(
+        request.query_param("location[directory]").as_deref(),
+        Some("/work/cola")
+    );
+    assert_eq!(request.body, "", "cancel carries no body");
+
+    let gone = client
+        .reject_location_form("frm_gone", Some("/work/cola"))
+        .await
+        .unwrap_err();
+    assert!(!gone.is_not_found(), "a Location Form 404 is retryable: {gone:?}");
+    let settled = client
+        .reject_location_form("frm_settled", Some("/work/cola"))
+        .await
+        .unwrap_err();
+    assert!(
+        settled.is_not_found(),
+        "a Location Form 409 is handled: {settled:?}"
+    );
+}
+
 /// A Turn's file diff (`GET /api/session/{id}/diff`): every query axis the
 /// caller set rides the URL, and the `{data: FileDiff.Info[]}` envelope decodes
 /// into the neutral model — the wire's `file` becomes `path`, while the counts

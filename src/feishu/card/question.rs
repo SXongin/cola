@@ -1359,6 +1359,165 @@ pub fn build_question_card(
     card_shell(&header, "blue", elements)
 }
 
+/// The header of a directory-owned Location Form card (ADR-0103).
+pub(crate) const LOCATION_FORM_HEADER: &str = "📍 目录级 MCP 请求";
+
+/// The shared-connection caveat every Location Form card carries: the wire has
+/// no caller marker, so cola cannot tell a caller-attributed form from a
+/// no-caller one and must put the wider consent scope on every card.
+pub(crate) const LOCATION_FORM_SHARED_CAVEAT: &str =
+    "⚠️ 这个回答会代表整个目录提交；若多个目录共用同一条 MCP 连接，也可能一并提交其他目录的同类请求。";
+
+/// The context block of a Location Form: the asking server, its message and
+/// the directory the answer commits.
+fn location_form_context(req: &crate::backend::types::QuestionRequest, directory: &str) -> String {
+    let mut md = super::sanitize::CardMarkdown::new();
+    let mut text = format!("**📍 目录**：`{directory}`");
+    if let Some(server) = req.server.as_deref().filter(|s| !s.is_empty()) {
+        text.push_str(&format!("\n**🔌 MCP 服务器**：{server}"));
+    }
+    if let Some(message) = req.message.as_deref().filter(|m| !m.is_empty()) {
+        text.push_str(&format!("\n\n{message}"));
+    }
+    text.push_str(&format!("\n\n{LOCATION_FORM_SHARED_CAVEAT}"));
+    md.clean(&text)
+}
+
+/// The 「稍后」 control: withdraws the card without declining the request
+/// (ADR-0103). It carries only routing — no session, because a Location Form
+/// has none.
+fn location_defer_button(request_id: &str, directory: &str) -> serde_json::Value {
+    json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "💤 稍后" },
+        "type": "default",
+        "value": {
+            "action": "question",
+            "reply": "defer",
+            "request_id": request_id,
+            "session_id": "",
+            "directory": directory,
+            "location_form": true,
+        },
+    })
+}
+
+/// Stamp `location_form: true` onto every callback value the card carries, so
+/// a plain click routes as a Location Form even before the flow reads its
+/// remembered owner (a form submit whose routing is rebuilt from the button
+/// name has no value and falls back to that owner).
+fn mark_location_controls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("action").and_then(|v| v.as_str()) == Some("question") {
+                map.insert("location_form".into(), serde_json::Value::Bool(true));
+            }
+            for child in map.values_mut() {
+                mark_location_controls(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                mark_location_controls(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the standalone card for a **Location Form** (ADR-0103): the asking
+/// server, its message, the committed directory and the shared-connection
+/// caveat, then the ordinary typed fields (or the uncollectable reason), the
+/// explicit decline, and 「稍后」. A typed input always stays at the card's end
+/// (the `card-inputs` rule), so the defer control is inserted before the form.
+#[allow(clippy::too_many_arguments)] // routing, fields, and the paint it renders
+pub fn build_location_form_card(
+    req: &crate::backend::types::QuestionRequest,
+    directory: &str,
+    answered: &[Option<Vec<String>>],
+    done: &[bool],
+    open: usize,
+    drafts: &[String],
+) -> serde_json::Value {
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": location_form_context(req, directory),
+    })];
+    let mut body = question_elements(
+        "",
+        req.uncollectable,
+        &req.id,
+        "",
+        &req.questions,
+        directory,
+        answered,
+        done,
+        open,
+        drafts,
+    );
+    let defer = location_defer_button(&req.id, directory);
+    match body
+        .iter()
+        .position(|element| element.get("tag").and_then(|tag| tag.as_str()) == Some("form"))
+    {
+        Some(form_at) => body.insert(form_at, defer),
+        None => body.push(defer),
+    }
+    elements.extend(body);
+    let header = if req.uncollectable.is_some() {
+        UNCOLLECTABLE_HEADER.to_string()
+    } else if req.title.is_empty() {
+        LOCATION_FORM_HEADER.to_string()
+    } else {
+        format!("📍 {}", req.title)
+    };
+    let mut card = card_shell(&header, "orange", elements);
+    mark_location_controls(&mut card);
+    card
+}
+
+/// The one-line summary a stale Location Form card carries: the asking server
+/// and message (or the form's title), so the "handled elsewhere" card still
+/// says what the form was about.
+pub fn location_form_summary(req: &crate::backend::types::QuestionRequest) -> String {
+    let mut text = String::new();
+    if let Some(server) = req.server.as_deref().filter(|s| !s.is_empty()) {
+        text.push_str(&format!("{server}："));
+    }
+    let what = req
+        .message
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .or_else(|| Some(req.title.as_str()).filter(|t| !t.is_empty()));
+    match what {
+        Some(what) => text.push_str(what),
+        None => text.push_str(&question_summary(&req.questions)),
+    }
+    super::sanitize::CardMarkdown::new().clean(&text)
+}
+
+/// The card a Location Form's 「稍后」 click leaves in place of the withdrawn
+/// one: the request is still pending, no decision was taken.
+pub fn build_location_form_deferred_card(server: Option<&str>, message: Option<&str>) -> serde_json::Value {
+    let mut detail = String::new();
+    if let Some(server) = server.filter(|s| !s.is_empty()) {
+        detail.push_str(&format!("**🔌 MCP 服务器**：{server}\n\n"));
+    }
+    if let Some(message) = message.filter(|m| !m.is_empty()) {
+        detail.push_str(message);
+        detail.push_str("\n\n");
+    }
+    detail.push_str("该请求仍然待处理，稍后可以重新处理。");
+    card_shell(
+        "💤 已稍后处理",
+        "grey",
+        vec![json!({
+            "tag": "markdown",
+            "content": super::sanitize::CardMarkdown::new().clean(&detail),
+        })],
+    )
+}
+
 /// The standalone card for a request cola cannot collect at all: the reason's
 /// copy and the ordinary reject control, never a field the answer could be
 /// typed into.
@@ -2486,6 +2645,7 @@ mod tests {
             custom: Some(false),
             required: true,
             url: None,
+            secret: false,
         };
         let boolean = QuestionInfo {
             key: "q1".into(),
