@@ -47,7 +47,10 @@ would mean anything.
 Chat/Topic of the directory's newest mapped Session in the SessionStore's
 activation order — the newest mapped entry first, filtered by directory and
 Agent Client; this is the store's local activation order, not `/switch`'s
-server-time sort — using that Chat/Topic's topic anchor when it is a topic.
+server-time sort — using that Chat/Topic's topic anchor when it is a topic. If
+the mapped Session is in a Topic and its anchor cannot be resolved, the push is
+deferred — no card, no suppression — and retried on the next sweep; a Location
+Form never falls back to posting in the Chat lobby.
 The card names the asking MCP server and its message, and shows the directory,
 so the answerer knows what is being asked and whom the answer commits; the V2
 adapter carries `metadata.server` and `metadata.message` into the neutral
@@ -73,15 +76,20 @@ attempted. The card never rides an inline block, never enters
 `pending_sessions`, and never drives the Instant Reminder: that surface needs a
 Turn's generation to own and clear its pin, and a Location Form has none. It
 does take a **Message Pin** under the same `instant_reminder` opt-in, because a
-pin is keyed by message.
+pin is keyed by message. The pin joins the same Message Pins registry as every
+other wait (ADR-0043): resolving, cancelling, dismissing, or staling the card
+removes it from the waiting set and releases the pin.
 
 **Dismissal.** 「稍后」 withdraws the card — and releases its Message Pin —
 without declining the request. The form stays pending and `/mcp` can reopen it
 as a fresh card; reopening sends the fresh card first and commits the cleared
 dismissal only after the send lands, so a failed send leaves the form dismissed
-and `/mcp` can retry rather than leaving it unsuppressed with no card. A landed
-reopen rewrites the standalone-surface record, so the two records never disagree
-about what the chat currently shows. Only an explicit 「取消」 declines it, and cola never
+and `/mcp` can retry rather than leaving it unsuppressed with no card. The
+reopen serializes with 「稍后」 on the per-form write lock, and the clear is
+conditional on the dismissal generation read before the send, so a dismissal
+that lands while the send is in flight survives. A landed reopen rewrites the
+standalone-surface record, so the two records never disagree about what the chat
+currently shows. Only an explicit 「取消」 declines it, and cola never
 auto-declines on a timer: turning a hesitation into a failed tool call is worse
 than waiting.
 
@@ -91,6 +99,8 @@ already deferred. The record is pruned only when a complete sweep can speak for
 the request — the #130 rule: a failed list never reads as gone. A restart that
 finds the card still live re-adopts it through ADR-0038 rather than posting a
 second; one that finds it withdrawn keeps it withdrawn until `/mcp` reopens it.
+That withdrawal-before-restart rule is ADR-0038's 2026-11-09 amendment, the one
+explicit exception to its "every still-pending request keeps one live surface".
 The pushed/dismissed record and the standalone surface are committed in one
 mutation, so a restart cannot see one without the other. The mirror is still
 best-effort (ADR-0038): a failed combined write is a known limit that may cost

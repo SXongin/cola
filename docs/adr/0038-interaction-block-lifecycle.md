@@ -310,3 +310,13 @@ in a request timeout: a create has at-least-once semantics, so abandoning a
 slow response could orphan a card that did land and a retry would post a second
 (ADR-0100). The sweep patches that target standalone or superseded cards — the
 ones Rule 8 already calls lock-free — stay exactly that.
+
+## Amendment (2026-11-09): a dismissed Location Form is a deliberately surface-less pending request
+
+Rule 6 assumes a still-pending request has exactly one live surface, and re-posts
+one whose card is gone so the Host is never left without a way to answer. ADR-0103
+adds the one exception: a **Location Form** the Host deferred with 「稍后」 is still
+pending but intentionally has no live card. Its persisted dismissed record is
+authoritative: the sweep must not re-post it, and restart re-adoption applies only
+to a card that was not dismissed; `/mcp` is the way back. The exception does not
+apply to a session-backed request, or to a Location Form that was never dismissed.
