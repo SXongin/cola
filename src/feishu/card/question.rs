@@ -1496,14 +1496,15 @@ pub fn build_location_form_card(
 /// and message (or the form's title), so the "handled elsewhere" card still
 /// says what the form was about.
 pub fn location_form_summary(req: &crate::backend::types::QuestionRequest) -> String {
-    super::sanitize::CardMarkdown::new().clean(&location_form_summary_text(req))
+    super::sanitize::CardMarkdown::new().clean(&location_form_summary_raw(req))
 }
 
-/// [`location_form_summary`] before markdown hygiene: the raw server/message
-/// (or title, else the question text). A caller building a multi-element card
-/// threads one [`super::sanitize::CardMarkdown`] and cleans this itself, so
-/// the card's one table budget is not spent by a per-summary instance.
-pub(crate) fn location_form_summary_text(req: &crate::backend::types::QuestionRequest) -> String {
+/// [`location_form_summary`] before markdown hygiene. **The result is raw
+/// transcript text and must be cleaned before it reaches a card** — a caller
+/// building a multi-element card threads one [`super::sanitize::CardMarkdown`]
+/// and cleans this itself, so the card's one table budget is not spent by a
+/// per-summary instance. The `_raw` suffix is the contract warning.
+pub(crate) fn location_form_summary_raw(req: &crate::backend::types::QuestionRequest) -> String {
     let mut text = String::new();
     if let Some(server) = req.server.as_deref().filter(|s| !s.is_empty()) {
         text.push_str(&format!("{server}："));
