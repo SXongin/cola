@@ -2136,6 +2136,13 @@ impl RequestKind for QuestionKind {
                 let Some((answered_count, paint, outcome, mutated)) = mutated else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
+                // A Location Form's live card is not repainted by a restart
+                // (that would wipe typed text), so persist what its controls
+                // now show: the restored state must submit exactly the visible
+                // selection (ADR-0103).
+                if location_form && mutated {
+                    flow.persist_location_form_partial(req_id).await;
+                }
                 if answered_count == n {
                     // All questions answered → claim the request and submit.
                     // The claim is atomic: a click that loses the race re-serves
@@ -2353,6 +2360,12 @@ impl RequestKind for QuestionKind {
                 let Some(switched) = switched else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
+                // The open question (and any draft the submit carried) is part
+                // of the card's visible state; persist it for the restart
+                // re-adoption, which must not repaint the card (ADR-0103).
+                if location_form {
+                    flow.persist_location_form_partial(req_id).await;
+                }
                 let Some(req) = flow.question_request(req_id).await else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };

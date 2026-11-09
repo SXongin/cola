@@ -1459,9 +1459,19 @@ pub fn build_location_form_card(
         "tag": "markdown",
         "content": location_form_context(req, directory),
     })];
+    // The renderer enforces the secret refusal independently of the adapter's
+    // request-level marker; the Location card's controls must read the same
+    // decision, or a defensive caller's field-only secret would still get
+    // 「稍后」.
+    let uncollectable = req.uncollectable.or_else(|| {
+        req.questions
+            .iter()
+            .any(|question| question.secret)
+            .then_some(UncollectableReason::SecretInput)
+    });
     let mut body = question_elements(
         "",
-        req.uncollectable,
+        uncollectable,
         &req.id,
         "",
         &req.questions,
@@ -1475,7 +1485,7 @@ pub fn build_location_form_card(
     // ADR-0103 rule is that the only decision is an explicit 「取消」, so it
     // never offers 「稍后」 (a withdrawal would leave an unanswerable form with
     // no way back except `/mcp`).
-    if req.uncollectable.is_none() {
+    if uncollectable.is_none() {
         let defer = location_defer_button(&req.id, directory);
         match body
             .iter()
@@ -1486,7 +1496,7 @@ pub fn build_location_form_card(
         }
     }
     elements.extend(body);
-    let header = if req.uncollectable.is_some() {
+    let header = if uncollectable.is_some() {
         UNCOLLECTABLE_HEADER.to_string()
     } else if req.title.is_empty() {
         LOCATION_FORM_HEADER.to_string()
@@ -2275,6 +2285,39 @@ mod tests {
                 .iter()
                 .any(|element| element["tag"] == "button" && element["value"]["reply"] == "reject"),
             "the only control is the decline: {text}"
+        );
+    }
+
+    /// A callers' field-only secret marker (no request-level uncollectable
+    /// reason) must still make a Location Form decline-only: the renderer
+    /// already refuses the input, so the card must not offer 「稍后」 either.
+    #[test]
+    fn a_field_only_secret_location_form_has_no_defer_control() {
+        let request = crate::backend::types::QuestionRequest::location(
+            "frm_defensive_secret",
+            "登录".into(),
+            vec![crate::backend::types::QuestionInfo {
+                key: "token".into(),
+                question: "API token".into(),
+                header: "Token".into(),
+                kind: crate::backend::types::FormFieldKind::String,
+                secret: true,
+                ..Default::default()
+            }],
+            Some("vault".into()),
+            Some("Sign in".into()),
+            None,
+        );
+        let card = build_location_form_card(&request, "/work", &[], &[], 0, &[]);
+        let text = card.to_string();
+        assert!(text.contains("私密输入"), "the secret reason is shown: {text}");
+        assert!(
+            !text.contains("\"reply\":\"defer\""),
+            "a field-only secret is decline-only: {text}"
+        );
+        assert!(
+            text.contains("\"reply\":\"reject\""),
+            "the explicit decline remains: {text}"
         );
     }
 

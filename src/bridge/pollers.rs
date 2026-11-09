@@ -484,9 +484,14 @@ pub(crate) async fn mark_stale_cards(
     surfaces: &crate::bridge::surfaces::Surfaces,
     kind: &str,
     dead: &std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
 ) {
     for (rid, card) in stale {
         sent.lock().await.remove(&rid);
+        // The poll loop's `seen` set survives sweeps. A request that left the
+        // pending list and later reappears must be allowed to surface again,
+        // so the stale pass forgets the id it just withdrew (ADR-0103).
+        seen.remove(&rid);
         surfaces.remove_standalone(&rid);
         // A stale Location Form has left the pending list, so its push/
         // dismissal decision describes a form that no longer exists. Leaving
