@@ -1303,7 +1303,7 @@ async fn a_surfaced_question_drains_the_explanation_before_it() {
     );
     let backend = Arc::new(mock);
     let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_live_card(&app, "ses_test", "om_live").await;
     // The draining card renders the Turn the pending request belongs to: the
     // live card's own anchor (production captures it from the session's
@@ -1362,11 +1362,64 @@ async fn a_surfaced_question_drains_the_explanation_before_it() {
             .contains("✅ 已回答"),
         "the receipt lands in the click's ack"
     );
-    let cards = app.cards_handle();
-    Turn::push_text_at(&cards, "ses_test", 1_300, "作答后的继续").await;
-    Turn::flush_card(&cards, "ses_test").await;
+    // The server's post-answer continuation is a NEW message created after
+    // the ask. Render it: its message floor puts it below the receipt even
+    // though its server time (1_300) is far behind cola's receipt key.
+    let continuation = crate::backend::SessionTranscript::new(vec![
+        typed_message(
+            "msg_anchor_1000",
+            crate::backend::MessageRole::User,
+            Some(1_000),
+            vec![text_part("帮我看看")],
+        ),
+        typed_message(
+            "msg_a",
+            crate::backend::MessageRole::Assistant,
+            Some(1_100),
+            vec![
+                text_part("先解释一下再问。"),
+                crate::backend::Part::Tool(crate::backend::ToolCall {
+                    identity: crate::backend::ToolIdentity {
+                        name: "question".into(),
+                        call_id: "call_q".into(),
+                    },
+                    status: crate::backend::ToolStatus::Completed,
+                    started_at: Some(1_200),
+                    input: Some(serde_json::json!({ "questions": [] })),
+                    metadata: None,
+                    output: Default::default(),
+                }),
+            ],
+        ),
+        typed_message(
+            "msg_b",
+            crate::backend::MessageRole::Assistant,
+            Some(1_300),
+            // A server-timestamped part: without the message floor its own
+            // key (1_300) sorts it above the receipt under clock skew.
+            vec![crate::backend::Part::Text(crate::backend::TextPart {
+                text: "作答后的继续".into(),
+                started_at: Some(1_300),
+            })],
+        ),
+    ]);
+    let handles = app.flow_handles();
+    Turn::render_and_flush(
+        &handles.cards,
+        &handles.sessions,
+        &handles.backend,
+        &handles.requests,
+        "ses_test",
+        &continuation,
+    )
+    .await;
+    Turn::flush_card(&handles.cards, "ses_test").await;
     let card = final_card(&platform).await;
     let text = card_text(&card);
+    assert!(
+        text.find("作答后的继续").is_some(),
+        "the continuation must render: {text}"
+    );
     assert!(
         text.find("✅ 已回答").unwrap() < text.find("作答后的继续").unwrap(),
         "post-click content stays below the receipt under clock skew: {text}"
@@ -1550,7 +1603,11 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     // Content written between the two asks predates the click: it stays above
     // the receipt. Content after the later ask follows it.
     Turn::push_text_at(&cards, "ses_test", 1_500, "两次提问之间").await;
+    // A message created after the latest ask (and so after the click) is
+    // floored at the receipt; the one before it keeps its position.
+    Turn::set_message_floor(&cards, "ses_test", Some(2_500)).await;
     Turn::push_text_at(&cards, "ses_test", 2_500, "自动之后的内容").await;
+    Turn::set_message_floor(&cards, "ses_test", None).await;
     Turn::flush_card(&cards, "ses_test").await;
 
     let text = card_text(&final_card(&platform).await);

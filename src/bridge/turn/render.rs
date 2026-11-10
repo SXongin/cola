@@ -1675,6 +1675,9 @@ pub(super) fn render_turn_parts(
             }
         }
         let message_pos = message_positions.get(message.id.as_str()).copied();
+        // A message the server created after a receipt's ask is post-click
+        // content: every part of it sorts after the receipt (issue #1023).
+        acc.set_message_floor(message.time.as_ref().map(|time| time.created));
         for (index, part) in message.parts.iter().enumerate() {
             let cut = match (seed.as_ref(), message_pos) {
                 (Some(seed), Some(pos)) => seed.cut(pos, index),
@@ -1713,6 +1716,7 @@ pub(super) fn render_turn_parts(
                 }
             }
         }
+        acc.set_message_floor(None);
     }
     rendered_any
 }
@@ -1800,6 +1804,7 @@ fn render_pending_gap(
         {
             continue;
         }
+        acc.set_message_floor(message.time.as_ref().map(|time| time.created));
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => {
@@ -1830,6 +1835,7 @@ fn render_pending_gap(
                 }
             }
         }
+        acc.set_message_floor(None);
     }
     rendered
 }
@@ -1964,6 +1970,7 @@ fn render_seed_scope(
         let Some(pos) = message_positions.get(message.id.as_str()).copied() else {
             continue;
         };
+        acc.set_message_floor(message.time.as_ref().map(|time| time.created));
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
@@ -1992,6 +1999,7 @@ fn render_seed_scope(
                 }
             }
         }
+        acc.set_message_floor(None);
     }
     if gap_scope && rendered {
         acc.mark_gap_rendered();
@@ -2247,15 +2255,28 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
         // The call's typed position — the seeded panel keeps it, so once it
         // settles its timeline entry can become the Rendered Cursor frontier
         // (spec #561, review #569).
+        let position = transcript.tool_call_position(&call_id);
         if let Some(call) = transcript.tool_call(&call_id)
-            && let Some((message_id, index)) = transcript.tool_call_position(&call_id)
-            && render_part(
+            && let Some((message_id, index)) = position.clone()
+        {
+            // The call's message carries the floor its settlement takes
+            // (issue #1023): a post-click message's parts follow the receipt.
+            acc.set_message_floor(
+                transcript
+                    .messages
+                    .iter()
+                    .find(|message| message.id == message_id)
+                    .and_then(|message| message.time)
+                    .map(|time| time.created),
+            );
+            if render_part(
                 acc,
                 Some(PartSource::at(message_id, index)),
                 &Part::Tool(call.clone()),
-            )
-        {
-            rendered = true;
+            ) {
+                rendered = true;
+            }
+            acc.set_message_floor(None);
         }
         if acc.tool_settled(&call_id) {
             acc.retire_seeded_call(&call_id);

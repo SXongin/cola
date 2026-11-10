@@ -1513,6 +1513,12 @@ pub(super) struct StreamAccumulator {
     /// the two asks must clear Q1's receipt while staying below the newer one
     /// — one "latest" cut cannot express that staircase.
     receipt_cuts: Vec<ReceiptCut>,
+    /// The timeline floor of the transcript MESSAGE currently being rendered
+    /// (issue #1023): a message the server created after a receipt's ask was
+    /// produced after that click, so every part of it sorts after the receipt.
+    /// Transient: the walks set it per message and clear it after, so a push
+    /// outside a walk (a synthetic receipt, a wake line) is never floored.
+    message_floor: Option<i64>,
     /// request id → the timeline key reserved for its receipt at CLICK time
     /// (issue #1023). The backend reply returns before the receipt is written,
     /// so a render poll can deliver post-click content in that gap; reserving
@@ -3044,30 +3050,41 @@ impl StreamAccumulator {
         }
     }
 
-    /// The key floor an entry whose own server time is `shown_at` earns from
-    /// the Interaction Receipts: every receipt whose asking time is BEFORE
-    /// `shown_at` was clicked before the entry was written, so the entry may
-    /// not sort above it ([`ReceiptCut`], ADR-0038 rule 4). The newest such
-    /// receipt's key is the floor. `None` when there is no such receipt, no
-    /// server time, or the entry predates every ask.
-    pub(super) fn receipt_cut_floor(&self, shown_at: Option<i64>) -> Option<i64> {
-        let at = shown_at?;
+    /// The key floor a transcript MESSAGE created at `created` earns from the
+    /// Interaction Receipts (issue #1023): every receipt asked before the
+    /// message existed was clicked before it was written, so none of its parts
+    /// may sort above that receipt ([`ReceiptCut`], ADR-0038 rule 4). A message
+    /// is the unit, not a part: a part that STARTED before the click but grew
+    /// after it belongs to a pre-click message and keeps its position, and a
+    /// parallel tool part delivered late sits in the asking message too. The
+    /// newest such receipt's key is the floor. `None` when there is no such
+    /// receipt or the message predates every ask.
+    pub(super) fn receipt_cut_floor(&self, created: i64) -> Option<i64> {
         self.receipt_cuts
             .iter()
-            .filter(|cut| at > cut.at)
+            .filter(|cut| created > cut.at)
             .map(|cut| cut.key)
             .max()
     }
 
+    /// Set (or clear) the floor for the transcript message about to render: the
+    /// walk calls this per message, so every part it pushes — including chunks
+    /// that continue a part across reads — is placed at or after the receipt
+    /// written for a click that preceded the message.
+    pub(super) fn set_message_floor(&mut self, created: Option<i64>) {
+        self.message_floor = created.and_then(|created| self.receipt_cut_floor(created));
+    }
+
     /// The timeline key a part's chunk is placed (and looked up) at: its own
-    /// server time, floored by the newest receipt cut (issue #1023). The push
-    /// paths must use this SAME key for the merge lookup — an entry already
-    /// placed at the floored key would otherwise be missed by a later chunk
-    /// still asking for the part's raw server key, and every render read would
-    /// start a second entry (a new reasoning panel, a split text run).
+    /// server time, floored by the CURRENT message's receipt floor (issue
+    /// #1023) and clamped to the live slice. The push paths must use this SAME
+    /// key for the merge lookup — an entry already placed at the floored key
+    /// would otherwise be missed by a later chunk still asking for the part's
+    /// raw server key, and every render read would start a second entry (a new
+    /// reasoning panel, a split text run).
     fn part_order_key(&mut self, at_ms: Option<i64>) -> i64 {
         let key = match at_ms {
-            Some(at) => self.receipt_cut_floor(Some(at)).map_or(at, |floor| at.max(floor)),
+            Some(at) => self.message_floor.map_or(at, |floor| at.max(floor)),
             None => self.next_order(),
         };
         // Apply the same live-slice clamp [`Self::insert_item`] will: a key
@@ -3750,13 +3767,11 @@ impl StreamAccumulator {
         kind: TimelineKind,
         lead: Option<String>,
     ) -> usize {
-        // A part the server timestamped AFTER an Interaction Receipt's asking
-        // time was produced after the click, so it may not sort above the
-        // receipt (issue #1023, [`ReceiptCut`]). The receipt's own key is the
-        // floor; equal keys keep this entry after it.
-        let key = self
-            .receipt_cut_floor(shown_at)
-            .map_or(key, |floor| key.max(floor));
+        // A part of a message the server created after an Interaction
+        // Receipt's ask was produced after the click, so it may not sort above
+        // the receipt (issue #1023, [`ReceiptCut`]). The receipt's own key is
+        // the floor; equal keys keep this entry after it.
+        let key = self.message_floor.map_or(key, |floor| key.max(floor));
         let idx = self.timeline.partition_point(|item| item.key <= key);
         let (idx, key) = if idx < self.render_from {
             (
@@ -3839,13 +3854,11 @@ impl StreamAccumulator {
     ) -> usize {
         self.item_seq += 1;
         let seq = self.item_seq;
-        // A continuation chunk of a part the server timestamped after a
-        // receipt's ask belongs below that receipt too (issue #1023): the
-        // first chunk is floored in [`Self::insert_item`], and a chunk left at
-        // the part's raw key would break the timeline's key order.
-        let key = self
-            .receipt_cut_floor(shown_at)
-            .map_or(key, |floor| key.max(floor));
+        // A continuation chunk of a part in a post-click message belongs below
+        // that receipt too (issue #1023): the first chunk is floored in
+        // [`Self::insert_item`], and a chunk left at the part's raw key would
+        // break the timeline's key order.
+        let key = self.message_floor.map_or(key, |floor| key.max(floor));
         let (idx, key) = if after + 1 < self.render_from {
             (
                 self.render_from,
@@ -8440,14 +8453,17 @@ mod tests {
         acc.add_interaction(question(Some(5_000)));
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
         assert!(
-            acc.receipt_cut_floor(Some(5_100)).is_some(),
+            acc.receipt_cut_floor(5_100).is_some(),
             "content after the ask earns a floor"
         );
 
         // The server's post-click continuation: its own time is 5_100, but the
         // receipt's cola-clock key is ~now, so without the cut it would sort
-        // ABOVE the receipt (ADR-0038 rule 4 forbids that).
+        // ABOVE the receipt (ADR-0038 rule 4 forbids that). The floor is the
+        // message's: a continuation message created after the ask.
+        acc.set_message_floor(Some(5_100));
         acc.push_text_at(Some(5_100), "continuation");
+        acc.set_message_floor(None);
         let card = acc.build_card().to_string();
         assert!(
             card.find("✅ 已回答").unwrap() < card.find("continuation").unwrap(),
@@ -8466,28 +8482,18 @@ mod tests {
             "pre-click content stays above the receipt: {card}"
         );
 
-        // An entry whose server time lives in its KEY (the external message
-        // block) is floored the same way: it records that time as its own.
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
-        acc.push_user_message(Some(5_100), "点击后的新消息");
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("✅ 已回答").unwrap() < card.find("点击后的新消息").unwrap(),
-            "a server-stamped user message follows the receipt too: {card}"
-        );
-
         // A part longer than one card entry is chunked: every continuation
         // chunk is floored too, so the timeline's key order cannot break under
         // the receipt (issue #1023).
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.set_message_floor(Some(5_100));
         acc.push_text_at(
             Some(5_100),
             &"长".repeat(crate::feishu::card::MAX_CARD_TEXT_CHARS + 10),
         );
+        acc.set_message_floor(None);
         assert!(
             acc.timeline.windows(2).all(|pair| pair[0].key <= pair[1].key),
             "the floored chunks keep the timeline key-sorted"
@@ -8506,7 +8512,9 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
         assert!(acc.reserve_receipt("q"), "the click reserves the receipt key");
+        acc.set_message_floor(Some(5_100));
         acc.push_text_at(Some(5_100), "竞态到达的继续");
+        acc.set_message_floor(None);
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
         let card = acc.build_card().to_string();
         assert!(
@@ -8523,7 +8531,9 @@ mod tests {
         acc.add_interaction(question(Some(5_000)));
         acc.push_text_at(Some(5_100), "远端作答前已可见");
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.set_message_floor(Some(5_200));
         acc.push_text_at(Some(5_200), "回执之后的内容");
+        acc.set_message_floor(None);
         let card = acc.build_card().to_string();
         assert!(
             card.find("远端作答前已可见").unwrap() < card.find("✅ 已回答").unwrap()
@@ -8545,6 +8555,7 @@ mod tests {
         let part = PartSource::at(MessageId::new("msg_part"), 0);
         acc.push_text_from(Some(3_000), Some(part.clone()), "甲");
         acc.push_text_from(Some(3_000), Some(part), "乙");
+        acc.set_message_floor(None);
         let texts: Vec<&str> = acc
             .timeline
             .iter()
@@ -8558,16 +8569,63 @@ mod tests {
             "the clamped slice key is used by the merge lookup: {texts:?}"
         );
 
+        // A PARALLEL part in the asking message: it started after the ask
+        // (2000 > 1000) and is delivered after the click, but its message was
+        // created before the click (900), so the Host could have seen it. The
+        // message-scoped floor leaves it above the receipt.
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(1_000)));
+        assert!(acc.reserve_receipt("q"), "the click reserves the receipt key");
+        acc.set_message_floor(Some(900));
+        acc.push_text_at(Some(2_000), "并行工具的结果");
+        acc.set_message_floor(None);
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("并行工具的结果").unwrap() < card.find("✅ 已回答").unwrap(),
+            "pre-click parallel work stays above the receipt: {card}"
+        );
+
+        // A part that SPANS the cut: it started before the click in a pre-click
+        // message, rendered once, then the click happens and it grows. Every
+        // chunk keeps the part's own entry (no floor, no second panel).
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(1_000)));
+        acc.set_message_floor(Some(900));
+        acc.push_text_at(Some(2_000), "跨点击的");
+        assert!(acc.reserve_receipt("q"), "the click reserves the receipt key");
+        acc.push_text_at(Some(2_000), "继续增长");
+        acc.set_message_floor(None);
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        let texts: Vec<&str> = acc
+            .timeline
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TimelineKind::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["跨点击的继续增长"], "one entry across the cut");
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("跨点击的继续增长").unwrap() < card.find("✅ 已回答").unwrap(),
+            "the spanning part stays above the receipt: {card}"
+        );
+
         // The SAME part arriving across two render reads still merges into one
         // entry: the merge lookup uses the floored key too (a raw-key lookup
         // would start a second entry — a new reasoning panel, a split text run).
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.set_message_floor(Some(5_100));
         acc.push_text_at(Some(5_100), "第一段");
         acc.push_text_at(Some(5_100), "第二段");
+        acc.set_message_floor(None);
+        acc.set_message_floor(Some(5_200));
         acc.push_reasoning_at(Some(5_200), "想一");
         acc.push_reasoning_at(Some(5_200), "想二");
+        acc.set_message_floor(None);
         let texts: Vec<&str> = acc
             .timeline
             .iter()
@@ -8621,7 +8679,9 @@ mod tests {
         acc.add_interaction(question("q2", 2_000));
         assert!(acc.resolve_interaction("q2", |_| "✅ 已回答 Q2".to_string()));
         assert!(acc.resolve_interaction("q1", |_| "✅ 已回答 Q1".to_string()));
+        acc.set_message_floor(Some(2_100));
         acc.push_text_at(Some(2_100), "两次提问之后写出的内容");
+        acc.set_message_floor(None);
         let card = acc.build_card().to_string();
         let q2 = card.find("✅ 已回答 Q2").unwrap();
         let q1 = card.find("✅ 已回答 Q1").unwrap();
@@ -8650,7 +8710,7 @@ mod tests {
         }));
         assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string()));
         assert!(acc.receipt_cuts.is_empty());
-        assert_eq!(acc.receipt_cut_floor(Some(1)), None);
+        assert_eq!(acc.receipt_cut_floor(1), None);
     }
 
     /// Two text parts of ONE message sharing a server time keep their own
