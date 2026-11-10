@@ -1504,6 +1504,12 @@ pub(super) struct StreamAccumulator {
     /// the two asks must clear Q1's receipt while staying below the newer one
     /// — one "latest" cut cannot express that staircase.
     receipt_cuts: Vec<ReceiptCut>,
+    /// request id → the timeline key reserved for its receipt at CLICK time
+    /// (issue #1023). The backend reply returns before the receipt is written,
+    /// so a render poll can deliver post-click content in that gap; reserving
+    /// the receipt's key first floors that content ABOVE the position the
+    /// receipt will take. Consumed by [`Self::resolve_interaction`].
+    reserved_receipts: HashMap<String, i64>,
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
     /// receipt is a timeline entry). Private to this module (no external
@@ -2946,16 +2952,27 @@ impl StreamAccumulator {
         // it (issue #1023): the receipt's server-time cut, so a later read's
         // post-click content cannot outrank the receipt on a skewed clock.
         let asked_at = self.interactions[idx].asked_at();
+        let question = matches!(self.interactions[idx], InteractionBlock::Question(_));
+        let reserved = self.reserved_receipts.remove(request_id);
         // `next_order` is the resolution moment with a monotonic guard: never
         // before the wall clock, never behind anything already on the card —
         // so a click's receipt always follows the content the Host was looking
         // at, even within the same millisecond. The key orders only: a receipt
         // resolves in cola's world, where no server time exists, and it shows
         // no clock rather than putting cola's in the panels' costume.
-        let key = self.next_order();
+        let key = reserved.unwrap_or_else(|| self.next_order());
         self.insert_kind(key, None, TimelineKind::Receipt(text));
-        if let Some(asked_at) = asked_at {
+        // A reserved key already floored the content written during the reply
+        // (issue #1023); an unreserved QUESTION is the remote path, where the
+        // turn-blocked rule lets the answer's ask cut the entries already
+        // placed. A permission without a reservation carries no cut: parallel
+        // tools make "newer than the ask" ambiguous while it waits.
+        if reserved.is_none()
+            && question
+            && let Some(asked_at) = asked_at
+        {
             self.record_receipt_cut(asked_at, key);
+            self.refloor_entries_after_cut(ReceiptCut { at: asked_at, key });
         }
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
         true
@@ -2969,23 +2986,49 @@ impl StreamAccumulator {
     /// nothing and leaves the earlier cuts in force.
     pub(super) fn record_receipt_cut(&mut self, asked_at: i64, key: i64) {
         self.receipt_cuts.push(ReceiptCut { at: asked_at, key });
-        self.refloor_entries_after_cut();
     }
 
-    /// Move every live timeline entry the server timestamped AFTER the newest
-    /// receipt's ask to the receipt's key (issue #1023). A render poll can
-    /// deliver a post-click continuation in the gap between the backend reply
-    /// and the receipt's own write — the click path returns from the server
-    /// first, and a remote client's answer is only noticed by the next sweep —
-    /// so that content may already sit ABOVE the receipt at its own server key.
-    /// It was written after the click (the request blocks the turn), so it must
-    /// follow the receipt; only entries at or after `render_from` are moved
-    /// (the finalized prefix is already on a sent card), keeping their own
-    /// order after it.
-    fn refloor_entries_after_cut(&mut self) {
-        let Some(cut) = self.receipt_cuts.last().copied() else {
-            return;
+    /// Reserve the timeline key for `request_id`'s Interaction Receipt at CLICK
+    /// time (issue #1023), before the backend reply. The reply returns before
+    /// the receipt is written, so a render poll can deliver post-click content
+    /// in that gap; flooring future inserts at `key + 1` keeps that content
+    /// after the position the receipt will take. Returns false when the card
+    /// does not carry an anchored live block for the request, or one is already
+    /// reserved (a repeated click keeps the first reservation — content after
+    /// that first click is already floored past it).
+    pub(super) fn reserve_receipt(&mut self, request_id: &str) -> bool {
+        if self.reserved_receipts.contains_key(request_id) {
+            return false;
+        }
+        let Some(asked_at) = self.interaction(request_id).and_then(|block| block.asked_at()) else {
+            return false;
         };
+        let receipt_key = self.next_order();
+        self.receipt_cuts.push(ReceiptCut {
+            at: asked_at,
+            key: receipt_key.saturating_add(1),
+        });
+        self.reserved_receipts.insert(request_id.to_string(), receipt_key);
+        true
+    }
+
+    /// Drop a click's reservation for `request_id` without writing a receipt —
+    /// a mode change resolves the block with ONE shared receipt, so its own
+    /// per-block key is never used (issue #1023).
+    pub(super) fn forget_reservation(&mut self, request_id: &str) {
+        self.reserved_receipts.remove(request_id);
+    }
+
+    /// Move every live timeline entry the server timestamped AFTER `cut.at` to
+    /// `cut.key` (issue #1023). Used when a QUESTION is resolved without a
+    /// reservation (a remote client's answer, noticed by a sweep): the Turn is
+    /// blocked while the question is pending, so content stamped after the ask
+    /// was produced after the click and must follow the receipt. Only entries
+    /// at or after `render_from` move (the finalized prefix is already on a
+    /// sent card), keeping their own order after it. A permission cannot use
+    /// this: other tools run in parallel while it waits, so newer content is
+    /// not necessarily post-click.
+    fn refloor_entries_after_cut(&mut self, cut: ReceiptCut) {
         let mut moved = Vec::new();
         let mut idx = self.render_from;
         while idx < self.timeline.len() {
@@ -3024,9 +3067,19 @@ impl StreamAccumulator {
     /// still asking for the part's raw server key, and every render read would
     /// start a second entry (a new reasoning panel, a split text run).
     fn part_order_key(&mut self, at_ms: Option<i64>) -> i64 {
-        match at_ms {
+        let key = match at_ms {
             Some(at) => self.receipt_cut_floor(Some(at)).map_or(at, |floor| at.max(floor)),
             None => self.next_order(),
+        };
+        // Apply the same live-slice clamp [`Self::insert_item`] will: a key
+        // behind the finalized boundary is placed at the slice's first key, and
+        // a later chunk's merge lookup must ask for THAT key or it would miss
+        // the entry and start a second one after a split.
+        let idx = self.timeline.partition_point(|item| item.key <= key);
+        if idx < self.render_from {
+            self.timeline.get(self.render_from).map_or(key, |item| item.key)
+        } else {
+            key
         }
     }
 
@@ -8448,16 +8501,57 @@ mod tests {
 
         // A render poll can deliver the continuation in the gap between the
         // backend reply and the receipt's write, so it is already placed when
-        // the receipt lands. It must be moved below the receipt, not left
-        // above it at its own (skewed) key.
+        // the receipt lands. On a LOCAL click the receipt's key is reserved
+        // first, so the gap content is floored above it and the receipt lands
+        // below — without moving anything placed before the click.
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
+        assert!(acc.reserve_receipt("q"), "the click reserves the receipt key");
         acc.push_text_at(Some(5_100), "竞态到达的继续");
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
         let card = acc.build_card().to_string();
         assert!(
             card.find("✅ 已回答").unwrap() < card.find("竞态到达的继续").unwrap(),
-            "a continuation placed before the receipt is moved below it: {card}"
+            "gap content follows the reserved receipt: {card}"
+        );
+
+        // Without a reservation (a remote client's answer, noticed by a sweep)
+        // the same content is already placed at its own key; the answer's ask
+        // cut moves it below the receipt — sound because a pending question
+        // blocks the turn.
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(5_000)));
+        acc.push_text_at(Some(5_100), "远端作答后到达的继续");
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("✅ 已回答").unwrap() < card.find("远端作答后到达的继续").unwrap(),
+            "a continuation placed before an unreserved receipt is moved below it: {card}"
+        );
+
+        // After a card split the live slice starts past the receipt's key: the
+        // first chunk is clamped to the slice's first key, and the next chunk
+        // must look the part up at that SAME clamped key (otherwise it starts
+        // a second entry — a duplicated text run or a new reasoning panel).
+        let mut acc = StreamAccumulator::new("test");
+        acc.insert_kind(1_000, None, TimelineKind::Receipt("✅ 已回答".into()));
+        acc.insert_kind(5_000, None, TimelineKind::Text("已发送卡片".into()));
+        acc.insert_kind(9_000, None, TimelineKind::Text("新切片".into()));
+        acc.render_from = 2;
+        acc.record_receipt_cut(500, 1_000);
+        acc.push_text_at(Some(6_000), "甲");
+        acc.push_text_at(Some(6_000), "乙");
+        let texts: Vec<&str> = acc
+            .timeline
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TimelineKind::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&"甲乙") && !texts.contains(&"乙"),
+            "the clamped slice key is used by the merge lookup: {texts:?}"
         );
 
         // The SAME part arriving across two render reads still merges into one
