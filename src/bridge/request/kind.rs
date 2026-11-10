@@ -761,13 +761,15 @@ impl RequestKind for PermissionKind {
                     // request (the sweep's `seen` set will not re-surface it),
                     // and the user must be able to retry either decision.
                     flow.unmark_answered(&handles.requests, req_id).await;
-                    Turn::forget_interaction_reservation(
-                        &handles.cards,
-                        host.as_deref().unwrap_or(session_id),
-                        req_id,
-                        reservation,
-                    )
-                    .await;
+                    if let Some(token) = reservation {
+                        Turn::forget_interaction_reservation(
+                            &handles.cards,
+                            host.as_deref().unwrap_or(session_id),
+                            req_id,
+                            token,
+                        )
+                        .await;
+                    }
                     return Some(CardActionResult {
                         card: None,
                         toast: Some("自动授权状态保存失败，请重试。".to_string()),
@@ -782,7 +784,19 @@ impl RequestKind for PermissionKind {
                 // becomes its Interaction Receipt so the streaming card
                 // re-renders without them synchronously — the poller would
                 // otherwise leave them lingering until the next poll notices
-                // the requests vanished (ADR-0038, rule 4).
+                // the requests vanished (ADR-0038, rule 4). Their own per-click
+                // reservations are dropped first, so the shared receipt takes
+                // the CLICKED block's reserved key (issue #1023).
+                for id in &approved {
+                    if id != req_id {
+                        Turn::drop_interaction_reservation(
+                            &handles.cards,
+                            host.as_deref().unwrap_or(session_id),
+                            id,
+                        )
+                        .await;
+                    }
+                }
                 cached = resolve_blocks(
                     flow,
                     &handles.cards,
@@ -1085,13 +1099,15 @@ impl RequestKind for PermissionKind {
             Err(e) => {
                 tracing::error!("perm reply failed: {}", e);
                 flow.unmark_answered(&handles.requests, req_id).await;
-                Turn::forget_interaction_reservation(
-                    &handles.cards,
-                    host.as_deref().unwrap_or(session_id),
-                    req_id,
-                    reservation,
-                )
-                .await;
+                if let Some(token) = reservation {
+                    Turn::forget_interaction_reservation(
+                        &handles.cards,
+                        host.as_deref().unwrap_or(session_id),
+                        req_id,
+                        token,
+                    )
+                    .await;
+                }
                 return Some(failed_result_card(
                     inline,
                     "该权限请求处理失败，请重试。",
@@ -2861,13 +2877,15 @@ async fn settle_question_reply(
             // (no replacement) and say the answer did not land.
             tracing::warn!("location form reply did not land ({}): {}", req_id, e);
             flow.unmark_answered(requests, req_id).await;
-            Turn::forget_interaction_reservation(
-                cards,
-                host.as_deref().unwrap_or(session_id),
-                req_id,
-                reservation,
-            )
-            .await;
+            if let Some(token) = reservation {
+                Turn::forget_interaction_reservation(
+                    cards,
+                    host.as_deref().unwrap_or(session_id),
+                    req_id,
+                    token,
+                )
+                .await;
+            }
             Some(CardActionResult {
                 card: None,
                 toast: Some(if cancel {
@@ -2880,13 +2898,15 @@ async fn settle_question_reply(
         Err(e) => {
             tracing::error!("question reply failed: {}", e);
             flow.unmark_answered(requests, req_id).await;
-            Turn::forget_interaction_reservation(
-                cards,
-                host.as_deref().unwrap_or(session_id),
-                req_id,
-                reservation,
-            )
-            .await;
+            if let Some(token) = reservation {
+                Turn::forget_interaction_reservation(
+                    cards,
+                    host.as_deref().unwrap_or(session_id),
+                    req_id,
+                    token,
+                )
+                .await;
+            }
             Some(failed_result_card(
                 inline,
                 "该问题处理失败，请重试。",

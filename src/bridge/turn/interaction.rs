@@ -352,7 +352,7 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
         request_id: &str,
-        token: Option<u64>,
+        token: u64,
     ) {
         let write_lock = cards.write_lock(session_id).await;
         let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
@@ -360,6 +360,23 @@ impl Turn {
         };
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.forget_reservation(request_id, token);
+        }
+    }
+
+    /// Drop `request_id`'s reservation unconditionally (issue #1023) — a mode
+    /// change resolves the block through its SHARED receipt, so the block's own
+    /// per-click reservation must not survive it.
+    pub(crate) async fn drop_interaction_reservation(
+        cards: &CardsHandle,
+        session_id: &str,
+        request_id: &str,
+    ) {
+        let write_lock = cards.write_lock(session_id).await;
+        let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
+            return;
+        };
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.consume_reservation(request_id);
         }
     }
 
@@ -374,6 +391,7 @@ impl Turn {
         session_id: &str,
         ids: &[String],
         residue: &InlineResidue<'_>,
+        reuse_reservation: bool,
     ) -> Option<(String, &'static str)> {
         let mut live = cards.cards.lock().await;
         let acc = &mut live.get_mut(session_id)?.acc;
@@ -386,7 +404,7 @@ impl Turn {
         for id in ids {
             let resolved = match residue {
                 InlineResidue::PerBlock(line) => {
-                    acc.resolve_interaction(id, |block| line(&block.receipt_target()))
+                    acc.resolve_interaction(id, |block| line(&block.receipt_target()), reuse_reservation)
                 }
                 InlineResidue::Single(_) => {
                     let asked = acc.interaction(id).and_then(|block| block.asked_at());
@@ -406,7 +424,7 @@ impl Turn {
                     } else {
                         // Nothing resolved under this id: its reservation must
                         // not outlive the click that made it.
-                        acc.forget_reservation(id, None);
+                        acc.consume_reservation(id);
                     }
                     resolved
                 }

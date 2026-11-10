@@ -386,10 +386,12 @@ in that gap. A **resolving click reserves the receipt's key** before it replies
 (`reserve_receipt`), which floors future inserts at `key + 1`; the receipt then
 takes the reserved key, so the gap content follows it. Nothing already placed
 moves: everything on the card before the click was something the Host could see.
-An Auto-Accept toggle reserves before its reply too, and its ONE mode receipt
-takes that reserved key (`take_reserved_receipt_key`); the other blocks it
-resolves drop their reservations (`forget_reservation`), and a reservation that
-never becomes a receipt drops its floor with it. The reservation consumes its
+An Auto-Accept toggle reserves before its reply too, with the LATEST ask among
+the live blocks its one receipt covers; the receipt takes that reserved key
+(`take_reserved_receipt`), and the blocks it resolves through the shared receipt
+drop their own reservations (`consume_reservation`). A reservation that never
+becomes a receipt drops its floor with it (`forget_reservation`, by token, so a
+stale click's late cleanup cannot delete a retry's fresh reservation). The reservation consumes its
 floor key from the synthetic key sequence, so no unrelated receipt can take the
 same key and be cut by a later cleanup.
 
@@ -399,9 +401,9 @@ already placed keep their server position. There is no click time to cut
 against, and moving placed content (child/background or external content can
 reach the card while a question waits) would violate rule 4 for what the remote
 Host already saw. That window (one sweep interval) is a deliberate limit. A
-permission carries no ask cut at all — parallel tools make "newer than the ask"
-ambiguous while it waits — and gets the floor only through a click's
-reservation, whose future messages are post-click. Every merge lookup uses the
+permission's receipt records the same message-scoped cut: parallel tools write
+their parts into the ASKING message (created before the ask), so they are never
+floored, while a new message after the answer follows the receipt. Every merge lookup uses the
 floored (and split-clamped) key, so a part cannot split into two entries across
 reads, and a part that spans the cut keeps one entry above the receipt.
 

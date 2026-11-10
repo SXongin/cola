@@ -5664,6 +5664,7 @@ async fn a_typed_answer_freezes_the_live_task_panel_activity() {
         "ses_test",
         &["que_typed".into()],
         &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+        true,
     )
     .await;
     wait_for_card_update(&platform, "the deferred activity", CardUpdates::Latest, |card| {
@@ -5876,6 +5877,7 @@ async fn a_typed_answer_freezes_the_yielded_ledger() {
         "ses_test",
         &["que_typed".into()],
         &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+        true,
     )
     .await;
     wait_for_card_update(
@@ -5958,6 +5960,7 @@ async fn a_typed_answer_freezes_the_live_ledger_rows() {
         "ses_test",
         &["que_typed".into()],
         &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+        true,
     )
     .await;
     wait_for_card_update(&platform, "the deferred live row", CardUpdates::Latest, |card| {

@@ -255,8 +255,14 @@ pub(crate) async fn resolve_blocks(
         Residue::PerBlock(line) => crate::bridge::turn::InlineResidue::PerBlock(*line),
         Residue::Single(text) => crate::bridge::turn::InlineResidue::Single(text),
     };
-    let post_resolution_header =
-        Turn::resolve_interactions(cards, host.as_deref().unwrap_or(session_id), ids, &residue_mode).await;
+    let post_resolution_header = Turn::resolve_interactions(
+        cards,
+        host.as_deref().unwrap_or(session_id),
+        ids,
+        &residue_mode,
+        matches!(origin, Origin::Click { .. }),
+    )
+    .await;
     // 2. The card handles: every card that rendered one of the blocks is
     //    edited from its cache. The clicked card's edit is the ack; any other
     //    card's edit is patched so its controls do not linger.
