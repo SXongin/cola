@@ -414,8 +414,8 @@ the sweep would have captured. The reservation takes the card write lock under a
 short budget (a click runs on Feishu's ack deadline, and a concurrent flush holds
 that lock across a network PATCH): under contention the reservation is skipped
 and the receipt keeps its default position. A block that reached the card without a surfacing read
-(a busy-follow seed, a restart re-adoption) carries no anchor and keeps the
-previous receipt behaviour; a **re-hosted** block keeps the anchor it was first
+(a restart re-adoption) carries no anchor and keeps the previous receipt
+behaviour; a **re-hosted** block keeps the anchor it was first
 surfaced with — the anchor belongs to the request, not to the card it sits on, so
 it travels in the block handle the registry writes at every render (the old
 accumulator is already gone when a re-host runs). A chunked entry's continuation

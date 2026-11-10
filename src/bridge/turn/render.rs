@@ -2030,7 +2030,11 @@ fn render_compactions(
         return false;
     }
     for (source, at_ms, fact) in owed {
+        // The row is keyed at its MESSAGE's server time; floor it by the same
+        // message cut a turn part gets (issue #1023).
+        acc.set_message_floor(at_ms);
         acc.push_compaction_at(at_ms, source, fact);
+        acc.set_message_floor(None);
     }
     true
 }
