@@ -485,7 +485,7 @@ const SURFACING_DRAIN_TIMEOUT_MS: u64 = 5_000;
 /// part (it is newer still) — a lower anchor could.
 /// `None` when the read carries no server time at all (the block then keeps the
 /// old receipt behaviour).
-fn asking_anchor(transcript: &crate::backend::SessionTranscript) -> Option<i64> {
+pub(crate) fn asking_anchor(transcript: &crate::backend::SessionTranscript) -> Option<i64> {
     // A capped read is a PREFIX: the asking tool part can be past the cap, so
     // its newest timestamp proves nothing about the whole turn. Leave the block
     // unanchored rather than floor content the Host already saw.
@@ -505,6 +505,27 @@ fn asking_anchor(transcript: &crate::backend::SessionTranscript) -> Option<i64> 
         .flat_map(|message| message.parts.iter())
         .filter_map(crate::backend::Part::started_at);
     timed_messages.chain(untimed_parts).max()
+}
+
+/// [`asking_anchor`] from one bounded transcript read of `session_id`, without
+/// rendering it. Used by the surfacing drain for an ancestor-hosted child and
+/// by the busy-follow seed, which both need the request's anchor but not the
+/// parts. A failed or timed-out read is `None` (the block stays unanchored).
+pub(crate) async fn session_anchor(handles: &FlowHandles, session_id: &str) -> Option<i64> {
+    match crate::bridge::bounded_call(
+        &format!("surfacing anchor ({session_id})"),
+        SURFACING_DRAIN_TIMEOUT_MS,
+        handles.backend.transcript(session_id),
+    )
+    .await
+    {
+        Some(Ok(transcript)) => asking_anchor(&transcript),
+        Some(Err(error)) => {
+            tracing::warn!("surfacing anchor transcript: {}", error);
+            None
+        }
+        None => None,
+    }
 }
 
 /// Whether `value` is answer state cola may persist for a Location Form.
@@ -969,6 +990,7 @@ impl RequestFlow {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool {
         // An over-budget permission must never be seeded onto a busy-follow card
         // without its companion: the block would render a clipped full target
@@ -982,7 +1004,7 @@ impl RequestFlow {
             return false;
         }
         self.kind
-            .add_initial_inline_locked(self, cards, host, req, dir, None)
+            .add_initial_inline_locked(self, cards, host, req, dir, asked_at)
             .await
     }
 
@@ -1803,24 +1825,7 @@ impl RequestFlow {
     /// without rendering it — a sub-task request hosted on an ancestor card
     /// (issue #1023). A failed or timed-out read leaves the block unanchored.
     async fn read_anchor(&self, handles: &FlowHandles, session_id: &str) -> Option<i64> {
-        let timeout_ms = self
-            .list_timeout_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .min(SURFACING_DRAIN_TIMEOUT_MS);
-        match crate::bridge::bounded_call(
-            &format!("{} surfacing anchor ({session_id})", self.kind.label()),
-            timeout_ms,
-            handles.backend.transcript(session_id),
-        )
-        .await
-        {
-            Some(Ok(transcript)) => asking_anchor(&transcript),
-            Some(Err(error)) => {
-                tracing::warn!("{} surfacing anchor transcript: {}", self.kind.label(), error);
-                None
-            }
-            None => None,
-        }
+        session_anchor(handles, session_id).await
     }
 
     /// Everything one sweep does with ONE listed request, wrapped by the

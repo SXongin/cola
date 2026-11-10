@@ -3111,7 +3111,14 @@ impl StreamAccumulator {
     /// would otherwise be missed by a later chunk still asking for the part's
     /// raw server key, and every render read would start a second entry (a new
     /// reasoning panel, a split text run).
-    fn part_order_key(&mut self, at_ms: Option<i64>) -> i64 {
+    fn part_order_key(&mut self, at_ms: Option<i64>, source: Option<&PartSource>) -> i64 {
+        // A part already on the timeline keeps the key it was placed at: an
+        // untimed V2 part (and a timed one whose floor/clamp differs on a later
+        // read) must keep merging into its own entry, or a growing part splits
+        // around a receipt that landed between its reads.
+        if let Some(key) = source.and_then(|source| self.placed_source_key(source)) {
+            return key;
+        }
         let key = match at_ms {
             Some(at) => self.message_floor.map_or(at, |floor| at.max(floor)),
             None => self.next_order(),
@@ -3833,6 +3840,19 @@ impl StreamAccumulator {
     /// search walks this key's own run for the part's entry instead of taking
     /// the run's last one. A `None` on either side demands an exact `None`
     /// match, so a synthetic push never absorbs a part's entry.
+    /// The timeline key of the entry this accumulator already holds for
+    /// `source`, when it holds one (issue #1023): a placed part's position is
+    /// fixed across reads, so a later chunk merges into it instead of starting
+    /// a second entry at a freshly allocated key.
+    fn placed_source_key(&self, source: &PartSource) -> Option<i64> {
+        self.timeline.iter().rev().find_map(|item| {
+            item.source
+                .as_ref()
+                .filter(|held| held.same_part(source))
+                .map(|_| item.key)
+        })
+    }
+
     fn source_entry(
         &self,
         key: i64,
@@ -3964,7 +3984,7 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = self.part_order_key(at_ms);
+        let key = self.part_order_key(at_ms, source.as_ref());
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
@@ -4088,7 +4108,7 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = self.part_order_key(at_ms);
+        let key = self.part_order_key(at_ms, source.as_ref());
         self.reasoning.push_str(chunk);
         // The entry THIS part merges into, never another part's at the same
         // server time (spec #561, review #569).
@@ -8753,6 +8773,50 @@ mod tests {
         acc.forget_reservation("q");
         assert!(acc.receipt_cuts.is_empty(), "the floor goes with the reservation");
         assert!(acc.reserved_receipts.is_empty());
+    }
+
+    /// V2 decodes EVERY text part with no start time, and the server can grow
+    /// a part across reads. A placed part keeps its entry: the suffix merges
+    /// above the receipt it was rendered before, instead of starting a second
+    /// entry at a fresh key below (issue #1023).
+    #[test]
+    fn an_untimed_part_that_grows_after_a_receipt_keeps_its_entry() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q".into(),
+            session_id: "s".into(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "继续?".into(),
+                header: "继续".into(),
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: "/w".into(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+            asked_at: Some(5_000),
+        }));
+        let part = PartSource::at(MessageId::new("msg_v2"), 0);
+        acc.push_text_from(None, Some(part.clone()), "第一段");
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.push_text_from(None, Some(part), "继续");
+        let texts: Vec<&str> = acc
+            .timeline
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TimelineKind::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["第一段继续"], "the part keeps one entry");
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("第一段继续").unwrap() < card.find("✅ 已回答").unwrap(),
+            "the grown part stays above the receipt it preceded: {card}"
+        );
     }
 
     /// A block surfaced without a read (a re-host, a busy-follow seed, a

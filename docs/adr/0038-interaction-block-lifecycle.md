@@ -408,7 +408,12 @@ reads, and a part that spans the cut keeps one entry above the receipt.
 A request whose asking part lives in a CHILD session (hosted on an ancestor's
 card) is anchored by one bounded read of the child's transcript, without
 rendering it: the ancestor card renders no child parts, but the anchor is still
-a property of the request. A block that reached the card without a surfacing read
+a property of the request. The busy-follow seed does the same: its plan carries
+the anchor from one bounded read, so a block attached by the follow has the cut
+the sweep would have captured. The reservation takes the card write lock under a
+short budget (a click runs on Feishu's ack deadline, and a concurrent flush holds
+that lock across a network PATCH): under contention the reservation is skipped
+and the receipt keeps its default position. A block that reached the card without a surfacing read
 (a busy-follow seed, a restart re-adoption) carries no anchor and keeps the
 previous receipt behaviour; a **re-hosted** block keeps the anchor it was first
 surfaced with — the anchor belongs to the request, not to the card it sits on, so
