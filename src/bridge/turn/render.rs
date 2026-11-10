@@ -2386,19 +2386,30 @@ enum RenderMode {
     /// so the settle tick adds no second durable write and no out-of-order
     /// flush (a pending split still serves on finalization, as before).
     Settling,
+    /// A surfacing drain (issue #1023): render the read so a request's
+    /// pre-question text lands BEFORE the block freezes the card, but write
+    /// only when the pass rendered content. The request sweep runs this on
+    /// every first surfacing; a header/footer-only delta there is not worth a
+    /// repaint (and would wake the card for a block that lands right after).
+    Draining,
 }
 
 impl RenderMode {
     /// Whether the pass persists the captured anchor on the durable record
     /// (ADR-0063).
     fn persists_anchor(self) -> bool {
-        matches!(self, Self::Streaming)
+        !matches!(self, Self::Settling)
     }
 
     /// Whether the pass may issue a card write; a settling pass leaves it to
     /// finalization.
     fn flushes(self) -> bool {
-        matches!(self, Self::Streaming)
+        !matches!(self, Self::Settling)
+    }
+
+    /// Whether only rendered content may owe the write (the surfacing drain).
+    fn content_only(self) -> bool {
+        matches!(self, Self::Draining)
     }
 }
 
@@ -2456,6 +2467,31 @@ pub(super) async fn render_and_flush(
         session_id,
         transcript,
         RenderMode::Streaming,
+    )
+    .await
+}
+
+/// [`render_and_flush`] for the request sweep's surfacing drain (issue #1023):
+/// render the read into the accumulator BEFORE a request block freezes the
+/// card, and write only when the pass rendered content. The drain's job is the
+/// text the Host must see before answering; header/footer churn alone is not
+/// worth a repaint there.
+pub(super) async fn render_and_flush_draining(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
+    session_id: &str,
+    transcript: &SessionTranscript,
+) -> Option<RenderPass> {
+    render_and_flush_inner(
+        cards,
+        sessions,
+        backend,
+        requests,
+        session_id,
+        transcript,
+        RenderMode::Draining,
     )
     .await
 }
@@ -2685,13 +2721,20 @@ async fn render_and_flush_inner(
         }
         None => (super::state::LedgerChange::default(), false),
     };
-    let owed = changed
-        || file_changed
-        || header_changed
-        || context_changed
-        || ledger.owes()
-        || liveness_changed
-        || entries_changed;
+    // A surfacing drain writes for content only (issue #1023): it exists to
+    // put the request's pre-question parts on the card, not to carry the
+    // header's tick or the footer's context figure.
+    let owed = if mode.content_only() {
+        changed || file_changed
+    } else {
+        changed
+            || file_changed
+            || header_changed
+            || context_changed
+            || ledger.owes()
+            || liveness_changed
+            || entries_changed
+    };
     let flush = if !mode.flushes() {
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
@@ -6641,6 +6684,7 @@ Index: /x/src/main.rs
             done: vec![false],
             open: 0,
             drafts: vec![String::new()],
+            asked_at: None,
         })));
         let transcript = SessionTranscript::new(vec![typed_message(
             "msg_user_plan",

@@ -1235,6 +1235,245 @@ async fn multi_select_custom_answer_appends_dedupes_and_removes() {
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 }
 
+/// Issue #1023: the request sweep can see a pending question BEFORE the
+/// session's render loop has written the assistant's pre-question explanation.
+/// Inserting the block first freezes the card (issue #917 keeps any repaint
+/// from wiping an unsubmitted answer), so the explanation would stay hidden
+/// until after the answer — the Host is asked to choose blind.
+///
+/// The sweep now drains the session once before the block lands, so the
+/// explanation is on the card when the question appears, and the block carries
+/// the asking tool's server time. That cut keeps a LATER read's post-click
+/// continuation below the receipt even when the server's clock runs behind
+/// cola's (the #1024 receipt-anchor requirement).
+#[tokio::test]
+async fn a_surfaced_question_drains_the_explanation_before_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.ask_questions(vec![crate::backend::types::QuestionRequest {
+        id: "que_race".into(),
+        session_id: "ses_test".into(),
+        questions: vec![crate::backend::types::QuestionInfo {
+            question: "选目录".into(),
+            header: "目录".into(),
+            options: vec![crate::backend::types::QuestionOption {
+                label: "/a".into(),
+                description: String::new(),
+                ..Default::default()
+            }],
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }]);
+    // The server has the explanation and the asking tool call; the render loop
+    // has not read them yet.
+    mock.given_transcript(
+        "ses_test",
+        vec![crate::backend::SessionTranscript::new(vec![
+            typed_message(
+                "msg_anchor_1000",
+                crate::backend::MessageRole::User,
+                Some(1_000),
+                vec![text_part("帮我看看")],
+            ),
+            typed_message(
+                "msg_a",
+                crate::backend::MessageRole::Assistant,
+                Some(1_100),
+                vec![
+                    text_part("先解释一下再问。"),
+                    crate::backend::Part::Tool(crate::backend::ToolCall {
+                        identity: crate::backend::ToolIdentity {
+                            name: "question".into(),
+                            call_id: "call_q".into(),
+                        },
+                        status: crate::backend::ToolStatus::Running,
+                        started_at: Some(1_200),
+                        input: Some(serde_json::json!({ "questions": [] })),
+                        metadata: None,
+                        output: Default::default(),
+                    }),
+                ],
+            ),
+        ])],
+    );
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    // The draining card renders the Turn the pending request belongs to: the
+    // live card's own anchor (production captures it from the session's
+    // prompt; `seed_live_card` seeds the card state only).
+    Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
+
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.question
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.question.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep").await;
+
+    let card = final_card(&platform).await;
+    let text = card_text(&card);
+    let explanation = text
+        .find("先解释一下再问。")
+        .unwrap_or_else(|| panic!("the explanation must be on the card before the question: {text}"));
+    let controls = text
+        .find("选目录")
+        .unwrap_or_else(|| panic!("the question must be surfaced: {text}"));
+    assert!(
+        explanation < controls,
+        "the explanation precedes the controls: {text}"
+    );
+    assert_eq!(
+        Turn::live_questions(&app.cards_handle(), "ses_test").await.len(),
+        1,
+        "the question is inlined on the live card"
+    );
+
+    // Answer it: the receipt carries the asking tool's time (1_200) as its
+    // cut. A continuation the server wrote after the click (1_300 — far below
+    // cola's wall-clock receipt key) must still follow the receipt.
+    let ack = app
+        .host_action(serde_json::json!({
+            "action": "question",
+            "reply": "answer",
+            "request_id": "que_race",
+            "session_id": "ses_test",
+            "question_index": 0,
+            "answer": "/a",
+        }))
+        .await
+        .expect("the answer is handled");
+    assert_eq!(ack.toast.as_deref(), Some("已回答"));
+    assert!(
+        ack.card
+            .as_ref()
+            .expect("the final answer carries the receipt card")
+            .to_string()
+            .contains("✅ 已回答"),
+        "the receipt lands in the click's ack"
+    );
+    let cards = app.cards_handle();
+    Turn::push_text_at(&cards, "ses_test", 1_300, "作答后的继续").await;
+    Turn::flush_card(&cards, "ses_test").await;
+    let card = final_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.find("✅ 已回答").unwrap() < text.find("作答后的继续").unwrap(),
+        "post-click content stays below the receipt under clock skew: {text}"
+    );
+}
+
+/// Issue #1023's bounded read: a failed transcript read changes nothing — the
+/// request still surfaces, exactly as before the drain existed.
+#[tokio::test]
+async fn a_failed_surfacing_drain_still_surfaces_the_question() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.ask_questions(vec![crate::backend::types::QuestionRequest {
+        id: "que_drain_fail".into(),
+        session_id: "ses_test".into(),
+        questions: vec![crate::backend::types::QuestionInfo {
+            question: "继续？".into(),
+            header: "下一步".into(),
+            options: vec![crate::backend::types::QuestionOption {
+                label: "继续".into(),
+                ..Default::default()
+            }],
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    backend.fail_transcript_for("ses_test").await;
+
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.question
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.question.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep").await;
+
+    assert_eq!(
+        Turn::live_questions(&app.cards_handle(), "ses_test").await.len(),
+        1,
+        "a failed drain must not block the request"
+    );
+}
+
+/// Issue #1023's bounded read: a WEDGED transcript read cannot park the sweep
+/// either — the drain gives up at its bound and the request still surfaces.
+#[tokio::test]
+async fn a_timed_out_surfacing_drain_still_surfaces_the_question() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.ask_questions(vec![crate::backend::types::QuestionRequest {
+        id: "que_drain_hang".into(),
+        session_id: "ses_test".into(),
+        questions: vec![crate::backend::types::QuestionInfo {
+            question: "继续？".into(),
+            header: "下一步".into(),
+            options: vec![crate::backend::types::QuestionOption {
+                label: "继续".into(),
+                ..Default::default()
+            }],
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }]);
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    backend.hang_transcript_for("ses_test").await;
+
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.question
+                .poll_interval_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            // Keep the drain's own bound short so the test does not sleep the
+            // production five seconds.
+            app.question
+                .list_timeout_ms
+                .store(50, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.question.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep").await;
+
+    assert_eq!(
+        Turn::live_questions(&app.cards_handle(), "ses_test").await.len(),
+        1,
+        "a wedged drain must not block the request"
+    );
+}
+
 /// A question raised during an active turn is surfaced INLINE on the
 /// streaming card; answering one of several only toasts and returns the
 /// re-rendered streaming card (markers/已选 in the callback response — the

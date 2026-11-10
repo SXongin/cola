@@ -85,19 +85,22 @@ impl Turn {
         // #917). The write lock is the flush's own, so the pair is ordered.
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        Self::add_permission_with_companion_locked(cards, session_id, p, directory, companion).await
+        Self::add_permission_with_companion_locked(cards, session_id, p, directory, companion, None).await
     }
 
     /// [`Self::add_permission_with_companion`] for a caller that already holds
     /// the Session's card write lock: the sweep's surfacing decision takes it
     /// across the inline-host check, the block insert and the flush
-    /// (ADR-0100).
+    /// (ADR-0100). `asked_at` is the asking tool part's server time from the
+    /// surfacing drain (issue #1023); the block keeps it as the Interaction
+    /// Receipt's server-time cut.
     pub(crate) async fn add_permission_with_companion_locked(
         cards: &CardsHandle,
         session_id: &str,
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
         companion: Option<crate::bridge::surfaces::CompanionDelivery>,
+        asked_at: Option<i64>,
     ) -> bool {
         let block = state::InteractionBlock::Permission(state::PendingPermission {
             session_id: p.session_id.clone().unwrap_or_default(),
@@ -109,6 +112,7 @@ impl Turn {
             summary_digest: companion
                 .as_ref()
                 .map(|_| crate::bridge::request::companion::patterns_target_digest(p)),
+            asked_at,
         });
         match cards.cards.lock().await.get_mut(session_id) {
             Some(card) => card.acc.add_interaction(block),
@@ -130,17 +134,19 @@ impl Turn {
         // flush are one ordered step against every card write (issue #917).
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        Self::add_question_locked(cards, session_id, q, directory, paint).await
+        Self::add_question_locked(cards, session_id, q, directory, paint, None).await
     }
 
     /// [`Self::add_question`] for a caller that already holds the Session's
-    /// card write lock (ADR-0100's one surfacing decision).
+    /// card write lock (ADR-0100's one surfacing decision). `asked_at` is the
+    /// asking tool part's server time from the surfacing drain (issue #1023).
     pub(crate) async fn add_question_locked(
         cards: &CardsHandle,
         session_id: &str,
         q: &crate::backend::types::QuestionRequest,
         directory: &str,
         paint: &crate::bridge::question::QuestionPaint,
+        asked_at: Option<i64>,
     ) -> bool {
         let block = state::InteractionBlock::Question(state::PendingQuestion {
             request_id: q.id.clone(),
@@ -153,6 +159,7 @@ impl Turn {
             done: paint.done.clone(),
             open: paint.open,
             drafts: paint.drafts.clone(),
+            asked_at,
         });
         match cards.cards.lock().await.get_mut(session_id) {
             Some(card) => card.acc.add_interaction(block),

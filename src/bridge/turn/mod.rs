@@ -3582,6 +3582,20 @@ impl Turn {
     ) -> Option<render::RenderPass> {
         render::render_and_flush(cards, sessions, backend, requests, session_id, transcript).await
     }
+
+    /// [`Self::render_and_flush`] for the request sweep's surfacing drain
+    /// (issue #1023): render the read before a request block freezes the card,
+    /// writing only when the pass rendered content.
+    pub(crate) async fn render_and_flush_draining(
+        cards: &CardsHandle,
+        sessions: &SessionsHandle,
+        backend: &Arc<dyn crate::backend::Backend>,
+        requests: &RequestsHandle,
+        session_id: &str,
+        transcript: &SessionTranscript,
+    ) -> Option<render::RenderPass> {
+        render::render_and_flush_draining(cards, sessions, backend, requests, session_id, transcript).await
+    }
 }
 
 /// The Instant Reminder facts a cola Turn's live card carries (ADR-0043): the
@@ -4853,6 +4867,15 @@ impl Turn {
     pub(crate) async fn push_reasoning_at(cards: &CardsHandle, session_id: &str, at_ms: i64, text: &str) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.push_reasoning_at(Some(at_ms), text);
+        }
+    }
+
+    /// Append text keyed at a server time (the render tests' seam for a part a
+    /// later read delivers with its own server clock).
+    #[cfg(test)]
+    pub(crate) async fn push_text_at(cards: &CardsHandle, session_id: &str, at_ms: i64, text: &str) {
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.push_text_at(Some(at_ms), text);
         }
     }
 
