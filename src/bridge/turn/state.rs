@@ -72,6 +72,15 @@ pub(super) struct TimelineItem {
     pub(super) lead: Option<String>,
 }
 
+/// A click's reservation of its Interaction Receipt's timeline position
+/// (issue #1023): the key the receipt will take, and the floor key already
+/// pushed into the cut list for content written during the reply.
+#[derive(Debug, Clone, Copy)]
+struct ReservedReceipt {
+    receipt_key: i64,
+    floor_key: i64,
+}
+
 /// An Interaction Receipt's **server-time cut** (issue #1023): the asking tool
 /// part's server time (`at`) and the receipt's own timeline key (`key`). Only
 /// `at` is on the server's clock — the cut exists so a later read's part times
@@ -1509,7 +1518,7 @@ pub(super) struct StreamAccumulator {
     /// so a render poll can deliver post-click content in that gap; reserving
     /// the receipt's key first floors that content ABOVE the position the
     /// receipt will take. Consumed by [`Self::resolve_interaction`].
-    reserved_receipts: HashMap<String, i64>,
+    reserved_receipts: HashMap<String, ReservedReceipt>,
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
     /// receipt is a timeline entry). Private to this module (no external
@@ -2953,7 +2962,10 @@ impl StreamAccumulator {
         // post-click content cannot outrank the receipt on a skewed clock.
         let asked_at = self.interactions[idx].asked_at();
         let question = matches!(self.interactions[idx], InteractionBlock::Question(_));
-        let reserved = self.reserved_receipts.remove(request_id);
+        let reserved = self
+            .reserved_receipts
+            .remove(request_id)
+            .map(|reserved| reserved.receipt_key);
         // `next_order` is the resolution moment with a monotonic guard: never
         // before the wall clock, never behind anything already on the card —
         // so a click's receipt always follows the content the Host was looking
@@ -2963,16 +2975,17 @@ impl StreamAccumulator {
         let key = reserved.unwrap_or_else(|| self.next_order());
         self.insert_kind(key, None, TimelineKind::Receipt(text));
         // A reserved key already floored the content written during the reply
-        // (issue #1023); an unreserved QUESTION is the remote path, where the
-        // turn-blocked rule lets the answer's ask cut the entries already
-        // placed. A permission without a reservation carries no cut: parallel
-        // tools make "newer than the ask" ambiguous while it waits.
+        // (issue #1023). Without one — a remote client's answer, noticed by a
+        // sweep — the answer's ask cuts FUTURE content (the click precedes the
+        // receipt), but entries already placed are left where they are: they
+        // may have been visible before the remote click, and there is no click
+        // time to re-floor against. A permission without a reservation carries
+        // no cut at all: parallel tools make "newer than the ask" ambiguous.
         if reserved.is_none()
             && question
             && let Some(asked_at) = asked_at
         {
             self.record_receipt_cut(asked_at, key);
-            self.refloor_entries_after_cut(ReceiptCut { at: asked_at, key });
         }
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
         true
@@ -3004,11 +3017,18 @@ impl StreamAccumulator {
             return false;
         };
         let receipt_key = self.next_order();
+        let floor_key = receipt_key.saturating_add(1);
         self.receipt_cuts.push(ReceiptCut {
             at: asked_at,
-            key: receipt_key.saturating_add(1),
+            key: floor_key,
         });
-        self.reserved_receipts.insert(request_id.to_string(), receipt_key);
+        self.reserved_receipts.insert(
+            request_id.to_string(),
+            ReservedReceipt {
+                receipt_key,
+                floor_key,
+            },
+        );
         true
     }
 
@@ -3016,33 +3036,12 @@ impl StreamAccumulator {
     /// a mode change resolves the block with ONE shared receipt, so its own
     /// per-block key is never used (issue #1023).
     pub(super) fn forget_reservation(&mut self, request_id: &str) {
-        self.reserved_receipts.remove(request_id);
-    }
-
-    /// Move every live timeline entry the server timestamped AFTER `cut.at` to
-    /// `cut.key` (issue #1023). Used when a QUESTION is resolved without a
-    /// reservation (a remote client's answer, noticed by a sweep): the Turn is
-    /// blocked while the question is pending, so content stamped after the ask
-    /// was produced after the click and must follow the receipt. Only entries
-    /// at or after `render_from` move (the finalized prefix is already on a
-    /// sent card), keeping their own order after it. A permission cannot use
-    /// this: other tools run in parallel while it waits, so newer content is
-    /// not necessarily post-click.
-    fn refloor_entries_after_cut(&mut self, cut: ReceiptCut) {
-        let mut moved = Vec::new();
-        let mut idx = self.render_from;
-        while idx < self.timeline.len() {
-            if self.timeline[idx].shown_at.is_some_and(|at| at > cut.at) {
-                moved.push(self.timeline.remove(idx));
-            } else {
-                idx += 1;
-            }
+        if let Some(reserved) = self.reserved_receipts.remove(request_id) {
+            // The mode receipt is the only cut this click leaves; the
+            // reservation's floor would otherwise outlive it and cut content
+            // against a receipt that is never written at that key.
+            self.receipt_cuts.retain(|cut| cut.key != reserved.floor_key);
         }
-        for mut item in moved {
-            item.key = cut.key;
-            self.timeline.push(item);
-        }
-        self.last_key = self.last_key.max(cut.key);
     }
 
     /// The key floor an entry whose own server time is `shown_at` earns from
@@ -8516,17 +8515,20 @@ mod tests {
         );
 
         // Without a reservation (a remote client's answer, noticed by a sweep)
-        // the same content is already placed at its own key; the answer's ask
-        // cut moves it below the receipt — sound because a pending question
-        // blocks the turn.
+        // already-placed content keeps its position — it may have been visible
+        // before the remote click, and there is no click time to re-floor
+        // against (the protocol limit). Future content is cut: the click
+        // precedes the receipt, so anything server-stamped later follows it.
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
-        acc.push_text_at(Some(5_100), "远端作答后到达的继续");
+        acc.push_text_at(Some(5_100), "远端作答前已可见");
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.push_text_at(Some(5_200), "回执之后的内容");
         let card = acc.build_card().to_string();
         assert!(
-            card.find("✅ 已回答").unwrap() < card.find("远端作答后到达的继续").unwrap(),
-            "a continuation placed before an unreserved receipt is moved below it: {card}"
+            card.find("远端作答前已可见").unwrap() < card.find("✅ 已回答").unwrap()
+                && card.find("✅ 已回答").unwrap() < card.find("回执之后的内容").unwrap(),
+            "placed content keeps its position; later content follows the receipt: {card}"
         );
 
         // After a card split the live slice starts past the receipt's key: the
@@ -8536,11 +8538,13 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.insert_kind(1_000, None, TimelineKind::Receipt("✅ 已回答".into()));
         acc.insert_kind(5_000, None, TimelineKind::Text("已发送卡片".into()));
-        acc.insert_kind(9_000, None, TimelineKind::Text("新切片".into()));
+        let head = PartSource::at(MessageId::new("msg_head"), 0);
+        acc.push_text_from(Some(9_000), Some(head), "新切片");
         acc.render_from = 2;
         acc.record_receipt_cut(500, 1_000);
-        acc.push_text_at(Some(6_000), "甲");
-        acc.push_text_at(Some(6_000), "乙");
+        let part = PartSource::at(MessageId::new("msg_part"), 0);
+        acc.push_text_from(Some(3_000), Some(part.clone()), "甲");
+        acc.push_text_from(Some(3_000), Some(part), "乙");
         let texts: Vec<&str> = acc
             .timeline
             .iter()

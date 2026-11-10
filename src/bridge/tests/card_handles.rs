@@ -66,7 +66,9 @@ fn question_request(request_id: &str, session_id: &str) -> crate::backend::types
 /// and in its handle. Returns the `seen` set that sweep used, so a caller can
 /// run the NEXT sweep with the poll loop's memory intact (a fresh set would
 /// surface the request as new instead of re-hosting it).
-async fn seed_old_turn_card_with_permission(app: &Arc<App>) -> std::collections::HashSet<String> {
+async fn seed_old_turn_card_with_permission(
+    app: &Arc<App>,
+) -> (std::collections::HashSet<String>, Option<i64>) {
     let cards = app.cards_handle();
     Turn::seed_card(&cards, "ses_old", Some("om_old")).await;
     Turn::set_title(&cards, "ses_old", "旧回合").await;
@@ -78,10 +80,12 @@ async fn seed_old_turn_card_with_permission(app: &Arc<App>) -> std::collections:
 
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    // The surfacing drain's anchor, before the accumulator is replaced.
+    let anchor = Turn::interaction_asked_at_in(&cards, "ses_old", "per_old").await;
 
     Turn::seed_card(&cards, "ses_old", Some("om_new")).await;
     Turn::set_title(&cards, "ses_old", "新回合").await;
-    seen
+    (seen, anchor)
 }
 
 /// How many times the platform patched `message_id` in place.
@@ -223,7 +227,7 @@ async fn click_updates_a_non_current_card_through_its_handle() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_old", "/work").await;
-    seed_old_turn_card_with_permission(&app).await;
+    let _ = seed_old_turn_card_with_permission(&app).await;
     let patches_before = patches_of(&platform, "om_old").await;
 
     let result = app
@@ -284,7 +288,7 @@ async fn sweep_repaints_a_non_current_card_from_its_cache() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
     seed_session(&app, "ses_old", "/work").await;
-    seed_old_turn_card_with_permission(&app).await;
+    let _ = seed_old_turn_card_with_permission(&app).await;
 
     // Resolved by another client: the request leaves the pending list.
     backend.permission_resolved_by_another("per_old").await;
@@ -711,7 +715,7 @@ async fn sweep_rehosts_a_pending_block_onto_the_new_turn_card() {
 
     // The old turn's card carries the block; a new turn then replaced the
     // accumulator. The poll loop has already seen the request.
-    let mut seen = seed_old_turn_card_with_permission(&app).await;
+    let (mut seen, anchor) = seed_old_turn_card_with_permission(&app).await;
     assert_eq!(
         app.card_handles.lock().await.message_of("per_old"),
         Some("om_old"),
@@ -724,6 +728,15 @@ async fn sweep_rehosts_a_pending_block_onto_the_new_turn_card() {
         app.card_handles.lock().await.message_of("per_old"),
         Some("om_new"),
         "the handle follows the new turn's card"
+    );
+    assert!(
+        anchor.is_some(),
+        "precondition: the first surfacing captured an anchor"
+    );
+    assert_eq!(
+        Turn::interaction_asked_at_in(&app.cards_handle(), "ses_old", "per_old").await,
+        anchor,
+        "the re-hosted block keeps the anchor its first surfacing captured"
     );
     let new_card = last_card_of(&platform, "om_new").await;
     assert!(

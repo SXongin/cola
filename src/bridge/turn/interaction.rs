@@ -36,6 +36,24 @@ impl Turn {
             .is_some_and(|c| c.acc.interaction(request_id).is_some())
     }
 
+    /// The asking tool's server time carried by `session_id`'s block for
+    /// `request_id` — the test seam for the re-host's anchor retention (issue
+    /// #1023).
+    #[cfg(test)]
+    pub(crate) async fn interaction_asked_at_in(
+        cards: &CardsHandle,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<i64> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|card| card.acc.interaction(request_id))
+            .and_then(|block| block.asked_at())
+    }
+
     /// The Instant Reminder source facts of a cola Turn's live card (ADR-0043).
     /// `None` when no cola turn registered one — an external turn, or a request
     /// pending across a restart.
