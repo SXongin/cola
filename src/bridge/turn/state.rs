@@ -76,9 +76,9 @@ pub(super) struct TimelineItem {
 /// (issue #1023): the key the receipt will take, and the floor key already
 /// pushed into the cut list for content written during the reply.
 #[derive(Debug, Clone, Copy)]
-struct ReservedReceipt {
-    receipt_key: i64,
-    floor_key: i64,
+pub(super) struct ReservedReceipt {
+    pub(super) receipt_key: i64,
+    pub(super) floor_key: i64,
 }
 
 /// An Interaction Receipt's **server-time cut** (issue #1023): the asking tool
@@ -3043,13 +3043,28 @@ impl StreamAccumulator {
         true
     }
 
-    /// Take the timeline key reserved for `request_id`'s receipt, if a click
-    /// reserved one (issue #1023). Used by the mode-change path, whose ONE
-    /// receipt covers several blocks.
-    pub(super) fn take_reserved_receipt_key(&mut self, request_id: &str) -> Option<i64> {
-        self.reserved_receipts
-            .remove(request_id)
-            .map(|reserved| reserved.receipt_key)
+    /// Take the reservation for `request_id`, if a click made one (issue
+    /// #1023). The mode-change path reuses the clicked block's key for its ONE
+    /// receipt.
+    pub(super) fn take_reserved_receipt(&mut self, request_id: &str) -> Option<ReservedReceipt> {
+        self.reserved_receipts.remove(request_id)
+    }
+
+    /// Drop a reservation's floor cut without writing its receipt — a mode
+    /// change uses ONE key, so the other blocks' floors must go with their
+    /// unused reservations.
+    pub(super) fn forget_reserved_cut(&mut self, floor_key: i64) {
+        self.receipt_cuts.retain(|cut| cut.key != floor_key);
+    }
+
+    /// Re-point a reservation's floor cut at the LATEST ask it covers. A mode
+    /// change resolves several blocks with one receipt; content written between
+    /// an earlier ask and the clicked (latest) ask was visible before the
+    /// click, so the cut must use the latest ask, not the clicked block's own.
+    pub(super) fn retune_receipt_cut(&mut self, floor_key: i64, at: i64) {
+        if let Some(cut) = self.receipt_cuts.iter_mut().find(|cut| cut.key == floor_key) {
+            cut.at = cut.at.max(at);
+        }
     }
 
     /// Drop a click's reservation for `request_id` without writing a receipt —
@@ -8704,6 +8719,40 @@ mod tests {
             q2 < q1 && q1 < after,
             "the content clears both receipts, the last click included: {card}"
         );
+    }
+
+    /// A failed reply drops the click's reservation (issue #1023): its floor
+    /// must not outlive a receipt that never lands, and the retry must reserve
+    /// a fresh key.
+    #[test]
+    fn forgetting_a_reservation_drops_its_floor_and_frees_its_key() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q".into(),
+            session_id: "s".into(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "继续?".into(),
+                header: "继续".into(),
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: "/w".into(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+            asked_at: Some(1_000),
+        }));
+        assert!(acc.reserve_receipt("q"));
+        let floor = acc.receipt_cuts.last().expect("a floor cut").key;
+        assert!(
+            acc.next_order() > floor,
+            "the floor key is consumed, so an unrelated receipt cannot take it"
+        );
+        acc.forget_reservation("q");
+        assert!(acc.receipt_cuts.is_empty(), "the floor goes with the reservation");
+        assert!(acc.reserved_receipts.is_empty());
     }
 
     /// A block surfaced without a read (a re-host, a busy-follow seed, a

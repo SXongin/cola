@@ -1472,6 +1472,15 @@ async fn a_failed_surfacing_drain_still_surfaces_the_question() {
         1,
         "a failed drain must not block the request"
     );
+    assert!(
+        backend
+            .transcript_calls
+            .lock()
+            .await
+            .iter()
+            .any(|session| session == "ses_test"),
+        "the drain did attempt the read"
+    );
 }
 
 /// Issue #1023's bounded read: a WEDGED transcript read cannot park the sweep
@@ -1608,7 +1617,12 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     assert!(resolved.is_some(), "the mode change resolves the blocks");
     // Content written between the two asks predates the click: it stays above
     // the receipt. Content after the later ask follows it.
+    // A message created between the two asks (1_500) and delivered after the
+    // receipt was visible before the click: the retuned cut (latest ask 2_000)
+    // leaves it above the receipt.
+    Turn::set_message_floor(&cards, "ses_test", Some(1_500)).await;
     Turn::push_text_at(&cards, "ses_test", 1_500, "两次提问之间").await;
+    Turn::set_message_floor(&cards, "ses_test", None).await;
     // A message created after the latest ask (and so after the click) is
     // floored at the receipt; the one before it keeps its position.
     Turn::set_message_floor(&cards, "ses_test", Some(2_500)).await;
