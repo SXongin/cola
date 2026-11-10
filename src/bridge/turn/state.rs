@@ -3225,12 +3225,17 @@ impl StreamAccumulator {
     /// #1022): a later render pass skips the earlier message as deduped, but the
     /// next message's parts still may not sort above it. Only transcript part
     /// entries count — a receipt or synthetic line is not read-order content.
-    pub(super) fn seed_read_floor(&mut self) {
+    /// [`Self::seed_read_floor`] restricted to the messages this walk covers:
+    /// a gap or takeover seed renders one Turn's window, and another Turn's
+    /// later cards must not floor it (issue #1022).
+    pub(super) fn seed_read_floor_where(&mut self, include: impl Fn(&MessageId) -> bool) {
         self.read_floor = self
             .timeline
             .iter()
             .filter(|item| {
-                item.source.is_some()
+                item.source
+                    .as_ref()
+                    .is_some_and(|source| include(&source.message_id))
                     && matches!(
                         item.kind,
                         TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
@@ -3930,10 +3935,17 @@ impl StreamAccumulator {
             &kind,
             TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
         );
-        let key = match (is_turn_part, self.read_floor) {
+        // Only a transcript PART is read-order content: a synthetic entry (a
+        // receipt, a wake line, a test push) keeps its own key and never moves
+        // the floor.
+        let read_ordered = is_turn_part && source.is_some();
+        let key = match (read_ordered, self.read_floor) {
             (true, Some(floor)) => key.max(floor),
             _ => key,
         };
+        if read_ordered {
+            self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
+        }
         // Equal keys keep ALLOCATION order (`order`): a live tool panel is
         // allocated at its transcript position and joins the timeline only when
         // it settles, after a later part of the same message may have been
@@ -4401,6 +4413,9 @@ impl StreamAccumulator {
                 (true, Some(floor)) => key.max(floor),
                 _ => key,
             };
+            if source.is_some() {
+                self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
+            }
             if live {
                 // Unfinished: TAIL content. Allocate its identity and key now,
                 // but do not join the timeline — a split must never finalize a
