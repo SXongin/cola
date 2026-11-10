@@ -2997,19 +2997,16 @@ impl StreamAccumulator {
         let key = reserved.unwrap_or_else(|| self.next_order());
         self.insert_kind(key, None, TimelineKind::Receipt(text));
         // A reserved key already floored the content written during the reply
-        // (issue #1023). Without one — a remote client's answer, noticed by a
-        // sweep — the answer's ask cuts FUTURE content (the click precedes the
-        // receipt), but entries already placed are left where they are: they
-        // may have been visible before the remote click, and there is no click
-        // time to re-floor against. A permission without a reservation carries
-        // no cut at all: parallel tools make "newer than the ask" ambiguous.
+        // (issue #1023). Without one — a remote client's answer, or a click
+        // whose reservation was skipped under the lock budget — the ask cuts
+        // FUTURE messages only: entries already placed are left where they are
+        // (they may have been visible before the remote click, and there is no
+        // click time to re-floor against). The cut is message-scoped, so a
+        // permission's parallel parts (in the asking message) are never cut
+        // while a new message after the answer is.
         if reserved.is_none()
             && let Some(asked_at) = asked_at
         {
-            // Message-scoped, so a permission's parallel pre-click work (in the
-            // asking message) is never cut; a new message is post-click for
-            // either kind. The turn-blocked argument the old comment relied on
-            // is not needed.
             self.record_receipt_cut(asked_at, key);
         }
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
@@ -3037,19 +3034,6 @@ impl StreamAccumulator {
     pub(super) fn reserve_receipt(&mut self, request_id: &str) -> Option<u64> {
         let asked_at = self.interaction(request_id).and_then(|block| block.asked_at())?;
         self.reserve_receipt_at(request_id, asked_at)
-    }
-
-    /// [`Self::reserve_receipt`] for a mode change: its one receipt covers every
-    /// live block, so its cut is the LATEST ask among them — content written
-    /// after an earlier ask but before the click was visible before it.
-    pub(super) fn reserve_receipt_for_pending(&mut self, request_id: &str) -> Option<u64> {
-        let at = self
-            .interactions
-            .iter()
-            .filter(|block| matches!(block, InteractionBlock::Permission(_)) && block.is_live())
-            .filter_map(|block| block.asked_at())
-            .max()?;
-        self.reserve_receipt_at(request_id, at)
     }
 
     fn reserve_receipt_at(&mut self, request_id: &str, asked_at: i64) -> Option<u64> {

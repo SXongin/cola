@@ -1580,12 +1580,25 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
         )
         .await
     );
+    // A SIBLING session's permission on the same card, asked much later: the
+    // toggle does not resolve it, so its ask must not raise the cut.
+    assert!(
+        Turn::add_permission_with_companion_locked(
+            &cards,
+            "ses_test",
+            &perm_request("per_sibling", "ses_child", "pwd"),
+            "/work",
+            None,
+            Some(5_000),
+        )
+        .await
+    );
     Turn::flush_card(&cards, "ses_test").await;
 
     // The toggle's click reserves the mode receipt's position BEFORE its
     // reply; a message rendered while the reply is in flight follows it.
     assert!(
-        Turn::reserve_interaction_cut_for_pending(&cards, "ses_test", "per_auto")
+        Turn::reserve_interaction_cut(&cards, "ses_test", "per_auto")
             .await
             .is_some()
     );
@@ -1609,6 +1622,11 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     Turn::set_message_floor(&cards, "ses_test", Some(2_500)).await;
     Turn::push_text_at(&cards, "ses_test", 2_500, "自动之后的内容").await;
     Turn::set_message_floor(&cards, "ses_test", None).await;
+    // A message after the resolved asks but BEFORE the unresolved sibling's
+    // ask (4_000 < 5_000) is still post-click for THIS receipt.
+    Turn::set_message_floor(&cards, "ses_test", Some(4_000)).await;
+    Turn::push_text_at(&cards, "ses_test", 4_000, "兄弟会话的提问之前").await;
+    Turn::set_message_floor(&cards, "ses_test", None).await;
     Turn::flush_card(&cards, "ses_test").await;
 
     let text = card_text(&final_card(&platform).await);
@@ -1618,8 +1636,10 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
         "content visible before the click stays above the receipt: {text}"
     );
     assert!(
-        receipt < text.find("点击后到达的继续").unwrap() && receipt < text.find("自动之后的内容").unwrap(),
-        "post-click content follows the receipt: {text}"
+        receipt < text.find("点击后到达的继续").unwrap()
+            && receipt < text.find("自动之后的内容").unwrap()
+            && receipt < text.find("兄弟会话的提问之前").unwrap(),
+        "post-click content follows the receipt, the sibling ask aside: {text}"
     );
 }
 
