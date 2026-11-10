@@ -628,18 +628,20 @@ pub enum UncollectableReason {
     SecretInput,
 }
 
-/// Who owns a pending form/question request. A Session-owned request belongs
-/// to the Session that asked; a Location-owned one belongs to a directory
-/// (an MCP elicitation from a directory-owned server, ADR-0103), so no
-/// Session — and no Turn — can own its surface.
+/// What a pending form/question request is scoped to. A Session-scoped
+/// request belongs to the Session that asked; a Location-scoped one belongs
+/// to a directory (an MCP elicitation from a directory-owned server,
+/// ADR-0103), so no Session — and no Turn — owns its surface. Named `scope`,
+/// not `owner`: in this repo an **Owner** is the Chat/Topic a Session maps to
+/// (ADR-0007).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RequestOwner {
+pub enum RequestScope {
     /// The ordinary case: the request names the asking Session.
     #[default]
     Session,
     /// The request belongs to the directory that listed it; there is no
     /// Session. `QuestionRequest::session_id` is empty for one of these — the
-    /// adapter maps its wire sentinel to this owner, and the bridge never
+    /// adapter maps its wire sentinel to this scope, and the bridge never
     /// reads that sentinel.
     Location,
 }
@@ -657,9 +659,9 @@ pub struct QuestionRequest {
     /// the reason and offer only a decline. The neutral shape carries the
     /// reason, never the user-facing copy.
     pub uncollectable: Option<UncollectableReason>,
-    /// Who owns the request. A Location Form carries no Session; its surface
-    /// belongs to the directory's Chat/Topic (ADR-0103).
-    pub owner: RequestOwner,
+    /// What the request is scoped to. A Location Form carries no Session; its
+    /// surface belongs to the directory's Chat/Topic (ADR-0103).
+    pub scope: RequestScope,
     /// The asking MCP server of an elicitation (`metadata.server`); `None` on
     /// a session-backed form and every V1 question.
     pub server: Option<String>,
@@ -687,7 +689,7 @@ impl QuestionRequest {
             title,
             questions,
             uncollectable,
-            owner: RequestOwner::Location,
+            scope: RequestScope::Location,
             server,
             message,
         }
@@ -695,7 +697,7 @@ impl QuestionRequest {
 
     /// Whether this request belongs to a directory rather than a Session.
     pub fn is_location(&self) -> bool {
-        self.owner == RequestOwner::Location
+        self.scope == RequestScope::Location
     }
 
     /// A request cola cannot safely collect at all — a secret input, which
@@ -709,7 +711,7 @@ impl QuestionRequest {
             title: String::new(),
             questions: Vec::new(),
             uncollectable: Some(UncollectableReason::SecretInput),
-            owner: RequestOwner::Session,
+            scope: RequestScope::Session,
             server: None,
             message: None,
         }

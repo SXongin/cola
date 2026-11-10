@@ -464,7 +464,7 @@ impl RawMcpServer {
 
 /// The session sentinel an OpenCode location-owned MCP elicitation carries
 /// (`GLOBAL_ELICITATION_SESSION_ID`). It is the *wire's* spelling: the neutral
-/// model maps it to [`crate::backend::types::RequestOwner::Location`], and the
+/// model maps it to [`crate::backend::types::RequestScope::Location`], and the
 /// bridge never reads this string.
 pub(super) const GLOBAL_ELICITATION_SESSION_ID: &str = "global";
 
@@ -556,7 +556,7 @@ impl RawForm {
             title,
             questions,
             uncollectable,
-            owner: crate::backend::types::RequestOwner::Session,
+            scope: crate::backend::types::RequestScope::Session,
             server: metadata.server,
             message: metadata.message,
         }

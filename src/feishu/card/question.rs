@@ -785,8 +785,11 @@ pub fn question_elements(
     drafts: &[String],
 ) -> Vec<serde_json::Value> {
     let mut md = super::sanitize::CardMarkdown::new();
+    // The public question card keeps the semantic "cannot answer"; the
+    // Location Form passes 「取消」, its explicit decline.
     question_elements_with(
         &mut md,
+        "🚫 无法回答",
         title,
         uncollectable,
         request_id,
@@ -807,6 +810,7 @@ pub fn question_elements(
 #[allow(clippy::too_many_arguments)]
 fn question_elements_with(
     md: &mut super::sanitize::CardMarkdown,
+    decline_label: &str,
     title: &str,
     uncollectable: Option<UncollectableReason>,
     request_id: &str,
@@ -1123,7 +1127,12 @@ fn question_elements_with(
                 },
             }));
         }
-        form.push(question_reject_button(request_id, session_id, directory));
+        form.push(question_reject_button(
+            decline_label,
+            request_id,
+            session_id,
+            directory,
+        ));
         elements.push(json!({
             "tag": "form",
             "name": format!("form_{request_id}"),
@@ -1132,7 +1141,12 @@ fn question_elements_with(
     } else {
         // Nothing to collect: the reason's copy above and the decline control.
         // No form — there is no field an answer could be typed into.
-        elements.push(question_reject_button(request_id, session_id, directory));
+        elements.push(question_reject_button(
+            decline_label,
+            request_id,
+            session_id,
+            directory,
+        ));
     }
 
     elements
@@ -1186,10 +1200,15 @@ fn switch_button(request_id: &str, session_id: &str, index: usize, from: usize) 
 
 /// The reject control every question block carries. One builder, so the
 /// uncollectable block and an ordinary question cannot drift.
-fn question_reject_button(request_id: &str, session_id: &str, directory: &str) -> serde_json::Value {
+fn question_reject_button(
+    decline_label: &str,
+    request_id: &str,
+    session_id: &str,
+    directory: &str,
+) -> serde_json::Value {
     json!({
         "tag": "button",
-        "text": { "tag": "plain_text", "content": "🚫 无法回答" },
+        "text": { "tag": "plain_text", "content": decline_label },
         "type": "danger",
         "value": {
             "action": "question",
@@ -1512,6 +1531,7 @@ pub fn build_location_form_card(
     });
     let mut body = question_elements_with(
         &mut md,
+        "🚫 取消",
         "",
         uncollectable,
         &req.id,

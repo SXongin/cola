@@ -802,7 +802,7 @@ impl WireQuestion {
             uncollectable: None,
             // V1 questions are always session-backed: it has no MCP
             // elicitation-form surface (ADR-0103).
-            owner: crate::backend::types::RequestOwner::Session,
+            scope: crate::backend::types::RequestScope::Session,
             server: None,
             message: None,
         }

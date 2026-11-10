@@ -202,13 +202,23 @@ fn boolean_location_form(request_id: &str) -> QuestionRequest {
     QuestionRequest::location(
         request_id,
         "确认部署".into(),
-        vec![QuestionInfo {
-            key: "confirm".into(),
-            question: "现在部署吗？".into(),
-            header: "确认".into(),
-            kind: FormFieldKind::Boolean,
-            ..Default::default()
-        }],
+        vec![
+            QuestionInfo {
+                key: "confirm".into(),
+                question: "现在部署吗？".into(),
+                header: "确认".into(),
+                kind: FormFieldKind::Boolean,
+                ..Default::default()
+            },
+            QuestionInfo {
+                key: "later".into(),
+                question: "备注".into(),
+                header: "备注".into(),
+                kind: FormFieldKind::String,
+                custom: Some(true),
+                ..Default::default()
+            },
+        ],
         Some("deploy".into()),
         Some("确认部署".into()),
         None,
@@ -216,19 +226,29 @@ fn boolean_location_form(request_id: &str) -> QuestionRequest {
 }
 
 /// A free-text Location Form: its typed value is not a toggle and must never
-/// reach the mirror.
+/// reach the mirror. A second unanswered field keeps the request pending so the
+/// record can be inspected before a sweep settles it.
 fn free_text_location_form(request_id: &str) -> QuestionRequest {
     QuestionRequest::location(
         request_id,
         "输入备注".into(),
-        vec![QuestionInfo {
-            key: "note".into(),
-            question: "备注".into(),
-            header: "备注".into(),
-            kind: FormFieldKind::String,
-            custom: Some(true),
-            ..Default::default()
-        }],
+        vec![
+            QuestionInfo {
+                key: "note".into(),
+                question: "备注".into(),
+                header: "备注".into(),
+                kind: FormFieldKind::String,
+                custom: Some(true),
+                ..Default::default()
+            },
+            QuestionInfo {
+                key: "confirm".into(),
+                question: "确认？".into(),
+                header: "确认".into(),
+                kind: FormFieldKind::Boolean,
+                ..Default::default()
+            },
+        ],
         Some("deploy".into()),
         Some("输入备注".into()),
         None,
@@ -714,6 +734,10 @@ async fn answering_routes_the_location_form_with_its_directory() {
         fixture.backend.reply_question_routes.lock().await.is_empty(),
         "a Location Form must never take the session route"
     );
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_answer").is_none(),
+        "a settled Location Form clears its record immediately, not at the next sweep"
+    );
 }
 
 /// A typed (form-submitted) Location Form answer survives the name-only
@@ -798,6 +822,10 @@ async fn cancelling_declines_through_the_location_route() {
     assert!(calls[0].1.is_none(), "a cancel carries no answers");
     assert_eq!(calls[0].2.as_deref(), Some("/work"));
     assert!(fixture.backend.reply_question_routes.lock().await.is_empty());
+    assert!(
+        persisted_location_form(&fixture.session_file(), "frm_cancel").is_none(),
+        "a cancelled Location Form clears its record immediately"
+    );
 }
 
 /// 「稍后」 withdraws the card and releases its Message Pin without declining:
@@ -1608,6 +1636,10 @@ async fn a_secret_location_form_is_uncollectable_and_only_declinable() {
         "the only decision is an explicit decline"
     );
     assert!(
+        text.contains("🚫 取消"),
+        "a Location Form's decline is labelled 取消: {text}"
+    );
+    assert!(
         button_with_reply(&card, "defer").is_none(),
         "a secret form is decline-only: 「稍后」 would leave an unanswerable form with no card"
     );
@@ -1939,6 +1971,75 @@ async fn a_restart_readopts_a_live_location_form_card() {
     );
 }
 
+/// A transport/5xx failure on the re-adoption read is UNKNOWN, not "deleted":
+/// the live card and its record survive and no duplicate is posted.
+#[tokio::test]
+async fn a_restart_card_read_failure_keeps_the_live_surface() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_read_fail"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let session_file = fixture.session_file();
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_read_fail"))]).await;
+    platform
+        .fail_card_view_transport_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let mut seen = std::collections::HashSet::new();
+    sweep_app(&app, &mut seen).await;
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "an unknown read never posts a duplicate"
+    );
+    assert!(
+        persisted_location_form(&session_file, "frm_read_fail").is_some(),
+        "the surface record survives a failed read"
+    );
+}
+
+/// A timed-out re-adoption read is likewise UNKNOWN: keep the live surface.
+#[tokio::test]
+async fn a_restart_card_read_timeout_keeps_the_live_surface() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_read_timeout"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let session_file = fixture.session_file();
+    let (app, platform, _backend) =
+        restart_fixture(&session_file, &[("/work", location_form("frm_read_timeout"))]).await;
+    app.question
+        .withdrawal_timeout_ms
+        .store(25, std::sync::atomic::Ordering::Relaxed);
+    let (entered, release) = platform.pause("card_view", "msg_sent");
+    let sweep = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut seen = std::collections::HashSet::new();
+            sweep_app(&app, &mut seen).await;
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the re-adoption read is in flight");
+    tokio::time::timeout(std::time::Duration::from_secs(2), sweep)
+        .await
+        .expect("a hung read is bounded")
+        .expect("the sweep task joins");
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "a timed-out read never posts a duplicate"
+    );
+    release.notify_waiters();
+}
+
 /// A persisted Location Form card deleted while cola was down is proven gone by
 /// the re-adoption read (Feishu `230002`) and re-surfaced as a fresh card in
 /// the same sweep — ADR-0038's fallback, which ADR-0103 excepts only for a
@@ -2100,6 +2201,59 @@ async fn a_location_form_record_is_pruned_only_by_a_complete_sweep() {
         posted_cards(&fixture.platform).await.len(),
         2,
         "a re-listed form is pushed after its pruned record released `seen`"
+    );
+}
+
+/// A live Location Form whose directory is unmapped (`/switch forget`) is not
+/// said to be resolved by a sweep that cannot list that directory: the card
+/// stays live, the record and partial selection survive, and remapping does not
+/// duplicate the push.
+#[tokio::test]
+async fn an_unmapped_directory_keeps_its_live_location_form_card() {
+    let fixture = fixture(
+        false,
+        &[("/work", multi_location_form("frm_unmap"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |_| {},
+    )
+    .await;
+    sweep(&fixture).await;
+    let card = posted_card(&fixture.platform).await;
+    let staging = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["answer"] == "staging")
+        .map(|button| button["value"].clone())
+        .expect("a staging option");
+    fixture.app.host_action(staging).await.expect("a toggle result");
+    let updates_before = fixture.platform.updated_cards().await.len();
+
+    let key = ThreadKey::new("chat_1".into(), "chat_1".into());
+    fixture
+        .app
+        .sessions
+        .lock()
+        .await
+        .remove_thread_persist(&key)
+        .expect("forget the mapping");
+    sweep(&fixture).await;
+
+    assert_eq!(
+        fixture.platform.updated_cards().await.len(),
+        updates_before,
+        "an unmapped directory's card is not repainted as handled"
+    );
+    assert_eq!(posted_cards(&fixture.platform).await.len(), 1);
+    let record = persisted_location_form(&fixture.session_file(), "frm_unmap")
+        .expect("the Location Form record survives an unmapped sweep");
+    assert_eq!(record["partial"]["display"][0][0], "staging");
+
+    // Remapping the same directory must not duplicate the still-live card.
+    seed_entry(&fixture.app, entry("chat_1", "ses_1", "/work")).await;
+    sweep(&fixture).await;
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        1,
+        "the kept record suppresses a second push after remapping"
     );
 }
 
@@ -2949,8 +3103,8 @@ async fn mcp_empty_state_lists_no_servers_and_no_forms() {
 
     let card = posted_card(&fixture.platform).await;
     let text = card_text(&card);
-    assert!(text.contains("没有配置 MCP 服务器"), "{text}");
-    assert!(text.contains("没有待处理的 Location Form"), "{text}");
+    assert!(text.contains("未配置。"), "{text}");
+    assert!(text.contains("无。"), "{text}");
 }
 
 #[tokio::test]
@@ -3082,6 +3236,64 @@ async fn mcp_reopen_sends_a_fresh_card_then_clears_the_dismissal() {
     assert_eq!(posted_cards(&fixture.platform).await.len(), 3);
 }
 
+/// The optional status read must not hold the reopen past the click deadline:
+/// the form list is enough to send the fresh card, and a repaint is optional.
+#[tokio::test]
+async fn mcp_reopen_does_not_wait_for_a_hanging_status_read() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_reopen_hang_status"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |backend| {
+            backend.with_mcp_statuses_in("/work", vec![status("context7", McpServerState::Connected)]);
+        },
+    )
+    .await;
+    sweep(&fixture).await;
+    let original = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&original, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    fixture
+        .backend
+        .hang_mcp_statuses
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let value = serde_json::json!({
+        "action": "mcp",
+        "op": "reopen",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "request_id": "frm_reopen_hang_status",
+        "directory": "/work",
+    });
+    let started = tokio::time::Instant::now();
+    let result = crate::bridge::mcp::handle_action(
+        &fixture.app.command_handles(),
+        &value,
+        started + std::time::Duration::from_millis(50),
+    )
+    .await
+    .expect("the reopen has a result");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the reopen did not wait for the optional status read: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        result
+            .toast
+            .as_deref()
+            .is_some_and(|toast| toast.contains("已重新打开")),
+        "the fresh card still lands: {:?}",
+        result.toast
+    );
+    assert_eq!(
+        posted_cards(&fixture.platform).await.len(),
+        2,
+        "the original and the fresh card"
+    );
+}
+
 #[tokio::test]
 async fn mcp_reopen_failure_leaves_the_form_dismissed_and_retryable() {
     let fixture = fixture(
@@ -3171,7 +3383,7 @@ async fn mcp_lists_an_unpushed_form_without_a_reopen_control() {
 
     let card = posted_card(&fixture.platform).await;
     let text = card_text(&card);
-    assert!(text.contains("等待推送"), "{text}");
+    assert!(text.contains("待推送"), "{text}");
     assert!(
         button_with_action_op(&card, "mcp", "reopen").is_none(),
         "a never-pushed form has no dismissal to reopen: {card}"
@@ -3198,7 +3410,7 @@ async fn mcp_lists_a_pushed_form_without_a_reopen_control() {
         .pop()
         .expect("the /mcp card");
     let text = card_text(&card);
-    assert!(text.contains("已推送，见原卡片"), "{text}");
+    assert!(text.contains("已推送"), "{text}");
     assert!(
         button_with_action_op(&card, "mcp", "reopen").is_none(),
         "a live form already has its card: {card}"
@@ -3282,7 +3494,7 @@ async fn mcp_reopen_after_success_is_not_reported_as_still_deferred() {
     let repainted = first.card.expect("a successful reopen repaints the /mcp card");
     let repainted_text = card_text(&repainted);
     assert!(
-        repainted_text.contains("已推送，见原卡片"),
+        repainted_text.contains("已推送"),
         "the reopened row is marked pushed: {repainted_text}"
     );
     assert!(

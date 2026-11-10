@@ -177,11 +177,13 @@ pub struct LocationFormRecord {
 }
 
 /// The partial answer state a Location Form's card displays. It persists the
-/// paint's clicked option values, final markers and open question; text the
-/// Host typed (drafts, custom answers, numeric input) stays client-side. A
-/// restart restores it into `QuestionState` without repainting the live card,
-/// so the card's visible clicked selections and the next confirm/submit agree
-/// (ADR-0103).
+/// paint's clicked option values, **multi-select toggles including a custom
+/// entry the Host added** (a deliberate selection the card renders as a checked
+/// chip), final markers and the open question. Unsubmitted drafts, a
+/// single-select free-text answer and numeric input stay client-side. A
+/// restart restores the persisted values into `QuestionState` without
+/// repainting the live card, so the card's visible selections and the next
+/// confirm/submit agree (ADR-0103).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LocationFormPartial {
     /// `Some(values)` for a question's displayed selection (final or live),
