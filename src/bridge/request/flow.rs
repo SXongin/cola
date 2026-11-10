@@ -1743,6 +1743,15 @@ impl RequestFlow {
             None => return None,
         };
         let asked_at = asking_anchor(&transcript);
+        // The pass is BOUNDED, but the write it owes is not (ADR-0100: a card
+        // create carries no idempotency key, so a timeout must never abandon
+        // one). The pass therefore renders only, and the flush below — outside
+        // the bound — carries whatever it applied. The progress mark is the
+        // "did this pass render anything" signal (#457): it advances as each
+        // stage applies, so a pass the timeout abandoned half way still owes
+        // its flush, while a pass that found nothing new owes no card write at
+        // all (the surfacing insert's own flush follows immediately).
+        let mark_before = Turn::progress_mark(&handles.cards, session_id).await;
         if tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
             Turn::render_and_flush_draining(
@@ -1761,6 +1770,12 @@ impl RequestFlow {
                 "{} surfacing drain render timed out after {timeout_ms}ms",
                 self.kind.label()
             );
+        }
+        if Turn::progress_mark(&handles.cards, session_id).await != mark_before {
+            // The helper re-checks the live-form freeze under the write lock
+            // (#917): a question that landed since the apply refuses the write,
+            // and its own resolution flush carries the content instead.
+            Turn::flush_card_unless_typed_answer(&handles.cards, session_id).await;
         }
         asked_at
     }
@@ -2835,7 +2850,15 @@ impl RequestFlow {
         {
             return;
         }
-        let pushed = self.kind.add_inline(self, &handles.cards, &host, req, dir).await;
+        // The block keeps the anchor its first surfacing captured (issue
+        // #1023): the asking tool's server time is a property of the request,
+        // not of the card it currently lives on, so a handoff must not reset
+        // the receipt's cut to "no anchor".
+        let asked_at = Turn::interaction_asked_at(&handles.cards, id).await;
+        let pushed = self
+            .kind
+            .add_inline(self, &handles.cards, &host, req, dir, asked_at)
+            .await;
         if !pushed {
             return;
         }

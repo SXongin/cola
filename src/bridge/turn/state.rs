@@ -1494,13 +1494,15 @@ pub(super) struct StreamAccumulator {
     last_key: i64,
     /// Next [`TimelineItem::seq`] to hand out (see [`Self::insert_kind`]).
     item_seq: u64,
-    /// The newest Interaction Receipt's server-time cut (issue #1023), when the
-    /// resolved block carried one. Private to this module: recorded by
-    /// [`Self::resolve_interaction`], read by [`Self::insert_item`] so a later
-    /// read's post-click content lands after the receipt. A newer receipt
-    /// replaces it; a block surfaced without a read leaves the previous cut in
-    /// force.
-    receipt_cut: Option<ReceiptCut>,
+    /// Every anchored Interaction Receipt's server-time cut (issue #1023), in
+    /// resolution order. Private to this module: pushed by the resolution
+    /// paths, read by [`Self::insert_item`] so a later read's content lands
+    /// after the receipts written before it. A list, not one cut: two requests
+    /// can be asked in one order and answered in another (Q1 asked at 1000,
+    /// Q2 at 2000, Q2 answered first, Q1 second), and content written between
+    /// the two asks must clear Q1's receipt while staying below the newer one
+    /// — one "latest" cut cannot express that staircase.
+    receipt_cuts: Vec<ReceiptCut>,
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
     /// receipt is a timeline entry). Private to this module (no external
@@ -2959,30 +2961,28 @@ impl StreamAccumulator {
     }
 
     /// Record the server-time cut of the receipt just written (issue #1023).
-    /// Only the NEWEST ask is kept: everything written after an earlier ask is
-    /// also after the newer one, so the newer receipt's key is the floor that
-    /// matters. A block without an anchor (no surfacing read) clears nothing —
-    /// decisions recorded earlier still hold.
-    fn record_receipt_cut(&mut self, asked_at: i64, key: i64) {
-        if self.receipt_cut.is_none_or(|cut| asked_at >= cut.at) {
-            self.receipt_cut = Some(ReceiptCut { at: asked_at, key });
-        }
-    }
-
-    /// The newest Interaction Receipt's server-time cut, if a resolved block
-    /// carried one ([`ReceiptCut`]).
-    pub(super) fn receipt_cut(&self) -> Option<ReceiptCut> {
-        self.receipt_cut
+    /// Every anchored receipt keeps its own cut: a later receipt is not
+    /// necessarily for a later ask (requests can be asked in one order and
+    /// answered in another), and [`Self::receipt_cut_floor`] needs the whole
+    /// staircase. A block without an anchor (no surfacing read) records
+    /// nothing and leaves the earlier cuts in force.
+    pub(super) fn record_receipt_cut(&mut self, asked_at: i64, key: i64) {
+        self.receipt_cuts.push(ReceiptCut { at: asked_at, key });
     }
 
     /// The key floor an entry whose own server time is `shown_at` earns from
-    /// the newest receipt cut: an entry the server timestamped after the asking
-    /// time was produced after the click, so it may not sort above the receipt
-    /// ([`ReceiptCut`], ADR-0038 rule 4). `None` when there is no cut, no
-    /// server time, or the entry predates the ask.
+    /// the Interaction Receipts: every receipt whose asking time is BEFORE
+    /// `shown_at` was clicked before the entry was written, so the entry may
+    /// not sort above it ([`ReceiptCut`], ADR-0038 rule 4). The newest such
+    /// receipt's key is the floor. `None` when there is no such receipt, no
+    /// server time, or the entry predates every ask.
     pub(super) fn receipt_cut_floor(&self, shown_at: Option<i64>) -> Option<i64> {
-        let cut = self.receipt_cut()?;
-        (shown_at.is_some_and(|at| at > cut.at)).then_some(cut.key)
+        let at = shown_at?;
+        self.receipt_cuts
+            .iter()
+            .filter(|cut| at > cut.at)
+            .map(|cut| cut.key)
+            .max()
     }
 
     /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
@@ -3000,8 +3000,8 @@ impl StreamAccumulator {
 
     /// Append one Interaction Receipt keyed at the resolution moment — the
     /// single residue a mode change leaves for every block it resolved.
-    pub(super) fn push_receipt(&mut self, text: &str) {
-        self.push_receipt_at(None, text);
+    pub(super) fn push_receipt(&mut self, text: &str) -> i64 {
+        self.push_receipt_at(None, text)
     }
 
     /// [`Self::push_receipt`] with an explicit timeline key: `at_ms` places the
@@ -3011,21 +3011,24 @@ impl StreamAccumulator {
     /// receipt after that work (ADR-0059; the live order bug). The key only
     /// orders: the receipt itself shows no clock (`shown_at` stays `None`,
     /// like every other receipt).
-    pub(super) fn push_receipt_at(&mut self, at_ms: Option<i64>, text: &str) {
+    pub(super) fn push_receipt_at(&mut self, at_ms: Option<i64>, text: &str) -> i64 {
         let key = at_ms.unwrap_or_else(|| self.next_order());
         self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
+        key
     }
 
     /// Place the External Message's own text (ADR-0028) on the timeline at
     /// `at_ms` — normally just before the Turn's anchor, so it heads the card.
     /// An empty message renders nothing. A distinct kind, so the reply's text
-    /// run can never absorb it (see [`TimelineKind::UserMessage`]).
+    /// run can never absorb it (see [`TimelineKind::UserMessage`]). `at_ms` is
+    /// a server time when present, so it is recorded as the entry's server
+    /// time too: the Interaction Receipt's cut compares against it (#1023).
     pub(super) fn push_user_message(&mut self, at_ms: Option<i64>, text: &str) {
         if text.trim().is_empty() {
             return;
         }
         let key = at_ms.unwrap_or_else(|| self.next_order());
-        self.insert_kind(key, None, TimelineKind::UserMessage(text.to_string()));
+        self.insert_kind(key, at_ms, TimelineKind::UserMessage(text.to_string()));
     }
 
     /// Place one Compaction row (ADR-0082) at `at_ms` — the catalogued fact's own
@@ -3366,7 +3369,9 @@ impl StreamAccumulator {
         ending: Option<EndingKey>,
     ) {
         let key = at_ms.unwrap_or_else(|| self.next_order());
-        self.insert_kind(key, None, TimelineKind::LedgerEntry(entry, ending.map(Box::new)));
+        // A server-stamped entry records its time as the entry's own server
+        // time, so the Interaction Receipt's cut can floor it (issue #1023).
+        self.insert_kind(key, at_ms, TimelineKind::LedgerEntry(entry, ending.map(Box::new)));
     }
 
     /// The Task Endings of the ledger entries in the timeline range a body
@@ -8330,8 +8335,10 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
-        let cut = acc.receipt_cut().expect("the anchor is the receipt's cut");
-        assert_eq!(cut.at, 5_000);
+        assert!(
+            acc.receipt_cut_floor(Some(5_100)).is_some(),
+            "content after the ask earns a floor"
+        );
 
         // The server's post-click continuation: its own time is 5_100, but the
         // receipt's cola-clock key is ~now, so without the cut it would sort
@@ -8354,6 +8361,62 @@ mod tests {
             card.find("explanation").unwrap() < card.find("✅ 已回答").unwrap(),
             "pre-click content stays above the receipt: {card}"
         );
+
+        // An entry whose server time lives in its KEY (the external message
+        // block) is floored the same way: it records that time as its own.
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(5_000)));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.push_user_message(Some(5_100), "点击后的新消息");
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("✅ 已回答").unwrap() < card.find("点击后的新消息").unwrap(),
+            "a server-stamped user message follows the receipt too: {card}"
+        );
+    }
+
+    /// Issues can be asked in one order and answered in another (issue #1023):
+    /// Q1 asked at 1000, Q2 at 2000, Q2 answered first, Q1 second. Content the
+    /// server timestamped between the asks (2100) is after both asks, so it is
+    /// post-click content for BOTH receipts and must clear the one the Host
+    /// clicked last. One "latest-asked" cut would floor it only to Q2's key,
+    /// leaving it between the two receipts — above Q1's receipt, which the last
+    /// click wrote.
+    #[test]
+    fn a_later_asked_but_earlier_answered_receipt_still_cuts() {
+        let question = |id: &str, asked_at: i64| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: id.into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "继续?".into(),
+                    header: "继续".into(),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![false],
+                open: 0,
+                drafts: vec![String::new()],
+                asked_at: Some(asked_at),
+            })
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question("q1", 1_000));
+        acc.add_interaction(question("q2", 2_000));
+        assert!(acc.resolve_interaction("q2", |_| "✅ 已回答 Q2".to_string()));
+        assert!(acc.resolve_interaction("q1", |_| "✅ 已回答 Q1".to_string()));
+        acc.push_text_at(Some(2_100), "两次提问之后写出的内容");
+        let card = acc.build_card().to_string();
+        let q2 = card.find("✅ 已回答 Q2").unwrap();
+        let q1 = card.find("✅ 已回答 Q1").unwrap();
+        let after = card.find("两次提问之后写出的内容").unwrap();
+        assert!(
+            q2 < q1 && q1 < after,
+            "the content clears both receipts, the last click included: {card}"
+        );
     }
 
     /// A block surfaced without a read (a re-host, a busy-follow seed, a
@@ -8373,7 +8436,7 @@ mod tests {
             asked_at: None,
         }));
         assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string()));
-        assert_eq!(acc.receipt_cut(), None);
+        assert!(acc.receipt_cuts.is_empty());
         assert_eq!(acc.receipt_cut_floor(Some(1)), None);
     }
 

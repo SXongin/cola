@@ -2321,6 +2321,34 @@ impl Turn {
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await
     }
 
+    /// Flush a card the surfacing drain just rendered into (issue #1023),
+    /// taking the write lock for the live-form check and the write as one step:
+    /// a question inserted since the drain's own apply leaves the card
+    /// untouched (any PATCH would wipe its unsubmitted answer, #917), and the
+    /// applied content rides the form's own resolution flush instead.
+    ///
+    /// Uses [`Self::flush_card`]'s ordinary split policy — a card create is
+    /// never abandoned by a caller's timeout (ADR-0100): the drain bounds its
+    /// READ, then flushes here outside that bound. `Unwritten` therefore means
+    /// "stood down", not "nothing owed".
+    pub(crate) async fn flush_card_unless_typed_answer(
+        cards: &CardsHandle,
+        session_id: &str,
+    ) -> FlushOutcome {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        if cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.awaits_typed_answer())
+        {
+            return FlushOutcome::Unwritten;
+        }
+        Self::flush_card_locked(cards, session_id).await
+    }
+
     /// Record that `card_message_id` is now `session_id`'s live card
     /// (ADR-0063): the durable fact Session Sync's reap needs after a restart.
     /// Every path that sends a card INTO the Session tracks it — a Turn's
