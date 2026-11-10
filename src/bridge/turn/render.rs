@@ -2362,10 +2362,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             // The call's READ POSITION orders it, exactly like the window walk
             // (issue #1022): the seeded set is resolved by identity, not by a
             // clock, but its key still comes from the message's part order.
-            let order_at = part_order_times(message)
-                .get(index)
-                .copied()
-                .flatten();
+            let order_at = part_order_times(message).get(index).copied().flatten();
             if render_part(
                 acc,
                 Some(PartSource::at(transcript.messages[position].id.clone(), index)),
@@ -4919,6 +4916,84 @@ Index: /x/src/main.rs
                 prefix_digest: Some(cursor_prefix_digest("回答")),
             }),
             "a fallback key is not a server start"
+        );
+    }
+
+    /// #1024's old Known limit is closed by the reply's server-time cut: a
+    /// continuation message delivered AFTER the receipt stays below it, even
+    /// though V2 text carries no server time and the message's `time.created`
+    /// is behind cola's clock (and even when the card showed no timed part
+    /// before the click, so there was no server high-water mark to compare
+    /// with).
+    #[test]
+    fn a_continuation_message_stays_below_the_receipt_under_clock_skew() {
+        let anchor = 2_000;
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        assert!(acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q_skew".into(),
+            session_id: "ses_skew".into(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "继续？".into(),
+                header: "下一步".into(),
+                kind: crate::backend::types::FormFieldKind::String,
+                options: Vec::new(),
+                custom: None,
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: "/work".into(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+            asked_at: Some(2_100),
+        })));
+        // The Host answers: the receipt is keyed at cola's now, far ahead of
+        // the server's clock.
+        assert!(acc.resolve_interaction("q_skew", |_| "✅ 已回答".to_string(), true));
+
+        // A pre-click message and the post-answer continuation. V2 text has no
+        // server time; the continuation's message.created (2_200) is below the
+        // receipt's cola-clock key.
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message(
+                "a1",
+                2_050,
+                vec![tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Completed,
+                    Some(2_050),
+                    Some(serde_json::json!({"command": "ls"})),
+                    Some("tool-output"),
+                )],
+            ),
+            // A continuation with a pre-tool text (its untimed V2 text borrows
+            // the message's `created`) and the tool call that follows it.
+            message(
+                "a2",
+                2_200,
+                vec![
+                    text_part("作答后的继续"),
+                    tool(
+                        "bash",
+                        "call_2",
+                        ToolStatus::Completed,
+                        Some(2_300),
+                        Some(serde_json::json!({"command": "pwd"})),
+                        Some("/work"),
+                    ),
+                ],
+            ),
+        ]);
+        render_new_turn_parts(&mut acc, &transcript);
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("✅ 已回答").unwrap() < text.find("作答后的继续").unwrap(),
+            "the continuation follows the receipt under skew: {text}"
         );
     }
 

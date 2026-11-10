@@ -353,20 +353,25 @@ mis-ordered:
 `shown_at` — what a panel header displays and what the Rendered Cursor frontier
 records as the part's start — is unchanged: it still carries only the time the
 server reported, so a borrowed key never becomes a fake clock or perturbs a
-cursor. Interaction Receipts keep Rule 4's resolution key (`next_order`): a
-receipt is an event in cola's world, and its key orders only. The rule applies to
+cursor. Interaction Receipts keep Rule 4's resolution key (`next_order`, or the
+key a click reserved before replying): a receipt is an event in cola's world,
+and its key orders only; the server-time cut above is what floors later
+messages against it. The rule applies to
 every walk that places transcript parts (the Turn window, the seed scope and the
 pending gap); synthetic content (receipts, wake markers) keeps `next_order()`,
 except the advisory-live opening line, which is keyed at the card head (`0`) so
 an older server position can never sort above it.
 
-**Known limit.** The borrow assumes cola's clock and the server's agree. Under
-skew, an untimed text in a message delivered *after* an Interaction Receipt can
-take a `time.created` below the receipt's `next_order()` key and sort above it;
-the pre-#1022 order (cola's clock for every untimed text) put it below. Closing
-that window needs a server-time anchor for the receipt — the request carries
-none — which is outside this ordering fix (#1023's surfacing work is the natural
-place to carry one).
+**The receipt's server-time cut.** The borrow no longer stands alone: the
+surfacing work (#1023) carries the asking tool part's server time on the block,
+and a resolution records it as the receipt's cut. A transcript MESSAGE the
+server created after that ask is post-click content, so every part of it —
+including an untimed V2 text that borrowed its `time.created` — is floored at
+the receipt's key. Under any clock skew the continuation therefore stays below
+the receipt, and so does one delivered to a card that showed no timed part
+before the click (there is no server high-water mark to compare, but the cut is
+the request's own ask). Already-placed entries keep their position; the remote
+answer window is described in the 2026-11-10 amendment below.
 
 ## Amendment (2026-11-09): a dismissed Location Form is a deliberately surface-less pending request
 
