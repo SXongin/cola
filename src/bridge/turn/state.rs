@@ -3017,6 +3017,19 @@ impl StreamAccumulator {
             .max()
     }
 
+    /// The timeline key a part's chunk is placed (and looked up) at: its own
+    /// server time, floored by the newest receipt cut (issue #1023). The push
+    /// paths must use this SAME key for the merge lookup — an entry already
+    /// placed at the floored key would otherwise be missed by a later chunk
+    /// still asking for the part's raw server key, and every render read would
+    /// start a second entry (a new reasoning panel, a split text run).
+    fn part_order_key(&mut self, at_ms: Option<i64>) -> i64 {
+        match at_ms {
+            Some(at) => self.receipt_cut_floor(Some(at)).map_or(at, |floor| at.max(floor)),
+            None => self.next_order(),
+        }
+    }
+
     /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
     /// (the Auto-Accept toggle) resolves several blocks at once and leaves ONE
     /// receipt covering them all, so the others only need their tombstone.
@@ -3857,7 +3870,7 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = at_ms.unwrap_or_else(|| self.next_order());
+        let key = self.part_order_key(at_ms);
         self.text.push_str(chunk);
         let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
         let mut remaining = chunk;
@@ -3981,7 +3994,7 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = at_ms.unwrap_or_else(|| self.next_order());
+        let key = self.part_order_key(at_ms);
         self.reasoning.push_str(chunk);
         // The entry THIS part merges into, never another part's at the same
         // server time (spec #561, review #569).
@@ -8446,6 +8459,35 @@ mod tests {
             card.find("✅ 已回答").unwrap() < card.find("竞态到达的继续").unwrap(),
             "a continuation placed before the receipt is moved below it: {card}"
         );
+
+        // The SAME part arriving across two render reads still merges into one
+        // entry: the merge lookup uses the floored key too (a raw-key lookup
+        // would start a second entry — a new reasoning panel, a split text run).
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(5_000)));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.push_text_at(Some(5_100), "第一段");
+        acc.push_text_at(Some(5_100), "第二段");
+        acc.push_reasoning_at(Some(5_200), "想一");
+        acc.push_reasoning_at(Some(5_200), "想二");
+        let texts: Vec<&str> = acc
+            .timeline
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TimelineKind::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let reasoning: Vec<&str> = acc
+            .timeline
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TimelineKind::Reasoning(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["第一段第二段"], "one text entry per part");
+        assert_eq!(reasoning, vec!["想一想二"], "one reasoning panel per part");
     }
 
     /// Issues can be asked in one order and answered in another (issue #1023):
