@@ -366,10 +366,13 @@ That time travels on the block
 (`PendingQuestion::asked_at` / `PendingPermission::asked_at`) and, when the block
 resolves, becomes the receipt's **server-time cut** (`ReceiptCut`): the receipt
 itself keeps its `next_order` key — it must follow everything the Host could see
-— and any later read's entry whose own server time is *after* the ask is floored
-at that key. Both halves are on the server's clock, so cola's wall clock cannot
-decide the comparison: a part server-timestamped after the click belongs below
-the receipt (rule 4), even when the server's clock runs behind cola's.
+— and a later transcript **MESSAGE** the server created after the ask is floored
+at that key. The unit is the message, not the part: a part that STARTED before
+the click but grew after it belongs to a pre-click message and keeps its place;
+a parallel tool's late-delivered part sits in the asking message too. A new
+message is only created once the turn resumes, i.e. after the click, so
+`message.created > ask` is the sound test. Both halves are on the server's
+clock, so cola's wall clock cannot decide the comparison.
 
 Every anchored receipt keeps its cut rather than only the newest one: requests
 can be asked in one order and answered in another, and content written between
@@ -387,16 +390,16 @@ A reservation that never becomes a per-block receipt (the Auto-Accept mode
 change's single receipt) drops its floor with it (`forget_reservation`).
 
 When a QUESTION is resolved with no reservation (a remote client's answer,
-noticed by the next sweep), the ask cut floors FUTURE content only — entries
-already placed keep their server position. The turn is blocked while a question
-is pending, but child/background or external content can still reach the card,
-and there is no click time to re-floor against; moving placed content would
-violate rule 4 for what the remote Host already saw. That window (one sweep
-interval) is a deliberate limit. A permission carries no ask cut at all —
-parallel tools make "newer than the ask" ambiguous while it waits — and gets the
-future floor only through a click's reservation. Every merge lookup uses the
+noticed by the next sweep), the ask cut floors future messages only — entries
+already placed keep their server position. There is no click time to cut
+against, and moving placed content (child/background or external content can
+reach the card while a question waits) would violate rule 4 for what the remote
+Host already saw. That window (one sweep interval) is a deliberate limit. A
+permission carries no ask cut at all — parallel tools make "newer than the ask"
+ambiguous while it waits — and gets the floor only through a click's
+reservation, whose future messages are post-click. Every merge lookup uses the
 floored (and split-clamped) key, so a part cannot split into two entries across
-reads.
+reads, and a part that spans the cut keeps one entry above the receipt.
 
 A request whose asking part lives in a CHILD session (hosted on an ancestor's
 card) is anchored by one bounded read of the child's transcript, without
