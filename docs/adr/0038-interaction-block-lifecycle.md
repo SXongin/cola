@@ -340,15 +340,20 @@ a standalone card has no card to drain. It is best-effort by construction: a
 failed or timed-out read changes nothing, the request surfaces exactly as before
 without the anchor, and it costs at most one read per first surfacing.
 
-The render-only split is deliberate. The **read** is bounded (5 s, or the flow's
-list timeout when shorter), but the **write** it owes is not: the pass renders
-into the accumulator and the flow flushes afterwards, outside that bound,
-because a card create carries no idempotency key and abandoning one could
-duplicate it (ADR-0100). The progress mark tells the two apart — a pass the
-timeout abandoned after applying content still owes its flush, a pass that found
-nothing new owes no write at all. The flush re-checks the live-form freeze under
-the write lock, so a question that landed since the apply still refuses the
-repaint (#917) and the applied content rides the form's own resolution flush.
+The render-only split is deliberate. The **read** is bounded — ONE deadline for
+the transcript read and the render pass together (5 s, or the flow's list
+timeout when shorter) — but the **write** it owes is not: the pass renders into
+the accumulator and the flow flushes afterwards, outside that bound, because a
+card create carries no idempotency key and abandoning one could duplicate it
+(ADR-0100). The pass also skips the side effects a render normally owns outside
+the flush — the auto-rename's title write and the File Message deliveries — since
+both write to Feishu and neither is guarded by the card write lock; the next
+ordinary render performs them (a pending file delivery stays pending). The
+progress mark tells the two apart — a pass the timeout abandoned after applying
+content still owes its flush, a pass that found nothing new owes no write at
+all. The flush re-checks the live-form freeze under the write lock, so a question
+that landed since the apply still refuses the repaint (#917) and the applied
+content rides the form's own resolution flush.
 
 The same read yields the **asking tool part's server time** — while a request is
 pending its turn is blocked, so the `question` / permission tool call is the
@@ -368,6 +373,9 @@ receipt key among the asks that precede the content's server time — a staircas
 not a single "latest" cut. A block that reached the card without a surfacing read
 (a busy-follow seed, a restart re-adoption) carries no anchor and keeps the
 previous receipt behaviour; a **re-hosted** block keeps the anchor it was first
-surfaced with (the anchor belongs to the request, not to the card it sits on).
+surfaced with — the anchor belongs to the request, not to the card it sits on, so
+it travels in the block handle the registry writes at every render (the old
+accumulator is already gone when a re-host runs). A chunked entry's continuation
+chunks take the same floor, so the timeline stays key-sorted under the receipt.
 A mode change (Auto-Accept) that resolves several blocks leaves one receipt and
 cuts at the latest ask among them.

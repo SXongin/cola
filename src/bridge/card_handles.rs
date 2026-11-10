@@ -27,6 +27,9 @@ pub struct RenderedBlock {
     pub directory: String,
     /// Compact one-line receipt target, recorded from the block at render time.
     pub target: String,
+    /// The asking tool's server time, recorded from the block at render time so
+    /// a re-host can keep the receipt's cut (issue #1023).
+    pub asked_at: Option<i64>,
 }
 
 /// A card handle: which card shows a live block, and what resolving it needs
@@ -37,6 +40,9 @@ struct BlockHandle {
     session_id: String,
     directory: String,
     target: String,
+    /// The block's receipt cut anchor (issue #1023): a property of the request,
+    /// kept here because a re-host's old accumulator is already gone.
+    asked_at: Option<i64>,
 }
 
 /// A card that shows at least one live interaction block: the JSON exactly as
@@ -86,6 +92,7 @@ impl CardHandles {
                         session_id: s.session_id,
                         directory: s.directory,
                         target: s.target,
+                        asked_at: s.asked_at,
                     },
                 )
             })
@@ -132,6 +139,7 @@ impl CardHandles {
                     session_id: handle.session_id.clone(),
                     directory: handle.directory.clone(),
                     target: handle.target.clone(),
+                    asked_at: handle.asked_at,
                 },
             );
         }
@@ -166,6 +174,7 @@ impl CardHandles {
                     session_id: block.session_id,
                     directory: block.directory,
                     target: block.target,
+                    asked_at: block.asked_at,
                 },
             );
         }
@@ -195,6 +204,12 @@ impl CardHandles {
     /// The card currently showing `request_id`'s live block.
     pub fn message_of(&self, request_id: &str) -> Option<&str> {
         self.blocks.get(request_id).map(|h| h.message_id.as_str())
+    }
+
+    /// The asking tool's server time recorded for `request_id`'s live block —
+    /// the anchor a re-host carries onto the new card (issue #1023).
+    pub fn asked_at(&self, request_id: &str) -> Option<i64> {
+        self.blocks.get(request_id).and_then(|h| h.asked_at)
     }
 
     /// The recorded receipt target of `request_id` — what a resolution names
@@ -521,6 +536,7 @@ mod tests {
             session_id: "ses_1".into(),
             directory: "/work".into(),
             target: format!("target-{request_id}"),
+            asked_at: None,
         }
     }
 
@@ -554,6 +570,26 @@ mod tests {
         found.sort();
         assert_eq!(found, vec!["om_new", "om_old"]);
         assert!(handles.cards_rendering("p_other").is_empty());
+    }
+
+    /// The asking tool's server time rides the block handle (issue #1023), so a
+    /// re-host — or a restart — can keep the receipt's cut after the old
+    /// accumulator is gone.
+    #[test]
+    fn the_ask_anchor_survives_the_block_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let surfaces = std::sync::Arc::new(Surfaces::load(dir.path().join("interactive_surfaces.json")));
+        let mut handles = CardHandles::with_surfaces(surfaces.clone());
+        let c = card(vec![text("body"), text("button")]);
+        let mut rendered = block("q1", 0, 2, InteractionKind::Question);
+        rendered.asked_at = Some(1_000);
+        handles.record("om_1", &c, vec![rendered]);
+        assert_eq!(handles.asked_at("q1"), Some(1_000));
+
+        // The persisted record carries it too: a restart's re-adoption knows
+        // the anchor before any accumulator exists.
+        let hydrated = CardHandles::with_surfaces(surfaces);
+        assert_eq!(hydrated.asked_at("q1"), Some(1_000));
     }
 
     /// `forget` is not a settlement: a Superseded/Retrying withdrawal calls it

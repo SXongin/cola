@@ -2417,6 +2417,16 @@ impl RenderMode {
     fn guards_forms(self) -> bool {
         !matches!(self, Self::Settling)
     }
+
+    /// Whether the pass may perform the side effects a render normally owns
+    /// outside the flush: the session-title rename (which flushes the card) and
+    /// the File Message deliveries. A draining pass (issue #1023) performs
+    /// neither — both write to Feishu outside any card-write-lock check and
+    /// inside the caller's timeout (ADR-0100, ADR-0076); the next ordinary
+    /// render does them, and a pending delivery stays pending until it does.
+    fn side_effects(self) -> bool {
+        !matches!(self, Self::Draining)
+    }
 }
 
 /// [`render_and_flush`] for a drain tick that is settling (#604): it renders the
@@ -2513,7 +2523,9 @@ async fn render_and_flush_inner(
 ) -> Option<RenderPass> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
-    refresh_session_title(cards, sessions, backend, session_id).await;
+    if mode.side_effects() {
+        refresh_session_title(cards, sessions, backend, session_id).await;
+    }
     let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans, typing) = {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
@@ -2590,7 +2602,7 @@ async fn render_and_flush_inner(
     // Message reply omits `reply_in_thread`, so Feishu keeps it in the live
     // card's own container (ADR-0076's amendment) — no Session mapping lookup,
     // so an adopt-mid-turn transition cannot fork the conversation.
-    let file_changed = resolve_file_deliveries(cards, session_id).await;
+    let file_changed = mode.side_effects() && resolve_file_deliveries(cards, session_id).await;
     // One output read per planned entry, OUTSIDE the cards lock (the reads are
     // network). The entries themselves are COMMITTED below, together with the
     // ledger and the write (spec #593, issue #917): committing them here would

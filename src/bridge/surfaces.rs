@@ -43,6 +43,11 @@ pub struct InlineSurface {
     pub directory: String,
     /// The block's compact receipt target, recorded at render time.
     pub target: String,
+    /// The asking tool's server time, recorded with the block so a re-hosted
+    /// block keeps its Interaction Receipt cut (issue #1023). `None` when the
+    /// surfacing read could not capture one (or the record predates it).
+    #[serde(default)]
+    pub asked_at: Option<i64>,
 }
 
 /// One card that renders at least one live interaction block: the JSON as last
@@ -830,6 +835,7 @@ mod tests {
             session_id: "ses_1".into(),
             directory: "/work".into(),
             target: "⚡ 执行 Shell 命令 `ls`".into(),
+            asked_at: None,
         }
     }
 

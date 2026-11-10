@@ -36,18 +36,6 @@ impl Turn {
             .is_some_and(|c| c.acc.interaction(request_id).is_some())
     }
 
-    /// The asking tool's server time carried by whichever card still holds
-    /// `request_id`'s block — the re-host's anchor (issue #1023). A block that
-    /// moves to a new card keeps its receipt cut; `None` when no card carries
-    /// the block (it was never surfaced, or its anchor was not captured).
-    pub(crate) async fn interaction_asked_at(cards: &CardsHandle, request_id: &str) -> Option<i64> {
-        cards.cards.lock().await.values().find_map(|card| {
-            card.acc
-                .interaction(request_id)
-                .and_then(|block| block.asked_at())
-        })
-    }
-
     /// The Instant Reminder source facts of a cola Turn's live card (ADR-0043).
     /// `None` when no cola turn registered one — an external turn, or a request
     /// pending across a restart.
