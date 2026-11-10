@@ -2400,9 +2400,11 @@ enum RenderMode {
 
 impl RenderMode {
     /// Whether the pass persists the captured anchor on the durable record
-    /// (ADR-0063).
+    /// (ADR-0063). Only a normal streaming render does: a settling pass leaves
+    /// it to finalization, and a draining pass to the next ordinary render —
+    /// the drain is a bounded read, not a durable-write owner.
     fn persists_anchor(self) -> bool {
-        !matches!(self, Self::Settling)
+        matches!(self, Self::Streaming)
     }
 
     /// Whether the pass may issue a card write; a settling pass leaves it to

@@ -375,13 +375,23 @@ Every anchored receipt keeps its cut rather than only the newest one: requests
 can be asked in one order and answered in another, and content written between
 the asks must clear the receipt of the *last* click too. The floor is the newest
 receipt key among the asks that precede the content's server time — a staircase,
-not a single "latest" cut. Content can even be PLACED before its receipt lands:
-the backend reply returns before the receipt is written, and a remote client's
-answer is only noticed by the next sweep, so a render poll may insert the
-post-click continuation in that gap at its own server key. Recording the cut
-therefore re-floors the live slice — entries server-stamped after the ask move to
-the receipt's key, keeping their own order after it; the finalized prefix is
-already on a sent card and is left as it is. A block that reached the card without a surfacing read
+not a single "latest" cut.
+
+Content can be PLACED before its receipt lands: the backend reply returns before
+the receipt is written, so a render poll may insert the post-click continuation
+in that gap. The **click reserves the receipt's key** (`reserve_receipt`), which
+floors future inserts at `key + 1`; the receipt then takes the reserved key, so
+the gap content follows it — no already-placed content moves, because everything
+placed before the click was something the Host could see. When a QUESTION is
+resolved without a reservation (a remote client's answer, noticed by the next
+sweep), the answer's ask cut re-floors the live slice instead: the turn is
+blocked while a question is pending, so content server-stamped after the ask was
+produced after the click. A permission cannot use that rule — other tools run in
+parallel while it waits, so "newer than the ask" does not mean post-click; it
+gets the future floor only through a click's reservation. In both paths only
+entries at or after `render_from` move (a finalized prefix is already on a sent
+card), and every merge lookup uses the floored key so a part cannot split into
+two entries across reads. A block that reached the card without a surfacing read
 (a busy-follow seed, a restart re-adoption) carries no anchor and keeps the
 previous receipt behaviour; a **re-hosted** block keeps the anchor it was first
 surfaced with — the anchor belongs to the request, not to the card it sits on, so

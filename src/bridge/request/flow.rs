@@ -486,6 +486,12 @@ const SURFACING_DRAIN_TIMEOUT_MS: u64 = 5_000;
 /// `None` when the read carries no server time at all (the block then keeps the
 /// old receipt behaviour).
 fn asking_anchor(transcript: &crate::backend::SessionTranscript) -> Option<i64> {
+    // A capped read is a PREFIX: the asking tool part can be past the cap, so
+    // its newest timestamp proves nothing about the whole turn. Leave the block
+    // unanchored rather than floor content the Host already saw.
+    if transcript.truncated {
+        return None;
+    }
     let timed_messages = transcript
         .messages
         .iter()
@@ -3966,6 +3972,22 @@ mod tests {
             ],
         )]);
         assert_eq!(asking_anchor(&transcript), Some(900));
+    }
+
+    /// A read capped at its page limit is a PREFIX: the asking tool part may be
+    /// past the cap, so the newest timestamp proves nothing about the whole
+    /// turn. No anchor is invented for it (the block keeps the old receipt
+    /// behaviour).
+    #[test]
+    fn a_truncated_read_has_no_anchor() {
+        let mut transcript = SessionTranscript::new(vec![typed_message(
+            "a1",
+            MessageRole::Assistant,
+            Some(1_100),
+            vec![text_part("前缀")],
+        )]);
+        transcript.truncated = true;
+        assert_eq!(asking_anchor(&transcript), None);
     }
 
     /// A read with no server time anywhere leaves the block without an anchor

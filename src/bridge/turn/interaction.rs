@@ -275,6 +275,27 @@ impl Turn {
         affected
     }
 
+    /// Reserve the timeline key `request_id`'s Interaction Receipt will take,
+    /// at CLICK time (issue #1023) — the click path replies to the backend
+    /// before `resolve_interactions` writes the receipt, and a render poll can
+    /// deliver post-click content in that gap. Floors future inserts past the
+    /// reserved position. Best-effort: a standalone card, a block without an
+    /// anchor, or a repeat click is a no-op.
+    pub(crate) async fn reserve_interaction_cut(
+        cards: &CardsHandle,
+        session_id: &str,
+        request_id: &str,
+    ) -> bool {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        cards
+            .cards
+            .lock()
+            .await
+            .get_mut(session_id)
+            .is_some_and(|card| card.acc.reserve_receipt(request_id))
+    }
+
     /// Resolve `ids` on `session_id`'s accumulator (ADR-0038, rule 4): each
     /// block becomes a tombstone and its receipt joins the timeline keyed at
     /// the resolution moment; a mode change (`Single`) leaves ONE receipt for
@@ -303,6 +324,9 @@ impl Turn {
                     if let Some(at) = acc.interaction(id).and_then(|block| block.asked_at()) {
                         mode_asked_at = Some(mode_asked_at.map_or(at, |seen: i64| seen.max(at)));
                     }
+                    // The one receipt covers every resolved block: drop any
+                    // per-block reservation a click made (issue #1023).
+                    acc.forget_reservation(id);
                     acc.dismiss_interaction(id)
                 }
             };
