@@ -802,9 +802,14 @@ impl ExternalFlow {
         // later, under the lock, once the seed count is final.
         let prepared =
             Turn::prepare_external_render(&data.session_id, &anchor, "", &session_dir, variant, None).await;
-        // One bounded read for the surfaces' receipt anchor (issue #1023); the
-        // follow streams parts later, but the block's cut must be captured now.
-        let asked_at = crate::bridge::request::flow::session_anchor(handles, &data.session_id).await;
+        // One bounded read for the surfaces' receipt anchor (issue #1023) —
+        // only when this follow will actually seed a request block; the follow
+        // streams parts later, but the block's cut must be captured now.
+        let asked_at = if data.pending.is_empty() {
+            None
+        } else {
+            crate::bridge::request::flow::session_anchor(handles, &data.session_id).await
+        };
         Some(SnapshotFollowPlan {
             anchor,
             session_thread_key,

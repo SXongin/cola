@@ -1616,6 +1616,7 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
         "ses_test",
         &["que_auto".into(), "que_auto_2".into()],
         &crate::bridge::turn::InlineResidue::Single("♻️ 已设为自动允许"),
+        true,
     )
     .await;
     assert!(resolved.is_some(), "the mode change resolves the blocks");
@@ -1700,6 +1701,7 @@ async fn the_drain_flush_stands_down_for_an_unanswered_typed_answer() {
         "ses_test",
         &["que_typed".into()],
         &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+        true,
     )
     .await;
     let resolved = platform.updated_cards().await.len();

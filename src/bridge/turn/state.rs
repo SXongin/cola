@@ -2963,22 +2963,31 @@ impl StreamAccumulator {
         &mut self,
         request_id: &str,
         line: impl FnOnce(&InteractionBlock) -> String,
+        reuse_reservation: bool,
     ) -> bool {
         let Some(idx) = self.live_index(request_id) else {
             // No live block on THIS card: no receipt will be written here, so
             // the click's reservation must not outlive it (issue #1023).
-            self.forget_reservation(request_id, None);
+            self.consume_reservation(request_id);
             return false;
+        };
+        // A LOCAL click owns the key it reserved. Any other resolution (a
+        // remote client's answer, a sweep, a command) discards it: the failed
+        // click wrote no receipt, and content rendered after it was visible
+        // before this resolution, so the receipt must land below it (a fresh
+        // `next_order` is past the abandoned floor).
+        let reserved = if reuse_reservation {
+            self.take_reserved_receipt(request_id)
+                .map(|reserved| reserved.receipt_key)
+        } else {
+            self.consume_reservation(request_id);
+            None
         };
         let text = line(&self.interactions[idx]);
         // The asking tool part's server time, when the surfacing read captured
         // it (issue #1023): the receipt's server-time cut, so a later read's
         // post-click content cannot outrank the receipt on a skewed clock.
         let asked_at = self.interactions[idx].asked_at();
-        let reserved = self
-            .reserved_receipts
-            .remove(request_id)
-            .map(|reserved| reserved.receipt_key);
         // `next_order` is the resolution moment with a monotonic guard: never
         // before the wall clock, never behind anything already on the card —
         // so a click's receipt always follows the content the Host was looking
@@ -3102,16 +3111,22 @@ impl StreamAccumulator {
     /// Drop a click's reservation for `request_id` without writing a receipt —
     /// a mode change resolves the block with ONE shared receipt, so its own
     /// per-block key is never used (issue #1023).
-    pub(super) fn forget_reservation(&mut self, request_id: &str, token: Option<u64>) {
+    pub(super) fn forget_reservation(&mut self, request_id: &str, token: u64) {
         // A failed click's late cleanup names its own reservation: never delete
         // a retry's fresh one for the same request.
         let matches = self
             .reserved_receipts
             .get(request_id)
-            .is_some_and(|reserved| token.is_none_or(|token| reserved.token == token));
-        if !matches {
-            return;
+            .is_some_and(|reserved| reserved.token == token);
+        if matches {
+            self.consume_reservation(request_id);
         }
+    }
+
+    /// Drop `request_id`'s reservation (and its floor) unconditionally: a
+    /// resolution that does not own the reservation, or a mode change resolving
+    /// another block with its own shared receipt.
+    pub(super) fn consume_reservation(&mut self, request_id: &str) {
         if let Some(reserved) = self.reserved_receipts.remove(request_id) {
             self.receipt_cuts.retain(|cut| cut.key != reserved.floor_key);
         }
@@ -3140,10 +3155,6 @@ impl StreamAccumulator {
     /// written for a click that preceded the message.
     pub(super) fn set_message_floor(&mut self, created: Option<i64>) {
         self.message_floor = created.and_then(|created| self.receipt_cut_floor(created));
-        eprintln!(
-            "FLOOR created={created:?} cuts={:?} floor={:?}",
-            self.receipt_cuts, self.message_floor
-        );
     }
 
     /// The timeline key a part's chunk is placed (and looked up) at: its own
@@ -3186,7 +3197,7 @@ impl StreamAccumulator {
         let Some(idx) = self.live_index(request_id) else {
             // No live block on THIS card: no receipt will be written here, so
             // the click's reservation must not outlive it (issue #1023).
-            self.forget_reservation(request_id, None);
+            self.consume_reservation(request_id);
             return false;
         };
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
@@ -3625,7 +3636,7 @@ impl StreamAccumulator {
             .map(|b| b.request_id().to_string())
             .collect();
         for id in &ids {
-            self.resolve_interaction(id, &line);
+            self.resolve_interaction(id, &line, false);
         }
         ids.len()
     }
@@ -8550,7 +8561,7 @@ mod tests {
 
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         assert!(
             acc.receipt_cut_floor(5_100).is_some(),
             "content after the ask earns a floor"
@@ -8573,7 +8584,7 @@ mod tests {
         // above the receipt — the cut only floors what came after it.
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         acc.push_text_at(Some(4_900), "explanation");
         let card = acc.build_card().to_string();
         assert!(
@@ -8586,7 +8597,7 @@ mod tests {
         // the receipt (issue #1023).
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         acc.set_message_floor(Some(5_100));
         acc.push_text_at(
             Some(5_100),
@@ -8617,7 +8628,7 @@ mod tests {
         acc.set_message_floor(Some(5_100));
         acc.push_text_at(Some(5_100), "竞态到达的继续");
         acc.set_message_floor(None);
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         let card = acc.build_card().to_string();
         assert!(
             card.find("✅ 已回答").unwrap() < card.find("竞态到达的继续").unwrap(),
@@ -8632,7 +8643,7 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
         acc.push_text_at(Some(5_100), "远端作答前已可见");
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         acc.set_message_floor(Some(5_200));
         acc.push_text_at(Some(5_200), "回执之后的内容");
         acc.set_message_floor(None);
@@ -8684,7 +8695,7 @@ mod tests {
         acc.set_message_floor(Some(900));
         acc.push_text_at(Some(2_000), "并行工具的结果");
         acc.set_message_floor(None);
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         let card = acc.build_card().to_string();
         assert!(
             card.find("并行工具的结果").unwrap() < card.find("✅ 已回答").unwrap(),
@@ -8704,7 +8715,7 @@ mod tests {
         );
         acc.push_text_at(Some(2_000), "继续增长");
         acc.set_message_floor(None);
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         let texts: Vec<&str> = acc
             .timeline
             .iter()
@@ -8725,7 +8736,7 @@ mod tests {
         // would start a second entry — a new reasoning panel, a split text run).
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         acc.set_message_floor(Some(5_100));
         acc.push_text_at(Some(5_100), "第一段");
         acc.push_text_at(Some(5_100), "第二段");
@@ -8785,8 +8796,8 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question("q1", 1_000));
         acc.add_interaction(question("q2", 2_000));
-        assert!(acc.resolve_interaction("q2", |_| "✅ 已回答 Q2".to_string()));
-        assert!(acc.resolve_interaction("q1", |_| "✅ 已回答 Q1".to_string()));
+        assert!(acc.resolve_interaction("q2", |_| "✅ 已回答 Q2".to_string(), true));
+        assert!(acc.resolve_interaction("q1", |_| "✅ 已回答 Q1".to_string(), true));
         acc.set_message_floor(Some(2_100));
         acc.push_text_at(Some(2_100), "两次提问之后写出的内容");
         acc.set_message_floor(None);
@@ -8823,15 +8834,75 @@ mod tests {
             drafts: vec![String::new()],
             asked_at: Some(1_000),
         }));
-        assert!(acc.reserve_receipt("q").is_some());
+        let token = acc.reserve_receipt("q").expect("the click reserves");
         let floor = acc.receipt_cuts.last().expect("a floor cut").key;
         assert!(
             acc.next_order() > floor,
             "the floor key is consumed, so an unrelated receipt cannot take it"
         );
-        acc.forget_reservation("q", None);
+        acc.forget_reservation("q", token);
         assert!(acc.receipt_cuts.is_empty(), "the floor goes with the reservation");
         assert!(acc.reserved_receipts.is_empty());
+    }
+
+    /// A stale click's cleanup names its own token: a retry's fresh reservation
+    /// for the same request must survive it (issue #1023).
+    #[test]
+    fn a_stale_cleanup_cannot_delete_a_retry_reservation() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
+            session_id: "s".into(),
+            request_id: "p".into(),
+            body: String::new(),
+            target: "⚡ ls".into(),
+            directory: "/w".into(),
+            always_supported: true,
+            summary_digest: None,
+            asked_at: Some(1_000),
+        }));
+        let stale = acc.reserve_receipt("p").expect("the first click reserves");
+        let retry = acc.reserve_receipt("p").expect("the retry reserves");
+        acc.forget_reservation("p", stale);
+        assert!(
+            acc.reserved_receipts.contains_key("p"),
+            "the retry's reservation survives the stale cleanup"
+        );
+        assert_eq!(
+            acc.reserved_receipts.get("p").map(|reserved| reserved.token),
+            Some(retry)
+        );
+    }
+
+    /// A permission's remote (or unreserved) receipt cuts a new MESSAGE after
+    /// the answer, while parallel work in the asking message (created before
+    /// the ask) stays above it (issue #1023).
+    #[test]
+    fn a_permission_receipt_cuts_post_click_messages_only() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
+            session_id: "s".into(),
+            request_id: "p".into(),
+            body: String::new(),
+            target: "⚡ ls".into(),
+            directory: "/w".into(),
+            always_supported: true,
+            summary_digest: None,
+            asked_at: Some(1_000),
+        }));
+        // A parallel part delivered late, in the ASKING message (created 900).
+        acc.set_message_floor(Some(900));
+        acc.push_text_at(Some(2_000), "并行工具的结果");
+        acc.set_message_floor(None);
+        assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string(), false));
+        acc.set_message_floor(Some(1_500));
+        acc.push_text_at(Some(1_500), "答复后的继续");
+        acc.set_message_floor(None);
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("并行工具的结果").unwrap() < card.find("✅ 已允许").unwrap()
+                && card.find("✅ 已允许").unwrap() < card.find("答复后的继续").unwrap(),
+            "message-scoped: parallel pre-click work above, new message below: {card}"
+        );
     }
 
     /// V2 decodes EVERY text part with no start time, and the server can grow
@@ -8860,7 +8931,7 @@ mod tests {
         }));
         let part = PartSource::at(MessageId::new("msg_v2"), 0);
         acc.push_text_from(None, Some(part.clone()), "第一段");
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         acc.push_text_from(None, Some(part), "继续");
         let texts: Vec<&str> = acc
             .timeline
@@ -8913,7 +8984,7 @@ mod tests {
             acc.receipt_cuts.iter().all(|cut| cut.key != first_floor),
             "the abandoned reservation's floor is dropped"
         );
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         let card = acc.build_card().to_string();
         assert!(
             card.find("失败后可见").unwrap() < card.find("✅ 已回答").unwrap(),
@@ -8937,7 +9008,7 @@ mod tests {
             summary_digest: None,
             asked_at: None,
         }));
-        assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string()));
+        assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string(), true));
         assert!(acc.receipt_cuts.is_empty());
         assert_eq!(acc.receipt_cut_floor(1), None);
     }

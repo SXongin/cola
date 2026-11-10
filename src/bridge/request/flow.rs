@@ -3172,6 +3172,7 @@ impl RequestFlow {
                 session,
                 &[id.to_string()],
                 &residue,
+                false,
             )
             .await;
             return true;
@@ -3194,6 +3195,7 @@ impl RequestFlow {
                 session,
                 &[id.to_string()],
                 &residue,
+                false,
             )
             .await;
             return true;
@@ -3219,6 +3221,7 @@ impl RequestFlow {
                     session,
                     &[id.to_string()],
                     &residue,
+                    false,
                 )
                 .await;
                 tracing::info!("withdrew {} inline block for the standalone fallback card", id);
@@ -3235,6 +3238,7 @@ impl RequestFlow {
                     session,
                     &[id.to_string()],
                     &residue,
+                    false,
                 )
                 .await;
                 tracing::info!(
