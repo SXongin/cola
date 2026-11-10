@@ -787,16 +787,13 @@ impl RequestKind for PermissionKind {
                 // the requests vanished (ADR-0038, rule 4). Their own per-click
                 // reservations are dropped first, so the shared receipt takes
                 // the CLICKED block's reserved key (issue #1023).
-                for id in &approved {
-                    if id != req_id {
-                        Turn::drop_interaction_reservation(
-                            &handles.cards,
-                            host.as_deref().unwrap_or(session_id),
-                            id,
-                        )
-                        .await;
-                    }
-                }
+                let others: Vec<String> = approved.iter().filter(|id| *id != req_id).cloned().collect();
+                Turn::drop_interaction_reservations(
+                    &handles.cards,
+                    host.as_deref().unwrap_or(session_id),
+                    &others,
+                )
+                .await;
                 cached = resolve_blocks(
                     flow,
                     &handles.cards,

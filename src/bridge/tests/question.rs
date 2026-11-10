@@ -1557,44 +1557,25 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
     seed_live_card(&app, "ses_test", "om_live").await;
     let cards = app.cards_handle();
-    let request = crate::backend::types::QuestionRequest {
-        id: "que_auto".into(),
-        session_id: "ses_test".into(),
-        questions: vec![crate::backend::types::QuestionInfo {
-            question: "继续？".into(),
-            header: "下一步".into(),
-            options: vec![crate::backend::types::QuestionOption {
-                label: "继续".into(),
-                ..Default::default()
-            }],
-            kind: crate::backend::types::FormFieldKind::String,
-            custom: None,
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    // Two PERMISSIONS (the Auto-Accept toggle's kind), asked at 1000 and 2000.
     assert!(
-        Turn::add_question(
+        Turn::add_permission_with_companion_locked(
             &cards,
             "ses_test",
-            &request,
+            &perm_request("per_auto", "ses_test", "ls -la"),
             "/work",
-            &crate::bridge::question::QuestionPaint::blank(1),
+            None,
             Some(1_000),
         )
         .await
     );
-    // A second block, asked later: the one receipt resolves both, and its cut
-    // is the LATEST ask among them (the click follows every ask).
-    let mut later = request.clone();
-    later.id = "que_auto_2".into();
     assert!(
-        Turn::add_question(
+        Turn::add_permission_with_companion_locked(
             &cards,
             "ses_test",
-            &later,
+            &perm_request("per_auto_2", "ses_test", "pwd"),
             "/work",
-            &crate::bridge::question::QuestionPaint::blank(1),
+            None,
             Some(2_000),
         )
         .await
@@ -1604,7 +1585,7 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     // The toggle's click reserves the mode receipt's position BEFORE its
     // reply; a message rendered while the reply is in flight follows it.
     assert!(
-        Turn::reserve_interaction_cut_for_pending(&cards, "ses_test", "que_auto")
+        Turn::reserve_interaction_cut_for_pending(&cards, "ses_test", "per_auto")
             .await
             .is_some()
     );
@@ -1614,7 +1595,7 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     let resolved = Turn::resolve_interactions(
         &cards,
         "ses_test",
-        &["que_auto".into(), "que_auto_2".into()],
+        &["per_auto".into(), "per_auto_2".into()],
         &crate::bridge::turn::InlineResidue::Single("♻️ 已设为自动允许"),
         true,
     )
@@ -1622,14 +1603,9 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     assert!(resolved.is_some(), "the mode change resolves the blocks");
     // Content written between the two asks predates the click: it stays above
     // the receipt. Content after the later ask follows it.
-    // A message created between the two asks (1_500) and delivered after the
-    // receipt was visible before the click: the retuned cut (latest ask 2_000)
-    // leaves it above the receipt.
     Turn::set_message_floor(&cards, "ses_test", Some(1_500)).await;
     Turn::push_text_at(&cards, "ses_test", 1_500, "两次提问之间").await;
     Turn::set_message_floor(&cards, "ses_test", None).await;
-    // A message created after the latest ask (and so after the click) is
-    // floored at the receipt; the one before it keeps its position.
     Turn::set_message_floor(&cards, "ses_test", Some(2_500)).await;
     Turn::push_text_at(&cards, "ses_test", 2_500, "自动之后的内容").await;
     Turn::set_message_floor(&cards, "ses_test", None).await;

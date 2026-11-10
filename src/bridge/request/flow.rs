@@ -469,7 +469,7 @@ pub(crate) const LOCATION_FORM_OMISSION_GRACE_SWEEPS: u32 = 3;
 /// the bound the request surfaces exactly as before, without the anchor. This
 /// is shorter than the flow's list timeout on purpose: listing is what the
 /// sweep is for, the drain is an improvement.
-const SURFACING_DRAIN_TIMEOUT_MS: u64 = 5_000;
+pub(crate) const SURFACING_DRAIN_TIMEOUT_MS: u64 = 5_000;
 
 /// The asking tool part's server time in a surfacing read (issue #1023): the
 /// newest server timestamp the read carries.
@@ -511,10 +511,10 @@ pub(crate) fn asking_anchor(transcript: &crate::backend::SessionTranscript) -> O
 /// rendering it. Used by the surfacing drain for an ancestor-hosted child and
 /// by the busy-follow seed, which both need the request's anchor but not the
 /// parts. A failed or timed-out read is `None` (the block stays unanchored).
-pub(crate) async fn session_anchor(handles: &FlowHandles, session_id: &str) -> Option<i64> {
+pub(crate) async fn session_anchor(handles: &FlowHandles, session_id: &str, timeout_ms: u64) -> Option<i64> {
     match crate::bridge::bounded_call(
         &format!("surfacing anchor ({session_id})"),
-        SURFACING_DRAIN_TIMEOUT_MS,
+        timeout_ms,
         handles.backend.transcript(session_id),
     )
     .await
@@ -1825,7 +1825,14 @@ impl RequestFlow {
     /// without rendering it — a sub-task request hosted on an ancestor card
     /// (issue #1023). A failed or timed-out read leaves the block unanchored.
     async fn read_anchor(&self, handles: &FlowHandles, session_id: &str) -> Option<i64> {
-        session_anchor(handles, session_id).await
+        session_anchor(
+            handles,
+            session_id,
+            self.list_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(SURFACING_DRAIN_TIMEOUT_MS),
+        )
+        .await
     }
 
     /// Everything one sweep does with ONE listed request, wrapped by the

@@ -808,7 +808,12 @@ impl ExternalFlow {
         let asked_at = if data.pending.is_empty() {
             None
         } else {
-            crate::bridge::request::flow::session_anchor(handles, &data.session_id).await
+            crate::bridge::request::flow::session_anchor(
+                handles,
+                &data.session_id,
+                crate::bridge::request::flow::SURFACING_DRAIN_TIMEOUT_MS,
+            )
+            .await
         };
         Some(SnapshotFollowPlan {
             anchor,
