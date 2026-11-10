@@ -3030,10 +3030,10 @@ impl StreamAccumulator {
     /// time (issue #1023), before the backend reply. The reply returns before
     /// the receipt is written, so a render poll can deliver post-click content
     /// in that gap; flooring future inserts at `key + 1` keeps that content
-    /// after the position the receipt will take. Returns false when the card
-    /// does not carry an anchored live block for the request, or one is already
-    /// reserved (a repeated click keeps the first reservation — content after
-    /// that first click is already floored past it).
+    /// after the position the receipt will take. Returns the reservation's
+    /// token, or `None` when the card does not carry an anchored live block for
+    /// the request. A repeated click supersedes the old reservation with a fresh
+    /// key (and drops the abandoned floor).
     pub(super) fn reserve_receipt(&mut self, request_id: &str) -> Option<u64> {
         let asked_at = self.interaction(request_id).and_then(|block| block.asked_at())?;
         self.reserve_receipt_at(request_id, asked_at)
@@ -3046,7 +3046,7 @@ impl StreamAccumulator {
         let at = self
             .interactions
             .iter()
-            .filter(|block| block.is_live())
+            .filter(|block| matches!(block, InteractionBlock::Permission(_)) && block.is_live())
             .filter_map(|block| block.asked_at())
             .max()?;
         self.reserve_receipt_at(request_id, at)

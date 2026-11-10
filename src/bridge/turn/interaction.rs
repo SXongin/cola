@@ -363,20 +363,24 @@ impl Turn {
         }
     }
 
-    /// Drop `request_id`'s reservation unconditionally (issue #1023) — a mode
-    /// change resolves the block through its SHARED receipt, so the block's own
-    /// per-click reservation must not survive it.
-    pub(crate) async fn drop_interaction_reservation(
+    /// Drop the reservations of `request_ids` under ONE lock acquisition
+    /// (issue #1023) — a mode change resolves those blocks through its SHARED
+    /// receipt, so their per-click reservations must not survive it. One
+    /// acquisition keeps the card callback's latency from growing with the
+    /// number of pending permissions.
+    pub(crate) async fn drop_interaction_reservations(
         cards: &CardsHandle,
         session_id: &str,
-        request_id: &str,
+        request_ids: &[String],
     ) {
         let write_lock = cards.write_lock(session_id).await;
         let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
             return;
         };
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.consume_reservation(request_id);
+            for request_id in request_ids {
+                card.acc.consume_reservation(request_id);
+            }
         }
     }
 
