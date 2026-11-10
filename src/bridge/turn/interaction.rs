@@ -314,6 +314,22 @@ impl Turn {
             .is_some_and(|card| card.acc.reserve_receipt(request_id))
     }
 
+    /// Drop a click's reservation for `request_id` without writing its receipt
+    /// (issue #1023) — the reply failed or the mode flag did not persist, so the
+    /// request stays pending. Content rendered after that failed click must not
+    /// be cut against a receipt that never lands; the retry takes a fresh key.
+    pub(crate) async fn forget_interaction_reservation(
+        cards: &CardsHandle,
+        session_id: &str,
+        request_id: &str,
+    ) {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+            card.acc.forget_reservation(request_id);
+        }
+    }
+
     /// Resolve `ids` on `session_id`'s accumulator (ADR-0038, rule 4): each
     /// block becomes a tombstone and its receipt joins the timeline keyed at
     /// the resolution moment; a mode change (`Single`) leaves ONE receipt for
@@ -333,25 +349,33 @@ impl Turn {
         // sits after every one of them, so content written after this click is
         // after that ask too (issue #1023).
         let mut mode_asked_at: Option<i64> = None;
-        let mut mode_reserved_key: Option<i64> = None;
+        let mut mode_reserved: Option<crate::bridge::turn::state::ReservedReceipt> = None;
         for id in ids {
             let resolved = match residue {
                 InlineResidue::PerBlock(line) => {
                     acc.resolve_interaction(id, |block| line(&block.receipt_target()))
                 }
                 InlineResidue::Single(_) => {
-                    if let Some(at) = acc.interaction(id).and_then(|block| block.asked_at()) {
-                        mode_asked_at = Some(mode_asked_at.map_or(at, |seen: i64| seen.max(at)));
-                    }
-                    // The click that started this mode change reserved its own
-                    // receipt key (issue #1023): use it, and drop the other
-                    // blocks' reservations (the one receipt covers them).
-                    if let Some(key) = acc.take_reserved_receipt_key(id) {
-                        mode_reserved_key.get_or_insert(key);
+                    let asked = acc.interaction(id).and_then(|block| block.asked_at());
+                    let resolved = acc.dismiss_interaction(id);
+                    if resolved {
+                        if let Some(at) = asked {
+                            mode_asked_at = Some(mode_asked_at.map_or(at, |seen: i64| seen.max(at)));
+                        }
+                        // The click that started this mode change reserved its
+                        // own receipt key (issue #1023): use it, and drop the
+                        // other blocks' reservations (one receipt covers them).
+                        match acc.take_reserved_receipt(id) {
+                            Some(reserved) if mode_reserved.is_none() => mode_reserved = Some(reserved),
+                            Some(reserved) => acc.forget_reserved_cut(reserved.floor_key),
+                            None => {}
+                        }
                     } else {
+                        // Nothing resolved under this id: its reservation must
+                        // not outlive the click that made it.
                         acc.forget_reservation(id);
                     }
-                    acc.dismiss_interaction(id)
+                    resolved
                 }
             };
             resolved_here |= resolved;
@@ -359,11 +383,17 @@ impl Turn {
         if let InlineResidue::Single(text) = residue
             && resolved_here
         {
-            match mode_reserved_key {
+            match mode_reserved {
                 // A reservation already floored the messages written during the
-                // reply; the receipt takes the reserved key below them.
-                Some(key) => {
-                    acc.push_receipt_at(Some(key), text);
+                // reply; the receipt takes the reserved key below them. Its cut
+                // is retuned to the latest ask among the resolved blocks, so a
+                // message written between an earlier ask and the click (which
+                // the Host saw) is not floored.
+                Some(reserved) => {
+                    if let Some(asked_at) = mode_asked_at {
+                        acc.retune_receipt_cut(reserved.floor_key, asked_at);
+                    }
+                    acc.push_receipt_at(Some(reserved.receipt_key), text);
                 }
                 None => {
                     let key = acc.push_receipt(text);
