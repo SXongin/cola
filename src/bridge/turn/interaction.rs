@@ -314,6 +314,21 @@ impl Turn {
         Self::reserve_locked(cards, session_id, |acc| acc.reserve_receipt(request_id)).await
     }
 
+    /// [`Self::reserve_interaction_cut`] for a mode change: the reservation's
+    /// cut is the latest ask among the live blocks of the CLICKED block's
+    /// session — the blocks the toggle's one receipt covers. A sibling
+    /// session's block on the same host card does not raise it.
+    pub(crate) async fn reserve_interaction_cut_for_session(
+        cards: &CardsHandle,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<u64> {
+        Self::reserve_locked(cards, session_id, |acc| {
+            acc.reserve_receipt_for_session(request_id)
+        })
+        .await
+    }
+
     async fn reserve_locked(
         cards: &CardsHandle,
         session_id: &str,
@@ -407,10 +422,16 @@ impl Turn {
                         // The click that started this mode change reserved its
                         // own receipt key (issue #1023): use it, and drop the
                         // other blocks' reservations (one receipt covers them).
-                        match acc.take_reserved_receipt(id) {
-                            Some(reserved) if mode_reserved.is_none() => mode_reserved = Some(reserved),
-                            Some(reserved) => acc.forget_reserved_cut(reserved.floor_key),
-                            None => {}
+                        // A command (`reuse_reservation == false`) has no click
+                        // to inherit: discard any stale reservation instead.
+                        if reuse_reservation {
+                            match acc.take_reserved_receipt(id) {
+                                Some(reserved) if mode_reserved.is_none() => mode_reserved = Some(reserved),
+                                Some(reserved) => acc.forget_reserved_cut(reserved.floor_key),
+                                None => {}
+                            }
+                        } else {
+                            acc.consume_reservation(id);
                         }
                     } else {
                         // Nothing resolved under this id: its reservation must

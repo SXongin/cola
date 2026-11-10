@@ -3023,6 +3023,25 @@ impl StreamAccumulator {
         self.receipt_cuts.push(ReceiptCut { at: asked_at, key });
     }
 
+    /// Reserve at the LATEST ask among the live blocks `request_id`'s receipt
+    /// covers — the per-block receipt covers only `request_id`, while a mode
+    /// change covers the live blocks of the clicked block's SESSION (not a
+    /// sibling session's block that merely shares the host card).
+    pub(super) fn reserve_receipt_for_session(&mut self, request_id: &str) -> Option<u64> {
+        let session = self.interaction(request_id)?.session_id().to_string();
+        let at = self
+            .interactions
+            .iter()
+            .filter(|block| {
+                matches!(block, InteractionBlock::Permission(_))
+                    && block.is_live()
+                    && block.session_id() == session
+            })
+            .filter_map(|block| block.asked_at())
+            .max()?;
+        self.reserve_receipt_at(request_id, at)
+    }
+
     /// Reserve the timeline key for `request_id`'s Interaction Receipt at CLICK
     /// time (issue #1023), before the backend reply. The reply returns before
     /// the receipt is written, so a render poll can deliver post-click content

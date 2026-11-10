@@ -1574,10 +1574,10 @@ pub(super) fn render_new_turn_parts_committing(
 /// start it does carry. `None` only when the message has no server time at all
 /// (it cannot be classified against a receipt then).
 fn message_floor_time(message: &crate::backend::TranscriptMessage) -> Option<i64> {
-    message
-        .time
-        .map(|time| time.created)
-        .or_else(|| message.parts.iter().filter_map(Part::started_at).max())
+    // Only the message's own server time can classify it: a part start does
+    // not say when the message itself was produced, so an untimed message stays
+    // unfloored rather than being moved on a guess.
+    message.time.map(|time| time.created)
 }
 
 pub(super) fn render_turn_parts(
