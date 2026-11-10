@@ -314,19 +314,6 @@ impl Turn {
         Self::reserve_locked(cards, session_id, |acc| acc.reserve_receipt(request_id)).await
     }
 
-    /// [`Self::reserve_interaction_cut`] for a mode change: the reservation's
-    /// cut is the latest ask among the live blocks its one receipt covers.
-    pub(crate) async fn reserve_interaction_cut_for_pending(
-        cards: &CardsHandle,
-        session_id: &str,
-        request_id: &str,
-    ) -> Option<u64> {
-        Self::reserve_locked(cards, session_id, |acc| {
-            acc.reserve_receipt_for_pending(request_id)
-        })
-        .await
-    }
-
     async fn reserve_locked(
         cards: &CardsHandle,
         session_id: &str,
