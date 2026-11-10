@@ -320,3 +320,35 @@ pending but intentionally has no live card. Its persisted dismissed record is
 authoritative: the sweep must not re-post it, and restart re-adoption applies only
 to a card that was not dismissed; `/mcp` is the way back. The exception does not
 apply to a session-backed request, or to a Location Form that was never dismissed.
+
+## Amendment (2026-11-10): the sweep drains the session before it surfaces a block, and a receipt carries a server-time cut
+
+The 2026-10-31 update made a live form freeze the render pass, which is right —
+but it has a consequence at **surfacing**: the request sweep lists a pending
+question independently of the render loop, and the assistant's explanation of
+*why* it is asking sits in the same transcript, not yet rendered. If the sweep
+inserts the block first, the card now carries an unanswered input, so the render
+pass stands down and the explanation is held until after the answer (issue
+#1023): the Host is asked to choose blind.
+
+`RequestFlow::surface` therefore **drains the session once before the inline
+block lands**: one bounded transcript read, one bounded `Turn::render_and_flush`,
+then the block insert and its flush — so the text the Host needs is on the card
+when the question appears. The drain runs only for the request's **own** session
+with a live card; an ancestor host render no part of a child's transcript, and a
+standalone card has no card to drain. It is best-effort by construction: a
+failed or timed-out read changes nothing, the request surfaces exactly as before
+without the anchor, and it costs at most one read per first surfacing.
+
+The same read yields the **asking tool part's server time** — while a request is
+pending its turn is blocked, so the `question` / permission tool call is the
+newest server activity in the read. That time travels on the block
+(`PendingQuestion::asked_at` / `PendingPermission::asked_at`) and, when the block
+resolves, becomes the receipt's **server-time cut** (`ReceiptCut`): the receipt
+itself keeps its `next_order` key — it must follow everything the Host could see
+— and any later read's entry whose own server time is *after* the cut is floored
+at that key. Both halves are on the server's clock, so cola's wall clock cannot
+decide the comparison: a part server-timestamped after the click belongs below
+the receipt (rule 4), even when the server's clock runs behind cola's. A block
+that reached the card without a surfacing read (a re-host, a busy-follow seed, a
+restart re-adoption) carries no anchor and keeps the previous receipt behaviour.

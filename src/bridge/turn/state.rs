@@ -72,6 +72,25 @@ pub(super) struct TimelineItem {
     pub(super) lead: Option<String>,
 }
 
+/// An Interaction Receipt's **server-time cut** (issue #1023): the asking tool
+/// part's server time (`at`) and the receipt's own timeline key (`key`). Only
+/// `at` is on the server's clock — the cut exists so a later read's part times
+/// can be compared against the ask; `key` is the timeline position (cola's
+/// scale) that content written after the ask may not precede.
+///
+/// The cut answers one question about content a later read delivers: was it
+/// written after the Host clicked? A part whose `shown_at` is AFTER `at` was
+/// server-timestamped after the request was asked, and the request blocks the
+/// turn, so the Host's click cannot precede it — it follows the click and may
+/// not sort above the receipt at `key` (ADR-0038 rule 4). A part at or before
+/// `at` was content the Host could see when they clicked, and keeps its own
+/// position, above the receipt if its key says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReceiptCut {
+    pub(super) at: i64,
+    pub(super) key: i64,
+}
+
 /// Where a timeline text/reasoning entry came from: the typed transcript
 /// part's own position (spec #561's cursor frontier). The payload carries no
 /// stable part id (AGENTS.md pitfall `wire-shapes`), so identity is the message plus the part's
@@ -740,6 +759,13 @@ pub(super) struct PendingPermission {
     /// delivered the full content). `None` for an ordinary in-budget block,
     /// which does not need the surface proof.
     pub(super) summary_digest: Option<u64>,
+    /// The asking tool call's server time at surfacing, when the sweep drained
+    /// the session first (issue #1023). The Interaction Receipt records it as
+    /// its server-time cut, so content the server wrote after the click can
+    /// never sort above the receipt under clock skew. `None` for a block that
+    /// reached the card without a surfacing read (a re-host, a busy-follow
+    /// seed, a restart re-adoption) — the receipt then keeps the old behaviour.
+    pub(super) asked_at: Option<i64>,
 }
 
 /// A `question` tool request surfaced inline on the streaming card. `answers[i]`
@@ -771,6 +797,10 @@ pub(super) struct PendingQuestion {
     /// The unsubmitted text per question, seeded into the open question's box
     /// as `default_value` so a switch does not lose what was typed.
     pub(super) drafts: Vec<String>,
+    /// The asking tool call's server time at surfacing, when the sweep drained
+    /// the session first (issue #1023) — the Interaction Receipt's server-time
+    /// cut. See [`PendingPermission::asked_at`].
+    pub(super) asked_at: Option<i64>,
 }
 
 impl PendingQuestion {
@@ -839,6 +869,16 @@ impl InteractionBlock {
             InteractionBlock::Permission(p) => &p.session_id,
             InteractionBlock::Question(q) => &q.session_id,
             InteractionBlock::Receipt(_) => "",
+        }
+    }
+
+    /// The asking tool call's server time, when the block was surfaced by a
+    /// read that saw it (issue #1023). Empty for a receipt tombstone.
+    pub(super) fn asked_at(&self) -> Option<i64> {
+        match self {
+            InteractionBlock::Permission(p) => p.asked_at,
+            InteractionBlock::Question(q) => q.asked_at,
+            InteractionBlock::Receipt(_) => None,
         }
     }
 
@@ -1454,6 +1494,13 @@ pub(super) struct StreamAccumulator {
     last_key: i64,
     /// Next [`TimelineItem::seq`] to hand out (see [`Self::insert_kind`]).
     item_seq: u64,
+    /// The newest Interaction Receipt's server-time cut (issue #1023), when the
+    /// resolved block carried one. Private to this module: recorded by
+    /// [`Self::resolve_interaction`], read by [`Self::insert_item`] so a later
+    /// read's post-click content lands after the receipt. A newer receipt
+    /// replaces it; a block surfaced without a read leaves the previous cut in
+    /// force.
+    receipt_cut: Option<ReceiptCut>,
     /// The card's interaction section: the live permission/question blocks
     /// (rendered in the tail) and the tombstones of resolved ones (their
     /// receipt is a timeline entry). Private to this module (no external
@@ -2892,6 +2939,10 @@ impl StreamAccumulator {
             return false;
         };
         let text = line(&self.interactions[idx]);
+        // The asking tool part's server time, when the surfacing read captured
+        // it (issue #1023): the receipt's server-time cut, so a later read's
+        // post-click content cannot outrank the receipt on a skewed clock.
+        let asked_at = self.interactions[idx].asked_at();
         // `next_order` is the resolution moment with a monotonic guard: never
         // before the wall clock, never behind anything already on the card —
         // so a click's receipt always follows the content the Host was looking
@@ -2900,8 +2951,38 @@ impl StreamAccumulator {
         // no clock rather than putting cola's in the panels' costume.
         let key = self.next_order();
         self.insert_kind(key, None, TimelineKind::Receipt(text));
+        if let Some(asked_at) = asked_at {
+            self.record_receipt_cut(asked_at, key);
+        }
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
         true
+    }
+
+    /// Record the server-time cut of the receipt just written (issue #1023).
+    /// Only the NEWEST ask is kept: everything written after an earlier ask is
+    /// also after the newer one, so the newer receipt's key is the floor that
+    /// matters. A block without an anchor (no surfacing read) clears nothing —
+    /// decisions recorded earlier still hold.
+    fn record_receipt_cut(&mut self, asked_at: i64, key: i64) {
+        if self.receipt_cut.is_none_or(|cut| asked_at >= cut.at) {
+            self.receipt_cut = Some(ReceiptCut { at: asked_at, key });
+        }
+    }
+
+    /// The newest Interaction Receipt's server-time cut, if a resolved block
+    /// carried one ([`ReceiptCut`]).
+    pub(super) fn receipt_cut(&self) -> Option<ReceiptCut> {
+        self.receipt_cut
+    }
+
+    /// The key floor an entry whose own server time is `shown_at` earns from
+    /// the newest receipt cut: an entry the server timestamped after the asking
+    /// time was produced after the click, so it may not sort above the receipt
+    /// ([`ReceiptCut`], ADR-0038 rule 4). `None` when there is no cut, no
+    /// server time, or the entry predates the ask.
+    pub(super) fn receipt_cut_floor(&self, shown_at: Option<i64>) -> Option<i64> {
+        let cut = self.receipt_cut()?;
+        (shown_at.is_some_and(|at| at > cut.at)).then_some(cut.key)
     }
 
     /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
@@ -3567,6 +3648,13 @@ impl StreamAccumulator {
         kind: TimelineKind,
         lead: Option<String>,
     ) -> usize {
+        // A part the server timestamped AFTER an Interaction Receipt's asking
+        // time was produced after the click, so it may not sort above the
+        // receipt (issue #1023, [`ReceiptCut`]). The receipt's own key is the
+        // floor; equal keys keep this entry after it.
+        let key = self
+            .receipt_cut_floor(shown_at)
+            .map_or(key, |floor| key.max(floor));
         let idx = self.timeline.partition_point(|item| item.key <= key);
         let (idx, key) = if idx < self.render_from {
             (
@@ -7942,6 +8030,7 @@ mod tests {
                 done: vec![done],
                 open: 0,
                 drafts: vec![String::new()],
+                asked_at: None,
             })
         };
         assert!(!acc.awaits_typed_answer(), "no block, no input");
@@ -7953,6 +8042,7 @@ mod tests {
             directory: "/w".into(),
             always_supported: true,
             summary_digest: None,
+            asked_at: None,
         }));
         assert!(
             !acc.awaits_typed_answer(),
@@ -8005,6 +8095,7 @@ mod tests {
                 done: done.to_vec(),
                 open: 0,
                 drafts: vec![String::new(); 2],
+                asked_at: None,
             })
         };
         let mut acc = StreamAccumulator::new("test");
@@ -8050,6 +8141,7 @@ mod tests {
                 done: vec![false, false],
                 open,
                 drafts: vec![String::new(); 2],
+                asked_at: None,
             })
         };
         let mut acc = StreamAccumulator::new("test");
@@ -8102,6 +8194,7 @@ mod tests {
             done: vec![false],
             open: 0,
             drafts: vec![String::new()],
+            asked_at: None,
         });
         acc.add_interaction(question);
         assert_eq!(acc.awaiting_action(), AwaitingAction::Question);
@@ -8119,6 +8212,7 @@ mod tests {
             directory: "/w".into(),
             always_supported: true,
             summary_digest: None,
+            asked_at: None,
         }));
         assert_eq!(acc.awaiting_action(), AwaitingAction::Both);
         assert!(
@@ -8204,6 +8298,83 @@ mod tests {
         let card = acc.build_card();
         assert_eq!(first_content(&card), "earlier content");
         assert_eq!(card["body"]["elements"][1]["content"], "📨 receipt");
+    }
+
+    /// Issue #1023: a block surfaced by a read that saw the asking tool call
+    /// carries its server time. The receipt records it as a cut, so a part the
+    /// server timestamped AFTER the ask — written after the click, whatever
+    /// cola's clock says — lands below the receipt even though its own server
+    /// key is far behind the receipt's `next_order` key.
+    #[test]
+    fn a_post_click_part_lands_below_the_receipt_that_carries_an_ask_time() {
+        let question = |asked_at: Option<i64>| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: "q".into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "继续?".into(),
+                    header: "继续".into(),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![false],
+                open: 0,
+                drafts: vec![String::new()],
+                asked_at,
+            })
+        };
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(5_000)));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        let cut = acc.receipt_cut().expect("the anchor is the receipt's cut");
+        assert_eq!(cut.at, 5_000);
+
+        // The server's post-click continuation: its own time is 5_100, but the
+        // receipt's cola-clock key is ~now, so without the cut it would sort
+        // ABOVE the receipt (ADR-0038 rule 4 forbids that).
+        acc.push_text_at(Some(5_100), "continuation");
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("✅ 已回答").unwrap() < card.find("continuation").unwrap(),
+            "post-click content must follow the receipt: {card}"
+        );
+
+        // Content written BEFORE the ask keeps the position its key earns,
+        // above the receipt — the cut only floors what came after it.
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(5_000)));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.push_text_at(Some(4_900), "explanation");
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("explanation").unwrap() < card.find("✅ 已回答").unwrap(),
+            "pre-click content stays above the receipt: {card}"
+        );
+    }
+
+    /// A block surfaced without a read (a re-host, a busy-follow seed, a
+    /// restart re-adoption) carries no anchor, so its receipt records no cut
+    /// and nothing a later read delivers is re-placed — the old behaviour.
+    #[test]
+    fn a_block_without_an_ask_time_records_no_cut() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
+            session_id: "s".into(),
+            request_id: "p".into(),
+            body: String::new(),
+            target: "⚡ ls".into(),
+            directory: "/w".into(),
+            always_supported: true,
+            summary_digest: None,
+            asked_at: None,
+        }));
+        assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string()));
+        assert_eq!(acc.receipt_cut(), None);
+        assert_eq!(acc.receipt_cut_floor(Some(1)), None);
     }
 
     /// Two text parts of ONE message sharing a server time keep their own

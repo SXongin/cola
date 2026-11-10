@@ -176,7 +176,11 @@ pub trait RequestKind: Send + Sync {
     ) -> bool;
 
     /// [`Self::add_inline`] for a caller that already holds the host's card
-    /// write lock — the sweep's one surfacing decision (ADR-0100).
+    /// write lock — the sweep's one surfacing decision (ADR-0100). `asked_at`
+    /// is the asking tool part's server time from the surfacing drain (issue
+    /// #1023): the block keeps it as its Interaction Receipt's server-time cut,
+    /// so a later read's post-click content cannot outrank the receipt under
+    /// clock skew. `None` when the caller did not read the session first.
     async fn add_inline_locked(
         &self,
         flow: &RequestFlow,
@@ -184,6 +188,7 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool;
 
     /// Seed this kind's inline block on a NEW host card with the request's
@@ -191,7 +196,8 @@ pub trait RequestKind: Send + Sync {
     /// reproduces the static read's blocks before the renderer takes over and
     /// remembers the request right after. The caller holds the host's card
     /// write lock: `/card`'s post, arm and seed are one critical section
-    /// (ADR-0100).
+    /// (ADR-0100). `asked_at` is the same surfacing drain anchor as
+    /// [`Self::add_inline_locked`]; this path has no drain of its own.
     async fn add_initial_inline_locked(
         &self,
         flow: &RequestFlow,
@@ -199,8 +205,10 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool {
-        self.add_inline_locked(flow, cards, host, req, dir).await
+        self.add_inline_locked(flow, cards, host, req, dir, asked_at)
+            .await
     }
 
     /// Build the standalone interactive card (used when no streaming card hosts
@@ -482,12 +490,13 @@ impl RequestKind for PermissionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool {
         let PendingRequest::Permission(p) = req else {
             return false;
         };
         let companion = flow.companion_for(req);
-        Turn::add_permission_with_companion_locked(cards, host, p, dir, companion).await
+        Turn::add_permission_with_companion_locked(cards, host, p, dir, companion, asked_at).await
     }
 
     fn build_card(&self, flow: &RequestFlow, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -1943,6 +1952,7 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1951,7 +1961,7 @@ impl RequestKind for QuestionKind {
             .with_question_state(&q.id, |state| state.paint())
             .await
             .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
-        Turn::add_question_locked(cards, host, q, dir, &paint).await
+        Turn::add_question_locked(cards, host, q, dir, &paint, asked_at).await
     }
 
     async fn add_initial_inline_locked(
@@ -1961,12 +1971,13 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
         };
         let paint = crate::bridge::question::QuestionPaint::blank(q.questions.len());
-        Turn::add_question_locked(cards, host, q, dir, &paint).await
+        Turn::add_question_locked(cards, host, q, dir, &paint, asked_at).await
     }
 
     fn build_card(&self, _flow: &RequestFlow, req: &PendingRequest, dir: &str) -> serde_json::Value {

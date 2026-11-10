@@ -462,6 +462,42 @@ const MAX_PENDING_WITHDRAWALS: usize = 32;
 /// record does not leak (ADR-0103).
 pub(crate) const LOCATION_FORM_OMISSION_GRACE_SWEEPS: u32 = 3;
 
+/// How long a first surfacing's session drain may take (issue #1023), for both
+/// its transcript read and its render pass. The drain exists to put a
+/// request's pre-question text on the card before the block freezes it, but a
+/// wedged connection must not delay surfacing more than a few seconds — past
+/// the bound the request surfaces exactly as before, without the anchor. This
+/// is shorter than the flow's list timeout on purpose: listing is what the
+/// sweep is for, the drain is an improvement.
+const SURFACING_DRAIN_TIMEOUT_MS: u64 = 5_000;
+
+/// The asking tool part's server time in a surfacing read (issue #1023): the
+/// newest server timestamp the read carries.
+///
+/// While a question or permission is pending its turn is blocked, so the tool
+/// call that raised it is the newest part the server wrote — this is that
+/// call's `time.created` in the ordinary case and, generally, a high-water mark
+/// no content the Host could have seen when they clicked exceeds. Everything
+/// the server writes after the click is timestamped above it, which is the only
+/// property the receipt's cut needs.
+/// `None` when the read carries no server time at all (the block then keeps the
+/// old receipt behaviour).
+fn asking_anchor(transcript: &crate::backend::SessionTranscript) -> Option<i64> {
+    let timed_messages = transcript
+        .messages
+        .iter()
+        .filter_map(|message| message.time.map(|time| message.newest_activity_ms(time.created)));
+    // A message without a server time cannot be placed, but its parts may
+    // still carry starts — include them rather than dropping the only clock.
+    let untimed_parts = transcript
+        .messages
+        .iter()
+        .filter(|message| message.time.is_none())
+        .flat_map(|message| message.parts.iter())
+        .filter_map(crate::backend::Part::started_at);
+    timed_messages.chain(untimed_parts).max()
+}
+
 /// Whether `value` is answer state cola may persist for a Location Form.
 ///
 /// A **multi-select** value is always persisted: its entries are deliberate
@@ -937,7 +973,7 @@ impl RequestFlow {
             return false;
         }
         self.kind
-            .add_initial_inline_locked(self, cards, host, req, dir)
+            .add_initial_inline_locked(self, cards, host, req, dir, None)
             .await
     }
 
@@ -1671,6 +1707,64 @@ impl RequestFlow {
             .retain(|id, dir| pending.contains(id) || failed_dirs.contains(dir));
     }
 
+    /// Read `session_id`'s transcript once and render it into its live card
+    /// before a request block is inserted (issue #1023), returning the asking
+    /// tool part's server time — the Interaction Receipt's server-time cut.
+    ///
+    /// Bounded by the flow's read timeout twice (the transcript read and the
+    /// render pass): the pass also reads the server (title, context window,
+    /// child liveness), and one wedged call must not park the sweep. A timeout
+    /// or failure is not fatal: the request surfaces exactly as before, without
+    /// the anchor. The parts render before the pass's other stages, so a timed
+    /// out pass normally still landed the text this drain exists for.
+    async fn drain_and_anchor(&self, handles: &FlowHandles, session_id: &str) -> Option<i64> {
+        // A finished/idle card is no host (ADR-0100): nothing will render into
+        // it, and the sweep is about to fall through to the standalone path.
+        if !Turn::is_running(&handles.cards, session_id).await {
+            return None;
+        }
+        let timeout_ms = self
+            .list_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(SURFACING_DRAIN_TIMEOUT_MS);
+        let read = crate::bridge::bounded_call(
+            &format!("{} surfacing drain ({session_id})", self.kind.label()),
+            timeout_ms,
+            handles.backend.transcript(session_id),
+        )
+        .await;
+        let transcript = match read {
+            Some(Ok(transcript)) => transcript,
+            Some(Err(error)) => {
+                tracing::warn!("{} surfacing drain transcript: {}", self.kind.label(), error);
+                return None;
+            }
+            // `bounded_call` already logged the timeout.
+            None => return None,
+        };
+        let asked_at = asking_anchor(&transcript);
+        if tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            Turn::render_and_flush_draining(
+                &handles.cards,
+                &handles.sessions,
+                &handles.backend,
+                &handles.requests,
+                session_id,
+                &transcript,
+            ),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "{} surfacing drain render timed out after {timeout_ms}ms",
+                self.kind.label()
+            );
+        }
+        asked_at
+    }
+
     /// Everything one sweep does with ONE listed request, wrapped by the
     /// caller in that request's session span (ADR-0048): the re-host for a
     /// request already surfaced, the companion refusal (a delivery that failed),
@@ -1969,6 +2063,33 @@ impl RequestFlow {
             // sweep retry the withdrawal.
             return false;
         }
+        // Issue #1023: the request sweep can see a pending request before the
+        // session's render loop has written the assistant text that precedes
+        // it. Inserting the block first freezes the card (any repaint would
+        // wipe an unsubmitted answer, issue #917), so that text would stay
+        // held back until after the answer — the Host is asked to choose
+        // blind. Read the session ONCE and render it BEFORE the block lands,
+        // so the explanation is on the card when the question appears. The
+        // same read yields the asking tool part's server time, carried on the
+        // block as its Interaction Receipt's server-time cut.
+        //
+        // Bounded and best-effort: a failed or timed-out read falls back to
+        // the old order and the request still surfaces. Only the request's
+        // OWN session is drained — an ancestor host renders no part of a
+        // child's transcript, and a standalone card has no live card to drain.
+        let asked_at = if fallback_summary.is_some() {
+            None
+        } else {
+            let drain = match resolved_host.as_deref() {
+                Some(host) if host == req.session_id() => Some(host),
+                Some(_) => None,
+                None => Some(req.session_id()),
+            };
+            match drain {
+                Some(session_id) => self.drain_and_anchor(handles, session_id).await,
+                None => None,
+            }
+        };
         // Inline path: take the HOST's write lock — never the request
         // Session's while also holding the host's, and never the reverse. A
         // sub-task child has no card of its own, so its lock would serialize
@@ -1986,7 +2107,7 @@ impl RequestFlow {
             if Turn::is_running(&handles.cards, host).await {
                 let pushed = self
                     .kind
-                    .add_inline_locked(self, &handles.cards, host, req, dir)
+                    .add_inline_locked(self, &handles.cards, host, req, dir, asked_at)
                     .await;
                 if pushed {
                     // The block landed: this request is surfaced from now on.
@@ -2038,7 +2159,7 @@ impl RequestFlow {
         if fallback_summary.is_none() && Turn::is_running(&handles.cards, req.session_id()).await {
             let pushed = self
                 .kind
-                .add_inline_locked(self, &handles.cards, req.session_id(), req, dir)
+                .add_inline_locked(self, &handles.cards, req.session_id(), req, dir, asked_at)
                 .await;
             if pushed {
                 seen.insert(req.id().to_string());
@@ -3705,4 +3826,80 @@ pub(crate) async fn reject_leftovers_for_turn(
         );
     }
     rejected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asking_anchor;
+    use crate::backend::{MessageRole, Part, SessionTranscript, ToolCall, ToolIdentity, ToolStatus};
+    use crate::bridge::test_support::{text_part, typed_message};
+
+    /// The surfacing anchor is the read's newest server timestamp: the asking
+    /// tool call is the newest part while a request blocks its turn, so this is
+    /// its start time — and nothing the Host could have seen is above it.
+    #[test]
+    fn the_anchor_is_the_newest_server_activity_in_the_read() {
+        let transcript = SessionTranscript::new(vec![
+            typed_message("u1", MessageRole::User, Some(1_000), vec![text_part("问题")]),
+            typed_message(
+                "a1",
+                MessageRole::Assistant,
+                Some(1_100),
+                vec![
+                    text_part("先解释。"),
+                    Part::Tool(ToolCall {
+                        identity: ToolIdentity {
+                            name: "question".into(),
+                            call_id: "call_q".into(),
+                        },
+                        status: ToolStatus::Running,
+                        started_at: Some(1_250),
+                        input: None,
+                        metadata: None,
+                        output: Default::default(),
+                    }),
+                ],
+            ),
+        ]);
+        assert_eq!(asking_anchor(&transcript), Some(1_250));
+    }
+
+    /// A message the wire carried no time for still contributes its parts'
+    /// starts — a read whose only clock is the asking tool's must anchor.
+    #[test]
+    fn an_untimed_message_contributes_its_part_starts() {
+        let transcript = SessionTranscript::new(vec![typed_message(
+            "a1",
+            MessageRole::Assistant,
+            None,
+            vec![
+                text_part("无时间的文本"),
+                Part::Tool(ToolCall {
+                    identity: ToolIdentity {
+                        name: "question".into(),
+                        call_id: "call_q".into(),
+                    },
+                    status: ToolStatus::Running,
+                    started_at: Some(900),
+                    input: None,
+                    metadata: None,
+                    output: Default::default(),
+                }),
+            ],
+        )]);
+        assert_eq!(asking_anchor(&transcript), Some(900));
+    }
+
+    /// A read with no server time anywhere leaves the block without an anchor
+    /// (the old receipt behaviour) rather than inventing a clock.
+    #[test]
+    fn a_timeless_read_has_no_anchor() {
+        let transcript = SessionTranscript::new(vec![typed_message(
+            "a1",
+            MessageRole::Assistant,
+            None,
+            vec![text_part("无时间")],
+        )]);
+        assert_eq!(asking_anchor(&transcript), None);
+    }
 }
