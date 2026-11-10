@@ -735,6 +735,11 @@ impl RequestKind for PermissionKind {
             };
             let mut cached = None;
             if flow.try_mark_answered(&handles.requests, req_id).await {
+                // The reply below unblocks the turn; reserve the mode receipt's
+                // position first so a message rendered while it is in flight
+                // follows the receipt (issue #1023).
+                Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id)
+                    .await;
                 let Some(mut approved) = set_auto_accept(
                     &handles.sessions,
                     &handles.requests,
