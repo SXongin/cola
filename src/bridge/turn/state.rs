@@ -3205,15 +3205,40 @@ impl StreamAccumulator {
         // be sorted above by a later message whose server time is older (a
         // post-tool part took a synthetic key). The walk's own high-water mark,
         // not `last_key` (which also counts receipts placed before the walk).
-        let key = self.read_floor.map_or(key, |floor| key.max(floor));
-        self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
-        key
+        // Synthetic pushes (no source) are not read-order content.
+        if source.is_some() {
+            let key = self.read_floor.map_or(key, |floor| key.max(floor));
+            self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
+            key
+        } else {
+            key
+        }
     }
 
     /// Reset the walk's read-order floor (issue #1022). The walks call this at
     /// their start and end so one pass's synthetic keys cannot floor another's.
     pub(super) fn reset_read_floor(&mut self) {
         self.read_floor = None;
+    }
+
+    /// Seed the walk's read-order floor from what is ALREADY placed (issue
+    /// #1022): a later render pass skips the earlier message as deduped, but the
+    /// next message's parts still may not sort above it. Only transcript part
+    /// entries count — a receipt or synthetic line is not read-order content.
+    pub(super) fn seed_read_floor(&mut self) {
+        self.read_floor = self
+            .timeline
+            .iter()
+            .filter(|item| {
+                item.source.is_some()
+                    && matches!(
+                        item.kind,
+                        TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
+                    )
+            })
+            .map(|item| item.key)
+            .max()
+            .or(self.read_floor);
     }
 
     /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
@@ -3897,6 +3922,18 @@ impl StreamAccumulator {
         // the receipt (issue #1023, [`ReceiptCut`]). The receipt's own key is
         // the floor; equal keys keep this entry after it.
         let key = self.message_floor.map_or(key, |floor| key.max(floor));
+        // A settled tool (and every other transcript part) keeps the walk's
+        // read order: a later message's tool cannot sort above content already
+        // read (issue #1022). Synthetic and session-scoped entries (a receipt,
+        // a compaction, a wake line) are not read-order content.
+        let is_turn_part = matches!(
+            &kind,
+            TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
+        );
+        let key = match (is_turn_part, self.read_floor) {
+            (true, Some(floor)) => key.max(floor),
+            _ => key,
+        };
         // Equal keys keep ALLOCATION order (`order`): a live tool panel is
         // allocated at its transcript position and joins the timeline only when
         // it settles, after a later part of the same message may have been
@@ -4360,6 +4397,10 @@ impl StreamAccumulator {
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
             let key = key_at.unwrap_or_else(|| self.next_order());
+            let key = match (source.is_some(), self.read_floor) {
+                (true, Some(floor)) => key.max(floor),
+                _ => key,
+            };
             if live {
                 // Unfinished: TAIL content. Allocate its identity and key now,
                 // but do not join the timeline — a split must never finalize a

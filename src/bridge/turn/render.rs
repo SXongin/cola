@@ -1693,6 +1693,7 @@ pub(super) fn render_turn_parts(
     let Some(anchor) = acc.turn_anchor().cloned() else {
         return rendered_any;
     };
+    acc.seed_read_floor();
     // The Turn's change index (#477) is NOT read here: it is resolved once at
     // the Turn's settle from the artifact's own source (ADR-0087), and the
     // card renders no estimate while the Turn runs (issue #830). An anchorless
@@ -5018,44 +5019,49 @@ Index: /x/src/main.rs
         let anchor = 2_000;
         let mut acc = StreamAccumulator::new("test");
         acc.repoint_turn_anchor(&turn_anchor(anchor));
-        let transcript = SessionTranscript::new(vec![
-            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
-            message(
-                "a1",
-                2_100,
-                vec![
-                    tool(
-                        "bash",
-                        "call_1",
-                        ToolStatus::Completed,
-                        Some(2_200),
-                        Some(serde_json::json!({"command": "ls"})),
-                        Some("tool-output"),
-                    ),
-                    text_part("先答"),
-                ],
-            ),
-            message(
-                "a2",
-                2_300,
-                vec![
-                    text_part("后答"),
-                    tool(
-                        "bash",
-                        "call_2",
-                        ToolStatus::Completed,
-                        Some(2_400),
-                        Some(serde_json::json!({"command": "pwd"})),
-                        Some("/work"),
-                    ),
-                ],
-            ),
-        ]);
-        render_new_turn_parts(&mut acc, &transcript);
+        let a1 = message(
+            "a1",
+            2_100,
+            vec![
+                tool(
+                    "bash",
+                    "call_1",
+                    ToolStatus::Completed,
+                    Some(2_200),
+                    Some(serde_json::json!({"command": "ls"})),
+                    Some("tool-output"),
+                ),
+                text_part("先答"),
+            ],
+        );
+        let a2 = message(
+            "a2",
+            2_300,
+            vec![
+                text_part("后答"),
+                tool(
+                    "bash",
+                    "call_2",
+                    ToolStatus::Completed,
+                    Some(2_400),
+                    Some(serde_json::json!({"command": "pwd"})),
+                    Some("late-tool-output"),
+                ),
+            ],
+        );
+        let user = || typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]);
+        // Pass 1 renders A1; pass 2 adds A2 — the real polling sequence, where
+        // A1 is deduped and only its PLACED key can floor A2.
+        render_new_turn_parts(&mut acc, &SessionTranscript::new(vec![user(), a1.clone()]));
+        render_new_turn_parts(&mut acc, &SessionTranscript::new(vec![user(), a1, a2]));
         let text = card_text(&acc.build_card_with_info().card);
         assert!(
             text.find("先答").unwrap() < text.find("后答").unwrap(),
             "the later message's text stays below the earlier answer: {text}"
+        );
+        assert!(
+            text.find("后答").unwrap() < text.find("late-tool-output").unwrap(),
+            "the later message's tool stays below its own text: {text}"
         );
     }
 
