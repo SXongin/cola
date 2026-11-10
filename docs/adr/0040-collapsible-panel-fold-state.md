@@ -30,7 +30,8 @@ keeps the plan size and status counts readable.
   (`insert_kind`, `src/bridge/turn/state.rs:845`) — an item's index can change
   after it was first rendered. (ADR-0038's 2026-11-09 amendment narrows the key
   for a part with no server time — V2's text — to the transcript's own part
-  order, and orders equal keys by `seq`.) Each entry does have a stable identity:
+  order, and orders equal keys by an internal `order` derived from allocation;
+  `seq` stays the immutable identity.) Each entry does have a stable identity:
   `TimelineItem::seq`, assigned once at insertion.
 - **Observed failure.** Expanding the todo tail collapsed it as soon as a new
   tool panel was inserted before it, and the new panel appeared expanded — the

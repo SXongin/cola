@@ -39,9 +39,11 @@ Panel, Interaction Blocks) rides the tail, settled history is a timeline row.
   its panel is inserted into the timeline at its server start key — clamped to
   the top of the live slice when the key is behind `render_from`, the ADR-0038
   late-part rule — and stops rendering in the tail. A part with no server time
-  takes the read position's key instead (ADR-0038's 2026-11-09 amendment), and
-  a position key is never replaced by a later-arriving start time. The permanent
-  transcript is strictly ordered; only the live view is not.
+  takes the read position's key instead (ADR-0038's 2026-11-09 amendment). A
+  panel that has not yet joined the timeline may have its allocated key replaced
+  by a later-arriving real start time (it is still tail-only); once placed, its
+  key is never replaced. The permanent transcript is strictly ordered; only the
+  live view is not.
 - **A split with nothing but a live tail may finalize an empty card.** The old
   card keeps its 「部分完成，继续中」 header and footer, and the live tail
   continues on the continuation. Accepted: a card whose only content is a Todo

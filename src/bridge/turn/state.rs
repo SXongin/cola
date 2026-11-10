@@ -1528,6 +1528,12 @@ pub(super) struct StreamAccumulator {
     /// Transient: the walks set it per message and clear it after, so a push
     /// outside a walk (a synthetic receipt, a wake line) is never floored.
     message_floor: Option<i64>,
+    /// The highest key this render walk has placed so far (issue #1022): the
+    /// next message's parts may not sort above content already read before
+    /// them, even when a post-tool part took a synthetic `next_order` key and
+    /// the next message's own server time is older. Transient, like
+    /// [`Self::message_floor`]: the walks reset it at their start and end.
+    read_floor: Option<i64>,
     /// Next [`ReservedReceipt::token`] to hand out.
     reservation_seq: u64,
     /// request id → the timeline key reserved for its receipt at CLICK time
@@ -3190,11 +3196,24 @@ impl StreamAccumulator {
         // a later chunk's merge lookup must ask for THAT key or it would miss
         // the entry and start a second one after a split.
         let idx = self.timeline.partition_point(|item| item.key <= key);
-        if idx < self.render_from {
+        let key = if idx < self.render_from {
             self.timeline.get(self.render_from).map_or(key, |item| item.key)
         } else {
             key
-        }
+        };
+        // Read order is monotonic across messages: a part already read may not
+        // be sorted above by a later message whose server time is older (a
+        // post-tool part took a synthetic key). The walk's own high-water mark,
+        // not `last_key` (which also counts receipts placed before the walk).
+        let key = self.read_floor.map_or(key, |floor| key.max(floor));
+        self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
+        key
+    }
+
+    /// Reset the walk's read-order floor (issue #1022). The walks call this at
+    /// their start and end so one pass's synthetic keys cannot floor another's.
+    pub(super) fn reset_read_floor(&mut self) {
+        self.read_floor = None;
     }
 
     /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
