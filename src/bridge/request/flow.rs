@@ -1799,6 +1799,30 @@ impl RequestFlow {
         asked_at
     }
 
+    /// The asking tool part's server time from ONE bounded transcript read,
+    /// without rendering it — a sub-task request hosted on an ancestor card
+    /// (issue #1023). A failed or timed-out read leaves the block unanchored.
+    async fn read_anchor(&self, handles: &FlowHandles, session_id: &str) -> Option<i64> {
+        let timeout_ms = self
+            .list_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(SURFACING_DRAIN_TIMEOUT_MS);
+        match crate::bridge::bounded_call(
+            &format!("{} surfacing anchor ({session_id})", self.kind.label()),
+            timeout_ms,
+            handles.backend.transcript(session_id),
+        )
+        .await
+        {
+            Some(Ok(transcript)) => asking_anchor(&transcript),
+            Some(Err(error)) => {
+                tracing::warn!("{} surfacing anchor transcript: {}", self.kind.label(), error);
+                None
+            }
+            None => None,
+        }
+    }
+
     /// Everything one sweep does with ONE listed request, wrapped by the
     /// caller in that request's session span (ADR-0048): the re-host for a
     /// request already surfaced, the companion refusal (a delivery that failed),
@@ -2114,14 +2138,15 @@ impl RequestFlow {
         let asked_at = if fallback_summary.is_some() {
             None
         } else {
-            let drain = match resolved_host.as_deref() {
-                Some(host) if host == req.session_id() => Some(host),
-                Some(_) => None,
-                None => Some(req.session_id()),
-            };
-            match drain {
-                Some(session_id) => self.drain_and_anchor(handles, session_id).await,
-                None => None,
+            match resolved_host.as_deref() {
+                // The host IS the asking session: drain its parts onto the card.
+                Some(host) if host == req.session_id() => self.drain_and_anchor(handles, host).await,
+                // An ancestor hosts the card and renders no part of a child's
+                // transcript, but the anchor is still a property of the
+                // request: read it WITHOUT rendering (one bounded read).
+                Some(_) => self.read_anchor(handles, req.session_id()).await,
+                // No live ancestor: the self-inline path below may host it.
+                None => self.drain_and_anchor(handles, req.session_id()).await,
             }
         };
         // Inline path: take the HOST's write lock — never the request

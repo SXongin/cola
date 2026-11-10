@@ -557,10 +557,6 @@ impl RequestKind for PermissionKind {
         clicked: Option<&str>,
         _scope: crate::backend::types::RequestScope,
     ) -> Option<CardActionResult> {
-        // The receipt this click may write takes its position NOW (issue
-        // #1023): content a render delivers while the backend reply is in
-        // flight must sort after it, not above it.
-        Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id).await;
         let perm_label = value.get("perm_label").and_then(|v| v.as_str()).unwrap_or("");
         let perm_color = value
             .get("perm_color")
@@ -975,6 +971,10 @@ impl RequestKind for PermissionKind {
         // carries the owning directory (ADR-0010); without it the reply
         // can't be routed, so surface the failure instead of guessing at
         // the server cwd instance.
+        // A resolving click reserves its receipt's position BEFORE the
+        // backend reply (issue #1023): content a render delivers while the
+        // reply is in flight must sort after the receipt, not above it.
+        Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id).await;
         let reply_result = match directory {
             Some(dir) => {
                 handles
@@ -2048,9 +2048,6 @@ impl RequestKind for QuestionKind {
         clicked: Option<&str>,
         scope: crate::backend::types::RequestScope,
     ) -> Option<CardActionResult> {
-        // The receipt this click may write takes its position NOW (issue
-        // #1023); see the permission handler.
-        Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id).await;
         let location_form = scope == crate::backend::types::RequestScope::Location;
         match reply {
             // "answer" = an option click (single-select replaces, multi-select
@@ -2185,6 +2182,15 @@ impl RequestKind for QuestionKind {
                     };
                     let answers =
                         crate::backend::types::build_form_answers(&snapshot.fields, &snapshot.answers);
+                    // A resolving click reserves its receipt's position BEFORE the
+                    // backend reply (issue #1023): content a render delivers while the
+                    // reply is in flight must sort after the receipt, not above it.
+                    Turn::reserve_interaction_cut(
+                        &handles.cards,
+                        host.as_deref().unwrap_or(session_id),
+                        req_id,
+                    )
+                    .await;
                     if let Some(r) = settle_question_reply(
                         flow,
                         &handles.cards,
@@ -2474,6 +2480,11 @@ impl RequestKind for QuestionKind {
                     );
                 };
                 let answers = crate::backend::types::build_form_answers(&snapshot.fields, &snapshot.answers);
+                // A resolving click reserves its receipt's position BEFORE the
+                // backend reply (issue #1023): content a render delivers while the
+                // reply is in flight must sort after the receipt, not above it.
+                Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id)
+                    .await;
                 if let Some(r) = settle_question_reply(
                     flow,
                     &handles.cards,
@@ -2654,6 +2665,11 @@ impl RequestKind for QuestionKind {
                             .await,
                     );
                 }
+                // A resolving click reserves its receipt's position BEFORE the
+                // backend reply (issue #1023): content a render delivers while the
+                // reply is in flight must sort after the receipt, not above it.
+                Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id)
+                    .await;
                 if let Some(r) = settle_question_reply(
                     flow,
                     &handles.cards,
