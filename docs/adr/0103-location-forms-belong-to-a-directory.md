@@ -99,7 +99,11 @@ hesitation into a failed tool call is worse than waiting.
 **Persistence.** "Pushed" and "dismissed" are recorded in the client-scoped
 surface file (ADR-0038, ADR-0091), so a restart does not re-push a form the Host
 already deferred. The record is pruned only when a complete sweep can speak for
-the request — the #130 rule: a failed list never reads as gone. A restart that
+the request — the #130 rule: a failed list never reads as gone. The same rule
+governs stale marking: a card whose directory is mapped-failed, or no longer
+mapped at all (`/switch forget`), is not repainted as handled and keeps its
+record and partial state, because that sweep could not list the directory. A
+restart that
 finds the card still live re-adopts it through ADR-0038 rather than posting a
 second; one that finds it withdrawn keeps it withdrawn until `/mcp` reopens it.
 That withdrawal-before-restart rule is ADR-0038's 2026-11-09 amendment, the one
@@ -183,8 +187,11 @@ Two accepted residuals, recorded rather than solved:
 MCP server statuses plus **only** Location Forms (session-backed forms already
 own their Session cards). The statuses belong here because a form names a server
 the Host may have to fix — `needs_auth` (no usable credential) in particular —
-before the form can be answered. `/mcp` can reopen a dismissed form. The
-capability is an adapter method. OpenCode V1 publishes a status read (`/mcp`,
+before the form can be answered. `/mcp` can reopen a dismissed form, and only
+a dismissed one: a `Pushed` form already owns its live card, so offering a
+reopen there would duplicate it. A pushed card deleted mid-run is recovered at
+the next restart, when the persisted-card read proves it gone and the sweep
+surfaces a fresh card. The capability is an adapter method. OpenCode V1 publishes a status read (`/mcp`,
 replaced by `/api/mcp*` in V2; `docs/research/opencode-v2/r2-api-protocol-delta.md`)
 but has no elicitation-form surface; Codex publishes `mcpServerStatus/list` but
 has no location-owned forms. Neither offers the full surface — statuses plus
