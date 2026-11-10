@@ -157,6 +157,7 @@ fn rendered_block(
         session_id: block.session_id().to_string(),
         directory: block.directory().to_string(),
         target: block.receipt_target(),
+        asked_at: block.asked_at(),
     })
 }
 

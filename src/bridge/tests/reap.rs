@@ -2143,6 +2143,7 @@ async fn a_takeover_collect_releases_the_cache_only_when_its_write_lands() {
             session_id: "ses_test".into(),
             directory: "/work".into(),
             target: "om_frozen".into(),
+            asked_at: None,
         }],
     );
     // Park the takeover collect's PATCH.
@@ -2201,6 +2202,7 @@ async fn a_recoverably_failed_collect_releases_the_cache() {
             session_id: "ses_test".into(),
             directory: "/work".into(),
             target: "om_frozen".into(),
+            asked_at: None,
         }],
     );
     // The collect's first attempt fails recoverably: the queue keeps it owed

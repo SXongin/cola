@@ -931,6 +931,7 @@ fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: 
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 target: "per_long".into(),
+                asked_at: None,
             },
         );
     } else {

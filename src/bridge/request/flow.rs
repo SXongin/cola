@@ -1711,25 +1711,35 @@ impl RequestFlow {
     /// before a request block is inserted (issue #1023), returning the asking
     /// tool part's server time — the Interaction Receipt's server-time cut.
     ///
-    /// Bounded by the flow's read timeout twice (the transcript read and the
-    /// render pass): the pass also reads the server (title, context window,
-    /// child liveness), and one wedged call must not park the sweep. A timeout
-    /// or failure is not fatal: the request surfaces exactly as before, without
-    /// the anchor. The parts render before the pass's other stages, so a timed
-    /// out pass normally still landed the text this drain exists for.
+    /// Bounded by ONE deadline for the transcript read and the render pass
+    /// together (the pass also reads the server — context window, child
+    /// liveness), so one wedged call cannot park the sweep for two windows. A
+    /// timeout or failure is not fatal: the request surfaces exactly as before,
+    /// without the anchor. The parts render before the pass's other stages, so
+    /// a timed out pass normally still landed the text this drain exists for.
     async fn drain_and_anchor(&self, handles: &FlowHandles, session_id: &str) -> Option<i64> {
         // A finished/idle card is no host (ADR-0100): nothing will render into
         // it, and the sweep is about to fall through to the standalone path.
         if !Turn::is_running(&handles.cards, session_id).await {
             return None;
         }
-        let timeout_ms = self
-            .list_timeout_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .min(SURFACING_DRAIN_TIMEOUT_MS);
+        // ONE deadline for the whole drain (read + render), not one per step:
+        // a wedged read must not buy the render a second full window.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(
+                self.list_timeout_ms
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .min(SURFACING_DRAIN_TIMEOUT_MS),
+            );
+        let remaining_ms = |deadline: tokio::time::Instant| {
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64
+        };
         let read = crate::bridge::bounded_call(
             &format!("{} surfacing drain ({session_id})", self.kind.label()),
-            timeout_ms,
+            remaining_ms(deadline),
             handles.backend.transcript(session_id),
         )
         .await;
@@ -1753,7 +1763,7 @@ impl RequestFlow {
         // all (the surfacing insert's own flush follows immediately).
         let mark_before = Turn::progress_mark(&handles.cards, session_id).await;
         if tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
+            std::time::Duration::from_millis(remaining_ms(deadline)),
             Turn::render_and_flush_draining(
                 &handles.cards,
                 &handles.sessions,
@@ -1767,7 +1777,7 @@ impl RequestFlow {
         .is_err()
         {
             tracing::warn!(
-                "{} surfacing drain render timed out after {timeout_ms}ms",
+                "{} surfacing drain render did not finish within the drain bound",
                 self.kind.label()
             );
         }
@@ -2852,9 +2862,10 @@ impl RequestFlow {
         }
         // The block keeps the anchor its first surfacing captured (issue
         // #1023): the asking tool's server time is a property of the request,
-        // not of the card it currently lives on, so a handoff must not reset
-        // the receipt's cut to "no anchor".
-        let asked_at = Turn::interaction_asked_at(&handles.cards, id).await;
+        // not of the card it currently lives on. The old accumulator is gone
+        // by the time a re-host runs, so the registry's block handle — written
+        // at every render of the block — is the surviving copy.
+        let asked_at = handles.cards.card_handles.lock().await.asked_at(id);
         let pushed = self
             .kind
             .add_inline(self, &handles.cards, &host, req, dir, asked_at)

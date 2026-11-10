@@ -763,8 +763,9 @@ pub(super) struct PendingPermission {
     /// the session first (issue #1023). The Interaction Receipt records it as
     /// its server-time cut, so content the server wrote after the click can
     /// never sort above the receipt under clock skew. `None` for a block that
-    /// reached the card without a surfacing read (a re-host, a busy-follow
-    /// seed, a restart re-adoption) — the receipt then keeps the old behaviour.
+    /// reached the card without a surfacing read (a busy-follow seed, a restart
+    /// re-adoption) — the receipt then keeps the old behaviour. A re-hosted
+    /// block keeps the anchor its first surfacing captured.
     pub(super) asked_at: Option<i64>,
 }
 
@@ -3742,6 +3743,13 @@ impl StreamAccumulator {
     ) -> usize {
         self.item_seq += 1;
         let seq = self.item_seq;
+        // A continuation chunk of a part the server timestamped after a
+        // receipt's ask belongs below that receipt too (issue #1023): the
+        // first chunk is floored in [`Self::insert_item`], and a chunk left at
+        // the part's raw key would break the timeline's key order.
+        let key = self
+            .receipt_cut_floor(shown_at)
+            .map_or(key, |floor| key.max(floor));
         let (idx, key) = if after + 1 < self.render_from {
             (
                 self.render_from,
@@ -8372,6 +8380,26 @@ mod tests {
         assert!(
             card.find("✅ 已回答").unwrap() < card.find("点击后的新消息").unwrap(),
             "a server-stamped user message follows the receipt too: {card}"
+        );
+
+        // A part longer than one card entry is chunked: every continuation
+        // chunk is floored too, so the timeline's key order cannot break under
+        // the receipt (issue #1023).
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(5_000)));
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        acc.push_text_at(
+            Some(5_100),
+            &"长".repeat(crate::feishu::card::MAX_CARD_TEXT_CHARS + 10),
+        );
+        assert!(
+            acc.timeline.windows(2).all(|pair| pair[0].key <= pair[1].key),
+            "the floored chunks keep the timeline key-sorted"
+        );
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("✅ 已回答").unwrap() < card.find("长长长").unwrap(),
+            "every chunk stays below the receipt: {card}"
         );
     }
 

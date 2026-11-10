@@ -875,6 +875,7 @@ async fn autoaccept_command_leaves_the_mode_receipt_on_the_card() {
                 session_id: "ses_1".into(),
                 directory: "/work".into(),
                 target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+                asked_at: None,
             }],
         );
     }

@@ -1522,23 +1522,42 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
         )
         .await
     );
+    // A second block, asked later: the one receipt resolves both, and its cut
+    // is the LATEST ask among them (the click follows every ask).
+    let mut later = request.clone();
+    later.id = "que_auto_2".into();
+    assert!(
+        Turn::add_question(
+            &cards,
+            "ses_test",
+            &later,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+            Some(2_000),
+        )
+        .await
+    );
     Turn::flush_card(&cards, "ses_test").await;
 
     let resolved = Turn::resolve_interactions(
         &cards,
         "ses_test",
-        &["que_auto".into()],
+        &["que_auto".into(), "que_auto_2".into()],
         &crate::bridge::turn::InlineResidue::Single("♻️ 已设为自动允许"),
     )
     .await;
-    assert!(resolved.is_some(), "the mode change resolves the block");
-    Turn::push_text_at(&cards, "ses_test", 1_100, "自动之后的内容").await;
+    assert!(resolved.is_some(), "the mode change resolves the blocks");
+    // Content written between the two asks predates the click: it stays above
+    // the receipt. Content after the later ask follows it.
+    Turn::push_text_at(&cards, "ses_test", 1_500, "两次提问之间").await;
+    Turn::push_text_at(&cards, "ses_test", 2_500, "自动之后的内容").await;
     Turn::flush_card(&cards, "ses_test").await;
 
     let text = card_text(&final_card(&platform).await);
     assert!(
-        text.find("♻️ 已设为自动允许").unwrap() < text.find("自动之后的内容").unwrap(),
-        "post-click content stays below the mode-change receipt: {text}"
+        text.find("两次提问之间").unwrap() < text.find("♻️ 已设为自动允许").unwrap()
+            && text.find("♻️ 已设为自动允许").unwrap() < text.find("自动之后的内容").unwrap(),
+        "the cut is the latest ask: {text}"
     );
 }
 
