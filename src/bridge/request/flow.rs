@@ -2140,18 +2140,31 @@ impl RequestFlow {
         // the old order and the request still surfaces. Only the request's
         // OWN session is drained — an ancestor host renders no part of a
         // child's transcript, and a standalone card has no live card to drain.
-        let asked_at = if fallback_summary.is_some() {
-            None
+        // The card the drain rendered into: if a `/card` follow or a fresh Turn
+        // replaces that CardSession during the read, the block must not land on
+        // an accumulator that never received the explanation (issue #1023) —
+        // the request stays unmarked and the next sweep drains the new card.
+        let (asked_at, drained_card) = if fallback_summary.is_some() {
+            (None, None)
         } else {
             match resolved_host.as_deref() {
                 // The host IS the asking session: drain its parts onto the card.
-                Some(host) if host == req.session_id() => self.drain_and_anchor(handles, host).await,
+                Some(host) if host == req.session_id() => {
+                    let chain = Turn::card_chain_id(&handles.cards, host).await;
+                    let at = self.drain_and_anchor(handles, host).await;
+                    (at, chain.map(|chain| (host.to_string(), chain)))
+                }
                 // An ancestor hosts the card and renders no part of a child's
                 // transcript, but the anchor is still a property of the
                 // request: read it WITHOUT rendering (one bounded read).
-                Some(_) => self.read_anchor(handles, req.session_id()).await,
+                Some(_) => (self.read_anchor(handles, req.session_id()).await, None),
                 // No live ancestor: the self-inline path below may host it.
-                None => self.drain_and_anchor(handles, req.session_id()).await,
+                None => {
+                    let session = req.session_id();
+                    let chain = Turn::card_chain_id(&handles.cards, session).await;
+                    let at = self.drain_and_anchor(handles, session).await;
+                    (at, chain.map(|chain| (session.to_string(), chain)))
+                }
             }
         };
         // Inline path: take the HOST's write lock — never the request
@@ -2169,6 +2182,20 @@ impl RequestFlow {
             // `/card` installed an Idle card during the bounded host walk. An
             // insert must never land on a card that stopped being live.
             if Turn::is_running(&handles.cards, host).await {
+                let replaced = match &drained_card {
+                    Some((drained, chain)) if drained == host => {
+                        Turn::card_chain_id(&handles.cards, host).await != Some(*chain)
+                    }
+                    _ => false,
+                };
+                if replaced {
+                    tracing::info!(
+                        "{} {}: the host card was replaced during the drain; retrying next sweep",
+                        self.kind.label(),
+                        req.id()
+                    );
+                    return false;
+                }
                 let pushed = self
                     .kind
                     .add_inline_locked(self, &handles.cards, host, req, dir, asked_at)
@@ -2221,6 +2248,15 @@ impl RequestFlow {
         // its own lock so the standalone send cannot duplicate a block that
         // just landed there. A fallback stays standalone by construction.
         if fallback_summary.is_none() && Turn::is_running(&handles.cards, req.session_id()).await {
+            let replaced = match &drained_card {
+                Some((drained, chain)) if drained == req.session_id() => {
+                    Turn::card_chain_id(&handles.cards, req.session_id()).await != Some(*chain)
+                }
+                _ => false,
+            };
+            if replaced {
+                return false;
+            }
             let pushed = self
                 .kind
                 .add_inline_locked(self, &handles.cards, req.session_id(), req, dir, asked_at)

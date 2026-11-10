@@ -79,6 +79,9 @@ pub(super) struct TimelineItem {
 pub(super) struct ReservedReceipt {
     pub(super) receipt_key: i64,
     pub(super) floor_key: i64,
+    /// Identity of this reservation, so a failed click's late cleanup cannot
+    /// delete a retry's fresh reservation for the same request.
+    pub(super) token: u64,
 }
 
 /// An Interaction Receipt's **server-time cut** (issue #1023): the asking tool
@@ -1519,6 +1522,8 @@ pub(super) struct StreamAccumulator {
     /// Transient: the walks set it per message and clear it after, so a push
     /// outside a walk (a synthetic receipt, a wake line) is never floored.
     message_floor: Option<i64>,
+    /// Next [`ReservedReceipt::token`] to hand out.
+    reservation_seq: u64,
     /// request id → the timeline key reserved for its receipt at CLICK time
     /// (issue #1023). The backend reply returns before the receipt is written,
     /// so a render poll can deliver post-click content in that gap; reserving
@@ -2962,7 +2967,7 @@ impl StreamAccumulator {
         let Some(idx) = self.live_index(request_id) else {
             // No live block on THIS card: no receipt will be written here, so
             // the click's reservation must not outlive it (issue #1023).
-            self.forget_reservation(request_id);
+            self.forget_reservation(request_id, None);
             return false;
         };
         let text = line(&self.interactions[idx]);
@@ -2970,7 +2975,6 @@ impl StreamAccumulator {
         // it (issue #1023): the receipt's server-time cut, so a later read's
         // post-click content cannot outrank the receipt on a skewed clock.
         let asked_at = self.interactions[idx].asked_at();
-        let question = matches!(self.interactions[idx], InteractionBlock::Question(_));
         let reserved = self
             .reserved_receipts
             .remove(request_id)
@@ -2991,9 +2995,12 @@ impl StreamAccumulator {
         // time to re-floor against. A permission without a reservation carries
         // no cut at all: parallel tools make "newer than the ask" ambiguous.
         if reserved.is_none()
-            && question
             && let Some(asked_at) = asked_at
         {
+            // Message-scoped, so a permission's parallel pre-click work (in the
+            // asking message) is never cut; a new message is post-click for
+            // either kind. The turn-blocked argument the old comment relied on
+            // is not needed.
             self.record_receipt_cut(asked_at, key);
         }
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
@@ -3018,10 +3025,25 @@ impl StreamAccumulator {
     /// does not carry an anchored live block for the request, or one is already
     /// reserved (a repeated click keeps the first reservation — content after
     /// that first click is already floored past it).
-    pub(super) fn reserve_receipt(&mut self, request_id: &str) -> bool {
-        let Some(asked_at) = self.interaction(request_id).and_then(|block| block.asked_at()) else {
-            return false;
-        };
+    pub(super) fn reserve_receipt(&mut self, request_id: &str) -> Option<u64> {
+        let asked_at = self.interaction(request_id).and_then(|block| block.asked_at())?;
+        self.reserve_receipt_at(request_id, asked_at)
+    }
+
+    /// [`Self::reserve_receipt`] for a mode change: its one receipt covers every
+    /// live block, so its cut is the LATEST ask among them — content written
+    /// after an earlier ask but before the click was visible before it.
+    pub(super) fn reserve_receipt_for_pending(&mut self, request_id: &str) -> Option<u64> {
+        let at = self
+            .interactions
+            .iter()
+            .filter(|block| block.is_live())
+            .filter_map(|block| block.asked_at())
+            .max()?;
+        self.reserve_receipt_at(request_id, at)
+    }
+
+    fn reserve_receipt_at(&mut self, request_id: &str, asked_at: i64) -> Option<u64> {
         // A repeat click (a retry after a failed reply, a double click) takes a
         // FRESH key and drops the old reservation's floor: the old click wrote
         // no receipt, and content rendered after it may have been visible before
@@ -3035,11 +3057,14 @@ impl StreamAccumulator {
             at: asked_at,
             key: floor_key,
         });
+        self.reservation_seq += 1;
+        let token = self.reservation_seq;
         self.reserved_receipts.insert(
             request_id.to_string(),
             ReservedReceipt {
                 receipt_key,
                 floor_key,
+                token,
             },
         );
         // Consume the floor key too: the next synthetic key must not equal it,
@@ -3047,7 +3072,7 @@ impl StreamAccumulator {
         // the reservation's cut and a later forget would delete both.
         self.order_seq = floor_key;
         self.last_key = self.last_key.max(floor_key);
-        true
+        Some(token)
     }
 
     /// Take the reservation for `request_id`, if a click made one (issue
@@ -3077,11 +3102,17 @@ impl StreamAccumulator {
     /// Drop a click's reservation for `request_id` without writing a receipt —
     /// a mode change resolves the block with ONE shared receipt, so its own
     /// per-block key is never used (issue #1023).
-    pub(super) fn forget_reservation(&mut self, request_id: &str) {
+    pub(super) fn forget_reservation(&mut self, request_id: &str, token: Option<u64>) {
+        // A failed click's late cleanup names its own reservation: never delete
+        // a retry's fresh one for the same request.
+        let matches = self
+            .reserved_receipts
+            .get(request_id)
+            .is_some_and(|reserved| token.is_none_or(|token| reserved.token == token));
+        if !matches {
+            return;
+        }
         if let Some(reserved) = self.reserved_receipts.remove(request_id) {
-            // The mode receipt is the only cut this click leaves; the
-            // reservation's floor would otherwise outlive it and cut content
-            // against a receipt that is never written at that key.
             self.receipt_cuts.retain(|cut| cut.key != reserved.floor_key);
         }
     }
@@ -3109,6 +3140,10 @@ impl StreamAccumulator {
     /// written for a click that preceded the message.
     pub(super) fn set_message_floor(&mut self, created: Option<i64>) {
         self.message_floor = created.and_then(|created| self.receipt_cut_floor(created));
+        eprintln!(
+            "FLOOR created={created:?} cuts={:?} floor={:?}",
+            self.receipt_cuts, self.message_floor
+        );
     }
 
     /// The timeline key a part's chunk is placed (and looked up) at: its own
@@ -3151,7 +3186,7 @@ impl StreamAccumulator {
         let Some(idx) = self.live_index(request_id) else {
             // No live block on THIS card: no receipt will be written here, so
             // the click's reservation must not outlive it (issue #1023).
-            self.forget_reservation(request_id);
+            self.forget_reservation(request_id, None);
             return false;
         };
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
@@ -3855,7 +3890,7 @@ impl StreamAccumulator {
     /// fixed across reads, so a later chunk merges into it instead of starting
     /// a second entry at a freshly allocated key.
     fn placed_source_key(&self, source: &PartSource) -> Option<i64> {
-        self.timeline.iter().rev().find_map(|item| {
+        self.timeline[self.render_from..].iter().rev().find_map(|item| {
             item.source
                 .as_ref()
                 .filter(|held| held.same_part(source))
@@ -3870,12 +3905,17 @@ impl StreamAccumulator {
         accepts: impl Fn(&TimelineKind) -> bool,
     ) -> Option<usize> {
         let end = self.timeline.partition_point(|item| item.key <= key);
-        for (idx, item) in self.timeline[..end]
+        // The live slice only: a finalized entry is already on a sent card, so
+        // a grown part starts a new entry on the continuation rather than
+        // merging into a body nobody will render again.
+        let start = self.render_from.min(end);
+        for (offset, item) in self.timeline[start..end]
             .iter()
             .enumerate()
             .rev()
             .take_while(|(_, item)| item.key == key)
         {
+            let idx = start + offset;
             // A sealed entry was abandoned by a refused payload (issue #886):
             // no card will render it again, so a later chunk of the same part
             // must start a NEW entry instead of growing the dead one.
@@ -8570,7 +8610,10 @@ mod tests {
         // below — without moving anything placed before the click.
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
-        assert!(acc.reserve_receipt("q"), "the click reserves the receipt key");
+        assert!(
+            acc.reserve_receipt("q").is_some(),
+            "the click reserves the receipt key"
+        );
         acc.set_message_floor(Some(5_100));
         acc.push_text_at(Some(5_100), "竞态到达的继续");
         acc.set_message_floor(None);
@@ -8634,7 +8677,10 @@ mod tests {
         // message-scoped floor leaves it above the receipt.
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(1_000)));
-        assert!(acc.reserve_receipt("q"), "the click reserves the receipt key");
+        assert!(
+            acc.reserve_receipt("q").is_some(),
+            "the click reserves the receipt key"
+        );
         acc.set_message_floor(Some(900));
         acc.push_text_at(Some(2_000), "并行工具的结果");
         acc.set_message_floor(None);
@@ -8652,7 +8698,10 @@ mod tests {
         acc.add_interaction(question(Some(1_000)));
         acc.set_message_floor(Some(900));
         acc.push_text_at(Some(2_000), "跨点击的");
-        assert!(acc.reserve_receipt("q"), "the click reserves the receipt key");
+        assert!(
+            acc.reserve_receipt("q").is_some(),
+            "the click reserves the receipt key"
+        );
         acc.push_text_at(Some(2_000), "继续增长");
         acc.set_message_floor(None);
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
@@ -8774,13 +8823,13 @@ mod tests {
             drafts: vec![String::new()],
             asked_at: Some(1_000),
         }));
-        assert!(acc.reserve_receipt("q"));
+        assert!(acc.reserve_receipt("q").is_some());
         let floor = acc.receipt_cuts.last().expect("a floor cut").key;
         assert!(
             acc.next_order() > floor,
             "the floor key is consumed, so an unrelated receipt cannot take it"
         );
-        acc.forget_reservation("q");
+        acc.forget_reservation("q", None);
         assert!(acc.receipt_cuts.is_empty(), "the floor goes with the reservation");
         assert!(acc.reserved_receipts.is_empty());
     }
@@ -8852,14 +8901,14 @@ mod tests {
             drafts: vec![String::new()],
             asked_at: Some(1_000),
         }));
-        assert!(acc.reserve_receipt("q"));
+        assert!(acc.reserve_receipt("q").is_some());
         let first_floor = acc.receipt_cuts.last().expect("the first floor").key;
         // Content rendered after the failed click, floored past the first key.
         acc.set_message_floor(Some(1_100));
         acc.push_text_at(Some(1_100), "失败后可见");
         acc.set_message_floor(None);
         // The Host retries: a fresh key, and the abandoned floor is gone.
-        assert!(acc.reserve_receipt("q"));
+        assert!(acc.reserve_receipt("q").is_some());
         assert!(
             acc.receipt_cuts.iter().all(|cut| cut.key != first_floor),
             "the abandoned reservation's floor is dropped"

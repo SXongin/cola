@@ -1603,9 +1603,13 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
 
     // The toggle's click reserves the mode receipt's position BEFORE its
     // reply; a message rendered while the reply is in flight follows it.
-    assert!(Turn::reserve_interaction_cut(&cards, "ses_test", "que_auto").await);
-    Turn::set_message_floor(&cards, "ses_test", Some(1_100)).await;
-    Turn::push_text_at(&cards, "ses_test", 1_100, "点击后到达的继续").await;
+    assert!(
+        Turn::reserve_interaction_cut_for_pending(&cards, "ses_test", "que_auto")
+            .await
+            .is_some()
+    );
+    Turn::set_message_floor(&cards, "ses_test", Some(2_300)).await;
+    Turn::push_text_at(&cards, "ses_test", 2_300, "点击后到达的继续").await;
     Turn::set_message_floor(&cards, "ses_test", None).await;
     let resolved = Turn::resolve_interactions(
         &cards,
