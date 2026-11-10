@@ -310,17 +310,38 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
         request_id: &str,
-    ) -> bool {
+    ) -> Option<u64> {
+        Self::reserve_locked(cards, session_id, |acc| acc.reserve_receipt(request_id)).await
+    }
+
+    /// [`Self::reserve_interaction_cut`] for a mode change: the reservation's
+    /// cut is the latest ask among the live blocks its one receipt covers.
+    pub(crate) async fn reserve_interaction_cut_for_pending(
+        cards: &CardsHandle,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<u64> {
+        Self::reserve_locked(cards, session_id, |acc| {
+            acc.reserve_receipt_for_pending(request_id)
+        })
+        .await
+    }
+
+    async fn reserve_locked(
+        cards: &CardsHandle,
+        session_id: &str,
+        reserve: impl FnOnce(&mut crate::bridge::turn::state::StreamAccumulator) -> Option<u64>,
+    ) -> Option<u64> {
         let write_lock = cards.write_lock(session_id).await;
         let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
-            return false;
+            return None;
         };
         cards
             .cards
             .lock()
             .await
             .get_mut(session_id)
-            .is_some_and(|card| card.acc.reserve_receipt(request_id))
+            .and_then(|card| reserve(&mut card.acc))
     }
 
     /// Drop a click's reservation for `request_id` without writing its receipt
@@ -331,13 +352,14 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
         request_id: &str,
+        token: Option<u64>,
     ) {
         let write_lock = cards.write_lock(session_id).await;
         let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
             return;
         };
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.forget_reservation(request_id);
+            card.acc.forget_reservation(request_id, token);
         }
     }
 
@@ -384,7 +406,7 @@ impl Turn {
                     } else {
                         // Nothing resolved under this id: its reservation must
                         // not outlive the click that made it.
-                        acc.forget_reservation(id);
+                        acc.forget_reservation(id, None);
                     }
                     resolved
                 }

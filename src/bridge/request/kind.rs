@@ -738,8 +738,12 @@ impl RequestKind for PermissionKind {
                 // The reply below unblocks the turn; reserve the mode receipt's
                 // position first so a message rendered while it is in flight
                 // follows the receipt (issue #1023).
-                Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id)
-                    .await;
+                let reservation = Turn::reserve_interaction_cut_for_pending(
+                    &handles.cards,
+                    host.as_deref().unwrap_or(session_id),
+                    req_id,
+                )
+                .await;
                 let Some(mut approved) = set_auto_accept(
                     &handles.sessions,
                     &handles.requests,
@@ -761,6 +765,7 @@ impl RequestKind for PermissionKind {
                         &handles.cards,
                         host.as_deref().unwrap_or(session_id),
                         req_id,
+                        reservation,
                     )
                     .await;
                     return Some(CardActionResult {
@@ -985,7 +990,9 @@ impl RequestKind for PermissionKind {
         // A resolving click reserves its receipt's position BEFORE the
         // backend reply (issue #1023): content a render delivers while the
         // reply is in flight must sort after the receipt, not above it.
-        Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id).await;
+        let reservation =
+            Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id)
+                .await;
         let reply_result = match directory {
             Some(dir) => {
                 handles
@@ -1082,6 +1089,7 @@ impl RequestKind for PermissionKind {
                     &handles.cards,
                     host.as_deref().unwrap_or(session_id),
                     req_id,
+                    reservation,
                 )
                 .await;
                 return Some(failed_result_card(
@@ -2202,7 +2210,7 @@ impl RequestKind for QuestionKind {
                     // A resolving click reserves its receipt's position BEFORE the
                     // backend reply (issue #1023): content a render delivers while the
                     // reply is in flight must sort after the receipt, not above it.
-                    Turn::reserve_interaction_cut(
+                    let reservation = Turn::reserve_interaction_cut(
                         &handles.cards,
                         host.as_deref().unwrap_or(session_id),
                         req_id,
@@ -2223,6 +2231,7 @@ impl RequestKind for QuestionKind {
                             scope,
                         )
                         .await,
+                        reservation,
                         inline,
                         host,
                         session_id,
@@ -2500,8 +2509,12 @@ impl RequestKind for QuestionKind {
                 // A resolving click reserves its receipt's position BEFORE the
                 // backend reply (issue #1023): content a render delivers while the
                 // reply is in flight must sort after the receipt, not above it.
-                Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id)
-                    .await;
+                let reservation = Turn::reserve_interaction_cut(
+                    &handles.cards,
+                    host.as_deref().unwrap_or(session_id),
+                    req_id,
+                )
+                .await;
                 if let Some(r) = settle_question_reply(
                     flow,
                     &handles.cards,
@@ -2517,6 +2530,7 @@ impl RequestKind for QuestionKind {
                         scope,
                     )
                     .await,
+                    reservation,
                     inline,
                     host,
                     session_id,
@@ -2685,8 +2699,12 @@ impl RequestKind for QuestionKind {
                 // A resolving click reserves its receipt's position BEFORE the
                 // backend reply (issue #1023): content a render delivers while the
                 // reply is in flight must sort after the receipt, not above it.
-                Turn::reserve_interaction_cut(&handles.cards, host.as_deref().unwrap_or(session_id), req_id)
-                    .await;
+                let reservation = Turn::reserve_interaction_cut(
+                    &handles.cards,
+                    host.as_deref().unwrap_or(session_id),
+                    req_id,
+                )
+                .await;
                 if let Some(r) = settle_question_reply(
                     flow,
                     &handles.cards,
@@ -2694,6 +2712,7 @@ impl RequestKind for QuestionKind {
                     req_id,
                     self.label(),
                     reply_question_scoped(&handles.backend, session_id, req_id, None, directory, scope).await,
+                    reservation,
                     inline,
                     host,
                     session_id,
@@ -2788,6 +2807,7 @@ async fn settle_question_reply(
     req_id: &str,
     kind: &str,
     result: crate::error::Result<()>,
+    reservation: Option<u64>,
     inline: bool,
     host: &Option<String>,
     session_id: &str,
@@ -2841,7 +2861,13 @@ async fn settle_question_reply(
             // (no replacement) and say the answer did not land.
             tracing::warn!("location form reply did not land ({}): {}", req_id, e);
             flow.unmark_answered(requests, req_id).await;
-            Turn::forget_interaction_reservation(cards, host.as_deref().unwrap_or(session_id), req_id).await;
+            Turn::forget_interaction_reservation(
+                cards,
+                host.as_deref().unwrap_or(session_id),
+                req_id,
+                reservation,
+            )
+            .await;
             Some(CardActionResult {
                 card: None,
                 toast: Some(if cancel {
@@ -2854,7 +2880,13 @@ async fn settle_question_reply(
         Err(e) => {
             tracing::error!("question reply failed: {}", e);
             flow.unmark_answered(requests, req_id).await;
-            Turn::forget_interaction_reservation(cards, host.as_deref().unwrap_or(session_id), req_id).await;
+            Turn::forget_interaction_reservation(
+                cards,
+                host.as_deref().unwrap_or(session_id),
+                req_id,
+                reservation,
+            )
+            .await;
             Some(failed_result_card(
                 inline,
                 "该问题处理失败，请重试。",

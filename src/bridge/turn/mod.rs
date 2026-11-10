@@ -3996,9 +3996,11 @@ impl Turn {
         Self::install_fresh_session(cards, session_id, state::StreamAccumulator::new("test")).await;
     }
 
-    /// Test seam: the armed card's chain identity, for a test that needs to
-    /// pass it to [`Self::take_over_card_if_current`].
-    #[cfg(test)]
+    /// The Session's current card-chain identity. The surfacing drain captures
+    /// it before its read and re-checks it under the host's lock, so a block is
+    /// never inserted into a CardSession that replaced the one the drain
+    /// rendered into (issue #1023); tests also use it for
+    /// [`Self::take_over_card_if_current`].
     pub(crate) async fn card_chain_id(cards: &CardsHandle, session_id: &str) -> Option<u64> {
         cards
             .cards

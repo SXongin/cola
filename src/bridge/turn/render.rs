@@ -1569,6 +1569,17 @@ pub(super) fn render_new_turn_parts_committing(
 /// the session-scoped compaction walk skips past. It is the SESSION's delivered
 /// past, not this card's, which is why it is passed in rather than read off
 /// `acc` — a fresh Turn's accumulator is deliberately cursorless.
+/// The server time a transcript message contributes to the receipt floor: its
+/// own `time.created`, or — when the payload carried none — the newest part
+/// start it does carry. `None` only when the message has no server time at all
+/// (it cannot be classified against a receipt then).
+fn message_floor_time(message: &crate::backend::TranscriptMessage) -> Option<i64> {
+    message
+        .time
+        .map(|time| time.created)
+        .or_else(|| message.parts.iter().filter_map(Part::started_at).max())
+}
+
 pub(super) fn render_turn_parts(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
@@ -1677,7 +1688,7 @@ pub(super) fn render_turn_parts(
         let message_pos = message_positions.get(message.id.as_str()).copied();
         // A message the server created after a receipt's ask is post-click
         // content: every part of it sorts after the receipt (issue #1023).
-        acc.set_message_floor(message.time.as_ref().map(|time| time.created));
+        acc.set_message_floor(message_floor_time(message));
         for (index, part) in message.parts.iter().enumerate() {
             let cut = match (seed.as_ref(), message_pos) {
                 (Some(seed), Some(pos)) => seed.cut(pos, index),
@@ -1804,7 +1815,7 @@ fn render_pending_gap(
         {
             continue;
         }
-        acc.set_message_floor(message.time.as_ref().map(|time| time.created));
+        acc.set_message_floor(message_floor_time(message));
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => {
@@ -1970,7 +1981,7 @@ fn render_seed_scope(
         let Some(pos) = message_positions.get(message.id.as_str()).copied() else {
             continue;
         };
-        acc.set_message_floor(message.time.as_ref().map(|time| time.created));
+        acc.set_message_floor(message_floor_time(message));
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
@@ -2270,8 +2281,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                     .messages
                     .iter()
                     .find(|message| message.id == message_id)
-                    .and_then(|message| message.time)
-                    .map(|time| time.created),
+                    .and_then(message_floor_time),
             );
             if render_part(
                 acc,
