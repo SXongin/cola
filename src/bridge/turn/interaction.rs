@@ -13,6 +13,13 @@ use crate::bridge::handles::CardsHandle;
 
 use super::{InlineResidue, Turn, TurnPinSource, state};
 
+/// How long a card callback may wait for the session's card write lock to
+/// reserve or drop a receipt's position (issue #1023). The click handler runs on
+/// Feishu's card-ack deadline, and a concurrent flush holds that lock across a
+/// network PATCH, so the reservation is best-effort under contention: a missing
+/// reservation only leaves the receipt at its default position.
+const RESERVATION_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl Turn {
     /// Whether ANY card session still carries a block for `request_id` (the
     /// already-surfaced probe, ADR-0038).
@@ -305,7 +312,9 @@ impl Turn {
         request_id: &str,
     ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
-        let _guard = write_lock.lock().await;
+        let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
+            return false;
+        };
         cards
             .cards
             .lock()
@@ -324,7 +333,9 @@ impl Turn {
         request_id: &str,
     ) {
         let write_lock = cards.write_lock(session_id).await;
-        let _guard = write_lock.lock().await;
+        let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
+            return;
+        };
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
             card.acc.forget_reservation(request_id);
         }

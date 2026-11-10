@@ -87,6 +87,10 @@ pub(crate) struct SnapshotFollowPlan {
     /// Whether the server read the run as busy at prepare time (the Waiting
     /// copy is chosen from this and the read's `waiting`).
     busy_now: bool,
+    /// The asking tool's server time from the follow's own bounded read (issue
+    /// #1023): carried onto every block this follow seeds, so a receipt it
+    /// later writes has the same cut the sweep would have captured.
+    asked_at: Option<i64>,
     /// The read's requests, BEFORE the surface filter: the filter runs under
     /// the card write lock so the set the pointer names is exactly the set
     /// attached, with no sweep able to slip between.
@@ -798,11 +802,15 @@ impl ExternalFlow {
         // later, under the lock, once the seed count is final.
         let prepared =
             Turn::prepare_external_render(&data.session_id, &anchor, "", &session_dir, variant, None).await;
+        // One bounded read for the surfaces' receipt anchor (issue #1023); the
+        // follow streams parts later, but the block's cut must be captured now.
+        let asked_at = crate::bridge::request::flow::session_anchor(handles, &data.session_id).await;
         Some(SnapshotFollowPlan {
             anchor,
             session_thread_key,
             directory: data.directory.clone(),
             busy_now,
+            asked_at,
             candidates: data.pending.clone(),
             seeds: Vec::new(),
             prepared: Some(prepared),
@@ -944,7 +952,7 @@ impl ExternalFlow {
             // NOT remember it: no card carries its block, so the sweep must
             // still be free to surface it on its own.
             if !flow
-                .add_initial_inline_locked(&handles.cards, session_id, req, &plan.directory)
+                .add_initial_inline_locked(&handles.cards, session_id, req, &plan.directory, plan.asked_at)
                 .await
             {
                 tracing::warn!(
@@ -2193,6 +2201,7 @@ mod tests {
             session_thread_key: None,
             directory: "/work".into(),
             busy_now: false,
+            asked_at: None,
             candidates: Vec::new(),
             seeds: vec![req.clone()],
             prepared: None,
@@ -2203,7 +2212,7 @@ mod tests {
         let guard = lock.lock().await;
         // The card already carries the block, so the seed's add is refused.
         assert!(
-            flow.add_initial_inline_locked(&handles.cards, "ses_test", &req, "/work")
+            flow.add_initial_inline_locked(&handles.cards, "ses_test", &req, "/work", None)
                 .await
         );
         app.external
