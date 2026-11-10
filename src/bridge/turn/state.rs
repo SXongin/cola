@@ -2960,6 +2960,9 @@ impl StreamAccumulator {
         line: impl FnOnce(&InteractionBlock) -> String,
     ) -> bool {
         let Some(idx) = self.live_index(request_id) else {
+            // No live block on THIS card: no receipt will be written here, so
+            // the click's reservation must not outlive it (issue #1023).
+            self.forget_reservation(request_id);
             return false;
         };
         let text = line(&self.interactions[idx]);
@@ -3016,12 +3019,16 @@ impl StreamAccumulator {
     /// reserved (a repeated click keeps the first reservation — content after
     /// that first click is already floored past it).
     pub(super) fn reserve_receipt(&mut self, request_id: &str) -> bool {
-        if self.reserved_receipts.contains_key(request_id) {
-            return false;
-        }
         let Some(asked_at) = self.interaction(request_id).and_then(|block| block.asked_at()) else {
             return false;
         };
+        // A repeat click (a retry after a failed reply, a double click) takes a
+        // FRESH key and drops the old reservation's floor: the old click wrote
+        // no receipt, and content rendered after it may have been visible before
+        // this click, so it must not be cut by the abandoned reservation.
+        if let Some(old) = self.reserved_receipts.remove(request_id) {
+            self.forget_reserved_cut(old.floor_key);
+        }
         let receipt_key = self.next_order();
         let floor_key = receipt_key.saturating_add(1);
         self.receipt_cuts.push(ReceiptCut {
@@ -3142,6 +3149,9 @@ impl StreamAccumulator {
     /// this card).
     pub(super) fn dismiss_interaction(&mut self, request_id: &str) -> bool {
         let Some(idx) = self.live_index(request_id) else {
+            // No live block on THIS card: no receipt will be written here, so
+            // the click's reservation must not outlive it (issue #1023).
+            self.forget_reservation(request_id);
             return false;
         };
         self.interactions[idx] = InteractionBlock::Receipt(request_id.to_string());
@@ -8816,6 +8826,49 @@ mod tests {
         assert!(
             card.find("第一段继续").unwrap() < card.find("✅ 已回答").unwrap(),
             "the grown part stays above the receipt it preceded: {card}"
+        );
+    }
+
+    /// A retried click replaces its abandoned reservation: the first click
+    /// wrote no receipt, so its floor must not cut content the Host saw before
+    /// the retry; the fresh key sits below that content (issue #1023).
+    #[test]
+    fn a_retried_click_takes_a_fresh_reservation() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q".into(),
+            session_id: "s".into(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "继续?".into(),
+                header: "继续".into(),
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: "/w".into(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+            asked_at: Some(1_000),
+        }));
+        assert!(acc.reserve_receipt("q"));
+        let first_floor = acc.receipt_cuts.last().expect("the first floor").key;
+        // Content rendered after the failed click, floored past the first key.
+        acc.set_message_floor(Some(1_100));
+        acc.push_text_at(Some(1_100), "失败后可见");
+        acc.set_message_floor(None);
+        // The Host retries: a fresh key, and the abandoned floor is gone.
+        assert!(acc.reserve_receipt("q"));
+        assert!(
+            acc.receipt_cuts.iter().all(|cut| cut.key != first_floor),
+            "the abandoned reservation's floor is dropped"
+        );
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("失败后可见").unwrap() < card.find("✅ 已回答").unwrap(),
+            "content visible before the retry stays above its receipt: {card}"
         );
     }
 
