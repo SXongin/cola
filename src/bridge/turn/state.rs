@@ -3201,49 +3201,52 @@ impl StreamAccumulator {
         } else {
             key
         };
-        // Read order is monotonic across messages: a part already read may not
-        // be sorted above by a later message whose server time is older (a
-        // post-tool part took a synthetic key). The walk's own high-water mark,
-        // not `last_key` (which also counts receipts placed before the walk).
-        // Synthetic pushes (no source) are not read-order content.
-        if source.is_some() {
-            let key = self.read_floor.map_or(key, |floor| key.max(floor));
-            self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
-            key
-        } else {
-            key
-        }
+        // A CROSS-message read floor (set by the walk per message): content
+        // already read from an earlier message may not sort below a later
+        // message whose own server time is older. Inside one message the
+        // transcript part order above wins, so the floor is never advanced
+        // here.
+        self.read_floor.map_or(key, |floor| key.max(floor))
     }
 
-    /// Reset the walk's read-order floor (issue #1022). The walks call this at
-    /// their start and end so one pass's synthetic keys cannot floor another's.
+    /// Set (or clear) the walk's read-order floor for the message about to
+    /// render (issue #1022). It is the highest key placed by a message BEFORE
+    /// this one in the read; the walks compute it per message with
+    /// [`Self::read_floor_before`] and clear it after.
+    pub(super) fn set_read_floor(&mut self, floor: Option<i64>) {
+        self.read_floor = floor;
+    }
+
+    /// Clear the walk's read-order floor.
     pub(super) fn reset_read_floor(&mut self) {
-        self.read_floor = None;
+        self.set_read_floor(None);
     }
 
-    /// Seed the walk's read-order floor from what is ALREADY placed (issue
-    /// #1022): a later render pass skips the earlier message as deduped, but the
-    /// next message's parts still may not sort above it. Only transcript part
-    /// entries count — a receipt or synthetic line is not read-order content.
-    /// [`Self::seed_read_floor`] restricted to the messages this walk covers:
-    /// a gap or takeover seed renders one Turn's window, and another Turn's
-    /// later cards must not floor it (issue #1022).
-    pub(super) fn seed_read_floor_where(&mut self, include: impl Fn(&MessageId) -> bool) {
-        self.read_floor = self
-            .timeline
+    /// [`Self::set_read_floor`]'s value: the highest key a transcript part from
+    /// an EARLIER message already holds. Receipts, compactions and other
+    /// session-scoped entries are not read-order content.
+    pub(super) fn read_floor_before(
+        &self,
+        positions: &std::collections::HashMap<&str, usize>,
+        message_id: &MessageId,
+    ) -> Option<i64> {
+        let current = *positions.get(message_id.as_str())?;
+        self.timeline
             .iter()
+            .filter(|item| {
+                matches!(
+                    item.kind,
+                    TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
+                )
+            })
             .filter(|item| {
                 item.source
                     .as_ref()
-                    .is_some_and(|source| include(&source.message_id))
-                    && matches!(
-                        item.kind,
-                        TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
-                    )
+                    .and_then(|source| positions.get(source.message_id.as_str()).copied())
+                    .is_some_and(|position| position < current)
             })
             .map(|item| item.key)
             .max()
-            .or(self.read_floor);
     }
 
     /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
@@ -3943,9 +3946,6 @@ impl StreamAccumulator {
             (true, Some(floor)) => key.max(floor),
             _ => key,
         };
-        if read_ordered {
-            self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
-        }
         // Equal keys keep ALLOCATION order (`order`): a live tool panel is
         // allocated at its transcript position and joins the timeline only when
         // it settles, after a later part of the same message may have been
@@ -4413,9 +4413,6 @@ impl StreamAccumulator {
                 (true, Some(floor)) => key.max(floor),
                 _ => key,
             };
-            if source.is_some() {
-                self.read_floor = Some(self.read_floor.map_or(key, |floor| floor.max(key)));
-            }
             if live {
                 // Unfinished: TAIL content. Allocate its identity and key now,
                 // but do not join the timeline — a split must never finalize a

@@ -1705,9 +1705,12 @@ pub(super) fn render_turn_parts(
     // committing it here or after the parts render is one card.
     let seed = acc.seed().cloned();
     let turn = transcript.turn_for_user(&anchor);
-    let turn_ids: std::collections::HashSet<MessageId> =
-        turn.messages.iter().map(|message| message.id.clone()).collect();
-    acc.seed_read_floor_where(|id| turn_ids.contains(id));
+    let read_positions: std::collections::HashMap<&str, usize> = transcript
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(position, message)| (message.id.as_str(), position))
+        .collect();
     // A card rendering an unanswered free-text field must not consume this
     // background update: otherwise the first pass removes it from "new" and
     // the post-answer pass has nothing left to show (#917 / card-repaints).
@@ -1749,6 +1752,8 @@ pub(super) fn render_turn_parts(
         // A message the server created after a receipt's ask is post-click
         // content: every part of it sorts after the receipt (issue #1023).
         acc.set_message_floor(message_floor_time(message));
+        let floor = acc.read_floor_before(&read_positions, &message.id);
+        acc.set_read_floor(floor);
         // The part order keys this message's card entries sort by (issue #1022):
         // V2 text parts carry no time, so they borrow the previous part's.
         let order_keys = part_order_times(message);
@@ -1845,13 +1850,7 @@ fn render_pending_gap(
     gap: &crate::bridge::chain::PendingGap,
 ) -> bool {
     acc.reset_read_floor();
-    let scope_ids: std::collections::HashSet<MessageId> = transcript
-        .turn_for_user(&gap.anchor)
-        .messages
-        .iter()
-        .map(|message| message.id.clone())
-        .collect();
-    acc.seed_read_floor_where(|id| scope_ids.contains(id));
+
     let cursor = &gap.cursor;
     let anchor = &gap.anchor;
     let Some(seed) = state::CursorSeed::for_orphan_resolving(transcript, cursor, anchor) else {
@@ -1891,6 +1890,8 @@ fn render_pending_gap(
             continue;
         }
         acc.set_message_floor(message_floor_time(message));
+        let floor = acc.read_floor_before(&message_positions, &message.id);
+        acc.set_read_floor(floor);
         let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
@@ -2044,13 +2045,7 @@ fn render_seed_scope(
         return false;
     }
     acc.reset_read_floor();
-    let seed_scope_ids: std::collections::HashSet<MessageId> = transcript
-        .turn_for_user(scope)
-        .messages
-        .iter()
-        .map(|message| message.id.clone())
-        .collect();
-    acc.seed_read_floor_where(|id| seed_scope_ids.contains(id));
+
     // When the accumulator OWES the durable gap this scope is the window of
     // (spec #561, review #569), the seed's render IS the gap's render: its
     // entries are tagged so the chain cursor skips them and the gap's own
@@ -2069,6 +2064,8 @@ fn render_seed_scope(
             continue;
         };
         acc.set_message_floor(message_floor_time(message));
+        let floor = acc.read_floor_before(message_positions, &message.id);
+        acc.set_read_floor(floor);
         let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
@@ -2357,6 +2354,12 @@ fn render_seeded_part(
 fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let mut rendered = false;
     acc.reset_read_floor();
+    let seeded_positions: std::collections::HashMap<&str, usize> = transcript
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(position, message)| (message.id.as_str(), position))
+        .collect();
     // The seeded ids are a SET, so sort them by their read position before
     // placing them: two calls sharing a borrowed key would otherwise allocate
     // in hash order (issue #1022).
@@ -2388,6 +2391,8 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             // The call's message carries the floor its settlement takes
             // (issue #1023): a post-click message's parts follow the receipt.
             acc.set_message_floor(message_floor_time(message));
+            let floor = acc.read_floor_before(&seeded_positions, &message.id);
+            acc.set_read_floor(floor);
             // The call's READ POSITION orders it, exactly like the window walk
             // (issue #1022): the seeded set is resolved by identity, not by a
             // clock, but its key still comes from the message's part order.
