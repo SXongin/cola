@@ -386,8 +386,12 @@ in that gap. A **resolving click reserves the receipt's key** before it replies
 (`reserve_receipt`), which floors future inserts at `key + 1`; the receipt then
 takes the reserved key, so the gap content follows it. Nothing already placed
 moves: everything on the card before the click was something the Host could see.
-A reservation that never becomes a per-block receipt (the Auto-Accept mode
-change's single receipt) drops its floor with it (`forget_reservation`).
+An Auto-Accept toggle reserves before its reply too, and its ONE mode receipt
+takes that reserved key (`take_reserved_receipt_key`); the other blocks it
+resolves drop their reservations (`forget_reservation`), and a reservation that
+never becomes a receipt drops its floor with it. The reservation consumes its
+floor key from the synthetic key sequence, so no unrelated receipt can take the
+same key and be cut by a later cleanup.
 
 When a QUESTION is resolved with no reservation (a remote client's answer,
 noticed by the next sweep), the ask cut floors future messages only — entries
