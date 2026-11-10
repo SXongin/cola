@@ -3035,7 +3035,21 @@ impl StreamAccumulator {
                 floor_key,
             },
         );
+        // Consume the floor key too: the next synthetic key must not equal it,
+        // or an unrelated receipt written in this same millisecond would share
+        // the reservation's cut and a later forget would delete both.
+        self.order_seq = floor_key;
+        self.last_key = self.last_key.max(floor_key);
         true
+    }
+
+    /// Take the timeline key reserved for `request_id`'s receipt, if a click
+    /// reserved one (issue #1023). Used by the mode-change path, whose ONE
+    /// receipt covers several blocks.
+    pub(super) fn take_reserved_receipt_key(&mut self, request_id: &str) -> Option<i64> {
+        self.reserved_receipts
+            .remove(request_id)
+            .map(|reserved| reserved.receipt_key)
     }
 
     /// Drop a click's reservation for `request_id` without writing a receipt —

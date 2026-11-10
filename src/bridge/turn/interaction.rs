@@ -333,6 +333,7 @@ impl Turn {
         // sits after every one of them, so content written after this click is
         // after that ask too (issue #1023).
         let mut mode_asked_at: Option<i64> = None;
+        let mut mode_reserved_key: Option<i64> = None;
         for id in ids {
             let resolved = match residue {
                 InlineResidue::PerBlock(line) => {
@@ -342,9 +343,14 @@ impl Turn {
                     if let Some(at) = acc.interaction(id).and_then(|block| block.asked_at()) {
                         mode_asked_at = Some(mode_asked_at.map_or(at, |seen: i64| seen.max(at)));
                     }
-                    // The one receipt covers every resolved block: drop any
-                    // per-block reservation a click made (issue #1023).
-                    acc.forget_reservation(id);
+                    // The click that started this mode change reserved its own
+                    // receipt key (issue #1023): use it, and drop the other
+                    // blocks' reservations (the one receipt covers them).
+                    if let Some(key) = acc.take_reserved_receipt_key(id) {
+                        mode_reserved_key.get_or_insert(key);
+                    } else {
+                        acc.forget_reservation(id);
+                    }
                     acc.dismiss_interaction(id)
                 }
             };
@@ -353,10 +359,22 @@ impl Turn {
         if let InlineResidue::Single(text) = residue
             && resolved_here
         {
-            let key = acc.push_receipt(text);
-            if let Some(asked_at) = mode_asked_at {
-                acc.record_receipt_cut(asked_at, key);
-            }
+            match mode_reserved_key {
+                // A reservation already floored the messages written during the
+                // reply; the receipt takes the reserved key below them.
+                Some(key) => {
+                    acc.push_receipt_at(Some(key), text);
+                }
+                None => {
+                    let key = acc.push_receipt(text);
+                    // No reservation: cut FUTURE messages at this receipt. The
+                    // toggle's click precedes the receipt, so anything created
+                    // later follows it.
+                    if let Some(asked_at) = mode_asked_at {
+                        acc.record_receipt_cut(asked_at, key);
+                    }
+                }
+            };
         }
         resolved_here.then(|| acc.header_title_and_template())
     }

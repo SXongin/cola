@@ -1592,6 +1592,12 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     );
     Turn::flush_card(&cards, "ses_test").await;
 
+    // The toggle's click reserves the mode receipt's position BEFORE its
+    // reply; a message rendered while the reply is in flight follows it.
+    assert!(Turn::reserve_interaction_cut(&cards, "ses_test", "que_auto").await);
+    Turn::set_message_floor(&cards, "ses_test", Some(1_100)).await;
+    Turn::push_text_at(&cards, "ses_test", 1_100, "点击后到达的继续").await;
+    Turn::set_message_floor(&cards, "ses_test", None).await;
     let resolved = Turn::resolve_interactions(
         &cards,
         "ses_test",
@@ -1611,10 +1617,14 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     Turn::flush_card(&cards, "ses_test").await;
 
     let text = card_text(&final_card(&platform).await);
+    let receipt = text.find("♻️ 已设为自动允许").unwrap();
     assert!(
-        text.find("两次提问之间").unwrap() < text.find("♻️ 已设为自动允许").unwrap()
-            && text.find("♻️ 已设为自动允许").unwrap() < text.find("自动之后的内容").unwrap(),
-        "the cut is the latest ask: {text}"
+        text.find("两次提问之间").unwrap() < receipt,
+        "content visible before the click stays above the receipt: {text}"
+    );
+    assert!(
+        receipt < text.find("点击后到达的继续").unwrap() && receipt < text.find("自动之后的内容").unwrap(),
+        "post-click content follows the receipt: {text}"
     );
 }
 
