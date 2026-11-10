@@ -1449,9 +1449,9 @@ async fn a_timed_out_surfacing_drain_still_surfaces_the_question() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
     seed_live_card(&app, "ses_test", "om_live").await;
-    // Every session read hangs: the host walk times out, and the drain's own
-    // render pass (which refreshes the title) runs into the bound too.
-    backend.hang_session_info_reads(usize::MAX);
+    // A wedged transcript read parks inside the drain: the drain's own deadline
+    // must abandon it and let the request surface.
+    backend.hang_transcript_for("ses_test").await;
 
     tokio::spawn({
         let app = app.clone();
@@ -1473,7 +1473,7 @@ async fn a_timed_out_surfacing_drain_still_surfaces_the_question() {
         wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep"),
     )
     .await
-    .expect("the sweep must complete despite the wedged render pass");
+    .expect("the sweep must complete despite the wedged drain read");
 
     assert_eq!(
         Turn::live_questions(&app.cards_handle(), "ses_test").await.len(),
@@ -1558,6 +1558,70 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
         text.find("两次提问之间").unwrap() < text.find("♻️ 已设为自动允许").unwrap()
             && text.find("♻️ 已设为自动允许").unwrap() < text.find("自动之后的内容").unwrap(),
         "the cut is the latest ask: {text}"
+    );
+}
+
+/// The surfacing drain's flush stands down while the card renders an
+/// unanswered typed answer (issue #917): the applied content waits for the
+/// form's own resolution flush, and the drain never wipes what the Host typed.
+#[tokio::test]
+async fn the_drain_flush_stands_down_for_an_unanswered_typed_answer() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let cards = app.cards_handle();
+    let request = crate::backend::types::QuestionRequest {
+        id: "que_typed".into(),
+        session_id: "ses_test".into(),
+        questions: vec![crate::backend::types::QuestionInfo {
+            question: "补充说明".into(),
+            header: "说明".into(),
+            options: Vec::new(),
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: Some(true),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(
+        Turn::add_question(
+            &cards,
+            "ses_test",
+            &request,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+            Some(1_000),
+        )
+        .await
+    );
+    Turn::flush_card(&cards, "ses_test").await;
+    let before = platform.updated_cards().await.len();
+
+    Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        before,
+        "a card holding an unanswered typed answer is not repainted"
+    );
+
+    // The resolution drops the input; the next flush writes (the receipt).
+    let receipt = |_: &str| "✅ 已回答".to_string();
+    Turn::resolve_interactions(
+        &cards,
+        "ses_test",
+        &["que_typed".into()],
+        &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+    )
+    .await;
+    let resolved = platform.updated_cards().await.len();
+    Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
+    assert!(
+        platform.updated_cards().await.len() > resolved,
+        "once the form is gone the deferred content is written"
     );
 }
 

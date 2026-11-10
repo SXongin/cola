@@ -355,9 +355,14 @@ all. The flush re-checks the live-form freeze under the write lock, so a questio
 that landed since the apply still refuses the repaint (#917) and the applied
 content rides the form's own resolution flush.
 
-The same read yields the **asking tool part's server time** — while a request is
-pending its turn is blocked, so the `question` / permission tool call is the
-newest server activity in the read. That time travels on the block
+The same read yields the **asking tool part's server time** — in the ordinary
+case the `question` / permission tool call is the newest part the server wrote.
+The anchor is the read's **high-water mark**, not one part id: the read happens
+before the click, and while a request is pending its turn is blocked, so nothing
+the Host could have seen — a parallel tool call or a queued message included —
+exceeds it, and nothing is produced between the read and the click either. A
+newer sibling part only raises the mark; a lower anchor is the unsafe choice.
+That time travels on the block
 (`PendingQuestion::asked_at` / `PendingPermission::asked_at`) and, when the block
 resolves, becomes the receipt's **server-time cut** (`ReceiptCut`): the receipt
 itself keeps its `next_order` key — it must follow everything the Host could see
@@ -370,7 +375,13 @@ Every anchored receipt keeps its cut rather than only the newest one: requests
 can be asked in one order and answered in another, and content written between
 the asks must clear the receipt of the *last* click too. The floor is the newest
 receipt key among the asks that precede the content's server time — a staircase,
-not a single "latest" cut. A block that reached the card without a surfacing read
+not a single "latest" cut. Content can even be PLACED before its receipt lands:
+the backend reply returns before the receipt is written, and a remote client's
+answer is only noticed by the next sweep, so a render poll may insert the
+post-click continuation in that gap at its own server key. Recording the cut
+therefore re-floors the live slice — entries server-stamped after the ask move to
+the receipt's key, keeping their own order after it; the finalized prefix is
+already on a sent card and is left as it is. A block that reached the card without a surfacing read
 (a busy-follow seed, a restart re-adoption) carries no anchor and keeps the
 previous receipt behaviour; a **re-hosted** block keeps the anchor it was first
 surfaced with — the anchor belongs to the request, not to the card it sits on, so
