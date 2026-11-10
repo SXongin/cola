@@ -1375,6 +1375,9 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_session_status("ses_1", Some(crate::backend::types::SessionStatus::Busy));
     let (app, platform) = build_app(cfg, backend).await;
+    // A stale card is only provable for a directory this sweep actually
+    // listed; map it so `/work` is in the successful-listing set.
+    seed_session(&app, "ses_1", "/work").await;
     app.permission.sent_cards.lock().await.insert(
         "per_stale".into(),
         crate::bridge::request::flow::SentCard {

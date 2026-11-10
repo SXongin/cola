@@ -253,7 +253,7 @@ pub trait RequestKind: Send + Sync {
         // Who owns the clicked request (ADR-0103): a Location owner routes the
         // reply/cancel through the directory, and a retryable refusal must keep
         // the card instead of replacing it.
-        owner: crate::backend::types::RequestOwner,
+        scope: crate::backend::types::RequestScope,
     ) -> Option<CardActionResult>;
 }
 
@@ -544,7 +544,7 @@ impl RequestKind for PermissionKind {
         inline: bool,
         host: &Option<String>,
         clicked: Option<&str>,
-        _owner: crate::backend::types::RequestOwner,
+        _scope: crate::backend::types::RequestScope,
     ) -> Option<CardActionResult> {
         let perm_label = value.get("perm_label").and_then(|v| v.as_str()).unwrap_or("");
         let perm_color = value
@@ -2028,9 +2028,9 @@ impl RequestKind for QuestionKind {
         inline: bool,
         host: &Option<String>,
         clicked: Option<&str>,
-        owner: crate::backend::types::RequestOwner,
+        scope: crate::backend::types::RequestScope,
     ) -> Option<CardActionResult> {
-        let location_form = owner == crate::backend::types::RequestOwner::Location;
+        let location_form = scope == crate::backend::types::RequestScope::Location;
         match reply {
             // "answer" = an option click (single-select replaces, multi-select
             // toggles). "custom" = a typed custom answer from the form — a
@@ -2176,7 +2176,7 @@ impl RequestKind for QuestionKind {
                             req_id,
                             Some(&answers),
                             directory,
-                            owner,
+                            scope,
                         )
                         .await,
                         inline,
@@ -2184,7 +2184,7 @@ impl RequestKind for QuestionKind {
                         session_id,
                         clicked,
                         false,
-                        owner,
+                        scope,
                     )
                     .await
                     {
@@ -2465,7 +2465,7 @@ impl RequestKind for QuestionKind {
                         req_id,
                         Some(&answers),
                         directory,
-                        owner,
+                        scope,
                     )
                     .await,
                     inline,
@@ -2473,7 +2473,7 @@ impl RequestKind for QuestionKind {
                     session_id,
                     clicked,
                     false,
-                    owner,
+                    scope,
                 )
                 .await
                 {
@@ -2639,13 +2639,13 @@ impl RequestKind for QuestionKind {
                     &handles.requests,
                     req_id,
                     self.label(),
-                    reply_question_scoped(&handles.backend, session_id, req_id, None, directory, owner).await,
+                    reply_question_scoped(&handles.backend, session_id, req_id, None, directory, scope).await,
                     inline,
                     host,
                     session_id,
                     clicked,
                     true,
-                    owner,
+                    scope,
                 )
                 .await
                 {
@@ -2739,14 +2739,18 @@ async fn settle_question_reply(
     session_id: &str,
     clicked: Option<&str>,
     cancel: bool,
-    owner: crate::backend::types::RequestOwner,
+    scope: crate::backend::types::RequestScope,
 ) -> Option<CardActionResult> {
-    let location_form = owner == crate::backend::types::RequestOwner::Location;
+    let location_form = scope == crate::backend::types::RequestScope::Location;
     match result {
         Ok(()) => {
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
             flow.surfaces.remove_standalone(req_id);
+            // A settled Location Form must not leave a record behind: while a
+            // listing lags, that record would suppress a fresh card (or show
+            // 已推送 with no card). No-op for a session-backed request.
+            flow.surfaces.remove_location_form(req_id);
             None
         }
         Err(e) if e.is_not_found() => {
@@ -2754,6 +2758,7 @@ async fn settle_question_reply(
             flow.remove_question(req_id).await;
             flow.sent_cards.lock().await.remove(req_id);
             flow.surfaces.remove_standalone(req_id);
+            flow.surfaces.remove_location_form(req_id);
             // The click found the request gone: leave the neutral "handled
             // elsewhere" receipt on the clicked card, carried in the ack like
             // any other resolution (ADR-0038, rules 3+4).
@@ -2814,7 +2819,7 @@ async fn reply_question_scoped(
     req_id: &str,
     answers: Option<&[crate::backend::types::FormAnswer]>,
     directory: Option<&str>,
-    owner: crate::backend::types::RequestOwner,
+    scope: crate::backend::types::RequestScope,
 ) -> crate::error::Result<()> {
     let Some(dir) = directory else {
         return Err(crate::error::BridgeError::OpenCode(
@@ -2825,7 +2830,7 @@ async fn reply_question_scoped(
     // A Location Form has no Session: its route carries the owning directory
     // and the generation's own location placeholder, so the adapter owns both
     // (ADR-0103). The bridge never reads the wire sentinel.
-    if owner == crate::backend::types::RequestOwner::Location {
+    if scope == crate::backend::types::RequestScope::Location {
         return match answers {
             Some(answers) => backend.reply_location_form(req_id, answers).await,
             None => backend.reject_location_form(req_id).await,

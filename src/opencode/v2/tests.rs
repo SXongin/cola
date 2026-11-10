@@ -2297,9 +2297,9 @@ async fn list_questions_maps_the_global_elicitation_to_a_location_owner() {
 
     let forms = client.list_questions(Some("/work/cola")).await.unwrap();
 
-    use crate::backend::types::RequestOwner;
+    use crate::backend::types::RequestScope;
     let location = forms.iter().find(|form| form.id == "frm_location").unwrap();
-    assert_eq!(location.owner, RequestOwner::Location);
+    assert_eq!(location.scope, RequestScope::Location);
     assert!(location.is_location());
     assert_eq!(
         location.session_id, "",
@@ -2310,8 +2310,8 @@ async fn list_questions_maps_the_global_elicitation_to_a_location_owner() {
 
     let unmarked = forms.iter().find(|form| form.id == "frm_unmarked").unwrap();
     assert_eq!(
-        unmarked.owner,
-        RequestOwner::Session,
+        unmarked.scope,
+        RequestScope::Session,
         "only a MARKED elicitation takes the location path"
     );
     assert_eq!(
@@ -2320,7 +2320,7 @@ async fn list_questions_maps_the_global_elicitation_to_a_location_owner() {
     );
 
     let session_backed = forms.iter().find(|form| form.id == "frm_session").unwrap();
-    assert_eq!(session_backed.owner, RequestOwner::Session);
+    assert_eq!(session_backed.scope, RequestScope::Session);
     assert_eq!(session_backed.session_id, "ses_1");
     assert_eq!(session_backed.server.as_deref(), Some("context7"));
     assert_eq!(session_backed.message.as_deref(), Some("session owns this"));

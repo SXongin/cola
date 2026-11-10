@@ -190,14 +190,10 @@ pub(crate) fn build_mcp_card(
     forms: &[McpFormRow<'_>],
 ) -> serde_json::Value {
     let mut body = BoundedBody::new();
-    body.push(&format!(
-        "**目录**：`{directory}`
-
-只读：不会连接/断开、增删 MCP 服务器，也不会登录或浏览资源。"
-    ));
+    body.push(&format!("📍 `{directory}` · 只读"));
 
     let mut omitted = 0;
-    body.push("**待处理的 Location Form**");
+    body.push("**待处理表单**");
     let mut location_forms: Vec<&McpFormRow<'_>> =
         forms.iter().filter(|form| form.request.is_location()).collect();
     // Stable sort: a dismissed form's control outranks every status and every
@@ -208,19 +204,18 @@ pub(crate) fn build_mcp_card(
         McpFormState::Pushed => 2,
     });
     if location_forms.is_empty() {
-        body.push("当前目录没有待处理的 Location Form。会话自有的提问不会列在这里。");
+        body.push("无。");
     } else {
-        body.push("重新打开会把表单作为一张新卡片发到该目录当前映射的聊天/话题。");
         for form in location_forms {
             let summary = location_form_summary_raw(form.request);
             let state = match form.state {
-                McpFormState::Dismissed => "已稍后，可重新打开",
-                McpFormState::Pushed => "已推送，见原卡片",
-                McpFormState::Unpushed => "等待推送",
+                McpFormState::Dismissed => "已稍后",
+                McpFormState::Pushed => "已推送",
+                McpFormState::Unpushed => "待推送",
             };
             let button = (form.state == McpFormState::Dismissed)
                 .then(|| reopen_button(thread_key, &form.request.id, directory));
-            if !body.push_with_button(&format!("- {summary}（{state}）"), button) {
+            if !body.push_with_button(&format!("- {summary} — {state}"), button) {
                 omitted += 1;
             }
         }
@@ -228,7 +223,7 @@ pub(crate) fn build_mcp_card(
 
     body.push("**MCP 服务器**");
     if statuses.is_empty() {
-        body.push("当前目录没有配置 MCP 服务器。");
+        body.push("未配置。");
     } else {
         for status in statuses {
             let row = format!("- **{}** · {}", status.name, status_label(status));
@@ -241,9 +236,7 @@ pub(crate) fn build_mcp_card(
         // The element/byte reserve above leaves room for this note; if a
         // future change exhausts it too, the listing is already truncated as
         // far as it can be and dropping the note is the only remaining option.
-        let _ = body.push_tail(&format!(
-            "…列表过长，还有 {omitted} 项未显示；可直接处理上方已列出的项。"
-        ));
+        let _ = body.push_tail(&format!("…还有 {omitted} 项未显示。"));
     }
 
     card_shell("🔌 MCP", "blue", body.elements)
@@ -316,7 +309,16 @@ mod tests {
             }],
         );
         let text = card_text(&card);
-        assert!(text.contains("/work"), "{text}");
+        assert!(text.contains("`/work` · 只读"), "the intro stays concise: {text}");
+        assert!(
+            !text.contains("不会连接/断开"),
+            "the long read-only paragraph is gone: {text}"
+        );
+        assert!(text.contains("**待处理表单**"), "{text}");
+        assert!(
+            text.contains("— 已稍后"),
+            "the row name and state are short: {text}"
+        );
         assert!(text.contains("codegraph") && text.contains("已连接"), "{text}");
         assert!(text.contains("context7"), "{text}");
         assert!(
@@ -377,13 +379,13 @@ mod tests {
             ],
         );
         let text = card_text(&card);
-        assert!(text.contains("已推送") && text.contains("等待推送"), "{text}");
+        assert!(text.contains("已推送") && text.contains("待推送"), "{text}");
         assert!(reopen(&card).is_none(), "only a dismissed form reopens: {card}");
 
         let empty = build_mcp_card(&thread_key, "/work", &[], &[]);
         let text = card_text(&empty);
-        assert!(text.contains("没有配置 MCP 服务器"), "{text}");
-        assert!(text.contains("没有待处理的 Location Form"), "{text}");
+        assert!(text.contains("未配置。"), "{text}");
+        assert!(text.contains("无。"), "{text}");
     }
 
     #[test]
@@ -402,7 +404,7 @@ mod tests {
         let text = card_text(&card);
         assert!(!text.contains("Questions"), "{text}");
         assert!(!text.contains("frm_session"), "{text}");
-        assert!(text.contains("没有待处理的 Location Form"), "{text}");
+        assert!(text.contains("无。"), "{text}");
     }
 
     /// One shared table budget: six servers whose error text each carries a
@@ -446,7 +448,7 @@ mod tests {
             text.matches("```").count() >= 2,
             "tables past the one shared budget are fenced, not native: {text}"
         );
-        assert!(text.contains("列表过长"), "the omitted rows are reported: {text}");
+        assert!(text.contains("还有"), "the omitted rows are reported: {text}");
         assert!(
             reopen(&card).is_some(),
             "a dismissed form's recovery control survives the cap: {text}"

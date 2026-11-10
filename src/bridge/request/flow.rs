@@ -1121,13 +1121,18 @@ impl RequestFlow {
 
     /// The standalone cards whose request has provably left the pending list:
     /// not pending, not answered by cola, and owned by a directory that listed
-    /// successfully. The sweep classifies these cards' sessions together with
-    /// the inline candidates — one status read per session per pass — and then
-    /// hands the list to [`mark_stale_cards`] to repaint.
+    /// **successfully this sweep**. A card whose directory is mapped but whose
+    /// list failed, or whose directory is no longer mapped at all, said
+    /// nothing: it must stay live (and keep its Location Form record/partial
+    /// state) until a sweep that can actually speak for it. The sweep
+    /// classifies these cards' sessions together with the inline candidates —
+    /// one status read per session per pass — and then hands the list to
+    /// [`mark_stale_cards`] to repaint.
     async fn stale_standalone_cards(
         &self,
         requests: &RequestsHandle,
         pending: &std::collections::HashSet<String>,
+        directories: &[String],
         failed_dirs: &std::collections::HashSet<String>,
     ) -> Vec<(String, SentCard)> {
         let answered = requests.answered_requests.lock().await;
@@ -1136,7 +1141,10 @@ impl RequestFlow {
             .await
             .iter()
             .filter(|(rid, card)| {
-                !pending.contains(*rid) && !answered.contains(*rid) && !failed_dirs.contains(&card.directory)
+                !pending.contains(*rid)
+                    && !answered.contains(*rid)
+                    && directories.iter().any(|dir| dir == &card.directory)
+                    && !failed_dirs.contains(&card.directory)
             })
             .map(|(rid, card)| (rid.clone(), card.clone()))
             .collect()
@@ -1437,7 +1445,7 @@ impl RequestFlow {
         // surfaces first, so one sweep reads each session's status at most
         // once, and a sweep with nothing vanished makes no status call at all.
         let stale_cards = self
-            .stale_standalone_cards(&handles.requests, &pending, &failed_dirs)
+            .stale_standalone_cards(&handles.requests, &pending, &directories, &failed_dirs)
             .await;
         let mut candidates: HashMap<String, String> = HashMap::new();
         for (_, card) in &stale_cards {
@@ -3587,9 +3595,9 @@ impl RequestFlow {
             .unwrap_or(false)
             || self.is_location_question(req_id).await;
         let owner = if location_form {
-            crate::backend::types::RequestOwner::Location
+            crate::backend::types::RequestScope::Location
         } else {
-            crate::backend::types::RequestOwner::Session
+            crate::backend::types::RequestScope::Session
         };
         let reply = value.get("reply").and_then(|v| v.as_str()).unwrap_or("reject");
         // The card the click landed on, so its handle can update THAT card

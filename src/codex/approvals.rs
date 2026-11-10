@@ -1327,7 +1327,7 @@ fn question_from_tool_input(input: &ToolInput) -> std::result::Result<QuestionRe
         title: String::new(),
         questions,
         uncollectable: None,
-        owner: crate::backend::types::RequestOwner::Session,
+        scope: crate::backend::types::RequestScope::Session,
         server: None,
         message: None,
     })
@@ -1381,7 +1381,7 @@ fn question_from_elicitation(elicitation: &Elicitation) -> Option<QuestionReques
         questions,
         uncollectable,
         // Codex elicitations are thread-backed: they keep the session path.
-        owner: crate::backend::types::RequestOwner::Session,
+        scope: crate::backend::types::RequestScope::Session,
         server: None,
         message: None,
     })

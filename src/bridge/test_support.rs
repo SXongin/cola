@@ -490,6 +490,10 @@ pub struct RecordingPlatform {
     /// (a parked read still counts). The reap's stamp tests count the reads a
     /// settled key must never repeat (spec #571, ticket #575).
     pub card_view_reads: std::sync::Mutex<Vec<String>>,
+    /// The next N `get_card_view` calls fail with a transport-class error
+    /// (a 5xx/connection loss): a Location Form re-adoption must keep the
+    /// surface rather than read it as deleted.
+    pub fail_card_view_transport_count: std::sync::atomic::AtomicUsize,
     /// Message ids a test deleted: `get_card_view` reports Feishu's
     /// `230002: message not found` for them, the proven-gone signal.
     pub deleted_messages: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -583,6 +587,7 @@ impl RecordingPlatform {
             quoted_messages: std::sync::Mutex::new(std::collections::HashMap::new()),
             card_views: std::sync::Mutex::new(std::collections::HashMap::new()),
             card_view_reads: std::sync::Mutex::new(Vec::new()),
+            fail_card_view_transport_count: std::sync::atomic::AtomicUsize::new(0),
             deleted_messages: std::sync::Mutex::new(std::collections::HashSet::new()),
             pause_call: std::sync::Mutex::new(None),
             reply_ids: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -1364,6 +1369,17 @@ impl feishu::Platform for RecordingPlatform {
         if let Some(gate) = self.take_gate("card_view", message_id) {
             wait_gate(gate).await;
         }
+        let transport_failures = self
+            .fail_card_view_transport_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if transport_failures > 0 {
+            self.fail_card_view_transport_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated card view transport failure",
+            )));
+        }
         if self.deleted_messages.lock().unwrap().contains(message_id) {
             return Err(crate::error::BridgeError::Feishu(
                 "get card view error 230002: message not found".into(),
@@ -1768,6 +1784,9 @@ pub struct MockBackend {
     /// When set, `mcp_server_statuses` fails with a transport-shaped error, so
     /// `/mcp` must answer a clear error instead of an empty card.
     pub fail_mcp_statuses: Arc<std::sync::atomic::AtomicBool>,
+    /// The next N `mcp_server_statuses` calls hang: a /mcp reopen must not
+    /// wait on this OPTIONAL read once the click deadline expires.
+    pub hang_mcp_statuses: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, `list_questions` fails (the `/mcp` form read and the reopen's
     /// live re-read both surface their own clear message).
     pub fail_list_questions: Arc<std::sync::atomic::AtomicBool>,
@@ -2238,6 +2257,7 @@ impl MockBackend {
             questions_by_directory: std::collections::HashMap::new(),
             mcp_statuses: None,
             fail_mcp_statuses: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hang_mcp_statuses: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_list_questions: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reply_question_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             reply_question_keyed_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -3882,6 +3902,7 @@ impl crate::backend::Backend for MockBackend {
         &self,
         directory: Option<&str>,
     ) -> crate::error::Result<Option<Vec<crate::backend::types::McpServerStatus>>> {
+        hang_if_scripted(&self.hang_mcp_statuses).await;
         if self.fail_mcp_statuses.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(crate::error::BridgeError::OpenCode(
                 "simulated MCP status failure".into(),
