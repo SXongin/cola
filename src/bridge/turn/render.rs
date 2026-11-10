@@ -400,11 +400,13 @@ fn source_chunk(
 #[cfg(test)]
 pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &[Part]) -> bool {
     let mut rendered_any = false;
+    acc.reset_read_floor();
     for part in parts {
         if render_part(acc, None, part, None) {
             rendered_any = true;
         }
     }
+    acc.reset_read_floor();
     rendered_any
 }
 
@@ -1632,11 +1634,13 @@ pub(super) fn render_turn_parts(
     bound: Option<usize>,
 ) -> bool {
     acc.capture_turn_anchor(transcript);
+    acc.reset_read_floor();
     // The orphan gap this accumulator owes (spec #561, review #569) renders
     // first, on the first read that can place its cursor: the content was never
     // on a card, while the chain's Rendered Cursor has already advanced past
     // the delivered content that follows it — one frontier cannot express both.
     let gap_rendered = render_pending_gap_once(acc, transcript);
+    acc.reset_read_floor();
     // The seed's live set (spec #561) reconciles on EVERY render read, before
     // the anchor gate below: a seeded call is resolved by call identity against
     // the whole read, so it needs no Turn anchor. In the canonical restart
@@ -1650,6 +1654,7 @@ pub(super) fn render_turn_parts(
     // The live set reconciles on every read — `||` would skip it whenever the
     // gap rendered (spec #561, review #569).
     let mut rendered_any = resolve_seeded_calls(acc, transcript);
+    acc.reset_read_floor();
     rendered_any |= gap_rendered;
     // The Session's compaction facts (ADR-0082) render before the anchor gate,
     // for the same reason the live set does: a compaction is a fact of the
@@ -1659,6 +1664,7 @@ pub(super) fn render_turn_parts(
     // chain's durable delivered frontier ([`rendered_bound`]), so a row an
     // earlier card already showed is never replayed onto this one.
     rendered_any |= render_compactions(acc, transcript, bound);
+    acc.reset_read_floor();
     // The seed (spec #561) resolves against THIS read: its at-or-before-the-
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
@@ -1683,6 +1689,7 @@ pub(super) fn render_turn_parts(
     if let Some(scope) = seed_scope(acc) {
         rendered_any |= render_seed_scope(acc, transcript, &scope, &message_positions, &mut seeded_messages);
     }
+    acc.reset_read_floor();
     let Some(anchor) = acc.turn_anchor().cloned() else {
         return rendered_any;
     };
@@ -1783,6 +1790,7 @@ pub(super) fn render_turn_parts(
         }
         acc.set_message_floor(None);
     }
+    acc.reset_read_floor();
     rendered_any
 }
 
@@ -1833,6 +1841,7 @@ fn render_pending_gap(
     transcript: &SessionTranscript,
     gap: &crate::bridge::chain::PendingGap,
 ) -> bool {
+    acc.reset_read_floor();
     let cursor = &gap.cursor;
     let anchor = &gap.anchor;
     let Some(seed) = state::CursorSeed::for_orphan_resolving(transcript, cursor, anchor) else {
@@ -2024,6 +2033,7 @@ fn render_seed_scope(
     if seed.frontier.is_none() {
         return false;
     }
+    acc.reset_read_floor();
     // When the accumulator OWES the durable gap this scope is the window of
     // (spec #561, review #569), the seed's render IS the gap's render: its
     // entries are tagged so the chain cursor skips them and the gap's own
@@ -2077,6 +2087,7 @@ fn render_seed_scope(
     if gap_scope && rendered {
         acc.mark_gap_rendered();
     }
+    acc.reset_read_floor();
     rendered
 }
 
@@ -2328,6 +2339,7 @@ fn render_seeded_part(
 /// settled card omits it, because no renderer will ever update that `⏳` again.
 fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let mut rendered = false;
+    acc.reset_read_floor();
     // The seeded ids are a SET, so sort them by their read position before
     // placing them: two calls sharing a borrowed key would otherwise allocate
     // in hash order (issue #1022).
@@ -2377,6 +2389,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             acc.retire_seeded_call(&call_id);
         }
     }
+    acc.reset_read_floor();
     rendered
 }
 
@@ -4994,6 +5007,55 @@ Index: /x/src/main.rs
         assert!(
             text.find("✅ 已回答").unwrap() < text.find("作答后的继续").unwrap(),
             "the continuation follows the receipt under skew: {text}"
+        );
+    }
+
+    /// Read order carries across messages: a post-tool text in A1 takes the
+    /// render-order fallback (cola's now), so A2's pre-tool text must not take
+    /// its older `time.created` and sort ABOVE A1's answer (issue #1022).
+    #[test]
+    fn a_later_messages_text_never_sorts_above_an_earlier_messages_answer() {
+        let anchor = 2_000;
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message(
+                "a1",
+                2_100,
+                vec![
+                    tool(
+                        "bash",
+                        "call_1",
+                        ToolStatus::Completed,
+                        Some(2_200),
+                        Some(serde_json::json!({"command": "ls"})),
+                        Some("tool-output"),
+                    ),
+                    text_part("先答"),
+                ],
+            ),
+            message(
+                "a2",
+                2_300,
+                vec![
+                    text_part("后答"),
+                    tool(
+                        "bash",
+                        "call_2",
+                        ToolStatus::Completed,
+                        Some(2_400),
+                        Some(serde_json::json!({"command": "pwd"})),
+                        Some("/work"),
+                    ),
+                ],
+            ),
+        ]);
+        render_new_turn_parts(&mut acc, &transcript);
+        let text = card_text(&acc.build_card_with_info().card);
+        assert!(
+            text.find("先答").unwrap() < text.find("后答").unwrap(),
+            "the later message's text stays below the earlier answer: {text}"
         );
     }
 
