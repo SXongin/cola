@@ -474,12 +474,15 @@ const SURFACING_DRAIN_TIMEOUT_MS: u64 = 5_000;
 /// The asking tool part's server time in a surfacing read (issue #1023): the
 /// newest server timestamp the read carries.
 ///
-/// While a question or permission is pending its turn is blocked, so the tool
-/// call that raised it is the newest part the server wrote — this is that
-/// call's `time.created` in the ordinary case and, generally, a high-water mark
-/// no content the Host could have seen when they clicked exceeds. Everything
-/// the server writes after the click is timestamped above it, which is the only
-/// property the receipt's cut needs.
+/// The INVARIANT is a high-water mark, not a particular part: everything the
+/// read shows was written before the click (the read happens first), so nothing
+/// the Host could have seen exceeds it; and while a question or permission is
+/// pending its turn is blocked, so nothing is produced between the read and the
+/// click either. Content written after the click is therefore server-stamped
+/// above it. In the ordinary case the asking tool call IS the newest part, so
+/// this is that call's `time.created`; a parallel tool call or a queued message
+/// that is newer only raises the mark, which cannot misclassify a post-click
+/// part (it is newer still) — a lower anchor could.
 /// `None` when the read carries no server time at all (the block then keeps the
 /// old receipt behaviour).
 fn asking_anchor(transcript: &crate::backend::SessionTranscript) -> Option<i64> {
@@ -3896,6 +3899,47 @@ mod tests {
             ),
         ]);
         assert_eq!(asking_anchor(&transcript), Some(1_250));
+    }
+
+    /// A newer sibling part raises the mark instead of pinning it to the asking
+    /// call (issue #1023): the anchor is the read's high-water mark, so a
+    /// parallel tool that started later is part of "what the Host could see",
+    /// and no post-click part (newer still) can fall below it.
+    #[test]
+    fn a_newer_parallel_part_raises_the_anchor() {
+        let transcript = SessionTranscript::new(vec![
+            typed_message("u1", MessageRole::User, Some(1_000), vec![text_part("问题")]),
+            typed_message(
+                "a1",
+                MessageRole::Assistant,
+                Some(1_100),
+                vec![
+                    Part::Tool(ToolCall {
+                        identity: ToolIdentity {
+                            name: "question".into(),
+                            call_id: "call_q".into(),
+                        },
+                        status: ToolStatus::Running,
+                        started_at: Some(1_200),
+                        input: None,
+                        metadata: None,
+                        output: Default::default(),
+                    }),
+                    Part::Tool(ToolCall {
+                        identity: ToolIdentity {
+                            name: "bash".into(),
+                            call_id: "call_bash".into(),
+                        },
+                        status: ToolStatus::Completed,
+                        started_at: Some(1_500),
+                        input: None,
+                        metadata: None,
+                        output: Default::default(),
+                    }),
+                ],
+            ),
+        ]);
+        assert_eq!(asking_anchor(&transcript), Some(1_500));
     }
 
     /// A message the wire carried no time for still contributes its parts'

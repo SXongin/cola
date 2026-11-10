@@ -2969,6 +2969,37 @@ impl StreamAccumulator {
     /// nothing and leaves the earlier cuts in force.
     pub(super) fn record_receipt_cut(&mut self, asked_at: i64, key: i64) {
         self.receipt_cuts.push(ReceiptCut { at: asked_at, key });
+        self.refloor_entries_after_cut();
+    }
+
+    /// Move every live timeline entry the server timestamped AFTER the newest
+    /// receipt's ask to the receipt's key (issue #1023). A render poll can
+    /// deliver a post-click continuation in the gap between the backend reply
+    /// and the receipt's own write — the click path returns from the server
+    /// first, and a remote client's answer is only noticed by the next sweep —
+    /// so that content may already sit ABOVE the receipt at its own server key.
+    /// It was written after the click (the request blocks the turn), so it must
+    /// follow the receipt; only entries at or after `render_from` are moved
+    /// (the finalized prefix is already on a sent card), keeping their own
+    /// order after it.
+    fn refloor_entries_after_cut(&mut self) {
+        let Some(cut) = self.receipt_cuts.last().copied() else {
+            return;
+        };
+        let mut moved = Vec::new();
+        let mut idx = self.render_from;
+        while idx < self.timeline.len() {
+            if self.timeline[idx].shown_at.is_some_and(|at| at > cut.at) {
+                moved.push(self.timeline.remove(idx));
+            } else {
+                idx += 1;
+            }
+        }
+        for mut item in moved {
+            item.key = cut.key;
+            self.timeline.push(item);
+        }
+        self.last_key = self.last_key.max(cut.key);
     }
 
     /// The key floor an entry whose own server time is `shown_at` earns from
@@ -8400,6 +8431,20 @@ mod tests {
         assert!(
             card.find("✅ 已回答").unwrap() < card.find("长长长").unwrap(),
             "every chunk stays below the receipt: {card}"
+        );
+
+        // A render poll can deliver the continuation in the gap between the
+        // backend reply and the receipt's write, so it is already placed when
+        // the receipt lands. It must be moved below the receipt, not left
+        // above it at its own (skewed) key.
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(Some(5_000)));
+        acc.push_text_at(Some(5_100), "竞态到达的继续");
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string()));
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("✅ 已回答").unwrap() < card.find("竞态到达的继续").unwrap(),
+            "a continuation placed before the receipt is moved below it: {card}"
         );
     }
 
