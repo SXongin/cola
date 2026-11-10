@@ -1598,10 +1598,16 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     // The toggle's click reserves the mode receipt's position BEFORE its
     // reply; a message rendered while the reply is in flight follows it.
     assert!(
-        Turn::reserve_interaction_cut(&cards, "ses_test", "per_auto")
+        Turn::reserve_interaction_cut_for_session(&cards, "ses_test", "per_auto")
             .await
             .is_some()
     );
+    // A message written between the clicked ask (1_000) and the later ask the
+    // toggle also resolves (2_000): the in-flight cut must already be the
+    // LATEST ask, or this content is floored below the receipt.
+    Turn::set_message_floor(&cards, "ses_test", Some(1_500)).await;
+    Turn::push_text_at(&cards, "ses_test", 1_500, "两次提问之间").await;
+    Turn::set_message_floor(&cards, "ses_test", None).await;
     Turn::set_message_floor(&cards, "ses_test", Some(2_300)).await;
     Turn::push_text_at(&cards, "ses_test", 2_300, "点击后到达的继续").await;
     Turn::set_message_floor(&cards, "ses_test", None).await;
@@ -1616,9 +1622,6 @@ async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
     assert!(resolved.is_some(), "the mode change resolves the blocks");
     // Content written between the two asks predates the click: it stays above
     // the receipt. Content after the later ask follows it.
-    Turn::set_message_floor(&cards, "ses_test", Some(1_500)).await;
-    Turn::push_text_at(&cards, "ses_test", 1_500, "两次提问之间").await;
-    Turn::set_message_floor(&cards, "ses_test", None).await;
     Turn::set_message_floor(&cards, "ses_test", Some(2_500)).await;
     Turn::push_text_at(&cards, "ses_test", 2_500, "自动之后的内容").await;
     Turn::set_message_floor(&cards, "ses_test", None).await;

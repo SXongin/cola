@@ -738,7 +738,7 @@ impl RequestKind for PermissionKind {
                 // The reply below unblocks the turn; reserve the mode receipt's
                 // position first so a message rendered while it is in flight
                 // follows the receipt (issue #1023).
-                let reservation = Turn::reserve_interaction_cut(
+                let reservation = Turn::reserve_interaction_cut_for_session(
                     &handles.cards,
                     host.as_deref().unwrap_or(session_id),
                     req_id,
