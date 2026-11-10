@@ -173,6 +173,7 @@ pub trait RequestKind: Send + Sync {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool;
 
     /// [`Self::add_inline`] for a caller that already holds the host's card
@@ -475,12 +476,13 @@ impl RequestKind for PermissionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool {
         let PendingRequest::Permission(p) = req else {
             return false;
         };
         let companion = flow.companion_for(req);
-        Turn::add_permission_with_companion(cards, host, p, dir, companion).await
+        Turn::add_permission_with_companion(cards, host, p, dir, companion, asked_at).await
     }
 
     async fn add_inline_locked(
@@ -1932,6 +1934,7 @@ impl RequestKind for QuestionKind {
         host: &str,
         req: &PendingRequest,
         dir: &str,
+        asked_at: Option<i64>,
     ) -> bool {
         let PendingRequest::Question(q) = req else {
             return false;
@@ -1942,7 +1945,7 @@ impl RequestKind for QuestionKind {
             .with_question_state(&q.id, |state| state.paint())
             .await
             .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
-        Turn::add_question(cards, host, q, dir, &paint).await
+        Turn::add_question(cards, host, q, dir, &paint, asked_at).await
     }
 
     async fn add_inline_locked(

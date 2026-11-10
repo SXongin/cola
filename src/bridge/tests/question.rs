@@ -1449,7 +1449,9 @@ async fn a_timed_out_surfacing_drain_still_surfaces_the_question() {
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
     seed_live_card(&app, "ses_test", "om_live").await;
-    backend.hang_transcript_for("ses_test").await;
+    // Every session read hangs: the host walk times out, and the drain's own
+    // render pass (which refreshes the title) runs into the bound too.
+    backend.hang_session_info_reads(usize::MAX);
 
     tokio::spawn({
         let app = app.clone();
@@ -1465,12 +1467,78 @@ async fn a_timed_out_surfacing_drain_still_surfaces_the_question() {
             let _ = app.question.poll_loop(&app.flow_handles()).await;
         }
     });
-    wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep").await;
+    // A wedged drain that is NOT bounded would never complete the pass.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_first_poll_pass(&app.question.poll_passes, "the request sweep"),
+    )
+    .await
+    .expect("the sweep must complete despite the wedged render pass");
 
     assert_eq!(
         Turn::live_questions(&app.cards_handle(), "ses_test").await.len(),
         1,
         "a wedged drain must not block the request"
+    );
+}
+
+/// The mode change (Auto-Accept) resolves blocks with ONE receipt; that
+/// receipt must still carry a server-time cut (issue #1023), so content the
+/// server writes after the click stays below it.
+#[tokio::test]
+async fn a_mode_change_receipt_cuts_at_the_latest_ask() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let cards = app.cards_handle();
+    let request = crate::backend::types::QuestionRequest {
+        id: "que_auto".into(),
+        session_id: "ses_test".into(),
+        questions: vec![crate::backend::types::QuestionInfo {
+            question: "继续？".into(),
+            header: "下一步".into(),
+            options: vec![crate::backend::types::QuestionOption {
+                label: "继续".into(),
+                ..Default::default()
+            }],
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(
+        Turn::add_question(
+            &cards,
+            "ses_test",
+            &request,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+            Some(1_000),
+        )
+        .await
+    );
+    Turn::flush_card(&cards, "ses_test").await;
+
+    let resolved = Turn::resolve_interactions(
+        &cards,
+        "ses_test",
+        &["que_auto".into()],
+        &crate::bridge::turn::InlineResidue::Single("♻️ 已设为自动允许"),
+    )
+    .await;
+    assert!(resolved.is_some(), "the mode change resolves the block");
+    Turn::push_text_at(&cards, "ses_test", 1_100, "自动之后的内容").await;
+    Turn::flush_card(&cards, "ses_test").await;
+
+    let text = card_text(&final_card(&platform).await);
+    assert!(
+        text.find("♻️ 已设为自动允许").unwrap() < text.find("自动之后的内容").unwrap(),
+        "post-click content stays below the mode-change receipt: {text}"
     );
 }
 
@@ -2475,6 +2543,7 @@ async fn an_inline_switch_repaints_the_clicked_card_and_moves_the_block() {
             open: 0,
             drafts: vec!["打到一半".to_string(), String::new()],
         },
+        None,
     )
     .await;
     Turn::flush_card(&app.cards_handle(), "ses_q").await;

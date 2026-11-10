@@ -36,6 +36,18 @@ impl Turn {
             .is_some_and(|c| c.acc.interaction(request_id).is_some())
     }
 
+    /// The asking tool's server time carried by whichever card still holds
+    /// `request_id`'s block — the re-host's anchor (issue #1023). A block that
+    /// moves to a new card keeps its receipt cut; `None` when no card carries
+    /// the block (it was never surfaced, or its anchor was not captured).
+    pub(crate) async fn interaction_asked_at(cards: &CardsHandle, request_id: &str) -> Option<i64> {
+        cards.cards.lock().await.values().find_map(|card| {
+            card.acc
+                .interaction(request_id)
+                .and_then(|block| block.asked_at())
+        })
+    }
+
     /// The Instant Reminder source facts of a cola Turn's live card (ADR-0043).
     /// `None` when no cola turn registered one — an external turn, or a request
     /// pending across a restart.
@@ -65,7 +77,7 @@ impl Turn {
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
     ) -> bool {
-        Self::add_permission_with_companion(cards, session_id, p, directory, None).await
+        Self::add_permission_with_companion(cards, session_id, p, directory, None, None).await
     }
 
     /// [`Self::add_permission`] for an over-budget request whose full target a
@@ -77,6 +89,7 @@ impl Turn {
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
         companion: Option<crate::bridge::surfaces::CompanionDelivery>,
+        asked_at: Option<i64>,
     ) -> bool {
         // Inserting a block is a card-surface mutation that must not interleave
         // with a flush: a background write that already passed its typed-answer
@@ -85,7 +98,7 @@ impl Turn {
         // #917). The write lock is the flush's own, so the pair is ordered.
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        Self::add_permission_with_companion_locked(cards, session_id, p, directory, companion, None).await
+        Self::add_permission_with_companion_locked(cards, session_id, p, directory, companion, asked_at).await
     }
 
     /// [`Self::add_permission_with_companion`] for a caller that already holds
@@ -129,12 +142,13 @@ impl Turn {
         q: &crate::backend::types::QuestionRequest,
         directory: &str,
         paint: &crate::bridge::question::QuestionPaint,
+        asked_at: Option<i64>,
     ) -> bool {
         // Same lock as `add_permission`: the block's arrival and the flow's
         // flush are one ordered step against every card write (issue #917).
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        Self::add_question_locked(cards, session_id, q, directory, paint, None).await
+        Self::add_question_locked(cards, session_id, q, directory, paint, asked_at).await
     }
 
     /// [`Self::add_question`] for a caller that already holds the Session's
@@ -288,19 +302,31 @@ impl Turn {
         let mut live = cards.cards.lock().await;
         let acc = &mut live.get_mut(session_id)?.acc;
         let mut resolved_here = false;
+        // The latest ask among the blocks a mode change resolves: its receipt
+        // sits after every one of them, so content written after this click is
+        // after that ask too (issue #1023).
+        let mut mode_asked_at: Option<i64> = None;
         for id in ids {
             let resolved = match residue {
                 InlineResidue::PerBlock(line) => {
                     acc.resolve_interaction(id, |block| line(&block.receipt_target()))
                 }
-                InlineResidue::Single(_) => acc.dismiss_interaction(id),
+                InlineResidue::Single(_) => {
+                    if let Some(at) = acc.interaction(id).and_then(|block| block.asked_at()) {
+                        mode_asked_at = Some(mode_asked_at.map_or(at, |seen: i64| seen.max(at)));
+                    }
+                    acc.dismiss_interaction(id)
+                }
             };
             resolved_here |= resolved;
         }
         if let InlineResidue::Single(text) = residue
             && resolved_here
         {
-            acc.push_receipt(text);
+            let key = acc.push_receipt(text);
+            if let Some(asked_at) = mode_asked_at {
+                acc.record_receipt_cut(asked_at, key);
+            }
         }
         resolved_here.then(|| acc.header_title_and_template())
     }

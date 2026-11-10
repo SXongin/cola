@@ -5412,6 +5412,7 @@ async fn seed_inline_request(
                 q,
                 directory,
                 &crate::bridge::question::QuestionPaint::blank(q.questions.len()),
+                None,
             )
             .await;
         }

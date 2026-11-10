@@ -2659,7 +2659,7 @@ async fn a_card_read_keeps_a_terminal_card_with_a_live_block_answerable() {
                 ..Default::default()
             };
             let paint = crate::bridge::question::QuestionPaint::blank(question.questions.len());
-            assert!(Turn::add_question(&cards, "ses_test", &question, "/work", &paint).await);
+            assert!(Turn::add_question(&cards, "ses_test", &question, "/work", &paint, None).await);
         }
         Turn::set_card_state(&cards, "ses_test", CardState::Error).await;
 

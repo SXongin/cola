@@ -332,13 +332,23 @@ pass stands down and the explanation is held until after the answer (issue
 #1023): the Host is asked to choose blind.
 
 `RequestFlow::surface` therefore **drains the session once before the inline
-block lands**: one bounded transcript read, one bounded `Turn::render_and_flush`,
+block lands**: one bounded transcript read, one bounded **render-only** pass,
 then the block insert and its flush — so the text the Host needs is on the card
 when the question appears. The drain runs only for the request's **own** session
-with a live card; an ancestor host render no part of a child's transcript, and a
-standalone card has no card to drain. It is best-effort by construction: a
+with a live card; an ancestor host renders no part of a child's transcript, and
+a standalone card has no card to drain. It is best-effort by construction: a
 failed or timed-out read changes nothing, the request surfaces exactly as before
 without the anchor, and it costs at most one read per first surfacing.
+
+The render-only split is deliberate. The **read** is bounded (5 s, or the flow's
+list timeout when shorter), but the **write** it owes is not: the pass renders
+into the accumulator and the flow flushes afterwards, outside that bound,
+because a card create carries no idempotency key and abandoning one could
+duplicate it (ADR-0100). The progress mark tells the two apart — a pass the
+timeout abandoned after applying content still owes its flush, a pass that found
+nothing new owes no write at all. The flush re-checks the live-form freeze under
+the write lock, so a question that landed since the apply still refuses the
+repaint (#917) and the applied content rides the form's own resolution flush.
 
 The same read yields the **asking tool part's server time** — while a request is
 pending its turn is blocked, so the `question` / permission tool call is the
@@ -346,9 +356,18 @@ newest server activity in the read. That time travels on the block
 (`PendingQuestion::asked_at` / `PendingPermission::asked_at`) and, when the block
 resolves, becomes the receipt's **server-time cut** (`ReceiptCut`): the receipt
 itself keeps its `next_order` key — it must follow everything the Host could see
-— and any later read's entry whose own server time is *after* the cut is floored
+— and any later read's entry whose own server time is *after* the ask is floored
 at that key. Both halves are on the server's clock, so cola's wall clock cannot
 decide the comparison: a part server-timestamped after the click belongs below
-the receipt (rule 4), even when the server's clock runs behind cola's. A block
-that reached the card without a surfacing read (a re-host, a busy-follow seed, a
-restart re-adoption) carries no anchor and keeps the previous receipt behaviour.
+the receipt (rule 4), even when the server's clock runs behind cola's.
+
+Every anchored receipt keeps its cut rather than only the newest one: requests
+can be asked in one order and answered in another, and content written between
+the asks must clear the receipt of the *last* click too. The floor is the newest
+receipt key among the asks that precede the content's server time — a staircase,
+not a single "latest" cut. A block that reached the card without a surfacing read
+(a busy-follow seed, a restart re-adoption) carries no anchor and keeps the
+previous receipt behaviour; a **re-hosted** block keeps the anchor it was first
+surfaced with (the anchor belongs to the request, not to the card it sits on).
+A mode change (Auto-Accept) that resolves several blocks leaves one receipt and
+cuts at the latest ask among them.

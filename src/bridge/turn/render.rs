@@ -2384,13 +2384,17 @@ enum RenderMode {
     /// A settling drain tick (#604): render only — no anchor persist, no
     /// flush. Finalization's own render on the same read owns the card write,
     /// so the settle tick adds no second durable write and no out-of-order
-    /// flush (a pending split still serves on finalization, as before).
+    /// flush (a pending split still serves on finalization, as before). It also
+    /// skips the live-form freeze: finalization's own write follows on this
+    /// read, and the freeze exists to protect a write, not the apply.
     Settling,
     /// A surfacing drain (issue #1023): render the read so a request's
-    /// pre-question text lands BEFORE the block freezes the card, but write
-    /// only when the pass rendered content. The request sweep runs this on
-    /// every first surfacing; a header/footer-only delta there is not worth a
-    /// repaint (and would wake the card for a block that lands right after).
+    /// pre-question text lands BEFORE the block freezes the card, but never
+    /// write here. The caller flushes after its own timeout (ADR-0100: a card
+    /// create carries no idempotency key, so it must not be abandoned by a
+    /// timeout), re-checking the live-form freeze under the write lock. The
+    /// apply still honours that freeze, so nothing is consumed for a card that
+    /// would refuse the write.
     Draining,
 }
 
@@ -2402,14 +2406,16 @@ impl RenderMode {
     }
 
     /// Whether the pass may issue a card write; a settling pass leaves it to
-    /// finalization.
+    /// finalization, a draining pass to its caller's bounded-then-flushed step.
     fn flushes(self) -> bool {
-        !matches!(self, Self::Settling)
+        matches!(self, Self::Streaming)
     }
 
-    /// Whether only rendered content may owe the write (the surfacing drain).
-    fn content_only(self) -> bool {
-        matches!(self, Self::Draining)
+    /// Whether the pass takes the card write lock and honours the live-form
+    /// freeze before applying its read (issue #917). Only a settling pass is
+    /// exempt: finalization writes on the same read and owns the whole step.
+    fn guards_forms(self) -> bool {
+        !matches!(self, Self::Settling)
     }
 }
 
@@ -2473,9 +2479,9 @@ pub(super) async fn render_and_flush(
 
 /// [`render_and_flush`] for the request sweep's surfacing drain (issue #1023):
 /// render the read into the accumulator BEFORE a request block freezes the
-/// card, and write only when the pass rendered content. The drain's job is the
-/// text the Host must see before answering; header/footer churn alone is not
-/// worth a repaint there.
+/// card, writing nothing itself. The caller bounds this pass and then flushes
+/// with [`Turn::flush_card_unless_typed_answer`] outside that bound — a card
+/// create must never be abandoned by a timeout (ADR-0100).
 pub(super) async fn render_and_flush_draining(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
@@ -2629,7 +2635,10 @@ async fn render_and_flush_inner(
     // The guard is held through the apply AND the build below: it is the
     // write lock a question's insertion and the form's own flush take, so a
     // form cannot appear between "no form on the card" and this pass's build.
-    let write_lock = if mode.flushes() {
+    // A draining pass (issue #1023) takes the lock for the same check+apply but
+    // writes nothing; its caller's flush re-checks the freeze under the lock,
+    // so a form that lands in between still refuses the write.
+    let write_lock = if mode.guards_forms() {
         Some(cards.write_lock(session_id).await)
     } else {
         None
@@ -2638,7 +2647,7 @@ async fn render_and_flush_inner(
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
-    if mode.flushes()
+    if mode.guards_forms()
         && cards
             .cards
             .lock()
@@ -2721,20 +2730,13 @@ async fn render_and_flush_inner(
         }
         None => (super::state::LedgerChange::default(), false),
     };
-    // A surfacing drain writes for content only (issue #1023): it exists to
-    // put the request's pre-question parts on the card, not to carry the
-    // header's tick or the footer's context figure.
-    let owed = if mode.content_only() {
-        changed || file_changed
-    } else {
-        changed
-            || file_changed
-            || header_changed
-            || context_changed
-            || ledger.owes()
-            || liveness_changed
-            || entries_changed
-    };
+    let owed = changed
+        || file_changed
+        || header_changed
+        || context_changed
+        || ledger.owes()
+        || liveness_changed
+        || entries_changed;
     let flush = if !mode.flushes() {
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
@@ -9346,6 +9348,7 @@ Index: /x/src/main.rs
             &request,
             "/work",
             &crate::bridge::question::QuestionPaint::blank(1),
+            None,
         )
         .await;
         Turn::flush_card(&cards, sid).await;
@@ -9418,6 +9421,7 @@ Index: /x/src/main.rs
             &request,
             "/work",
             &crate::bridge::question::QuestionPaint::blank(1),
+            None,
         )
         .await;
         Turn::flush_card(&cards, sid).await;
@@ -9577,6 +9581,7 @@ Index: /x/src/main.rs
             &request,
             "/work",
             &crate::bridge::question::QuestionPaint::blank(1),
+            None,
         )
         .await;
         Turn::flush_card(&cards, sid).await;
