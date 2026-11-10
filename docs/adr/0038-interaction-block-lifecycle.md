@@ -349,6 +349,15 @@ mis-ordered:
 - A part already on the timeline **keeps the key it was placed at** — a rewrite
   captures the old key before it drops the run — because a later read's floor can
   differ, and re-keying would split a growing part into two entries.
+- **Across messages, read order is monotonic.** Each walk floors a message's
+  parts at the highest key a part from an EARLIER transcript message already
+  holds (`read_floor_before`/`set_read_floor`). A post-tool part that took
+  `next_order` therefore cannot be overtaken by a later message whose own
+  server time is older, on any read pass — including the pass that dedupes the
+  earlier message. Inside one message the transcript part order wins: the floor
+  is the earlier messages' high-water mark, never the current message's own
+  parts, so a timed part keeps its server position and a late pre-tool part
+  still lands before the tool it precedes.
 
 `shown_at` — what a panel header displays and what the Rendered Cursor frontier
 records as the part's start — is unchanged: it still carries only the time the
