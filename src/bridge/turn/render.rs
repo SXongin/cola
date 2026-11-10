@@ -1693,7 +1693,6 @@ pub(super) fn render_turn_parts(
     let Some(anchor) = acc.turn_anchor().cloned() else {
         return rendered_any;
     };
-    acc.seed_read_floor();
     // The Turn's change index (#477) is NOT read here: it is resolved once at
     // the Turn's settle from the artifact's own source (ADR-0087), and the
     // card renders no estimate while the Turn runs (issue #830). An anchorless
@@ -1706,6 +1705,9 @@ pub(super) fn render_turn_parts(
     // committing it here or after the parts render is one card.
     let seed = acc.seed().cloned();
     let turn = transcript.turn_for_user(&anchor);
+    let turn_ids: std::collections::HashSet<MessageId> =
+        turn.messages.iter().map(|message| message.id.clone()).collect();
+    acc.seed_read_floor_where(|id| turn_ids.contains(id));
     // A card rendering an unanswered free-text field must not consume this
     // background update: otherwise the first pass removes it from "new" and
     // the post-answer pass has nothing left to show (#917 / card-repaints).
@@ -1843,6 +1845,13 @@ fn render_pending_gap(
     gap: &crate::bridge::chain::PendingGap,
 ) -> bool {
     acc.reset_read_floor();
+    let scope_ids: std::collections::HashSet<MessageId> = transcript
+        .turn_for_user(&gap.anchor)
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect();
+    acc.seed_read_floor_where(|id| scope_ids.contains(id));
     let cursor = &gap.cursor;
     let anchor = &gap.anchor;
     let Some(seed) = state::CursorSeed::for_orphan_resolving(transcript, cursor, anchor) else {
@@ -2035,6 +2044,13 @@ fn render_seed_scope(
         return false;
     }
     acc.reset_read_floor();
+    let seed_scope_ids: std::collections::HashSet<MessageId> = transcript
+        .turn_for_user(scope)
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect();
+    acc.seed_read_floor_where(|id| seed_scope_ids.contains(id));
     // When the accumulator OWES the durable gap this scope is the window of
     // (spec #561, review #569), the seed's render IS the gap's render: its
     // entries are tagged so the chain cursor skips them and the gap's own
