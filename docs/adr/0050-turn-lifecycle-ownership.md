@@ -1,6 +1,6 @@
 # Turn lifecycle ownership: a deep module behind narrow handles
 
-> **Amended by ADR-0104**: the Timeline's entry state moves to
+> **Amended by ADR-0104**: the Timeline's entry state and types move to
 > `turn/timeline.rs` — `TimelineItem`, `TimelineKind`, `PartSource`, `Placement`,
 > the floor/cut value types, the message and read floors, `render_from`, the
 > sealed-entry set, merge-by-part lookup, key minting and the receipt-cut
