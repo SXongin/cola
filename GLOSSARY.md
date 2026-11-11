@@ -303,6 +303,14 @@ the message takeover seeds the same delta onto the fresh Turn's card (ADR-0071).
 _Avoid_: Render watermark (the name of the option ADR-0071 reopened), **Sync
 Watermark** (user messages), **Wake Watermark** (Wakes)
 
+**Timeline**:
+The ordered entries one card body is built from, and the one owner of where an entry lands: the live text/reasoning/tool entries in transcript order, the **Interaction Receipt** cuts and their staircase, the per-message and per-read floors, the live-slice boundary, the sealed-entry set, and the identity (`seq`) an entry keeps when a live **Tool Panel** settles into it. A walk places transcript parts into it through a message scope, so the floor protocol has no caller-side half to forget. It is handed a read order and part facts, never a `SessionTranscript`. Not a **Card Chain** and not a card: a card body may be one continuation slice of the chain, and the chain's durable frontier is the **Rendered Cursor**.
+_Avoid_: Card Timeline (it is `turn/timeline.rs`; the card renders it), entry list (it is ordered, and the ordering rule is the point), element list (that is the Feishu card JSON).
+
+**Placement**:
+The value a **Timeline** walk produces for one transcript part: the entry key it sorts at, the merge identity that keeps a later chunk in the same entry, and the server clock the card shows. It is what a push accepts, so a caller no longer passes a bare `i64` order key beside a bare `i64` display time. Distinct from a **Rendered Cursor** position: a Placement says where content goes on the body being built; the Cursor says how far a delivered body has got.
+_Avoid_: key (one field of it), order (a field, and the name of the rule), slot (a physical position, not the identity-bearing value).
+
 **Session Sync** (会话同步):
 The Bridge flow that keeps a thread's **Active Session**'s card chain current without a user message: it notifies **External Messages**, refreshes a waiting card's ledger and renders **Wakes** — resuming a yielded card in place for a shell/subagent completion, a continuation card for a genuine restart/interrupt resumption, and the neutral **Residual Card** for a Wake-less late tail (ADR-0074) — and catches content its card missed (ADR-0059, ADR-0066). The successor of the external-message sync; still scoped to the thread's active Session (ADR-0017).
 _Avoid_: External poller (the old name), background watcher
