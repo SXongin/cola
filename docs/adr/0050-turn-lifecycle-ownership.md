@@ -1,5 +1,10 @@
 # Turn lifecycle ownership: a deep module behind narrow handles
 
+> **Amended by ADR-0104**: the Timeline's entry types (`TimelineItem`,
+> `TimelineKind`, `PartSource`, the floor/cut values) move to
+> `turn/timeline.rs`. The Turn boundary this ADR records is unchanged — the
+> accumulator, the flush and the render poll stay internal to the Turn module.
+
 The second architecture deepening (spec #298) gave the Turn one home. Before
 A2, one prompt's lifecycle ran through the coordinator, `turn.rs`, a separate
 `render.rs` and the streaming accumulator, and the two halves of a turn met

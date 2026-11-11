@@ -2,6 +2,10 @@
 
 > **Names the deepening before it lands** (the ADR-0079 pattern). The landing
 > amendment records the finished module and the tickets that landed it.
+>
+> **Amends ADR-0050**: the Timeline's entry types move to `turn/timeline.rs`.
+> Only the value types' home changes — the Turn boundary (the accumulator, the
+> flush and the render poll internal to the module) is unchanged.
 
 Where a card entry lands has no owner. The rule is written three times, its
 protocol is re-armed by hand in four walks, and its inputs cross the seam as
@@ -18,8 +22,9 @@ bare `i64`s.
   (`turn/render.rs:1631`), `render_pending_gap` (`:1847`), `render_seed_scope`
   (`:2027`) and `resolve_seeded_calls` (`:2354`) each write the sequence
   `set_message_floor` → `read_floor_before` → `set_read_floor` … →
-  `set_message_floor(None)`, and `render.rs` calls `reset_read_floor()` twelve
-  times. `render_compactions` (`:2114`) writes a third of it. A missed reset is
+  `set_message_floor(None)`, and `render.rs` calls `reset_read_floor()` thirteen
+  times (eleven in production, two in the test-only `render_parts`).
+  `render_compactions` (`:2114`) writes a third of it. A missed reset is
   invisible until a live card mis-sorts.
 - **The inputs travel as bare integers.** Every push takes an order key and a
   display clock side by side:
@@ -49,15 +54,23 @@ content into them.**
 
 - **The interface is a walk.** `timeline.walk(&read_order)` yields a walk;
   `walk.message(created, id)` yields a message scope; the scope's `place(part
-  facts) -> Placement` and `push(placement, chunk)` are the only way content
-  enters. The message scope's `Drop` clears the message floor and the walk's
-  `Drop` clears the read floor, so the half-written protocol that produced the
-  fixes above is no longer representable.
+  facts) -> Placement` and `push(placement, chunk)` are the only way *transcript*
+  content enters. The message scope's `Drop` clears the message floor and the
+  walk's `Drop` clears the read floor, so the half-written protocol that produced
+  the fixes above is no longer representable.
+- **Synthetic entries have their own admission.** An Interaction Receipt, a
+  compaction row, a ledger entry and the External Message's lead are
+  session-scoped, not read-order content. They enter through
+  `Timeline::synthetic(kind, at)`, keyed at their own server time (or
+  `next_order()` when they carry none), and never take a message or read floor —
+  the distinction `insert_item` draws today with `is_turn_part &&
+  source.is_some()`. A synthetic entry never joins a walk, so it can neither
+  inherit nor move a floor.
 - **`Placement` is the only push input.** It carries the entry key, the merge
   identity (`PartSource`) and the server clock the card shows. Bare order keys
   stop crossing the seam; the five-layer push wrappers collapse.
-- **What the module owns.** The entry list (`TimelineItem`), the floors, the
-  Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
+- **What the module owns.** The Timeline's entries (`TimelineItem`), the floors,
+  the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
   entry identity (`seq`, including the seq a live tool panel pins when it
   settles, ADR-0045).
