@@ -33,9 +33,10 @@ bare `i64`s.
   `part_order_times`. Five wrapper layers (`push_text` → `push_text_at` →
   `push_text_from` → `push_text_lead` → `push_text_at_key`) exist to default one
   of those parameters.
-- **The cost is measurable.** 111 of the 2,268 commits in the three months to
-  2026-11-12 mention order, floor, receipt, placement, clamp or seq, and a run
-  of consecutive `fix(bridge)` commits is nothing but placement repairs
+- **The cost is measurable.** 113 of the 2,274 commit subjects in the three
+  months to 2026-11-12 match `order|floor|receipt|place|clamp|seq`
+  (`git log --oneline --since=2026-08-12 --until=2026-11-12 | grep -ciE …`), and
+  a run of consecutive `fix(bridge)` commits is nothing but placement repairs
   ("keep read order across messages in one walk", "clamp the order floor and pin
   live panel keys", "keep a clamped entry's identity seq intact"). ADR-0038
   documents the receipt-cut semantics in prose; no module owns the protocol.
@@ -68,29 +69,35 @@ content into them.**
   the one that takes the Interaction Receipt cut for its message time — the floor
   `render_compactions` sets around it today (ADR-0038, issue #1023); the receipt,
   the ledger entry and the lead are placed outside any floor window today and
-  keep that. `row` is the entry's merge identity: a compaction row carries its
-  `PartSource` so a terminal fact updates the running row in place instead of
-  appending a second one; the other three pass none and append.
-- **`Placement` is the only push input.** It carries the entry key, the merge
-  identity (`PartSource`) and the server clock the card shows. Bare order keys
-  stop crossing the seam; the five-layer push wrappers collapse.
-- **The rewrite path is the Timeline's.** `Timeline::replace(placement, kind,
-  source, content)` serves a part the server re-sent with different content: the
-  Timeline prefers the key the part's existing entry already holds (else the
-  placement's key), drops every entry of that `PartSource` across the boundary
-  while keeping `render_from` on the same logical position, and inserts the new
-  run.
+  keep that. The kind decides the display clock: an Interaction Receipt shows
+  none, while a compaction row, a ledger entry and the External Message's lead
+  show their server time. `row` is the entry's merge identity: a compaction row
+  carries its `PartSource` so a terminal fact updates the running row in place
+  instead of appending a second one; the other three pass none and append.
+- **A `Placement` is the only way a push carries a position.** It carries the
+  entry key, the merge identity (`PartSource`) and the server clock the card
+  shows. Its fields are private to the Timeline with no public constructor, so
+  only `place` (and the synthetic admission above) can produce one, and a push
+  cannot be handed a hand-built placement. Bare order keys stop crossing the
+  seam; the five-layer push wrappers collapse.
+- **The rewrite path is the Timeline's.** `Timeline::replace(placement, source,
+  kind)` serves a part the server re-sent with different content: the `kind`
+  carries the new text, the Timeline prefers the key the part's existing entry
+  already holds (else the placement's key), drops every entry of that
+  `PartSource` across the boundary while keeping `render_from` on the same
+  logical position, and inserts the new run.
 - **What the module owns.** The Timeline's entries (`TimelineItem`), the floors,
   the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
   entry identity (`seq`, including the seq a live tool panel pins when it
   settles, ADR-0045).
 - **What does not move.** The live (unsettled) tool tail stays in the
-  accumulator, which holds the `Placement` the part was first seen with (key,
-  merge identity, shown clock) and asks the Timeline for the `seq` it pins; when
-  the panel settles after the message scope drops, it enters with that stored
-  `Placement`, so a tool first seen in a post-click message keeps its key and
-  floor. Content-keyed dedup and the rewritten part's prefix digest stay in the
+  accumulator as a provisional `Placement` plus the `seq` it pins. Its key is
+  the allocation made at first sighting and, while the panel is tail-only, a
+  later real `started_at` replaces that key — ADR-0045's rule, which this ADR
+  keeps rather than overrides — so a pending call settles where it started, not
+  where it was first seen. Once settled and placed, its key is never replaced.
+  Content-keyed dedup and the rewritten part's prefix digest stay in the
   accumulator; the Timeline owns the entry-run replace defined above. The
   `request_id → ReservedReceipt` map stays with the interaction state while the
   Timeline owns the cut staircase and mints a reservation's keys. The **Rendered
@@ -100,9 +107,10 @@ content into them.**
   cursorless fallback and every current ordering test are unchanged. The
   timeline tests move beside the module; the guards gain invariant tests (a
   message scope always clears its floor, a walk always resets, a rewritten run
-  keeps the boundary, a placed part keeps its key, a post-click compaction row
-  still floors at the receipt, and a repeated compaction fact updates the row it
-  already has).
+  keeps the boundary, a placed part keeps its key, a pending tool that later
+  reports its start time settles at that time per ADR-0045, a post-click
+  compaction row still floors at the receipt, and a repeated compaction fact
+  updates the row it already has).
 
 ## Consequences
 
