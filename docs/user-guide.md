@@ -443,28 +443,37 @@ runtimes over one store: cola is one connection and the desktop must be the
 other. This is the Codex shape of [Multi-client sync](#multi-client-sync).
 
 - **Windows.** The desktop starts its own embedded `codex app-server` over
-  stdio. Bridge it to the app-server daemon: forward a loopback TCP port to
-  `$CODEX_HOME\app-server-control\app-server-control.sock` and launch the app
-  with `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`. The desktop then has no
-  `codex` child process and holds one connection to that port.
-- **macOS.** Launch the desktop with
+  stdio. Keep cola attach-only (`start_server = "never"`) so it never raises a
+  second daemon, forward a loopback TCP port to
+  `$CODEX_HOME\app-server-control\app-server-control.sock` (the reference
+  relay, or `socat`), and launch the app with
+  `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`. The variable must be in the
+  app's environment before it starts: a normal Start-menu launch does not
+  inherit it, so use a controlled launcher. The desktop then has no `codex`
+  child process and holds one connection to that port. #986 carries the
+  reference bridge and launcher.
+- **macOS (experimental, unverified).** Launch the desktop with
   `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`; when an app-server daemon is running,
   the app connects to its control socket directly instead of starting the
   embedded runtime. `launchctl setenv` applies to apps started afterwards, so
-  quit the desktop completely (helpers included) and reopen it.
+  quit the desktop completely (helpers included) and reopen it. The switch is
+  decoded from the 26.1103 bundle, not yet exercised on a Mac.
 - **Verify.** `cola doctor` reports the daemon, the desktop has no
   `codex ... app-server` child, and cola logs `attached to the codex
   app-server daemon` for the same socket.
 
-Both environment variables are undocumented and may change (#986 records the
-evidence); without one, the desktop falls back to the embedded server and the
-writer lock keeps the second client read-only. A transient `already has an
-active writer` while the other side is mid-turn is expected and clears when it
-finishes. `/switch forget` (or quitting cola) releases cola's subscription, and
-Codex unloads the thread after `thread_unload_delay_secs` (default 60).
+**Limits.** Bind the bridge to loopback only: it has no authentication of its
+own, so never expose the port on a network interface. Codex still allows one
+active writer per thread — two clients can watch a thread and take turns
+writing, but they cannot both drive the same turn. The lock belongs to the
+thread, not to a turn: `already has an active writer` clears when the owning
+client releases the thread (it closes the conversation or quits), not when its
+turn ends. `/switch forget` releases cola's subscription, but the daemon
+unloads the thread — and drops the lock — only once no client holds it, and the
+release merely starts `thread_unload_delay_secs` (60 s by default; ADR-0096).
 
-**Status.** The Windows bridge is exercised; the macOS local-daemon switch is
-decoded from the desktop bundle, not yet verified on a Mac.
+Both environment variables are undocumented and may change; #986 tracks the
+evidence and the current status.
 
 ### `[bridge]` — all optional
 
