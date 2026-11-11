@@ -441,7 +441,7 @@ the thread — it just cannot type into it.
 Sharing therefore needs **one app-server process with two connections**, not two
 runtimes over one store: cola is one connection and the desktop must be the
 other. This is the Codex shape of [Multi-client sync](#multi-client-sync).
-Within that one process the connections are peers: a pending approval is
+Within that one process the connections are peers: a pending Permission is
 broadcast to subscribers and either may answer it, and a `turn/start` or
 `turn/steer` from the second client joins the active turn (ADR-0090).
 
@@ -453,15 +453,17 @@ broadcast to subscribers and either may answer it, and a `turn/start` or
   relay, or `socat`) and launch the app with
   `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`. The variable must be in the
   app's environment before it starts: a normal Start-menu launch does not
-  inherit it, so use a controlled launcher. The desktop then has no `codex`
-  child process and holds one connection to that port. #986 carries the
-  reference relay, the launcher and the unsupported status.
-- **macOS (experimental, unverified).** Launch the desktop with
-  `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`; when an app-server daemon is running,
-  the app connects to its control socket directly instead of starting the
-  embedded runtime. `launchctl setenv` applies to apps started afterwards, so
-  quit the desktop completely (helpers included) and reopen it. The switch is
-  decoded from the 26.1103 bundle, not yet exercised on a Mac.
+  inherit it, so use a controlled launcher. The desktop then has no
+  `codex ... app-server` child process and holds one connection to that port.
+  #986 carries the reference relay, the launcher and the unsupported status.
+- **macOS (experimental, unverified).** With the app-server daemon already
+  running and cola attach-only (`start_server = "never"`), launch the desktop
+  with `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`:
+  `launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON 1`, then quit the desktop
+  completely (helpers included) and reopen it — `launchctl setenv` applies to
+  apps started afterwards. The app then connects to the daemon's control
+  socket instead of starting the embedded runtime. The switch is decoded from
+  the 26.1103 bundle, not yet exercised on a Mac.
 - **Verify.** `cola doctor` reports the app-server daemon, the desktop has no
   `codex ... app-server` child, and cola logs `attached to the codex
   app-server daemon` for the same socket. `cola doctor` cannot yet identify the
@@ -469,11 +471,15 @@ broadcast to subscribers and either may answer it, and a `turn/start` or
   evidence.
 
 **Limits.** Bind the relay to loopback only: it has no authentication of its
-own, so never expose the port on a network interface. A **second app-server
-process** gets `already has an active writer` until the process holding the
-thread exits, or unloads it after its idle grace (`thread_unload_delay_secs`,
-60 s by default). Closing a conversation only starts that grace, and the lock
-does not clear when a turn ends. `/switch forget` on cola's side likewise only
+own, so never expose the port on a network interface. `already has an active
+writer` is still possible inside the shared setup: resuming a thread while the
+other client owns its active turn answers that (#986). Start with `/new` rather
+than contending for a thread already being driven. Across processes the
+conflict is lasting: a second app-server process cannot load the thread until
+the process holding it exits, or unloads it after its idle grace
+(`thread_unload_delay_secs`, set by the daemon's config). Closing a
+conversation only starts that grace, and the lock does not clear when a turn
+ends. `/switch forget` on cola's side likewise only
 starts the window: a release is best-effort, and a thread another client still
 holds is never unloaded (ADR-0096).
 

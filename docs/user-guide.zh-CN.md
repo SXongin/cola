@@ -349,8 +349,9 @@ active writer`。桌面应用此时显示「已在另一个应用打开」，并
 因此共享的前提是**一个 app-server 进程、两个连接**，而不是一个 store 上跑两个
 runtime：cola 是其中一个连接，桌面端必须是另一个。这是
 [多客户端同步](#多客户端同步) 在 Codex 上的形态。
-在同一个进程内，这些连接是对等的：待处理的审批会广播给所有订阅者，任一方都可
-作答；第二个客户端的 `turn/start` 或 `turn/steer` 会并入当前回合（ADR-0090）。
+在同一个进程内，这些连接是对等的：待处理的 Permission 会广播给所有订阅者，
+任一方都可作答；第二个客户端的 `turn/start` 或 `turn/steer` 会并入当前回合
+（ADR-0090）。
 
 - **Windows（实验性）。** 先启动 app-server daemon
   （`codex app-server daemon start`），并让 cola 只附加
@@ -360,22 +361,27 @@ runtime：cola 是其中一个连接，桌面端必须是另一个。这是
   或使用 `socat`），并在启动应用时设置
   `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`。该变量必须在应用启动**前**
   就位于它的环境里：从开始菜单正常启动不会继承它，请使用受控的启动方式。
-  之后桌面端不应再有 `codex` 子进程，而是到该端口的一条连接。参考中继、
-  启动方式与「不受支持」的状态见 #986。
-- **macOS（实验性，未验证）。** 用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 启动
-  桌面端；有 app-server daemon 在运行时，应用会直接连它的 control socket，
-  而不是启动 embedded runtime。`launchctl setenv` 只对之后启动的应用生效，
-  所以要先完全退出桌面端（含 helper），再重新打开。该开关是从 26.1103 的
-  bundle 中解出的，尚未在 Mac 上实测。
+  之后桌面端不应再有 `codex ... app-server` 子进程，而是到该端口的一条连接。
+  参考中继、启动方式与「不受支持」的状态见 #986。
+- **macOS（实验性，未验证）。** 在 app-server daemon 已运行、且 cola 只附加
+  （`start_server = "never"`）的前提下，用
+  `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 启动桌面端：
+  `launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON 1`，然后完全退出桌面端
+  （含 helper）再重新打开——`launchctl setenv` 只对之后启动的应用生效。应用会
+  连 daemon 的 control socket，而不是启动 embedded runtime。该开关是从
+  26.1103 的 bundle 中解出的，尚未在 Mac 上实测。
 - **验证。** `cola doctor` 报告 app-server daemon；桌面端没有
   `codex ... app-server` 子进程；cola 为同一个 socket 打
   `attached to the codex app-server daemon`。`cola doctor` 目前还不能自行识别
   桌面端的连接（由 #986 跟踪）；以上检查就是当前证据。
 
 **限制。** 中继只绑定回环，且自身没有任何认证——绝不要把端口暴露到网络接口上。
-**第二个 app-server 进程**会得到 `already has an active writer`，直到持有该线程
-的进程退出，或在其空闲宽限期（`thread_unload_delay_secs`，默认 60 秒）后卸载
-线程。关闭会话只是让宽限期开始计时，锁不会在回合结束时消失。cola 这边的
+共享拓扑里仍可能出现 `already has an active writer`：当另一方正在驱动一个活跃
+回合时，resume 该线程就会得到这个答案（#986）。第一次做双向验证请用 `/new`，
+不要去争一个已被驱动的线程。跨进程时冲突才是持久的：第二个 app-server 进程无法
+加载该线程，直到持有它的进程退出，或在其空闲宽限期
+（`thread_unload_delay_secs`，由 daemon 的配置决定）后卸载。关闭会话只是让宽限期
+开始计时，锁不会在回合结束时消失。cola 这边的
 `/switch forget` 同样只是让窗口开始计时：释放是尽力而为的，另一个客户端仍持有
 的线程永远不会被卸载（ADR-0096）。
 
