@@ -95,3 +95,16 @@ The decisive cost is unchanged: `cardkit:card:write`, the card-entity lifecycle,
 and a second rendering path — none of which #972 removes. See ADR-0004's
 2026-11-04 update.
 
+
+## Update (2026-11-11): a running tool outranks reasoning
+
+The four phases are a priority order, not just a set of labels (issue #1025). A
+reasoning part can render while a `task`/`subagent` call is still running — a
+seeded tail replayed by the renderer, or reasoning that lands before the wait is
+live — and the card's state then says Reasoning while the card is genuinely
+waiting on that tool. The phase and the header label therefore read the running
+call first: a Reasoning state with a running tool reports the Tool phase and the
+tool's own label, and no reasoning length rides along. The STATE keeps its
+ordinary meaning (`mark_reasoning` is still a plain write), so when the call
+settles and nothing else has streamed the header falls back to 「💭 推理中」
+rather than claiming a reply nobody wrote.

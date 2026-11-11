@@ -2184,7 +2184,17 @@ impl StreamAccumulator {
     pub(super) fn active_phase(&self) -> Option<HeaderPhase> {
         match self.card_state {
             CardState::Loading => Some(HeaderPhase::Loading),
-            CardState::Reasoning => Some(HeaderPhase::Reasoning),
+            // A running tool outranks reasoning (issue #1025): a reasoning part
+            // can render while a `task`/`subagent` call is still running, and
+            // the card is then waiting on that tool, not thinking. The header
+            // label reads the same rule ([`crate::feishu::card::shell`]).
+            CardState::Reasoning => {
+                if self.has_running_tool() {
+                    Some(HeaderPhase::Tool)
+                } else {
+                    Some(HeaderPhase::Reasoning)
+                }
+            }
             CardState::Streaming | CardState::Resuming => {
                 // A running todowrite is a tail panel, not a timeline tool, but
                 // it is still a running tool: ADR-0014 gives it the Tool phase

@@ -6880,6 +6880,75 @@ Index: /x/src/main.rs
         );
     }
 
+    /// A running `task` call outranks reasoning in the header (issue #1025):
+    /// the card is waiting on the subagent, so it must not read 「💭 推理中」
+    /// however much reasoning sits before the call.
+    #[test]
+    fn a_running_tool_outranks_reasoning_in_the_header() {
+        use crate::bridge::turn::state::HeaderPhase;
+
+        let read = |reasoning: &str, status: ToolStatus| {
+            SessionTranscript::new(vec![message(
+                "a1",
+                100,
+                vec![
+                    reasoning_part(reasoning),
+                    tool("task", "call_task", status, Some(100), None, None),
+                ],
+            )])
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(0));
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &read("先等子 agent。", ToolStatus::Running)
+        ));
+        assert_eq!(acc.card_state(), &CardState::Streaming);
+        assert_eq!(acc.current_phase(), Some(&HeaderPhase::Tool));
+        let (title, template) = acc.header_title_and_template();
+        assert_eq!(
+            template, "orange",
+            "the header turns to the working tool: {title}"
+        );
+        assert!(
+            title.contains("task"),
+            "the header names the running call: {title}"
+        );
+
+        // More reasoning arrives while the call still runs: the reasoning mark
+        // takes the STATE back to Reasoning, while the phase and the label
+        // still defer to the tool — and no reasoning count rides along.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &read("先等子 agent，再继续。", ToolStatus::Running)
+        ));
+        assert_eq!(acc.card_state(), &CardState::Reasoning);
+        assert_eq!(acc.current_phase(), Some(&HeaderPhase::Tool));
+        let (title, template) = acc.header_title_and_template();
+        assert_eq!(template, "orange", "the running tool keeps the header: {title}");
+        assert!(
+            title.contains("task"),
+            "the header still names the running call: {title}"
+        );
+        assert!(
+            !title.contains("推理中") && !title.contains('字'),
+            "no reasoning label or count while the tool runs: {title}"
+        );
+
+        // The call settles and only reasoning remains: the card falls back to
+        // the reasoning header — never to a reply it is not writing.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &read("先等子 agent，再继续。", ToolStatus::Completed)
+        ));
+        assert_eq!(acc.current_phase(), Some(&HeaderPhase::Reasoning));
+        assert!(
+            acc.header_title_and_template().0.contains("推理中"),
+            "a settled tool restores the reasoning header: {}",
+            acc.header_title_and_template().0
+        );
+    }
+
     /// A tail cut inside a markdown table repeats the table's header and
     /// delimiter, so the remaining rows parse as the table they continue
     /// (spec #561, ticket #563).
