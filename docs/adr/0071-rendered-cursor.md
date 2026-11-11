@@ -75,10 +75,12 @@ projects the chain's delta after it onto a successor card.**
   renders only its tail. The same rewrite seen live, from the read that carries
   it, replaces the part's timeline entries instead of accumulating the old
   content under the new snapshot — the replacement is the part's whole content
-  now — and stamps its prefix digest at the new full length, so the persisted
-  cursor describes exactly what the card shows rather than the double-counted
-  sum, and a restart resolves the part instead of rejecting it as the digestless
-  legacy case (review #569, round 2). A cursor written by an older release
+  now — and stamps its prefix digest at the new delivered extent (the
+  replacement's length clamped to the card's display cap, the same number the
+  frontier reports), so the persisted cursor describes exactly what the card
+  shows rather than the double-counted sum, and a restart resolves the part
+  instead of rejecting it as the digestless legacy case (review #569, round 2;
+  issue #1025). A cursor written by an older release
   carries no digest and therefore resolves nothing (a one-release migration
   seam, the cursorless fallback by another name); the first confirmed write
   after the upgrade gives it one.

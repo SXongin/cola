@@ -1975,7 +1975,11 @@ fn render_gap_part(
         }
     };
     let full_len = full.chars().count();
-    let held = acc.source_extent(&PartSource::at(message_id.clone(), index));
+    // The CUT reads the content this accumulator already pushed, never the
+    // card's display-capped extent (issue #1025): a >cap reasoning entry holds
+    // characters its extent does not count, and cutting at the extent would
+    // push them again on every read.
+    let held = acc.source_held_chars(&PartSource::at(message_id.clone(), index));
     let cut = held.max(delivered).min(full_len);
     let prefix: String = full.chars().take(cut).collect();
     let suffix: String = full.chars().skip(cut).collect();
@@ -1984,33 +1988,22 @@ fn render_gap_part(
         return false;
     }
     let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
-    // The delivered prefix after this push: a reasoning element shows only its
-    // cap, so the digest never covers characters the card cannot display
-    // (spec #561, review #569).
-    let delivered_len = match is_text {
-        true => full_len,
-        false => (cut
-            + suffix
-                .chars()
-                .count()
-                .min(crate::feishu::card::REASONING_TEXT_CAP))
-        .min(full_len),
-    };
     let source = PartSource {
         message_id,
         index,
         delivered_before: cut,
-        prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(
-            &full.chars().take(delivered_len).collect::<String>(),
-        )),
+        prefix_digest: None,
     };
     if is_text {
-        acc.push_text_at_key(order_at, started_at, Some(source), &suffix, lead);
+        acc.push_text_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
         acc.mark_streaming();
     } else {
-        acc.push_reasoning_at_key(order_at, started_at, Some(source), &suffix, lead);
+        acc.push_reasoning_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
         acc.mark_reasoning();
     }
+    // The digest fingerprints EXACTLY the delivered prefix this body reports,
+    // read back after the push (spec #561, review #569; issue #1025).
+    acc.stamp_source_digest(&source, full);
     true
 }
 
@@ -2267,14 +2260,19 @@ fn render_seeded_part(
     // under a later read) continues from what it delivered, never repeating
     // the offset (spec #561, review #569).
     let source = PartSource::at(message_id.clone(), index);
-    let held = acc.source_extent(&source);
+    // The CUT reads the part CONTENT this accumulator already pushed, never
+    // the card's display-capped extent (issue #1025): a >cap reasoning entry
+    // holds characters its extent does not count, and cutting at the extent
+    // pushed them a second time on every pass.
+    let held = acc.source_held_chars(&source);
+    let extent = acc.source_extent(&source);
     // The suffix-only cut is valid only while the read still carries what the
     // chain delivered for the part. A live REWRITE — the read's prefix no
-    // longer hashing to the held extent — replaces the part's run with the new
-    // content in full: cutting at `held` would push a stray suffix and let the
-    // cursor claim the replacement delivered (spec #561, review #569, ADR-0071's
-    // rewrite rule).
-    if held > 0 && !acc.source_prefix_holds(&source, full, held) {
+    // longer hashing to the delivered extent — replaces the part's run with the
+    // new content in full: cutting at `held` would push a stray suffix and let
+    // the cursor claim the replacement delivered (spec #561, review #569,
+    // ADR-0071's rewrite rule).
+    if held > 0 && !acc.source_prefix_holds(&source, full, extent) {
         acc.mark_delivered_part(&message_id, part);
         if is_text {
             acc.replace_text_run(&source, full, order_at, started_at);
@@ -2283,7 +2281,10 @@ fn render_seeded_part(
             acc.replace_reasoning_run(&source, full, order_at, started_at);
             acc.mark_reasoning();
         }
-        acc.record_seed_frontier_delivered(full_len);
+        // The fresh run holds the whole read from its start, so what it
+        // delivered is again the card's visible extent — never the part's raw
+        // length (issue #1025).
+        record_seed_extent(acc, &source, delivered);
         return !full.is_empty();
     }
     let (cut, before) = if held == 0 {
@@ -2298,38 +2299,37 @@ fn render_seeded_part(
     acc.mark_delivered_part(&message_id, part);
     if !suffix.is_empty() {
         let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
-        // The delivered prefix after this push: the whole read's part for a
-        // text entry, and only the characters a reasoning element can show for
-        // a reasoning one (spec #561, review #569) — so its digest lets a later
-        // resolution tell growth from a same-slot replacement AND never claims
-        // characters the card could not display.
-        let delivered_len = match is_text {
-            true => full.chars().count(),
-            false => (cut
-                + suffix
-                    .chars()
-                    .count()
-                    .min(crate::feishu::card::REASONING_TEXT_CAP))
-            .min(full.chars().count()),
-        };
         let source = PartSource {
-            message_id,
+            message_id: message_id.clone(),
             index,
             delivered_before: before,
-            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(
-                &full.chars().take(delivered_len).collect::<String>(),
-            )),
+            prefix_digest: None,
         };
         if is_text {
-            acc.push_text_at_key(order_at, started_at, Some(source), &suffix, lead);
+            acc.push_text_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
             acc.mark_streaming();
         } else {
-            acc.push_reasoning_at_key(order_at, started_at, Some(source), &suffix, lead);
+            acc.push_reasoning_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
             acc.mark_reasoning();
         }
+        // The digest fingerprints EXACTLY the delivered prefix this body
+        // reports, read back after the push — never a second formula that can
+        // drift from the extent's (spec #561, review #569; issue #1025).
+        acc.stamp_source_digest(&source, full);
     }
-    acc.record_seed_frontier_delivered(full_len);
+    record_seed_extent(acc, &source, delivered);
     !suffix.is_empty()
+}
+
+/// Record what a seeded pass delivered as the seed frontier's extent (issue
+/// #1025): the absolute extent the body now reports — the same number the
+/// confirmed cursor will carry — or the cursor's own value when the pass
+/// pushed nothing (the part was fully delivered by the previous card, so this
+/// accumulator holds no entry for it and recording a zero extent would replay
+/// the part on the next read).
+fn record_seed_extent(acc: &mut StreamAccumulator, source: &PartSource, delivered: usize) {
+    let extent = acc.source_extent(source);
+    acc.record_seed_frontier_delivered(if extent == 0 { delivered } else { extent });
 }
 
 /// The projection seed's live set (spec #561): a takeover hands the successor
@@ -6697,6 +6697,186 @@ Index: /x/src/main.rs
         assert!(
             !text.contains(shown),
             "nothing at or before the delivered extent repeats: {text}"
+        );
+    }
+
+    /// Issue #1025: a reasoning part longer than the card's cap whose frontier
+    /// resolves CUT AT 0 renders its whole body on the first pass — and every
+    /// later pass must not re-push it. Before the fix the recorded digest and
+    /// the clamped extent could never agree, so each pass took the "rewritten
+    /// part" branch and appended the whole part to the accumulator again.
+    #[test]
+    fn a_long_reasoning_frontier_renders_once_and_never_replays() {
+        let full = "隐".repeat(938);
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message("msg_a_2000", 2_000, vec![reasoning_at(&full, 2_000)]),
+        ]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Reasoning,
+                started_at: Some(2_000),
+                delivered_chars: 0,
+                prefix_digest: Some(cursor_prefix_digest("")),
+            }),
+            live_calls: Default::default(),
+        };
+
+        let mut acc = StreamAccumulator::new("proj");
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+        let mut lens = Vec::new();
+        for _ in 0..5 {
+            render_new_turn_parts(&mut acc, &transcript);
+            lens.push(acc.reasoning().chars().count());
+        }
+        assert_eq!(lens, vec![full.chars().count(); 5], "no pass may replay the part");
+        // The header's own number is what the reporter saw growing; it reads
+        // this same text, so it must stay put too.
+        assert_eq!(
+            acc.header_progress().reasoning_chars,
+            full.chars().count(),
+            "the header count does not grow with the passes"
+        );
+        // The confirmed cursor's extent and its digest name the SAME prefix
+        // (the issue's acceptance): the card shows at most its cap, so that is
+        // all a restart may treat as delivered.
+        let confirmed = acc.build_card_with_info().cursor;
+        let frontier = confirmed.frontier.as_ref().expect("the reasoning frontier");
+        assert_eq!(
+            frontier.delivered_chars,
+            crate::feishu::card::REASONING_TEXT_CAP,
+            "the cursor counts only what the card displays"
+        );
+        assert_eq!(
+            frontier.prefix_digest,
+            Some(cursor_prefix_digest(
+                &full.chars().take(frontier.delivered_chars).collect::<String>()
+            )),
+            "the digest covers exactly the extent the cursor records"
+        );
+        assert!(
+            CursorSeed::resolve(&transcript, &confirmed).is_some(),
+            "the confirmed cursor resolves on the same read"
+        );
+    }
+
+    /// The issue's own shape (issue #1025): a >cap reasoning frontier the
+    /// card already delivered up to its cap renders only the undisclosed
+    /// suffix on the first pass — and never again.
+    #[test]
+    fn a_capped_reasoning_frontier_renders_its_suffix_once() {
+        let full = format!("{}{}", "隐".repeat(900), "尾巴");
+        let delivered = crate::feishu::card::REASONING_TEXT_CAP;
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("问题")],
+            ),
+            message("msg_a_2000", 2_000, vec![reasoning_at(&full, 2_000)]),
+        ]);
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Reasoning,
+                started_at: Some(2_000),
+                delivered_chars: delivered,
+                prefix_digest: Some(cursor_prefix_digest(
+                    &full.chars().take(delivered).collect::<String>(),
+                )),
+            }),
+            live_calls: Default::default(),
+        };
+        let mut acc = StreamAccumulator::new("proj");
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
+        let seed = CursorSeed::resolve(&transcript, &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+        let mut lens = Vec::new();
+        for _ in 0..5 {
+            render_new_turn_parts(&mut acc, &transcript);
+            lens.push(acc.reasoning().chars().count());
+        }
+        assert_eq!(
+            lens,
+            vec![full.chars().count() - delivered; 5],
+            "only the undisclosed suffix renders, once"
+        );
+    }
+
+    /// A >cap reasoning part the server REWRITES (issue #1025): the
+    /// replacement's digest must fingerprint the same capped prefix the extent
+    /// counts, or the cursor can never resolve and every pass replaces the
+    /// run — the permanent replay loop. Before the fix the digest covered the
+    /// whole part while the extent stopped at the cap.
+    #[test]
+    fn a_seeded_reasoning_rewrite_fingerprints_only_what_the_card_shows() {
+        let first = "隐".repeat(938);
+        let rewritten = format!("{}{}", "改".repeat(900), "尾巴");
+        let read = |reasoning: &str| {
+            SessionTranscript::new(vec![
+                typed_message(
+                    "msg_cola_anchor",
+                    MessageRole::User,
+                    Some(1_000),
+                    vec![text_part("问题")],
+                ),
+                message("msg_a_2000", 2_000, vec![reasoning_at(reasoning, 2_000)]),
+            ])
+        };
+        let cursor = RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_2000"),
+                part_index: 0,
+                kind: CursorPartKind::Reasoning,
+                started_at: Some(2_000),
+                delivered_chars: 0,
+                prefix_digest: Some(cursor_prefix_digest("")),
+            }),
+            live_calls: Default::default(),
+        };
+        let mut acc = StreamAccumulator::new("proj");
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
+        let seed = CursorSeed::resolve(&read(&first), &cursor).expect("the frontier resolves");
+        acc.seed_projection(&cursor, seed);
+        assert!(render_new_turn_parts(&mut acc, &read(&first)));
+        // The read rewrites the part: the seeded walk REPLACES its run.
+        assert!(render_new_turn_parts(&mut acc, &read(&rewritten)));
+        let rewritten_len = acc.reasoning().chars().count();
+        for _ in 0..4 {
+            render_new_turn_parts(&mut acc, &read(&rewritten));
+        }
+        assert_eq!(
+            acc.reasoning().chars().count(),
+            rewritten_len,
+            "the rewrite renders once, not once per pass"
+        );
+        let confirmed = acc.build_card_with_info().cursor;
+        let frontier = confirmed.frontier.as_ref().expect("the reasoning frontier");
+        assert_eq!(
+            frontier.delivered_chars,
+            crate::feishu::card::REASONING_TEXT_CAP,
+            "the rewrite's cursor counts only what the card displays"
+        );
+        assert_eq!(
+            frontier.prefix_digest,
+            Some(cursor_prefix_digest(
+                &rewritten
+                    .chars()
+                    .take(frontier.delivered_chars)
+                    .collect::<String>()
+            )),
+            "the replacement's digest covers exactly the extent it records"
         );
     }
 

@@ -5681,6 +5681,25 @@ impl StreamAccumulator {
     /// [`Self::source_extent`] over the timeline prefix `..end`: one body's
     /// Rendered Cursor reads only what that body delivers.
     fn source_extent_in(&self, source: &PartSource, end: usize) -> usize {
+        self.source_chars_in(source, end, Some(crate::feishu::card::REASONING_TEXT_CAP))
+    }
+
+    /// The part CONTENT this accumulator has pushed, counted from the part's
+    /// start — the seeded cut's unit (issue #1025). Unlike
+    /// [`Self::source_extent`] it applies no display cap: the cut decides what
+    /// still has to be pushed, and an entry whose shown prefix was capped
+    /// still HOLDS every character it carries. Cutting at the capped extent
+    /// instead pushed those characters a second time, and a >cap reasoning
+    /// frontier replayed itself on every render pass.
+    pub(super) fn source_held_chars(&self, source: &PartSource) -> usize {
+        self.source_chars_in(source, self.timeline.len(), None)
+    }
+
+    /// The one walk behind [`Self::source_extent_in`] and
+    /// [`Self::source_held_chars`], so the two readings cannot drift:
+    /// `reasoning_cap` clamps what a reasoning element can display, `None`
+    /// counts the content itself.
+    fn source_chars_in(&self, source: &PartSource, end: usize, reasoning_cap: Option<usize>) -> usize {
         let mut chars = 0usize;
         let mut offset = 0usize;
         for item in &self.timeline[..end] {
@@ -5697,15 +5716,40 @@ impl StreamAccumulator {
                 // review #569): the delivered extent counts only what the
                 // element could display, so a restart still renders the
                 // characters beyond the cap instead of skipping them.
-                chars += match &item.kind {
-                    TimelineKind::Reasoning(_) => {
-                        text.chars().count().min(crate::feishu::card::REASONING_TEXT_CAP)
-                    }
+                chars += match (&item.kind, reasoning_cap) {
+                    (TimelineKind::Reasoning(_), Some(cap)) => text.chars().count().min(cap),
                     _ => text.chars().count(),
                 };
             }
         }
         offset + chars
+    }
+
+    /// Stamp the delivered-prefix digest a seeded push owes (issue #1025), read
+    /// back from the extent this body will actually report rather than from a
+    /// second formula: `CursorFrontier::delivered_chars` and its
+    /// `prefix_digest` must describe the SAME prefix, or `CursorSeed::resolve`
+    /// can never verify the cursor and every pass replays the part.
+    pub(super) fn stamp_source_digest(&mut self, source: &PartSource, full: &str) {
+        let extent = self.source_extent(source).min(full.chars().count());
+        let digest =
+            crate::bridge::chain::cursor_prefix_digest(&full.chars().take(extent).collect::<String>());
+        let stamped = if let Some(item_source) = self
+            .timeline
+            .iter_mut()
+            .rev()
+            .find(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
+            .and_then(|item| item.source.as_mut())
+        {
+            item_source.prefix_digest = Some(digest);
+            true
+        } else {
+            false
+        };
+        // The caller has just pushed this part: no entry to stamp would mean
+        // the push placed nothing and the cursor stays digestless — exactly the
+        // replay symptom this reads back to avoid, so surface it in tests.
+        debug_assert!(stamped, "a seeded push left no timeline entry to stamp");
     }
 
     /// Whether any timeline entry names the part `source` (spec #561, review
@@ -5815,7 +5859,13 @@ impl StreamAccumulator {
     ) {
         let key = self.entry_key_of(source).or(key_at);
         self.drop_source_run(source);
-        self.push_text_at_key(key, shown_at, Some(self.rewrite_source(source, text)), text, None);
+        self.push_text_at_key(
+            key,
+            shown_at,
+            Some(self.rewrite_source(source, text, None)),
+            text,
+            None,
+        );
     }
 
     /// [`Self::replace_text_run`] for a rewritten reasoning part.
@@ -5828,17 +5878,30 @@ impl StreamAccumulator {
     ) {
         let key = self.entry_key_of(source).or(key_at);
         self.drop_source_run(source);
-        self.push_reasoning_at_key(key, shown_at, Some(self.rewrite_source(source, text)), text, None);
+        self.push_reasoning_at_key(
+            key,
+            shown_at,
+            Some(self.rewrite_source(source, text, Some(crate::feishu::card::REASONING_TEXT_CAP))),
+            text,
+            None,
+        );
     }
 
     /// The source a rewritten part's fresh run carries: its position with the
-    /// new content's prefix digest and no offset.
-    fn rewrite_source(&self, source: &PartSource, text: &str) -> PartSource {
+    /// new content's prefix digest and no offset. `cap` is the part's visible
+    /// character cap (a reasoning element's), so the digest covers exactly
+    /// what the card can display — the same prefix [`Self::source_extent`]
+    /// counts (issue #1025). A digest over the whole >cap part could never be
+    /// verified against that extent, and every pass took the rewrite branch.
+    fn rewrite_source(&self, source: &PartSource, text: &str, cap: Option<usize>) -> PartSource {
+        let shown = text.chars().count().min(cap.unwrap_or(usize::MAX));
         PartSource {
             message_id: source.message_id.clone(),
             index: source.index,
             delivered_before: 0,
-            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(text)),
+            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(
+                &text.chars().take(shown).collect::<String>(),
+            )),
         }
     }
 

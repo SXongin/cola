@@ -88,7 +88,7 @@ async fn restarted_app(
 /// [`restarted_app`] with the scripted Backend handed back — for a test that
 /// re-scripts the session's read mid-life (the tasks retiring while cola
 /// watches) or waits on the reap's own reads.
-async fn restarted_app_with_backend(
+pub(super) async fn restarted_app_with_backend(
     session_file: &Path,
     transcript: SessionTranscript,
     status: Option<SessionStatus>,
@@ -336,7 +336,7 @@ fn completed(created_ms: i64) -> SessionTranscript {
 /// a collapsible panel with nested markdown, a `form` of controls, an action
 /// block and an hr — the shape a reap must keep without its controls (#434
 /// acceptance feedback).
-fn realistic_card_view() -> serde_json::Value {
+pub(super) fn realistic_card_view() -> serde_json::Value {
     serde_json::json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true, "streaming_mode": true },
@@ -5104,7 +5104,7 @@ async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
 /// Seed a record the previous life left with a confirmed Rendered Cursor: its
 /// card's last delivered frontier and live set (spec #561). The next app
 /// loads it at construction exactly like a real restart.
-fn seed_cursor_record(
+pub(super) fn seed_cursor_record(
     session_file: &Path,
     card_message_id: &str,
     message_id: &str,
@@ -5172,7 +5172,10 @@ fn text_frontier(delivered: &str) -> CursorFrontier {
 
 /// Wait for the projection's successor create — a reply carrying an ending
 /// header — returning its card and text. Panics after 5 s.
-async fn wait_for_projection(platform: &RecordingPlatform, reply_to: &str) -> (serde_json::Value, String) {
+pub(super) async fn wait_for_projection(
+    platform: &RecordingPlatform,
+    reply_to: &str,
+) -> (serde_json::Value, String) {
     let wait = async {
         loop {
             let calls = platform.calls.lock().await;
@@ -10720,6 +10723,20 @@ async fn a_restart_renders_a_long_reasoning_parts_undisclosed_suffix() {
             .map(|frontier| (frontier.kind, frontier.delivered_chars)),
         Some((CursorPartKind::Reasoning, crate::feishu::card::REASONING_TEXT_CAP)),
         "the frontier counts only the characters the card displayed"
+    );
+    // Issue #1025: the cursor's extent and its digest must name the SAME
+    // prefix — a restart resolves on exactly that pair, and a digest over more
+    // than the extent can never verify, so every pass replays the part.
+    let frontier = cursor.frontier.as_ref().expect("the reasoning frontier");
+    assert_eq!(
+        frontier.prefix_digest,
+        Some(cursor_prefix_digest(
+            &reasoning
+                .chars()
+                .take(frontier.delivered_chars)
+                .collect::<String>()
+        )),
+        "the digest covers exactly the extent the cursor records"
     );
     turn.abort();
     drop(app);
