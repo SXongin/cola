@@ -17,7 +17,7 @@ use super::drain::{
 };
 use crate::backend::types::SessionStatus;
 use crate::backend::{
-    Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, MessageTime, Part,
+    Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, MessageTime, Part, ReasoningPart,
     SessionTranscript, TextPart, ToolStatus, TranscriptMessage,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
@@ -834,5 +834,70 @@ async fn a_confirmed_write_on_a_compaction_advances_the_cursor_onto_it() {
             prefix_digest: Some(cursor_prefix_digest("")),
         }),
         "the frontier is the compaction's own position"
+    );
+}
+
+/// The issue's cursor acceptance (#1025): a seeded tail replay — a reasoning
+/// frontier resolved CUT AT 0, longer than the card's cap — must confirm an
+/// extent and a digest over the SAME prefix. A digest that covers more than the
+/// extent the frontier records can never verify, and every later render pass
+/// replays the part.
+#[tokio::test]
+async fn a_seeded_reasoning_replay_confirms_one_prefix() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let full = format!("{}{}", "隐".repeat(900), "尾巴");
+    let cap = crate::feishu::card::REASONING_TEXT_CAP;
+    super::reap::seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_2000"),
+            part_index: 0,
+            kind: CursorPartKind::Reasoning,
+            started_at: Some(2_000),
+            delivered_chars: 0,
+            prefix_digest: Some(cursor_prefix_digest("")),
+        }),
+        &[],
+    );
+    // The run is live: the successor is armed at the cut-at-0 frontier and its
+    // seeded render pushes the whole part, so the create's confirmation is the
+    // cursor this test reads.
+    let running = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "问题"),
+        typed_message(
+            "msg_a_2000",
+            MessageRole::Assistant,
+            Some(2_000),
+            vec![Part::Reasoning(ReasoningPart {
+                text: full.clone(),
+                started_at: Some(2_000),
+            })],
+        ),
+    ]);
+    let (app, platform, _backend) =
+        super::reap::restarted_app_with_backend(&session_file, running, Some(SessionStatus::Busy)).await;
+    platform.given_card_view("om_frozen", super::reap::realistic_card_view());
+    spawn_sync(&app);
+    super::reap::wait_for_projection(&platform, "om_frozen").await;
+
+    let cursor = wait_for_cursor(&app, |cursor| {
+        cursor
+            .frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.delivered_chars == cap)
+    })
+    .await;
+    let frontier = cursor.frontier.as_ref().expect("the reasoning frontier");
+    assert_eq!(frontier.kind, CursorPartKind::Reasoning);
+    assert_eq!(
+        frontier.prefix_digest,
+        Some(cursor_prefix_digest(&full.chars().take(cap).collect::<String>())),
+        "the confirmed digest covers exactly the extent the frontier records"
     );
 }
