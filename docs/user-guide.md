@@ -428,6 +428,44 @@ token is a ❌ and an unreadable elevation a ⚠️:
 `cola doctor` reports the first three as rows with one actionable instruction
 each; the fourth is Codex's own refusal.
 
+### Sharing a Codex thread with the desktop app
+
+Codex's thread store is single-writer **across processes**: a thread loaded by
+one app-server process holds `$CODEX_HOME/thread-writer-locks/<thread-id>.lock`,
+and a second process's `thread/resume` fails with `-32600 thread-store conflict:
+... already has an active writer`. The desktop app then reports "This
+conversation is open in another app" and offers a fork. Reads (`thread/list`,
+`thread/read`, `thread/turns/list`) take no lock, so the desktop still renders
+the thread — it just cannot type into it.
+
+Sharing therefore needs **one app-server process with two connections**, not two
+runtimes over one store: cola is one connection and the desktop must be the
+other. This is the Codex shape of [Multi-client sync](#multi-client-sync).
+
+- **Windows.** The desktop starts its own embedded `codex app-server` over
+  stdio. Bridge it to the app-server daemon: forward a loopback TCP port to
+  `$CODEX_HOME\app-server-control\app-server-control.sock` and launch the app
+  with `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`. The desktop then has no
+  `codex` child process and holds one connection to that port.
+- **macOS.** Launch the desktop with
+  `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1`; when an app-server daemon is running,
+  the app connects to its control socket directly instead of starting the
+  embedded runtime. `launchctl setenv` applies to apps started afterwards, so
+  quit the desktop completely (helpers included) and reopen it.
+- **Verify.** `cola doctor` reports the daemon, the desktop has no
+  `codex ... app-server` child, and cola logs `attached to the codex
+  app-server daemon` for the same socket.
+
+Both environment variables are undocumented and may change (#986 records the
+evidence); without one, the desktop falls back to the embedded server and the
+writer lock keeps the second client read-only. A transient `already has an
+active writer` while the other side is mid-turn is expected and clears when it
+finishes. `/switch forget` (or quitting cola) releases cola's subscription, and
+Codex unloads the thread after `thread_unload_delay_secs` (default 60).
+
+**Status.** The Windows bridge is exercised; the macOS local-daemon switch is
+decoded from the desktop bundle, not yet verified on a Mac.
+
 ### `[bridge]` — all optional
 
 ```toml

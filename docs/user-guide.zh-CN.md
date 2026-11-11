@@ -337,6 +337,40 @@ WSL 内时还有第四个约束。大多数失败在 TUI 层面是静默的（�
 `cola doctor` 会把前三条作为检查行列出，每行给出一条可执行的指示；第四条是
 Codex 自己的拒绝。
 
+### 与桌面应用共享 Codex 线程
+
+Codex 的线程存储是**跨进程单写者**的：某个 app-server 进程加载一个线程后，
+会持有 `$CODEX_HOME/thread-writer-locks/<thread-id>.lock`，第二个进程的
+`thread/resume` 会失败并返回 `-32600 thread-store conflict: ... already has an
+active writer`。桌面应用此时显示「已在另一个应用打开」，并提供 fork 选项。
+读路径（`thread/list`、`thread/read`、`thread/turns/list`）不拿锁，所以桌面端
+仍能显示线程——只是不能输入。
+
+因此共享的前提是**一个 app-server 进程、两个连接**，而不是一个 store 上跑两个
+runtime：cola 是其中一个连接，桌面端必须是另一个。这是
+[多客户端同步](#多客户端同步) 在 Codex 上的形态。
+
+- **Windows。** 桌面端会自己起一个 embedded `codex app-server`（stdio）。
+  把它桥接到 app-server daemon：把回环 TCP 端口转发到
+  `$CODEX_HOME\app-server-control\app-server-control.sock`，并在启动应用时设置
+  `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`。之后桌面端不应再有 `codex`
+  子进程，而是到该端口的一条连接。
+- **macOS。** 用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 启动桌面端；有
+  app-server daemon 在运行时，应用会直接连它的 control socket，而不是启动
+  embedded runtime。`launchctl setenv` 只对之后启动的应用生效，所以要先完全
+  退出桌面端（含 helper），再重新打开。
+- **验证。** `cola doctor` 报告 daemon；桌面端没有 `codex ... app-server`
+  子进程；cola 为同一个 socket 打 `attached to the codex app-server daemon`。
+
+两个环境变量都未文档化、可能变更（证据记录在 #986）；没有它们时，桌面端回落到
+embedded server，单写者锁会让第二个客户端只读。另一端正在写时短暂出现
+`already has an active writer` 是预期行为，对方结束后会恢复。`/switch forget`
+（或退出 cola）会释放 cola 的订阅，Codex 在 `thread_unload_delay_secs`
+（默认 60）后卸载线程。
+
+**状态。** Windows 的桥经过实测；macOS 的本地 daemon 开关是从桌面端 bundle 中
+解出的，尚未在 Mac 上验证。
+
 ### `[bridge]` —— 全部可选
 
 ```toml
