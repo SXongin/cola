@@ -599,3 +599,38 @@ ADR-0042's amendment puts Codex's `codex/file_change` in the tailored set, so
 
 The `edit` / `apply_patch` / `patch` rules above are unchanged: their count and
 totals still come from one `EditDiff`.
+
+## Amendment (2026-11-11, #772): a long path is priced before the preview is cut
+
+§6's preview budget assumed the frame around the preview — the naming block, the notes and the
+button row — fits a constant 4,000 chars. It does not: the resolved path is repeated,
+JSON-escaped, in the naming block and every control's payload (the 「📂 所在目录」 parent, the
+transfer's path and listing, the pager's carried state), so a path past ~600 characters could
+push an at-budget preview past `MAX_CARD_JSON_CHARS` and Feishu rejected the whole card (#772).
+
+- **The frame is measured, not assumed.** `build_viewer_card` prices what the card spends around
+  the preview — everything but the preview element and the pager — and re-cuts the preview only
+  when that frame cannot hold what it emits: a whole preview's own element, or, once the preview
+  pages, the pager plus the page budget. A card whose frame fits renders once, at the nominal
+  budget, exactly as before.
+- **The frame is measured on page 1.** The derived budget decides the line windows, so it must
+  not move with the requested page: a flip must rebuild the same windows (ADR-0052). Only the
+  payloads' page digits differ between pages, and the re-cut's margin absorbs them.
+- **The worst page, not this page, must fit.** When the preview pages, the packer charges every
+  window against the budget, so the budget is `MAX − frame − pager − margin`; the pager is
+  reserved at its widest digits, and only when a page actually exists.
+- **A whole preview is one element.** A rendered markdown body or a table has no page to flip,
+  so its measured element is the whole story: if the card fits, the reader's rendered view is
+  kept. A frame that cannot hold the render does not offer it — §6's existing rule, since a
+  re-cut cannot shrink an element, only replace it with the paged source.
+- **Every preview element answers to the budget.** The delimited file with no rows (whitespace
+  only) renders a fenced block like the text lane, so it pages instead of shipping an oversized
+  element; lanes with no budgeted preview at all — an embedded image, a lane line, a
+  landed-overflow card — are untouched, and at a real path length their frame already fits.
+- **A frame that leaves under 512 chars cannot be made to fit** (a path at the platform's own
+  limit repeated through every payload). The preview is cut to that floor rather than to one
+  character per page, and the card is marginal: the guarantee is against the conservative
+  `MAX_CARD_JSON_CHARS`, not Feishu's hard 30 KB ceiling.
+
+Not in this amendment: shortening the path a card *displays*, and any routing change to the
+payloads — every control must keep the full path to act on it.

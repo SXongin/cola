@@ -121,6 +121,7 @@ impl ViewerView {
 /// ambiguous-send status) and, for
 /// an embedded image, the `img` element. Named so a file past Feishu's 30MB cap
 /// — which is never read — can still carry its real size and the 未发送 state.
+#[derive(Clone)]
 pub(crate) struct ViewerFileLane {
     pub(crate) mime: String,
     pub(crate) name: String,
@@ -316,10 +317,59 @@ const MAX_PREVIEW_COLUMNS: usize = 20;
 /// `MAX_PREVIEW_COLUMNS` worst-case cells plus the rows still fit.
 const MAX_CELL_CHARS: usize = 120;
 
-/// The card-JSON share one preview may spend: the naming block, the trailing
-/// note and the button row need room, and the whole card must stay under
-/// [`MAX_CARD_JSON_CHARS`] or Feishu rejects it outright.
+/// The NOMINAL card-JSON share one preview may spend (#772): the naming block,
+/// the trailing note and the button row need room, and the whole card must stay
+/// under [`MAX_CARD_JSON_CHARS`] or Feishu rejects it outright.
+///
+/// The reserve is a constant but the frame around the preview is not: the
+/// resolved path is repeated, JSON-escaped, in the naming block, the
+/// 「📂 所在目录」 payload and the transfer payloads (plus the pager's own
+/// carried copy once a preview pages), so a long path can outgrow any fixed
+/// reserve. [`build_viewer_card`] therefore prices the frame this card actually
+/// renders and re-cuts the preview only when that frame cannot hold what it
+/// emits; a card whose frame fits is rendered once, at this exact budget.
 const PREVIEW_JSON_BUDGET: usize = MAX_CARD_JSON_CHARS - 4_000;
+
+/// The least preview share worth cutting to: a frame so large that less than
+/// this is left cannot host a useful preview, and splitting the text down to
+/// this floor keeps one pathological card from spending an allocation per
+/// character. Such a frame is several copies of a path at the platform's own
+/// limit; the card is marginal either way.
+const MIN_PREVIEW_JSON_BUDGET: usize = 512;
+
+/// The margin one re-cut leaves for the preview element's wrapper, a cut note
+/// that appears only at the tighter budget, and the payload's page digits
+/// growing between page 1 (the frame is measured there) and a later page.
+const PREVIEW_BUDGET_MARGIN: usize = 512;
+
+/// What one render of the viewer card spent, so the build can price the frame
+/// around its preview (#772).
+struct ViewerRender {
+    card: serde_json::Value,
+    /// The card's serialized JSON length.
+    len: usize,
+    /// Serialized bytes of the element(s) that ARE the budgeted preview (array
+    /// separators included).
+    preview_bytes: usize,
+    /// Serialized bytes of the pager element, when this preview paged.
+    pager_bytes: usize,
+}
+
+impl ViewerRender {
+    /// Whether this preview answers to [`PREVIEW_JSON_BUDGET`] at all: the text
+    /// and delimited arms do, while an embedded image, a lane line or a
+    /// landed-overflow card has no budgeted element to re-cut.
+    fn shrinkable(&self) -> bool {
+        self.preview_bytes > 0
+    }
+
+    /// The bytes this render spends around the preview: the naming block, the
+    /// notes, the lane line, the header and the button payloads — everything a
+    /// long resolved path is repeated in.
+    fn frame_bytes(&self) -> usize {
+        self.len.saturating_sub(self.preview_bytes + self.pager_bytes)
+    }
+}
 
 /// How a delimited preview was cut to fit the card, so its note names the rows,
 /// columns and budget limits that actually affected the rendered table
@@ -339,6 +389,7 @@ struct TableCut {
 }
 
 /// Everything the viewer card renders.
+#[derive(Clone)]
 pub(crate) struct ViewerCard<'a> {
     /// The **resolved** absolute path (never the typed spelling).
     pub(crate) path: &'a str,
@@ -359,12 +410,13 @@ pub(crate) struct ViewerCard<'a> {
     /// cut it). A file past the preview read cap is never previewed at all, so
     /// it takes the File Message lane rather than being truncated here.
     pub(crate) truncated: bool,
-    /// The 1-based page of the line-windowed text preview this card shows
-    /// (#740, ADR-0083 §6): a text preview longer than one card holds pages by
-    /// lines through the shared pager, and a flip rebuilds the card at the
-    /// payload's page — the viewer keeps no per-card state, so a rebuild from
-    /// a flipped page renders the same window (ADR-0052). `1` on open; the
-    /// builder clamps it into `[1, total_pages]`. Ignored by every other kind.
+    /// The 1-based page of the paged preview this card shows (#740, ADR-0083
+    /// §6): a preview longer than one card holds pages by lines through the
+    /// shared pager — the text lane, and a delimited file with no rows — and a
+    /// flip rebuilds the card at the payload's page; the viewer keeps no
+    /// per-card state, so a rebuild from a flipped page renders the same window
+    /// (ADR-0052). `1` on open; the builder clamps it into `[1, total_pages]`.
+    /// Ignored by a kind with no paged preview.
     pub(crate) page: usize,
     /// Which markdown rendering to show (#781): `None` is the default — the
     /// SOURCE view — and `Some(Rendered)` is the reader asking for the rendered
@@ -408,7 +460,117 @@ pub(crate) struct ViewerCard<'a> {
 pub(crate) const PAGE_CONTENT_CHANGED_NOTE: &str = "⚠️ 文件在打开后已变化；点「🔄 重新读取」查看最新内容。";
 
 /// Build the File Viewer card (ADR-0083 §3).
+///
+/// The fixed preview reserve ([`PREVIEW_JSON_BUDGET`]) assumes the frame
+/// around the preview fits in 4,000 chars, which a long path disproves: it is
+/// repeated in the naming block and every button payload, so an at-budget
+/// preview on such a path built a card past [`MAX_CARD_JSON_CHARS`] that Feishu
+/// rejected outright (#772). The build therefore prices the frame the card
+/// actually renders — everything except the preview element and the pager —
+/// and re-cuts the preview only when that frame cannot hold what it emits. A
+/// card whose frame fits renders exactly as it always did, at the nominal
+/// budget, once.
 pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) -> serde_json::Value {
+    let nominal = build_viewer_card_with_budget(thread_key, &view, PREVIEW_JSON_BUDGET);
+    // A lane with no budgeted preview element (an embedded image, a tracking
+    // line, a landed overflow, a delimited file with no rows) has nothing a
+    // re-cut could shrink; its frame is the whole card.
+    if !nominal.shrinkable() {
+        return nominal.card;
+    }
+    // The frame must be measured on page 1 whatever page is being read: the
+    // budget derived from it decides the line windows, and a budget that moved
+    // with the page would re-page every flip (a flip must rebuild the same
+    // windows — [`ViewerCard::page`], ADR-0052). Only the button payloads' page
+    // digits differ between pages, and the margin absorbs those.
+    let page_one;
+    let measured = if view.page == 1 {
+        &nominal
+    } else {
+        let mut first = view.clone();
+        first.page = 1;
+        page_one = build_viewer_card_with_budget(thread_key, &first, PREVIEW_JSON_BUDGET);
+        &page_one
+    };
+    // Everything the card spends around the preview. A measured pager is the
+    // page-1 pager; [`pager_bound`] covers any flip's digits.
+    let frame = measured.frame_bytes();
+    if measured.pager_bytes == 0 {
+        // A whole preview is ONE page-independent element: nothing can flip, so
+        // the requested card — not the page-1 probe — is the whole story. Only
+        // a card over the limit is re-cut, and then (text lanes) it pages, so
+        // the tighter budget reserves a pager below.
+        if nominal.len <= MAX_CARD_JSON_CHARS {
+            return nominal.card;
+        }
+    } else if frame + PREVIEW_JSON_BUDGET + pager_bound(thread_key, &view) <= MAX_CARD_JSON_CHARS {
+        // The preview already pages, so every page's block is bounded by the
+        // nominal budget; the pager is the one extra element a page adds, and
+        // the worst page — not this one — is what must fit.
+        return nominal.card;
+    }
+    let pager = if measured.pager_bytes > 0
+        || view.kind == ViewerKind::Text
+        || (view.kind == ViewerKind::Delimited
+            && delimited_table(view.text, delim_for(view.ext), 0).is_none())
+    {
+        pager_bound(thread_key, &view)
+    } else {
+        0
+    };
+    let computed = MAX_CARD_JSON_CHARS.saturating_sub(frame + pager + PREVIEW_BUDGET_MARGIN);
+    let budget = computed.max(MIN_PREVIEW_JSON_BUDGET);
+    let rebuilt = build_viewer_card_with_budget(thread_key, &view, budget);
+    // A card build must never take the bot down with user data, so an
+    // over-limit rebuild is a signal, not a panic. The arithmetic above is what
+    // makes it unreachable for a budgeted preview; the floor and a delimited
+    // table whose own header rows exceed the budget are the two known gaps.
+    if rebuilt.len > MAX_CARD_JSON_CHARS
+        && computed >= MIN_PREVIEW_JSON_BUDGET
+        && rebuilt.preview_bytes <= budget
+    {
+        tracing::warn!(
+            "viewer card over budget after re-cut: {} > {} (frame {frame}, pager {pager}, budget {budget})",
+            rebuilt.len,
+            MAX_CARD_JSON_CHARS
+        );
+    }
+    rebuilt.card
+}
+
+/// The most bytes the shared pager can spend for this card: one copy of every
+/// carried field, at the widest page/total/line numbers the preview can reach
+/// (its own character count bounds every count, since a page holds at least one
+/// character). The caller decides whether this card can page; `0` for a landed
+/// overflow, which renders no preview at all.
+fn pager_bound(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> usize {
+    if view.overflowed {
+        return 0;
+    }
+    let carry = viewer_carry_fields(view);
+    let extra: Vec<(&str, &str)> = carry.iter().map(|(key, value)| (*key, value.as_str())).collect();
+    let count_bound = view.text.len().max(2);
+    pager_element(
+        "file",
+        thread_key,
+        "",
+        None,
+        count_bound,
+        count_bound,
+        count_bound,
+        &extra,
+    )
+    .map(|pager| element_json_len(&pager))
+    .unwrap_or(0)
+}
+
+/// [`build_viewer_card`]'s render at one preview budget, with the preview's own
+/// spend reported so the caller can price the frame around it.
+fn build_viewer_card_with_budget(
+    thread_key: &ThreadKey,
+    view: &ViewerCard<'_>,
+    budget: usize,
+) -> ViewerRender {
     // One markdown hygiene state per card build, so the table budget the
     // preview's own table spends is counted exactly once.
     let mut markdown = CardMarkdown::new();
@@ -416,10 +578,12 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
     let truncated = view.truncated;
     let mut clipped_cells = false;
     let mut table_cut = None;
+    let mut preview_bytes = 0usize;
+    let mut pager_bytes = 0usize;
 
     elements.push(json!({
         "tag": "markdown",
-        "content": markdown.clean(&naming_block(&view)),
+        "content": markdown.clean(&naming_block(view)),
     }));
 
     // The markdown view (#781), decided ONCE for the whole card so the preview
@@ -429,9 +593,9 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
     // under-count exactly the file that must fall back to source. The preview is
     // this card's only table-bearing element, so the shared instance's budget is
     // the card's either way.
-    let rendered_body = is_markdown_document(&view)
+    let rendered_body = is_markdown_document(view)
         .then(|| markdown.clean(view.text))
-        .filter(|body| serialized_len(body) + 128 <= PREVIEW_JSON_BUDGET);
+        .filter(|body| serialized_len(body) + 128 <= budget);
     // The card OPENS on the source view (#781): the rendered text is one tap
     // away, and a long document rendered whole floods a phone screen — the
     // owner's own read of the first cut, on a real device. `view` records the
@@ -471,28 +635,43 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
             // the tracking line below is the whole card body.
             ViewerKind::Binary | ViewerKind::TextTooLarge => {}
             ViewerKind::Delimited => {
-                let delim = if view.ext.map(str::to_ascii_lowercase).as_deref() == Some("tsv") {
-                    '\t'
-                } else {
-                    ','
-                };
-                match delimited_table(view.text, delim) {
+                match delimited_table(view.text, delim_for(view.ext), budget) {
                     Some((table, cut)) => {
                         clipped_cells = cut.cells;
                         table_cut = Some(cut);
-                        elements.push(json!({
-                            "tag": "markdown",
-                            "content": markdown.clean(&table),
-                        }));
+                        preview_bytes = push_preview_element(
+                            &mut elements,
+                            json!({
+                                "tag": "markdown",
+                                "content": markdown.clean(&table),
+                            }),
+                        );
                     }
                     // A delimited file with no rows (whitespace only) has no table
-                    // to render: show the bytes in a block rather than invent one.
+                    // to render: show the bytes in a block rather than invent one,
+                    // held to the same preview budget as the text lane (#772) —
+                    // past it the block pages rather than shipping a card Feishu
+                    // rejects.
                     None => {
                         let block = fenced_code(view.text, Some(PLAIN_TEXT));
-                        elements.push(json!({
-                            "tag": "markdown",
-                            "content": markdown.clean(&block),
-                        }));
+                        if serialized_len(&block) + 128 <= budget {
+                            preview_bytes = push_preview_element(
+                                &mut elements,
+                                json!({
+                                    "tag": "markdown",
+                                    "content": markdown.clean(&block),
+                                }),
+                            );
+                        } else {
+                            (preview_bytes, pager_bytes) = push_text_page(
+                                &mut elements,
+                                &mut markdown,
+                                thread_key,
+                                view,
+                                PLAIN_TEXT,
+                                budget,
+                            );
+                        }
                     }
                 }
             }
@@ -505,10 +684,13 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
                     _ => None,
                 };
                 if let Some(body) = rendered {
-                    elements.push(json!({
-                        "tag": "markdown",
-                        "content": body,
-                    }));
+                    preview_bytes = push_preview_element(
+                        &mut elements,
+                        json!({
+                            "tag": "markdown",
+                            "content": body,
+                        }),
+                    );
                 } else {
                     let lang = language_token(view.ext);
                     // ONE fenced block when it fits the card's preview budget — a
@@ -518,16 +700,20 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
                     // a single large block is exactly what the paged path already
                     // renders per page.
                     let block = fenced_code(view.text, Some(lang));
-                    if serialized_len(&block) + 128 <= PREVIEW_JSON_BUDGET {
-                        elements.push(json!({
-                            "tag": "markdown",
-                            "content": markdown.clean(&block),
-                        }));
+                    if serialized_len(&block) + 128 <= budget {
+                        preview_bytes = push_preview_element(
+                            &mut elements,
+                            json!({
+                                "tag": "markdown",
+                                "content": markdown.clean(&block),
+                            }),
+                        );
                     } else {
                         // Past it, the shared pager windows the preview by LINES
                         // (#740): the budget decides only THAT it pages, never
                         // what the reader sees.
-                        push_text_page(&mut elements, &mut markdown, thread_key, &view, lang);
+                        (preview_bytes, pager_bytes) =
+                            push_text_page(&mut elements, &mut markdown, thread_key, view, lang, budget);
                     }
                 }
             }
@@ -576,26 +762,52 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
         }));
     }
 
-    elements.push(viewer_buttons(thread_key, &view, view_toggle));
-    card_shell(&format!("📄 {}", file_name(view.path)), "blue", elements)
+    elements.push(viewer_buttons(thread_key, view, view_toggle));
+    let card = card_shell(&format!("📄 {}", file_name(view.path)), "blue", elements);
+    let len = card.to_string().len();
+    ViewerRender {
+        card,
+        len,
+        preview_bytes,
+        pager_bytes,
+    }
 }
 
-/// The paged text preview (#740, ADR-0083 §6): the requested 1-based page's
+/// One element's serialized bytes, its array separator included — the unit the
+/// build measures the preview and the frame in (#772).
+fn element_json_len(element: &serde_json::Value) -> usize {
+    serde_json::to_string(element)
+        .map(|json| json.len() + 1)
+        .unwrap_or(0)
+}
+
+/// Push one preview element and report its [`element_json_len`], so the build
+/// can subtract the preview from the assembled card and price the frame that is
+/// left (#772).
+fn push_preview_element(elements: &mut Vec<serde_json::Value>, element: serde_json::Value) -> usize {
+    let bytes = element_json_len(&element);
+    elements.push(element);
+    bytes
+}
+
+/// The paged preview (#740, ADR-0083 §6): the requested 1-based page's
 /// window of whole lines as one fenced block, plus the shared pager — whose
 /// buttons carry the file's path, the TARGET page and (when opened from one)
 /// the browse listing's whole state, so a flip rebuilds the same window with
-/// the way back intact (ADR-0052's statelessness). The pager reports the
-/// preview's TRUE line total, so a reader knows what they are not seeing. A
-/// preview that fits one card never reaches here, so a single-page preview
-/// renders no pager.
+/// the way back intact (ADR-0052's statelessness). Used by the text lane and by
+/// a delimited file with no rows (which has no table to show). The pager
+/// reports the preview's TRUE line total, so a reader knows what they are not
+/// seeing. A preview that fits one card never reaches here, so a single-page
+/// preview renders no pager.
 fn push_text_page(
     elements: &mut Vec<serde_json::Value>,
     markdown: &mut CardMarkdown,
     thread_key: &ThreadKey,
     view: &ViewerCard<'_>,
     lang: &str,
-) {
-    let pages = paginate_text(view.text, lang);
+    budget: usize,
+) -> (usize, usize) {
+    let pages = paginate_text(view.text, lang, budget);
     let total_pages = pages.windows.len().max(1);
     let page = view.page.clamp(1, total_pages);
     let (start, end) = pages.windows.get(page - 1).copied().unwrap_or((0, 0));
@@ -610,16 +822,19 @@ fn push_text_page(
         }
     }
     let block = fenced_code(&window_text, Some(lang));
-    elements.push(json!({
-        "tag": "markdown",
-        "content": markdown.clean(&block),
-    }));
+    let preview_bytes = push_preview_element(
+        elements,
+        json!({
+            "tag": "markdown",
+            "content": markdown.clean(&block),
+        }),
+    );
     // The pager's extra fields are the same stateless carriage every viewer
     // rebuild control carries ([`viewer_carry_fields`]), strings only because
     // the shared pager holds string callback fields.
     let carry = viewer_carry_fields(view);
     let extra: Vec<(&str, &str)> = carry.iter().map(|(key, value)| (*key, value.as_str())).collect();
-    if let Some(pager) = pager_element(
+    let pager_bytes = pager_element(
         "file",
         thread_key,
         "",
@@ -628,9 +843,10 @@ fn push_text_page(
         total_pages,
         pages.lines.len(),
         &extra,
-    ) {
-        elements.push(pager);
-    }
+    )
+    .map(|pager| push_preview_element(elements, pager))
+    .unwrap_or(0);
+    (preview_bytes, pager_bytes)
 }
 
 /// The stateless state EVERY viewer rebuild control carries (#740, #781): the
@@ -701,8 +917,8 @@ fn viewer_carry_fields(view: &ViewerCard<'_>) -> Vec<(&'static str, String)> {
 /// the pager reports the total of), `segments` are what packs into windows —
 /// whole lines, except a line that alone outgrows a page contributes its
 /// char-split pieces — and `windows` are the `(start, end)` SEGMENT ranges the
-/// pager flips through, each rendering as one fenced block within
-/// [`PREVIEW_JSON_BUDGET`].
+/// pager flips through, each rendering as one fenced block within the build
+/// pass's preview budget.
 struct TextPages<'a> {
     lines: Vec<&'a str>,
     segments: Vec<PageSegment>,
@@ -729,19 +945,20 @@ impl PageSegment {
 }
 
 /// Split a text preview into line windows for the pager (#740): whole lines
-/// packed greedily so each window's fenced block fits [`PREVIEW_JSON_BUDGET`] —
-/// a line that alone outgrows a page (a minified one-liner) is char-split
-/// first, so every window still fits and no card is ever rejected.
-fn paginate_text<'a>(text: &'a str, lang: &str) -> TextPages<'a> {
+/// packed greedily so each window's fenced block fits `budget` — the card's
+/// preview share for this build pass (#772) — a line that alone outgrows a page
+/// (a minified one-liner) is char-split first, so every window still fits and no
+/// card is ever rejected.
+fn paginate_text<'a>(text: &'a str, lang: &str, budget: usize) -> TextPages<'a> {
     let lines: Vec<&str> = text.lines().collect();
     let mut segments: Vec<PageSegment> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let (cost, run, _) = PageSegment::Line(index).measure(&lines);
-        if page_block_cost(cost, run, 1, lang) + 128 <= PREVIEW_JSON_BUDGET {
+        if page_block_cost(cost, run, 1, lang) + 128 <= budget {
             segments.push(PageSegment::Line(index));
         } else {
             segments.extend(
-                split_overlong_line(line, lang)
+                split_overlong_line(line, lang, budget)
                     .into_iter()
                     .map(PageSegment::Piece),
             );
@@ -757,8 +974,7 @@ fn paginate_text<'a>(text: &'a str, lang: &str) -> TextPages<'a> {
     for (index, segment) in segments.iter().enumerate() {
         let (cost, segment_run, segment_count) = segment.measure(&lines);
         if count > 0
-            && page_block_cost(sum + cost, run.max(segment_run), count + segment_count, lang) + 128
-                > PREVIEW_JSON_BUDGET
+            && page_block_cost(sum + cost, run.max(segment_run), count + segment_count, lang) + 128 > budget
         {
             windows.push((start, index));
             start = index;
@@ -810,13 +1026,13 @@ fn line_tick_run(line: &str) -> usize {
 /// Split one overlong line — alone past a page's budget — into pieces that
 /// each fit a page, halving on char boundaries and measuring exactly, so a
 /// minified one-liner still pages instead of breaking the card.
-fn split_overlong_line(line: &str, lang: &str) -> Vec<String> {
+fn split_overlong_line(line: &str, lang: &str, budget: usize) -> Vec<String> {
     let mut pieces = vec![line.to_string()];
     let mut index = 0;
     while index < pieces.len() {
         let fits = {
             let piece = &pieces[index];
-            page_block_cost(serialized_len(piece), line_tick_run(piece), 1, lang) + 128 <= PREVIEW_JSON_BUDGET
+            page_block_cost(serialized_len(piece), line_tick_run(piece), 1, lang) + 128 <= budget
         };
         if fits {
             index += 1;
@@ -1299,10 +1515,10 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
 /// columns or long cells were dropped/clipped to keep the card valid.
 ///
 /// Records are pulled LAZILY and the pull stops at the card's own caps (the row
-/// cap and the JSON budget), so a file of millions of tiny rows is parsed only
-/// as far as the card needs — never materialized whole (finding #739 §1,
-/// round 2).
-fn delimited_table(text: &str, delim: char) -> Option<(String, TableCut)> {
+/// cap and `budget`, this build pass's preview share), so a file of millions of
+/// tiny rows is parsed only as far as the card needs — never materialized whole
+/// (finding #739 §1, round 2).
+fn delimited_table(text: &str, delim: char, budget: usize) -> Option<(String, TableCut)> {
     let mut records = delimited_records(text, delim);
     let header = records.next()?;
     let mut cut = TableCut {
@@ -1324,7 +1540,7 @@ fn delimited_table(text: &str, delim: char) -> Option<(String, TableCut)> {
         }
         let (line, clipped) = table_row(&row);
         let cost = serialized_len(&line) + 8;
-        if used + cost > PREVIEW_JSON_BUDGET {
+        if used + cost > budget {
             cut.rows_dropped = true;
             cut.budget_limited = true;
             break;
@@ -1785,7 +2001,8 @@ mod tests {
     /// cap are dropped and reported.
     #[test]
     fn delimited_preview_is_a_markdown_table() {
-        let (table, cut) = delimited_table("name,age\n\"Doe, Jane\",41\nbob\",42\n", ',').unwrap();
+        let (table, cut) =
+            delimited_table("name,age\n\"Doe, Jane\",41\nbob\",42\n", ',', PREVIEW_JSON_BUDGET).unwrap();
         assert_eq!(
             table,
             "| name | age |\n| --- | --- |\n| Doe, Jane | 41 |\n| bob\" | 42 |"
@@ -1799,7 +2016,7 @@ mod tests {
             "nothing was cut"
         );
 
-        let (piped, _) = delimited_table("a|b,c\nd,e", ',').unwrap();
+        let (piped, _) = delimited_table("a|b,c\nd,e", ',', PREVIEW_JSON_BUDGET).unwrap();
         assert!(
             piped.contains("| a\\|b | c |"),
             "a pipe in a cell is escaped: {piped}"
@@ -1810,7 +2027,7 @@ mod tests {
             (1..=30).map(|i| i.to_string()).collect::<Vec<_>>().join(","),
             "x"
         );
-        let (table, cut) = delimited_table(&wide, ',').unwrap();
+        let (table, cut) = delimited_table(&wide, ',', PREVIEW_JSON_BUDGET).unwrap();
         assert_eq!(
             table.lines().next().unwrap().matches('|').count(),
             MAX_PREVIEW_COLUMNS + 1
@@ -1824,7 +2041,7 @@ mod tests {
             .map(|i| format!("r{i},1"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (table, cut) = delimited_table(&long, ',').unwrap();
+        let (table, cut) = delimited_table(&long, ',', PREVIEW_JSON_BUDGET).unwrap();
         assert_eq!(
             table.lines().count(),
             MAX_TABLE_ROWS + 2,
@@ -1832,7 +2049,10 @@ mod tests {
         );
         assert!(cut.rows_dropped, "a table past the row cap says so");
 
-        assert!(delimited_table("   \n\n", ',').is_none(), "no rows, no table");
+        assert!(
+            delimited_table("   \n\n", ',', PREVIEW_JSON_BUDGET).is_none(),
+            "no rows, no table"
+        );
     }
 
     /// A quoted field may carry the delimiter, an escaped `""` for a literal
@@ -1842,7 +2062,7 @@ mod tests {
     #[test]
     fn delimited_preview_keeps_a_quoted_newline_in_one_cell() {
         let text = "name,note\nann,\"first\nsecond\"\nbob,\"say \"\"hi\"\"\"\n";
-        let (table, cut) = delimited_table(text, ',').unwrap();
+        let (table, cut) = delimited_table(text, ',', PREVIEW_JSON_BUDGET).unwrap();
         assert_eq!(
             table,
             "| name | note |\n| --- | --- |\n| ann | first second |\n| bob | say \"hi\" |"
@@ -1884,7 +2104,7 @@ mod tests {
     fn an_oversized_delimited_preview_stays_within_the_card_budget() {
         // One row with a single ~30 KB field: the cell is clipped, honestly.
         let huge_cell = format!("name,notes\nrow,{}", "x".repeat(30_000));
-        let (table, cut) = delimited_table(&huge_cell, ',').unwrap();
+        let (table, cut) = delimited_table(&huge_cell, ',', PREVIEW_JSON_BUDGET).unwrap();
         assert!(cut.cells, "a long cell is clipped: {cut:?}");
         assert!(
             table.len() < 1_000,
@@ -3249,6 +3469,191 @@ mod tests {
                 "{len} chars fit the card budget: {json_len}"
             );
         }
+    }
+
+    /// #772: a path longer than the constant frame reserve must not push an
+    /// at-budget preview past the card limit. The naming block and every
+    /// button payload repeat the resolved path, so the old fixed reserve was
+    /// breached at ~600 characters and Feishu rejected the whole card. The
+    /// build measures the assembled card and re-cuts the preview against what
+    /// its own frame spends — so the preview stays (paged, never dropped) and
+    /// the card fits.
+    #[test]
+    fn a_long_path_keeps_an_at_budget_preview_within_the_card() {
+        let path = format!("/tmp/{}/notes.txt", "p".repeat(1_500));
+        // ~20,000 chars over 200 whole lines: near the nominal preview budget
+        // (one block) before the frame is priced.
+        let text = format!("{}\n", "x".repeat(99)).repeat(200);
+        assert_eq!(text.len(), 20_000);
+
+        let card = build_viewer_card(&key(), view(&path, ViewerKind::Text, Some("txt"), &text));
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "a {}-char path must not break the card limit: {json_len}",
+            path.len()
+        );
+        assert_eq!(preview_blocks(&card).len(), 1, "the preview survives");
+        assert!(has_pager(&card), "the tighter budget pages, never drops");
+        assert!(
+            card_text(&card).contains(&path),
+            "the naming block still names the resolved path"
+        );
+
+        // A whole preview that fits at the nominal budget is left exactly
+        // alone: no pager appears just because the frame is large — the frame
+        // plus the element it actually emitted is what must fit. 15,000 chars
+        // is past a naive frame-derived budget yet still fits the card.
+        let small = "x".repeat(15_000);
+        let fitting = build_viewer_card(&key(), view(&path, ViewerKind::Text, Some("txt"), &small));
+        assert!(
+            !has_pager(&fitting),
+            "a fitting whole preview on the same long path stays whole"
+        );
+        assert!(serde_json::to_string(&fitting).unwrap().len() < MAX_CARD_JSON_CHARS);
+
+        // The reader's explicit rendered view survives too: the render is one
+        // whole element, so a frame that fits must not withdraw it (#772).
+        let markdown = format!("# hi\n\n{}", "word ".repeat(3_000));
+        let markdown_path = format!("/tmp/{}/notes.md", "p".repeat(1_500));
+        let mut rendered = view(&markdown_path, ViewerKind::Text, Some("md"), &markdown);
+        rendered.view = Some(ViewerView::Rendered);
+        let rendered_card = build_viewer_card(&key(), rendered);
+        assert!(
+            preview_blocks(&rendered_card).is_empty(),
+            "the rendered body still renders (no fence)"
+        );
+        assert!(
+            card_buttons(&rendered_card)
+                .iter()
+                .any(|button| button["value"]["op"] == "view"),
+            "the source toggle is still offered"
+        );
+        assert!(serde_json::to_string(&rendered_card).unwrap().len() < MAX_CARD_JSON_CHARS);
+    }
+
+    /// #772: the reserve was a viewer-wide assumption, so the delimited lane
+    /// was exposed the same way. A long path re-prices the table too: rows cut
+    /// against the measured budget, the cut stated, the card still valid.
+    #[test]
+    fn a_long_path_keeps_an_at_budget_table_within_the_card() {
+        let path = format!("/tmp/{}/table.csv", "p".repeat(1_500));
+        let header = (0..MAX_PREVIEW_COLUMNS)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let row = (0..MAX_PREVIEW_COLUMNS)
+            .map(|_| "y".repeat(MAX_CELL_CHARS))
+            .collect::<Vec<_>>()
+            .join(",");
+        let csv = format!(
+            "{header}\n{}",
+            std::iter::repeat_n(row, 30).collect::<Vec<_>>().join("\n")
+        );
+
+        let card = build_viewer_card(&key(), view(&path, ViewerKind::Delimited, Some("csv"), &csv));
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "a {}-char path must not break the card limit: {json_len}",
+            path.len()
+        );
+        let text = card_text(&card);
+        assert!(text.contains("| c0"), "the table still renders: {text}");
+        assert!(
+            text.contains("预算不足"),
+            "the tighter budget's row cut is stated: {text}"
+        );
+
+        // A delimited file with NO rows (whitespace only) is still a preview
+        // element: its block answers to the same budget, so a long path pages
+        // it instead of shipping an oversized card.
+        let blanks = "\n".repeat(40_000);
+        let card = build_viewer_card(&key(), view(&path, ViewerKind::Delimited, Some("csv"), &blanks));
+        let json_len = serde_json::to_string(&card).unwrap().len();
+        assert!(
+            json_len < MAX_CARD_JSON_CHARS,
+            "a no-row delimited preview on a long path must fit: {json_len}"
+        );
+        assert!(has_pager(&card), "the block pages rather than overflowing");
+    }
+
+    /// #772: the budget is derived from the frame measured on PAGE 1, so every
+    /// flip builds the same window set. Pricing each page's own card would make
+    /// the page count move with the page being read — a "下一页" click could be
+    /// clamped back onto its own page, or skip a page of lines.
+    #[test]
+    fn a_long_path_pages_the_same_windows_on_every_flip() {
+        let path = format!("/tmp/{}/notes.txt", "p".repeat(1_500));
+        let text = format!("{}\n", "x".repeat(99)).repeat(200);
+        let card_for = |page: usize| {
+            let mut view = view(&path, ViewerKind::Text, Some("txt"), &text);
+            view.page = page;
+            build_viewer_card(&key(), view)
+        };
+
+        let first = card_for(1);
+        assert!(has_pager(&first), "the long path still pages");
+        let text = card_text(&first);
+        let total: usize = text
+            .lines()
+            .find_map(|line| line.split("第 1/").nth(1))
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("the pager names the page count: {text}"));
+        assert!(total > 1, "the fixture spans more than one page: {total}");
+
+        let mut windows = Vec::new();
+        for page in 1..=total {
+            let card = card_for(page);
+            let text = card_text(&card);
+            assert!(
+                text.contains(&format!("第 {page}/{total} 页")),
+                "page {page} keeps the page count that page 1 named: {text}"
+            );
+            let json_len = serde_json::to_string(&card).unwrap().len();
+            assert!(json_len < MAX_CARD_JSON_CHARS, "page {page} fits: {json_len}");
+            windows.push(preview_blocks(&card)[0].to_string());
+        }
+        assert_ne!(windows[0], windows[1], "the windows move across flips");
+    }
+
+    /// #772: the lane lines and an embedded image have no preview share to
+    /// re-cut, so the fix must not disturb them — their frame is the whole
+    /// card, and at the issue's path length it fits.
+    #[test]
+    fn a_long_path_still_fits_the_no_preview_lanes() {
+        let path = format!("/tmp/{}/shot.png", "p".repeat(1_500));
+        let image = build_viewer_card(
+            &key(),
+            with_lane(
+                view(&path, ViewerKind::Image, Some("png"), ""),
+                "image/png",
+                "shot.png",
+                2048,
+                FileDelivery::Embedded {
+                    image_key: "img_v2_shot".into(),
+                },
+            ),
+        );
+        let binary = build_viewer_card(
+            &key(),
+            with_lane(
+                view(&path, ViewerKind::Binary, Some("bin"), ""),
+                "application/octet-stream",
+                "shot.png",
+                2048,
+                FileDelivery::SentAsFile,
+            ),
+        );
+        for card in [&image, &binary] {
+            let json_len = serde_json::to_string(card).unwrap().len();
+            assert!(
+                json_len < MAX_CARD_JSON_CHARS,
+                "a no-preview lane on a long path must fit: {json_len}"
+            );
+        }
+        assert!(card_text(&image).contains("已内嵌"));
     }
 
     /// #741: the structural-overflow lane is chosen from the RENDERED
