@@ -444,7 +444,10 @@ impl ThreadProjection {
 
     /// Rebuild the item and turn projection from persisted `thread/read` turns
     /// (the `Lagged` recovery path). Diff and token-usage facts survive: they
-    /// are per-turn notifications that history does not carry.
+    /// are per-turn notifications that history does not carry. Each item's own
+    /// start clock survives too: the page carries only the TURN's clock, and
+    /// re-timing an already-rendered item would read as new content to the
+    /// card (see the loop below).
     pub(crate) fn resync(&mut self, turns: &[Value], boundary_seq: u64) {
         let previous: HashMap<String, Item> =
             self.items.drain(..).map(|item| (item.id.clone(), item)).collect();
@@ -456,7 +459,19 @@ impl ThreadProjection {
             self.seed_turn(turn);
         }
         for item in &mut self.items {
-            item.set_pending_from(previous.get(&item.id));
+            let previous = previous.get(&item.id);
+            item.set_pending_from(previous);
+            // The turn page carries only the TURN's clock, so a rebuilt item
+            // would otherwise take the turn's start as its own. The card
+            // dedupes a Tool Panel by its whole revision — clock included — so
+            // re-timing an item it already rendered reads as new content on
+            // the next Session Sync and, on an ended chain, posts the neutral
+            // residual Card for work that never happened. Keep the clock this
+            // process observed; the page's turn start is the fallback for an
+            // item it did not have.
+            if let Some(previous) = previous {
+                item.started_at_ms = previous.started_at_ms.or(item.started_at_ms);
+            }
         }
         // The replayed history is the authority on the turns it carries, at the
         // boundary of what this connection had received when it asked for the
@@ -4150,6 +4165,101 @@ mod tests {
             "history rebuilds the projection, it does not append to it"
         );
         assert_eq!(transcript.messages[1].text(), "Done.");
+    }
+
+    /// A reconnect's resync rebuilds the projection from `thread/read`, whose
+    /// turn page carries only the TURN's clock. The rebuild must not re-time an
+    /// item this process already projected: the card dedupes a Tool Panel by
+    /// its whole revision, clock included, so replacing a live `item/started`
+    /// clock with the turn's start reads as new content on the next Session
+    /// Sync — and on an ended chain that posts the one neutral residual Card
+    /// (「📄 还有更新」) for work that never happened.
+    #[test]
+    fn a_resync_keeps_an_items_own_start_clock() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[
+                json!({
+                    "method": "turn/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {
+                            "id": "turn-1",
+                            "status": "inProgress",
+                            "startedAt": 1_700_000_000,
+                            "completedAt": null,
+                            "error": null,
+                            "items": []
+                        }
+                    }
+                }),
+                json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "startedAtMs": 1_700_000_000_500i64,
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "item-command",
+                            "command": "cargo test",
+                            "cwd": "/workspace",
+                            "status": "inProgress",
+                            "aggregatedOutput": null,
+                            "exitCode": null
+                        }
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_700i64,
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "item-command",
+                            "command": "cargo test",
+                            "cwd": "/workspace",
+                            "status": "completed",
+                            "aggregatedOutput": "ok",
+                            "exitCode": 0
+                        }
+                    }
+                }),
+            ],
+        );
+        let before = projected_tool(&projection, "item-command");
+        assert_eq!(
+            before.started_at,
+            Some(1_700_000_000_500),
+            "the live item/started clock is what the card rendered"
+        );
+
+        let history = json!([{
+            "id": "turn-1",
+            "status": "completed",
+            "startedAt": 1_700_000_000,
+            "completedAt": 1_700_000_001,
+            "error": null,
+            "items": [{
+                "type": "commandExecution",
+                "id": "item-command",
+                "command": "cargo test",
+                "cwd": "/workspace",
+                "status": "completed",
+                "aggregatedOutput": "ok",
+                "exitCode": 0
+            }]
+        }]);
+        projection.resync(history.as_array().unwrap(), projection.feed_seq + 1);
+
+        let after = projected_tool(&projection, "item-command");
+        assert_eq!(
+            after, before,
+            "a resync must leave the projected call — clock included — identical"
+        );
     }
 
     /// Ticket #880 review finding: the status watcher and the thread subscriber
