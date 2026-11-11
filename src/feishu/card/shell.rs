@@ -468,6 +468,17 @@ impl CardBuilder {
     }
 }
 
+/// The header a RUNNING tool owns, in either state that can show one —
+/// `Streaming` (a live panel) or `Reasoning` (a reasoning render while the
+/// call still runs, issue #1025) — so the label and the colour cannot drift.
+/// One icon only: `status_icon` already marks running/pending with ⏳, so an
+/// extra hardcoded 🔧 would show TWO icons (e.g. "🔧 ⏳ bench") on long-running
+/// tools. The name goes through the panel's display mapping, so a Codex item
+/// kind reads "命令" here too, never `codex/command_execution`.
+fn running_tool_header(tool: &RunningToolView) -> (String, &'static str) {
+    (format!("{} {}", tool.icon, tool.label), "orange")
+}
+
 /// Header title + template for a card. `running_tool` is the tool currently
 /// running (the builder's slice-local panel, or the caller's global selection
 /// via [`CardBuilder::with_header_running_tool`]), driving the "⏳ tool"
@@ -493,15 +504,19 @@ pub(crate) fn header_title_and_template(
     }
     let (label, template) = match state {
         CardState::Loading => ("⏳ 思考中".to_string(), "blue"),
-        CardState::Reasoning => ("💭 推理中".to_string(), "blue"),
+        // A running tool outranks reasoning (issue #1025): a reasoning part can
+        // render while a `task`/`subagent` call is still running — a seeded
+        // tail replay, or the model reasoning before the wait is live — and the
+        // card is then waiting on that tool, not thinking. The state stays
+        // Reasoning, so a settled tool falls back to the reasoning header
+        // rather than claiming a reply that was never written.
+        CardState::Reasoning => match running_tool {
+            Some(tool) => running_tool_header(tool),
+            None => ("💭 推理中".to_string(), "blue"),
+        },
         CardState::Streaming => {
             if let Some(tool) = running_tool {
-                // One icon only: `status_icon` already marks running/pending
-                // with ⏳, so an extra hardcoded 🔧 would show TWO icons
-                // (e.g. "🔧 ⏳ bench") on long-running tools. The name goes
-                // through the panel's display mapping, so a Codex item kind
-                // reads "命令" here too, never `codex/command_execution`.
-                (format!("{} {}", tool.icon, tool.label), "orange")
+                running_tool_header(tool)
             } else {
                 ("✍️ 回复中".to_string(), "blue")
             }
@@ -555,8 +570,9 @@ pub(crate) fn header_title_and_template(
             title.push_str(&format!(" {}", fmt_elapsed(e)));
         }
         // Reasoning is streamed incrementally by OpenCode, so its length is
-        // real progress during the thinking phase.
-        if *state == CardState::Reasoning && progress.reasoning_chars > 0 {
+        // real progress during the thinking phase — but not while the header
+        // names a running tool instead (issue #1025).
+        if *state == CardState::Reasoning && running_tool.is_none() && progress.reasoning_chars > 0 {
             title.push_str(&format!(" · {}", format_chars(progress.reasoning_chars)));
         }
     }
