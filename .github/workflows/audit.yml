@@ -17,3 +17,30 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
+      # cargo-deny audits the *feature-resolved* graph, so a crate that is only
+      # locked — reqwest's optional `http3` QUIC stack, say — is invisible to it
+      # while still riding in Cargo.lock. That is how three high RustSec
+      # advisories (quinn-proto, RUSTSEC-2026-0338..0343, #1031) sat behind a
+      # green `Dependency audit` job and surfaced only as a Scorecard alert.
+      # OSV scans the lockfile itself — the same view Scorecard's
+      # `Vulnerabilities` check takes — so this step owns that check instead of
+      # renting it from a third party. Deliberately off the PR path: the finding
+      # is never in compiled code, and a required check that calls api.osv.dev
+      # would fail every PR on someone else's outage.
+      - name: Lockfile advisories (optional dependencies included)
+        env:
+          OSV_SCANNER_VERSION: v2.7.1
+          OSV_SCANNER_SHA256: fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/osv-scanner"
+          curl --fail --silent --show-error --location \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64" \
+            --output "$bin"
+          actual=$(shasum -a 256 "$bin" | awk '{print $1}')
+          if [ "$actual" != "$OSV_SCANNER_SHA256" ]; then
+            echo "the osv-scanner binary is SHA-256 $actual, expected $OSV_SCANNER_SHA256" >&2
+            exit 1
+          fi
+          chmod +x "$bin"
+          "$bin" scan source --lockfile Cargo.lock
