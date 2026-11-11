@@ -352,11 +352,12 @@ runtime：cola 是其中一个连接，桌面端必须是另一个。这是
 在同一个进程内，这些连接是对等的：待处理的审批会广播给所有订阅者，任一方都可
 作答；第二个客户端的 `turn/start` 或 `turn/steer` 会并入当前回合（ADR-0090）。
 
-- **Windows（实验性）。** 先启动托管 daemon（`codex app-server daemon start`），
-  并让 cola 只附加（`start_server = "never"`），两边都不要另起第二个。桌面端会
-  自己起一个 embedded `codex app-server`（stdio）；把回环 TCP 端口转发到
-  `$CODEX_HOME\app-server-control\app-server-control.sock`（用参考中继或
-  `socat`），并在启动应用时设置
+- **Windows（实验性）。** 先启动 app-server daemon
+  （`codex app-server daemon start`），并让 cola 只附加
+  （`start_server = "never"`），两边都不要另起第二个。桌面端会自己起一个
+  embedded `codex app-server`（stdio）；跑一个回环中继（TCP → AF_UNIX）到
+  `$CODEX_HOME\app-server-control\app-server-control.sock`（参考中继见 #986，
+  或使用 `socat`），并在启动应用时设置
   `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`。该变量必须在应用启动**前**
   就位于它的环境里：从开始菜单正常启动不会继承它，请使用受控的启动方式。
   之后桌面端不应再有 `codex` 子进程，而是到该端口的一条连接。参考中继、
@@ -366,17 +367,20 @@ runtime：cola 是其中一个连接，桌面端必须是另一个。这是
   而不是启动 embedded runtime。`launchctl setenv` 只对之后启动的应用生效，
   所以要先完全退出桌面端（含 helper），再重新打开。该开关是从 26.1103 的
   bundle 中解出的，尚未在 Mac 上实测。
-- **验证。** `cola doctor` 报告 daemon；桌面端没有 `codex ... app-server`
-  子进程；cola 为同一个 socket 打 `attached to the codex app-server daemon`。
+- **验证。** `cola doctor` 报告 app-server daemon；桌面端没有
+  `codex ... app-server` 子进程；cola 为同一个 socket 打
+  `attached to the codex app-server daemon`。`cola doctor` 目前还不能自行识别
+  桌面端的连接（由 #986 跟踪）；以上检查就是当前证据。
 
-**限制。** 桥只绑定回环，且自身没有任何认证——绝不要把端口暴露到网络接口上。
+**限制。** 中继只绑定回环，且自身没有任何认证——绝不要把端口暴露到网络接口上。
 **第二个 app-server 进程**会得到 `already has an active writer`，直到持有该线程
 的进程退出，或在其空闲宽限期（`thread_unload_delay_secs`，默认 60 秒）后卸载
 线程。关闭会话只是让宽限期开始计时，锁不会在回合结束时消失。cola 这边的
 `/switch forget` 同样只是让窗口开始计时：释放是尽力而为的，另一个客户端仍持有
 的线程永远不会被卸载（ADR-0096）。
 
-两个环境变量都未文档化、可能变更；证据与当前状态由 #986 跟踪。
+两个环境变量都未文档化、可能变更，升级桌面端或 Codex 后都需要重新验证中继和
+开关；证据与当前状态由 #986 跟踪。
 
 ### `[bridge]` —— 全部可选
 

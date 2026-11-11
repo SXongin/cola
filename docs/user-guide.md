@@ -445,10 +445,10 @@ Within that one process the connections are peers: a pending approval is
 broadcast to subscribers and either may answer it, and a `turn/start` or
 `turn/steer` from the second client joins the active turn (ADR-0090).
 
-- **Windows (experimental).** Start the managed daemon (`codex app-server
+- **Windows (experimental).** Start the app-server daemon (`codex app-server
   daemon start`) and keep cola attach-only (`start_server = "never"`), so
   neither raises a second one. The desktop starts its own embedded
-  `codex app-server` over stdio; forward a loopback TCP port to
+  `codex app-server` over stdio; run a loopback relay (TCP to AF_UNIX) to
   `$CODEX_HOME\app-server-control\app-server-control.sock` (the reference
   relay, or `socat`) and launch the app with
   `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`. The variable must be in the
@@ -462,11 +462,13 @@ broadcast to subscribers and either may answer it, and a `turn/start` or
   embedded runtime. `launchctl setenv` applies to apps started afterwards, so
   quit the desktop completely (helpers included) and reopen it. The switch is
   decoded from the 26.1103 bundle, not yet exercised on a Mac.
-- **Verify.** `cola doctor` reports the daemon, the desktop has no
+- **Verify.** `cola doctor` reports the app-server daemon, the desktop has no
   `codex ... app-server` child, and cola logs `attached to the codex
-  app-server daemon` for the same socket.
+  app-server daemon` for the same socket. `cola doctor` cannot yet identify the
+  desktop attachment itself (tracked in #986); these checks are the current
+  evidence.
 
-**Limits.** Bind the bridge to loopback only: it has no authentication of its
+**Limits.** Bind the relay to loopback only: it has no authentication of its
 own, so never expose the port on a network interface. A **second app-server
 process** gets `already has an active writer` until the process holding the
 thread exits, or unloads it after its idle grace (`thread_unload_delay_secs`,
@@ -475,8 +477,10 @@ does not clear when a turn ends. `/switch forget` on cola's side likewise only
 starts the window: a release is best-effort, and a thread another client still
 holds is never unloaded (ADR-0096).
 
-Both environment variables are undocumented and may change; #986 tracks the
-evidence and the current status.
+Both environment variables are undocumented and may change, and neither
+survives an app update unverified: revalidate the relay and the switch after
+upgrading the desktop app or Codex. #986 tracks the evidence and the current
+status.
 
 ### `[bridge]` — all optional
 
