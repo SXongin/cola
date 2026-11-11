@@ -3,9 +3,9 @@
 > **Names the deepening before it lands** (the ADR-0079 pattern). The landing
 > amendment records the finished module and the tickets that landed it.
 >
-> **Amends ADR-0050**: the Timeline's entry types move to `turn/timeline.rs`.
-> Only the value types' home changes — the Turn boundary (the accumulator, the
-> flush and the render poll internal to the module) is unchanged.
+> **Amends ADR-0050**: the Timeline's entry state and types move to
+> `turn/timeline.rs`. The Turn boundary this ADR records is unchanged — the
+> accumulator, the flush and the render poll stay internal to the Turn module.
 
 Where a card entry lands has no owner. The rule is written three times, its
 protocol is re-armed by hand in four walks, and its inputs cross the seam as
@@ -54,10 +54,12 @@ content into them.**
 
 - **The interface is a walk.** `timeline.walk(&read_order)` yields a walk;
   `walk.message(created, id)` yields a message scope; the scope's `place(part
-  facts) -> Placement` and `push(placement, chunk)` are the only way *transcript*
-  content enters. The message scope's `Drop` clears the message floor and the
-  walk's `Drop` clears the read floor, so the half-written protocol that produced
-  the fixes above is no longer representable.
+  facts) -> Placement` and `push(placement, kind: TimelineKind)` are the only
+  way *transcript* content enters. A push carries the entry's kind, which is its
+  content: a text or reasoning chunk, or a settled `ToolPanel`. The message
+  scope's `Drop` clears the message floor and the walk's `Drop` clears the read
+  floor, so the half-written protocol that produced the fixes above is no longer
+  representable.
 - **Synthetic entries have their own admission.** An Interaction Receipt, a
   compaction row, a ledger entry and the External Message's lead are not
   read-order content, so they never take the read floor and never join a walk.
@@ -84,13 +86,16 @@ content into them.**
   entry identity (`seq`, including the seq a live tool panel pins when it
   settles, ADR-0045).
 - **What does not move.** The live (unsettled) tool tail stays in the
-  accumulator, which asks the Timeline for the identity it pins. Content-keyed
-  dedup and the rewritten part's prefix digest stay in the accumulator; the
-  Timeline owns only the entry-run replace (drop across the boundary,
-  re-insert). The `request_id → ReservedReceipt` map stays with the interaction
-  state while the Timeline owns the cut staircase and mints a reservation's
-  keys. The **Rendered Cursor** and its staging, the ledger, the interactions
-  and the card build stay where they are. `StreamAccumulator` keeps its name.
+  accumulator, which holds the `Placement` the part was first seen with (key,
+  merge identity, shown clock) and asks the Timeline for the `seq` it pins; when
+  the panel settles after the message scope drops, it enters with that stored
+  `Placement`, so a tool first seen in a post-click message keeps its key and
+  floor. Content-keyed dedup and the rewritten part's prefix digest stay in the
+  accumulator; the Timeline owns the entry-run replace defined above. The
+  `request_id → ReservedReceipt` map stays with the interaction state while the
+  Timeline owns the cut staircase and mints a reservation's keys. The **Rendered
+  Cursor** and its staging, the ledger, the interactions and the card build stay
+  where they are. `StreamAccumulator` keeps its name.
 - **Behaviour-preserving.** ADR-0038's receipt-skew window, ADR-0071's
   cursorless fallback and every current ordering test are unchanged. The
   timeline tests move beside the module; the guards gain invariant tests (a
