@@ -349,15 +349,18 @@ active writer`。桌面应用此时显示「已在另一个应用打开」，并
 因此共享的前提是**一个 app-server 进程、两个连接**，而不是一个 store 上跑两个
 runtime：cola 是其中一个连接，桌面端必须是另一个。这是
 [多客户端同步](#多客户端同步) 在 Codex 上的形态。
+在同一个进程内，这些连接是对等的：待处理的审批会广播给所有订阅者，任一方都可
+作答；第二个客户端的 `turn/start` 或 `turn/steer` 会并入当前回合（ADR-0090）。
 
-- **Windows。** 桌面端会自己起一个 embedded `codex app-server`（stdio）。
-  让 cola 只附加（`start_server = "never"`）以免再起一个 daemon，把回环 TCP
-  端口转发到 `$CODEX_HOME\app-server-control\app-server-control.sock`（用参考
-  中继或 `socat`），并在启动应用时设置
+- **Windows（实验性）。** 先启动托管 daemon（`codex app-server daemon start`），
+  并让 cola 只附加（`start_server = "never"`），两边都不要另起第二个。桌面端会
+  自己起一个 embedded `codex app-server`（stdio）；把回环 TCP 端口转发到
+  `$CODEX_HOME\app-server-control\app-server-control.sock`（用参考中继或
+  `socat`），并在启动应用时设置
   `CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>`。该变量必须在应用启动**前**
   就位于它的环境里：从开始菜单正常启动不会继承它，请使用受控的启动方式。
-  之后桌面端不应再有 `codex` 子进程，而是到该端口的一条连接。参考中继和
-  启动方式见 #986。
+  之后桌面端不应再有 `codex` 子进程，而是到该端口的一条连接。参考中继、
+  启动方式与「不受支持」的状态见 #986。
 - **macOS（实验性，未验证）。** 用 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 启动
   桌面端；有 app-server daemon 在运行时，应用会直接连它的 control socket，
   而不是启动 embedded runtime。`launchctl setenv` 只对之后启动的应用生效，
@@ -367,12 +370,11 @@ runtime：cola 是其中一个连接，桌面端必须是另一个。这是
   子进程；cola 为同一个 socket 打 `attached to the codex app-server daemon`。
 
 **限制。** 桥只绑定回环，且自身没有任何认证——绝不要把端口暴露到网络接口上。
-Codex 仍然允许每个线程只有一个活跃 writer：两个客户端可以同时观察一个线程并
-轮流写入，但不能同时驱动同一个回合。锁属于线程而不是回合：`already has an
-active writer` 会在持有方释放线程（关闭会话或退出）时消失，而不是在它的回合
-结束时消失。`/switch forget` 会释放 cola 的订阅，但只有没有任何客户端再持有
-该线程时 daemon 才会卸载它并放锁；释放只是让 `thread_unload_delay_secs`
-（默认 60 秒）更早开始计时（ADR-0096）。
+**第二个 app-server 进程**会得到 `already has an active writer`，直到持有该线程
+的进程退出，或在其空闲宽限期（`thread_unload_delay_secs`，默认 60 秒）后卸载
+线程。关闭会话只是让宽限期开始计时，锁不会在回合结束时消失。cola 这边的
+`/switch forget` 同样只是让窗口开始计时：释放是尽力而为的，另一个客户端仍持有
+的线程永远不会被卸载（ADR-0096）。
 
 两个环境变量都未文档化、可能变更；证据与当前状态由 #986 跟踪。
 
