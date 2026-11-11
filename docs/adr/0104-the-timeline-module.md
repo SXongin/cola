@@ -59,16 +59,25 @@ content into them.**
   walk's `Drop` clears the read floor, so the half-written protocol that produced
   the fixes above is no longer representable.
 - **Synthetic entries have their own admission.** An Interaction Receipt, a
-  compaction row, a ledger entry and the External Message's lead are
-  session-scoped, not read-order content. They enter through
-  `Timeline::synthetic(kind, at)`, keyed at their own server time (or
-  `next_order()` when they carry none), and never take a message or read floor —
-  the distinction `insert_item` draws today with `is_turn_part &&
-  source.is_some()`. A synthetic entry never joins a walk, so it can neither
-  inherit nor move a floor.
+  compaction row, a ledger entry and the External Message's lead are not
+  read-order content, so they never take the read floor and never join a walk.
+  They enter through `Timeline::synthetic(kind, at, row)`, keyed at their own
+  server time (or `next_order()` when they carry none). The **compaction row** is
+  the one that takes the Interaction Receipt cut for its message time — the floor
+  `render_compactions` sets around it today (ADR-0038, issue #1023); the receipt,
+  the ledger entry and the lead are placed outside any floor window today and
+  keep that. `row` is the entry's merge identity: a compaction row carries its
+  `PartSource` so a terminal fact updates the running row in place instead of
+  appending a second one; the other three pass none and append.
 - **`Placement` is the only push input.** It carries the entry key, the merge
   identity (`PartSource`) and the server clock the card shows. Bare order keys
   stop crossing the seam; the five-layer push wrappers collapse.
+- **The rewrite path is the Timeline's.** `Timeline::replace(placement, kind,
+  source, content)` serves a part the server re-sent with different content: the
+  Timeline prefers the key the part's existing entry already holds (else the
+  placement's key), drops every entry of that `PartSource` across the boundary
+  while keeping `render_from` on the same logical position, and inserts the new
+  run.
 - **What the module owns.** The Timeline's entries (`TimelineItem`), the floors,
   the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
@@ -86,7 +95,9 @@ content into them.**
   cursorless fallback and every current ordering test are unchanged. The
   timeline tests move beside the module; the guards gain invariant tests (a
   message scope always clears its floor, a walk always resets, a rewritten run
-  keeps the boundary, a placed part keeps its key).
+  keeps the boundary, a placed part keeps its key, a post-click compaction row
+  still floors at the receipt, and a repeated compaction fact updates the row it
+  already has).
 
 ## Consequences
 
