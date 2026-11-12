@@ -89,20 +89,24 @@ content into them.**
   notice (the Wake 承接 line, a busy-follow static lead) are not read-order
   content, so they never take the read floor and never join a walk. They enter
   through `Timeline::synthetic(entry: SyntheticEntry)` — one content-bearing
-  variant per kind: `Receipt { text, at }`, `Compaction { fact, at, row }`,
-  `Ledger { entry, ending, at }`, `UserMessage { text, at }`,
-  `Notice { text, at }` — which inserts directly and returns the key the entry
+  variant per kind: `Receipt { text, at }`, `Compaction { fact, at,
+  message_time, row }`, `Ledger { entry, ending, at }`, `UserMessage { text, at
+  }`, `Notice { text, at }` — which inserts directly and returns the key the
+  entry
   took. It yields no pushable `Placement`, so a synthetic row can never travel
   the transcript path. Every synthetic kind's `at` is an **order key only** —
   a resolved click's **reserved receipt key** (ADR-0038), a Wake's or a message's
   server time — and never a display clock: a receipt, a notice, a user lead and a
   compaction row show no clock (as today), while a ledger entry shows its own
-  payload's `finished_at`, not `at`. The **compaction row** is
-  the one that takes the Interaction Receipt cut for its message time — the
-  floor `render_compactions` sets around it today (ADR-0038, issue #1023); the
-  others are placed outside any floor window today and keep that. `row` is the
-  compaction's merge identity, so a terminal fact updates the running row in
-  place instead of appending a second one. A reserved receipt key the live slice
+  payload's `finished_at`, not `at`. A compaction's `at` is its order key
+  (`message_time.unwrap_or_else(next_order)`), while `message_time` is the server
+  time the **Interaction Receipt cut** compares against — the floor
+  `render_compactions` sets around it today (ADR-0038, issue #1023); a timeless
+  compaction (`message_time: None`) takes no cut, exactly as today. The other
+  synthetic kinds are placed outside any floor window today and keep that. `row`
+  is the compaction's merge identity, and its update-in-place lookup is scoped to
+  the **live slice**: a terminal fact after a split starts a row on the live card
+  rather than updating a finalized one. A reserved receipt key the live slice
   no longer reaches (a split finalized past it) is clamped to the slice's first
   key, exactly the clamp `insert_item` applies today, and the returned key is
   the clamped one.
@@ -111,12 +115,16 @@ content into them.**
   `{asked_at, floor_key}` cut**, so content written during the reply is floored
   before the receipt lands. `retune_cut(floor_key, at)` and
   `forget_cut(floor_key)` adjust or drop it, so a mode change resolving several
-  blocks can retune or drop cuts. `reservation_seq`, `reserved_receipts` and every
+  blocks can retune or drop cuts. `record_cut(asked_at, key)` records the cut of a
+  receipt written **without** a reservation — a remote client's answer, or a
+  click whose reservation was skipped — so later messages still floor at it.
+  `reservation_seq`, `reserved_receipts` and every
   `request_id` stay in the accumulator, which owns the reservation's lifecycle.
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
   and `push` / `replace` consume it; it carries the entry key, an optional merge
-  identity (`Option<PartSource>` — a source-less placement is not read-order
-  content and takes no read floor, exactly as `insert_item` decides today), the
+  identity (`Option<PartSource>`; a source-less placement still takes the read
+  floor, exactly as `part_order_key` applies it today, and only the message-scoped
+  receipt cut distinguishes read-order content), the
   display clock, the floor it was placed under, and a private scope generation. Its fields are private with no public constructor and it is
   neither `Clone` nor `Copy`, so a second push of one token is a compile error; a
   token from another scope fails the generation check, so a placement cannot be
@@ -157,9 +165,10 @@ content into them.**
   the content that floored it; this is the one place the equal-key allocation
   rule defers to read order, and ADR-0038's note records it. So a tail-only panel cannot jump a receipt cut or
   content read after it was pinned, before or after its start time arrives.
-  These two rules — the settle clamp and the equal-key exception — are the ADR's
-  deliberate tightenings, and tests pin them; every other placement rule and
-  every current test is unchanged. Content-keyed dedup and the rewritten
+  The deliberate tightenings are the settle clamp, its equal-key exception, and
+  the compaction row's live-slice lookup (a terminal fact after a split lands on
+  the live card instead of updating a finalized row); tests pin them, and every
+  other placement rule and every current test is unchanged. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
   replace defined above. The **Rendered Cursor** and its staging, the ledger,
   the interactions and the card build stay where they are. `StreamAccumulator`
@@ -170,7 +179,8 @@ content into them.**
   scope); no production caller gains a new path.
 - **Behaviour-preserving.** ADR-0038's receipt-skew window, ADR-0071's
   cursorless fallback and every current ordering test are unchanged, apart from
-  the tail-only settle clamp and its equal-key exception above. The timeline tests
+  the tail-only settle clamp, its equal-key exception and the compaction
+  live-slice lookup above. The timeline tests
   move beside the module;
   the guards gain invariant tests (a message scope always clears its floor, a
   walk always resets, a rewritten run keeps the boundary, a placed part keeps

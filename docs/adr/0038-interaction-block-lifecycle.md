@@ -4,7 +4,7 @@
 > with the Session Snapshot card, so every **Interaction Block** lives on a live
 > card or its own standalone card, and `SnapshotClaims` no longer exists.
 >
-> **Amended by ADR-0104** (the keying sentence and the equal-key rule): synthetic
+> **Amended by ADR-0104 when it lands** (the keying sentence and the equal-key rule): synthetic
 > entries may be keyed at their own server time or at a key the caller already
 > holds — a click's reserved receipt key, the Wake 承接 line's server time — not
 > only at `next_order()`; and a tail-only **Tool Panel** seated at settle takes a
