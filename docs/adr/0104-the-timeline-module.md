@@ -87,6 +87,10 @@ content into them.**
   walk, the live-slice clamp, and placed-part stability (a part already on the
   **live slice** keeps the key it was placed at; a finalized entry is behind
   `render_from`, so a grown part starts a continuation entry as today). The
+  borrowed-key policy moves in too: a part that reports no server start time
+  takes the key of the part placed before it in its message (the V2 untimed-text
+  rule `part_order_times` applies today), falling back to `next_order()` only
+  when there is none. The
   message scope's `Drop` clears the message floor and the walk's `Drop` clears
   the read floor, so the half-written protocol that produced the fixes above is
   no longer representable.
@@ -95,25 +99,26 @@ content into them.**
   notice (the Wake 承接 line, a busy-follow static lead) are not read-order
   content, so they never take the read floor and never join a walk. Each variant
   maps onto the stored `TimelineKind` its call site uses today, so a `Lead`
-  still merges as text and a `Receipt` (the Wake line included) still flushes the
-  pending text run They enter
+  still merges as text and a `Receipt` is a click's receipt only They enter
   through `Timeline::synthetic(entry: SyntheticEntry)` — one content-bearing
-  variant per kind: `Receipt { text, at }` (a click's receipt and the Wake 承接
-  line — `TimelineKind::Receipt`), `Compaction { fact, at, message_time, row }`,
+  variant per kind: `Receipt { text, at }` (a click's receipt —
+  `TimelineKind::Receipt`), `Compaction { fact, at, message_time, row }`,
   `Ledger { entry, ending, at }`, `UserMessage { text, at }`, and `Lead { text,
-  at }` (the busy-follow static lead — `TimelineKind::Text`, where it still
-  merges into a text run) — which inserts directly and returns the key the
-  entry
+  at }` (the Wake 承接 line and the busy-follow static lead —
+  `TimelineKind::Text`, where both still merge into a text run) — which inserts
+  directly and returns the key the entry
   took. It yields no pushable `Placement`, so a synthetic row can never travel
   the transcript path. Every synthetic kind's `at` is an **order key only** —
   a resolved click's **reserved receipt key** (ADR-0038), a Wake's or a message's
   server time — and never a display clock: a receipt, a lead and a user message
   show no clock (text blocks), a compaction row shows none, and a ledger entry
-  shows its own payload's `finished_at`, not `at`. A compaction's `at` is its order key
-  (`message_time.unwrap_or_else(next_order)`), while `message_time` is the server
-  time the **Interaction Receipt cut** compares against — the floor
-  `render_compactions` sets around it today (ADR-0038, issue #1023); a timeless
-  compaction (`message_time: None`) takes no cut, exactly as today. The other
+  shows its own payload's `finished_at`, not `at`. A compaction's `at` is its
+  **pre-floor seed** (`message_time.unwrap_or_else(next_order)`), while
+  `message_time` is the server time the **Interaction Receipt cut** compares
+  against — the floor `render_compactions` sets around it today (ADR-0038, issue
+  #1023); the admission applies that floor and returns the final key, which may
+  be the receipt's. A timeless compaction (`message_time: None`) takes no cut,
+  exactly as today. The other
   synthetic kinds are placed outside any floor window today and keep that. `row`
   is the compaction's merge identity, and its update-in-place lookup is scoped to
   the **live slice**: a terminal fact after a split starts a row on the live card
@@ -205,9 +210,11 @@ content into them.**
   the tail-only settle clamp, its equal-key exception and the compaction
   live-slice lookup above. The timeline tests
   move beside the module;
-  the guards gain invariant tests (a message scope always clears its floor, a
-  walk always resets, a rewritten run keeps the boundary, a placed part keeps
-  its key, a pending tool that later reports its start time settles at that time
+  the guards gain invariant tests (a message scope always clears its floor — a
+  later transcript part with a key older than the dropped scope's floor is not
+  floored; a walk always resets — the next message's first part carries a key
+  below the stale floor; a rewritten run keeps the boundary; a placed part keeps
+  its key; an untimed part after a timed one borrows that timed part's key; a pending tool that later reports its start time settles at that time
   but never below its floor, a resolved click's receipt keeps its reserved key
   while the slice reaches it and returns the clamped key after a split past it, a
   rewritten run's later chunk merges into the new run, a rewrite whose source
