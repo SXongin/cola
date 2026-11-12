@@ -106,11 +106,13 @@ content into them.**
   merge opening, a receive hint, the residual marker, a skipped-content note or a
   split line; `TimelineKind::Receipt`), `Compaction { fact, at, message_time, row }`,
   `Ledger { entry, ending, at }`, `UserMessage { text, at }`, and `Lead { text,
-  at }` (the Wake 承接 line and the busy-follow static lead —
-  `TimelineKind::Text`, where both still merge into a text run) — which inserts
-  directly and returns the key the entry took, except a `Lead`, which may merge
-  into an existing text run or chunk into several entries and therefore returns
-  none. Each variant maps onto the stored
+  at }` (the fresh-card Wake 承接 opener and the busy-follow static lead —
+  `TimelineKind::Text`, where both still merge into a text run; the queued Wake
+  continuation's split line is a `Receipt`, its call site being
+  `push_receipt_at`) — which inserts
+  directly and returns `Option<i64>`: `Some(key)` for a variant that owns one
+  entry, `None` for a `Lead`, which may merge into an existing text run or chunk
+  into several entries. Each variant maps onto the stored
   `TimelineKind` its call site uses today, so a `Lead` still merges as text and a
   `Receipt` covers every receipt line. It yields no pushable `Placement`, so a synthetic row can never travel
   the transcript path. Every synthetic kind's `at` is an **order key only** —
@@ -153,9 +155,10 @@ content into them.**
   `request_id` stay in the accumulator, which owns the reservation's lifecycle.
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
   and `push` / `replace` consume it, returning `Result<(), PlacementError>`:
-  a token from another scope, a reused token, or a rewrite whose source is
-  missing or names another part is **refused without inserting anything** (and
-  `debug_assert!`ed in tests), never a panic in production; it carries the entry key, an optional merge
+  a **stale** token (one whose scope generation differs from the live scope) or
+  a rewrite whose source is missing or names another part is refused without
+  inserting anything, never a panic in production. Reuse is already a compile
+  error (the token is move-only and not `Clone`); it carries the entry key, an optional merge
   identity (`Option<PartSource>`; a source-less placement takes both the read
   floor and the message-scoped receipt cut, exactly as `part_order_key` plus
   `insert_item` apply them today), the
@@ -204,9 +207,11 @@ content into them.**
   **earlier** messages only, exactly ADR-0038's rule, recomputed against the
   settle read so content that became visible after the pin still floors the
   panel. When the floor is **at or above** the pinned key, the panel takes a
-  **key `max(pinned, floor)`**, and at that key it sorts by its own part's read
-  position (see below) — after earlier-message entries at the key and before its
-  own message's later parts. A synthetic entry at that key sorts before both. Placed content never moves, no key or `order` is
+  **key `max(pinned, floor)`**, seated through the normal insert path (so the
+  live-slice late-part clamp still applies), and at that key it sorts by its own
+  part's read position (see below) — after earlier-message entries at the key and
+  before its own message's later parts. A synthetic entry at that key sorts
+  before both. Placed content never moves, no key or `order` is
   renumbered, and `seq` stays identity. When the panel's own following entry
   sits at a *lower* key (placed before that floor became visible), the floor
   wins and the panel lands after it. So a tail-only panel cannot jump a receipt cut or
