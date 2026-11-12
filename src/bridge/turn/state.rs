@@ -3715,19 +3715,17 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        self.push_scripted(
-            PartFacts {
-                form: PartForm::Text,
-                key_at,
-                shown_at,
-                source,
-                index: 0,
-            },
-            TranscriptKind::Text {
-                chunk: chunk.to_string(),
-                lead,
-            },
-        );
+        let facts = PartFacts {
+            form: PartForm::Text,
+            key_at,
+            shown_at,
+            source,
+            index: 0,
+        };
+        let read_order = HashMap::new();
+        let message = self.scripted_transcript();
+        self.push_text_scoped(&read_order, &message, facts, chunk.to_string(), lead)
+            .expect("the scripted message scope accepts its own placement");
     }
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
@@ -3792,19 +3790,17 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        self.push_scripted(
-            PartFacts {
-                form: PartForm::Reasoning,
-                key_at,
-                shown_at,
-                source,
-                index: 0,
-            },
-            TranscriptKind::Reasoning {
-                chunk: chunk.to_string(),
-                lead,
-            },
-        );
+        let facts = PartFacts {
+            form: PartForm::Reasoning,
+            key_at,
+            shown_at,
+            source,
+            index: 0,
+        };
+        let read_order = HashMap::new();
+        let message = self.scripted_transcript();
+        self.push_reasoning_scoped(&read_order, &message, facts, chunk.to_string(), lead)
+            .expect("the scripted message scope accepts its own placement");
     }
 
     /// The scripted message the integration suite's source-less test pushes
@@ -3825,26 +3821,6 @@ impl StreamAccumulator {
             error: None,
             parts: Vec::new(),
         }
-    }
-
-    /// Push one source-less chunk through the production message scope (spec
-    /// #1040's test seam, #1043): the same `push_*_scoped` path a real walk
-    /// uses, with the scripted message's cut as the only floor, so the seam
-    /// has no body of its own to drift.
-    #[cfg(test)]
-    fn push_scripted(&mut self, facts: PartFacts, kind: TranscriptKind) {
-        let read_order = HashMap::new();
-        let message = self.scripted_transcript();
-        let result = match kind {
-            TranscriptKind::Text { chunk, lead } => {
-                self.push_text_scoped(&read_order, &message, facts, chunk, lead)
-            }
-            TranscriptKind::Reasoning { chunk, lead } => {
-                self.push_reasoning_scoped(&read_order, &message, facts, chunk, lead)
-            }
-            TranscriptKind::Tool(_) => unreachable!("a tool push goes through push_tool_scoped"),
-        };
-        result.expect("the scripted message scope accepts its own placement");
     }
 
     /// Insert/update a tool panel; the timeline gets a marker only on the FIRST
@@ -5413,14 +5389,10 @@ impl StreamAccumulator {
             source: Some(self.rewrite_source(source, text, None)),
             index: source.index(),
         };
-        self.replace_scripted(
-            source,
-            facts,
-            TranscriptKind::Text {
-                chunk: text.to_string(),
-                lead: None,
-            },
-        );
+        let read_order = HashMap::new();
+        let message = self.scripted_transcript();
+        self.replace_text_scoped(&read_order, &message, source, facts, text.to_string())
+            .expect("the scripted message scope accepts its own rewrite");
     }
 
     /// [`Self::replace_text_run`] for a rewritten reasoning part.
@@ -5439,33 +5411,10 @@ impl StreamAccumulator {
             source: Some(self.rewrite_source(source, text, Some(crate::feishu::card::REASONING_TEXT_CAP))),
             index: source.index(),
         };
-        self.replace_scripted(
-            source,
-            facts,
-            TranscriptKind::Reasoning {
-                chunk: text.to_string(),
-                lead: None,
-            },
-        );
-    }
-
-    /// Replace a part's entry run through the production message scope (spec
-    /// #1040's test seam, #1043): the same `replace_*_scoped` path a real walk
-    /// uses, with the scripted message's cut as the only floor.
-    #[cfg(test)]
-    fn replace_scripted(&mut self, source: &PartSource, facts: PartFacts, kind: TranscriptKind) {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        let result = match kind {
-            TranscriptKind::Text { chunk, .. } => {
-                self.replace_text_scoped(&read_order, &message, source, facts, chunk)
-            }
-            TranscriptKind::Reasoning { chunk, .. } => {
-                self.replace_reasoning_scoped(&read_order, &message, source, facts, chunk)
-            }
-            TranscriptKind::Tool(_) => unreachable!("a tool panel has no rewritten run"),
-        };
-        result.expect("the scripted message scope accepts its own rewrite");
+        self.replace_reasoning_scoped(&read_order, &message, source, facts, text.to_string())
+            .expect("the scripted message scope accepts its own rewrite");
     }
 
     /// The source a rewritten part's fresh run carries: its position with the
