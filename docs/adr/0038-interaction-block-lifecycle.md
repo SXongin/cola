@@ -359,7 +359,7 @@ mis-ordered:
   of appending it after a part already pushed at the same key. The sort uses an
   internal `order`: an ordinary insert's `order` equals its `seq`, a chunked
   continuation shares its part's `order`, and the render-boundary clamp lowers
-  `order` alone — never the identity `seq` (ADR-0040). ADR-0104 replaces the
+  `order` alone — never the identity `seq` (ADR-0040). ADR-0104, when it lands, replaces the
   equal-key rule: synthetic and source-less entries sort first (a receipt stays
   above content floored to its key), then source-bearing transcript entries by
   read position, so a later-visible earlier-message entry lands ahead of a later
