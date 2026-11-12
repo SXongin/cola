@@ -4,9 +4,11 @@
 > with the Session Snapshot card, so every **Interaction Block** lives on a live
 > card or its own standalone card, and `SnapshotClaims` no longer exists.
 >
-> **Amended by ADR-0104 when it lands**: the placement rules below — how a
-> synthetic entry is keyed, the equal-key tie-break and the read floor — move to
-> the Timeline module; #1040 carries the exact rules and their tests.
+> **Amended by ADR-0104 when it lands**: how a synthetic entry is keyed, the
+> equal-key tie-break and the read floor are both **owned** by the Timeline module
+> and **changed** (a derived key before the work it introduces; class-then-read-
+> position at equal keys; earlier messages' pinned tails in the floor). #1040
+> carries the exact rules and their tests.
 
 A pending Permission/Question is rendered inline on the card the Host is already reading (an **Interaction Block**). Its updates were ad-hoc: discovery and first render came from the 3 s request poller; a click mostly repainted "the accumulator's current card" through a PATCH; a request resolved by another client was stripped from memory but never repainted; and a card that stopped being the accumulator's current card had no repaint path at all. Observed: a block clicked on an older card only toasted; a remotely-resolved block lingered on a finished turn's card forever; permission/answer disappearance lagged the click by one PATCH; a block whose turn ended froze in place. This ADR fixes the lifecycle: blocks stay inline and follow the live card, and every card showing a live block carries a handle that lets cola repaint it — cached last-rendered JSON plus a `request_id → message_id` registry — so a click updates the clicked card atomically in the callback ack and a remote resolution repaints within one sweep.
 
