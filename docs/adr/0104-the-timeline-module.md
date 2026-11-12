@@ -66,37 +66,38 @@ content into them.**
 - **The interface is a walk.** `timeline.walk(&read_order)` yields a walk;
   `walk.message(created, id)` yields a message scope; the scope's `place(part
   facts) -> Placement` and `push(placement, kind: TranscriptKind)` are the only
-  way transcript content enters. Content-bearing kinds are separate types at the
-  seam — `TranscriptKind::{Text, Reasoning, Tool(call_id)}` and
-  `SyntheticKind::{Receipt, Compaction, Ledger, Lead, Notice, UserMessage}` — so
-  a synthetic kind cannot be pushed down the transcript path (both map onto the
-  stored `TimelineKind`). The tool's panel body stays in the accumulator's tool
+  way transcript content enters. Transcript content is a separate type at the
+  seam (`TranscriptKind::{Text, Reasoning, Tool(call_id)}`; synthetic entries
+  have their own admission below), so a synthetic entry cannot be pushed down
+  the transcript path. The tool's panel body stays in the accumulator's tool
   map, which file delivery and liveness keep updating, and the card build reads
   it from there as today. `place` applies the same floors a transcript part gets:
   the message's `receipt_cut_floor(created)`, the read floor carried by the
-  walk, and the live-slice clamp. The message scope's `Drop` clears the message
-  floor and the walk's `Drop` clears the read floor, so the half-written
+  walk, the live-slice clamp, and placed-part stability (a part already on the
+  timeline keeps the key it was placed at). The message scope's `Drop` clears the
+  message floor and the walk's `Drop` clears the read floor, so the half-written
   protocol that produced the fixes above is no longer representable.
 - **Synthetic entries have their own admission.** An Interaction Receipt, a
   compaction row, a ledger entry, the External Message's lead and a bot-authored
   notice (the Wake 承接 line, a busy-follow static lead) are not read-order
   content, so they never take the read floor and never join a walk. They enter
-  through `Timeline::synthetic(kind: SyntheticKind, at: Option<i64>, row)`, which
-  inserts directly and returns the key the entry actually took — it yields no
-  pushable `Placement`, so a synthetic row can never travel the transcript path.
-  `at` is the entry's order key when the caller holds one — a resolved click's
-  **reserved receipt key** (ADR-0038), a Wake's or a message's server time — else
-  `next_order()`. The display clock is `at` only for the kinds that show one and
-  only when `at` is `Some`; an Interaction Receipt and a notice always show none,
-  and a minted fallback is never displayed. The **compaction row** is the one
-  that takes the Interaction Receipt cut for its message time — the floor
-  `render_compactions` sets around it today (ADR-0038, issue #1023); the others
-  are placed outside any floor window today and keep that. `row` is the entry's
-  merge identity: a compaction row carries its `PartSource` so a terminal fact
-  updates the running row in place instead of appending a second one; the others
-  pass none and append. A reserved receipt key the live slice no longer reaches
-  (a split finalized past it) is clamped to the slice's first key, exactly the
-  clamp `insert_item` applies today, and the returned key is the clamped one.
+  through `Timeline::synthetic(entry: SyntheticEntry)` — one content-bearing
+  variant per kind: `Receipt { text, at }`, `Compaction { fact, at, row }`,
+  `Ledger { entry, ending, at }`, `UserMessage { text, at }`,
+  `Notice { text, at }` — which inserts directly and returns the key the entry
+  took. It yields no pushable `Placement`, so a synthetic row can never travel
+  the transcript path. A **receipt's** `at` is an order key only — a resolved
+  click's **reserved receipt key** (ADR-0038) or a server time — and its card
+  shows no clock. Every other variant's `at` is a server time and is displayed
+  when `Some`; a minted fallback is never displayed. The **compaction row** is
+  the one that takes the Interaction Receipt cut for its message time — the
+  floor `render_compactions` sets around it today (ADR-0038, issue #1023); the
+  others are placed outside any floor window today and keep that. `row` is the
+  compaction's merge identity, so a terminal fact updates the running row in
+  place instead of appending a second one. A reserved receipt key the live slice
+  no longer reaches (a split finalized past it) is clamped to the slice's first
+  key, exactly the clamp `insert_item` applies today, and the returned key is
+  the clamped one.
 - **The receipt seam.** The Timeline exposes `reserve_key` (minting a click's
   receipt and floor keys from its order sequence), `retune_cut(floor_key, at)`
   and `forget_cut(floor_key)`, so a mode change resolving several blocks can
@@ -125,9 +126,12 @@ content into them.**
   it was placed under, the call id, and the pinned `seq` — plus its panel body in
   the tool map. `MessageScope::pin(facts, call_id)` produces it; it cannot be
   pushed, only settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
-  replacement, clamped to that floor, so a tail-only panel cannot jump the
-  receipt cut or the read floor when its start time arrives;
-  `Timeline::settle(tail, panel)` seats it with the stored `seq`. This clamp is
+  replacement, clamped to the floor the pin carried.
+  `Timeline::settle(tail, panel)` applies the **current** receipt cut for the
+  tail's message time (a receipt recorded after the pin still floors it) together
+  with the read floor captured at pin, then seats the panel with the stored
+  `seq`. So a tail-only panel cannot jump a receipt cut, before or after its
+  start time arrives. This clamp is
   the ADR's one deliberate tightening, and a test pins it; every other placement
   rule and every current test is unchanged. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
