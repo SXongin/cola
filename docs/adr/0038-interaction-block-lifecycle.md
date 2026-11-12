@@ -13,7 +13,9 @@
 > floored to a receipt's key stays below that receipt), and positioned entries
 > (a tail **Tool Panel** included) order by **read position** — the message's
 > position in the read, then the part index — not by allocation; `order` breaks
-> ties only within a class. Placed content never moves; `seq` stays identity. The
+> ties only within a class. The read floor of a message also counts **earlier
+> messages' pinned tails** (ADR-0104's deliberate extension; tails are not
+> Timeline entries). Placed content never moves; `seq` stays identity. The
 > receipt's server-time cut is unchanged.
 
 A pending Permission/Question is rendered inline on the card the Host is already reading (an **Interaction Block**). Its updates were ad-hoc: discovery and first render came from the 3 s request poller; a click mostly repainted "the accumulator's current card" through a PATCH; a request resolved by another client was stripped from memory but never repainted; and a card that stopped being the accumulator's current card had no repaint path at all. Observed: a block clicked on an older card only toasted; a remotely-resolved block lingered on a finished turn's card forever; permission/answer disappearance lagged the click by one PATCH; a block whose turn ended froze in place. This ADR fixes the lifecycle: blocks stay inline and follow the live card, and every card showing a live block carries a handle that lets cola repaint it — cached last-rendered JSON plus a `request_id → message_id` registry — so a click updates the clicked card atomically in the callback ack and a remote resolution repaints within one sweep.
@@ -367,7 +369,8 @@ mis-ordered:
   differ, and re-keying would split a growing part into two entries.
 - **Across messages, read order is monotonic.** Each walk floors a message's
   parts at the highest key a part from an EARLIER transcript message already
-  holds (`read_floor_before`/`set_read_floor`). A post-tool part that took
+  holds (`read_floor_before`/`set_read_floor`), plus any pinned tail of an
+  earlier message (ADR-0104's extension). A post-tool part that took
   `next_order` therefore cannot be overtaken by a later message whose own
   server time is older, on any read pass — including the pass that dedupes the
   earlier message. Inside one message the transcript part order wins: the floor

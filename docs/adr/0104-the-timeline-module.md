@@ -255,7 +255,7 @@ content into them.**
   inside a fence keeps its opener; a **source-bearing** post-click part floored
   to a receipt's key still sorts below that receipt; a post-click compaction row
   still floors at the receipt; a repeated compaction fact updates the row it
-  already has; a Wake ledger entry
+  already has **without a split** (the split-state outcome is #1049); a Wake ledger entry
   shows its `finished_at` across a minute boundary rather than its keyed clock;
   and a compaction row shows no clock).
 
