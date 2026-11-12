@@ -358,8 +358,9 @@ mis-ordered:
   differ, and re-keying would split a growing part into two entries.
 - **Across messages, read order is monotonic.** Each walk floors a message's
   parts at the highest key a part from an EARLIER transcript message already
-  holds (`read_floor_before`/`set_read_floor`), plus any pinned tail of an
-  earlier message (#1040's extension). A post-tool part that took
+  holds (`read_floor_before`/`set_read_floor`, since replaced by the Timeline
+  walk's read floor), plus any pinned tail of an earlier message (#1040's
+  extension). A post-tool part that took
   `next_order` therefore cannot be overtaken by a later message whose own
   server time is older, on any read pass — including the pass that dedupes the
   earlier message. Inside one message the transcript part order wins: the floor

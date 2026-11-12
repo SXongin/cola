@@ -30,10 +30,11 @@ bare `i64`s.
   `set_message_floor` → `read_floor_before` → `set_read_floor` … →
   `set_message_floor(None)`, and `render.rs` called `reset_read_floor()` thirteen
   times (eleven in production, two in the test-only `render_parts`).
-- **The inputs travel as bare integers.** Every push takes an order key and a
-  display clock side by side, and `render_part` threads the key from
-  `part_order_times`. Five wrapper layers (`push_text` → … → `push_text_at_key`)
-  exist to default one parameter.
+- **The inputs traveled as bare integers (at `main@1268d2d0`; the batch
+  narrowed them).** Every push took an order key and a display clock side by
+  side, and `render_part` threaded the key from `part_order_times`. Five wrapper
+  layers (`push_text` → … → `push_text_at_key`) existed to default one
+  parameter.
 - **The cost is measurable.** 111 of the 2,268 subjects on `main` in the three
   months to 2026-11-12 match `order|floor|receipt|place|clamp|seq`
   (`git log --oneline 1268d2d0 --since=2026-08-12 | grep -ciE …`), and a run of
@@ -124,10 +125,10 @@ ADR-0050 records is unchanged.
 - **One insert path.** `Timeline::seat` seats an entry at its already-resolved
   slot, allocates `seq` when the caller has none and lowers a clamped entry's
   `order`; the live-slice clamp is `slot_at`, the equal-key partition is
-  `slot_for_new` / `slot_for_seq` / `slot_after`, and the continuation/merge
-  walk is `push_text_at_slot` (`source_entry`, the remaining-space probe,
-  `slot_after`). `place` and the insert consume one key computation, so
-  `part_order_key` and the mirrored clamps are gone.
+  `slot_for_new` / `slot_for_seq`, and the continuation/merge walk is
+  `push_text_at_slot` (`source_entry`, the remaining-space probe, `slot_after`).
+  `place` and the insert consume one key computation, so `part_order_key` and
+  the mirrored clamps are gone.
 - **What stays in the accumulator.** `StreamAccumulator` (name unchanged) keeps
   the text and reasoning buffers, content-keyed dedup and the rewritten part's
   prefix digest, the interactions and the `request_id → ReservedReceipt` map
