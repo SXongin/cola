@@ -1263,17 +1263,17 @@ pub(super) struct StreamAccumulator {
     /// [`Self::set_ending_write`]; read through [`Self::ending_write`].
     ending_write: EndingWrite,
     /// The card's streamed assistant text, in arrival order — the reply body.
-    /// Private to this module: written only by [`Self::push_text_lead`] (the
-    /// sink for `push_text` / `push_text_at` / `push_text_from` /
-    /// `replace_text_run`); read through [`Self::text`].
+    /// Private to this module: written only by [`Self::push_text_scoped`] (the
+    /// sink for the test-only scripted pushes and `replace_text_scoped`); read
+    /// through [`Self::text`].
     text: String,
     /// The card's streamed reasoning text, in arrival order. Private to this
-    /// module: written only by [`Self::push_reasoning_lead`] (the sink for
-    /// `push_reasoning` / `push_reasoning_from` / `replace_reasoning_run`); read
+    /// module: written only by [`Self::push_reasoning_scoped`] (the sink for
+    /// the test-only scripted pushes and `replace_reasoning_scoped`); read
     /// through [`Self::reasoning`].
     reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
-    /// Private to this module: written by [`Self::push_tool_from`], the seeded
+    /// Private to this module: written by [`Self::push_tool_scoped`], the seeded
     /// delivery [`Self::mark_delivered_part`] and the liveness attach
     /// [`Self::set_tool_liveness`]; read through [`Self::tool_panel_current`],
     /// [`Self::tool_settled`], [`Self::tool_count`],
@@ -2632,13 +2632,13 @@ impl StreamAccumulator {
     }
 
     /// The card's streamed assistant text. Private to this module: written by
-    /// [`Self::push_text_lead`].
+    /// [`Self::push_text_scoped`].
     pub(super) fn text(&self) -> &str {
         &self.text
     }
 
     /// The card's streamed reasoning text. Private to this module: written by
-    /// [`Self::push_reasoning_lead`].
+    /// [`Self::push_reasoning_scoped`].
     pub(super) fn reasoning(&self) -> &str {
         &self.reasoning
     }
@@ -3653,11 +3653,12 @@ impl StreamAccumulator {
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
     /// — the card splitter can then break a long answer across cards at item
     /// boundaries instead of truncating it. Production renders place through
-    /// [`Self::push_text_scoped`] (the message scope); [`Self::push_text`] and
-    /// [`Self::push_text_at`] are test-only convenience forms.
+    /// [`Self::push_text_scoped`]; this and [`Self::push_text_at`] /
+    /// [`Self::push_text_at_key`] are the test-only convenience forms.
     #[cfg(test)]
     pub(super) fn push_text(&mut self, chunk: &str) {
-        self.push_text_at(None, chunk);
+        self.push_text_scripted(None, None, None, chunk, None)
+            .expect("the scripted message scope accepts its own placement");
     }
 
     /// [`Self::push_text`] for a chunk from the part that started at `at_ms`
@@ -3666,40 +3667,17 @@ impl StreamAccumulator {
     /// monotonic fallback (call order) and shows no clock. Test-only.
     #[cfg(test)]
     pub(super) fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
-        self.push_text_from(at_ms, None, chunk);
+        self.push_text_scripted(at_ms, at_ms, None, chunk, None)
+            .expect("the scripted message scope accepts its own placement");
     }
 
-    /// [`Self::push_text_at`] carrying the typed transcript part this chunk
-    /// rendered from (spec #561's cursor frontier). Synthetic pushes pass
-    /// `None`.
-    #[cfg(test)]
-    pub(super) fn push_text_from(&mut self, at_ms: Option<i64>, source: Option<PartSource>, chunk: &str) {
-        self.push_text_lead(at_ms, source, chunk, None);
-    }
-
-    /// [`Self::push_text_from`] with a markdown lead emitted before the
-    /// chunk's content (spec #561's cut tail): the lead renders (closing the
-    /// construct the delivered prefix left open) while the entry's counted
-    /// characters stay the model's suffix, so the Rendered Cursor's arithmetic
-    /// is exact.
-    #[cfg(test)]
-    pub(super) fn push_text_lead(
-        &mut self,
-        at_ms: Option<i64>,
-        source: Option<PartSource>,
-        chunk: &str,
-        lead: Option<String>,
-    ) {
-        self.push_text_at_key(at_ms, at_ms, source, chunk, lead);
-    }
-
-    /// [`Self::push_text_lead`] for a part whose timeline ORDER key is not the
-    /// server time it may show (issue #1022): V2 decodes text parts without a
-    /// time at all, so the card sorts them by the transcript's own order while
-    /// the Rendered Cursor frontier must keep the part's real (absent) start
-    /// time. `key_at` positions the entries; `shown_at` is what the entry
-    /// displays and what the cursor records. Test-only: production renders
-    /// place through [`Self::push_text_scoped`].
+    /// The test-only scripted push with every placement input spelled out
+    /// (spec #1040): the render fixtures and the ordering tests that need an
+    /// ORDER key apart from the displayed clock (issue #1022), a typed
+    /// transcript part, or a markdown lead. `key_at` positions the entry;
+    /// `shown_at` is what it displays and what the cursor records. Production
+    /// renders never call this: they place through the message scope
+    /// ([`Self::push_text_scoped`]).
     #[cfg(test)]
     pub(super) fn push_text_at_key(
         &mut self,
@@ -3709,6 +3687,23 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
+        self.push_text_scripted(key_at, shown_at, source, chunk, lead)
+            .expect("the scripted message scope accepts its own placement");
+    }
+
+    /// The shared body of the text convenience pushes: a placement in the
+    /// source-less scripted message scope ([`Self::scripted_transcript`]),
+    /// outside the read, so a test push keeps its own ordering and the guards'
+    /// floors stay the only ones applied.
+    #[cfg(test)]
+    fn push_text_scripted(
+        &mut self,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        chunk: &str,
+        lead: Option<String>,
+    ) -> Result<(), PlacementError> {
         let facts = PartFacts {
             form: PartForm::Text,
             key_at,
@@ -3719,17 +3714,17 @@ impl StreamAccumulator {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
         self.push_text_scoped(&read_order, &message, facts, chunk.to_string(), lead)
-            .expect("the scripted message scope accepts its own placement");
     }
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
     /// (chunks of the same part merge into one panel; a part keyed apart is
     /// its own panel). Production renders place through
-    /// [`Self::push_reasoning_scoped`] (the message scope); this convenience
-    /// form is for tests and synthetic content.
+    /// [`Self::push_reasoning_scoped`]; this and [`Self::push_reasoning_at`] /
+    /// [`Self::push_reasoning_at_key`] are the test-only convenience forms.
     #[cfg(test)]
     pub(super) fn push_reasoning(&mut self, chunk: &str) {
-        self.push_reasoning_at(None, chunk);
+        self.push_reasoning_scripted(None, None, None, chunk, None)
+            .expect("the scripted message scope accepts its own placement");
     }
 
     /// [`Self::push_reasoning`] for a reasoning part that started at `at_ms`
@@ -3738,42 +3733,16 @@ impl StreamAccumulator {
     /// through [`Self::push_reasoning_scoped`].
     #[cfg(test)]
     pub(super) fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
-        self.push_reasoning_from(at_ms, None, chunk);
+        self.push_reasoning_scripted(at_ms, at_ms, None, chunk, None)
+            .expect("the scripted message scope accepts its own placement");
     }
 
-    /// [`Self::push_reasoning_at`] carrying the typed transcript part this
-    /// chunk rendered from (spec #561's cursor frontier). Synthetic pushes
-    /// pass `None`. Test-only: a production render that needs an order key
-    /// apart from the displayed time calls [`Self::push_reasoning_scoped`].
-    #[cfg(test)]
-    pub(super) fn push_reasoning_from(
-        &mut self,
-        at_ms: Option<i64>,
-        source: Option<PartSource>,
-        chunk: &str,
-    ) {
-        self.push_reasoning_lead(at_ms, source, chunk, None);
-    }
-
-    /// [`Self::push_reasoning_from`] with a markdown lead emitted before the
-    /// chunk's content (spec #561's cut tail), exactly like
-    /// [`Self::push_text_lead`]. Test-only; see [`Self::push_reasoning_at_key`].
-    #[cfg(test)]
-    pub(super) fn push_reasoning_lead(
-        &mut self,
-        at_ms: Option<i64>,
-        source: Option<PartSource>,
-        chunk: &str,
-        lead: Option<String>,
-    ) {
-        self.push_reasoning_at_key(at_ms, at_ms, source, chunk, lead);
-    }
-
-    /// [`Self::push_reasoning_lead`] for a part whose timeline ORDER key is not
-    /// the server time it may show: V2's reasoning time is optional, so an
-    /// untimed part sorts by the transcript's own order while the entry (and
-    /// its cursor frontier) keeps the absent server clock (issue #1022).
-    /// Test-only: production renders place through
+    /// The test-only scripted reasoning push with every placement input spelled
+    /// out: a part whose timeline ORDER key is not the server time it may show
+    /// (V2's reasoning time is optional, so an untimed part sorts by the
+    /// transcript's own order while the entry and its cursor frontier keep the
+    /// absent server clock — issue #1022), a typed transcript part, or a
+    /// markdown lead. Production renders place through
     /// [`Self::push_reasoning_scoped`].
     #[cfg(test)]
     pub(super) fn push_reasoning_at_key(
@@ -3784,6 +3753,21 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
+        self.push_reasoning_scripted(key_at, shown_at, source, chunk, lead)
+            .expect("the scripted message scope accepts its own placement");
+    }
+
+    /// The shared body of the reasoning convenience pushes; see
+    /// [`Self::push_text_scripted`].
+    #[cfg(test)]
+    fn push_reasoning_scripted(
+        &mut self,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        chunk: &str,
+        lead: Option<String>,
+    ) -> Result<(), PlacementError> {
         let facts = PartFacts {
             form: PartForm::Reasoning,
             key_at,
@@ -3794,7 +3778,6 @@ impl StreamAccumulator {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
         self.push_reasoning_scoped(&read_order, &message, facts, chunk.to_string(), lead)
-            .expect("the scripted message scope accepts its own placement");
     }
 
     /// The scripted message the integration suite's source-less test pushes
@@ -3819,10 +3802,12 @@ impl StreamAccumulator {
 
     /// Insert/update a tool panel; the timeline gets a marker only on the FIRST
     /// appearance (state updates re-render in place). Production renders place
-    /// through [`Self::push_tool_scoped`]; this convenience form is test-only.
+    /// through [`Self::push_tool_scoped`]; this and [`Self::push_tool_at`] /
+    /// [`Self::push_tool_at_key`] are the test-only convenience forms.
     #[cfg(test)]
     pub(super) fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
-        self.push_tool_at(None, call_id, panel);
+        self.push_tool_scripted(None, None, call_id, panel, None)
+            .expect("the scripted message scope accepts its own tool placement");
     }
 
     /// [`Self::push_tool`] for a tool call that started at `at_ms` (the typed
@@ -3834,29 +3819,16 @@ impl StreamAccumulator {
     /// no clock.
     #[cfg(test)]
     pub(super) fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
-        self.push_tool_from(at_ms, call_id, panel, None);
+        self.push_tool_scripted(at_ms, at_ms, call_id, panel, None)
+            .expect("the scripted message scope accepts its own tool placement");
     }
 
-    /// [`Self::push_tool_at`] carrying the typed transcript part the call
-    /// rendered from (spec #561, review #569): a settled panel's timeline entry
-    /// keeps it, so it can become the Rendered Cursor frontier. Test-only: a
-    /// production render that needs an order key apart from the displayed time
-    /// calls [`Self::push_tool_scoped`].
-    #[cfg(test)]
-    pub(super) fn push_tool_from(
-        &mut self,
-        at_ms: Option<i64>,
-        call_id: &str,
-        panel: ToolPanel,
-        source: Option<PartSource>,
-    ) {
-        self.push_tool_at_key(at_ms, at_ms, call_id, panel, source);
-    }
-
-    /// [`Self::push_tool_from`] for a call whose timeline ORDER key is not the
-    /// server time it may show (issue #1022): an untimed part borrows the
-    /// previous part's key while the panel keeps showing no clock. Test-only:
-    /// production renders place through [`Self::push_tool_scoped`].
+    /// The test-only scripted tool push with every placement input spelled out:
+    /// a call whose timeline ORDER key is not the server time it may show (an
+    /// untimed part borrows the previous part's key while the panel keeps
+    /// showing no clock — issue #1022), or whose entry carries the typed
+    /// transcript part it rendered from (spec #561, review #569). Production
+    /// renders place through [`Self::push_tool_scoped`].
     #[cfg(test)]
     pub(super) fn push_tool_at_key(
         &mut self,
@@ -3866,10 +3838,24 @@ impl StreamAccumulator {
         panel: ToolPanel,
         source: Option<PartSource>,
     ) {
+        self.push_tool_scripted(key_at, shown_at, call_id, panel, source)
+            .expect("the scripted message scope accepts its own tool placement");
+    }
+
+    /// The shared body of the tool convenience pushes; see
+    /// [`Self::push_text_scripted`].
+    #[cfg(test)]
+    fn push_tool_scripted(
+        &mut self,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+        call_id: &str,
+        panel: ToolPanel,
+        source: Option<PartSource>,
+    ) -> Result<(), PlacementError> {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
         self.push_tool_scoped(&read_order, &message, 0, key_at, shown_at, call_id, panel, source)
-            .expect("the scripted message scope accepts its own tool placement");
     }
 
     /// Every live tail's fact, as the walk and the settle read them (spec
@@ -3916,7 +3902,9 @@ impl StreamAccumulator {
         scope.replace(placement, replaced, kind)
     }
 
-    /// [`Self::push_text_at_key`] through the message scope (spec #1040).
+    /// Place and push one text part through the message scope (spec #1040):
+    /// the production render's text path. The test-only scripted convenience
+    /// [`Self::push_text_at_key`] and its siblings delegate here.
     pub(super) fn push_text_scoped(
         &mut self,
         read_positions: &HashMap<&str, usize>,
@@ -3940,7 +3928,10 @@ impl StreamAccumulator {
         result
     }
 
-    /// [`Self::push_reasoning_at_key`] through the message scope (spec #1040).
+    /// Place and push one reasoning part through the message scope (spec
+    /// #1040): the production render's reasoning path. The test-only scripted
+    /// convenience [`Self::push_reasoning_at_key`] and its siblings delegate
+    /// here.
     pub(super) fn push_reasoning_scoped(
         &mut self,
         read_positions: &HashMap<&str, usize>,
@@ -3964,7 +3955,9 @@ impl StreamAccumulator {
         result
     }
 
-    /// [`Self::replace_text_run`] through the message scope (spec #1040).
+    /// Replace a rewritten text part's run through the message scope (spec
+    /// #1040): the production render's rewrite path. The test-only
+    /// [`Self::replace_text_run`] delegates here.
     pub(super) fn replace_text_scoped(
         &mut self,
         read_positions: &HashMap<&str, usize>,
@@ -3989,7 +3982,9 @@ impl StreamAccumulator {
         result
     }
 
-    /// [`Self::replace_reasoning_run`] through the message scope (spec #1040).
+    /// Replace a rewritten reasoning part's run through the message scope (spec
+    /// #1040): the production render's rewrite path. The test-only
+    /// [`Self::replace_reasoning_run`] delegates here.
     pub(super) fn replace_reasoning_scoped(
         &mut self,
         read_positions: &HashMap<&str, usize>,
@@ -4014,9 +4009,11 @@ impl StreamAccumulator {
         result
     }
 
-    /// [`Self::push_tool_at_key`] through the message scope (spec #1040): a
-    /// running call pins a [`TailPlacement`] that never enters `push`; a
-    /// settled first sighting pushes its entry; a settled live tail settles.
+    /// Place and push one tool call through the message scope (spec #1040):
+    /// the production render's tool path. A running call pins a
+    /// [`TailPlacement`] that never enters `push`; a settled first sighting
+    /// pushes its entry; a settled live tail settles. The test-only
+    /// [`Self::push_tool_at_key`] and its siblings delegate here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn push_tool_scoped(
         &mut self,

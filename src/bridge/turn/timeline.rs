@@ -1682,10 +1682,9 @@ impl MessageScope<'_> {
             return Err(PlacementError::SourceMismatch);
         }
         // A rewrite re-floors at its placement key exactly as the pre-#1040
-        // replace did: `part_order_key` applied the message/read floor at push
-        // time (after the run dropped), and `insert_item` re-applied it; here
-        // `place` applied the same floor before the drop and `push` re-clamps
-        // at the same floor after it. Parity, not a tightening.
+        // replace did: `place` applied the message and read floor before the
+        // run dropped, and `push` re-applies the same floor after it. Parity,
+        // not a tightening.
         if let Some(floor) = placement.floor {
             placement.key = placement.key.max(floor);
         }
@@ -2104,14 +2103,14 @@ mod tests {
         acc.push_receipt_at(Some(1_000), "✅ 已回答");
         acc.push_text_at(Some(5_000), "已发送卡片");
         let head = PartSource::at(MessageId::new("msg_head"), 0);
-        acc.push_text_from(Some(9_000), Some(head), "新切片");
+        acc.push_text_at_key(Some(9_000), Some(9_000), Some(head), "新切片", None);
         // Move the live slice past both pre-split entries WITHOUT sealing them:
         // the merge lookup must cross an unsealed boundary.
         acc.test_set_render_from(2);
         acc.record_receipt_cut(500, 1_000);
         let part = PartSource::at(MessageId::new("msg_part"), 0);
-        acc.push_text_from(Some(3_000), Some(part.clone()), "甲");
-        acc.push_text_from(Some(3_000), Some(part), "乙");
+        acc.push_text_at_key(Some(3_000), Some(3_000), Some(part.clone()), "甲", None);
+        acc.push_text_at_key(Some(3_000), Some(3_000), Some(part), "乙", None);
         acc.script_message(None);
         let texts: Vec<&str> = acc
             .timeline()
@@ -2312,9 +2311,9 @@ mod tests {
             asked_at: Some(5_000),
         }));
         let part = PartSource::at(MessageId::new("msg_v2"), 0);
-        acc.push_text_from(None, Some(part.clone()), "第一段");
+        acc.push_text_at_key(None, None, Some(part.clone()), "第一段", None);
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.push_text_from(None, Some(part), "继续");
+        acc.push_text_at_key(None, None, Some(part), "继续", None);
         let texts: Vec<&str> = acc
             .timeline()
             .iter()
@@ -2369,8 +2368,8 @@ mod tests {
             prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(text)),
         };
         let mut acc = StreamAccumulator::new("test");
-        acc.push_text_lead(Some(2_000), Some(source(0, first)), first, None);
-        acc.push_text_lead(Some(2_000), Some(source(1, second)), second, None);
+        acc.push_text_at_key(Some(2_000), Some(2_000), Some(source(0, first)), first, None);
+        acc.push_text_at_key(Some(2_000), Some(2_000), Some(source(1, second)), second, None);
 
         assert_eq!(
             acc.timeline()
