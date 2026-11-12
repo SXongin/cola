@@ -112,9 +112,11 @@ content into them.**
   the **live slice**: a terminal fact after a split starts a row on the live card
   rather than updating a finalized one. That successor row is **terminal only** —
   the finalized card keeps the `running` revision it was sent with — and the
-  delivered bound must not suppress a position the live slice no longer carries,
-  so exactly-once becomes **one revision per card body** rather than one row per
-  session (ADR-0082 §3's amendment). A reserved receipt key the live slice
+  delivered bound must not suppress a position the live slice no longer carries
+  **in this chain's own accumulator** — a later Turn's fresh Timeline carries no
+  such row, so the session bound still applies there. Exactly-once becomes one
+  revision per **live-timeline** body rather than one row per session (ADR-0082
+  §3's amendment); the busy-follow static lead's copy is its standing exception. A reserved receipt key the live slice
   no longer reaches (a split finalized past it) is clamped to the slice's first
   key, exactly the clamp `insert_item` applies today, and the returned key is
   the clamped one.
@@ -150,8 +152,8 @@ content into them.**
 - **What the module owns.** The Timeline's entries (`TimelineItem`), the floors,
   the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
-  entry identity (`seq`, including the seq a live tool panel pins when it
-  settles, ADR-0045). `part_order_key` retires and `insert_item` /
+  entry identity (`seq`, including the seq a live tool panel keeps from first
+  sighting when it settles, ADR-0045). `part_order_key` retires and `insert_item` /
   `insert_kind_after` become one private insert path, so the live-slice clamp is
   computed once. `TimelineKind` keeps its current shape (`Tool(call_id)` among
   the variants) and gains no generic parameter — there is no second entry
@@ -168,10 +170,12 @@ content into them.**
   floors it) and the current read floor for that message — the high-water mark of
   **earlier** messages only, exactly ADR-0038's rule, recomputed against the
   settle read so content that became visible after the pin still floors the
-  panel. A key raised to that floor takes a **fresh `order` above any equal-key
-  run** (the pinned `seq` is identity, not position), so the panel renders after
-  the content that floored it; this is the one place the equal-key allocation
-  rule defers to read order, and ADR-0038's note records it. So a tail-only panel cannot jump a receipt cut or
+  panel. When the floor is **at or above** the pinned key, the panel takes a
+  **fresh `order` above the equal-key entries of earlier messages** but below
+  those of its own message that follow it in part order — so it renders after the
+  content that floored it while in-message transcript order still wins (the
+  pinned `seq` is identity, not position). This is the one place the equal-key
+  allocation rule defers to read order, and ADR-0038's note records it. So a tail-only panel cannot jump a receipt cut or
   content read after it was pinned, before or after its start time arrives.
   The deliberate tightenings are the settle clamp, its equal-key exception, and
   the compaction row's live-slice lookup (a terminal fact after a split lands on

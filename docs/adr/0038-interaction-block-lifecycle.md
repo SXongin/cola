@@ -7,8 +7,9 @@
 > **Amended by ADR-0104 when it lands** (the keying sentence and the equal-key rule): synthetic
 > entries may be keyed at their own server time or at a key the caller already
 > holds — a click's reserved receipt key, the Wake 承接 line's server time — not
-> only at `next_order()`; and a tail-only **Tool Panel** whose settle raises its key takes a
-> fresh allocation order above the equal-key run, because its allocation predates
+> only at `next_order()`; and a tail-only **Tool Panel** whose settle floor is at or above its key takes a
+> fresh allocation order above the equal-key entries of earlier messages (but
+> below its own message's following entries), because its allocation predates
 > content that became visible after it was pinned. The receipt's server-time cut
 > is unchanged.
 
