@@ -192,7 +192,9 @@ content into them.**
   token cannot be paired with another part's run. The Timeline prefers the key
   the part's existing entry already holds (else the placement's key), drops every
   entry of that `PartSource` across the boundary while keeping `render_from` on
-  the same logical position, and inserts the new run.
+  the same logical position, and inserts the new run. It validates the token, the
+  kind and the source **completely before any mutation**: a refusal leaves the
+  old run, its key and `render_from` untouched.
 - **What the module owns.** The Timeline's entries (`TimelineItem`), the floors,
   the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
@@ -222,10 +224,12 @@ content into them.**
   the Timeline keeps only earlier messages' tails and the panel's own preceding
   ones (a later same-message tail can never raise the floor). The panel seats at
   `max(current, floor)` — `current` is its key after any `rekey`, the original pin
-  before one — capped at the first entry that follows the panel in read order
-  (its own message's later parts, then later messages') when that entry's key is
-  at or above the floor, so a real start time never carries it past content the
-  read already placed after it. It goes through the normal insert path (the
+  before one — capped at the **minimum key among all entries that follow the panel
+  in read order** (its own message's later parts, then later messages') that is at
+  or above the floor, so a real start time never carries it past content the read
+  already placed after it. The cap takes the minimum, not the first: after a tool,
+  keys need not be monotonic (`next_order()` then a later completed tool's server
+  time). It goes through the normal insert path (the
   live-slice late-part clamp included), and at that key it sorts by its own
   part's read position (see below) — after earlier-message entries at the key and
   before its own message's later parts. A synthetic entry at that key sorts

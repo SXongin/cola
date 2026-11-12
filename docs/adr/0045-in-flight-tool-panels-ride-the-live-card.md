@@ -10,9 +10,9 @@
 > tail never raises it — ADR-0104's settle extension) — and
 > applies ADR-0038's late-part clamp, so the panel cannot jump a receipt or
 > content read before it. Its key is `max(current, floor)` (the current key after
-> any `rekey`), **capped at the first entry that follows the panel in read order**
-> — its own message's later parts, then later messages' — when that entry's key
-> is at or above the floor; at that key it sorts by its own part's read position,
+> any `rekey`), **capped at the minimum key among all entries that follow the
+> panel in read order** — its own message's later parts, then later messages' —
+> when that key is at or above the floor; at that key it sorts by its own part's read position,
 > landing after earlier-message entries and before those later parts. Placed
 > content never moves. A same-message continuation at a **lower** key stays put,
 > so the floor wins and the panel lands after it.
