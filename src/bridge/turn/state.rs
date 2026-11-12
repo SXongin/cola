@@ -1263,14 +1263,13 @@ pub(super) struct StreamAccumulator {
     /// [`Self::set_ending_write`]; read through [`Self::ending_write`].
     ending_write: EndingWrite,
     /// The card's streamed assistant text, in arrival order — the reply body.
-    /// Private to this module: written only by [`Self::push_text_scoped`] (the
-    /// sink for the test-only scripted pushes and `replace_text_scoped`); read
-    /// through [`Self::text`].
+    /// Private to this module: written by [`Self::push_text_scoped`],
+    /// [`Self::replace_text_scoped`] and the bot-authored [`Self::push_lead`];
+    /// read through [`Self::text`].
     text: String,
     /// The card's streamed reasoning text, in arrival order. Private to this
-    /// module: written only by [`Self::push_reasoning_scoped`] (the sink for
-    /// the test-only scripted pushes and `replace_reasoning_scoped`); read
-    /// through [`Self::reasoning`].
+    /// module: written by [`Self::push_reasoning_scoped`] and
+    /// [`Self::replace_reasoning_scoped`]; read through [`Self::reasoning`].
     reasoning: String,
     /// Tool panels keyed by call ID (current state; `timeline` keeps order).
     /// Private to this module: written by [`Self::push_tool_scoped`], the seeded
@@ -2632,13 +2631,14 @@ impl StreamAccumulator {
     }
 
     /// The card's streamed assistant text. Private to this module: written by
-    /// [`Self::push_text_scoped`].
+    /// [`Self::push_text_scoped`], [`Self::replace_text_scoped`] and
+    /// [`Self::push_lead`].
     pub(super) fn text(&self) -> &str {
         &self.text
     }
 
     /// The card's streamed reasoning text. Private to this module: written by
-    /// [`Self::push_reasoning_scoped`].
+    /// [`Self::push_reasoning_scoped`] and [`Self::replace_reasoning_scoped`].
     pub(super) fn reasoning(&self) -> &str {
         &self.reasoning
     }
@@ -3653,31 +3653,31 @@ impl StreamAccumulator {
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
     /// — the card splitter can then break a long answer across cards at item
     /// boundaries instead of truncating it. Production renders place through
-    /// [`Self::push_text_scoped`]; this and [`Self::push_text_at`] /
-    /// [`Self::push_text_at_key`] are the test-only convenience forms.
+    /// [`Self::push_text_scoped`]; this is the test-only [`Self::push_text_at`]
+    /// convenience with its one parameter — the server time — defaulted.
     #[cfg(test)]
     pub(super) fn push_text(&mut self, chunk: &str) {
-        self.push_text_scripted(None, None, None, chunk, None)
-            .expect("the scripted message scope accepts its own placement");
+        self.push_text_at(None, chunk);
     }
 
-    /// [`Self::push_text`] for a chunk from the part that started at `at_ms`
-    /// (the server's `time.start`), which also places it on the timeline.
-    /// `None` for a payload with no server time: the item is then keyed by a
-    /// monotonic fallback (call order) and shows no clock. Test-only.
+    /// [`Self::push_text_at_key`] with the order key set to the part's server
+    /// start (`at_ms`, the server's `time.start`) and no typed part or lead.
+    /// `None` keys the item by a monotonic fallback (call order) and shows no
+    /// clock. Test-only.
     #[cfg(test)]
     pub(super) fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
-        self.push_text_scripted(at_ms, at_ms, None, chunk, None)
-            .expect("the scripted message scope accepts its own placement");
+        self.push_text_at_key(at_ms, at_ms, None, chunk, None);
     }
 
-    /// The test-only scripted push with every placement input spelled out
-    /// (spec #1040): the render fixtures and the ordering tests that need an
-    /// ORDER key apart from the displayed clock (issue #1022), a typed
-    /// transcript part, or a markdown lead. `key_at` positions the entry;
-    /// `shown_at` is what it displays and what the cursor records. Production
-    /// renders never call this: they place through the message scope
-    /// ([`Self::push_text_scoped`]).
+    /// The test-only scripted push body with every placement input spelled out
+    /// (spec #1040): the render fixtures and the ordering tests use it, and it
+    /// is the one test path into the message scope. The source-less scripted
+    /// message ([`Self::scripted_transcript`]) sits outside the read, so a test
+    /// push keeps its own ordering and the guards' floors stay the only ones
+    /// applied. `key_at` positions the entry; `shown_at` is what it displays
+    /// and what the cursor records (issue #1022 keeps the two apart); `lead` is
+    /// the markdown lead a test may carry, rendered but never counted.
+    /// Production renders place through [`Self::push_text_scoped`].
     #[cfg(test)]
     pub(super) fn push_text_at_key(
         &mut self,
@@ -3687,23 +3687,6 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        self.push_text_scripted(key_at, shown_at, source, chunk, lead)
-            .expect("the scripted message scope accepts its own placement");
-    }
-
-    /// The shared body of the text convenience pushes: a placement in the
-    /// source-less scripted message scope ([`Self::scripted_transcript`]),
-    /// outside the read, so a test push keeps its own ordering and the guards'
-    /// floors stay the only ones applied.
-    #[cfg(test)]
-    fn push_text_scripted(
-        &mut self,
-        key_at: Option<i64>,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        chunk: &str,
-        lead: Option<String>,
-    ) -> Result<(), PlacementError> {
         let facts = PartFacts {
             form: PartForm::Text,
             key_at,
@@ -3714,34 +3697,35 @@ impl StreamAccumulator {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
         self.push_text_scoped(&read_order, &message, facts, chunk.to_string(), lead)
+            .expect("the scripted message scope accepts its own placement");
     }
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
     /// (chunks of the same part merge into one panel; a part keyed apart is
     /// its own panel). Production renders place through
-    /// [`Self::push_reasoning_scoped`]; this and [`Self::push_reasoning_at`] /
-    /// [`Self::push_reasoning_at_key`] are the test-only convenience forms.
+    /// [`Self::push_reasoning_scoped`]; this is the test-only
+    /// [`Self::push_reasoning_at`] convenience with its one parameter — the
+    /// server time — defaulted.
     #[cfg(test)]
     pub(super) fn push_reasoning(&mut self, chunk: &str) {
-        self.push_reasoning_scripted(None, None, None, chunk, None)
-            .expect("the scripted message scope accepts its own placement");
+        self.push_reasoning_at(None, chunk);
     }
 
-    /// [`Self::push_reasoning`] for a reasoning part that started at `at_ms`
-    /// (the server's `time.start`); `None` keys it by fallback and shows no
-    /// clock. Test-only like [`Self::push_reasoning`]: production renders go
-    /// through [`Self::push_reasoning_scoped`].
+    /// [`Self::push_reasoning_at_key`] with the order key set to the part's
+    /// server start (`at_ms`, the server's `time.start`) and no typed part or
+    /// lead; `None` keys it by fallback and shows no clock. Test-only like
+    /// [`Self::push_reasoning`]: production renders go through
+    /// [`Self::push_reasoning_scoped`].
     #[cfg(test)]
     pub(super) fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
-        self.push_reasoning_scripted(at_ms, at_ms, None, chunk, None)
-            .expect("the scripted message scope accepts its own placement");
+        self.push_reasoning_at_key(at_ms, at_ms, None, chunk, None);
     }
 
-    /// The test-only scripted reasoning push with every placement input spelled
-    /// out: a part whose timeline ORDER key is not the server time it may show
-    /// (V2's reasoning time is optional, so an untimed part sorts by the
-    /// transcript's own order while the entry and its cursor frontier keep the
-    /// absent server clock — issue #1022), a typed transcript part, or a
+    /// The test-only scripted reasoning push body with every placement input
+    /// spelled out: a part whose timeline ORDER key is not the server time it
+    /// may show (V2's reasoning time is optional, so an untimed part sorts by
+    /// the transcript's own order while the entry and its cursor frontier keep
+    /// the absent server clock — issue #1022), a typed transcript part, or a
     /// markdown lead. Production renders place through
     /// [`Self::push_reasoning_scoped`].
     #[cfg(test)]
@@ -3753,21 +3737,6 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        self.push_reasoning_scripted(key_at, shown_at, source, chunk, lead)
-            .expect("the scripted message scope accepts its own placement");
-    }
-
-    /// The shared body of the reasoning convenience pushes; see
-    /// [`Self::push_text_scripted`].
-    #[cfg(test)]
-    fn push_reasoning_scripted(
-        &mut self,
-        key_at: Option<i64>,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        chunk: &str,
-        lead: Option<String>,
-    ) -> Result<(), PlacementError> {
         let facts = PartFacts {
             form: PartForm::Reasoning,
             key_at,
@@ -3778,6 +3747,7 @@ impl StreamAccumulator {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
         self.push_reasoning_scoped(&read_order, &message, facts, chunk.to_string(), lead)
+            .expect("the scripted message scope accepts its own placement");
     }
 
     /// The scripted message the integration suite's source-less test pushes
@@ -3802,30 +3772,30 @@ impl StreamAccumulator {
 
     /// Insert/update a tool panel; the timeline gets a marker only on the FIRST
     /// appearance (state updates re-render in place). Production renders place
-    /// through [`Self::push_tool_scoped`]; this and [`Self::push_tool_at`] /
-    /// [`Self::push_tool_at_key`] are the test-only convenience forms.
+    /// through [`Self::push_tool_scoped`]; this is the test-only
+    /// [`Self::push_tool_at`] convenience with its one parameter — the server
+    /// start time — defaulted.
     #[cfg(test)]
     pub(super) fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
-        self.push_tool_scripted(None, None, call_id, panel, None)
-            .expect("the scripted message scope accepts its own tool placement");
+        self.push_tool_at(None, call_id, panel);
     }
 
-    /// [`Self::push_tool`] for a tool call that started at `at_ms` (the typed
-    /// [`ToolCall::started_at`](crate::backend::ToolCall)). A tool first seen
-    /// before the server stamped it (a pending call, no time) gains its start
-    /// time on the later update: a live panel adopts it as its timeline key —
-    /// nothing is placed yet — while a panel already in the timeline keeps its
-    /// key and only gains the clock. A call with no server time keeps showing
-    /// no clock.
+    /// [`Self::push_tool_at_key`] with the order key set to the call's server
+    /// start (`at_ms`, the typed
+    /// [`ToolCall::started_at`](crate::backend::ToolCall)) and no typed part.
+    /// A tool first seen before the server stamped it (a pending call, no
+    /// time) gains its start time on the later update: a live panel adopts it
+    /// as its timeline key — nothing is placed yet — while a panel already in
+    /// the timeline keeps its key and only gains the clock. A call with no
+    /// server time keeps showing no clock.
     #[cfg(test)]
     pub(super) fn push_tool_at(&mut self, at_ms: Option<i64>, call_id: &str, panel: ToolPanel) {
-        self.push_tool_scripted(at_ms, at_ms, call_id, panel, None)
-            .expect("the scripted message scope accepts its own tool placement");
+        self.push_tool_at_key(at_ms, at_ms, call_id, panel, None);
     }
 
-    /// The test-only scripted tool push with every placement input spelled out:
-    /// a call whose timeline ORDER key is not the server time it may show (an
-    /// untimed part borrows the previous part's key while the panel keeps
+    /// The test-only scripted tool push body with every placement input spelled
+    /// out: a call whose timeline ORDER key is not the server time it may show
+    /// (an untimed part borrows the previous part's key while the panel keeps
     /// showing no clock — issue #1022), or whose entry carries the typed
     /// transcript part it rendered from (spec #561, review #569). Production
     /// renders place through [`Self::push_tool_scoped`].
@@ -3838,24 +3808,10 @@ impl StreamAccumulator {
         panel: ToolPanel,
         source: Option<PartSource>,
     ) {
-        self.push_tool_scripted(key_at, shown_at, call_id, panel, source)
-            .expect("the scripted message scope accepts its own tool placement");
-    }
-
-    /// The shared body of the tool convenience pushes; see
-    /// [`Self::push_text_scripted`].
-    #[cfg(test)]
-    fn push_tool_scripted(
-        &mut self,
-        key_at: Option<i64>,
-        shown_at: Option<i64>,
-        call_id: &str,
-        panel: ToolPanel,
-        source: Option<PartSource>,
-    ) -> Result<(), PlacementError> {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
         self.push_tool_scoped(&read_order, &message, 0, key_at, shown_at, call_id, panel, source)
+            .expect("the scripted message scope accepts its own tool placement");
     }
 
     /// Every live tail's fact, as the walk and the settle read them (spec
