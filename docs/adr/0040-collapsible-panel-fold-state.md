@@ -4,12 +4,8 @@
 > card and its rebuild path are gone, so the `snap_{i}` example no longer exists.
 >
 > **Amended by ADR-0104 when it lands**: `seq` is assigned once by the Timeline
-> (the successor of the accumulator's `insert_kind`), with the same never-reuse,
-> never-renumber invariant; a tail panel keeps the `seq` it was pinned with. At
-> equal keys, ordering is class-then-read-position (synthetic/source-less first,
-> then a transcript part's position), not allocation; `order` is the tie-break
-> within a class (never `seq`, which is identity only), and neither is
-> renumbered.
+> (the successor of `insert_kind`), and the equal-key ordering changes; #1040
+> carries the exact rules. The never-reuse/never-renumber invariant is unchanged.
 
 Every flush PATCHes the whole card JSON (`update_message`), and a collapsible
 panel's open/closed state lives in the client: toggling a panel fires no

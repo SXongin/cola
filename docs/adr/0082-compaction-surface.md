@@ -4,12 +4,10 @@
 > bound it leaned on was chain-scoped, while the fact is the Session's. See the
 > amendment at the end.
 >
-> **Amended by ADR-0104 when it lands**: §2's "at its server time" gains one
-> floor — a compaction created after a click takes the Interaction Receipt cut.
-> The split/restart case where a terminal revision lands after the running one was
-> confirmed is a separate delivery gap tracked in #1049; neither §3's
-> exactly-once nor the 2026-11-07 busy-follow exception changes.
->
+> **Amended by ADR-0104 when it lands**: §2's "at its server time" gains the
+> Interaction Receipt floor; #1040 carries the exact rule. The split/restart
+> delivery gap is #1049; §3 is otherwise unchanged.
+
 > **Amended (2026-11-07)**: §3's exactly-once is a promise about the live
 > timeline's own render. The busy follow's static lead repeats the read tail's
 > Compaction markers for #1002's equal-body contract, so a followed card may
