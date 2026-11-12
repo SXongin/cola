@@ -88,8 +88,10 @@ content into them.**
   took. It yields no pushable `Placement`, so a synthetic row can never travel
   the transcript path. A **receipt's** `at` is an order key only — a resolved
   click's **reserved receipt key** (ADR-0038) or a server time — and its card
-  shows no clock. Every other variant's `at` is a server time and is displayed
-  when `Some`; a minted fallback is never displayed. The **compaction row** is
+  shows no clock. The card renders a `Notice` and a `UserMessage` as text blocks,
+  which show no clock today; the **compaction row** and the **ledger entry** are
+  the only synthetic kinds that display `at` as a server time, and only when
+  `Some`. A minted fallback is never displayed anywhere. The **compaction row** is
   the one that takes the Interaction Receipt cut for its message time — the
   floor `render_compactions` sets around it today (ADR-0038, issue #1023); the
   others are placed outside any floor window today and keep that. `row` is the
@@ -106,16 +108,19 @@ content into them.**
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
   and `push` / `replace` consume it; it carries the entry key, the merge identity
   (`PartSource`), the display clock, the floor it was placed under, and a private
-  scope generation. Pushing the same token twice is a move error, and a token
-  from another scope fails the generation check, so a placement cannot be
+  scope generation. Its fields are private with no public constructor and it is
+  neither `Clone` nor `Copy`, so a second push of one token is a compile error; a
+  token from another scope fails the generation check, so a placement cannot be
   replayed into a later message. Bare order keys stop crossing the seam; the
   five-layer push wrappers collapse.
 - **The rewrite path is the Timeline's.** `Timeline::replace(placement, source,
   kind)` serves a part the server re-sent with different content: the `kind`
-  carries the new text, the Timeline prefers the key the part's existing entry
-  already holds (else the placement's key), drops every entry of that
-  `PartSource` across the boundary while keeping `render_from` on the same
-  logical position, and inserts the new run.
+  carries the new text, and `source` must name the same transcript part the token
+  does (`placement.source.same_part(&source)`, checked by the Timeline) so a
+  token cannot be paired with another part's run. The Timeline prefers the key
+  the part's existing entry already holds (else the placement's key), drops every
+  entry of that `PartSource` across the boundary while keeping `render_from` on
+  the same logical position, and inserts the new run.
 - **What the module owns.** The Timeline's entries (`TimelineItem`), the floors,
   the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
@@ -128,10 +133,12 @@ content into them.**
   pushed, only settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
   replacement, clamped to the floor the pin carried.
   `Timeline::settle(tail, panel)` applies the **current** receipt cut for the
-  tail's message time (a receipt recorded after the pin still floors it) together
-  with the read floor captured at pin, then seats the panel with the stored
-  `seq`. So a tail-only panel cannot jump a receipt cut, before or after its
-  start time arrives. This clamp is
+  tail's message time (a receipt recorded after the pin still floors it) and the
+  Timeline's **current read-order high-water mark** — a monotonic maximum key over
+  placed transcript entries, so a message that became visible after the pin still
+  floors the panel — then seats the panel with the stored `seq`. So a tail-only
+  panel cannot jump a receipt cut or content read after it was pinned, before or
+  after its start time arrives. This clamp is
   the ADR's one deliberate tightening, and a test pins it; every other placement
   rule and every current test is unchanged. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
@@ -148,9 +155,11 @@ content into them.**
   the guards gain invariant tests (a message scope always clears its floor, a
   walk always resets, a rewritten run keeps the boundary, a placed part keeps
   its key, a pending tool that later reports its start time settles at that time
-  but not above its floor, a resolved click's receipt keeps its reserved key, a
-  post-click compaction row still floors at the receipt, and a repeated
-  compaction fact updates the row it already has).
+  but not above its floor, a resolved click's receipt keeps its reserved key
+  while the slice reaches it and returns the clamped key after a split past it, a
+  rewritten run's later chunk merges into the new run, a post-click compaction
+  row still floors at the receipt, and a repeated compaction fact updates the row
+  it already has).
 
 ## Consequences
 
