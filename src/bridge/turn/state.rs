@@ -2712,6 +2712,13 @@ impl StreamAccumulator {
         self.timeline.seat_for_test(key, seq, kind)
     }
 
+    /// Move the live-slice boundary for the Timeline's merge test: no
+    /// production path sets it without first finalizing the slice before it.
+    #[cfg(test)]
+    pub(super) fn test_set_render_from(&mut self, index: usize) {
+        self.timeline.set_render_from(index);
+    }
+
     /// The fate of the write carrying this flush's terminal slice (spec #602).
     /// Private to this module: set by [`Self::set_ending_write`].
     pub(super) fn ending_write(&self) -> EndingWrite {

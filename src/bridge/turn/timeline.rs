@@ -21,12 +21,17 @@ use std::collections::HashSet;
 /// One entry on a turn's chronological timeline: a rendered item plus the
 /// server-side start time (epoch ms) of the part it came from — its **key**.
 /// The card renders the timeline in key order, matching how OpenChamber shows
-/// the parts interleaved. `shown_at` is the same server time when the part
-/// truly has one, or `None` when the key is a synthetic ordering device — the
-/// card only ever shows server clocks (#183 follow-up).
+/// the parts interleaved. The card only ever shows server clocks (#183
+/// follow-up).
 #[derive(Debug, Clone)]
 pub(super) struct TimelineItem {
     key: i64,
+    /// The server start time the entry may display, or `None` when the key is
+    /// a synthetic ordering device. Synthetic receipts, ledger entries, user
+    /// messages and leads carry `None` (their card elements show no clock); a
+    /// compaction keeps its start time only because the accumulator's
+    /// `frontier_for` records it as the Rendered Cursor's `started_at`, still
+    /// without displaying it.
     shown_at: Option<i64>,
     /// The entry's position within an equal-`key` run. An ordinary insert's
     /// `order` equals its `seq`; a chunked continuation shares its part entry's
@@ -269,9 +274,10 @@ pub(super) enum TimelineKind {
 /// line, a compaction row, a ledger entry, the External Message's lead or a
 /// bot-authored notice. Each maps onto the stored [`TimelineKind`] its call
 /// site uses today; the admission inserts directly and returns the key it took
-/// (`None` when it may merge or chunk, which only a [`SyntheticEntry::Lead`]
-/// does) and never produces a pushable placement, so a synthetic row cannot
-/// travel the transcript path.
+/// (`None` when the variant owns no single key: a [`SyntheticEntry::Lead`] may
+/// merge or chunk, and a blank [`SyntheticEntry::UserMessage`] renders nothing)
+/// and never produces a pushable placement, so a synthetic row cannot travel
+/// the transcript path.
 ///
 /// Every variant's `at` is an **order key only** — a resolved click's reserved
 /// receipt key, a server time, or a derived key just before the work it
@@ -892,7 +898,7 @@ impl Timeline {
         shown_at: Option<i64>,
         source: Option<PartSource>,
         chunk: &str,
-        lead: Option<String>,
+        mut lead: Option<String>,
     ) {
         let slot = self.place_key(key_at, source.as_ref());
         let key = slot.key;
@@ -904,7 +910,6 @@ impl Timeline {
                 if let TimelineKind::Reasoning(last) = &mut item.kind {
                     last.push_str(chunk);
                 }
-                let mut lead = lead;
                 Self::merge_part_metadata(item, source.as_ref(), &mut lead);
             }
             None => {
@@ -1551,8 +1556,9 @@ mod tests {
         acc.push_text_at(Some(5_000), "已发送卡片");
         let head = PartSource::at(MessageId::new("msg_head"), 0);
         acc.push_text_from(Some(9_000), Some(head), "新切片");
-        // Finalize both pre-split entries, leaving the 9_000 entry live.
-        acc.skip_rejected_slice(0, 2);
+        // Move the live slice past both pre-split entries WITHOUT sealing them:
+        // the merge lookup must cross an unsealed boundary.
+        acc.test_set_render_from(2);
         acc.record_receipt_cut(500, 1_000);
         let part = PartSource::at(MessageId::new("msg_part"), 0);
         acc.push_text_from(Some(3_000), Some(part.clone()), "甲");
