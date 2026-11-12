@@ -118,8 +118,10 @@ content into them.**
   entry, `None` for a `Lead`, which may merge into an existing text run or chunk
   into several entries. Each variant maps onto the stored
   `TimelineKind` its call site uses today, so a `Lead` still merges as text and a
-  `Receipt` covers every receipt line. It yields no pushable `Placement`, so a synthetic row can never travel
-  the transcript path. Every synthetic kind's `at` is an **order key only** —
+  `Receipt` covers every receipt line. It yields no pushable `Placement`, so a
+  synthetic row can never travel the transcript path. A reserved receipt key the
+  live slice no longer reaches (a split finalized past it) is clamped to the
+  slice's first key, as today; direct insertion never bypasses that clamp. Every synthetic kind's `at` is an **order key only** —
   a resolved click's **reserved receipt key** (ADR-0038), a Wake's or a message's
   server time, or a derived key just before the work it introduces (the Wake line
   and the External Message lead use `created_ms - 1`) — and never a display
@@ -221,11 +223,11 @@ content into them.**
   sits at a *lower* key (placed before that floor became visible), the floor
   wins and the panel lands after it. So a tail-only panel cannot jump a receipt cut or
   content read after it was pinned, before or after its start time arrives.
-  The deliberate tightenings are the settle clamp and the read-position tie-break
-  at equal keys; tests pin them, and every other placement rule and every current
-  test is unchanged. The compaction row's update-in-place lookup keeps its
-  current whole-timeline behaviour: the split/restart case is #1049, out of this
-  batch. Content-keyed dedup and the rewritten
+  The deliberate tightenings are the settle clamp, the read-position tie-break at
+  equal keys, and the pinned-tail read-floor extension; tests pin them, and every
+  other placement rule and every current test is unchanged. The compaction row's
+  update-in-place lookup keeps its current whole-timeline behaviour: the
+  split/restart case is #1049, out of this batch. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
   replace defined above. The **Rendered Cursor** and its staging, the ledger,
   the interactions and the card build stay where they are. `StreamAccumulator`
@@ -236,8 +238,8 @@ content into them.**
   scope); no production caller gains a new path.
 - **Behaviour-preserving.** ADR-0038's receipt-skew window, ADR-0071's
   cursorless fallback and every current ordering test are unchanged, apart from
-  the tail-only settle clamp, the read-position tie-break and the compaction
-  whole-timeline compaction lookup above. The timeline tests
+  the tail-only settle clamp, the read-position tie-break and the pinned-tail
+  read-floor extension above. The timeline tests
   move beside the module;
   the guards gain invariant tests (a message scope always clears its floor — a
   later transcript part with a key older than the dropped scope's floor is not
@@ -249,8 +251,9 @@ content into them.**
   part's key (or the message's created time) while one after a tool keeps the
   render-order fallback; a pending tool's late start time settles at that time
   but never below its floor, and lands by read position after an equal-key entry
-  of an earlier message; a receipt recorded after the pin still floors it at
-  settle; a resolved click's receipt keeps its reserved key while the slice
+  of an earlier message; a later message's part whose server key is older than an
+  earlier message's pinned tail still lands below that panel; a receipt recorded
+  after the pin still floors it at settle; a resolved click's receipt keeps its reserved key while the slice
   reaches it and returns the clamped key after a split past it; a seeded cut
   inside a fence keeps its opener; a **source-bearing** post-click part floored
   to a receipt's key still sorts below that receipt; a post-click compaction row
