@@ -14,9 +14,11 @@
 > **Amends ADR-0038's keying and equal-key rules**: a synthetic entry may be
 > keyed at its own server time or at a key the caller already holds — a click's
 > reserved receipt key, the Wake 承接 line's server time, a message's created
-> time — not only at `next_order()`; and a tail-only Tool Panel seated at settle
-> takes a fresh allocation order above the equal-key run, because its allocation
-> predates content that became visible after it was pinned.
+> time — not only at `next_order()`; and a tail-only Tool Panel whose settle
+> floor is at or above its key takes a fresh allocation order above the
+> equal-key entries of **earlier messages** but below its own message's following
+> entries, because its allocation predates content that became visible after it
+> was pinned.
 >
 > **Amends ADR-0045's re-key rule**: a tail-only panel's allocated key is still
 > replaced by a later real start time, but settle first floors it with the
@@ -137,10 +139,9 @@ content into them.**
   `request_id` stay in the accumulator, which owns the reservation's lifecycle.
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
   and `push` / `replace` consume it; it carries the entry key, an optional merge
-  identity (`Option<PartSource>`; a source-less placement still takes the read
-  floor, exactly as `part_order_key` applies it today, while the message-scoped
-  receipt cut applies only to a source-bearing transcript part, as
-  `insert_item` decides), the
+  identity (`Option<PartSource>`; a source-less placement takes both the read
+  floor and the message-scoped receipt cut, exactly as `part_order_key` plus
+  `insert_item` apply them today), the
   display clock, the floor it was placed under, and a private scope generation. Its fields are private with no public constructor and it is
   neither `Clone` nor `Copy`, so a second push of one token is a compile error; a
   token from another scope fails the generation check, so a placement cannot be
@@ -180,8 +181,12 @@ content into them.**
   **fresh `order` above the equal-key entries of earlier messages** but below
   those of its own message that follow it in part order — so it renders after the
   content that floored it while in-message transcript order still wins (the
-  pinned `seq` is identity, not position). This is the one place the equal-key
-  allocation rule defers to read order, and ADR-0038's note records it. So a tail-only panel cannot jump a receipt cut or
+  pinned `seq` is identity, not position). When no integer lies between the two
+  neighbours, settle **renumbers the live slice's equal-key `order` values in one
+  deterministic pass** (the same kind of local renumbering a clamp already
+  performs) to make room; `seq` is never touched. This is the one place the
+  equal-key allocation rule defers to read order, and ADR-0038's note records
+  it. So a tail-only panel cannot jump a receipt cut or
   content read after it was pinned, before or after its start time arrives.
   The deliberate tightenings are the settle clamp, its equal-key exception, and
   the compaction row's live-slice lookup (a terminal fact after a split lands on
@@ -205,8 +210,9 @@ content into them.**
   its key, a pending tool that later reports its start time settles at that time
   but never below its floor, a resolved click's receipt keeps its reserved key
   while the slice reaches it and returns the clamped key after a split past it, a
-  rewritten run's later chunk merges into the new run, a seeded cut inside a
-  fence keeps its opener, a post-click compaction row still floors at the
+  rewritten run's later chunk merges into the new run, a rewrite whose source
+  names another part (or none) is rejected, a token from another scope is
+  rejected, a seeded cut inside a fence keeps its opener, a post-click compaction row still floors at the
   receipt, a repeated compaction fact updates the row it already has, a Wake
   ledger entry shows its `finished_at` across a minute boundary rather than its
   keyed clock, and a compaction row shows no clock).
