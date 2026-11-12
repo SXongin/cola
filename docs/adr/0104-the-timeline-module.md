@@ -169,8 +169,9 @@ ADR-0050 records is unchanged.
   message's, or the panel's own) — seats at `max(current, floor)`, caps at the
   minimum key among the entries that follow it in read order at or above the
   floor, and seats through the normal insert path (clamp included) with its
-  pinned `seq` — never renumbered (ADR-0040), pinned by
-  `a_settled_panel_keeps_the_identity_it_was_pinned_with`.
+  pinned `seq` — never renumbered (ADR-0040). Pinned by
+  `a_settled_panel_keeps_the_identity_it_was_pinned_with` and
+  `a_settle_is_floored_by_the_pinned_tails_that_precede_it`.
 
 ### Deliberate tightenings
 
