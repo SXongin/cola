@@ -4,7 +4,7 @@
 > bound it leaned on was chain-scoped, while the fact is the Session's. See the
 > amendment at the end.
 >
-> **Amended by ADR-0104 when it lands**: §2's "at its server time" gains the
+> **Amended by ADR-0104**: §2's "at its server time" gains the
 > Interaction Receipt floor; #1040 carries the exact rule. The split/restart
 > delivery gap is #1049; §3 is otherwise unchanged.
 

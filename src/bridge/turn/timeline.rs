@@ -1022,6 +1022,8 @@ impl Timeline {
 
     /// Seat one bounded text chunk of [`Self::push_text_at_slot`] at an
     /// already-resolved slot: a fresh identity, the caller's equal-key `order`.
+    // A chunk carries its placement fields through unchanged; a struct would
+    // only rename them at each call site.
     #[allow(clippy::too_many_arguments)]
     fn seat_text_chunk(
         &mut self,
@@ -1107,27 +1109,13 @@ impl Timeline {
             }
             let take: String = remaining.chars().take(space).collect();
             let idx = target.expect("space came from it");
-            match self.items.get_mut(idx) {
-                Some(item) => {
-                    if let TimelineKind::Text(last) = &mut item.kind {
-                        last.push_str(&take);
-                    }
-                    Self::merge_part_metadata(item, source.as_ref(), &mut lead);
-                }
-                None => {
-                    let order = self.items.get(idx).map(|item| item.order);
-                    let slot = self.slot_after(idx, key);
-                    target = Some(self.seat_text_chunk(
-                        slot,
-                        order,
-                        shown_at,
-                        source.clone(),
-                        take.clone(),
-                        lead.take(),
-                        position,
-                    ));
-                }
+            // `space` came from this exact entry a moment ago and nothing ran
+            // in between, so the index is live.
+            let item = self.items.get_mut(idx).expect("the space came from this entry");
+            if let TimelineKind::Text(last) = &mut item.kind {
+                last.push_str(&take);
             }
+            Self::merge_part_metadata(item, source.as_ref(), &mut lead);
             remaining = &remaining[take.len()..];
         }
     }
@@ -1809,6 +1797,33 @@ mod tests {
                 },
             )
             .expect("the scope accepts its own token");
+    }
+
+    /// Pin a tool tail in one message through the guard (the settle tests'
+    /// arrangement): `key_at` is the first sighting's server start, `None` a
+    /// tail-only panel that only later reports one; `shown_at` is the clock the
+    /// entry may display.
+    fn pin_tail(
+        timeline: &mut Timeline,
+        order: &HashMap<&str, usize>,
+        created: Option<i64>,
+        message: &MessageId,
+        index: usize,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+    ) -> TailPlacement {
+        let mut walk = timeline.walk(order);
+        let mut scope = walk.message(created, message, &[]);
+        scope.pin(
+            PartFacts {
+                form: PartForm::Tool,
+                key_at,
+                shown_at,
+                source: Some(PartSource::at(message.clone(), index)),
+                index,
+            },
+            "call_bash".into(),
+        )
     }
 
     /// `push_text` chunks one large blob into bounded timeline items so a single
@@ -2638,6 +2653,11 @@ mod tests {
             },
             None,
         );
+        assert_eq!(
+            acc.timeline().entries()[0].shown_at(),
+            None,
+            "the admission keeps no keyed clock on the entry"
+        );
         let card = acc.build_card().to_string();
         assert!(
             card.contains("14:05"),
@@ -3181,20 +3201,15 @@ mod tests {
             Some(serde_json::json!("ls")),
             Some("src"),
         );
-        let tail = {
-            let mut walk = timeline.walk(&order);
-            let mut scope = walk.message(Some(5_000), &message, &[]);
-            scope.pin(
-                PartFacts {
-                    form: PartForm::Tool,
-                    key_at: Some(2_000),
-                    shown_at: Some(2_000),
-                    source: Some(PartSource::at(MessageId::new("m1"), 0)),
-                    index: 0,
-                },
-                "call_bash".into(),
-            )
-        };
+        let tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(5_000),
+            &message,
+            0,
+            Some(2_000),
+            Some(2_000),
+        );
         timeline.record_cut(4_000, 9_000);
         timeline.settle(tail, &panel, &order, &[]);
         assert_eq!(
@@ -3218,24 +3233,86 @@ mod tests {
             Some(serde_json::json!("ls")),
             Some("src"),
         );
-        let mut tail = {
-            let mut walk = timeline.walk(&order);
-            let mut scope = walk.message(Some(5_000), &MessageId::new("m1"), &[]);
-            scope.pin(
-                PartFacts {
-                    form: PartForm::Tool,
-                    key_at: Some(2_000),
-                    shown_at: None,
-                    source: Some(PartSource::at(MessageId::new("m1"), 0)),
-                    index: 0,
-                },
-                "call_bash".into(),
-            )
-        };
+        let mut tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(5_000),
+            &MessageId::new("m1"),
+            0,
+            Some(2_000),
+            None,
+        );
         timeline.rekey(&mut tail, Some(1_000));
         assert_eq!(tail.key, 9_000, "the rekey clamps to the pin's floor");
         timeline.settle(tail, &panel, &order, &[]);
         assert_eq!(timeline.entries()[0].key(), 9_000);
+    }
+
+    /// ADR-0040: the Timeline assigns `seq` once. A live panel is pinned with an
+    /// identity; when it settles at a different key (after a rekey and the
+    /// settle cap), the entry keeps that identity and neither entry is
+    /// renumbered.
+    #[test]
+    fn a_settled_panel_keeps_the_identity_it_was_pinned_with() {
+        let order = HashMap::from([("m1", 0usize)]);
+        let message = MessageId::new("m1");
+        let panel = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!("ls")),
+            Some("src"),
+        );
+        let mut timeline = Timeline::default();
+        let mut tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(5_000),
+            &message,
+            0,
+            Some(1_000),
+            Some(1_000),
+        );
+        let pinned = tail.seq;
+        // A following part caps the settle, so the panel lands at a key it was
+        // never pinned at.
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            2_000,
+            Some(PartSource::at(MessageId::new("m1"), 1)),
+            "后续正文",
+        );
+        let follower_seq = timeline.entries()[0].seq();
+        timeline.rekey(&mut tail, Some(9_000));
+        timeline.settle(tail, &panel, &order, &[]);
+
+        let tool = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the panel settled");
+        assert_eq!(
+            timeline.entries()[tool].key(),
+            2_000,
+            "the settle cap moved the panel off its pinned key"
+        );
+        assert_eq!(
+            timeline.entries()[tool].seq(),
+            pinned,
+            "the pinned identity survives the move"
+        );
+        let follower = timeline
+            .entries()
+            .iter()
+            .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "后续正文"))
+            .expect("the following part stayed");
+        assert_eq!(
+            follower.seq(),
+            follower_seq,
+            "the following entry keeps its identity too"
+        );
+        assert_ne!(pinned, follower_seq, "identities are never shared");
     }
 
     /// The settle clamp is a MINIMUM over the entries that follow the panel in
@@ -3253,60 +3330,49 @@ mod tests {
             Some(serde_json::json!("ls")),
             Some("src"),
         );
+        // A positioned follower BELOW the floor, placed before the cut is
+        // recorded: it keeps its own key and the panel lands after it.
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            1_000,
+            Some(PartSource::at(MessageId::new("m1"), 3)),
+            "floor 之下",
+        );
         // The message is post-click: content may not precede the receipt's
         // key, so the entries at 3000 and 2000 are at/above the floor.
         timeline.record_cut(4_000, 1_500);
-        let mut tail = None;
-        for (index, key) in [(0, 5_000), (1, 3_000), (2, 2_000)] {
+        let mut tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(5_000),
+            &message,
+            0,
+            Some(5_000),
+            Some(5_000),
+        );
+        for (index, key) in [(1, 3_000), (2, 2_000)] {
             let mut walk = timeline.walk(&order);
             let mut scope = walk.message(Some(5_000), &message, &[]);
-            if index == 0 {
-                tail = Some(scope.pin(
-                    PartFacts {
-                        form: PartForm::Tool,
-                        key_at: Some(key),
-                        shown_at: Some(key),
-                        source: Some(PartSource::at(MessageId::new("m1"), index)),
-                        index,
+            let facts = PartFacts {
+                form: PartForm::Text,
+                key_at: Some(key),
+                shown_at: Some(key),
+                source: Some(PartSource::at(MessageId::new("m1"), index)),
+                index,
+            };
+            let placement = scope.place(facts);
+            scope
+                .push(
+                    placement,
+                    TranscriptKind::Text {
+                        chunk: format!("正文{index}"),
+                        lead: None,
                     },
-                    "call_bash".into(),
-                ));
-            } else {
-                let facts = PartFacts {
-                    form: PartForm::Text,
-                    key_at: Some(key),
-                    shown_at: Some(key),
-                    source: Some(PartSource::at(MessageId::new("m1"), index)),
-                    index,
-                };
-                let placement = scope.place(facts);
-                scope
-                    .push(
-                        placement,
-                        TranscriptKind::Text {
-                            chunk: format!("正文{index}"),
-                            lead: None,
-                        },
-                    )
-                    .unwrap();
-            }
+                )
+                .unwrap();
         }
-        // A positioned follower BELOW the floor never caps the settle: it
-        // keeps its key and the panel lands after it.
-        timeline.items.insert(
-            0,
-            TimelineItem {
-                key: 1_000,
-                shown_at: None,
-                order: 0,
-                seq: 99,
-                kind: TimelineKind::Text("floor 之下".into()),
-                source: Some(PartSource::at(MessageId::new("m1"), 3)),
-                lead: None,
-                position: Some((0, 3)),
-            },
-        );
-        let mut tail = tail.expect("the tail was pinned");
         // The server's late start time is beyond every following key.
         timeline.rekey(&mut tail, Some(9_000));
         timeline.settle(tail, &panel, &order, &[]);
@@ -3340,30 +3406,13 @@ mod tests {
             Some(serde_json::json!("ls")),
             Some("src"),
         );
-        let pin = |timeline: &mut Timeline,
-                   order: &HashMap<&str, usize>,
-                   created: Option<i64>,
-                   message: &MessageId| {
-            let mut walk = timeline.walk(order);
-            let mut scope = walk.message(created, message, &[]);
-            scope.pin(
-                PartFacts {
-                    form: PartForm::Tool,
-                    key_at: None,
-                    shown_at: None,
-                    source: Some(PartSource::at(message.clone(), 0)),
-                    index: 0,
-                },
-                "call_bash".into(),
-            )
-        };
 
         // (a) A receipt recorded AFTER the pin: the click's cut is the current
         // one, so the late start cannot sort the panel above it.
         let order = HashMap::from([("m1", 0usize)]);
         let message = MessageId::new("m1");
         let mut timeline = Timeline::default();
-        let mut tail = pin(&mut timeline, &order, Some(5_000), &message);
+        let mut tail = pin_tail(&mut timeline, &order, Some(5_000), &message, 0, None, None);
         timeline.rekey(&mut tail, Some(1_000));
         timeline.record_cut(4_000, 9_000);
         timeline.settle(tail, &panel, &order, &[]);
@@ -3377,7 +3426,7 @@ mod tests {
         // the read floor the settle re-applies.
         let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
         let mut timeline = Timeline::default();
-        let mut tail = pin(&mut timeline, &order, None, &message);
+        let mut tail = pin_tail(&mut timeline, &order, None, &message, 0, None, None);
         timeline.rekey(&mut tail, Some(1_000));
         push_text(
             &mut timeline,
@@ -3416,20 +3465,15 @@ mod tests {
         );
         let mut timeline = Timeline::default();
         let m0 = MessageId::new("m0");
-        let mut tail = {
-            let mut walk = timeline.walk(&order);
-            let mut scope = walk.message(Some(5_000), &m0, &[]);
-            scope.pin(
-                PartFacts {
-                    form: PartForm::Tool,
-                    key_at: Some(1_000),
-                    shown_at: Some(1_000),
-                    source: Some(PartSource::at(m0.clone(), 0)),
-                    index: 0,
-                },
-                "call_bash".into(),
-            )
-        };
+        let mut tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(5_000),
+            &m0,
+            0,
+            Some(1_000),
+            Some(1_000),
+        );
         // The later message's part was already placed while the tool ran.
         push_text(
             &mut timeline,
@@ -3480,20 +3524,15 @@ mod tests {
             Some(serde_json::json!("ls")),
             Some("src"),
         );
-        let tail = {
-            let mut walk = timeline.walk(&order);
-            let mut scope = walk.message(Some(5_000), &MessageId::new("m0"), &[]);
-            scope.pin(
-                PartFacts {
-                    form: PartForm::Tool,
-                    key_at: Some(9_000),
-                    shown_at: Some(9_000),
-                    source: Some(PartSource::at(MessageId::new("m0"), 0)),
-                    index: 0,
-                },
-                "call_bash".into(),
-            )
-        };
+        let tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(5_000),
+            &MessageId::new("m0"),
+            0,
+            Some(9_000),
+            Some(9_000),
+        );
         let pinned = vec![tail.fact().expect("a scoped pin names its message")];
         {
             let mut walk = timeline.walk(&order);

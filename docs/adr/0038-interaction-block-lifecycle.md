@@ -4,7 +4,7 @@
 > with the Session Snapshot card, so every **Interaction Block** lives on a live
 > card or its own standalone card, and `SnapshotClaims` no longer exists.
 >
-> **Amended by ADR-0104 when it lands**: how a synthetic entry is keyed, the
+> **Amended by ADR-0104**: how a synthetic entry is keyed, the
 > equal-key tie-break and the read floor are both **owned** by the Timeline module
 > and **changed** (a derived key before the work it introduces; class-then-read-
 > position at equal keys; earlier messages' pinned tails in the floor). #1040
@@ -351,7 +351,8 @@ mis-ordered:
   of appending it after a part already pushed at the same key. The sort uses an
   internal `order`: an ordinary insert's `order` equals its `seq`, a chunked
   continuation shares its part's `order`, and the render-boundary clamp lowers
-  `order` alone — never the identity `seq` (ADR-0040). ADR-0104, when it lands, replaces this rule; see #1040.
+  `order` alone — never the identity `seq` (ADR-0040). ADR-0104 replaced this
+  rule with the equal-key read-position tie-break; see #1040.
 - A part already on the timeline **keeps the key it was placed at** — a rewrite
   captures the old key before it drops the run — because a later read's floor can
   differ, and re-keying would split a growing part into two entries.
