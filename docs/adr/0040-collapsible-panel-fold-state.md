@@ -2,6 +2,10 @@
 
 > **Retired by ADR-0100** (the Session Snapshot tail's fold ids): the snapshot
 > card and its rebuild path are gone, so the `snap_{i}` example no longer exists.
+>
+> **Amended by ADR-0104 when it lands**: `seq` is assigned once by the Timeline
+> (the successor of the accumulator's `insert_kind`), with the same never-reuse,
+> never-renumber invariant; a tail panel keeps the `seq` it was pinned with.
 
 Every flush PATCHes the whole card JSON (`update_message`), and a collapsible
 panel's open/closed state lives in the client: toggling a panel fires no

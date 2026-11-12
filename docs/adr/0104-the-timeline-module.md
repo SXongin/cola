@@ -3,6 +3,10 @@
 > **Names the deepening before it lands** (the ADR-0079 pattern). The landing
 > amendment records the finished module and the tickets that landed it.
 >
+> **Amends ADR-0040 when this lands**: `seq` is assigned once by the Timeline
+> (the successor of the accumulator's `insert_kind`) with the same never-reuse,
+> never-renumber invariant; a tail panel keeps the `seq` it was pinned with.
+>
 > **Amends ADR-0050** when this lands: the Timeline's entry state and types move
 > to `turn/timeline.rs`. The Turn boundary this ADR records is unchanged — the
 > accumulator, the flush and the render poll stay internal to the Turn module.
@@ -106,7 +110,11 @@ content into them.**
   synthetic kinds are placed outside any floor window today and keep that. `row`
   is the compaction's merge identity, and its update-in-place lookup is scoped to
   the **live slice**: a terminal fact after a split starts a row on the live card
-  rather than updating a finalized one. A reserved receipt key the live slice
+  rather than updating a finalized one. That successor row is **terminal only** —
+  the finalized card keeps the `running` revision it was sent with — and the
+  delivered bound must not suppress a position the live slice no longer carries,
+  so exactly-once becomes **one revision per card body** rather than one row per
+  session (ADR-0082 §3's amendment). A reserved receipt key the live slice
   no longer reaches (a split finalized past it) is clamped to the slice's first
   key, exactly the clamp `insert_item` applies today, and the returned key is
   the clamped one.
