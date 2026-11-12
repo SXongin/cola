@@ -1,15 +1,17 @@
 # In-flight Tool Panels ride the live card; settled panels join the timeline
 
 > **Amended by ADR-0104** when it lands: a tail-only panel's allocated key may
-> still be replaced by a later real start time, but `settle` first floors it with
+> still be replaced by a later real start time, and `rekey` clamps that
+> replacement to the floor the pin carried. `settle` then floors the panel with
 > the **current** receipt cut for its message's created time and the Timeline's
-> then-current read floor for the panel's message (the **earlier** messages'
-> high-water mark, ADR-0038), then applies ADR-0038's late-part clamp — so the
-> panel cannot jump a receipt or content read before it. Its key is
-> `max(pinned, floor)`; at that key it sorts by its own part's read position
-> (ADR-0104), so it lands after earlier-message entries and before its own
-> message's later parts. Placed content never moves, and a same-message
-> continuation at a lower key stays put, with the panel landing after it.
+> current read floor for the panel's message — the **earlier** messages'
+> high-water mark, plus any **pinned tail** (ADR-0104's settle extension) — and
+> applies ADR-0038's late-part clamp, so the panel cannot jump a receipt or
+> content read before it. Its key is `max(current, floor)` (the current key after
+> any `rekey`); at that key it sorts by its own part's read position, landing
+> after earlier-message entries and before its own message's later parts. Placed
+> content never moves, and a same-message continuation at a lower key stays put,
+> with the panel landing after it.
 
 A **Tool Panel** rendered as a timeline row: it sat where its tool call started,
 and a **Card Chain** split could finalize the card while the tool still ran. The
