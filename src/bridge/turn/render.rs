@@ -201,6 +201,11 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
 /// fallback); the seeded live-set join resolves its part the same way, so every
 /// placement shares one policy. Returns true when the part rendered (not
 /// skipped as duplicate/empty).
+///
+/// Test-only since #1043: every production walk places its parts through a
+/// message scope ([`render_part_scoped`] and its siblings), so this source-less
+/// helper survives for the batch fixtures that render a bare part list.
+#[cfg(test)]
 fn render_part(
     acc: &mut StreamAccumulator,
     source: Option<PartSource>,
@@ -399,7 +404,7 @@ fn render_part_scoped(
     true
 }
 
-/// [`render_seeded_part`] through the Timeline's message scope (spec #1040).
+/// The seeded frontier part through the Timeline's message scope (spec #1040).
 fn render_seeded_part_scoped(
     acc: &mut StreamAccumulator,
     message: &crate::backend::TranscriptMessage,
@@ -571,13 +576,11 @@ fn source_chunk(
 #[cfg(test)]
 pub(super) fn render_parts(acc: &mut StreamAccumulator, parts: &[Part]) -> bool {
     let mut rendered_any = false;
-    acc.reset_read_floor();
     for part in parts {
         if render_part(acc, None, part, None) {
             rendered_any = true;
         }
     }
-    acc.reset_read_floor();
     rendered_any
 }
 
@@ -1788,17 +1791,6 @@ pub(super) fn render_new_turn_parts_committing(
 /// the session-scoped compaction walk skips past. It is the SESSION's delivered
 /// past, not this card's, which is why it is passed in rather than read off
 /// `acc` — a fresh Turn's accumulator is deliberately cursorless.
-/// The server time a transcript message contributes to the receipt floor: its
-/// own `time.created`, or — when the payload carried none — the newest part
-/// start it does carry. `None` only when the message has no server time at all
-/// (it cannot be classified against a receipt then).
-fn message_floor_time(message: &crate::backend::TranscriptMessage) -> Option<i64> {
-    // Only the message's own server time can classify it: a part start does
-    // not say when the message itself was produced, so an untimed message stays
-    // unfloored rather than being moved on a guess.
-    message.time.map(|time| time.created)
-}
-
 pub(super) fn render_turn_parts(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
@@ -2016,8 +2008,6 @@ fn render_pending_gap(
     transcript: &SessionTranscript,
     gap: &crate::bridge::chain::PendingGap,
 ) -> bool {
-    acc.reset_read_floor();
-
     let cursor = &gap.cursor;
     let anchor = &gap.anchor;
     let Some(seed) = state::CursorSeed::for_orphan_resolving(transcript, cursor, anchor) else {
@@ -2056,9 +2046,6 @@ fn render_pending_gap(
         {
             continue;
         }
-        acc.set_message_floor(message_floor_time(message));
-        let floor = acc.read_floor_before(&message_positions, &message.id);
-        acc.set_read_floor(floor);
         let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
@@ -2071,7 +2058,15 @@ fn render_pending_gap(
                     // never be built from these entries, while the gap's own
                     // progress is read from them.
                     acc.mark_gap_message(message.id.clone());
-                    if render_gap_part(acc, message.id.clone(), index, part, delivered, order_keys[index]) {
+                    if render_gap_part_scoped(
+                        acc,
+                        message,
+                        index,
+                        part,
+                        delivered,
+                        order_keys[index],
+                        &message_positions,
+                    ) {
                         rendered = true;
                     }
                 }
@@ -2083,14 +2078,12 @@ fn render_pending_gap(
                     if let Part::Tool(call) = part {
                         acc.retire_seeded_call(&call.identity.call_id);
                     }
-                    let source = PartSource::at(message.id.clone(), index);
-                    if render_part(acc, Some(source), part, order_keys[index]) {
+                    if render_part_scoped(acc, message, index, part, order_keys[index], &message_positions) {
                         rendered = true;
                     }
                 }
             }
         }
-        acc.set_message_floor(None);
     }
     rendered
 }
@@ -2123,23 +2116,22 @@ fn next_user_position(
 /// back from the body — the chain cursor skips it by message
 /// ([`StreamAccumulator::gap_messages`]), so it can still never lower the
 /// chain's frontier.
-fn render_gap_part(
+fn render_gap_part_scoped(
     acc: &mut StreamAccumulator,
-    message_id: MessageId,
+    message: &crate::backend::TranscriptMessage,
     index: usize,
     part: &Part,
     delivered: usize,
     order_at: Option<i64>,
+    read_positions: &std::collections::HashMap<&str, usize>,
 ) -> bool {
+    let message_id = message.id.clone();
     let (full, started_at, is_text) = match part {
         Part::Text(text) => (text.text.as_str(), text.started_at, true),
         Part::Reasoning(reasoning) => (reasoning.text.as_str(), reasoning.started_at, false),
         // The gap's cut resolved to a tool: render it whole — the ordinary
-        // render's own dedup decides.
-        _ => {
-            let source = PartSource::at(message_id, index);
-            return render_part(acc, Some(source), part, order_at);
-        }
+        // scoped render's own dedup decides.
+        _ => return render_part_scoped(acc, message, index, part, order_at, read_positions),
     };
     let full_len = full.chars().count();
     // The CUT reads the content this accumulator already pushed, never the
@@ -2156,11 +2148,24 @@ fn render_gap_part(
     }
     let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
     let source = PartSource::new(message_id, index, cut, None);
+    let facts = PartFacts {
+        form: if is_text {
+            PartForm::Text
+        } else {
+            PartForm::Reasoning
+        },
+        key_at: order_at,
+        shown_at: started_at,
+        source: Some(source.clone()),
+        index,
+    };
     if is_text {
-        acc.push_text_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
+        acc.push_text_scoped(read_positions, message, facts, suffix, lead)
+            .expect("the message scope accepts its own placement");
         acc.mark_streaming();
     } else {
-        acc.push_reasoning_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
+        acc.push_reasoning_scoped(read_positions, message, facts, suffix, lead)
+            .expect("the message scope accepts its own placement");
         acc.mark_reasoning();
     }
     // The digest fingerprints EXACTLY the delivered prefix this body reports,
@@ -2199,7 +2204,6 @@ fn render_seed_scope(
     if seed.frontier.is_none() {
         return false;
     }
-    acc.reset_read_floor();
 
     // When the accumulator OWES the durable gap this scope is the window of
     // (spec #561, review #569), the seed's render IS the gap's render: its
@@ -2218,9 +2222,6 @@ fn render_seed_scope(
         let Some(pos) = message_positions.get(message.id.as_str()).copied() else {
             continue;
         };
-        acc.set_message_floor(message_floor_time(message));
-        let floor = acc.read_floor_before(message_positions, &message.id);
-        acc.set_read_floor(floor);
         let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
@@ -2229,8 +2230,15 @@ fn render_seed_scope(
                     if gap_scope {
                         acc.mark_gap_message(message.id.clone());
                     }
-                    if render_seeded_part(acc, message.id.clone(), index, part, delivered, order_keys[index])
-                    {
+                    if render_seeded_part_scoped(
+                        acc,
+                        message,
+                        index,
+                        part,
+                        delivered,
+                        order_keys[index],
+                        message_positions,
+                    ) {
                         rendered = true;
                     }
                 }
@@ -2244,19 +2252,16 @@ fn render_seed_scope(
                     if gap_scope {
                         acc.mark_gap_message(message.id.clone());
                     }
-                    let source = PartSource::at(message.id.clone(), index);
-                    if render_part(acc, Some(source), part, order_keys[index]) {
+                    if render_part_scoped(acc, message, index, part, order_keys[index], message_positions) {
                         rendered = true;
                     }
                 }
             }
         }
-        acc.set_message_floor(None);
     }
     if gap_scope && rendered {
         acc.mark_gap_rendered();
     }
-    acc.reset_read_floor();
     rendered
 }
 
@@ -2282,13 +2287,21 @@ fn render_compactions(
     if owed.is_empty() {
         return false;
     }
-    for (source, at_ms, fact) in owed {
-        // The row is keyed at its MESSAGE's server time; floor it by the same
-        // message cut a turn part gets (issue #1023).
-        acc.set_message_floor(at_ms);
-        acc.push_compaction_at(at_ms, source, fact);
-        acc.set_message_floor(None);
-    }
+    let read_positions: std::collections::HashMap<&str, usize> = transcript
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(position, message)| (message.id.as_str(), position))
+        .collect();
+    // One walk, one message scope per row: the row is keyed at its MESSAGE's
+    // server time, and that scope's floor is the same message cut a turn part
+    // gets (issue #1023). The synthetic admission takes the cut itself, so the
+    // floor is never applied twice in a way that moves the row.
+    acc.place_compactions(
+        &read_positions,
+        owed.into_iter()
+            .map(|(source, at_ms, fact)| (source, at_ms, fact.clone())),
+    );
     true
 }
 
@@ -2390,94 +2403,6 @@ pub(super) fn rendered_bound(
     bound
 }
 
-/// Render the frontier part of a projection seed (spec #561, ticket #563):
-/// only its undelivered `text[delivered..]` suffix enters the card — with the
-/// markdown lead its cut needs ([`crate::feishu::card::sanitize::neutralize_tail`])
-/// — while the part is marked delivered up to its current end so a later
-/// read's growth renders only the new suffix. Returns whether content entered
-/// the card.
-fn render_seeded_part(
-    acc: &mut StreamAccumulator,
-    message_id: MessageId,
-    index: usize,
-    part: &Part,
-    delivered: usize,
-    order_at: Option<i64>,
-) -> bool {
-    let (full, started_at, is_text) = match part {
-        Part::Text(text) => (text.text.as_str(), text.started_at, true),
-        Part::Reasoning(reasoning) => (reasoning.text.as_str(), reasoning.started_at, false),
-        // The seed resolved this position to text/reasoning; a tool here
-        // means the read changed under the cursor — mark it delivered rather
-        // than guess a suffix.
-        _ => {
-            acc.mark_delivered_part(&message_id, part);
-            return false;
-        }
-    };
-    let full_len = full.chars().count();
-    let delivered = delivered.min(full_len);
-    // The prefix the PREVIOUS card delivered is carried on this part's first
-    // entry alone; a part this accumulator already holds (the frontier growing
-    // under a later read) continues from what it delivered, never repeating
-    // the offset (spec #561, review #569).
-    let source = PartSource::at(message_id.clone(), index);
-    // The CUT reads the part CONTENT this accumulator already pushed, never
-    // the card's display-capped extent (issue #1025): a >cap reasoning entry
-    // holds characters its extent does not count, and cutting at the extent
-    // pushed them a second time on every pass.
-    let held = acc.source_held_chars(&source);
-    let extent = acc.source_extent(&source);
-    // The suffix-only cut is valid only while the read still carries what the
-    // chain delivered for the part. A live REWRITE — the read's prefix no
-    // longer hashing to the delivered extent — replaces the part's run with the
-    // new content in full: cutting at `held` would push a stray suffix and let
-    // the cursor claim the replacement delivered (spec #561, review #569,
-    // ADR-0071's rewrite rule).
-    if held > 0 && !acc.source_prefix_holds(&source, full, extent) {
-        acc.mark_delivered_part(&message_id, part);
-        if is_text {
-            acc.replace_text_run(&source, full, order_at, started_at);
-            acc.mark_streaming();
-        } else {
-            acc.replace_reasoning_run(&source, full, order_at, started_at);
-            acc.mark_reasoning();
-        }
-        // The fresh run holds the whole read from its start, so what it
-        // delivered is again the card's visible extent — never the part's raw
-        // length (issue #1025).
-        record_seed_extent(acc, &source, delivered);
-        return !full.is_empty();
-    }
-    let (cut, before) = if held == 0 {
-        (delivered, delivered)
-    } else {
-        (held, 0)
-    };
-    let prefix: String = full.chars().take(cut).collect();
-    let suffix: String = full.chars().skip(cut).collect();
-    // Everything up to the part's current end is delivered now: a later read
-    // grows the part and renders only the growth.
-    acc.mark_delivered_part(&message_id, part);
-    if !suffix.is_empty() {
-        let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
-        let source = PartSource::new(message_id.clone(), index, before, None);
-        if is_text {
-            acc.push_text_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
-            acc.mark_streaming();
-        } else {
-            acc.push_reasoning_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
-            acc.mark_reasoning();
-        }
-        // The digest fingerprints EXACTLY the delivered prefix this body
-        // reports, read back after the push — never a second formula that can
-        // drift from the extent's (spec #561, review #569; issue #1025).
-        acc.stamp_source_digest(&source, full);
-    }
-    record_seed_extent(acc, &source, delivered);
-    !suffix.is_empty()
-}
-
 /// Record what a seeded pass delivered as the seed frontier's extent (issue
 /// #1025): the absolute extent the body now reports — the same number the
 /// confirmed cursor will carry — or the cursor's own value when the pass
@@ -2510,7 +2435,6 @@ fn record_seed_extent(acc: &mut StreamAccumulator, source: &PartSource, delivere
 /// settled card omits it, because no renderer will ever update that `⏳` again.
 fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let mut rendered = false;
-    acc.reset_read_floor();
     let seeded_positions: std::collections::HashMap<&str, usize> = transcript
         .messages
         .iter()
@@ -2545,30 +2469,40 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             && let Some(call) = transcript.tool_call(&call_id)
         {
             let message = &transcript.messages[position];
-            // The call's message carries the floor its settlement takes
-            // (issue #1023): a post-click message's parts follow the receipt.
-            acc.set_message_floor(message_floor_time(message));
-            let floor = acc.read_floor_before(&seeded_positions, &message.id);
-            acc.set_read_floor(floor);
-            // The call's READ POSITION orders it, exactly like the window walk
-            // (issue #1022): the seeded set is resolved by identity, not by a
-            // clock, but its key still comes from the message's part order.
-            let order_at = part_order_times(message).get(index).copied().flatten();
-            if render_part(
-                acc,
-                Some(PartSource::at(transcript.messages[position].id.clone(), index)),
-                &Part::Tool(call.clone()),
-                order_at,
-            ) {
+            let source = PartSource::at(message.id.clone(), index);
+            let part = Part::Tool(call.clone());
+            // The message scope carries the floor the settlement takes (issue
+            // #1023): a post-click message's parts follow the receipt — and
+            // the call's read position orders it, exactly like the window walk
+            // (issue #1022).
+            if !acc.part_seeded_delivered(source.message_id(), &part) && renders_part(acc, &part) {
+                if call.identity.name == "todowrite" {
+                    acc.record_todo_call(call);
+                    acc.refresh_phase();
+                } else {
+                    let order_at = part_order_times(message).get(index).copied().flatten();
+                    acc.push_tool_scoped(
+                        &seeded_positions,
+                        message,
+                        index,
+                        order_at,
+                        call.started_at,
+                        &call.identity.call_id,
+                        crate::feishu::card::tool_render::ToolPanel::new(call.clone()),
+                        Some(source),
+                    )
+                    .expect("the message scope accepts its own tool placement");
+                }
+                if call.status == ToolStatus::Running {
+                    acc.mark_streaming();
+                }
                 rendered = true;
             }
-            acc.set_message_floor(None);
         }
         if acc.tool_settled(&call_id) {
             acc.retire_seeded_call(&call_id);
         }
     }
-    acc.reset_read_floor();
     rendered
 }
 
