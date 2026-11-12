@@ -1,7 +1,8 @@
 # The Timeline module: one owner for card placement
 
 > **Names the deepening before it lands** (the ADR-0079 pattern). The landing
-> amendment records the finished module and the tickets that landed it.
+> amendment records the finished module and the tickets that landed it. Spec:
+> #1040.
 >
 > **Amends ADR-0040 when this lands**: `seq` is assigned once by the Timeline
 > (the successor of the accumulator's `insert_kind`) with the same never-reuse,
@@ -107,7 +108,9 @@ content into them.**
   `Ledger { entry, ending, at }`, `UserMessage { text, at }`, and `Lead { text,
   at }` (the Wake 承接 line and the busy-follow static lead —
   `TimelineKind::Text`, where both still merge into a text run) — which inserts
-  directly and returns the key the entry took. Each variant maps onto the stored
+  directly and returns the key the entry took, except a `Lead`, which may merge
+  into an existing text run or chunk into several entries and therefore returns
+  none. Each variant maps onto the stored
   `TimelineKind` its call site uses today, so a `Lead` still merges as text and a
   `Receipt` covers every receipt line. It yields no pushable `Placement`, so a synthetic row can never travel
   the transcript path. Every synthetic kind's `at` is an **order key only** —
@@ -158,6 +161,14 @@ content into them.**
   token from another scope fails the generation check, so a placement cannot be
   replayed into a later message. Bare order keys stop crossing the seam; the
   five-layer push wrappers collapse.
+- **Equal keys order by read position.** Every source-bearing transcript entry
+  carries its part's read position (the message's position in the read, then the
+  part index); at equal keys those entries compare by it, which is what makes
+  the settle rule above expressible and keeps a later-visible earlier message
+  ahead of a later message's part. A source-less placement and a synthetic entry
+  have no read position; they sort after positioned entries at the same key and
+  keep allocation order among their peers. `seq` remains identity; `order` now
+  breaks ties only where no read position exists.
 - **The rewrite path is the Timeline's.** `Timeline::replace(placement, source,
   kind)` serves a part the server re-sent with different content: the `kind`
   carries the new text, and `source` must name the same transcript part the token
@@ -189,22 +200,18 @@ content into them.**
   **earlier** messages only, exactly ADR-0038's rule, recomputed against the
   settle read so content that became visible after the pin still floors the
   panel. When the floor is **at or above** the pinned key, the panel takes a
-  **fresh `order` above the equal-key entries of earlier messages** at that floor
-  but below those of its own message that share the key — so it renders after the
-  content that floored it while in-message transcript order still wins **within
-  the equal-key run** (the pinned `seq` is identity, not position). Placed
-  content never moves: when the panel's own following entry sits at a *lower*
-  key (placed before that floor became visible), the floor wins and the panel
-  lands after it. When no integer lies between the two neighbours in the run,
-  settle **renumbers the live slice's equal-key `order` values in one
-  deterministic pass** to make room; `seq` is never touched. This is the one
-  place the equal-key allocation rule defers to read order, and ADR-0038's body
-  records both rules. So a tail-only panel cannot jump a receipt cut or
+  **key `max(pinned, floor)`**, and at that key it sorts by its own part's read
+  position (see below) — after earlier-message entries at the key and before its
+  own message's later parts. Placed content never moves, no key or `order` is
+  renumbered, and `seq` stays identity. When the panel's own following entry
+  sits at a *lower* key (placed before that floor became visible), the floor
+  wins and the panel lands after it. So a tail-only panel cannot jump a receipt cut or
   content read after it was pinned, before or after its start time arrives.
-  The deliberate tightenings are the settle clamp, its equal-key exception, and
-  the compaction row's live-slice lookup (a terminal fact after a split lands on
-  the live card instead of updating a finalized row); tests pin them, and every
-  other placement rule and every current test is unchanged. Content-keyed dedup and the rewritten
+  The deliberate tightenings are the settle clamp, the read-position tie-break
+  at equal keys, and the compaction row's live-slice lookup (a terminal fact
+  after a split lands on the live card instead of updating a finalized row);
+  tests pin them, and every other placement rule and every current test is
+  unchanged. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
   replace defined above. The **Rendered Cursor** and its staging, the ledger,
   the interactions and the card build stay where they are. `StreamAccumulator`
@@ -215,7 +222,7 @@ content into them.**
   scope); no production caller gains a new path.
 - **Behaviour-preserving.** ADR-0038's receipt-skew window, ADR-0071's
   cursorless fallback and every current ordering test are unchanged, apart from
-  the tail-only settle clamp, its equal-key exception and the compaction
+  the tail-only settle clamp, the read-position tie-break and the compaction
   live-slice lookup above. The timeline tests
   move beside the module;
   the guards gain invariant tests (a message scope always clears its floor — a
@@ -227,9 +234,9 @@ content into them.**
   key; an untimed part before a message's first tool borrows the previous timed
   part's key (or the message's created time) while one after a tool keeps the
   render-order fallback; a pending tool's late start time settles at that time
-  but never below its floor, and takes a fresh order above an equal-key entry of
-  an earlier message at the floor; a receipt recorded after the pin still floors
-  it at settle; a resolved click's receipt keeps its reserved key while the slice
+  but never below its floor, and lands by read position after an equal-key entry
+  of an earlier message; a receipt recorded after the pin still floors it at
+  settle; a resolved click's receipt keeps its reserved key while the slice
   reaches it and returns the clamped key after a split past it; a seeded cut
   inside a fence keeps its opener; a post-click compaction row still floors at
   the receipt; a repeated compaction fact updates the row it already has; a
