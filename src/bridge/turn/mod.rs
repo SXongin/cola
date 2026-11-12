@@ -6,6 +6,7 @@ mod ownership;
 mod render;
 mod settle;
 mod state;
+mod timeline;
 mod wake;
 
 /// The Wake continuation's decision vocabulary and the projection's successor

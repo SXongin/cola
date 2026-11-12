@@ -23,7 +23,8 @@ use crate::bridge::handles::{
 use crate::bridge::span;
 use crate::bridge::tasks::TaskRunId;
 use crate::bridge::turn::state;
-use crate::bridge::turn::state::{LedgerCadence, LedgerChange, PartSource, RenderedPart, StreamAccumulator};
+use crate::bridge::turn::state::{LedgerCadence, LedgerChange, RenderedPart, StreamAccumulator};
+use crate::bridge::turn::timeline::PartSource;
 use crate::config::ThreadKey;
 use crate::feishu::card::compaction::same_row;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
@@ -245,7 +246,7 @@ fn render_part(
     order_at: Option<i64>,
 ) -> bool {
     if let Some(source) = source.as_ref()
-        && acc.part_seeded_delivered(&source.message_id, part)
+        && acc.part_seeded_delivered(source.message_id(), part)
     {
         return false;
     }
@@ -383,12 +384,12 @@ fn source_chunk(
         crate::bridge::chain::cursor_prefix_digest(&text.chars().take(len).collect::<String>())
     });
     (
-        Some(PartSource {
-            message_id: source.message_id,
-            index: source.index,
-            delivered_before: 0,
-            prefix_digest: digest,
-        }),
+        Some(PartSource::new(
+            source.message_id().clone(),
+            source.index(),
+            0,
+            digest,
+        )),
         chunk,
     )
 }
@@ -1988,12 +1989,7 @@ fn render_gap_part(
         return false;
     }
     let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
-    let source = PartSource {
-        message_id,
-        index,
-        delivered_before: cut,
-        prefix_digest: None,
-    };
+    let source = PartSource::new(message_id, index, cut, None);
     if is_text {
         acc.push_text_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
         acc.mark_streaming();
@@ -2299,12 +2295,7 @@ fn render_seeded_part(
     acc.mark_delivered_part(&message_id, part);
     if !suffix.is_empty() {
         let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
-        let source = PartSource {
-            message_id: message_id.clone(),
-            index,
-            delivered_before: before,
-            prefix_digest: None,
-        };
+        let source = PartSource::new(message_id.clone(), index, before, None);
         if is_text {
             acc.push_text_at_key(order_at, started_at, Some(source.clone()), &suffix, lead);
             acc.mark_streaming();

@@ -51,7 +51,7 @@ impl PreparedExternalRender {
     /// composed at the same moment.
     pub(crate) fn set_static_lead(&mut self, text: &str) {
         if !text.is_empty() {
-            self.acc.push_text_at(Some(self.anchor_ms - 1), text);
+            self.acc.push_lead(Some(self.anchor_ms - 1), text);
         }
     }
 }
@@ -914,7 +914,7 @@ impl Turn {
         // The 承接 line is keyed just before the Wake's own work so the
         // resumed parts — whose server times are at or after the anchor —
         // always insert below it.
-        acc.push_text_at(Some(anchor.created_ms.saturating_sub(1)), WAKE_RECEIPT);
+        acc.push_lead(Some(anchor.created_ms.saturating_sub(1)), WAKE_RECEIPT);
         let card = {
             // The initial send is a probe: building it must not advance the
             // live card's render boundary.

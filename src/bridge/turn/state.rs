@@ -8,6 +8,7 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
+use super::timeline::{PartSource, SyntheticEntry, Timeline, TimelineItem, TimelineKind};
 use crate::backend::{
     Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor,
     TurnDiffStats,
@@ -42,42 +43,6 @@ pub(super) enum RenderedPart {
     Reasoning(String),
 }
 
-/// One entry on a turn's chronological timeline: a rendered item plus the
-/// server-side start time (epoch ms) of the part it came from — its **key**.
-/// The card renders the timeline in key order, matching how OpenChamber shows
-/// the parts interleaved. `shown_at` is the same server time when the part
-/// truly has one, or `None` when the key is a synthetic ordering device — the
-/// card only ever shows server clocks (#183 follow-up).
-#[derive(Debug, Clone)]
-pub(super) struct TimelineItem {
-    pub(super) key: i64,
-    pub(super) shown_at: Option<i64>,
-    /// The entry's position within an equal-`key` run. An ordinary insert's
-    /// `order` equals its `seq`; a chunked continuation shares its part entry's
-    /// order, and the render-boundary clamp lowers it. `seq` is never
-    /// renumbered, so the identity a panel is keyed by cannot drift (issue
-    /// #1022).
-    pub(super) order: u64,
-    /// Identity of this entry, assigned once at insertion and never reused.
-    /// It names the entry's panel on the card (`reason_{seq}`; a tool panel
-    /// uses the call's own id, `tool_{call_id}`, so the takeover's per-call
-    /// strip can match it); unlike the entry's position it survives timeline
-    /// insertions and merges, so the client's local panel state can't drift to
-    /// another panel when the card re-renders.
-    pub(super) seq: u64,
-    pub(super) kind: TimelineKind,
-    /// The typed transcript part this entry rendered from, for text/reasoning
-    /// entries pushed by the render (spec #561's cursor frontier); `None` for
-    /// synthetic entries (receipts, ledger entries) and for entries no
-    /// frontier can name (tools).
-    pub(super) source: Option<PartSource>,
-    /// A markdown lead to emit before this entry's content (spec #561's cut
-    /// tail): the fence opener or table header a projection's seeded render
-    /// needs because the delivered prefix ended inside that construct. It is
-    /// rendered, never counted as the part's own delivered characters.
-    pub(super) lead: Option<String>,
-}
-
 /// A click's reservation of its Interaction Receipt's timeline position
 /// (issue #1023): the key the receipt will take, and the floor key already
 /// pushed into the cut list for content written during the reply.
@@ -88,68 +53,6 @@ pub(super) struct ReservedReceipt {
     /// Identity of this reservation, so a failed click's late cleanup cannot
     /// delete a retry's fresh reservation for the same request.
     pub(super) token: u64,
-}
-
-/// An Interaction Receipt's **server-time cut** (issue #1023): the asking tool
-/// part's server time (`at`) and the receipt's own timeline key (`key`). Only
-/// `at` is on the server's clock — the cut exists so a later read's part times
-/// can be compared against the ask; `key` is the timeline position (cola's
-/// scale) that content written after the ask may not precede.
-///
-/// The cut answers one question about content a later read delivers: was it
-/// written after the Host clicked? A part whose `shown_at` is AFTER `at` was
-/// server-timestamped after the request was asked, and the request blocks the
-/// turn, so the Host's click cannot precede it — it follows the click and may
-/// not sort above the receipt at `key` (ADR-0038 rule 4). A part at or before
-/// `at` was content the Host could see when they clicked, and keeps its own
-/// position, above the receipt if its key says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReceiptCut {
-    pub(super) at: i64,
-    pub(super) key: i64,
-}
-
-/// Where a timeline text/reasoning entry came from: the typed transcript
-/// part's own position (spec #561's cursor frontier). The payload carries no
-/// stable part id (AGENTS.md pitfall `wire-shapes`), so identity is the message plus the part's
-/// ordinal in it. Test and synthetic pushes carry none.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PartSource {
-    /// The assistant message that carried the part.
-    pub(super) message_id: MessageId,
-    /// The part's index in its message's typed `parts` vec.
-    pub(super) index: usize,
-    /// The part's model characters that were already delivered before this
-    /// entry was rendered (spec #561's projection seed): the frontier's cut
-    /// point. The cursor's delivered extent for the part is this offset plus
-    /// the entry's own (model) characters; the markdown lead is not counted.
-    /// `0` for every ordinary render.
-    pub(super) delivered_before: usize,
-    /// The digest of the part's delivered prefix at the moment this entry was
-    /// pushed (spec #561, review #569): derived metadata, never content, kept
-    /// so the frontier can tell a grown part from a same-slot replacement even
-    /// when neither carries a server start time (V2). `None` for a source no
-    /// render stamped.
-    pub(super) prefix_digest: Option<u64>,
-}
-
-impl PartSource {
-    /// An ordinary render's source: nothing delivered before it and no digest
-    /// yet — the push stamps the digest of what it renders.
-    pub(super) fn at(message_id: MessageId, index: usize) -> Self {
-        Self {
-            message_id,
-            index,
-            delivered_before: 0,
-            prefix_digest: None,
-        }
-    }
-
-    /// Whether `self` names the same transcript part as `other` (the position,
-    /// not the offset or digest).
-    pub(super) fn same_part(&self, other: &PartSource) -> bool {
-        self.message_id == other.message_id && self.index == other.index
-    }
 }
 
 /// The Rendered Cursor resolved against one transcript read (spec #561): the
@@ -494,47 +397,6 @@ struct LiveTool {
     source: Option<PartSource>,
 }
 
-/// What a timeline entry renders.
-#[derive(Debug, Clone)]
-pub(super) enum TimelineKind {
-    Text(String),
-    Reasoning(String),
-    Tool(String),
-    /// The External Message's own user block (ADR-0028): the text another
-    /// client — the TUI, another IDE — sent into the Session, rendered as a
-    /// blockquote that names the role. Keyed just before the Turn's anchor, so
-    /// it heads the card; a distinct kind (never a `Text` entry) is what keeps
-    /// it out of the reply's text run, which merges consecutive text chunks
-    /// into one element (live 2026-10-26: the TUI's message and the answer read
-    /// as one paragraph).
-    UserMessage(String),
-    /// A resolved interaction block's Interaction Receipt (ADR-0038, rule 4):
-    /// one markdown line keyed by the moment it was resolved, so it sits below
-    /// everything that was on the card when the Host clicked and above
-    /// everything resolved afterwards.
-    Receipt(String),
-    /// A completed Background Task's ledger entry (ADR-0060): the mechanical
-    /// completion line as a folded collapsible panel's title, the task's
-    /// identity and timing in the fold. Keyed at the Wake's own server time,
-    /// so the entry sits where the completion happened — never on a later
-    /// card, and never doubled by a repeated poll. The second field is the
-    /// **Task Ending** this entry renders (ADR-0080) — the run and the class
-    /// whose shown bit this body's confirmed write flips, `None` for an entry
-    /// whose read carried no identity to name. The body that renders an ending
-    /// stages it, so a body that leaves the entry to a continuation claims
-    /// nothing for it.
-    // Boxed: the ending pair is large and this variant is the rarest in the
-    // timeline, so the box keeps the enum (and the timeline it fills) small.
-    LedgerEntry(TaskCompletionEntry, Option<Box<EndingKey>>),
-    /// One **Compaction** (ADR-0082): a folded row naming its reason with the
-    /// summary in the fold — or, while it is in flight or failed, a plain live
-    /// or failure row — keyed at the compaction's own server time, so it sits in
-    /// history where it happened rather than at the card's end. The typed fact
-    /// rides the entry: the row's revision is what dedupes against it
-    /// ([`RenderedPart::compaction`]).
-    Compaction(Compaction),
-}
-
 /// A card as built for one message: the JSON, whether the timeline had to
 /// split (the caller then sends a continuation), and the element ranges of the
 /// live interaction blocks this card renders — empty on finalized slices, whose
@@ -585,9 +447,9 @@ impl SliceFingerprint {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for item in items {
-            item.seq.hash(&mut hasher);
-            hash_slice_content(&item.kind, tools, &mut hasher);
-            item.lead.hash(&mut hasher);
+            item.seq().hash(&mut hasher);
+            hash_slice_content(item.kind(), tools, &mut hasher);
+            item.lead().hash(&mut hasher);
         }
         Self {
             entries: items.len(),
@@ -1388,10 +1250,6 @@ pub(super) struct StreamAccumulator {
     /// the refusal is the card's own shell rather than its content: cleared by
     /// any delivered write, never by an abandonment.
     card_abandonments: u8,
-    /// Timeline entries an abandonment skipped (issue #886). A later chunk of
-    /// the same streaming part must start a NEW entry, never merge into a
-    /// skipped one — no card will ever render it again.
-    sealed_entries: std::collections::HashSet<u64>,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
@@ -1496,44 +1354,12 @@ pub(super) struct StreamAccumulator {
     /// clock churn), the yielded refresh at whole seconds (its reads are the
     /// card's only clock).
     ledger_clock: Vec<crate::feishu::card::ledger::LedgerRowClock>,
-    /// Text, reasoning, tool and receipt entries ordered by their key (the
-    /// server-side part start time) — the card is built from this, so message ↔
-    /// tool interleaving is preserved even when a part renders late. Private to
-    /// this module (no external writer): maintained by [`Self::insert_item`],
-    /// [`Self::insert_kind_after`], [`Self::push_text_lead`],
-    /// [`Self::push_reasoning_lead`], [`Self::push_tool_from`] and
-    /// [`Self::drop_source_run`]; read through [`Self::has_receipt_prefix`] and
-    /// the card build.
-    timeline: Vec<TimelineItem>,
-    /// Fallback key source for pushes without a server part time
-    /// ([`Self::next_order`]).
-    order_seq: i64,
-    /// Highest key inserted so far — keeps [`Self::next_order`] ahead of the
-    /// timeline even when a server clock runs ahead of cola's.
-    last_key: i64,
-    /// Next [`TimelineItem::seq`] to hand out (see [`Self::insert_kind`]).
-    item_seq: u64,
-    /// Every anchored Interaction Receipt's server-time cut (issue #1023), in
-    /// resolution order. Private to this module: pushed by the resolution
-    /// paths, read by [`Self::insert_item`] so a later read's content lands
-    /// after the receipts written before it. A list, not one cut: two requests
-    /// can be asked in one order and answered in another (Q1 asked at 1000,
-    /// Q2 at 2000, Q2 answered first, Q1 second), and content written between
-    /// the two asks must clear Q1's receipt while staying below the newer one
-    /// — one "latest" cut cannot express that staircase.
-    receipt_cuts: Vec<ReceiptCut>,
-    /// The timeline floor of the transcript MESSAGE currently being rendered
-    /// (issue #1023): a message the server created after a receipt's ask was
-    /// produced after that click, so every part of it sorts after the receipt.
-    /// Transient: the walks set it per message and clear it after, so a push
-    /// outside a walk (a synthetic receipt, a wake line) is never floored.
-    message_floor: Option<i64>,
-    /// The highest key this render walk has placed so far (issue #1022): the
-    /// next message's parts may not sort above content already read before
-    /// them, even when a post-tool part took a synthetic `next_order` key and
-    /// the next message's own server time is older. Transient, like
-    /// [`Self::message_floor`]: the walks reset it at their start and end.
-    read_floor: Option<i64>,
+    /// The card body's ordered entries and the rule that places content into
+    /// them (spec #1040): the timeline, its floors, the Interaction Receipt
+    /// cuts, the live-slice boundary, the sealed set and key/identity minting
+    /// all live behind [`Timeline`]. Private to this module: the accumulator
+    /// delegates every timeline accessor to it.
+    timeline: Timeline,
     /// Next [`ReservedReceipt::token`] to hand out.
     reservation_seq: u64,
     /// request id → the timeline key reserved for its receipt at CLICK time
@@ -1550,16 +1376,6 @@ pub(super) struct StreamAccumulator {
     /// [`Self::update_question_state`]; `resolve_vanished` sweeps through
     /// [`Self::resolve_interaction`].
     interactions: Vec<InteractionBlock>,
-    /// Timeline index the CURRENT card starts rendering from. When a card fills
-    /// up (Feishu component limit) it is finalized with a "to be continued"
-    /// marker and `render_from` advances — a fresh continuation card renders the
-    /// remaining timeline from there. Private to this module: advanced by the
-    /// builds ([`Self::build_card_with_info`] / [`Self::build_finalized_handoff`])
-    /// and the source prune [`Self::drop_source_run`] re-bases it; the failed-write
-    /// rewind goes through [`Self::restore_render_boundary`], the projection
-    /// arm's fenced retry through [`Self::rewind_render_boundary`]. Read through
-    /// [`Self::render_from`].
-    render_from: usize,
     /// Provider ID of the model answering this turn (e.g. "opencode-go").
     /// Private to this module: set by [`Self::apply_footer_model`] (a transcript
     /// read) and the `set_model` test seam; read only inside this module (the
@@ -2091,7 +1907,7 @@ impl StreamAccumulator {
             || self
                 .timeline
                 .iter()
-                .any(|item| matches!(item.kind, TimelineKind::Compaction(_)))
+                .any(|item| matches!(item.kind(), TimelineKind::Compaction(_)))
     }
 
     /// Whether this part's content was already rendered into the card — the
@@ -2874,18 +2690,25 @@ impl StreamAccumulator {
     /// next build starts after it, so the same refused payload is never
     /// re-rendered on this card. Never rewinds a boundary already advanced.
     pub(super) fn skip_rejected_slice(&mut self, start: usize, end: usize) {
-        for item in &self.timeline[start.min(end)..end] {
-            self.sealed_entries.insert(item.seq);
-        }
-        if end > self.render_from {
-            self.render_from = end;
-        }
+        self.timeline.skip_rejected_slice(start, end);
     }
 
     /// How many timeline entries the accumulator holds — the flush's
     /// "did anything arrive while the refused write was in flight" probe.
     pub(super) fn timeline_len(&self) -> usize {
         self.timeline.len()
+    }
+
+    /// The timeline module, for the internal test seam and read-only walks.
+    #[cfg(test)]
+    pub(super) fn timeline(&self) -> &Timeline {
+        &self.timeline
+    }
+
+    /// The timeline module, mutable for the internal test seam.
+    #[cfg(test)]
+    pub(super) fn timeline_mut(&mut self) -> &mut Timeline {
+        &mut self.timeline
     }
 
     /// The fate of the write carrying this flush's terminal slice (spec #602).
@@ -3016,8 +2839,13 @@ impl StreamAccumulator {
         // at, even within the same millisecond. The key orders only: a receipt
         // resolves in cola's world, where no server time exists, and it shows
         // no clock rather than putting cola's in the panels' costume.
-        let key = reserved.unwrap_or_else(|| self.next_order());
-        self.insert_kind(key, None, TimelineKind::Receipt(text));
+        let key = self
+            .timeline
+            .synthetic(SyntheticEntry::Receipt {
+                text: &text,
+                at: reserved,
+            })
+            .expect("a receipt always owns one entry");
         // A reserved key already floored the content written during the reply
         // (issue #1023). Without one — a remote client's answer, or a click
         // whose reservation was skipped under the lock budget — the ask cuts
@@ -3042,7 +2870,7 @@ impl StreamAccumulator {
     /// staircase. A block without an anchor (no surfacing read) records
     /// nothing and leaves the earlier cuts in force.
     pub(super) fn record_receipt_cut(&mut self, asked_at: i64, key: i64) {
-        self.receipt_cuts.push(ReceiptCut { at: asked_at, key });
+        self.timeline.record_cut(asked_at, key);
     }
 
     /// Reserve at the LATEST ask among the live blocks `request_id`'s receipt
@@ -3085,12 +2913,11 @@ impl StreamAccumulator {
         if let Some(old) = self.reserved_receipts.remove(request_id) {
             self.forget_reserved_cut(old.floor_key);
         }
-        let receipt_key = self.next_order();
+        // The Timeline mints the key and installs the floor cut; the floor key
+        // is consumed there too, so an unrelated receipt written in this same
+        // millisecond cannot share the reservation's cut.
+        let receipt_key = self.timeline.reserve_key(asked_at);
         let floor_key = receipt_key.saturating_add(1);
-        self.receipt_cuts.push(ReceiptCut {
-            at: asked_at,
-            key: floor_key,
-        });
         self.reservation_seq += 1;
         let token = self.reservation_seq;
         self.reserved_receipts.insert(
@@ -3101,11 +2928,6 @@ impl StreamAccumulator {
                 token,
             },
         );
-        // Consume the floor key too: the next synthetic key must not equal it,
-        // or an unrelated receipt written in this same millisecond would share
-        // the reservation's cut and a later forget would delete both.
-        self.order_seq = floor_key;
-        self.last_key = self.last_key.max(floor_key);
         Some(token)
     }
 
@@ -3120,7 +2942,7 @@ impl StreamAccumulator {
     /// change uses ONE key, so the other blocks' floors must go with their
     /// unused reservations.
     pub(super) fn forget_reserved_cut(&mut self, floor_key: i64) {
-        self.receipt_cuts.retain(|cut| cut.key != floor_key);
+        self.timeline.forget_cut(floor_key);
     }
 
     /// Re-point a reservation's floor cut at the LATEST ask it covers. A mode
@@ -3128,9 +2950,7 @@ impl StreamAccumulator {
     /// an earlier ask and the clicked (latest) ask was visible before the
     /// click, so the cut must use the latest ask, not the clicked block's own.
     pub(super) fn retune_receipt_cut(&mut self, floor_key: i64, at: i64) {
-        if let Some(cut) = self.receipt_cuts.iter_mut().find(|cut| cut.key == floor_key) {
-            cut.at = cut.at.max(at);
-        }
+        self.timeline.retune_cut(floor_key, at);
     }
 
     /// Drop a click's reservation for `request_id` without writing a receipt —
@@ -3153,25 +2973,17 @@ impl StreamAccumulator {
     /// another block with its own shared receipt.
     pub(super) fn consume_reservation(&mut self, request_id: &str) {
         if let Some(reserved) = self.reserved_receipts.remove(request_id) {
-            self.receipt_cuts.retain(|cut| cut.key != reserved.floor_key);
+            self.timeline.forget_cut(reserved.floor_key);
         }
     }
 
     /// The key floor a transcript MESSAGE created at `created` earns from the
-    /// Interaction Receipts (issue #1023): every receipt asked before the
-    /// message existed was clicked before it was written, so none of its parts
-    /// may sort above that receipt ([`ReceiptCut`], ADR-0038 rule 4). A message
-    /// is the unit, not a part: a part that STARTED before the click but grew
-    /// after it belongs to a pre-click message and keeps its position, and a
-    /// parallel tool part delivered late sits in the asking message too. The
-    /// newest such receipt's key is the floor. `None` when there is no such
-    /// receipt or the message predates every ask.
+    /// Interaction Receipts (issue #1023), as the Timeline computes it: the
+    /// newest receipt asked before the message existed is the floor, `None`
+    /// when there is no such receipt or the message predates every ask.
+    #[cfg(test)]
     pub(super) fn receipt_cut_floor(&self, created: i64) -> Option<i64> {
-        self.receipt_cuts
-            .iter()
-            .filter(|cut| created > cut.at)
-            .map(|cut| cut.key)
-            .max()
+        self.timeline.receipt_cut_floor(created)
     }
 
     /// Set (or clear) the floor for the transcript message about to render: the
@@ -3179,44 +2991,7 @@ impl StreamAccumulator {
     /// that continue a part across reads — is placed at or after the receipt
     /// written for a click that preceded the message.
     pub(super) fn set_message_floor(&mut self, created: Option<i64>) {
-        self.message_floor = created.and_then(|created| self.receipt_cut_floor(created));
-    }
-
-    /// The timeline key a part's chunk is placed (and looked up) at: its own
-    /// server time, floored by the CURRENT message's receipt floor (issue
-    /// #1023) and clamped to the live slice. The push paths must use this SAME
-    /// key for the merge lookup — an entry already placed at the floored key
-    /// would otherwise be missed by a later chunk still asking for the part's
-    /// raw server key, and every render read would start a second entry (a new
-    /// reasoning panel, a split text run).
-    fn part_order_key(&mut self, key_at: Option<i64>, source: Option<&PartSource>) -> i64 {
-        // A part already on the timeline keeps the key it was placed at: an
-        // untimed V2 part (and a timed one whose floor/clamp differs on a later
-        // read) must keep merging into its own entry, or a growing part splits
-        // around a receipt that landed between its reads.
-        if let Some(key) = source.and_then(|source| self.placed_source_key(source)) {
-            return key;
-        }
-        let key = match key_at {
-            Some(at) => self.message_floor.map_or(at, |floor| at.max(floor)),
-            None => self.next_order(),
-        };
-        // Apply the same live-slice clamp [`Self::insert_item`] will: a key
-        // behind the finalized boundary is placed at the slice's first key, and
-        // a later chunk's merge lookup must ask for THAT key or it would miss
-        // the entry and start a second one after a split.
-        let idx = self.timeline.partition_point(|item| item.key <= key);
-        let key = if idx < self.render_from {
-            self.timeline.get(self.render_from).map_or(key, |item| item.key)
-        } else {
-            key
-        };
-        // A CROSS-message read floor (set by the walk per message): content
-        // already read from an earlier message may not sort below a later
-        // message whose own server time is older. Inside one message the
-        // transcript part order above wins, so the floor is never advanced
-        // here.
-        self.read_floor.map_or(key, |floor| key.max(floor))
+        self.timeline.set_message_floor(created);
     }
 
     /// Set (or clear) the walk's read-order floor for the message about to
@@ -3224,12 +2999,12 @@ impl StreamAccumulator {
     /// this one in the read; the walks compute it per message with
     /// [`Self::read_floor_before`] and clear it after.
     pub(super) fn set_read_floor(&mut self, floor: Option<i64>) {
-        self.read_floor = floor;
+        self.timeline.set_read_floor(floor);
     }
 
     /// Clear the walk's read-order floor.
     pub(super) fn reset_read_floor(&mut self) {
-        self.set_read_floor(None);
+        self.timeline.reset_read_floor();
     }
 
     /// [`Self::set_read_floor`]'s value: the highest key a transcript part from
@@ -3240,23 +3015,7 @@ impl StreamAccumulator {
         positions: &std::collections::HashMap<&str, usize>,
         message_id: &MessageId,
     ) -> Option<i64> {
-        let current = *positions.get(message_id.as_str())?;
-        self.timeline
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.kind,
-                    TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
-                )
-            })
-            .filter(|item| {
-                item.source
-                    .as_ref()
-                    .and_then(|source| positions.get(source.message_id.as_str()).copied())
-                    .is_some_and(|position| position < current)
-            })
-            .map(|item| item.key)
-            .max()
+        self.timeline.read_floor_before(positions, message_id)
     }
 
     /// Resolve a live block WITHOUT a timeline receipt of its own: a mode change
@@ -3289,9 +3048,9 @@ impl StreamAccumulator {
     /// orders: the receipt itself shows no clock (`shown_at` stays `None`,
     /// like every other receipt).
     pub(super) fn push_receipt_at(&mut self, at_ms: Option<i64>, text: &str) -> i64 {
-        let key = at_ms.unwrap_or_else(|| self.next_order());
-        self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
-        key
+        self.timeline
+            .synthetic(SyntheticEntry::Receipt { text, at: at_ms })
+            .expect("a receipt always owns one entry")
     }
 
     /// Place the External Message's own text (ADR-0028) on the timeline at
@@ -3301,11 +3060,18 @@ impl StreamAccumulator {
     /// a server time when present, so it is recorded as the entry's server
     /// time too: the Interaction Receipt's cut compares against it (#1023).
     pub(super) fn push_user_message(&mut self, at_ms: Option<i64>, text: &str) {
-        if text.trim().is_empty() {
-            return;
-        }
-        let key = at_ms.unwrap_or_else(|| self.next_order());
-        self.insert_kind(key, at_ms, TimelineKind::UserMessage(text.to_string()));
+        let _ = self
+            .timeline
+            .synthetic(SyntheticEntry::UserMessage { text, at: at_ms });
+    }
+
+    /// Place a bot-authored notice rendered as text — the fresh-card Wake 承接
+    /// opener or a busy-follow static lead (spec #1040's [`SyntheticEntry::Lead`]).
+    /// The entry may merge or chunk, so it owns no key; the reply body keeps
+    /// the text as before.
+    pub(super) fn push_lead(&mut self, at_ms: Option<i64>, text: &str) {
+        self.text.push_str(text);
+        let _ = self.timeline.synthetic(SyntheticEntry::Lead { text, at: at_ms });
     }
 
     /// Place one Compaction row (ADR-0082) at `at_ms` — the catalogued fact's own
@@ -3324,18 +3090,12 @@ impl StreamAccumulator {
         source: PartSource,
         compaction: &Compaction,
     ) {
-        match self.carried_compaction(&source).map(|(index, _)| index) {
-            Some(index) => self.timeline[index].kind = TimelineKind::Compaction(compaction.clone()),
-            None => {
-                let key = at_ms.unwrap_or_else(|| self.next_order());
-                self.insert_kind_src(
-                    key,
-                    at_ms,
-                    Some(source),
-                    TimelineKind::Compaction(compaction.clone()),
-                );
-            }
-        }
+        let _ = self.timeline.synthetic(SyntheticEntry::Compaction {
+            fact: compaction.clone(),
+            at: at_ms,
+            message_time: at_ms,
+            row: source,
+        });
     }
 
     /// Mark `wake_id`'s resumed work as handed to a card: the handoff a 承接
@@ -3528,23 +3288,6 @@ impl StreamAccumulator {
         self.pending_gap = Some(gap);
     }
 
-    /// The timeline index and the fact of the Compaction row THIS card carries at
-    /// `source`'s position, whatever its key or revision (ADR-0082): the one scan
-    /// both the render's in-place update and its dedup read go through. A row
-    /// keyed by a synthetic order (a compaction whose message reports no server
-    /// time) is found by its position alone, exactly like one keyed by a clock.
-    fn carried_compaction(&self, source: &PartSource) -> Option<(usize, &Compaction)> {
-        self.timeline
-            .iter()
-            .enumerate()
-            .find_map(|(index, item)| match (&item.kind, item.source.as_ref()) {
-                (TimelineKind::Compaction(fact), Some(item_source)) if item_source.same_part(source) => {
-                    Some((index, fact))
-                }
-                _ => None,
-            })
-    }
-
     /// The Compaction row THIS card carries at `source`'s position, whatever
     /// revision it holds (ADR-0082): the row's own confirmed write advances the
     /// session's durable delivered position past the position, so a later
@@ -3555,7 +3298,7 @@ impl StreamAccumulator {
     /// ([`crate::bridge::turn::render::rendered_bound`]), and a compaction no
     /// confirmed card has shown yet renders.
     pub(super) fn compaction_row(&self, source: &PartSource) -> Option<&Compaction> {
-        self.carried_compaction(source).map(|(_, fact)| fact)
+        self.timeline.compaction_row(source)
     }
 
     /// The accumulator's confirmed Rendered Cursor (spec #561): the frontier a
@@ -3645,10 +3388,13 @@ impl StreamAccumulator {
         entry: TaskCompletionEntry,
         ending: Option<EndingKey>,
     ) {
-        let key = at_ms.unwrap_or_else(|| self.next_order());
         // A server-stamped entry records its time as the entry's own server
         // time, so the Interaction Receipt's cut can floor it (issue #1023).
-        self.insert_kind(key, at_ms, TimelineKind::LedgerEntry(entry, ending.map(Box::new)));
+        let _ = self.timeline.synthetic(SyntheticEntry::Ledger {
+            entry,
+            ending,
+            at: at_ms,
+        });
     }
 
     /// The Task Endings of the ledger entries in the timeline range a body
@@ -3656,9 +3402,10 @@ impl StreamAccumulator {
     /// so a split's prefix never claims an entry its continuation carries, and
     /// no less.
     fn rendered_ledger_keys(&self, from: usize, to: usize) -> Vec<EndingKey> {
-        self.timeline[from.min(self.timeline.len())..to.min(self.timeline.len())]
+        self.timeline
+            .range(from, to)
             .iter()
-            .filter_map(|item| match &item.kind {
+            .filter_map(|item| match item.kind() {
                 TimelineKind::LedgerEntry(_, ending) => ending.as_deref().cloned(),
                 _ => None,
             })
@@ -3872,259 +3619,14 @@ impl StreamAccumulator {
         }
     }
 
-    /// Insert a timeline entry at its key's position: after every entry whose
-    /// part started no later, before the ones that started later. The poll can
-    /// deliver parts out of order (a panel whose content lands after later
-    /// parts), so appending would put it after content that follows it — the
-    /// ordering bug that moved a gated command below its receipt. Equal keys
-    /// keep ALLOCATION order ([`TimelineItem::seq`]), not settle order: a live
-    /// tool panel is allocated where its part stands in the read and joins the
-    /// timeline only when it settles, by which point a later part of the same
-    /// message may already sit at that key. Sequencing the equal-key run keeps
-    /// the panel at its transcript position (issue #1022: V2 text parts carry no
-    /// time, so they borrow the previous part's key).
-    ///
-    /// A key behind the live slice inserts at its start: the finalized card
-    /// that owned that position is already sent, and the top of the live card
-    /// is the closest honest place left. Both the index AND the key clamp then
-    /// (to the live slice's first key), so the timeline stays sorted and key
-    /// lookups stay sound. `shown_at` records the part's server start time
-    /// (or `None` for a synthetic key) as the instant a panel header may
-    /// display.
-    fn insert_kind(&mut self, key: i64, shown_at: Option<i64>, kind: TimelineKind) {
-        self.insert_kind_src(key, shown_at, None, kind);
-    }
-
-    /// [`Self::insert_kind`] carrying the typed transcript part a
-    /// text/reasoning entry rendered from (spec #561's cursor frontier).
-    fn insert_kind_src(
-        &mut self,
-        key: i64,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        kind: TimelineKind,
-    ) {
-        self.insert_kind_lead(key, shown_at, source, kind, None);
-    }
-
-    /// [`Self::insert_kind_src`] with a markdown lead rendered before the
-    /// entry's content (spec #561's cut tail): the seeded render's fence
-    /// opener / table header.
-    fn insert_kind_lead(
-        &mut self,
-        key: i64,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        kind: TimelineKind,
-        lead: Option<String>,
-    ) -> usize {
-        self.item_seq += 1;
-        self.insert_item(key, shown_at, source, self.item_seq, kind, lead)
-    }
-
-    /// [`Self::insert_kind`] with a pre-allocated identity: a live Tool Panel
-    /// keeps the seq it was born with when it settles into the timeline, so
-    /// its card element — and the reader's fold state — survives the move
-    /// (ADR-0045).
-    fn insert_item(
-        &mut self,
-        key: i64,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        seq: u64,
-        kind: TimelineKind,
-        lead: Option<String>,
-    ) -> usize {
-        // A part of a message the server created after an Interaction
-        // Receipt's ask was produced after the click, so it may not sort above
-        // the receipt (issue #1023, [`ReceiptCut`]). The receipt's own key is
-        // the floor; equal keys keep this entry after it.
-        let key = self.message_floor.map_or(key, |floor| key.max(floor));
-        // A settled tool (and every other transcript part) keeps the walk's
-        // read order: a later message's tool cannot sort above content already
-        // read (issue #1022). Synthetic and session-scoped entries (a receipt,
-        // a compaction, a wake line) are not read-order content.
-        let is_turn_part = matches!(
-            &kind,
-            TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
-        );
-        // Only a transcript PART is read-order content: a synthetic entry (a
-        // receipt, a wake line, a test push) keeps its own key and never moves
-        // the floor.
-        let read_ordered = is_turn_part && source.is_some();
-        let key = match (read_ordered, self.read_floor) {
-            (true, Some(floor)) => key.max(floor),
-            _ => key,
-        };
-        // Equal keys keep ALLOCATION order (`order`): a live tool panel is
-        // allocated at its transcript position and joins the timeline only when
-        // it settles, after a later part of the same message may have been
-        // pushed at the same key (issue #1022). `order` matches `seq` for every
-        // ordinary insert; the clamp below may lower it without touching the
-        // entry's identity.
-        let idx = self
-            .timeline
-            .partition_point(|item| item.key < key || (item.key == key && item.order < seq));
-        let (idx, key, order) = if idx < self.render_from {
-            let idx = self.render_from;
-            let key = self.timeline.get(idx).map_or(key, |item| item.key);
-            // The clamp puts the entry at the top of the live slice, which can
-            // land inside an equal-key run. Lower its ORDER ahead of that run so
-            // the (key, order) sort the search above assumes still holds; `seq`
-            // — the panel identity — is untouched.
-            let order = self.timeline[idx..]
-                .iter()
-                .take_while(|item| item.key == key)
-                .map(|item| item.order)
-                .min()
-                .map_or(seq, |first| first.saturating_sub(1));
-            (idx, key, order)
-        } else {
-            (idx, key, seq)
-        };
-        self.item_seq = self.item_seq.max(seq);
-        self.timeline.insert(
-            idx,
-            TimelineItem {
-                key,
-                shown_at,
-                order,
-                seq,
-                kind,
-                source,
-                lead,
-            },
-        );
-        self.last_key = self.last_key.max(key);
-        idx
-    }
-
-    /// The timeline index of the LAST entry keyed `key` that renders `kind`
-    /// and belongs to the SAME transcript part as `source` (spec #561, review
-    /// #569): the entry a push may merge into. Entries from different parts
-    /// never merge — two parts of one message may share a server time — so the
-    /// search walks this key's own run for the part's entry instead of taking
-    /// the run's last one. A `None` on either side demands an exact `None`
-    /// match, so a synthetic push never absorbs a part's entry.
-    /// The timeline key of the entry this accumulator already holds for
-    /// `source`, when it holds one (issue #1023): a placed part's position is
-    /// fixed across reads, so a later chunk merges into it instead of starting
-    /// a second entry at a freshly allocated key.
-    fn placed_source_key(&self, source: &PartSource) -> Option<i64> {
-        self.timeline[self.render_from..].iter().rev().find_map(|item| {
-            item.source
-                .as_ref()
-                .filter(|held| held.same_part(source))
-                .map(|_| item.key)
-        })
-    }
-
-    fn source_entry(
-        &self,
-        key: i64,
-        source: Option<&PartSource>,
-        accepts: impl Fn(&TimelineKind) -> bool,
-    ) -> Option<usize> {
-        let end = self.timeline.partition_point(|item| item.key <= key);
-        // The live slice only: a finalized entry is already on a sent card, so
-        // a grown part starts a new entry on the continuation rather than
-        // merging into a body nobody will render again.
-        let start = self.render_from.min(end);
-        for (offset, item) in self.timeline[start..end]
-            .iter()
-            .enumerate()
-            .rev()
-            .take_while(|(_, item)| item.key == key)
-        {
-            let idx = start + offset;
-            // A sealed entry was abandoned by a refused payload (issue #886):
-            // no card will render it again, so a later chunk of the same part
-            // must start a NEW entry instead of growing the dead one.
-            if self.sealed_entries.contains(&item.seq) {
-                return None;
-            }
-            if !accepts(&item.kind) {
-                continue;
-            }
-            let same = match (item.source.as_ref(), source) {
-                (None, None) => true,
-                (Some(item_source), Some(source)) => item_source.same_part(source),
-                _ => false,
-            };
-            if same {
-                return Some(idx);
-            }
-        }
-        None
-    }
-
-    /// Insert `kind` directly AFTER timeline index `after` (spec #561, review
-    /// #569): a chunk continuing a part whose equal-key run another part's
-    /// entry follows must stay beside its own entries, never jump past them.
-    /// Mirrors [`Self::insert_item`]'s render-boundary clamp; returns the
-    /// inserted index.
-    fn insert_kind_after(
-        &mut self,
-        after: usize,
-        key: i64,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        kind: TimelineKind,
-        lead: Option<String>,
-    ) -> usize {
-        self.item_seq += 1;
-        let seq = self.item_seq;
-        // A continuation chunk of a part in a post-click message belongs below
-        // that receipt too (issue #1023): the first chunk is floored in
-        // [`Self::insert_item`], and a chunk left at the part's raw key would
-        // break the timeline's key order.
-        let key = self.message_floor.map_or(key, |floor| key.max(floor));
-        // A continuation stays beside its own part's entry: it shares that
-        // entry's position order (the identity `seq` stays its own). The clamp
-        // to the live slice lowers the order like [`Self::insert_item`] does,
-        // never the identity.
-        let order = self.timeline.get(after).map_or(seq, |item| item.order);
-        let (idx, key, order) = if after + 1 < self.render_from {
-            let idx = self.render_from;
-            let key = self.timeline.get(idx).map_or(key, |item| item.key);
-            let order = self.timeline[idx..]
-                .iter()
-                .take_while(|item| item.key == key)
-                .map(|item| item.order)
-                .min()
-                .map_or(order, |first| first.saturating_sub(1));
-            (idx, key, order)
-        } else {
-            (after + 1, key, order)
-        };
-        self.timeline.insert(
-            idx,
-            TimelineItem {
-                key,
-                shown_at,
-                order,
-                seq,
-                kind,
-                source,
-                lead,
-            },
-        );
-        self.last_key = self.last_key.max(key);
-        idx
-    }
-
     /// Key for a push with no server part time (tests, synthetic content), and
     /// for an Interaction Receipt's resolution moment: strictly increasing,
     /// never before the wall clock, and never behind a key already inserted —
     /// so it keeps call order and stays after everything already on the card
     /// even under clock skew between cola and the server.
+    #[cfg(test)]
     pub(super) fn next_order(&mut self) -> i64 {
-        self.order_seq = self
-            .order_seq
-            .saturating_add(1)
-            .max(self.last_key.saturating_add(1))
-            .max(chrono::Utc::now().timestamp_millis());
-        self.order_seq
+        self.timeline.next_order()
     }
 
     /// Append a text chunk, keeping it in the chronological timeline (merging
@@ -4143,6 +3645,7 @@ impl StreamAccumulator {
     /// (the server's `time.start`), which also places it on the timeline.
     /// `None` for a payload with no server time: the item is then keyed by a
     /// monotonic fallback (call order) and shows no clock.
+    #[cfg(test)]
     pub(super) fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
         self.push_text_from(at_ms, None, chunk);
     }
@@ -4150,6 +3653,7 @@ impl StreamAccumulator {
     /// [`Self::push_text_at`] carrying the typed transcript part this chunk
     /// rendered from (spec #561's cursor frontier). Synthetic pushes pass
     /// `None`.
+    #[cfg(test)]
     pub(super) fn push_text_from(&mut self, at_ms: Option<i64>, source: Option<PartSource>, chunk: &str) {
         self.push_text_lead(at_ms, source, chunk, None);
     }
@@ -4159,6 +3663,7 @@ impl StreamAccumulator {
     /// construct the delivered prefix left open) while the entry's counted
     /// characters stay the model's suffix, so the Rendered Cursor's arithmetic
     /// is exact.
+    #[cfg(test)]
     pub(super) fn push_text_lead(
         &mut self,
         at_ms: Option<i64>,
@@ -4183,88 +3688,8 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = self.part_order_key(key_at, source.as_ref());
         self.text.push_str(chunk);
-        let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
-        let mut remaining = chunk;
-        let mut lead = lead;
-        // The entry THIS part merges into (spec #561, review #569): another
-        // part's entry at the same server time is never a merge target, so
-        // each part keeps its own source and extent. `None` until this part
-        // has an entry under this key.
-        let mut target =
-            self.source_entry(key, source.as_ref(), |kind| matches!(kind, TimelineKind::Text(_)));
-        while !remaining.is_empty() {
-            let space = match target.and_then(|idx| self.timeline.get(idx)) {
-                Some(TimelineItem {
-                    kind: TimelineKind::Text(last),
-                    ..
-                }) => max.saturating_sub(last.chars().count()),
-                _ => 0,
-            };
-            if space == 0 {
-                let take: String = remaining.chars().take(max).collect();
-                let pushed = source.clone();
-                target = Some(match target {
-                    // Beside its own run: another part's equal-key entry may
-                    // already follow it.
-                    Some(idx) => self.insert_kind_after(
-                        idx,
-                        key,
-                        shown_at,
-                        pushed,
-                        TimelineKind::Text(take.clone()),
-                        lead.take(),
-                    ),
-                    None => self.insert_kind_lead(
-                        key,
-                        shown_at,
-                        pushed,
-                        TimelineKind::Text(take.clone()),
-                        lead.take(),
-                    ),
-                });
-                remaining = &remaining[take.len()..];
-                continue;
-            }
-            let take: String = remaining.chars().take(space).collect();
-            let idx = target.expect("space came from it");
-            match self.timeline.get_mut(idx) {
-                Some(TimelineItem {
-                    kind: TimelineKind::Text(last),
-                    source: item_source,
-                    lead: item_lead,
-                    ..
-                }) => {
-                    last.push_str(&take);
-                    if item_source.is_none() {
-                        *item_source = source.clone();
-                    }
-                    // A later push of the same part refreshes the entry's
-                    // prefix digest: it always covers the whole delivered
-                    // prefix at each push (spec #561, review #569).
-                    if let (Some(item_source), Some(pushed)) = (item_source.as_mut(), source.as_ref())
-                        && item_source.same_part(pushed)
-                    {
-                        item_source.prefix_digest = pushed.prefix_digest;
-                    }
-                    if item_lead.is_none() {
-                        *item_lead = lead.take();
-                    }
-                }
-                _ => {
-                    target = Some(self.insert_kind_after(
-                        idx,
-                        key,
-                        shown_at,
-                        source.clone(),
-                        TimelineKind::Text(take.clone()),
-                        lead.take(),
-                    ));
-                }
-            }
-            remaining = &remaining[take.len()..];
-        }
+        self.timeline.push_text(key_at, shown_at, source, chunk, lead);
     }
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
@@ -4326,45 +3751,9 @@ impl StreamAccumulator {
         chunk: &str,
         lead: Option<String>,
     ) {
-        let key = self.part_order_key(key_at, source.as_ref());
         self.reasoning.push_str(chunk);
-        // The entry THIS part merges into, never another part's at the same
-        // server time (spec #561, review #569).
-        let idx = self.source_entry(key, source.as_ref(), |kind| {
-            matches!(kind, TimelineKind::Reasoning(_))
-        });
-        match idx.and_then(|i| self.timeline.get_mut(i)) {
-            Some(TimelineItem {
-                kind: TimelineKind::Reasoning(last),
-                source: item_source,
-                lead: item_lead,
-                ..
-            }) => {
-                last.push_str(chunk);
-                if item_source.is_none() {
-                    *item_source = source.clone();
-                }
-                // A later push of the same part refreshes the entry's prefix
-                // digest (spec #561, review #569).
-                if let (Some(item_source), Some(pushed)) = (item_source.as_mut(), source.as_ref())
-                    && item_source.same_part(pushed)
-                {
-                    item_source.prefix_digest = pushed.prefix_digest;
-                }
-                if item_lead.is_none() {
-                    *item_lead = lead;
-                }
-            }
-            _ => {
-                self.insert_kind_lead(
-                    key,
-                    shown_at,
-                    source,
-                    TimelineKind::Reasoning(chunk.to_string()),
-                    lead,
-                );
-            }
-        }
+        self.timeline
+            .push_reasoning(key_at, shown_at, source, chunk, lead);
     }
 
     /// Insert/update a tool panel; the timeline gets a marker only on the FIRST
@@ -4418,27 +3807,25 @@ impl StreamAccumulator {
         let is_new = !self.tools.contains_key(call_id);
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
-            let key = key_at.unwrap_or_else(|| self.next_order());
-            let key = match (source.is_some(), self.read_floor) {
-                (true, Some(floor)) => key.max(floor),
-                _ => key,
-            };
+            let key = key_at.unwrap_or_else(|| self.timeline.next_order());
+            let key = self.timeline.read_floor_key(key, source.is_some());
             if live {
                 // Unfinished: TAIL content. Allocate its identity and key now,
                 // but do not join the timeline — a split must never finalize a
                 // panel whose tool is still running (ADR-0045).
-                self.item_seq += 1;
+                let seq = self.timeline.allocate_seq();
                 self.live_tools.insert(
                     call_id.to_string(),
                     LiveTool {
                         key,
                         shown_at,
-                        seq: self.item_seq,
+                        seq,
                         source,
                     },
                 );
             } else {
-                self.insert_kind_src(key, shown_at, source, TimelineKind::Tool(call_id.to_string()));
+                self.timeline
+                    .insert_tool(key, shown_at, source, None, call_id.to_string());
             }
         } else if self.live_tools.contains_key(call_id) {
             // A later sighting may carry the server start time the first one
@@ -4462,22 +3849,16 @@ impl StreamAccumulator {
                 // behind it (ADR-0038's late-part rule) — carrying the element
                 // identity it was born with, so its fold state survives.
                 let entry = self.live_tools.shift_remove(call_id).expect("checked");
-                self.insert_item(
+                self.timeline.insert_tool(
                     entry.key,
                     entry.shown_at,
                     entry.source,
-                    entry.seq,
-                    TimelineKind::Tool(call_id.to_string()),
-                    None,
+                    Some(entry.seq),
+                    call_id.to_string(),
                 );
             }
-        } else if shown_at.is_some()
-            && let Some(item) = self
-                .timeline
-                .iter_mut()
-                .find(|i| matches!(&i.kind, TimelineKind::Tool(id) if id == call_id))
-        {
-            item.shown_at = item.shown_at.or(shown_at);
+        } else {
+            self.timeline.adopt_tool_shown_at(call_id, shown_at);
         }
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.
@@ -4952,13 +4333,13 @@ impl StreamAccumulator {
     /// interaction block's element range, for the card handle (ADR-0038,
     /// rule 2).
     pub(super) fn build_card_with_info(&mut self) -> BuiltCard {
-        let start = self.render_from;
+        let start = self.render_from();
         // The slice that fits on its own. When items remain, it must hold at
         // least one: an empty slice would leave `render_from` frozen and the
         // flush loop would re-send empty "部分完成" cards forever.
-        let mut split = self.estimate_split_index(self.render_from, false);
-        if self.render_from < self.timeline.len() {
-            split = split.max(self.render_from + 1);
+        let mut split = self.estimate_split_index(start, false);
+        if start < self.timeline.len() {
+            split = split.max(start + 1);
         }
         let mut full = split < self.timeline.len();
         // The tail rides only a non-full (live) card. When the remainder fits
@@ -4966,22 +4347,22 @@ impl StreamAccumulator {
         // panels (ADR-0045) — this card finalizes without the tail, sized so
         // the next card can carry it, instead of overflowing Feishu's limit.
         if !full {
-            let with_tail = self.estimate_split_index(self.render_from, true);
+            let with_tail = self.estimate_split_index(start, true);
             if with_tail < split {
-                split = with_tail.max(self.render_from + 1).min(split);
+                split = with_tail.max(start + 1).min(split);
                 full = true;
             }
         }
         let state = if full { Some(CardState::Continued) } else { None };
         // The ledger entries THIS slice renders (issue #671, ticket #672): a
         // prefix's confirmation may mark only these, never the continuation's.
-        let rendered_endings = self.rendered_ledger_keys(self.render_from, split);
-        let (card, spans, cursor, gap) = self.build_card_inner(self.render_from, split, !full, state);
+        let rendered_endings = self.rendered_ledger_keys(start, split);
+        let (card, spans, cursor, gap) = self.build_card_inner(start, split, !full, state);
         // Advance `render_from` ONLY on an actual split: while the card still
         // fits, subsequent flushes must re-render from the SAME start so the
         // content accumulates instead of only showing the latest delta.
         if full {
-            self.render_from = split;
+            self.timeline.set_render_from(split);
         }
         BuiltCard {
             card,
@@ -5012,17 +4393,18 @@ impl StreamAccumulator {
     /// stays under Feishu's hard cap even when its estimate crosses the split
     /// budget.
     pub(super) fn build_card_unsplit(&self) -> BuiltCard {
+        let start = self.render_from();
         let end = self.timeline.len();
-        let (card, spans, cursor, gap) = self.build_card_inner(self.render_from, end, true, None);
+        let (card, spans, cursor, gap) = self.build_card_inner(start, end, true, None);
         BuiltCard {
             card,
             full: false,
             end,
-            slice: self.slice_fingerprint(self.render_from, end),
+            slice: self.slice_fingerprint(start, end),
             spans,
             cursor,
             gap,
-            rendered_endings: self.rendered_ledger_keys(self.render_from, end),
+            rendered_endings: self.rendered_ledger_keys(start, end),
         }
     }
 
@@ -5037,15 +4419,10 @@ impl StreamAccumulator {
     /// keeps its own recorded ending when the ledger handover still owes it a
     /// PATCH (ADR-0060).
     pub(super) fn build_finalized_handoff(&mut self, state: Option<CardState>) -> BuiltCard {
-        let start = self.render_from;
+        let start = self.render_from();
         let end = self.timeline.len();
-        let built = self.build_card_inner(
-            self.render_from,
-            end,
-            false,
-            Some(state.unwrap_or(CardState::Continued)),
-        );
-        self.render_from = end;
+        let built = self.build_card_inner(start, end, false, Some(state.unwrap_or(CardState::Continued)));
+        self.timeline.set_render_from(end);
         BuiltCard {
             card: built.0,
             full: false,
@@ -5073,14 +4450,14 @@ impl StreamAccumulator {
     /// projection arm's remaining-slice probe and the flush's failed-write
     /// restore read it.
     pub(super) fn render_from(&self) -> usize {
-        self.render_from
+        self.timeline.render_from()
     }
 
     /// The content identity of `start..end` (issue #886): what a refused
     /// payload's [`BuiltCard::slice`] is compared against before the flush
     /// skips it.
     pub(super) fn slice_fingerprint(&self, start: usize, end: usize) -> SliceFingerprint {
-        SliceFingerprint::of(&self.timeline[start..end], &self.tools)
+        SliceFingerprint::of(self.timeline.range(start, end), &self.tools)
     }
 
     /// Rewind the render boundary to `from` when the build still left it at
@@ -5092,11 +4469,7 @@ impl StreamAccumulator {
     /// whether the boundary moved. Production writers: the flush's finalized
     /// fenced retry and its failed continuation create.
     pub(super) fn restore_render_boundary(&mut self, from: usize, to: usize) -> bool {
-        if self.render_from != to {
-            return false;
-        }
-        self.rewind_render_boundary(from);
-        true
+        self.timeline.restore_render_boundary(from, to)
     }
 
     /// Rewind the render boundary to `to` unconditionally: the projection arm's
@@ -5104,7 +4477,7 @@ impl StreamAccumulator {
     /// goes back to it (spec #561, review #569). Production writer:
     /// `fenced_projected_slice`.
     pub(super) fn rewind_render_boundary(&mut self, to: usize) {
-        self.render_from = to;
+        self.timeline.rewind_render_boundary(to);
     }
 
     /// Whether any timeline entry is an Interaction Receipt whose line starts
@@ -5114,9 +4487,7 @@ impl StreamAccumulator {
     /// `#[cfg(test)] impl Turn` block in `mod.rs`.
     #[cfg(test)]
     pub(super) fn has_receipt_prefix(&self, prefix: &str) -> bool {
-        self.timeline
-            .iter()
-            .any(|item| matches!(&item.kind, TimelineKind::Receipt(text) if text.starts_with(prefix)))
+        self.timeline.has_receipt_prefix(prefix)
     }
 
     /// Whether a still-running seeded call (spec #561's live set) is omitted
@@ -5227,7 +4598,7 @@ impl StreamAccumulator {
             }
         }
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
-            let (c, s, t) = match &item.kind {
+            let (c, s, t) = match item.kind() {
                 TimelineKind::Reasoning(r) => (4, 300 + first_n_chars_bytes(r, 800), 0),
                 TimelineKind::Tool(call_id) => {
                     // The panel's own elements plus one `img` per embedded File
@@ -5353,7 +4724,7 @@ impl StreamAccumulator {
         // truncation, no separate plain-text message.
         let mut pending = String::new();
         for item in self.timeline.iter().take(end).skip(start) {
-            match &item.kind {
+            match item.kind() {
                 TimelineKind::Reasoning(r) => {
                     if !pending.is_empty() {
                         builder = builder.with_text(&pending);
@@ -5362,15 +4733,18 @@ impl StreamAccumulator {
                     // A seeded reasoning entry carries the lead its cut needs
                     // (spec #561): the construct the delivered prefix left
                     // open is closed inside this panel.
-                    let r = match &item.lead {
+                    let r = match item.lead() {
                         Some(lead) => format!("{lead}{r}"),
                         None => r.clone(),
                     };
-                    builder =
-                        builder.with_reasoning_at(&r, item.shown_at, Some(&format!("reason_{}", item.seq)));
+                    builder = builder.with_reasoning_at(
+                        &r,
+                        item.shown_at(),
+                        Some(&format!("reason_{}", item.seq())),
+                    );
                 }
                 TimelineKind::Text(t) => {
-                    if let Some(lead) = &item.lead {
+                    if let Some(lead) = item.lead() {
                         pending.push_str(lead);
                     }
                     pending.push_str(t);
@@ -5383,7 +4757,7 @@ impl StreamAccumulator {
                     if let Some(panel) = self.tools.get(call_id) {
                         builder = builder.with_tool_at(
                             panel.clone(),
-                            item.shown_at,
+                            item.shown_at(),
                             Some(&format!("tool_{call_id}")),
                             self.session_id.as_deref(),
                         );
@@ -5417,7 +4791,7 @@ impl StreamAccumulator {
                         builder = builder.with_text(&pending);
                         pending.clear();
                     }
-                    builder = builder.with_task_entry(entry, Some(&format!("entry_{}", item.seq)));
+                    builder = builder.with_task_entry(entry, Some(&format!("entry_{}", item.seq())));
                 }
                 // One Compaction (ADR-0082): a folded row naming its reason, a
                 // live row while it runs, a failure row carrying the Backend's
@@ -5429,7 +4803,8 @@ impl StreamAccumulator {
                         builder = builder.with_text(&pending);
                         pending.clear();
                     }
-                    builder = builder.with_compaction(compaction, Some(&format!("compaction_{}", item.seq)));
+                    builder =
+                        builder.with_compaction(compaction, Some(&format!("compaction_{}", item.seq())));
                 }
             }
         }
@@ -5671,7 +5046,7 @@ impl StreamAccumulator {
     /// server-grown snapshot, a split past the size budget) carries none — so
     /// the offset is counted once, never once per entry.
     pub(super) fn source_extent(&self, source: &PartSource) -> usize {
-        self.source_extent_in(source, self.timeline.len())
+        self.timeline.source_extent_in(source, self.timeline.len())
     }
 
     /// The timeline key of the entry this accumulator already holds for
@@ -5680,18 +5055,13 @@ impl StreamAccumulator {
     /// between reads, and re-keying would split the part into two entries
     /// (issue #1022).
     fn entry_key_of(&self, source: &PartSource) -> Option<i64> {
-        self.timeline.iter().rev().find_map(|item| {
-            item.source
-                .as_ref()
-                .is_some_and(|item_source| item_source.same_part(source))
-                .then_some(item.key)
-        })
+        self.timeline.entry_key_of(source)
     }
 
     /// [`Self::source_extent`] over the timeline prefix `..end`: one body's
     /// Rendered Cursor reads only what that body delivers.
     fn source_extent_in(&self, source: &PartSource, end: usize) -> usize {
-        self.source_chars_in(source, end, Some(crate::feishu::card::REASONING_TEXT_CAP))
+        self.timeline.source_extent_in(source, end)
     }
 
     /// The part CONTENT this accumulator has pushed, counted from the part's
@@ -5702,37 +5072,7 @@ impl StreamAccumulator {
     /// instead pushed those characters a second time, and a >cap reasoning
     /// frontier replayed itself on every render pass.
     pub(super) fn source_held_chars(&self, source: &PartSource) -> usize {
-        self.source_chars_in(source, self.timeline.len(), None)
-    }
-
-    /// The one walk behind [`Self::source_extent_in`] and
-    /// [`Self::source_held_chars`], so the two readings cannot drift:
-    /// `reasoning_cap` clamps what a reasoning element can display, `None`
-    /// counts the content itself.
-    fn source_chars_in(&self, source: &PartSource, end: usize, reasoning_cap: Option<usize>) -> usize {
-        let mut chars = 0usize;
-        let mut offset = 0usize;
-        for item in &self.timeline[..end] {
-            if !item
-                .source
-                .as_ref()
-                .is_some_and(|s| s.message_id == source.message_id && s.index == source.index)
-            {
-                continue;
-            }
-            if let TimelineKind::Text(text) | TimelineKind::Reasoning(text) = &item.kind {
-                offset = offset.max(item.source.as_ref().map_or(0, |s| s.delivered_before));
-                // A reasoning entry shows at most the card's cap (spec #561,
-                // review #569): the delivered extent counts only what the
-                // element could display, so a restart still renders the
-                // characters beyond the cap instead of skipping them.
-                chars += match (&item.kind, reasoning_cap) {
-                    (TimelineKind::Reasoning(_), Some(cap)) => text.chars().count().min(cap),
-                    _ => text.chars().count(),
-                };
-            }
-        }
-        offset + chars
+        self.timeline.source_held_chars(source)
     }
 
     /// Stamp the delivered-prefix digest a seeded push owes (issue #1025), read
@@ -5744,18 +5084,7 @@ impl StreamAccumulator {
         let extent = self.source_extent(source).min(full.chars().count());
         let digest =
             crate::bridge::chain::cursor_prefix_digest(&full.chars().take(extent).collect::<String>());
-        let stamped = if let Some(item_source) = self
-            .timeline
-            .iter_mut()
-            .rev()
-            .find(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
-            .and_then(|item| item.source.as_mut())
-        {
-            item_source.prefix_digest = Some(digest);
-            true
-        } else {
-            false
-        };
+        let stamped = self.timeline.stamp_source_digest(source, digest);
         // The caller has just pushed this part: no entry to stamp would mean
         // the push placed nothing and the cursor stays digestless — exactly the
         // replay symptom this reads back to avoid, so surface it in tests.
@@ -5767,9 +5096,7 @@ impl StreamAccumulator {
     /// a later one when the entry carries a seed offset and yields no plain
     /// rendered text.
     pub(super) fn has_source(&self, source: &PartSource) -> bool {
-        self.timeline
-            .iter()
-            .any(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
+        self.timeline.has_source(source)
     }
 
     /// Whether the read's part text still carries what this accumulator (and
@@ -5793,12 +5120,7 @@ impl StreamAccumulator {
     /// characters a PREVIOUS card delivered before them. `0` for the ordinary,
     /// offset-free render.
     pub(super) fn source_delivered_before(&self, source: &PartSource) -> usize {
-        self.timeline
-            .iter()
-            .filter(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
-            .filter_map(|item| item.source.as_ref().map(|s| s.delivered_before))
-            .max()
-            .unwrap_or(0)
+        self.timeline.source_delivered_before(source)
     }
 
     /// The prefix digest of `source`'s newest timeline entry — the one whose
@@ -5806,11 +5128,7 @@ impl StreamAccumulator {
     /// #569). `None` when the part has no entry here, or that entry carries
     /// none: the caller then cannot tell a growth from a rewrite.
     fn source_digest(&self, source: &PartSource) -> Option<u64> {
-        self.timeline
-            .iter()
-            .rev()
-            .find(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
-            .and_then(|item| item.source.as_ref().and_then(|s| s.prefix_digest))
+        self.timeline.source_digest(source)
     }
 
     /// The part content this accumulator's timeline already shows for `source`
@@ -5820,27 +5138,7 @@ impl StreamAccumulator {
     /// does not hold: the caller can then tell neither a growth nor its
     /// remainder. The delta test the ordinary render reads (review #569).
     pub(super) fn source_rendered(&self, source: &PartSource) -> Option<String> {
-        let mut rendered = String::new();
-        let mut found = false;
-        for item in &self.timeline {
-            let Some(item_source) = item.source.as_ref() else {
-                continue;
-            };
-            if item_source.message_id != source.message_id || item_source.index != source.index {
-                continue;
-            }
-            if item_source.delivered_before != 0 {
-                return None;
-            }
-            match &item.kind {
-                TimelineKind::Text(text) | TimelineKind::Reasoning(text) => {
-                    found = true;
-                    rendered.push_str(text);
-                }
-                _ => return None,
-            }
-        }
-        found.then_some(rendered)
+        self.timeline.source_rendered(source)
     }
 
     /// Whether `text` is a REWRITE of the part `source` (spec #561, review
@@ -5905,14 +5203,14 @@ impl StreamAccumulator {
     /// verified against that extent, and every pass took the rewrite branch.
     fn rewrite_source(&self, source: &PartSource, text: &str, cap: Option<usize>) -> PartSource {
         let shown = text.chars().count().min(cap.unwrap_or(usize::MAX));
-        PartSource {
-            message_id: source.message_id.clone(),
-            index: source.index,
-            delivered_before: 0,
-            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(
+        PartSource::new(
+            source.message_id().clone(),
+            source.index(),
+            0,
+            Some(crate::bridge::chain::cursor_prefix_digest(
                 &text.chars().take(shown).collect::<String>(),
             )),
-        }
+        )
     }
 
     /// Drop every timeline entry of `source` (spec #561, review #569), keeping
@@ -5920,14 +5218,7 @@ impl StreamAccumulator {
     /// finalized boundary belong to sent cards, and a rewritten part's entries
     /// after it are the live render's own.
     fn drop_source_run(&mut self, source: &PartSource) {
-        let boundary = self.render_from.min(self.timeline.len());
-        let removed_before = self.timeline[..boundary]
-            .iter()
-            .filter(|item| item.source.as_ref().is_some_and(|s| s.same_part(source)))
-            .count();
-        self.timeline
-            .retain(|item| !item.source.as_ref().is_some_and(|s| s.same_part(source)));
-        self.render_from = self.render_from.saturating_sub(removed_before);
+        self.timeline.drop_source_run(source);
     }
 
     /// The Rendered Cursor of the card body [`Self::build_card_inner`] is
@@ -5949,16 +5240,17 @@ impl StreamAccumulator {
     fn frontier_for(&self, end: usize, wanted: impl Fn(&PartSource) -> bool) -> Option<CursorFrontier> {
         let end = end.min(self.timeline.len());
         let (idx, source, kind, started_at) =
-            self.timeline[..end]
+            self.timeline
+                .range(0, end)
                 .iter()
                 .enumerate()
                 .rev()
                 .find_map(|(idx, item)| {
-                    let source = item.source.as_ref()?;
+                    let source = item.source()?;
                     if !wanted(source) {
                         return None;
                     }
-                    let kind = match &item.kind {
+                    let kind = match item.kind() {
                         TimelineKind::Text(_) => CursorPartKind::Text,
                         TimelineKind::Reasoning(_) => CursorPartKind::Reasoning,
                         // A timeline tool entry is settled by construction: a
@@ -5973,23 +5265,25 @@ impl StreamAccumulator {
                         TimelineKind::Compaction(_) => CursorPartKind::Compaction,
                         _ => return None,
                     };
-                    Some((idx, source, kind, item.shown_at))
+                    Some((idx, source, kind, item.shown_at()))
                 })?;
         let (delivered_chars, prefix_digest) = match kind {
             // The settled tool has no extent of its own: the frontier
             // carries the newest text/reasoning part's, so that part still
             // renders its growth after a restart (review #569).
             CursorPartKind::Tool => {
-                match self.timeline[..idx]
+                match self
+                    .timeline
+                    .range(0, idx)
                     .iter()
                     .rev()
-                    .find_map(|item| match &item.kind {
-                        TimelineKind::Text(_) | TimelineKind::Reasoning(_) => item.source.as_ref(),
+                    .find_map(|item| match item.kind() {
+                        TimelineKind::Text(_) | TimelineKind::Reasoning(_) => item.source(),
                         _ => None,
                     })
                     .filter(|source| wanted(source))
                 {
-                    Some(source) => (self.source_extent_in(source, end), source.prefix_digest),
+                    Some(source) => (self.source_extent_in(source, end), source.prefix_digest()),
                     // No text part to fingerprint: the empty prefix.
                     None => (0, Some(crate::bridge::chain::cursor_prefix_digest(""))),
                 }
@@ -5999,11 +5293,11 @@ impl StreamAccumulator {
             // tool with no text before it, so the cursor resolves on the next
             // read instead of falling back.
             CursorPartKind::Compaction => (0, Some(crate::bridge::chain::cursor_prefix_digest(""))),
-            _ => (self.source_extent_in(source, end), source.prefix_digest),
+            _ => (self.source_extent_in(source, end), source.prefix_digest()),
         };
         Some(CursorFrontier {
-            message_id: source.message_id.clone(),
-            part_index: source.index,
+            message_id: source.message_id().clone(),
+            part_index: source.index(),
             kind,
             started_at,
             delivered_chars,
@@ -6018,15 +5312,14 @@ impl StreamAccumulator {
     /// that stops mid-gap reports `complete: false`, so its confirmation only
     /// advances the gap and the remaining tail stays owed.
     fn gap_coverage(&self, end: usize) -> Option<GapCoverage> {
-        let frontier = self.frontier_for(end, |source| self.gap_messages.contains(&source.message_id))?;
+        let frontier = self.frontier_for(end, |source| self.gap_messages.contains(source.message_id()))?;
         let complete = !self.gap_truncated
             && self
                 .timeline
                 .iter()
                 .rposition(|item| {
-                    item.source
-                        .as_ref()
-                        .is_some_and(|source| self.gap_messages.contains(&source.message_id))
+                    item.source()
+                        .is_some_and(|source| self.gap_messages.contains(source.message_id()))
                 })
                 .is_some_and(|last| last < end.min(self.timeline.len()));
         Some(GapCoverage { frontier, complete })
@@ -6039,12 +5332,12 @@ impl StreamAccumulator {
         // frontier, so taking it would lower the cursor below content a later
         // card already showed.
         if let Some(frontier) =
-            self.frontier_for(end, |source| !self.gap_messages.contains(&source.message_id))
+            self.frontier_for(end, |source| !self.gap_messages.contains(source.message_id()))
         {
             cursor.frontier = Some(frontier);
         }
-        for item in &self.timeline[..end] {
-            if let TimelineKind::Tool(call_id) = &item.kind {
+        for item in self.timeline.range(0, end) {
+            if let TimelineKind::Tool(call_id) = item.kind() {
                 cursor.live_calls.remove(call_id);
             }
         }
@@ -6290,7 +5583,6 @@ pub(super) use crate::bridge::tasks::{task_kind, task_label};
 mod tests {
     use super::*;
     use crate::backend::{BackgroundTask, ToolIdentity, ToolStatus};
-    use crate::feishu::card::MAX_CARD_TEXT_CHARS;
 
     /// The slice fingerprint hashes VALUES, not lengths (issue #886 review): a
     /// compaction summary rewritten to a same-length sentence changes the
@@ -6334,15 +5626,7 @@ mod tests {
     /// continuation would skip the newly embedded image (issue #886 review).
     #[test]
     fn a_tool_panels_async_file_delivery_changes_the_slice_fingerprint() {
-        let item = TimelineItem {
-            key: 1,
-            shown_at: None,
-            order: 1,
-            seq: 1,
-            kind: TimelineKind::Tool("call_1".into()),
-            source: None,
-            lead: None,
-        };
+        let item = TimelineItem::test_item(1, None, 1, 1, TimelineKind::Tool("call_1".into()), None, None);
         let mut tools = indexmap::IndexMap::new();
         tools.insert(
             "call_1".to_string(),
@@ -6359,31 +5643,6 @@ mod tests {
         assert_ne!(
             before, after,
             "the resolved image must be visible to the fingerprint"
-        );
-    }
-
-    /// A chunk that arrives AFTER an abandonment must not merge into the
-    /// skipped entry (issue #886 review): it starts a new entry the
-    /// continuation renders.
-    #[test]
-    fn a_chunk_after_an_abandonment_starts_a_new_entry() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.push_text_at(Some(1_000), "被拒绝的内容");
-        acc.skip_rejected_slice(0, 1);
-        acc.push_text_at(Some(1_000), "后来的内容");
-        assert_eq!(
-            acc.timeline_len(),
-            2,
-            "the chunk did not merge into the skipped entry"
-        );
-        let card = acc.build_card_with_info().card.to_string();
-        assert!(
-            card.contains("后来的内容"),
-            "the continuation renders the new chunk: {card}"
-        );
-        assert!(
-            !card.contains("被拒绝的内容"),
-            "the skipped entry stays off the card: {card}"
         );
     }
 
@@ -6743,7 +6002,7 @@ mod tests {
             "split card must show a partial header: {}",
             card_text
         );
-        assert!(acc.render_from > 0, "render_from must advance past the split");
+        assert!(acc.render_from() > 0, "render_from must advance past the split");
 
         // The continuation holds the remaining content, nothing duplicated.
         let (rest, full2) = acc.build_card_with_split();
@@ -6782,7 +6041,7 @@ mod tests {
             full,
             "the embedded images must push the card over the component budget"
         );
-        assert!(acc.render_from > 0, "render_from must advance past the split");
+        assert!(acc.render_from() > 0, "render_from must advance past the split");
     }
 
     /// The File Content tracking block is part of the panel body (ADR-0076), so
@@ -7243,7 +6502,7 @@ mod tests {
             full,
             "the tracking line's ESCAPED bytes must count toward the size budget"
         );
-        assert!(acc.render_from > 0, "render_from must advance past the split");
+        assert!(acc.render_from() > 0, "render_from must advance past the split");
     }
 
     /// A panel's embedded images emit one `img` element each (ADR-0076), and
@@ -7293,7 +6552,7 @@ mod tests {
             full,
             "the embedded images' serialized bytes must count toward the size budget"
         );
-        assert!(acc.render_from > 0, "render_from must advance past the split");
+        assert!(acc.render_from() > 0, "render_from must advance past the split");
     }
 
     /// A resolved delivery attaches by content hash, not by position (ADR-0076):
@@ -7461,7 +6720,7 @@ mod tests {
             "split card must show the partial header: {}",
             card
         );
-        assert!(acc.render_from > 0, "render_from must advance");
+        assert!(acc.render_from() > 0, "render_from must advance");
 
         // The continuation carries the tail; between them all text is present.
         let (rest, full2) = acc.build_card_with_split();
@@ -7511,7 +6770,7 @@ mod tests {
         // The normal build finalizes this slice and advances the boundary.
         let (finalized, full) = acc.build_card_with_split();
         assert!(full, "the oversized slice must split");
-        let boundary = acc.render_from;
+        let boundary = acc.render_from();
         assert!(boundary > 0, "the split advances the boundary");
         assert!(
             finalized.to_string().contains("部分完成，继续中"),
@@ -7522,7 +6781,7 @@ mod tests {
         // card, with the boundary untouched: nothing is owed a continuation.
         let unsplit = acc.build_card_unsplit();
         assert!(!unsplit.full, "an unsplit build never finalizes");
-        assert_eq!(acc.render_from, boundary, "the boundary is untouched");
+        assert_eq!(acc.render_from(), boundary, "the boundary is untouched");
         let text = unsplit.card.to_string();
         assert!(
             !text.contains("部分完成，继续中"),
@@ -8089,38 +7348,6 @@ mod tests {
         }
     }
 
-    /// `push_text` chunks one large blob into bounded timeline items so a single
-    /// item never exceeds the per-card text budget.
-    #[test]
-    fn push_text_chunks_long_blobs() {
-        let mut acc = StreamAccumulator::new("test");
-        let long = "字".repeat(MAX_CARD_TEXT_CHARS * 2 + 100);
-        acc.push_text(&long);
-
-        let text_items: Vec<&String> = acc
-            .timeline
-            .iter()
-            .filter_map(|item| match &item.kind {
-                TimelineKind::Text(t) => Some(t),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            text_items.len() >= 3,
-            "a long blob must be split into multiple text items, got {}",
-            text_items.len()
-        );
-        for t in &text_items {
-            assert!(
-                t.chars().count() <= MAX_CARD_TEXT_CHARS,
-                "text item over the per-card budget: {} chars",
-                t.chars().count()
-            );
-        }
-        let joined: String = text_items.iter().map(|t| t.as_str()).collect();
-        assert_eq!(joined, long, "all text must be preserved across chunks");
-    }
-
     /// Text and tool calls must render interleaved (chronological), not all
     /// tools on top and all text below — matching OpenChamber's presentation.
     #[test]
@@ -8275,123 +7502,6 @@ mod tests {
             continuation.to_string().contains("bash"),
             "the live continuation must carry the running panel: {continuation}"
         );
-    }
-
-    /// #243 / ADR-0045: a pending tool first sighted before the server
-    /// stamped it has a synthetic fallback key; when the server start time
-    /// arrives, the settle move must use THAT time, or the panel lands after
-    /// content it actually preceded.
-    #[test]
-    fn a_late_server_start_time_orders_the_settled_panel() {
-        let bash = |status: ToolStatus, output: Option<&str>| {
-            ToolPanel::for_test(
-                "bash",
-                status,
-                Some(serde_json::json!({ "command": "sleep 30" })),
-                output,
-            )
-        };
-        let mut acc = StreamAccumulator::new("test");
-        acc.push_tool_at(None, "call_bash", bash(ToolStatus::Pending, None));
-        // Content that really started before and after the tool (server keys
-        // 0 and 1000); the tool's own start time lands later.
-        acc.push_text_at(Some(0), "第一段");
-        acc.push_text_at(Some(1_000), "第二段");
-        acc.push_tool_at(Some(500), "call_bash", bash(ToolStatus::Running, None));
-        acc.push_tool_at(Some(500), "call_bash", bash(ToolStatus::Completed, Some("done")));
-
-        let card = acc.build_card();
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let order: Vec<&str> = elements
-            .iter()
-            .map(|e| {
-                if e["tag"] == "collapsible_panel" {
-                    "tool"
-                } else {
-                    e["content"].as_str().unwrap_or_default()
-                }
-            })
-            .collect();
-        assert_eq!(
-            order,
-            vec!["第一段", "tool", "第二段"],
-            "the settled panel must sit at its server start time: {card}"
-        );
-    }
-
-    /// #243 / ADR-0045: when the tool settles, its panel leaves the tail and
-    /// joins the timeline — with the element identity it was born with, so the
-    /// reader's fold state survives the move. The id names the CALL
-    /// (`tool_{call_id}`, spec #561, review #569), so a takeover's collect can
-    /// also identify the marker of a call the successor resolved.
-    #[test]
-    fn a_settled_tool_panel_joins_the_timeline_keeping_its_identity() {
-        let panel_ids = |card: &serde_json::Value| -> Vec<String> {
-            card["body"]["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|e| e["tag"] == "collapsible_panel")
-                .map(|e| e["element_id"].as_str().unwrap().to_string())
-                .collect()
-        };
-        let bash = |status: ToolStatus, output: Option<&str>| {
-            ToolPanel::for_test(
-                "bash",
-                status,
-                Some(serde_json::json!({ "command": "sleep 30" })),
-                output,
-            )
-        };
-        let mut acc = StreamAccumulator::new("test");
-        acc.push_tool("call_bash", bash(ToolStatus::Running, None));
-        // While the tool runs the panel is live: it renders on the card, but
-        // has not joined the timeline.
-        assert!(acc.timeline.is_empty(), "a running panel is not history yet");
-        let running_card = acc.build_card();
-        assert_eq!(panel_ids(&running_card).len(), 1, "{running_card}");
-
-        acc.push_tool("call_bash", bash(ToolStatus::Completed, Some("done")));
-        assert_eq!(acc.timeline.len(), 1, "the settled panel joins the timeline");
-        let done_card = acc.build_card();
-        assert!(
-            done_card.to_string().contains("done"),
-            "the result must render: {done_card}"
-        );
-        assert_eq!(
-            panel_ids(&done_card),
-            panel_ids(&running_card),
-            "the settle move keeps the panel's element identity"
-        );
-        assert_eq!(
-            panel_ids(&done_card),
-            vec!["tool_call_bash".to_string()],
-            "the panel's id names its call"
-        );
-    }
-
-    /// The render-boundary clamp puts a late entry at the top of the live slice
-    /// and lowers only its ORDER, never the identity `seq` a panel's element id
-    /// is built from (ADR-0040; issue #1022).
-    #[test]
-    fn a_clamped_entry_keeps_its_identity_seq() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.push_text_at(Some(1_000), "前");
-        acc.push_text_at(Some(2_000), "后");
-        // Finalize the first entry: the live slice starts at the second, and an
-        // entry keyed behind it must clamp to the slice's first key.
-        acc.skip_rejected_slice(0, 1);
-        assert_eq!(acc.render_from, 1);
-
-        // An older identity (7) with a key behind the slice.
-        acc.insert_item(500, None, None, 7, TimelineKind::Text("迟到".into()), None);
-        let clamped = &acc.timeline[acc.render_from];
-        assert_eq!(clamped.seq, 7, "the identity is never renumbered");
-        assert!(
-            clamped.order < acc.timeline[acc.render_from + 1].order,
-            "the order sorts it ahead of the equal-key run"
-        );
-        assert_eq!(clamped.key, acc.timeline[acc.render_from + 1].key);
     }
 
     /// The header phase (ADR-0014) follows state transitions: Loading until the
@@ -8796,315 +7906,6 @@ mod tests {
         );
     }
 
-    /// `push_receipt_at` can key a receipt at a SERVER time, ahead of work
-    /// whose server times are already in the past at poll time (the Wake
-    /// continuation's 承接 line), while `push_receipt` keeps the
-    /// resolution-moment key everything else uses (a click, a Supplement
-    /// split) — after everything already on the card.
-    #[test]
-    fn a_receipt_can_be_keyed_before_the_work_it_announces() {
-        let first_content = |card: &serde_json::Value| {
-            card["body"]["elements"][0]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        };
-
-        // The resumed work is keyed at its server time; the 承接 receipt is
-        // keyed just before it, so it opens the card.
-        let mut acc = StreamAccumulator::new("test");
-        acc.push_text_at(Some(1_000), "resumed work");
-        acc.push_receipt_at(Some(999), "🔔 承接");
-        assert_eq!(first_content(&acc.build_card()), "🔔 承接");
-
-        // The default key is cola's "now": after content already on the card.
-        let mut acc = StreamAccumulator::new("test");
-        acc.push_text_at(Some(1_000), "earlier content");
-        acc.push_receipt("📨 receipt");
-        let card = acc.build_card();
-        assert_eq!(first_content(&card), "earlier content");
-        assert_eq!(card["body"]["elements"][1]["content"], "📨 receipt");
-    }
-
-    /// Issue #1023: a block surfaced by a read that saw the asking tool call
-    /// carries its server time. The receipt records it as a cut, so a part the
-    /// server timestamped AFTER the ask — written after the click, whatever
-    /// cola's clock says — lands below the receipt even though its own server
-    /// key is far behind the receipt's `next_order` key.
-    #[test]
-    fn a_post_click_part_lands_below_the_receipt_that_carries_an_ask_time() {
-        let question = |asked_at: Option<i64>| {
-            InteractionBlock::Question(PendingQuestion {
-                request_id: "q".into(),
-                session_id: "s".into(),
-                title: String::new(),
-                questions: vec![crate::backend::types::QuestionInfo {
-                    question: "继续?".into(),
-                    header: "继续".into(),
-                    ..Default::default()
-                }],
-                uncollectable: None,
-                directory: "/w".into(),
-                answers: vec![None],
-                done: vec![false],
-                open: 0,
-                drafts: vec![String::new()],
-                asked_at,
-            })
-        };
-
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        assert!(
-            acc.receipt_cut_floor(5_100).is_some(),
-            "content after the ask earns a floor"
-        );
-
-        // The server's post-click continuation: its own time is 5_100, but the
-        // receipt's cola-clock key is ~now, so without the cut it would sort
-        // ABOVE the receipt (ADR-0038 rule 4 forbids that). The floor is the
-        // message's: a continuation message created after the ask.
-        acc.set_message_floor(Some(5_100));
-        acc.push_text_at(Some(5_100), "continuation");
-        acc.set_message_floor(None);
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("✅ 已回答").unwrap() < card.find("continuation").unwrap(),
-            "post-click content must follow the receipt: {card}"
-        );
-
-        // Content written BEFORE the ask keeps the position its key earns,
-        // above the receipt — the cut only floors what came after it.
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.push_text_at(Some(4_900), "explanation");
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("explanation").unwrap() < card.find("✅ 已回答").unwrap(),
-            "pre-click content stays above the receipt: {card}"
-        );
-
-        // A part longer than one card entry is chunked: every continuation
-        // chunk is floored too, so the timeline's key order cannot break under
-        // the receipt (issue #1023).
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.set_message_floor(Some(5_100));
-        acc.push_text_at(
-            Some(5_100),
-            &"长".repeat(crate::feishu::card::MAX_CARD_TEXT_CHARS + 10),
-        );
-        acc.set_message_floor(None);
-        assert!(
-            acc.timeline.windows(2).all(|pair| pair[0].key <= pair[1].key),
-            "the floored chunks keep the timeline key-sorted"
-        );
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("✅ 已回答").unwrap() < card.find("长长长").unwrap(),
-            "every chunk stays below the receipt: {card}"
-        );
-
-        // A render poll can deliver the continuation in the gap between the
-        // backend reply and the receipt's write, so it is already placed when
-        // the receipt lands. On a LOCAL click the receipt's key is reserved
-        // first, so the gap content is floored above it and the receipt lands
-        // below — without moving anything placed before the click.
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(5_000)));
-        assert!(
-            acc.reserve_receipt("q").is_some(),
-            "the click reserves the receipt key"
-        );
-        acc.set_message_floor(Some(5_100));
-        acc.push_text_at(Some(5_100), "竞态到达的继续");
-        acc.set_message_floor(None);
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("✅ 已回答").unwrap() < card.find("竞态到达的继续").unwrap(),
-            "gap content follows the reserved receipt: {card}"
-        );
-
-        // Without a reservation (a remote client's answer, noticed by a sweep)
-        // already-placed content keeps its position — it may have been visible
-        // before the remote click, and there is no click time to re-floor
-        // against (the protocol limit). Future content is cut: the click
-        // precedes the receipt, so anything server-stamped later follows it.
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(5_000)));
-        acc.push_text_at(Some(5_100), "远端作答前已可见");
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.set_message_floor(Some(5_200));
-        acc.push_text_at(Some(5_200), "回执之后的内容");
-        acc.set_message_floor(None);
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("远端作答前已可见").unwrap() < card.find("✅ 已回答").unwrap()
-                && card.find("✅ 已回答").unwrap() < card.find("回执之后的内容").unwrap(),
-            "placed content keeps its position; later content follows the receipt: {card}"
-        );
-
-        // After a card split the live slice starts past the receipt's key: the
-        // first chunk is clamped to the slice's first key, and the next chunk
-        // must look the part up at that SAME clamped key (otherwise it starts
-        // a second entry — a duplicated text run or a new reasoning panel).
-        let mut acc = StreamAccumulator::new("test");
-        acc.insert_kind(1_000, None, TimelineKind::Receipt("✅ 已回答".into()));
-        acc.insert_kind(5_000, None, TimelineKind::Text("已发送卡片".into()));
-        let head = PartSource::at(MessageId::new("msg_head"), 0);
-        acc.push_text_from(Some(9_000), Some(head), "新切片");
-        acc.render_from = 2;
-        acc.record_receipt_cut(500, 1_000);
-        let part = PartSource::at(MessageId::new("msg_part"), 0);
-        acc.push_text_from(Some(3_000), Some(part.clone()), "甲");
-        acc.push_text_from(Some(3_000), Some(part), "乙");
-        acc.set_message_floor(None);
-        let texts: Vec<&str> = acc
-            .timeline
-            .iter()
-            .filter_map(|item| match &item.kind {
-                TimelineKind::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            texts.contains(&"甲乙") && !texts.contains(&"乙"),
-            "the clamped slice key is used by the merge lookup: {texts:?}"
-        );
-
-        // A PARALLEL part in the asking message: it started after the ask
-        // (2000 > 1000) and is delivered after the click, but its message was
-        // created before the click (900), so the Host could have seen it. The
-        // message-scoped floor leaves it above the receipt.
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(1_000)));
-        assert!(
-            acc.reserve_receipt("q").is_some(),
-            "the click reserves the receipt key"
-        );
-        acc.set_message_floor(Some(900));
-        acc.push_text_at(Some(2_000), "并行工具的结果");
-        acc.set_message_floor(None);
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("并行工具的结果").unwrap() < card.find("✅ 已回答").unwrap(),
-            "pre-click parallel work stays above the receipt: {card}"
-        );
-
-        // A part that SPANS the cut: it started before the click in a pre-click
-        // message, rendered once, then the click happens and it grows. Every
-        // chunk keeps the part's own entry (no floor, no second panel).
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(1_000)));
-        acc.set_message_floor(Some(900));
-        acc.push_text_at(Some(2_000), "跨点击的");
-        assert!(
-            acc.reserve_receipt("q").is_some(),
-            "the click reserves the receipt key"
-        );
-        acc.push_text_at(Some(2_000), "继续增长");
-        acc.set_message_floor(None);
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        let texts: Vec<&str> = acc
-            .timeline
-            .iter()
-            .filter_map(|item| match &item.kind {
-                TimelineKind::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["跨点击的继续增长"], "one entry across the cut");
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("跨点击的继续增长").unwrap() < card.find("✅ 已回答").unwrap(),
-            "the spanning part stays above the receipt: {card}"
-        );
-
-        // The SAME part arriving across two render reads still merges into one
-        // entry: the merge lookup uses the floored key too (a raw-key lookup
-        // would start a second entry — a new reasoning panel, a split text run).
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(Some(5_000)));
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.set_message_floor(Some(5_100));
-        acc.push_text_at(Some(5_100), "第一段");
-        acc.push_text_at(Some(5_100), "第二段");
-        acc.set_message_floor(None);
-        acc.set_message_floor(Some(5_200));
-        acc.push_reasoning_at(Some(5_200), "想一");
-        acc.push_reasoning_at(Some(5_200), "想二");
-        acc.set_message_floor(None);
-        let texts: Vec<&str> = acc
-            .timeline
-            .iter()
-            .filter_map(|item| match &item.kind {
-                TimelineKind::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        let reasoning: Vec<&str> = acc
-            .timeline
-            .iter()
-            .filter_map(|item| match &item.kind {
-                TimelineKind::Reasoning(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["第一段第二段"], "one text entry per part");
-        assert_eq!(reasoning, vec!["想一想二"], "one reasoning panel per part");
-    }
-
-    /// Issues can be asked in one order and answered in another (issue #1023):
-    /// Q1 asked at 1000, Q2 at 2000, Q2 answered first, Q1 second. Content the
-    /// server timestamped between the asks (2100) is after both asks, so it is
-    /// post-click content for BOTH receipts and must clear the one the Host
-    /// clicked last. One "latest-asked" cut would floor it only to Q2's key,
-    /// leaving it between the two receipts — above Q1's receipt, which the last
-    /// click wrote.
-    #[test]
-    fn a_later_asked_but_earlier_answered_receipt_still_cuts() {
-        let question = |id: &str, asked_at: i64| {
-            InteractionBlock::Question(PendingQuestion {
-                request_id: id.into(),
-                session_id: "s".into(),
-                title: String::new(),
-                questions: vec![crate::backend::types::QuestionInfo {
-                    question: "继续?".into(),
-                    header: "继续".into(),
-                    ..Default::default()
-                }],
-                uncollectable: None,
-                directory: "/w".into(),
-                answers: vec![None],
-                done: vec![false],
-                open: 0,
-                drafts: vec![String::new()],
-                asked_at: Some(asked_at),
-            })
-        };
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question("q1", 1_000));
-        acc.add_interaction(question("q2", 2_000));
-        assert!(acc.resolve_interaction("q2", |_| "✅ 已回答 Q2".to_string(), true));
-        assert!(acc.resolve_interaction("q1", |_| "✅ 已回答 Q1".to_string(), true));
-        acc.set_message_floor(Some(2_100));
-        acc.push_text_at(Some(2_100), "两次提问之后写出的内容");
-        acc.set_message_floor(None);
-        let card = acc.build_card().to_string();
-        let q2 = card.find("✅ 已回答 Q2").unwrap();
-        let q1 = card.find("✅ 已回答 Q1").unwrap();
-        let after = card.find("两次提问之后写出的内容").unwrap();
-        assert!(
-            q2 < q1 && q1 < after,
-            "the content clears both receipts, the last click included: {card}"
-        );
-    }
-
     /// A failed reply drops the click's reservation (issue #1023): its floor
     /// must not outlive a receipt that never lands, and the retry must reserve
     /// a fresh key.
@@ -9129,13 +7930,16 @@ mod tests {
             asked_at: Some(1_000),
         }));
         let token = acc.reserve_receipt("q").expect("the click reserves");
-        let floor = acc.receipt_cuts.last().expect("a floor cut").key;
+        let floor = acc.timeline().receipt_cuts().last().expect("a floor cut").key();
         assert!(
             acc.next_order() > floor,
             "the floor key is consumed, so an unrelated receipt cannot take it"
         );
         acc.forget_reservation("q", token);
-        assert!(acc.receipt_cuts.is_empty(), "the floor goes with the reservation");
+        assert!(
+            acc.timeline().receipt_cuts().is_empty(),
+            "the floor goes with the reservation"
+        );
         assert!(acc.reserved_receipts.is_empty());
     }
 
@@ -9167,82 +7971,6 @@ mod tests {
         );
     }
 
-    /// A permission's remote (or unreserved) receipt cuts a new MESSAGE after
-    /// the answer, while parallel work in the asking message (created before
-    /// the ask) stays above it (issue #1023).
-    #[test]
-    fn a_permission_receipt_cuts_post_click_messages_only() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
-            session_id: "s".into(),
-            request_id: "p".into(),
-            body: String::new(),
-            target: "⚡ ls".into(),
-            directory: "/w".into(),
-            always_supported: true,
-            summary_digest: None,
-            asked_at: Some(1_000),
-        }));
-        // A parallel part delivered late, in the ASKING message (created 900).
-        acc.set_message_floor(Some(900));
-        acc.push_text_at(Some(2_000), "并行工具的结果");
-        acc.set_message_floor(None);
-        assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string(), false));
-        acc.set_message_floor(Some(1_500));
-        acc.push_text_at(Some(1_500), "答复后的继续");
-        acc.set_message_floor(None);
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("并行工具的结果").unwrap() < card.find("✅ 已允许").unwrap()
-                && card.find("✅ 已允许").unwrap() < card.find("答复后的继续").unwrap(),
-            "message-scoped: parallel pre-click work above, new message below: {card}"
-        );
-    }
-
-    /// V2 decodes EVERY text part with no start time, and the server can grow
-    /// a part across reads. A placed part keeps its entry: the suffix merges
-    /// above the receipt it was rendered before, instead of starting a second
-    /// entry at a fresh key below (issue #1023).
-    #[test]
-    fn an_untimed_part_that_grows_after_a_receipt_keeps_its_entry() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
-            request_id: "q".into(),
-            session_id: "s".into(),
-            title: String::new(),
-            questions: vec![crate::backend::types::QuestionInfo {
-                question: "继续?".into(),
-                header: "继续".into(),
-                ..Default::default()
-            }],
-            uncollectable: None,
-            directory: "/w".into(),
-            answers: vec![None],
-            done: vec![false],
-            open: 0,
-            drafts: vec![String::new()],
-            asked_at: Some(5_000),
-        }));
-        let part = PartSource::at(MessageId::new("msg_v2"), 0);
-        acc.push_text_from(None, Some(part.clone()), "第一段");
-        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.push_text_from(None, Some(part), "继续");
-        let texts: Vec<&str> = acc
-            .timeline
-            .iter()
-            .filter_map(|item| match &item.kind {
-                TimelineKind::Text(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, vec!["第一段继续"], "the part keeps one entry");
-        let card = acc.build_card().to_string();
-        assert!(
-            card.find("第一段继续").unwrap() < card.find("✅ 已回答").unwrap(),
-            "the grown part stays above the receipt it preceded: {card}"
-        );
-    }
-
     /// A retried click replaces its abandoned reservation: the first click
     /// wrote no receipt, so its floor must not cut content the Host saw before
     /// the retry; the fresh key sits below that content (issue #1023).
@@ -9267,7 +7995,12 @@ mod tests {
             asked_at: Some(1_000),
         }));
         assert!(acc.reserve_receipt("q").is_some());
-        let first_floor = acc.receipt_cuts.last().expect("the first floor").key;
+        let first_floor = acc
+            .timeline()
+            .receipt_cuts()
+            .last()
+            .expect("the first floor")
+            .key();
         // Content rendered after the failed click, floored past the first key.
         acc.set_message_floor(Some(1_100));
         acc.push_text_at(Some(1_100), "失败后可见");
@@ -9275,7 +8008,10 @@ mod tests {
         // The Host retries: a fresh key, and the abandoned floor is gone.
         assert!(acc.reserve_receipt("q").is_some());
         assert!(
-            acc.receipt_cuts.iter().all(|cut| cut.key != first_floor),
+            acc.timeline()
+                .receipt_cuts()
+                .iter()
+                .all(|cut| cut.key() != first_floor),
             "the abandoned reservation's floor is dropped"
         );
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
@@ -9284,99 +8020,6 @@ mod tests {
             card.find("失败后可见").unwrap() < card.find("✅ 已回答").unwrap(),
             "content visible before the retry stays above its receipt: {card}"
         );
-    }
-
-    /// A block surfaced without a read (a re-host, a busy-follow seed, a
-    /// restart re-adoption) carries no anchor, so its receipt records no cut
-    /// and nothing a later read delivers is re-placed — the old behaviour.
-    #[test]
-    fn a_block_without_an_ask_time_records_no_cut() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
-            session_id: "s".into(),
-            request_id: "p".into(),
-            body: String::new(),
-            target: "⚡ ls".into(),
-            directory: "/w".into(),
-            always_supported: true,
-            summary_digest: None,
-            asked_at: None,
-        }));
-        assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string(), true));
-        assert!(acc.receipt_cuts.is_empty());
-        assert_eq!(acc.receipt_cut_floor(1), None);
-    }
-
-    /// Two text parts of ONE message sharing a server time keep their own
-    /// timeline entries — and their own sources (spec #561, review #569):
-    /// merging them would record the combined character count under the FIRST
-    /// part's digest, so the frontier could not resolve on a restart and both
-    /// parts would render again. The card's content and order are unchanged.
-    #[test]
-    fn two_text_parts_at_one_server_time_keep_their_own_entries() {
-        let message = MessageId::new("msg_a_2000");
-        let first = "第一段回答。";
-        let second = "第二段回答。";
-        let source = |index: usize, text: &str| PartSource {
-            message_id: message.clone(),
-            index,
-            delivered_before: 0,
-            prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(text)),
-        };
-        let mut acc = StreamAccumulator::new("test");
-        acc.push_text_lead(Some(2_000), Some(source(0, first)), first, None);
-        acc.push_text_lead(Some(2_000), Some(source(1, second)), second, None);
-
-        assert_eq!(
-            acc.timeline
-                .iter()
-                .map(|item| item.source.as_ref().map(|source| source.index))
-                .collect::<Vec<_>>(),
-            vec![Some(0), Some(1)],
-            "each part keeps its own entry and source: {:?}",
-            acc.timeline
-        );
-        let built = acc.build_card_with_info();
-        assert_eq!(
-            built.cursor.frontier,
-            Some(CursorFrontier {
-                message_id: message.clone(),
-                part_index: 1,
-                kind: CursorPartKind::Text,
-                started_at: Some(2_000),
-                delivered_chars: second.chars().count(),
-                prefix_digest: Some(crate::bridge::chain::cursor_prefix_digest(second)),
-            }),
-            "the frontier names the second part with its OWN extent"
-        );
-
-        // The frontier resolves against the read: part one stays delivered and
-        // the second part renders only past its own cut.
-        let transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
-            id: message.clone(),
-            role: crate::backend::MessageRole::Assistant,
-            time: Some(crate::backend::MessageTime {
-                created: 2_000,
-                completed: None,
-            }),
-            model: None,
-            tokens: None,
-            error: None,
-            parts: vec![
-                crate::backend::Part::Text(crate::backend::TextPart {
-                    text: first.to_string(),
-                    started_at: Some(2_000),
-                }),
-                crate::backend::Part::Text(crate::backend::TextPart {
-                    text: second.to_string(),
-                    started_at: Some(2_000),
-                }),
-            ],
-        }]);
-        let seed = CursorSeed::resolve(&transcript, &built.cursor).expect("the frontier resolves");
-        let frontier = seed.frontier.as_ref().expect("a frontier");
-        assert_eq!(frontier.part_index, 1);
-        assert_eq!(frontier.delivered_chars, second.chars().count());
     }
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).
