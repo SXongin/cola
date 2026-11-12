@@ -427,7 +427,7 @@ impl Turn {
                         if reuse_reservation {
                             match acc.take_reserved_receipt(id) {
                                 Some(reserved) if mode_reserved.is_none() => mode_reserved = Some(reserved),
-                                Some(reserved) => acc.forget_reserved_cut(reserved.floor_key),
+                                Some(reserved) => acc.forget_reserved_cut(reserved.keys.floor_key),
                                 None => {}
                             }
                         } else {
@@ -454,9 +454,9 @@ impl Turn {
                 // the Host saw) is not floored.
                 Some(reserved) => {
                     if let Some(asked_at) = mode_asked_at {
-                        acc.retune_receipt_cut(reserved.floor_key, asked_at);
+                        acc.retune_receipt_cut(reserved.keys.floor_key, asked_at);
                     }
-                    acc.push_receipt_at(Some(reserved.receipt_key), text);
+                    acc.push_receipt_at(Some(reserved.keys.receipt_key), text);
                 }
                 None => {
                     let key = acc.push_receipt(text);

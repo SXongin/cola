@@ -9,8 +9,8 @@
 
 use super::disposition::Disposition;
 use super::timeline::{
-    PartFacts, PartForm, PartSource, PlacementError, SyntheticEntry, TailFact, TailPlacement, Timeline,
-    TimelineItem, TimelineKind, TranscriptKind,
+    PartFacts, PartForm, PartSource, PlacementError, ReservationKeys, SyntheticEntry, TailFact,
+    TailPlacement, Timeline, TimelineItem, TimelineKind, TranscriptKind,
 };
 use crate::backend::{
     Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TranscriptMessage,
@@ -47,12 +47,13 @@ pub(super) enum RenderedPart {
 }
 
 /// A click's reservation of its Interaction Receipt's timeline position
-/// (issue #1023): the key the receipt will take, and the floor key already
-/// pushed into the cut list for content written during the reply.
+/// (issue #1023): the ready-made [`ReservationKeys`] the Timeline minted, plus
+/// an identity token, so a failed click's late cleanup cannot delete a retry's
+/// fresh reservation for the same request. The map keyed by request id stays
+/// here — the accumulator owns the reservation's lifecycle, not the Timeline.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ReservedReceipt {
-    pub(super) receipt_key: i64,
-    pub(super) floor_key: i64,
+    pub(super) keys: ReservationKeys,
     /// Identity of this reservation, so a failed click's late cleanup cannot
     /// delete a retry's fresh reservation for the same request.
     pub(super) token: u64,
@@ -2841,7 +2842,7 @@ impl StreamAccumulator {
         // `next_order` is past the abandoned floor).
         let reserved = if reuse_reservation {
             self.take_reserved_receipt(request_id)
-                .map(|reserved| reserved.receipt_key)
+                .map(|reserved| reserved.keys.receipt_key)
         } else {
             self.consume_reservation(request_id);
             None
@@ -2929,22 +2930,16 @@ impl StreamAccumulator {
         // no receipt, and content rendered after it may have been visible before
         // this click, so it must not be cut by the abandoned reservation.
         if let Some(old) = self.reserved_receipts.remove(request_id) {
-            self.forget_reserved_cut(old.floor_key);
+            self.forget_reserved_cut(old.keys.floor_key);
         }
         // The Timeline mints both keys and installs the floor cut; the floor
         // key is consumed there too, so an unrelated receipt written in this
         // same millisecond cannot share the reservation's cut.
-        let keys = self.timeline.reserve_key(asked_at);
+        let keys = self.timeline.reserve_receipt_keys(asked_at);
         self.reservation_seq += 1;
         let token = self.reservation_seq;
-        self.reserved_receipts.insert(
-            request_id.to_string(),
-            ReservedReceipt {
-                receipt_key: keys.receipt_key,
-                floor_key: keys.floor_key,
-                token,
-            },
-        );
+        self.reserved_receipts
+            .insert(request_id.to_string(), ReservedReceipt { keys, token });
         Some(token)
     }
 
@@ -2990,7 +2985,7 @@ impl StreamAccumulator {
     /// another block with its own shared receipt.
     pub(super) fn consume_reservation(&mut self, request_id: &str) {
         if let Some(reserved) = self.reserved_receipts.remove(request_id) {
-            self.timeline.forget_cut(reserved.floor_key);
+            self.timeline.forget_cut(reserved.keys.floor_key);
         }
     }
 
@@ -8119,14 +8114,11 @@ mod tests {
         );
     }
 
-    /// A failed reply drops the click's reservation (issue #1023): its floor
-    /// must not outlive a receipt that never lands, and the retry must reserve
-    /// a fresh key.
-    #[test]
-    fn forgetting_a_reservation_drops_its_floor_and_frees_its_key() {
-        let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
-            request_id: "q".into(),
+    /// The anchored question block the receipt tests click; the ask time is the
+    /// only field they vary.
+    fn pending_question(request_id: &str, asked_at: i64) -> InteractionBlock {
+        InteractionBlock::Question(PendingQuestion {
+            request_id: request_id.into(),
             session_id: "s".into(),
             title: String::new(),
             questions: vec![crate::backend::types::QuestionInfo {
@@ -8140,8 +8132,17 @@ mod tests {
             done: vec![false],
             open: 0,
             drafts: vec![String::new()],
-            asked_at: Some(1_000),
-        }));
+            asked_at: Some(asked_at),
+        })
+    }
+
+    /// A failed reply drops the click's reservation (issue #1023): its floor
+    /// must not outlive a receipt that never lands, and the retry must reserve
+    /// a fresh key.
+    #[test]
+    fn forgetting_a_reservation_drops_its_floor_and_frees_its_key() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(pending_question("q", 1_000));
         let token = acc.reserve_receipt("q").expect("the click reserves");
         let floor = acc.timeline().receipt_cuts().last().expect("a floor cut").key();
         assert!(
@@ -8190,23 +8191,7 @@ mod tests {
     #[test]
     fn a_retried_click_takes_a_fresh_reservation() {
         let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
-            request_id: "q".into(),
-            session_id: "s".into(),
-            title: String::new(),
-            questions: vec![crate::backend::types::QuestionInfo {
-                question: "继续?".into(),
-                header: "继续".into(),
-                ..Default::default()
-            }],
-            uncollectable: None,
-            directory: "/w".into(),
-            answers: vec![None],
-            done: vec![false],
-            open: 0,
-            drafts: vec![String::new()],
-            asked_at: Some(1_000),
-        }));
+        acc.add_interaction(pending_question("q", 1_000));
         assert!(acc.reserve_receipt("q").is_some());
         let first_floor = acc
             .timeline()
@@ -8236,50 +8221,30 @@ mod tests {
     }
 
     /// A local click's reservation mints BOTH keys in the Timeline (spec
-    /// #1044): `take_reserved_receipt`'s `receipt_key` is the synthetic
-    /// admission's `at`, so the receipt keeps it — and a split past it clamps
-    /// the receipt to the live slice's first key instead of lifting it above
-    /// the body. `reserved_receipts` stays the accumulator's, keyed by
+    /// #1040, ticket #1044): `take_reserved_receipt`'s `receipt_key` is the
+    /// synthetic admission's `at`, so the receipt keeps it — and a split past
+    /// it clamps the receipt to the live slice's first key instead of lifting
+    /// it above the body. `reserved_receipts` stays the accumulator's, keyed by
     /// `request_id`.
     #[test]
     fn a_reserved_click_receipt_keeps_its_key_and_clamps_after_a_split() {
-        let question = |asked_at: i64| {
-            InteractionBlock::Question(PendingQuestion {
-                request_id: "q".into(),
-                session_id: "s".into(),
-                title: String::new(),
-                questions: vec![crate::backend::types::QuestionInfo {
-                    question: "继续?".into(),
-                    header: "继续".into(),
-                    ..Default::default()
-                }],
-                uncollectable: None,
-                directory: "/w".into(),
-                answers: vec![None],
-                done: vec![false],
-                open: 0,
-                drafts: vec![String::new()],
-                asked_at: Some(asked_at),
-            })
-        };
-        let receipt_key = |acc: &StreamAccumulator| {
+        let receipt_index = |acc: &StreamAccumulator| {
             acc.timeline()
                 .iter()
-                .find_map(|item| match item.kind() {
-                    TimelineKind::Receipt(text) if text.starts_with("✅") => Some(item.key()),
-                    _ => None,
-                })
+                .position(|item| matches!(item.kind(), TimelineKind::Receipt(text) if text.starts_with("✅")))
                 .expect("the click's receipt landed")
         };
+        let receipt_key = |acc: &StreamAccumulator| acc.timeline().entries()[receipt_index(acc)].key();
 
         // No split: the admission takes exactly the reserved key.
         let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(5_000));
+        acc.add_interaction(pending_question("q", 5_000));
         assert!(acc.reserve_receipt("q").is_some(), "the click reserves");
         let reserved = acc
             .reserved_receipts
             .get("q")
             .expect("the reservation")
+            .keys
             .receipt_key;
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         assert!(
@@ -8295,16 +8260,17 @@ mod tests {
         // A split past the reserved key: the synthetic admission's clamp seats
         // the receipt at the live slice's first key.
         let mut acc = StreamAccumulator::new("test");
-        acc.add_interaction(question(5_000));
+        acc.add_interaction(pending_question("q", 5_000));
         assert!(acc.reserve_receipt("q").is_some(), "the click reserves");
         let reserved = acc
             .reserved_receipts
             .get("q")
             .expect("the reservation")
+            .keys
             .receipt_key;
         acc.push_text_at(Some(reserved + 5_000), "已发送");
         acc.push_text_at(Some(reserved + 6_000), "继续");
-        acc.skip_rejected_slice(0, 1);
+        acc.test_set_render_from(1);
         assert_eq!(acc.render_from(), 1);
         let slice_key = acc.timeline().entries()[1].key();
         assert!(slice_key > reserved, "the live slice is past the reservation");
@@ -8313,6 +8279,43 @@ mod tests {
             receipt_key(&acc),
             slice_key,
             "a split past the reservation clamps the receipt to the slice start"
+        );
+
+        // A post-click part still floors at the OLD cut (`reserved + 1`), which
+        // is behind the live slice, so its insert clamps to the receipt's key
+        // too. The class rule keeps the source-bearing part after the
+        // source-less receipt (ADR-0038 rule 4).
+        let post = TranscriptMessage {
+            id: MessageId::new("msg_post"),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: 5_100,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: Vec::new(),
+        };
+        let read_positions = HashMap::from([("msg_post", 1usize)]);
+        let facts = PartFacts {
+            form: PartForm::Text,
+            key_at: Some(reserved + 1),
+            shown_at: Some(reserved + 1),
+            source: Some(PartSource::at(post.id.clone(), 0)),
+            index: 0,
+        };
+        acc.push_text_scoped(&read_positions, &post, facts, "点击后到达".into(), None)
+            .expect("the post-click part places");
+        let content = acc
+            .timeline()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "点击后到达"))
+            .expect("the post-click content landed");
+        let receipt = receipt_index(&acc);
+        assert!(
+            receipt < content,
+            "post-click content stays below the clamped receipt: receipt={receipt}, content={content}"
         );
     }
 

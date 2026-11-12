@@ -738,13 +738,13 @@ impl Timeline {
         self.receipt_cuts.push(ReceiptCut { at: asked_at, key });
     }
 
-    /// Mint a click's reserved receipt key and install its floor cut (issue
+    /// Mint a click's reserved receipt keys and install the floor cut (issue
     /// #1023): the receipt takes `receipt_key`, content written during the
     /// reply is floored at `floor_key` (`receipt_key + 1`). The floor key is
-    /// consumed, so the next synthetic key cannot equal it. Both keys come
-    /// from here, so the reservation's arithmetic never leaks into the
-    /// accumulator.
-    pub(super) fn reserve_key(&mut self, asked_at: i64) -> ReservationKeys {
+    /// consumed, so the next synthetic key cannot equal it. The keys and their
+    /// relation are the Timeline's, so the floor derivation never leaks into
+    /// the accumulator.
+    pub(super) fn reserve_receipt_keys(&mut self, asked_at: i64) -> ReservationKeys {
         let receipt_key = self.next_order();
         let floor_key = receipt_key.saturating_add(1);
         self.receipt_cuts.push(ReceiptCut {
@@ -1681,8 +1681,11 @@ impl MessageScope<'_> {
         if !placement_source.same_part(source) {
             return Err(PlacementError::SourceMismatch);
         }
-        // A rewrite re-floors at its placement key like the pre-#1040 replace
-        // did; a part already on the live slice otherwise keeps its key.
+        // A rewrite re-floors at its placement key exactly as the pre-#1040
+        // replace did: `part_order_key` applied the message/read floor at push
+        // time (after the run dropped), and `insert_item` re-applied it; here
+        // `place` applied the same floor before the drop and `push` re-clamps
+        // at the same floor after it. Parity, not a tightening.
         if let Some(floor) = placement.floor {
             placement.key = placement.key.max(floor);
         }
@@ -1752,51 +1755,26 @@ mod tests {
     use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
     use crate::feishu::card::tool_render::ToolPanel;
 
-    /// Push one source-less chunk through a fresh, unfloored message scope —
-    /// the observable a guard test uses to prove a dropped scope/walk left no
-    /// floor behind.
-    fn push_outside(timeline: &mut Timeline, message: &str, key: i64, chunk: &str) {
-        let order = HashMap::new();
+    /// Push one text part through a fresh message scope: `source` names the
+    /// transcript part (and its index), `None` a scripted source-less chunk.
+    /// The guard and rewrite tests read the entry back from the timeline.
+    fn push_text(
+        timeline: &mut Timeline,
+        order: &HashMap<&str, usize>,
+        message: &str,
+        key: i64,
+        source: Option<PartSource>,
+        chunk: &str,
+    ) {
         let id = MessageId::new(message);
-        let mut walk = timeline.walk(&order);
+        let index = source.as_ref().map_or(0, |source| source.index());
+        let mut walk = timeline.walk(order);
         let mut scope = walk.message(None, &id, &[]);
         let facts = PartFacts {
             form: PartForm::Text,
             key_at: Some(key),
             shown_at: Some(key),
-            source: None,
-            index: 0,
-        };
-        let placement = scope.place(facts);
-        scope
-            .push(
-                placement,
-                TranscriptKind::Text {
-                    chunk: chunk.into(),
-                    lead: None,
-                },
-            )
-            .expect("the scope accepts its own token");
-    }
-
-    /// Push one sourced text part through its message scope and hand back its
-    /// source — the observable a rewrite test reads back from the timeline.
-    fn push_sourced(
-        timeline: &mut Timeline,
-        order: &HashMap<&str, usize>,
-        message: &MessageId,
-        index: usize,
-        key: i64,
-        chunk: &str,
-    ) -> PartSource {
-        let source = PartSource::at(message.clone(), index);
-        let mut walk = timeline.walk(order);
-        let mut scope = walk.message(None, message, &[]);
-        let facts = PartFacts {
-            form: PartForm::Text,
-            key_at: Some(key),
-            shown_at: Some(key),
-            source: Some(source.clone()),
+            source,
             index,
         };
         let placement = scope.place(facts);
@@ -1809,7 +1787,6 @@ mod tests {
                 },
             )
             .expect("the scope accepts its own token");
-        source
     }
 
     /// `push_text` chunks one large blob into bounded timeline items so a single
@@ -2638,7 +2615,7 @@ mod tests {
         );
         // The scope is gone: a push through a fresh one is no longer floored by
         // it (no walk writes a floor outside its own scope).
-        push_outside(&mut timeline, "after", 2_000, "无作用域");
+        push_text(&mut timeline, &order, "after", 2_000, None, "无作用域");
         let after = timeline
             .entries()
             .iter()
@@ -2685,7 +2662,14 @@ mod tests {
             let _later = walk.message(None, &m1, &[]);
         }
         // A push outside the dropped walk is not floored by it.
-        push_outside(&mut timeline, "outside_msg", 1_000, "outside");
+        push_text(
+            &mut timeline,
+            &second_order,
+            "outside_msg",
+            1_000,
+            None,
+            "outside",
+        );
         let outside = timeline
             .entries()
             .iter()
@@ -2869,45 +2853,106 @@ mod tests {
         );
     }
 
-    /// `drop_source_run` re-bases the live-slice boundary by exactly the run
-    /// entries that sat before it (spec #561's replace rule, #1044): the entry
-    /// the boundary started at is still the entry it starts at, so a rewritten
-    /// finalized part cannot drag a sent entry back onto the live card.
+    /// A rewritten part whose run straddles the live-slice boundary (spec
+    /// #561's replace rule, ticket #1044): `drop_source_run` lowers
+    /// `render_from` by exactly the run entries that sat BEFORE it, never by
+    /// the whole removed run, so the sent part of the timeline stays sent and
+    /// the surviving next entry stays live. Driven through
+    /// [`MessageScope::replace`], so the pre-drop placement and the post-drop
+    /// clamp are the ones production uses.
     #[test]
     fn a_rewritten_run_keeps_the_boundary_on_its_entry() {
         let mut timeline = Timeline::default();
         let order = HashMap::from([("m1", 0usize)]);
-        let message = MessageId::new("m1");
-        push_sourced(&mut timeline, &order, &message, 0, 1_000, "A");
-        let rewritten = push_sourced(&mut timeline, &order, &message, 1, 2_000, "B");
-        push_sourced(&mut timeline, &order, &message, 2, 3_000, "C");
-        timeline.set_render_from(2);
-        let live_start = timeline.entries()[timeline.render_from()].seq();
+        let source = PartSource::at(MessageId::new("m1"), 1);
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            500,
+            Some(PartSource::at(MessageId::new("m1"), 0)),
+            "A",
+        );
+        // A chunked run: three entries at the part's key, one before the
+        // boundary and two after it.
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            1_000,
+            Some(source.clone()),
+            &"长".repeat(MAX_CARD_TEXT_CHARS * 2 + 10),
+        );
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            2_000,
+            Some(PartSource::at(MessageId::new("m1"), 2)),
+            "X",
+        );
+        assert_eq!(timeline.entries().len(), 5, "A, three chunks, X");
+        // Sent: A and the run's first two chunks. Live: its last chunk and X.
+        timeline.set_render_from(3);
 
-        timeline.drop_source_run(&rewritten);
+        let rewritten = PartSource::new(MessageId::new("m1"), 1, 0, Some(cursor_prefix_digest("XYZ")));
+        {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(None, &MessageId::new("m1"), &[]);
+            let facts = PartFacts {
+                form: PartForm::Text,
+                key_at: Some(1_000),
+                shown_at: Some(1_000),
+                source: Some(rewritten),
+                index: 1,
+            };
+            let placement = scope.place(facts);
+            scope
+                .replace(
+                    placement,
+                    &source,
+                    TranscriptKind::Text {
+                        chunk: "XYZ".into(),
+                        lead: None,
+                    },
+                )
+                .expect("the scope accepts its own rewrite");
+        }
 
-        assert_eq!(timeline.entries().len(), 2, "only the rewritten run left");
+        assert_eq!(
+            timeline.entries().len(),
+            3,
+            "the rewritten run replaced all three chunks"
+        );
         assert_eq!(
             timeline.render_from(),
             1,
-            "the boundary moved by the one removed pre-boundary entry"
+            "the boundary dropped only the two run entries before it, not all three"
         );
-        assert_eq!(
-            timeline.entries()[timeline.render_from()].seq(),
-            live_start,
-            "the boundary still starts at the entry it started at"
+        assert!(
+            matches!(timeline.entries()[0].kind(), TimelineKind::Text(text) if text == "A"),
+            "the already-sent entry stays before the boundary"
+        );
+        assert!(
+            matches!(timeline.entries()[timeline.render_from()].kind(), TimelineKind::Text(text) if text == "XYZ"),
+            "the rewrite's new run starts the live slice"
+        );
+        assert!(
+            matches!(timeline.entries()[2].kind(), TimelineKind::Text(text) if text == "X"),
+            "the entry that followed the run stays live, after the new run"
         );
     }
 
     /// A later chunk of a rewritten part merges into the run the rewrite
-    /// installed instead of starting a second entry (spec #561, #1044): the
-    /// new run is the part's one run, so the card cannot duplicate its text.
+    /// installed instead of starting a second entry (spec #561, ticket #1044):
+    /// the new run is the part's one run, so the card cannot duplicate its text.
     #[test]
     fn a_later_chunk_merges_into_the_rewritten_run() {
         let mut timeline = Timeline::default();
         let order = HashMap::from([("m1", 0usize)]);
         let message = MessageId::new("m1");
-        let source = push_sourced(&mut timeline, &order, &message, 0, 2_000, "ABC");
+        let source = PartSource::at(message.clone(), 0);
+        push_text(&mut timeline, &order, "m1", 2_000, Some(source.clone()), "ABC");
 
         let rewritten = PartSource::new(message.clone(), 0, 0, Some(cursor_prefix_digest("XYZ")));
         {
@@ -2940,27 +2985,7 @@ mod tests {
         let rewritten_seq = timeline.entries()[0].seq();
 
         let grown = PartSource::new(message.clone(), 0, 0, Some(cursor_prefix_digest("XYZ更多")));
-        {
-            let mut walk = timeline.walk(&order);
-            let mut scope = walk.message(None, &message, &[]);
-            let facts = PartFacts {
-                form: PartForm::Text,
-                key_at: Some(2_000),
-                shown_at: Some(2_000),
-                source: Some(grown),
-                index: 0,
-            };
-            let placement = scope.place(facts);
-            scope
-                .push(
-                    placement,
-                    TranscriptKind::Text {
-                        chunk: "更多".into(),
-                        lead: None,
-                    },
-                )
-                .expect("the scope accepts its own token");
-        }
+        push_text(&mut timeline, &order, "m1", 2_000, Some(grown), "更多");
 
         assert_eq!(
             timeline.entries().len(),
