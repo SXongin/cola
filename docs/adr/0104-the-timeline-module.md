@@ -132,35 +132,10 @@ content into them.**
   exactly as today. The other
   synthetic kinds are placed outside any floor window today and keep that. `row`
   is the compaction's merge identity, and its update-in-place lookup is scoped to
-  the **live slice**: a terminal fact after a split starts a row on the live card
-  rather than updating a finalized one. That successor row is **terminal only** —
-  the finalized card keeps the `running` revision it was sent with — and the
-  delivered bound must not suppress a position the live slice no longer carries.
-  Restart-safety needs a revision-keyed fact, not the positional bound: the
-  Chain Record gains a bounded **`delivered_compactions`** section keyed by
-  `(part position, terminal revision fingerprint)` — the same row identity
-  `same_row` compares — so a different terminal revision at the same position is
-  not suppressed. It is a **client-scoped session section** under the sidecar's
-  bumped format version (ADR-0091), written when a **terminal** revision's card
-  write confirms; a `running` revision never enters it (and a `running` row is
-  excluded from `frontier_for`, so a confirmed running write names no delivered
-  position). `owed_compactions` replays a terminal revision whose entry is absent
-  **only when the Timeline already carries that position** (the split case); a
-  fresh Timeline with no carried row keeps the positional bound, so exactly-once
-  across Turns holds and eviction can only lose a terminal revision that a
-  restart and the bound would have skipped anyway (ADR-0080's bounded-loss
-  precedent).
-  `owed_compactions` therefore keeps a **separate all-timeline "already carried"
-  probe** that matches the row's **revision** (`same_row`, not position alone): a
-  `running` row found behind `render_from` may render its terminal revision on
-  the live card, a row already carrying that terminal revision is not recreated
-  (a second split moves it behind `render_from` too), and a fresh Turn's Timeline
-  carries no such row, so the session bound still applies there. Exactly-once becomes one
-  revision per **live-timeline** body rather than one row per session (ADR-0082
-  §3's amendment); the busy-follow static lead's copy is its standing exception. A reserved receipt key the live slice
-  no longer reaches (a split finalized past it) is clamped to the slice's first
-  key, exactly the clamp `insert_item` applies today, and the returned key is
-  the clamped one.
+  the **live slice**. A terminal revision that arrives after a split or a restart
+  is a separate, pre-existing delivery gap (the positional bound can skip it, and
+  relaxing the bound would repost the fact); it is tracked in #1049 and
+  deliberately **not** part of this batch — no durable-format change lands here.
 - **The receipt seam.** `reserve_key(asked_at)` mints a click's receipt and
   floor keys from the order sequence **and installs the initial
   `{asked_at, floor_key}` cut**, so content written during the reply is floored
