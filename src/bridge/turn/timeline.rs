@@ -798,11 +798,17 @@ impl Timeline {
         }
     }
 
-    /// The two transient floors, for the guard invariant tests (reading is not
-    /// arranging): the message floor and the read floor.
+    /// The transient MESSAGE floor, for the guard invariant tests (reading is
+    /// not arranging).
     #[cfg(test)]
-    pub(super) fn floors(&self) -> (Option<i64>, Option<i64>) {
-        (self.message_floor, self.read_floor)
+    pub(super) fn message_floor(&self) -> Option<i64> {
+        self.message_floor
+    }
+
+    /// The transient READ floor, for the guard invariant tests.
+    #[cfg(test)]
+    pub(super) fn read_floor(&self) -> Option<i64> {
+        self.read_floor
     }
 
     /// Key for a push with no server part time (tests, synthetic content), and
@@ -1580,10 +1586,16 @@ impl Timeline {
 }
 
 impl<'a, 'r> Walk<'a, 'r> {
-    /// The transient floors, for the guard invariant tests.
+    /// The transient MESSAGE floor, for the guard invariant tests.
     #[cfg(test)]
-    pub(super) fn floors(&self) -> (Option<i64>, Option<i64>) {
-        self.timeline.floors()
+    pub(super) fn message_floor(&self) -> Option<i64> {
+        self.timeline.message_floor()
+    }
+
+    /// The transient READ floor, for the guard invariant tests.
+    #[cfg(test)]
+    pub(super) fn read_floor(&self) -> Option<i64> {
+        self.timeline.read_floor()
     }
 
     /// Scope the walk to one message (spec #1040): apply the message's receipt
@@ -1617,10 +1629,16 @@ impl<'a, 'r> Walk<'a, 'r> {
 }
 
 impl MessageScope<'_> {
-    /// The transient floors, for the guard invariant tests.
+    /// The transient MESSAGE floor, for the guard invariant tests.
     #[cfg(test)]
-    pub(super) fn floors(&self) -> (Option<i64>, Option<i64>) {
-        self.timeline.floors()
+    pub(super) fn message_floor(&self) -> Option<i64> {
+        self.timeline.message_floor()
+    }
+
+    /// The transient READ floor, for the guard invariant tests.
+    #[cfg(test)]
+    pub(super) fn read_floor(&self) -> Option<i64> {
+        self.timeline.read_floor()
     }
 
     /// Place one transcript part (spec #1040): apply the message's receipt
@@ -2794,18 +2812,35 @@ mod tests {
         let mut walk = timeline.walk(&order);
         let scope = walk.message(Some(2_000), &message, &[]);
         assert_eq!(
-            scope.floors(),
-            (Some(9_000), None),
+            scope.message_floor(),
+            Some(9_000),
             "the scope sets the message's receipt cut as its floor"
         );
+        assert_eq!(scope.read_floor(), None, "the scope reads no earlier entry");
         drop(scope);
         assert_eq!(
-            walk.floors(),
-            (None, None),
+            walk.message_floor(),
+            None,
             "the scope's Drop cleared the message floor"
         );
+        assert_eq!(walk.read_floor(), None, "the read floor was never set");
         drop(walk);
-        assert_eq!(timeline.floors(), (None, None), "no floor outlives the walk");
+        assert_eq!(
+            timeline.message_floor(),
+            None,
+            "no message floor outlives the walk"
+        );
+        assert_eq!(timeline.read_floor(), None, "no read floor outlives the walk");
+
+        // The ticket's observable: a later part with an older key is not
+        // floored by the dropped scope's receipt cut.
+        push_text(&mut timeline, &order, "after", 2_000, None, "无作用域");
+        let after = timeline
+            .entries()
+            .iter()
+            .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "无作用域"))
+            .expect("the after-scope push landed");
+        assert_eq!(after.key(), 2_000, "the dropped scope's floor is cleared");
     }
 
     /// Spec #1040's guard invariant: a walk's `Drop` clears the read floor. A
@@ -2841,21 +2876,52 @@ mod tests {
         // A later message in this walk sees m0's 9000 as its read floor.
         let later = walk.message(None, &m1, &[]);
         assert_eq!(
-            later.floors(),
-            (None, Some(9_000)),
+            later.read_floor(),
+            Some(9_000),
             "a later message sees the earlier entry's key as its read floor"
         );
+        assert_eq!(later.message_floor(), None, "m1 earned no receipt cut");
         drop(later);
         assert_eq!(
-            walk.floors(),
-            (None, Some(9_000)),
+            walk.read_floor(),
+            Some(9_000),
             "the message scope's Drop leaves the walk's read floor set"
         );
+        assert_eq!(walk.message_floor(), None, "the scope's Drop cleared its floor");
         drop(walk);
         assert_eq!(
-            timeline.floors(),
-            (None, None),
+            timeline.read_floor(),
+            None,
             "the walk's Drop cleared the read floor"
+        );
+        assert_eq!(
+            timeline.message_floor(),
+            None,
+            "no message floor outlives the walk"
+        );
+
+        // The ticket's observable: the next message's first part carries a key
+        // below the stale floor and still lands at its own server time. In a
+        // read where m1 precedes m0, the stored m0 entry is not an "earlier
+        // message", so no live floor holds the part at 9000.
+        let second_order = HashMap::from([("m1", 0usize), ("m0", 1usize)]);
+        push_text(
+            &mut timeline,
+            &second_order,
+            "m1",
+            1_000,
+            Some(PartSource::at(m1.clone(), 0)),
+            "后续",
+        );
+        let next = timeline
+            .entries()
+            .iter()
+            .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "后续"))
+            .expect("the next message's part landed");
+        assert_eq!(
+            next.key(),
+            1_000,
+            "the next message's first part lands at its own server time below the stale floor"
         );
     }
 
