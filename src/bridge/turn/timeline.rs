@@ -25,6 +25,15 @@ use crate::feishu::card::ledger::TaskCompletionEntry;
 use crate::feishu::card::tool_render::ToolPanel;
 use std::collections::{HashMap, HashSet};
 
+/// An entry's read position (spec #1040): the message's position in the read,
+/// then the part's index in that message. `None` for a source-less or
+/// synthetic entry, which sorts before positioned entries at the same key.
+pub(super) type ReadPosition = (usize, usize);
+
+/// The tie-break order a fresh entry uses at its equal-key position: after
+/// every entry already seated there (`order` breaks ties only within a class).
+const AFTER_EQUAL_POSITION: u64 = u64::MAX;
+
 /// One entry on a turn's chronological timeline: a rendered item plus the
 /// server-side start time (epoch ms) of the part it came from — its **key**.
 /// The card renders the timeline in key order, matching how OpenChamber shows
@@ -68,7 +77,7 @@ pub(super) struct TimelineItem {
     /// the part's index in that message — for the equal-key tie-break (spec
     /// #1040). `None` for a source-less or synthetic entry: those sort before
     /// positioned entries at the same key.
-    position: Option<(usize, usize)>,
+    position: Option<ReadPosition>,
 }
 
 impl TimelineItem {
@@ -315,7 +324,7 @@ pub(super) struct Placement {
     floor: Option<i64>,
     expected: PartForm,
     generation: u64,
-    position: Option<(usize, usize)>,
+    position: Option<ReadPosition>,
 }
 
 /// One live tail's fact, as the accumulator hands it to a walk or a settle
@@ -344,7 +353,7 @@ pub(super) struct TailPlacement {
     /// points (the gap and seed walks, a test push) pin without one.
     message: Option<MessageId>,
     created: Option<i64>,
-    position: Option<(usize, usize)>,
+    position: Option<ReadPosition>,
     call_id: String,
     seq: u64,
 }
@@ -526,7 +535,7 @@ struct Entry {
     source: Option<PartSource>,
     kind: TimelineKind,
     lead: Option<String>,
-    position: Option<(usize, usize)>,
+    position: Option<ReadPosition>,
 }
 
 /// A render read's walk over the timeline (spec #1040): holds the read's
@@ -602,7 +611,7 @@ pub(super) fn part_order_times(message: &TranscriptMessage) -> Vec<Option<i64>> 
 /// recorded position, or — for an entry the compatibility walks still push —
 /// its source's message position in the read plus the part index. Synthetic
 /// entries (a receipt, a compaction row, a ledger entry) have none.
-fn item_read_position(item: &TimelineItem, read_order: &HashMap<&str, usize>) -> Option<(usize, usize)> {
+fn item_read_position(item: &TimelineItem, read_order: &HashMap<&str, usize>) -> Option<ReadPosition> {
     if !matches!(
         item.kind,
         TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
@@ -890,11 +899,7 @@ impl Timeline {
     /// positioned entry; positioned entries sort by read position — the
     /// message's position in the read, then the part index — and `order` breaks
     /// ties only within a class.
-    fn equal_key_cmp(
-        item: &TimelineItem,
-        position: Option<(usize, usize)>,
-        order: u64,
-    ) -> std::cmp::Ordering {
+    fn equal_key_cmp(item: &TimelineItem, position: Option<ReadPosition>, order: u64) -> std::cmp::Ordering {
         match (item.position, position) {
             (None, None) => item.order.cmp(&order),
             (None, Some(_)) => std::cmp::Ordering::Less,
@@ -907,11 +912,12 @@ impl Timeline {
 
     /// The slot a fresh entry takes at `key`: after every equal-key entry of
     /// its own class and read position, before the ones that read later.
-    fn slot_for_new(&self, key: i64, position: Option<(usize, usize)>) -> Slot {
+    fn slot_for_new(&self, key: i64, position: Option<ReadPosition>) -> Slot {
         let index = self.items.partition_point(|item| {
             item.key < key
                 || (item.key == key
-                    && Self::equal_key_cmp(item, position, u64::MAX) != std::cmp::Ordering::Greater)
+                    && Self::equal_key_cmp(item, position, AFTER_EQUAL_POSITION)
+                        != std::cmp::Ordering::Greater)
         });
         self.slot_at(key, index)
     }
@@ -919,7 +925,7 @@ impl Timeline {
     /// The slot a pre-allocated identity takes at `key`: its equal-key position
     /// is its own read position (then `order`), exactly as the settle move
     /// assumes.
-    fn slot_for_seq(&self, key: i64, seq: u64, position: Option<(usize, usize)>) -> Slot {
+    fn slot_for_seq(&self, key: i64, seq: u64, position: Option<ReadPosition>) -> Slot {
         let index = self.items.partition_point(|item| {
             item.key < key
                 || (item.key == key
@@ -1091,7 +1097,7 @@ impl Timeline {
         source: Option<PartSource>,
         chunk: &str,
         lead: Option<String>,
-        position: Option<(usize, usize)>,
+        position: Option<ReadPosition>,
     ) {
         let key = slot.key;
         let mut target =
@@ -1195,7 +1201,7 @@ impl Timeline {
         source: Option<PartSource>,
         chunk: &str,
         mut lead: Option<String>,
-        position: Option<(usize, usize)>,
+        position: Option<ReadPosition>,
     ) {
         let key = slot.key;
         let idx = self.source_entry(key, source.as_ref(), |kind| {
@@ -1559,7 +1565,9 @@ impl Timeline {
     }
 
     /// Settle a compatibility-pinned tail under the CURRENT floors (the walks
-    /// #1043 moves still set them by hand).
+    /// #1043 moves still set them by hand). `_panel` keeps #1040's
+    /// `settle(tail, panel, …)` signature; the panel body stays in the
+    /// accumulator's `tools` map and the Timeline never reads it.
     pub(super) fn settle_compat(&mut self, tail: TailPlacement, _panel: &ToolPanel) {
         let receipt = tail.created.and_then(|created| self.receipt_cut_floor(created));
         let floor = tail
@@ -1662,7 +1670,7 @@ impl Timeline {
     /// those keys need not be monotonic, so it is a minimum, never the first.
     fn min_following_key(
         &self,
-        position: Option<(usize, usize)>,
+        position: Option<ReadPosition>,
         floor: i64,
         read_order: &HashMap<&str, usize>,
     ) -> Option<i64> {
@@ -1761,12 +1769,7 @@ impl MessageScope<'_> {
     /// Validates completely before mutating: a stale token or a kind mismatch
     /// inserts nothing.
     pub(super) fn push(&mut self, placement: Placement, kind: TranscriptKind) -> Result<(), PlacementError> {
-        if placement.generation != self.generation {
-            return Err(PlacementError::Stale);
-        }
-        if placement.expected != kind.form() {
-            return Err(PlacementError::KindMismatch);
-        }
+        self.validate(&placement, &kind)?;
         let position = placement.position;
         let key = placement.key;
         let source = placement.source;
@@ -1803,29 +1806,40 @@ impl MessageScope<'_> {
     /// the token must name the same part, and the old run is dropped across the
     /// live-slice boundary before the fresh one is inserted under the token.
     /// #1044 owns the public replace path; this keeps the turn walk's rewrite
-    /// correct and validates the source before mutating anything.
+    /// correct and validates everything — generation, kind and source — before
+    /// mutating anything.
     pub(super) fn replace(
         &mut self,
         mut placement: Placement,
         source: &PartSource,
         kind: TranscriptKind,
     ) -> Result<(), PlacementError> {
-        if placement.generation != self.generation {
-            return Err(PlacementError::Stale);
-        }
+        self.validate(&placement, &kind)?;
         let Some(placement_source) = placement.source.as_ref() else {
             return Err(PlacementError::SourceMismatch);
         };
         if !placement_source.same_part(source) {
             return Err(PlacementError::SourceMismatch);
         }
-        self.timeline.drop_source_run(source);
         // A rewrite re-floors at its placement key like the pre-#1040 replace
         // did; a part already on the live slice otherwise keeps its key.
         if let Some(floor) = placement.floor {
             placement.key = placement.key.max(floor);
         }
+        self.timeline.drop_source_run(source);
         self.push(placement, kind)
+    }
+
+    /// The checks shared by `push` and `replace` (spec #1040): nothing may be
+    /// mutated until the token's scope and the content's kind both agree.
+    fn validate(&self, placement: &Placement, kind: &TranscriptKind) -> Result<(), PlacementError> {
+        if placement.generation != self.generation {
+            return Err(PlacementError::Stale);
+        }
+        if placement.expected != kind.form() {
+            return Err(PlacementError::KindMismatch);
+        }
+        Ok(())
     }
 
     /// Pin a live tool tail (spec #1040): the key, display clock, merge
@@ -1853,7 +1867,8 @@ impl MessageScope<'_> {
 mod tests {
     use super::*;
     use crate::backend::{
-        Compaction, CompactionReason, CompactionStatus, MessageId, SessionTranscript, ToolStatus,
+        Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, MessageTime,
+        SessionTranscript, ToolStatus, TranscriptMessage,
     };
     use crate::bridge::chain::{CursorFrontier, CursorPartKind};
     use crate::bridge::turn::state::{
@@ -2658,43 +2673,61 @@ mod tests {
         assert_eq!(after.key(), 2_000, "the dropped scope's floor is cleared");
     }
 
-    /// Spec #1040's guard invariant: a walk's `Drop` clears the read floor, so
-    /// the next walk's message lands at its own server time.
+    /// Spec #1040's guard invariant: a walk's `Drop` clears the read floor. A
+    /// scope in the same walk sets 9000 as the floor; after the walk drops, a
+    /// push outside any walk and a FRESH scope whose message is first in the
+    /// new read both land at their own server key, never the stale floor.
     #[test]
     fn a_dropped_walk_clears_the_read_floor() {
         let mut timeline = Timeline::default();
-        let order = HashMap::from([("m1", 0usize), ("m2", 1usize)]);
-        let place = |timeline: &mut Timeline, message: &str, key: i64| {
-            let id = MessageId::new(message);
-            let mut walk = timeline.walk(&order);
-            let mut scope = walk.message(None, &id, &[]);
-            let facts = PartFacts {
-                form: PartForm::Text,
-                key_at: Some(key),
-                shown_at: Some(key),
-                source: Some(PartSource::at(id.clone(), 0)),
-                index: 0,
-            };
-            let placement = scope.place(facts);
-            scope
-                .push(
-                    placement,
-                    TranscriptKind::Text {
-                        chunk: message.to_string(),
-                        lead: None,
-                    },
-                )
-                .unwrap();
+        let first_order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let second_order = HashMap::from([("m1", 0usize), ("m0", 1usize)]);
+        let m0 = MessageId::new("m0");
+        let m1 = MessageId::new("m1");
+        let facts = |message: &MessageId, key: i64| PartFacts {
+            form: PartForm::Text,
+            key_at: Some(key),
+            shown_at: Some(key),
+            source: Some(PartSource::at(message.clone(), 0)),
+            index: 0,
         };
-        place(&mut timeline, "m1", 5_000);
+        {
+            let mut walk = timeline.walk(&first_order);
+            {
+                let mut scope = walk.message(None, &m0, &[]);
+                let placement = scope.place(facts(&m0, 9_000));
+                scope
+                    .push(
+                        placement,
+                        TranscriptKind::Text {
+                            chunk: "m0".into(),
+                            lead: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            // A later message in this walk sees m0's 9000 as its read floor;
+            // the scope is enough to set it (no part has to render).
+            let _later = walk.message(None, &m1, &[]);
+        }
         // A push outside any walk is not floored by the dropped walk.
-        timeline.push_text(Some(1_000), Some(1_000), None, "m2", None);
-        let after = timeline
+        timeline.push_text(Some(1_000), Some(1_000), None, "outside", None);
+        let outside = timeline
             .entries()
             .iter()
-            .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "m2"))
+            .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "outside"))
             .expect("the after-walk push landed");
-        assert_eq!(after.key(), 1_000, "the dropped walk's read floor is cleared");
+        assert_eq!(outside.key(), 1_000, "the dropped walk's read floor is cleared");
+
+        // A fresh read where m1 precedes m0: the stored m0 entry is not an
+        // earlier message, so m1's own server key wins below the stale floor.
+        let mut walk = timeline.walk(&second_order);
+        let mut scope = walk.message(None, &m1, &[]);
+        let placement = scope.place(facts(&m1, 1_000));
+        assert_eq!(
+            placement.key, 1_000,
+            "the fresh scope lands at its own server time, not the stale floor"
+        );
     }
 
     /// At equal keys a positioned entry sorts by read position — a later
@@ -2791,6 +2824,75 @@ mod tests {
         assert_eq!(stale, Err(PlacementError::Stale));
         assert_eq!(mismatch, Err(PlacementError::KindMismatch));
         assert!(timeline.is_empty(), "a refused placement inserts nothing");
+    }
+
+    /// A replace validates generation, kind and source BEFORE dropping the
+    /// part's run: every refusal leaves the original entries intact.
+    #[test]
+    fn a_refused_replace_keeps_the_run() {
+        let mut timeline = Timeline::default();
+        let order = HashMap::from([("m1", 0usize)]);
+        let message = MessageId::new("m1");
+        let source = PartSource::at(MessageId::new("m1"), 0);
+        {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(None, &message, &[]);
+            let facts = PartFacts {
+                form: PartForm::Text,
+                key_at: Some(1_000),
+                shown_at: Some(1_000),
+                source: Some(source.clone()),
+                index: 0,
+            };
+            let placement = scope.place(facts);
+            scope
+                .push(
+                    placement,
+                    TranscriptKind::Text {
+                        chunk: "原始".into(),
+                        lead: None,
+                    },
+                )
+                .unwrap();
+        }
+        let (mismatch, source_less, other_source) = {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(None, &message, &[]);
+            let text = || TranscriptKind::Text {
+                chunk: "改写".into(),
+                lead: None,
+            };
+            let facts = |source: Option<PartSource>, index: usize| PartFacts {
+                form: PartForm::Text,
+                key_at: Some(1_000),
+                shown_at: Some(1_000),
+                source,
+                index,
+            };
+            let token = scope.place(facts(Some(source.clone()), 0));
+            let mismatch = scope.replace(
+                token,
+                &source,
+                TranscriptKind::Reasoning {
+                    chunk: "错类".into(),
+                    lead: None,
+                },
+            );
+            let token = scope.place(facts(None, 0));
+            let source_less = scope.replace(token, &source, text());
+            let other = PartSource::at(MessageId::new("m1"), 1);
+            let token = scope.place(facts(Some(other), 1));
+            let other_source = scope.replace(token, &source, text());
+            (mismatch, source_less, other_source)
+        };
+        assert_eq!(mismatch, Err(PlacementError::KindMismatch));
+        assert_eq!(source_less, Err(PlacementError::SourceMismatch));
+        assert_eq!(other_source, Err(PlacementError::SourceMismatch));
+        assert_eq!(timeline.entries().len(), 1, "the original run survives");
+        assert!(
+            matches!(timeline.entries()[0].kind(), TimelineKind::Text(text) if text == "原始"),
+            "no refused replace dropped or overwrote the run"
+        );
     }
 
     /// A receipt recorded AFTER the pin still floors the settle (ADR-0038
@@ -2916,6 +3018,21 @@ mod tests {
                     .unwrap();
             }
         }
+        // A positioned follower BELOW the floor never caps the settle: it
+        // keeps its key and the panel lands after it.
+        timeline.items.insert(
+            0,
+            TimelineItem {
+                key: 1_000,
+                shown_at: None,
+                order: 0,
+                seq: 99,
+                kind: TimelineKind::Text("floor 之下".into()),
+                source: Some(PartSource::at(MessageId::new("m1"), 3)),
+                lead: None,
+                position: Some((0, 3)),
+            },
+        );
         let mut tail = tail.expect("the tail was pinned");
         // The server's late start time is beyond every following key.
         timeline.rekey(&mut tail, Some(9_000));
@@ -2931,14 +3048,11 @@ mod tests {
             "the settle lands at the minimum following key at/above the floor"
         );
         assert_eq!(
-            timeline
-                .entries()
-                .iter()
-                .filter(|item| item.key() < 2_000)
-                .count(),
-            0,
-            "no placed content moved below the cap"
+            timeline.entries()[0].key(),
+            1_000,
+            "a follower below the floor stays put"
         );
+        assert!(tool > 0, "the panel lands after the below-floor follower");
     }
 
     /// An earlier message's pinned tail floors a later message's part (spec
@@ -3008,6 +3122,64 @@ mod tests {
             kinds,
             vec!["tool", "later"],
             "the panel keeps the earlier read position at the tied key"
+        );
+    }
+
+    /// The accumulator's scoped path feeds every pinned tail into the walk
+    /// (spec #1040): a live tool pinned in an earlier message floors a later
+    /// message's part through `pinned_tail_facts`, not by hand.
+    #[test]
+    fn the_accumulators_scoped_push_uses_the_pinned_tail_floor() {
+        let message = |id: &str, created: i64| TranscriptMessage {
+            id: MessageId::new(id),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: Vec::new(),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        let read_positions = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let m0 = message("m0", 5_000);
+        let m1 = message("m1", 2_000);
+        acc.push_tool_scoped(
+            &read_positions,
+            &m0,
+            0,
+            Some(9_000),
+            Some(9_000),
+            "call_bash",
+            ToolPanel::for_test(
+                "bash",
+                ToolStatus::Running,
+                Some(serde_json::json!({ "command": "sleep 30" })),
+                None,
+            ),
+            Some(PartSource::at(m0.id.clone(), 0)),
+        )
+        .expect("the live tool pins");
+        let facts = PartFacts {
+            form: PartForm::Text,
+            key_at: Some(1_000),
+            shown_at: Some(1_000),
+            source: Some(PartSource::at(m1.id.clone(), 0)),
+            index: 0,
+        };
+        acc.push_text_scoped(&read_positions, &m1, facts, "later".into(), None)
+            .expect("the later part places");
+        let later = acc
+            .timeline()
+            .iter()
+            .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "later"))
+            .expect("the later part landed");
+        assert_eq!(
+            later.key(),
+            9_000,
+            "the earlier message's pinned tail is the later part's floor"
         );
     }
 

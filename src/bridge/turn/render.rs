@@ -316,7 +316,8 @@ fn render_part_scoped(
                     source: Some(rewritten),
                     index,
                 };
-                let _ = acc.replace_text_scoped(read_positions, message, &source, facts, text.text.clone());
+                acc.replace_text_scoped(read_positions, message, &source, facts, text.text.clone())
+                    .expect("the message scope accepts its own rewrite");
             } else {
                 let (source, chunk) = source_chunk(acc, Some(source), &text.text, None);
                 let facts = PartFacts {
@@ -326,7 +327,8 @@ fn render_part_scoped(
                     source,
                     index,
                 };
-                let _ = acc.push_text_scoped(read_positions, message, facts, chunk, None);
+                acc.push_text_scoped(read_positions, message, facts, chunk, None)
+                    .expect("the message scope accepts its own placement");
             }
             acc.mark_streaming();
         }
@@ -346,13 +348,8 @@ fn render_part_scoped(
                     source: Some(rewritten),
                     index,
                 };
-                let _ = acc.replace_reasoning_scoped(
-                    read_positions,
-                    message,
-                    &source,
-                    facts,
-                    reasoning.text.clone(),
-                );
+                acc.replace_reasoning_scoped(read_positions, message, &source, facts, reasoning.text.clone())
+                    .expect("the message scope accepts its own rewrite");
             } else {
                 let (source, chunk) = source_chunk(
                     acc,
@@ -367,7 +364,8 @@ fn render_part_scoped(
                     source,
                     index,
                 };
-                let _ = acc.push_reasoning_scoped(read_positions, message, facts, chunk, None);
+                acc.push_reasoning_scoped(read_positions, message, facts, chunk, None)
+                    .expect("the message scope accepts its own placement");
             }
             acc.mark_reasoning();
         }
@@ -376,7 +374,7 @@ fn render_part_scoped(
                 acc.record_todo_call(call);
             } else {
                 let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
-                let _ = acc.push_tool_scoped(
+                acc.push_tool_scoped(
                     read_positions,
                     message,
                     index,
@@ -385,7 +383,8 @@ fn render_part_scoped(
                     &call.identity.call_id,
                     panel,
                     Some(source),
-                );
+                )
+                .expect("the message scope accepts its own tool placement");
             }
             if call.status == ToolStatus::Running {
                 acc.mark_streaming();
@@ -445,7 +444,7 @@ fn render_seeded_part_scoped(
         } else {
             acc.replace_reasoning_scoped(read_positions, message, &source, facts, full.to_string())
         };
-        let _ = result;
+        result.expect("the message scope accepts its own rewrite");
         if is_text {
             acc.mark_streaming();
         } else {
@@ -481,7 +480,7 @@ fn render_seeded_part_scoped(
         } else {
             acc.push_reasoning_scoped(read_positions, message, facts, suffix.clone(), lead)
         };
-        let _ = result;
+        result.expect("the message scope accepts its own placement");
         if is_text {
             acc.mark_streaming();
         } else {
