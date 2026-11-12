@@ -134,9 +134,11 @@ content into them.**
   rather than updating a finalized one. That successor row is **terminal only** —
   the finalized card keeps the `running` revision it was sent with — and the
   delivered bound must not suppress a position the live slice no longer carries.
-  The bound itself advances only for a **terminal** revision: a confirmed
-  `running` row does not push the session's delivered position past its own
-  message, so a refused or restarted terminal revision is still re-renderable.
+  The bound itself advances only for a **terminal** revision: a `running`
+  compaction row is excluded from `frontier_for` (only a terminal row names its
+  position), so a confirmed running write cannot push the session's delivered
+  position past its own message and a refused or restarted terminal revision is
+  still re-renderable.
   `owed_compactions` therefore keeps a **separate all-timeline "already carried"
   probe** that matches the row's **revision** (`same_row`, not position alone): a
   `running` row found behind `render_from` may render its terminal revision on
@@ -211,11 +213,12 @@ content into them.**
   floors it) and the current read floor for that message — the high-water mark of
   **earlier** messages only, exactly ADR-0038's rule, recomputed against the
   settle read so content that became visible after the pin still floors the
-  panel. The pinned tail's own key also counts as placed content for the read
-  floor, so a later message's part can never sort below a pinned panel (a
-  no-start panel included); the walk floors each message at the highest key of
-  earlier messages **and any pinned tail**. When the floor is **at or above** the
-  pinned key, the panel takes a
+  panel. The base read floor is ADR-0038's earlier-messages high-water mark; at
+  settle it is widened, as the deliberate extension, to include **any pinned
+  tail** as placed content, so a later message's part can never sort below a
+  pinned panel (a no-start panel included). The panel's key is
+  `max(current, floor)`, where `current` is its key after any `rekey`. When the
+  floor is **at or above** that key, the panel takes a
   **key `max(pinned, floor)`**, seated through the normal insert path (so the
   live-slice late-part clamp still applies), and at that key it sorts by its own
   part's read position (see below) — after earlier-message entries at the key and
@@ -256,8 +259,9 @@ content into them.**
   of an earlier message; a receipt recorded after the pin still floors it at
   settle; a resolved click's receipt keeps its reserved key while the slice
   reaches it and returns the clamped key after a split past it; a seeded cut
-  inside a fence keeps its opener; a post-click compaction row still floors at
-  the receipt; a repeated compaction fact updates the row it already has; a
+  inside a fence keeps its opener; a **source-bearing** post-click part floored
+  to a receipt's key still sorts below that receipt; a post-click compaction row
+  still floors at the receipt; a repeated compaction fact updates the row it already has; a
   compaction row finalized by a split takes a terminal-only live row when its
   terminal fact arrives, the bound bypass keys on the carried revision, and a
   second split does not recreate an already-terminal row; a Wake ledger entry
