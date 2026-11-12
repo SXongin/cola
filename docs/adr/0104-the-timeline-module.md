@@ -13,13 +13,13 @@
 > accumulator, the flush and the render poll stay internal to the Turn module.
 >
 > **Amends ADR-0038's keying and equal-key rules**: a synthetic entry may be
-> keyed at its own server time or at a key the caller already holds — a click's
-> reserved receipt key, the Wake 承接 line's server time, a message's created
-> time — not only at `next_order()`; and a tail-only Tool Panel whose settle
-> floor is at or above its key takes a fresh allocation order above the
-> equal-key entries of **earlier messages** but below its own message's following
-> entries, because its allocation predates content that became visible after it
-> was pinned.
+> keyed at its own server time, at a key the caller already holds (a click's
+> reserved receipt key), or at a derived key just before the work it introduces
+> (a Wake line and the External Message lead use `created_ms - 1`) — not only at
+> `next_order()`; and at equal keys entries order by **read position** (message
+> position, then part index) for source-bearing parts, so a tail panel whose
+> settle floor raises its key lands after earlier-message entries and before its
+> own message's later parts, without renumbering anything.
 >
 > **Amends ADR-0045's re-key rule**: a tail-only panel's allocated key is still
 > replaced by a later real start time, but settle first floors it with the
@@ -152,7 +152,10 @@ content into them.**
   `reservation_seq`, `reserved_receipts` and every
   `request_id` stay in the accumulator, which owns the reservation's lifecycle.
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
-  and `push` / `replace` consume it; it carries the entry key, an optional merge
+  and `push` / `replace` consume it, returning `Result<(), PlacementError>`:
+  a token from another scope, a reused token, or a rewrite whose source is
+  missing or names another part is **refused without inserting anything** (and
+  `debug_assert!`ed in tests), never a panic in production; it carries the entry key, an optional merge
   identity (`Option<PartSource>`; a source-less placement takes both the read
   floor and the message-scoped receipt cut, exactly as `part_order_key` plus
   `insert_item` apply them today), the
@@ -161,14 +164,15 @@ content into them.**
   token from another scope fails the generation check, so a placement cannot be
   replayed into a later message. Bare order keys stop crossing the seam; the
   five-layer push wrappers collapse.
-- **Equal keys order by read position.** Every source-bearing transcript entry
-  carries its part's read position (the message's position in the read, then the
-  part index); at equal keys those entries compare by it, which is what makes
-  the settle rule above expressible and keeps a later-visible earlier message
-  ahead of a later message's part. A source-less placement and a synthetic entry
-  have no read position; they sort after positioned entries at the same key and
-  keep allocation order among their peers. `seq` remains identity; `order` now
-  breaks ties only where no read position exists.
+- **Equal keys order by class, then read position.** Every source-bearing
+  transcript entry carries its part's read position (the message's position in
+  the read, then the part index); at equal keys those entries compare by it,
+  which makes the settle rule above expressible and keeps a later-visible earlier
+  message ahead of a later message's part. A source-less placement and a
+  synthetic entry have no read position; they sort **before** positioned entries
+  at the same key — so content floored to a receipt's key stays below that
+  receipt (ADR-0038 Rule 4) — and keep allocation order among themselves. `seq`
+  remains identity; `order` breaks ties only within a class.
 - **The rewrite path is the Timeline's.** `Timeline::replace(placement, source,
   kind)` serves a part the server re-sent with different content: the `kind`
   carries the new text, and `source` must name the same transcript part the token
@@ -202,7 +206,7 @@ content into them.**
   panel. When the floor is **at or above** the pinned key, the panel takes a
   **key `max(pinned, floor)`**, and at that key it sorts by its own part's read
   position (see below) — after earlier-message entries at the key and before its
-  own message's later parts. Placed content never moves, no key or `order` is
+  own message's later parts. A synthetic entry at that key sorts before both. Placed content never moves, no key or `order` is
   renumbered, and `seq` stays identity. When the panel's own following entry
   sits at a *lower* key (placed before that floor became visible), the floor
   wins and the panel lands after it. So a tail-only panel cannot jump a receipt cut or
