@@ -72,7 +72,9 @@ bare `i64`s.
 per ADR-0050) owns the ordered entries of a card body and the rule that places
 content into them.**
 
-- **The interface is a walk.** `timeline.walk(&read_order)` yields a walk;
+- **The interface is a walk.** `timeline.walk(&read_order, pinned_tail_keys)` yields
+  a walk; the accumulator passes its live tails' keys, each mapped to its message
+  (the walk is built once per pass, so this is a snapshot);
   `walk.message(created, id)` yields a message scope; the scope's `place(part
   facts) -> Placement` and `push(placement, kind: TranscriptKind)` are the only
   way transcript content enters. Transcript content is a separate type at the
@@ -135,12 +137,19 @@ content into them.**
   the finalized card keeps the `running` revision it was sent with — and the
   delivered bound must not suppress a position the live slice no longer carries.
   Restart-safety needs a revision-keyed fact, not the positional bound: the
-  Chain Record gains a session-scoped, bounded **`delivered_compactions`** set
-  (position identity), written when a **terminal** revision's card write
-  confirms. `owed_compactions` replays a terminal revision unless its position is
-  in that set, regardless of where the content bound stands; a `running` revision
-  never enters it, and a `running` row is excluded from `frontier_for` so a
-  confirmed running write does not name a delivered position.
+  Chain Record gains a bounded **`delivered_compactions`** section keyed by
+  `(part position, terminal revision fingerprint)` — the same row identity
+  `same_row` compares — so a different terminal revision at the same position is
+  not suppressed. It is a **client-scoped session section** under the sidecar's
+  bumped format version (ADR-0091), written when a **terminal** revision's card
+  write confirms; a `running` revision never enters it (and a `running` row is
+  excluded from `frontier_for`, so a confirmed running write names no delivered
+  position). `owed_compactions` replays a terminal revision whose entry is absent
+  **only when the Timeline already carries that position** (the split case); a
+  fresh Timeline with no carried row keeps the positional bound, so exactly-once
+  across Turns holds and eviction can only lose a terminal revision that a
+  restart and the bound would have skipped anyway (ADR-0080's bounded-loss
+  precedent).
   `owed_compactions` therefore keeps a **separate all-timeline "already carried"
   probe** that matches the row's **revision** (`same_row`, not position alone): a
   `running` row found behind `render_from` may render its terminal revision on
@@ -178,10 +187,11 @@ content into them.**
   five-layer push wrappers collapse.
 - **The walk's read floor includes pinned tails.** Each message's `place` floors
   the message at the highest key of earlier messages' placed entries **and their
-  pinned tails**, so a later message's part can never be placed above a panel
-  that is still riding the tail under clock skew. This is the deliberate
-  extension to ADR-0038's high-water mark; within the panel's own message,
-  `settle`'s `pinned_keys` covers the tails that precede it in part order.
+  pinned tails** (from `walk`'s `pinned_tail_keys`), so a later message's part can
+  never be placed above a panel still riding the tail under clock skew. This is
+  the deliberate extension to ADR-0038's high-water mark. Within the panel's own
+  message, `settle`'s `pinned_keys` covers only tails that precede it in part
+  order, never a later one.
 - **Equal keys order by class, then read position.** Every source-bearing
   transcript entry carries its part's read position (the message's position in
   the read, then the part index); at equal keys those entries compare by it,
