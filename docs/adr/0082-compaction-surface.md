@@ -6,27 +6,10 @@
 >
 > **Amended by ADR-0104 when it lands**: §2's "at its server time" gains one
 > floor — a compaction created after a click takes the Interaction Receipt cut —
-> and its in-place update is scoped to the live slice. §3's exactly-once becomes
-> per card body: when a split separates a compaction's `running` revision from
-> its terminal one, the finalized card keeps `running`, the successor shows only
-> the terminal revision as a fresh row, and the `delivered` bound does not
-> suppress that position **for that chain's own accumulator** (a later Turn's
-> fresh Timeline carries no such row, so the session bound still applies). The
-> bound is positional, restart safety needs a revision-keyed fact: the Chain
-> Record gains a bounded **`delivered_compactions`** section keyed by
-> `(part position, terminal revision fingerprint)`, client-scoped under the
-> sidecar's bumped version (ADR-0091), written when a **terminal** revision's card
-> write confirms. A confirmed `running` row never enters it (and is excluded from
-> `frontier_for`). `owed_compactions` bypasses the positional bound only for a
-> position the Timeline still carries (the split case); a fresh Timeline keeps the
-> bound, so exactly-once across Turns holds. No live-timeline body repeats a revision; the 2026-11-07 busy-follow
-> static-lead copy is the standing exception and is unchanged.
->
-> **Amended (2026-11-07)**: §3's exactly-once is a promise about the live
-> timeline's own render. The busy follow's static lead repeats the read tail's
-> Compaction markers for #1002's equal-body contract, so a followed card may
-> show the same compaction twice — once in the lead, once in the timeline. See
-> the amendment at the end.
+> and its in-place update is scoped to the live slice. The split/restart case
+> where a terminal revision lands after the running one was confirmed is a
+> separate delivery gap tracked in #1049; this amendment does not change §3's
+> exactly-once across Turns.
 
 V2 persists a compaction as a first-class message (`status` running/completed/failed,
 `reason` auto|manual, `summary`, `recent`, and the compaction request's own usage), and
