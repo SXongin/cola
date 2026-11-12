@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::{
-    BackgroundTask, Compaction, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding,
-    ToolStatus, TurnAnchor, Wake, WakeSource,
+    BackgroundTask, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus,
+    TurnAnchor, Wake, WakeSource,
 };
 use crate::bridge::chain::{EndingFacts, EndingKey, TaskEndingClass, TaskEndingState};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
@@ -23,7 +23,9 @@ use crate::bridge::handles::{
 use crate::bridge::span;
 use crate::bridge::tasks::TaskRunId;
 use crate::bridge::turn::state;
-use crate::bridge::turn::state::{LedgerCadence, LedgerChange, RenderedPart, StreamAccumulator};
+use crate::bridge::turn::state::{
+    CompactionRow, LedgerCadence, LedgerChange, RenderedPart, StreamAccumulator,
+};
 use crate::bridge::turn::timeline::{PartFacts, PartForm, PartSource, part_order_times};
 use crate::config::ThreadKey;
 use crate::feishu::card::compaction::same_row;
@@ -290,9 +292,9 @@ fn render_part(
 }
 
 /// Render one typed part through the Timeline's message scope (spec #1040):
-/// the turn walk's only content path. It mirrors [`render_part`]'s dedup and
-/// rewrite rules, but placement and the floors ride the scope's `Placement` /
-/// `TranscriptKind` instead of the accumulator's compatibility push wrappers.
+/// the walks' only content path. It mirrors [`render_part`]'s dedup and rewrite
+/// rules, but placement and the floors ride the scope's `Placement` /
+/// `TranscriptKind` — no caller arms a floor by hand.
 fn render_part_scoped(
     acc: &mut StreamAccumulator,
     message: &crate::backend::TranscriptMessage,
@@ -1791,6 +1793,17 @@ pub(super) fn render_new_turn_parts_committing(
 /// the session-scoped compaction walk skips past. It is the SESSION's delivered
 /// past, not this card's, which is why it is passed in rather than read off
 /// `acc` — a fresh Turn's accumulator is deliberately cursorless.
+/// The read's message positions, keyed by message id (spec #1040): the
+/// equal-key tie-break and each message scope's read floor order by them.
+fn read_positions(transcript: &SessionTranscript) -> std::collections::HashMap<&str, usize> {
+    transcript
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(position, message)| (message.id.as_str(), position))
+        .collect()
+}
+
 pub(super) fn render_turn_parts(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
@@ -1828,12 +1841,7 @@ pub(super) fn render_turn_parts(
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
     let message_positions: std::collections::HashMap<&str, usize> = if acc.seed().is_some() {
-        transcript
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(pos, message)| (message.id.as_str(), pos))
-            .collect()
+        read_positions(transcript)
     } else {
         std::collections::HashMap::new()
     };
@@ -1863,12 +1871,7 @@ pub(super) fn render_turn_parts(
     // committing it here or after the parts render is one card.
     let seed = acc.seed().cloned();
     let turn = transcript.turn_for_user(&anchor);
-    let read_positions: std::collections::HashMap<&str, usize> = transcript
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(position, message)| (message.id.as_str(), position))
-        .collect();
+    let read_positions = read_positions(transcript);
     // A card rendering an unanswered free-text field must not consume this
     // background update: otherwise the first pass removes it from "new" and
     // the post-answer pass has nothing left to show (#917 / card-repaints).
@@ -2016,12 +2019,7 @@ fn render_pending_gap(
     if seed.frontier.is_none() {
         return false;
     }
-    let message_positions: std::collections::HashMap<&str, usize> = transcript
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(pos, message)| (message.id.as_str(), pos))
-        .collect();
+    let message_positions = read_positions(transcript);
     // The gap's window ends where the NEXT Turn begins (spec #561, review
     // #569): `turn_for_user` has no upper end, so without a bound the walk
     // would swallow every later Turn — content a later card already showed,
@@ -2287,21 +2285,12 @@ fn render_compactions(
     if owed.is_empty() {
         return false;
     }
-    let read_positions: std::collections::HashMap<&str, usize> = transcript
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(position, message)| (message.id.as_str(), position))
-        .collect();
+    let read_positions = read_positions(transcript);
     // One walk, one message scope per row: the row is keyed at its MESSAGE's
     // server time, and that scope's floor is the same message cut a turn part
-    // gets (issue #1023). The synthetic admission takes the cut itself, so the
-    // floor is never applied twice in a way that moves the row.
-    acc.place_compactions(
-        &read_positions,
-        owed.into_iter()
-            .map(|(source, at_ms, fact)| (source, at_ms, fact.clone())),
-    );
+    // gets (issue #1023). The admission's own `receipt_cut_floor(message_time)`
+    // is the same cut, so applying both is idempotent.
+    acc.place_compactions(&read_positions, owed);
     true
 }
 
@@ -2325,11 +2314,11 @@ pub(super) fn renders_compactions(
 /// skipped. The one source both [`render_compactions`] and
 /// [`renders_compactions`] read, so the two cannot drift. The fact's server time
 /// is its MESSAGE's: a part carries none.
-fn owed_compactions<'a>(
+fn owed_compactions(
     acc: &StreamAccumulator,
-    transcript: &'a SessionTranscript,
+    transcript: &SessionTranscript,
     bound: Option<usize>,
-) -> Vec<(PartSource, Option<i64>, &'a Compaction)> {
+) -> Vec<CompactionRow> {
     let mut owed = Vec::new();
     for (position, message) in transcript.messages.iter().enumerate() {
         if acc.baseline_suppresses(message.id.as_str()) {
@@ -2352,7 +2341,11 @@ fn owed_compactions<'a>(
             if carried.is_some_and(|row| same_row(row, fact)) {
                 continue;
             }
-            owed.push((source, message.time.map(|time| time.created), fact));
+            owed.push(CompactionRow {
+                source,
+                at: message.time.map(|time| time.created),
+                fact: fact.clone(),
+            });
         }
     }
     owed
@@ -2435,12 +2428,7 @@ fn record_seed_extent(acc: &mut StreamAccumulator, source: &PartSource, delivere
 /// settled card omits it, because no renderer will ever update that `⏳` again.
 fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let mut rendered = false;
-    let seeded_positions: std::collections::HashMap<&str, usize> = transcript
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(position, message)| (message.id.as_str(), position))
-        .collect();
+    let seeded_positions = read_positions(transcript);
     // The seeded ids are a SET, so sort them by their read position before
     // placing them: two calls sharing a borrowed key would otherwise allocate
     // in hash order (issue #1022).
@@ -3352,8 +3340,8 @@ mod tests {
     };
     use crate::bridge::App;
     use crate::bridge::chain::{
-        CursorFrontier, CursorPartKind, EndingFacts, RenderedCursor, TaskEndingState, TaskRunIdentity,
-        TaskRunRecord, cursor_prefix_digest,
+        CursorFrontier, CursorPartKind, EndingFacts, PendingGap, RenderedCursor, TaskEndingState,
+        TaskRunIdentity, TaskRunRecord, cursor_prefix_digest,
     };
     use crate::bridge::test_support::{
         HostCardAction, MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card,
@@ -3363,6 +3351,7 @@ mod tests {
     use crate::bridge::turn::state::{
         CursorSeed, InteractionBlock, PendingQuestion, StreamAccumulator, file_content_hash,
     };
+    use crate::bridge::turn::timeline::TimelineKind;
     use crate::feishu::card::CardState;
     use crate::feishu::card::tool_render::ToolPanel;
 
@@ -6090,6 +6079,170 @@ Index: /x/src/main.rs
             text.matches("slept").count(),
             1,
             "a settled seeded call still renders on the final card: {text}"
+        );
+    }
+
+    /// Spec #1043: the gap walk's floors are the guard's. The orphan's cut part
+    /// belongs to a message created after a receipt's ask (so it must clear the
+    /// receipt's key) while an earlier message still holds a live panel at a
+    /// HIGHER crossing key — the gap's tail lands above both, never at its own
+    /// server time and never below the pin. Reverting the walk to hand-set
+    /// floors drops the pinned tail and lands the tail at the receipt's key.
+    #[test]
+    fn a_gap_tail_takes_the_receipt_cut_and_the_earlier_live_panel_floor() {
+        let orphan_anchor = 1_000_000;
+        let delivered = "已写一半。";
+        let missed = "停机前没写的尾巴。";
+        let full = format!("{delivered}{missed}");
+        let transcript = SessionTranscript::new(vec![
+            // An earlier Turn's message: where the live panel was pinned.
+            message("msg_a_early", 900_000, Vec::new()),
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(orphan_anchor),
+                vec![text_part("跑个长命令")],
+            ),
+            // The orphan Turn's in-flight message, cut at the delivered prefix.
+            message_in_flight(
+                "msg_a_orphan",
+                orphan_anchor + 500,
+                None,
+                vec![Part::Text(crate::backend::TextPart {
+                    text: full.clone(),
+                    started_at: Some(orphan_anchor + 500),
+                })],
+            ),
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(2_000_000),
+                vec![text_part("新问题")],
+            ),
+        ]);
+        let positions = read_positions(&transcript);
+
+        let mut acc = StreamAccumulator::new("test");
+        // The click precedes the orphan message: its parts earn the cut.
+        acc.record_receipt_cut(orphan_anchor, 1_200_000);
+        // An earlier message's live panel sits ABOVE the receipt's key.
+        let early = &transcript.messages[0];
+        acc.push_tool_scoped(
+            &positions,
+            early,
+            0,
+            Some(1_500_000),
+            Some(1_500_000),
+            "call_early",
+            ToolPanel::for_test(
+                "bash",
+                ToolStatus::Running,
+                Some(serde_json::json!({"command": "sleep 30"})),
+                None,
+            ),
+            Some(PartSource::at(early.id.clone(), 0)),
+        )
+        .expect("the earlier message's panel pins");
+
+        let gap = PendingGap {
+            cursor: RenderedCursor {
+                frontier: Some(CursorFrontier {
+                    message_id: MessageId::new("msg_a_orphan"),
+                    part_index: 0,
+                    kind: CursorPartKind::Text,
+                    started_at: Some(orphan_anchor + 500),
+                    delivered_chars: delivered.chars().count(),
+                    prefix_digest: Some(cursor_prefix_digest(delivered)),
+                }),
+                live_calls: Default::default(),
+            },
+            anchor: TurnAnchor {
+                message_id: MessageId::new("msg_cola_anchor"),
+                created_ms: orphan_anchor,
+            },
+            bound: Some(MessageId::new("msg_cola_new")),
+        };
+        assert!(
+            render_pending_gap(&mut acc, &transcript, &gap),
+            "the gap's tail renders"
+        );
+        let tail = acc
+            .timeline()
+            .iter()
+            .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text.contains(missed)))
+            .expect("the gap's tail landed");
+        assert_eq!(
+            tail.key(),
+            1_500_000,
+            "the guard's read floor (the earlier live panel) outranks the receipt cut and the part's own time"
+        );
+    }
+
+    /// Spec #1043: the seeded-call walk settles through the guard, so an
+    /// earlier message's live panel floors the call it renders. Without the
+    /// pinned-tail read floor the call would land at its own server key.
+    #[test]
+    fn a_seeded_call_settles_above_an_earlier_live_panel() {
+        let transcript = SessionTranscript::new(vec![
+            message("msg_a_early", 900_000, Vec::new()),
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000_000),
+                vec![text_part("提问")],
+            ),
+            message(
+                "msg_a_seeded",
+                2_000_000,
+                vec![tool(
+                    "bash",
+                    "call_seed",
+                    ToolStatus::Completed,
+                    Some(1_000),
+                    Some(serde_json::json!({"command": "ls"})),
+                    Some("src"),
+                )],
+            ),
+        ]);
+        let positions = read_positions(&transcript);
+
+        let mut acc = StreamAccumulator::new("test");
+        let early = &transcript.messages[0];
+        acc.push_tool_scoped(
+            &positions,
+            early,
+            0,
+            Some(9_000),
+            Some(9_000),
+            "call_early",
+            ToolPanel::for_test(
+                "bash",
+                ToolStatus::Running,
+                Some(serde_json::json!({"command": "sleep 30"})),
+                None,
+            ),
+            Some(PartSource::at(early.id.clone(), 0)),
+        )
+        .expect("the earlier message's panel pins");
+        acc.seed_projection(
+            &RenderedCursor::default(),
+            CursorSeed {
+                frontier: None,
+                live_calls: ["call_seed".to_string()].into(),
+                resolved_live_calls: ["call_seed".to_string()].into(),
+                scope: None,
+            },
+        );
+        assert!(resolve_seeded_calls(&mut acc, &transcript));
+        let seeded = acc
+            .timeline()
+            .iter()
+            .find(|item| matches!(item.kind(), TimelineKind::Tool(id) if id == "call_seed"))
+            .expect("the seeded call settled into the timeline");
+        assert_eq!(
+            seeded.key(),
+            9_000,
+            "the earlier message's live panel floors the settlement, not the call's own server key"
         );
     }
 
