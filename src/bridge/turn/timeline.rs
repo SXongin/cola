@@ -15,9 +15,9 @@
 //! [`TailPlacement`] and settled through [`Timeline::settle`].
 //!
 //! One private insert path ([`Timeline::seat`]) owns the live-slice clamp, the
-//! index an entry takes and the continuation rule. The placement key a part is
-//! looked up and inserted at is resolved once ([`Timeline::place_key`]), so
-//! `part_order_key`'s clamp and the insert's clamp are the same computation.
+//! index an entry takes and the continuation rule. A part's key is resolved by
+//! its message scope's `place`, and the same slot seats the entry, so the merge
+//! lookup and the insert cannot disagree.
 
 use crate::backend::{Compaction, MessageId, Part, TranscriptMessage};
 use crate::bridge::chain::EndingKey;
@@ -768,62 +768,6 @@ impl Timeline {
             .max()
     }
 
-    /// Set (or clear) the floor for the transcript message about to render: the
-    /// walk calls this per message, so every part it pushes — including chunks
-    /// that continue a part across reads — is placed at or after the receipt
-    /// written for a click that preceded the message.
-    pub(super) fn set_message_floor(&mut self, created: Option<i64>) {
-        self.message_floor = created.and_then(|created| self.receipt_cut_floor(created));
-    }
-
-    /// Set (or clear) the walk's read-order floor for the message about to
-    /// render (issue #1022).
-    pub(super) fn set_read_floor(&mut self, floor: Option<i64>) {
-        self.read_floor = floor;
-    }
-
-    /// Clear the walk's read-order floor.
-    pub(super) fn reset_read_floor(&mut self) {
-        self.set_read_floor(None);
-    }
-
-    /// The read-order floor a part key takes: only transcript content is
-    /// read-order content, so a synthetic entry keeps its own key.
-    pub(super) fn read_floor_key(&self, key: i64, read_ordered: bool) -> i64 {
-        if read_ordered {
-            self.read_floor.map_or(key, |floor| key.max(floor))
-        } else {
-            key
-        }
-    }
-
-    /// [`Self::set_read_floor`]'s value: the highest key a transcript part from
-    /// an EARLIER message already holds. Receipts, compactions and other
-    /// session-scoped entries are not read-order content.
-    pub(super) fn read_floor_before(
-        &self,
-        positions: &std::collections::HashMap<&str, usize>,
-        message_id: &MessageId,
-    ) -> Option<i64> {
-        let current = *positions.get(message_id.as_str())?;
-        self.items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.kind,
-                    TimelineKind::Text(_) | TimelineKind::Reasoning(_) | TimelineKind::Tool(_)
-                )
-            })
-            .filter(|item| {
-                item.source
-                    .as_ref()
-                    .and_then(|source| positions.get(source.message_id.as_str()).copied())
-                    .is_some_and(|position| position < current)
-            })
-            .map(|item| item.key)
-            .max()
-    }
-
     /// Begin a render read's walk (spec #1040). The read's message positions
     /// order the equal-key tie-break and scope the read and pinned-tail
     /// floors; the walk's `Drop` clears the read floor, and each message
@@ -1038,27 +982,6 @@ impl Timeline {
         None
     }
 
-    /// The placement key a transcript part's chunk is looked up and inserted
-    /// at: its own server time, floored by the CURRENT message's receipt floor
-    /// (issue #1023) and the walk's read floor, clamped to the live slice. The
-    /// same resolved slot seats the entry, so the push's merge lookup and the
-    /// insert cannot disagree.
-    fn place_key(&mut self, key_at: Option<i64>, source: Option<&PartSource>) -> Slot {
-        // A part already on the timeline keeps the key it was placed at: an
-        // untimed V2 part (and a timed one whose floor/clamp differs on a later
-        // read) must keep merging into its own entry, or a growing part splits
-        // around a receipt that landed between its reads.
-        if let Some(key) = source.and_then(|source| self.placed_source_key(source)) {
-            return self.slot_for_new(key, None);
-        }
-        let key = match key_at {
-            Some(at) => self.message_floor.map_or(at, |floor| at.max(floor)),
-            None => self.next_order(),
-        };
-        let key = self.read_floor_key(key, true);
-        self.slot_for_new(key, None)
-    }
-
     /// Fill the merge metadata a chunk leaves on its entry: a first chunk
     /// stamps the part source, a later chunk of the same part refreshes the
     /// prefix digest, and the markdown lead rides whichever entry first has
@@ -1080,23 +1003,7 @@ impl Timeline {
         }
     }
 
-    /// Append a text chunk, merging consecutive chunks of the same part and
-    /// chunking a blob no single entry may exceed. The slot is resolved once
-    /// and consumed by the first insert; later chunks continue their own run.
-    pub(super) fn push_text(
-        &mut self,
-        key_at: Option<i64>,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        chunk: &str,
-        lead: Option<String>,
-    ) {
-        let slot = self.place_key(key_at, source.as_ref());
-        self.push_text_at_slot(slot, shown_at, source, chunk, lead, None);
-    }
-
-    /// [`Self::push_text`] at an already-resolved slot: the merge/chunk walk
-    /// shared by transcript text and a synthetic lead.
+    /// The merge/chunk walk shared by transcript text and a synthetic lead.
     fn push_text_at_slot(
         &mut self,
         slot: Slot,
@@ -1186,21 +1093,9 @@ impl Timeline {
         }
     }
 
-    /// Append a reasoning chunk: chunks of the same part merge into one panel,
-    /// a part keyed apart is its own panel.
-    pub(super) fn push_reasoning(
-        &mut self,
-        key_at: Option<i64>,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        chunk: &str,
-        lead: Option<String>,
-    ) {
-        let slot = self.place_key(key_at, source.as_ref());
-        self.push_reasoning_at_slot(slot, shown_at, source, chunk, lead, None);
-    }
-
-    /// [`Self::push_reasoning`] at an already-resolved slot and read position.
+    /// Append a reasoning chunk at an already-resolved slot and read position:
+    /// chunks of the same part merge into one panel, a part keyed apart is its
+    /// own panel.
     fn push_reasoning_at_slot(
         &mut self,
         slot: Slot,
@@ -1234,34 +1129,6 @@ impl Timeline {
                 });
             }
         }
-    }
-
-    /// Insert a settled tool's timeline entry. `seq` is the identity a live
-    /// panel pinned when it was born (ADR-0045); `None` allocates a fresh one.
-    pub(super) fn insert_tool(
-        &mut self,
-        key: i64,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        seq: Option<u64>,
-        call_id: String,
-    ) -> usize {
-        let key = self.message_floor.map_or(key, |floor| key.max(floor));
-        let key = self.read_floor_key(key, source.is_some());
-        let slot = match seq {
-            Some(seq) => self.slot_for_seq(key, seq, None),
-            None => self.slot_for_new(key, None),
-        };
-        self.seat(Entry {
-            slot,
-            seq,
-            order: None,
-            shown_at,
-            source,
-            kind: TimelineKind::Tool(call_id),
-            lead: None,
-            position: None,
-        })
     }
 
     /// A later sighting of a settled tool may carry the server start time the
@@ -1545,60 +1412,6 @@ impl Timeline {
         }
     }
 
-    /// Pin a live tail from a compatibility entry point that names no message
-    /// scope (the walks #1043 moves, a test push): the current floors serve as
-    /// the pin's floor and the settle re-applies the current ones.
-    pub(super) fn pin_compat(
-        &mut self,
-        key_at: Option<i64>,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        call_id: String,
-    ) -> TailPlacement {
-        let key = key_at.unwrap_or_else(|| self.next_order());
-        let floor = self.current_floor();
-        let seq = self.allocate_seq();
-        let message = source.as_ref().map(|source| source.message_id().clone());
-        TailPlacement {
-            key,
-            shown_at,
-            source,
-            floor,
-            message,
-            created: None,
-            position: None,
-            call_id,
-            seq,
-        }
-    }
-
-    /// Settle a compatibility-pinned tail under the CURRENT floors (the walks
-    /// #1043 moves still set them by hand). `_panel` keeps #1040's
-    /// `settle(tail, panel, …)` signature; the panel body stays in the
-    /// accumulator's `tools` map and the Timeline never reads it.
-    pub(super) fn settle_compat(&mut self, tail: TailPlacement, _panel: &ToolPanel) {
-        let receipt = tail.created.and_then(|created| self.receipt_cut_floor(created));
-        let floor = tail
-            .floor
-            .into_iter()
-            .chain(receipt)
-            .chain(self.message_floor)
-            .chain(self.read_floor)
-            .max();
-        let key = floor.map_or(tail.key, |floor| tail.key.max(floor));
-        let slot = self.slot_for_seq(key, tail.seq, tail.position);
-        self.seat(Entry {
-            slot,
-            seq: Some(tail.seq),
-            order: None,
-            shown_at: tail.shown_at,
-            source: tail.source,
-            kind: TimelineKind::Tool(tail.call_id),
-            lead: None,
-            position: tail.position,
-        });
-    }
-
     /// Settle a pinned live tail into the timeline (spec #1040): re-apply the
     /// CURRENT receipt cut for the tail's message and the CURRENT read floor
     /// for it — the earlier messages' placed entries and pinned tails, plus the
@@ -1871,6 +1684,29 @@ impl MessageScope<'_> {
             seq,
         }
     }
+
+    /// Settle a pinned tail inside this message scope (spec #1040): the
+    /// timeline's settle, with the walk's read order the caller holds. The
+    /// scripted test seam passes an empty read order, because its pin names no
+    /// read position; production settles through
+    /// [`StreamAccumulator::push_tool_scoped`](super::state::StreamAccumulator).
+    #[cfg(test)]
+    pub(super) fn settle(
+        &mut self,
+        tail: TailPlacement,
+        panel: &ToolPanel,
+        read_order: &HashMap<&str, usize>,
+        pinned_tails: &[TailFact],
+    ) {
+        self.timeline.settle(tail, panel, read_order, pinned_tails);
+    }
+
+    /// Admit one synthetic entry inside this message scope (spec #1043): the
+    /// scope supplies the message floor, and the admission keeps its own
+    /// receipt cut for a compaction row.
+    pub(super) fn synthetic(&mut self, entry: SyntheticEntry<'_>) -> Option<i64> {
+        self.timeline.synthetic(entry)
+    }
 }
 
 #[cfg(test)]
@@ -1887,6 +1723,33 @@ mod tests {
     use crate::feishu::card::MAX_CARD_TEXT_CHARS;
     use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
     use crate::feishu::card::tool_render::ToolPanel;
+
+    /// Push one source-less chunk through a fresh, unfloored message scope —
+    /// the observable a guard test uses to prove a dropped scope/walk left no
+    /// floor behind.
+    fn push_outside(timeline: &mut Timeline, message: &str, key: i64, chunk: &str) {
+        let order = HashMap::new();
+        let id = MessageId::new(message);
+        let mut walk = timeline.walk(&order);
+        let mut scope = walk.message(None, &id, &[]);
+        let facts = PartFacts {
+            form: PartForm::Text,
+            key_at: Some(key),
+            shown_at: Some(key),
+            source: None,
+            index: 0,
+        };
+        let placement = scope.place(facts);
+        scope
+            .push(
+                placement,
+                TranscriptKind::Text {
+                    chunk: chunk.into(),
+                    lead: None,
+                },
+            )
+            .expect("the scope accepts its own token");
+    }
 
     /// `push_text` chunks one large blob into bounded timeline items so a single
     /// item never exceeds the per-card text budget.
@@ -2109,9 +1972,9 @@ mod tests {
         // receipt's cola-clock key is ~now, so without the cut it would sort
         // ABOVE the receipt (ADR-0038 rule 4 forbids that). The floor is the
         // message's: a continuation message created after the ask.
-        acc.set_message_floor(Some(5_100));
+        acc.script_message(Some(5_100));
         acc.push_text_at(Some(5_100), "continuation");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         let card = acc.build_card().to_string();
         assert!(
             card.find("✅ 已回答").unwrap() < card.find("continuation").unwrap(),
@@ -2136,12 +1999,12 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.set_message_floor(Some(5_100));
+        acc.script_message(Some(5_100));
         acc.push_text_at(
             Some(5_100),
             &"长".repeat(crate::feishu::card::MAX_CARD_TEXT_CHARS + 10),
         );
-        acc.set_message_floor(None);
+        acc.script_message(None);
         assert!(
             acc.timeline()
                 .entries()
@@ -2166,9 +2029,9 @@ mod tests {
             acc.reserve_receipt("q").is_some(),
             "the click reserves the receipt key"
         );
-        acc.set_message_floor(Some(5_100));
+        acc.script_message(Some(5_100));
         acc.push_text_at(Some(5_100), "竞态到达的继续");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         let card = acc.build_card().to_string();
         assert!(
@@ -2185,9 +2048,9 @@ mod tests {
         acc.add_interaction(question(Some(5_000)));
         acc.push_text_at(Some(5_100), "远端作答前已可见");
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.set_message_floor(Some(5_200));
+        acc.script_message(Some(5_200));
         acc.push_text_at(Some(5_200), "回执之后的内容");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         let card = acc.build_card().to_string();
         assert!(
             card.find("远端作答前已可见").unwrap() < card.find("✅ 已回答").unwrap()
@@ -2211,7 +2074,7 @@ mod tests {
         let part = PartSource::at(MessageId::new("msg_part"), 0);
         acc.push_text_from(Some(3_000), Some(part.clone()), "甲");
         acc.push_text_from(Some(3_000), Some(part), "乙");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         let texts: Vec<&str> = acc
             .timeline()
             .iter()
@@ -2235,9 +2098,9 @@ mod tests {
             acc.reserve_receipt("q").is_some(),
             "the click reserves the receipt key"
         );
-        acc.set_message_floor(Some(900));
+        acc.script_message(Some(900));
         acc.push_text_at(Some(2_000), "并行工具的结果");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         let card = acc.build_card().to_string();
         assert!(
@@ -2250,14 +2113,14 @@ mod tests {
         // chunk keeps the part's own entry (no floor, no second panel).
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(1_000)));
-        acc.set_message_floor(Some(900));
+        acc.script_message(Some(900));
         acc.push_text_at(Some(2_000), "跨点击的");
         assert!(
             acc.reserve_receipt("q").is_some(),
             "the click reserves the receipt key"
         );
         acc.push_text_at(Some(2_000), "继续增长");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
         let texts: Vec<&str> = acc
             .timeline()
@@ -2280,14 +2143,14 @@ mod tests {
         let mut acc = StreamAccumulator::new("test");
         acc.add_interaction(question(Some(5_000)));
         assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
-        acc.set_message_floor(Some(5_100));
+        acc.script_message(Some(5_100));
         acc.push_text_at(Some(5_100), "第一段");
         acc.push_text_at(Some(5_100), "第二段");
-        acc.set_message_floor(None);
-        acc.set_message_floor(Some(5_200));
+        acc.script_message(None);
+        acc.script_message(Some(5_200));
         acc.push_reasoning_at(Some(5_200), "想一");
         acc.push_reasoning_at(Some(5_200), "想二");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         let texts: Vec<&str> = acc
             .timeline()
             .iter()
@@ -2341,9 +2204,9 @@ mod tests {
         acc.add_interaction(question("q2", 2_000));
         assert!(acc.resolve_interaction("q2", |_| "✅ 已回答 Q2".to_string(), true));
         assert!(acc.resolve_interaction("q1", |_| "✅ 已回答 Q1".to_string(), true));
-        acc.set_message_floor(Some(2_100));
+        acc.script_message(Some(2_100));
         acc.push_text_at(Some(2_100), "两次提问之后写出的内容");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         let card = acc.build_card().to_string();
         let q2 = card.find("✅ 已回答 Q2").unwrap();
         let q1 = card.find("✅ 已回答 Q1").unwrap();
@@ -2371,13 +2234,13 @@ mod tests {
             asked_at: Some(1_000),
         }));
         // A parallel part delivered late, in the ASKING message (created 900).
-        acc.set_message_floor(Some(900));
+        acc.script_message(Some(900));
         acc.push_text_at(Some(2_000), "并行工具的结果");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         assert!(acc.resolve_interaction("p", |_| "✅ 已允许".to_string(), false));
-        acc.set_message_floor(Some(1_500));
+        acc.script_message(Some(1_500));
         acc.push_text_at(Some(1_500), "答复后的继续");
-        acc.set_message_floor(None);
+        acc.script_message(None);
         let card = acc.build_card().to_string();
         assert!(
             card.find("并行工具的结果").unwrap() < card.find("✅ 已允许").unwrap()
@@ -2673,8 +2536,9 @@ mod tests {
             9_000,
             "a message created after the ask takes the receipt cut"
         );
-        // The scope is gone: a push is no longer floored by it.
-        timeline.push_text(Some(2_000), Some(2_000), None, "无作用域", None);
+        // The scope is gone: a push through a fresh one is no longer floored by
+        // it (no walk writes a floor outside its own scope).
+        push_outside(&mut timeline, "after", 2_000, "无作用域");
         let after = timeline
             .entries()
             .iter()
@@ -2720,8 +2584,8 @@ mod tests {
             // the scope is enough to set it (no part has to render).
             let _later = walk.message(None, &m1, &[]);
         }
-        // A push outside any walk is not floored by the dropped walk.
-        timeline.push_text(Some(1_000), Some(1_000), None, "outside", None);
+        // A push outside the dropped walk is not floored by it.
+        push_outside(&mut timeline, "outside_msg", 1_000, "outside");
         let outside = timeline
             .entries()
             .iter()
@@ -3065,37 +2929,6 @@ mod tests {
         assert!(tool > 0, "the panel lands after the below-floor follower");
     }
 
-    /// A compatibility pin (the walks #1043 moves) still names its message and
-    /// part through the source: its live panel floors a later message through
-    /// the walk's pinned-tail path.
-    #[test]
-    fn a_compat_pinned_tail_floors_a_later_message() {
-        let mut timeline = Timeline::default();
-        let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
-        let tail = timeline.pin_compat(
-            Some(9_000),
-            Some(9_000),
-            Some(PartSource::at(MessageId::new("m0"), 1)),
-            "call_bash".into(),
-        );
-        let fact = tail.fact().expect("the source names the message");
-        assert_eq!(fact.part, 1, "the part index comes from the source");
-        let mut walk = timeline.walk(&order);
-        let mut scope = walk.message(None, &MessageId::new("m1"), &[fact]);
-        let facts = PartFacts {
-            form: PartForm::Text,
-            key_at: Some(1_000),
-            shown_at: Some(1_000),
-            source: Some(PartSource::at(MessageId::new("m1"), 0)),
-            index: 0,
-        };
-        let placement = scope.place(facts);
-        assert_eq!(
-            placement.key, 9_000,
-            "the earlier message's compat-pinned tail floors the later part"
-        );
-    }
-
     /// An earlier message's pinned tail floors a later message's part (spec
     /// #1040's deliberate extension): its older server key cannot place it
     /// above the live panel, and the panel keeps the read order at the tie.
@@ -3230,7 +3063,7 @@ mod tests {
     fn a_settled_tool_takes_the_message_floor() {
         let mut acc = StreamAccumulator::new("test");
         acc.record_receipt_cut(1_000, 9_000);
-        acc.set_message_floor(Some(2_000));
+        acc.script_message(Some(2_000));
         acc.push_tool_at(
             Some(2_000),
             "call_1",
@@ -3241,7 +3074,7 @@ mod tests {
                 Some("src"),
             ),
         );
-        acc.set_message_floor(None);
+        acc.script_message(None);
         assert_eq!(acc.timeline().len(), 1);
         assert_eq!(
             acc.timeline().entries()[0].key(),

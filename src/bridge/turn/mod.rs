@@ -4904,12 +4904,15 @@ impl Turn {
         }
     }
 
-    /// Set the receipt-floor message time for a synthetic push (the render
-    /// tests' seam for a part delivered in a later MESSAGE, issue #1023).
+    /// Script the message time a source-less test push takes (the render tests'
+    /// seam for a part delivered in a later MESSAGE, issue #1023; spec #1040's
+    /// test seam, #1043): the push runs through a test-only scripted message
+    /// scope, so the receipt cut is the guard's — never a floor field set by
+    /// hand.
     #[cfg(test)]
     pub(crate) async fn set_message_floor(cards: &CardsHandle, session_id: &str, created: Option<i64>) {
         if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
-            card.acc.set_message_floor(created);
+            card.acc.script_message(created);
         }
     }
 
