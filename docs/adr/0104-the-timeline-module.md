@@ -67,11 +67,13 @@ content into them.**
   `walk.message(created, id)` yields a message scope; the scope's `place(part
   facts) -> Placement` and `push(placement, kind: TranscriptKind)` are the only
   way transcript content enters. Transcript content is a separate type at the
-  seam (`TranscriptKind::{Text, Reasoning, Tool(call_id)}`; synthetic entries
-  have their own admission below), so a synthetic entry cannot be pushed down
-  the transcript path. The tool's panel body stays in the accumulator's tool
-  map, which file delivery and liveness keep updating, and the card build reads
-  it from there as today. `place` applies the same floors a transcript part gets:
+  seam (`TranscriptKind::{Text { chunk, lead }, Reasoning { chunk, lead },
+  Tool(call_id)}`; synthetic entries have their own admission below), so a
+  synthetic entry cannot be pushed down the transcript path. The `lead` is the
+  seeded cut's fence opener or table header: it renders before the chunk but is
+  never counted as the part's delivered characters, exactly as today. The tool's
+  panel body stays in the accumulator's tool map, which file delivery and
+  liveness keep updating, and the card build reads it from there as today. `place` applies the same floors a transcript part gets:
   the message's `receipt_cut_floor(created)`, the read floor carried by the
   walk, the live-slice clamp, and placed-part stability (a part already on the
   timeline keeps the key it was placed at). The message scope's `Drop` clears the
@@ -127,18 +129,19 @@ content into them.**
   entry identity (`seq`, including the seq a live tool panel pins when it
   settles, ADR-0045).
 - **What does not move.** The live (unsettled) tool tail stays in the
-  accumulator as a `TailPlacement` — key, display clock, merge identity, the floor
-  it was placed under, the call id, and the pinned `seq` — plus its panel body in
-  the tool map. `MessageScope::pin(facts, call_id)` produces it; it cannot be
-  pushed, only settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
+  accumulator as a `TailPlacement` — key, display clock, merge identity, the
+  floor it was placed under, the message's **created time** (the receipt cut's
+  input), the call id, and the pinned `seq` — plus its panel body in the tool
+  map. `MessageScope::pin(facts, call_id)` produces it; it cannot be pushed, only
+  settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
   replacement, clamped to the floor the pin carried.
   `Timeline::settle(tail, panel)` applies the **current** receipt cut for the
-  tail's message time (a receipt recorded after the pin still floors it) and the
-  Timeline's **current read-order high-water mark** — a monotonic maximum key over
-  placed transcript entries, so a message that became visible after the pin still
-  floors the panel — then seats the panel with the stored `seq`. So a tail-only
-  panel cannot jump a receipt cut or content read after it was pinned, before or
-  after its start time arrives. This clamp is
+  tail's message created time (a receipt recorded after the pin still floors it)
+  and the Timeline's **current read-order high-water mark** — a monotonic maximum
+  key over placed transcript entries, so a message that became visible after the
+  pin still floors the panel — then seats the panel with the stored `seq`. So a
+  tail-only panel cannot jump a receipt cut or content read after it was pinned,
+  before or after its start time arrives. This clamp is
   the ADR's one deliberate tightening, and a test pins it; every other placement
   rule and every current test is unchanged. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
@@ -155,11 +158,11 @@ content into them.**
   the guards gain invariant tests (a message scope always clears its floor, a
   walk always resets, a rewritten run keeps the boundary, a placed part keeps
   its key, a pending tool that later reports its start time settles at that time
-  but not above its floor, a resolved click's receipt keeps its reserved key
+  but never below its floor, a resolved click's receipt keeps its reserved key
   while the slice reaches it and returns the clamped key after a split past it, a
-  rewritten run's later chunk merges into the new run, a post-click compaction
-  row still floors at the receipt, and a repeated compaction fact updates the row
-  it already has).
+  rewritten run's later chunk merges into the new run, a seeded cut inside a
+  fence keeps its opener, a post-click compaction row still floors at the
+  receipt, and a repeated compaction fact updates the row it already has).
 
 ## Consequences
 
