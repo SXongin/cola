@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::{
-    BackgroundTask, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding, ToolStatus,
-    TurnAnchor, Wake, WakeSource,
+    BackgroundTask, Compaction, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding,
+    ToolStatus, TurnAnchor, Wake, WakeSource,
 };
 use crate::bridge::chain::{EndingFacts, EndingKey, TaskEndingClass, TaskEndingState};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
@@ -1763,6 +1763,17 @@ pub(super) fn render_new_turn_parts_committing(
         | entries
 }
 
+/// The read's message positions, keyed by message id (spec #1040): the
+/// equal-key tie-break and each message scope's read floor order by them.
+fn read_position_map(transcript: &SessionTranscript) -> std::collections::HashMap<&str, usize> {
+    transcript
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(position, message)| (message.id.as_str(), position))
+        .collect()
+}
+
 /// Render the parts of this turn's assistant messages that haven't been
 /// rendered yet (the live Background Task ledger is the caller's: the render's
 /// shared gather has to run between the parts and the ledger). Returns true if
@@ -1793,17 +1804,6 @@ pub(super) fn render_new_turn_parts_committing(
 /// the session-scoped compaction walk skips past. It is the SESSION's delivered
 /// past, not this card's, which is why it is passed in rather than read off
 /// `acc` — a fresh Turn's accumulator is deliberately cursorless.
-/// The read's message positions, keyed by message id (spec #1040): the
-/// equal-key tie-break and each message scope's read floor order by them.
-fn read_positions(transcript: &SessionTranscript) -> std::collections::HashMap<&str, usize> {
-    transcript
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(position, message)| (message.id.as_str(), position))
-        .collect()
-}
-
 pub(super) fn render_turn_parts(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
@@ -1841,7 +1841,7 @@ pub(super) fn render_turn_parts(
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
     let message_positions: std::collections::HashMap<&str, usize> = if acc.seed().is_some() {
-        read_positions(transcript)
+        read_position_map(transcript)
     } else {
         std::collections::HashMap::new()
     };
@@ -1871,7 +1871,7 @@ pub(super) fn render_turn_parts(
     // committing it here or after the parts render is one card.
     let seed = acc.seed().cloned();
     let turn = transcript.turn_for_user(&anchor);
-    let read_positions = read_positions(transcript);
+    let read_positions = read_position_map(transcript);
     // A card rendering an unanswered free-text field must not consume this
     // background update: otherwise the first pass removes it from "new" and
     // the post-answer pass has nothing left to show (#917 / card-repaints).
@@ -2019,7 +2019,7 @@ fn render_pending_gap(
     if seed.frontier.is_none() {
         return false;
     }
-    let message_positions = read_positions(transcript);
+    let message_positions = read_position_map(transcript);
     // The gap's window ends where the NEXT Turn begins (spec #561, review
     // #569): `turn_for_user` has no upper end, so without a bound the walk
     // would swallow every later Turn — content a later card already showed,
@@ -2285,7 +2285,7 @@ fn render_compactions(
     if owed.is_empty() {
         return false;
     }
-    let read_positions = read_positions(transcript);
+    let read_positions = read_position_map(transcript);
     // One walk, one message scope per row: the row is keyed at its MESSAGE's
     // server time, and that scope's floor is the same message cut a turn part
     // gets (issue #1023). The admission's own `receipt_cut_floor(message_time)`
@@ -2303,17 +2303,53 @@ pub(super) fn renders_compactions(
     transcript: &SessionTranscript,
     bound: Option<usize>,
 ) -> bool {
-    !owed_compactions(acc, transcript, bound).is_empty()
+    transcript.messages.iter().enumerate().any(|(position, message)| {
+        !acc.baseline_suppresses(message.id.as_str())
+            && message.parts.iter().enumerate().any(|(index, part)| {
+                let Part::Compaction(fact) = part else {
+                    return false;
+                };
+                compaction_owed(
+                    acc,
+                    &PartSource::at(message.id.clone(), index),
+                    position,
+                    fact,
+                    bound,
+                )
+            })
+    })
 }
 
-/// The compaction facts this read owes this card, in server order. A fact is owed
-/// when the card carries no row at its position — or carries one whose rendered
-/// revision has changed — and, for a position the card has never shown, when the
-/// session's durable delivered position has not already passed it
-/// ([`rendered_bound`]). Messages an error-card retry's baseline suppresses are
-/// skipped. The one source both [`render_compactions`] and
-/// [`renders_compactions`] read, so the two cannot drift. The fact's server time
-/// is its MESSAGE's: a part carries none.
+/// Whether the compaction `fact` at transcript `position` is owed this card: the
+/// card carries no row at its position — or carries one whose rendered revision
+/// has changed — and, for a position the card has never shown, the session's
+/// durable delivered position has not already passed it ([`rendered_bound`]).
+/// The one decision [`render_compactions`] and [`renders_compactions`] share, so
+/// the probe can early-exit without cloning a fact.
+fn compaction_owed(
+    acc: &StreamAccumulator,
+    source: &PartSource,
+    position: usize,
+    fact: &Compaction,
+    bound: Option<usize>,
+) -> bool {
+    // The row this card already carries AT THIS POSITION, at whatever revision.
+    // It is the only thing a fact dedupes against: two distinct compactions may
+    // render the same fields, and only their positions tell them apart. A
+    // carried row is an UPDATE, never a replay: the row's own confirmed write
+    // advanced the chain cursor past the position, so the bound must not skip
+    // the terminal revision of a row the card is already showing.
+    let carried = acc.compaction_row(source);
+    if carried.is_none() && bound.is_some_and(|bound| position <= bound) {
+        return false;
+    }
+    !carried.is_some_and(|row| same_row(row, fact))
+}
+
+/// The compaction facts this read owes this card, in server order: every
+/// [`compaction_owed`] part, with its message's server time. Messages an
+/// error-card retry's baseline suppresses are skipped. The fact's server time is
+/// its MESSAGE's: a part carries none.
 fn owed_compactions(
     acc: &StreamAccumulator,
     transcript: &SessionTranscript,
@@ -2327,18 +2363,7 @@ fn owed_compactions(
         for (index, part) in message.parts.iter().enumerate() {
             let Part::Compaction(fact) = part else { continue };
             let source = PartSource::at(message.id.clone(), index);
-            // The row this card already carries AT THIS POSITION, at whatever
-            // revision. It is the only thing a fact dedupes against: two distinct
-            // compactions may render the same fields, and only their positions
-            // tell them apart. A carried row is an UPDATE, never a replay: the
-            // row's own confirmed write advanced the chain cursor past the
-            // position, so the bound must not skip the terminal revision of a row
-            // the card is already showing.
-            let carried = acc.compaction_row(&source);
-            if carried.is_none() && bound.is_some_and(|bound| position <= bound) {
-                continue;
-            }
-            if carried.is_some_and(|row| same_row(row, fact)) {
+            if !compaction_owed(acc, &source, position, fact, bound) {
                 continue;
             }
             owed.push(CompactionRow {
@@ -2428,7 +2453,7 @@ fn record_seed_extent(acc: &mut StreamAccumulator, source: &PartSource, delivere
 /// settled card omits it, because no renderer will ever update that `⏳` again.
 fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscript) -> bool {
     let mut rendered = false;
-    let seeded_positions = read_positions(transcript);
+    let seeded_positions = read_position_map(transcript);
     // The seeded ids are a SET, so sort them by their read position before
     // placing them: two calls sharing a borrowed key would otherwise allocate
     // in hash order (issue #1022).
@@ -6120,7 +6145,7 @@ Index: /x/src/main.rs
                 vec![text_part("新问题")],
             ),
         ]);
-        let positions = read_positions(&transcript);
+        let positions = read_position_map(&transcript);
 
         let mut acc = StreamAccumulator::new("test");
         // The click precedes the orphan message: its parts earn the cut.
@@ -6204,7 +6229,7 @@ Index: /x/src/main.rs
                 )],
             ),
         ]);
-        let positions = read_positions(&transcript);
+        let positions = read_position_map(&transcript);
 
         let mut acc = StreamAccumulator::new("test");
         let early = &transcript.messages[0];
