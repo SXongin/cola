@@ -173,7 +173,7 @@ content into them.**
   pinned tails** (the per-message `pinned_tails`), so a later message's part can
   never be placed above a panel still riding the tail under clock skew. This is
   the deliberate extension to ADR-0038's high-water mark. Within the panel's own
-  message, `settle`'s `pinned_keys` covers only tails that precede it in part
+  message, `settle`'s `pinned_tails` covers only tails that precede it in part
   order, never a later one.
 - **Equal keys order by class, then read position.** Every source-bearing
   transcript entry carries its part's read position (the message's position in
@@ -264,8 +264,10 @@ content into them.**
   but never below its floor, and lands by read position after an equal-key entry
   of an earlier message; a later message's part whose server key is older than an
   earlier message's pinned tail still lands below that panel; a late real start
-  time never pushes the panel past a same-message continuation; a receipt
-  recorded after the pin still floors it at settle; a resolved click's receipt keeps its reserved key while the slice
+  time never pushes the panel past a same-message continuation **or a later
+  message's placed part**; the four walks contain no `set_message_floor`,
+  `set_read_floor` or `reset_read_floor` call; a receipt recorded after the pin
+  still floors it at settle; a resolved click's receipt keeps its reserved key while the slice
   reaches it and returns the clamped key after a split past it; a seeded cut
   inside a fence keeps its opener; a **source-bearing** post-click part floored
   to a receipt's key still sorts below that receipt; a post-click compaction row
