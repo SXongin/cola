@@ -4,15 +4,17 @@
 > with the Session Snapshot card, so every **Interaction Block** lives on a live
 > card or its own standalone card, and `SnapshotClaims` no longer exists.
 >
-> **Amended by ADR-0104 when it lands** (the keying sentence and the equal-key rule): synthetic
-> entries may be keyed at their own server time or at a key the caller already
-> holds — a click's reserved receipt key, the Wake 承接 line's server time — not
-> only at `next_order()`; and at equal keys a source-bearing transcript entry
-> (a tail **Tool Panel** included) orders by its **read position** — the
-> message's position in the read, then the part index — not by allocation, so a
-> later-visible earlier-message entry sorts before a later message's part and
-> in-message part order holds. Placed content never moves; `seq` stays identity.
-> The receipt's server-time cut is unchanged.
+> **Amended by ADR-0104 when it lands** (the keying sentence and the equal-key
+> rule): synthetic entries may be keyed at their own server time, at a key the
+> caller already holds (a click's reserved receipt key), or at a derived key just
+> before the work they introduce (a Wake line and the External Message lead use
+> `created_ms - 1`) — not only at `next_order()`. At equal keys, source-less and
+> synthetic entries sort **before** positioned transcript entries (so content
+> floored to a receipt's key stays below that receipt), and positioned entries
+> (a tail **Tool Panel** included) order by **read position** — the message's
+> position in the read, then the part index — not by allocation; `order` breaks
+> ties only within a class. Placed content never moves; `seq` stays identity. The
+> receipt's server-time cut is unchanged.
 
 A pending Permission/Question is rendered inline on the card the Host is already reading (an **Interaction Block**). Its updates were ad-hoc: discovery and first render came from the 3 s request poller; a click mostly repainted "the accumulator's current card" through a PATCH; a request resolved by another client was stripped from memory but never repainted; and a card that stopped being the accumulator's current card had no repaint path at all. Observed: a block clicked on an older card only toasted; a remotely-resolved block lingered on a finished turn's card forever; permission/answer disappearance lagged the click by one PATCH; a block whose turn ended froze in place. This ADR fixes the lifecycle: blocks stay inline and follow the live card, and every card showing a live block carries a handle that lets cola repaint it — cached last-rendered JSON plus a `request_id → message_id` registry — so a click updates the clicked card atomically in the callback ack and a remote resolution repaints within one sweep.
 
@@ -355,11 +357,11 @@ mis-ordered:
   of appending it after a part already pushed at the same key. The sort uses an
   internal `order`: an ordinary insert's `order` equals its `seq`, a chunked
   continuation shares its part's `order`, and the render-boundary clamp lowers
-  `order` alone — never the identity `seq` (ADR-0040). ADR-0104 adds the
-  read-position rule above: at equal keys a source-bearing transcript entry
-  sorts by its part's position rather than by allocation, so a later-visible
-  earlier-message entry lands ahead of a later message's part; `order` remains
-  the tie-break among entries with no read position.
+  `order` alone — never the identity `seq` (ADR-0040). ADR-0104 replaces the
+  equal-key rule: synthetic and source-less entries sort first (a receipt stays
+  above content floored to its key), then source-bearing transcript entries by
+  read position, so a later-visible earlier-message entry lands ahead of a later
+  message's part; `order` remains the tie-break within a class.
 - A part already on the timeline **keeps the key it was placed at** — a rewrite
   captures the old key before it drops the run — because a later read's floor can
   differ, and re-keying would split a growing part into two entries.
