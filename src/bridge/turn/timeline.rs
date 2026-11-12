@@ -371,12 +371,19 @@ impl TailPlacement {
     }
 
     /// The fact a later walk or settle needs: which message owns the tail,
-    /// which part pinned it and where it sits. `None` for a compatibility pin
-    /// that named no message (the old walks pinned none).
+    /// which part pinned it and where it sits. A compatibility pin names no
+    /// message position but still carries its part's identity through the
+    /// source, so the fact can floor a later message. `None` only when the pin
+    /// named neither a message nor a source.
     pub(super) fn fact(&self) -> Option<TailFact> {
+        let message = self.message.clone()?;
+        let part = self.position.map_or_else(
+            || self.source.as_ref().map_or(0, |source| source.index()),
+            |(_, part)| part,
+        );
         Some(TailFact {
-            message: self.message.clone()?,
-            part: self.position.map_or(0, |(_, part)| part),
+            message,
+            part,
             key: self.key,
         })
     }
@@ -1551,12 +1558,13 @@ impl Timeline {
         let key = key_at.unwrap_or_else(|| self.next_order());
         let floor = self.current_floor();
         let seq = self.allocate_seq();
+        let message = source.as_ref().map(|source| source.message_id().clone());
         TailPlacement {
             key,
             shown_at,
             source,
             floor,
-            message: None,
+            message,
             created: None,
             position: None,
             call_id,
@@ -1597,7 +1605,9 @@ impl Timeline {
     /// panel's own preceding ones — then seat it at `max(current, floor)`,
     /// capped at the minimum key among the entries that follow it in read order
     /// at or above the floor. Placed content never moves and `seq` stays
-    /// identity.
+    /// identity. `_panel` keeps #1040's `settle(tail, panel, …)` signature;
+    /// the panel body stays in the accumulator's `tools` map and the Timeline
+    /// never reads it.
     pub(super) fn settle(
         &mut self,
         tail: TailPlacement,
@@ -3053,6 +3063,37 @@ mod tests {
             "a follower below the floor stays put"
         );
         assert!(tool > 0, "the panel lands after the below-floor follower");
+    }
+
+    /// A compatibility pin (the walks #1043 moves) still names its message and
+    /// part through the source: its live panel floors a later message through
+    /// the walk's pinned-tail path.
+    #[test]
+    fn a_compat_pinned_tail_floors_a_later_message() {
+        let mut timeline = Timeline::default();
+        let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let tail = timeline.pin_compat(
+            Some(9_000),
+            Some(9_000),
+            Some(PartSource::at(MessageId::new("m0"), 1)),
+            "call_bash".into(),
+        );
+        let fact = tail.fact().expect("the source names the message");
+        assert_eq!(fact.part, 1, "the part index comes from the source");
+        let mut walk = timeline.walk(&order);
+        let mut scope = walk.message(None, &MessageId::new("m1"), &[fact]);
+        let facts = PartFacts {
+            form: PartForm::Text,
+            key_at: Some(1_000),
+            shown_at: Some(1_000),
+            source: Some(PartSource::at(MessageId::new("m1"), 0)),
+            index: 0,
+        };
+        let placement = scope.place(facts);
+        assert_eq!(
+            placement.key, 9_000,
+            "the earlier message's compat-pinned tail floors the later part"
+        );
     }
 
     /// An earlier message's pinned tail floors a later message's part (spec
