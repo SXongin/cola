@@ -1,6 +1,6 @@
 # In-flight Tool Panels ride the live card; settled panels join the timeline
 
-> **Amended by ADR-0104 when it lands**: a tail panel's re-key and its settle
+> **Amended by ADR-0104**: a tail panel's re-key and its settle
 > floor **and cap** are owned by the Timeline module: a late start cannot carry
 > the panel past the **minimum key among all entries that follow it in read
 > order** at or above the floor, while a following entry at a lower key stays

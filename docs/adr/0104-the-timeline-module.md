@@ -1,7 +1,6 @@
 # The Timeline module: one owner for card placement
 
-> **Landed** with spec #1040's batch (#1041–#1046). This ADR records the module
-> boundary and the ownership move; the landing amendment below records the
+> **Landed** with spec #1040's batch. The landing amendment below records the
 > finished mechanism, the accumulator split as built, the rules as landed and
 > the tickets that landed them.
 >
@@ -17,16 +16,19 @@ bare `i64`s.
 
 ## Context
 
-- **Three bodies implement one rule.** `StreamAccumulator::part_order_key`
-  (`src/bridge/turn/state.rs:3192`) decides the key a part will take;
-  `insert_item` (`:3929`) decides it again when the part lands, clamp included;
-  `insert_kind_after` (`:4066`) mirrors the clamp a third time. The code says so:
+- **Three bodies implemented one rule (removed by this batch; the anchors name
+  `main@1268d2d0`).** `StreamAccumulator::part_order_key`
+  (`src/bridge/turn/state.rs`, since deleted) decided the key a part will take;
+  `insert_item` (same file, since deleted) decided it again when the part lands,
+  clamp included; `insert_kind_after` (same file, since deleted) mirrored the
+  clamp a third time. The code said so:
   "Apply the same live-slice clamp [`Self::insert_item`] will".
-- **Four walks re-arm the protocol by hand.** `render_turn_parts`
+- **Four walks re-armed the protocol by hand (line numbers name
+  `main@1268d2d0`).** `render_turn_parts`
   (`turn/render.rs:1631`), `render_pending_gap` (`:1847`), `render_seed_scope`
-  (`:2027`) and `resolve_seeded_calls` (`:2354`) each write the sequence
+  (`:2027`) and `resolve_seeded_calls` (`:2354`) each wrote the sequence
   `set_message_floor` → `read_floor_before` → `set_read_floor` … →
-  `set_message_floor(None)`, and `render.rs` calls `reset_read_floor()` thirteen
+  `set_message_floor(None)`, and `render.rs` called `reset_read_floor()` thirteen
   times (eleven in production, two in the test-only `render_parts`).
 - **The inputs travel as bare integers.** Every push takes an order key and a
   display clock side by side, and `render_part` threads the key from
@@ -119,11 +121,13 @@ ADR-0050 records is unchanged.
   floor; `MessageScope::pin` produces the `TailPlacement` a live panel carries.
   The scope's `Drop` clears the message floor and the walk's `Drop` clears the
   read floor, so a half-written protocol cannot survive either.
-- **One insert path.** `Timeline::seat` owns the live-slice clamp, the
-  equal-key partition (read position, then `order`), chunk continuation, `seq`
-  allocation and the `order` lowering a clamped slot needs. `place` and the
-  insert consume one key computation, so `part_order_key` and the mirrored
-  clamps are gone.
+- **One insert path.** `Timeline::seat` seats an entry at its already-resolved
+  slot, allocates `seq` when the caller has none and lowers a clamped entry's
+  `order`; the live-slice clamp is `slot_at`, the equal-key partition is
+  `slot_for_new` / `slot_for_seq` / `slot_after`, and the continuation/merge
+  walk is `push_text_at_slot` (`source_entry`, the remaining-space probe,
+  `slot_after`). `place` and the insert consume one key computation, so
+  `part_order_key` and the mirrored clamps are gone.
 - **What stays in the accumulator.** `StreamAccumulator` (name unchanged) keeps
   the text and reasoning buffers, content-keyed dedup and the rewritten part's
   prefix digest, the interactions and the `request_id → ReservedReceipt` map
@@ -142,21 +146,27 @@ ADR-0050 records is unchanged.
   placed-part stability (`placed_source_key`: a part already on the live slice
   keeps its key) and the live-slice clamp. A source-bearing placement carries
   its read position; a source-less one clamps like the insert path always did.
+  Pinned by `a_placed_part_keeps_its_key_across_reads`.
 - A synthetic entry inserts directly and returns the key it took (`None` for a
   `Lead`, which may merge or chunk, and for a blank `UserMessage`). Every
   variant's `at` is an order key only: a receipt, a notice, a user lead and a
   compaction row render no clock, and a ledger entry shows its payload's
   `finished_at`. A compaction row takes its message's Interaction Receipt cut,
   keeps its start time on `shown_at` for the cursor frontier only, and updates
-  in place by `PartSource`.
+  in place by `PartSource`. Pinned by
+  `a_wake_ledger_entry_shows_its_finished_at_not_its_keyed_clock`,
+  `a_post_click_compaction_row_floors_at_the_cut_and_shows_no_clock` and
+  `a_message_scope_floors_a_compaction_row`.
 - `replace` drops the part's run across the boundary (`drop_source_run` keeps
   `render_from` on the same logical position) and re-floors the placement at
   `max(placement.key, placement.floor)` before inserting the new run.
-- `settle` re-applies the CURRENT receipt cut and the CURRENT read floor for the
-  tail's message (earlier messages' entries and pinned tails, plus the panel's
-  own preceding tails), seats at `max(current, floor)`, caps at the minimum key
-  among the entries that follow it in read order at or above the floor, and
-  seats through the normal insert path (clamp included) with its pinned `seq`.
+- `settle` takes `tail.floor` (the floor the pin carried), the CURRENT receipt
+  cut and the CURRENT read floor for the tail's message (earlier messages'
+  entries and pinned tails, plus the panel's own preceding tails), seats at
+  `max(current, floor)`, caps at the minimum key among the entries that follow
+  it in read order at or above the floor, and seats through the normal insert
+  path (clamp included) with its pinned `seq` — never renumbered (ADR-0040),
+  pinned by `a_settled_panel_keeps_the_identity_it_was_pinned_with`.
 
 ### Deliberate tightenings
 

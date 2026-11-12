@@ -3,8 +3,8 @@
 > **Retired by ADR-0100** (the Session Snapshot tail's fold ids): the snapshot
 > card and its rebuild path are gone, so the `snap_{i}` example no longer exists.
 >
-> **Amended by ADR-0104 when it lands**: `seq` is assigned once by the Timeline
-> (the successor of `insert_kind`), and the equal-key ordering changes; #1040
+> **Amended by ADR-0104**: `seq` is now assigned once by the Timeline
+> (the successor of `insert_kind`), and the equal-key ordering changed; #1040
 > carries the exact rules. The never-reuse/never-renumber invariant is unchanged.
 
 Every flush PATCHes the whole card JSON (`update_message`), and a collapsible
