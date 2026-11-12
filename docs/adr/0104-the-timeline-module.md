@@ -133,8 +133,8 @@ content into them.**
   be the receipt's. A timeless compaction (`message_time: None`) takes no cut,
   exactly as today. The other
   synthetic kinds are placed outside any floor window today and keep that. `row`
-  is the compaction's merge identity, and its update-in-place lookup is scoped to
-  the **live slice**. A terminal revision that arrives after a split or a restart
+  is the compaction's merge identity, and its update-in-place lookup keeps today's
+  whole-timeline behaviour. A terminal revision that arrives after a split or a restart
   is a separate, pre-existing delivery gap (the positional bound can skip it, and
   relaxing the bound would repost the fact); it is tracked in #1049 and
   deliberately **not** part of this batch — no durable-format change lands here.
