@@ -72,8 +72,9 @@ content into them.**
   `Placement`), the message and read floors, the Interaction Receipt cut
   staircase, the live-slice boundary, the sealed-entry set, merge-by-part
   lookup, key minting and entry identity (`seq`). One private insert path
-  replaces `part_order_key` and the mirrored clamps, so the live-slice clamp is
-  computed once.
+  replaces `part_order_key` and the mirrored clamps, so one key computation
+  feeds both `place` and `push` (the live-slice clamp itself lives in
+  `slot_at`, and `push` re-partitions at that key).
 - **What stays.** The Rendered Cursor and its staging, content-keyed dedup and
   the rewritten part's prefix digest, the ledger, the interactions and the card
   build. The live (unsettled) tool tail stays in the accumulator as a
@@ -162,12 +163,14 @@ ADR-0050 records is unchanged.
   `render_from` on the same logical position) and re-floors the placement at
   `max(placement.key, placement.floor)` before inserting the new run.
 - `settle` takes `tail.floor` (the floor the pin carried), the CURRENT receipt
-  cut and the CURRENT read floor for the tail's message (earlier messages'
-  entries and pinned tails, plus the panel's own preceding tails), seats at
-  `max(current, floor)`, caps at the minimum key among the entries that follow
-  it in read order at or above the floor, and seats through the normal insert
-  path (clamp included) with its pinned `seq` — never renumbered (ADR-0040),
-  pinned by `a_settled_panel_keeps_the_identity_it_was_pinned_with`.
+  cut and the CURRENT read floor for the tail's message — every entry that
+  precedes it in read order (earlier messages' entries and the panel's own
+  preceding parts) plus every pinned tail that precedes it (an earlier
+  message's, or the panel's own) — seats at `max(current, floor)`, caps at the
+  minimum key among the entries that follow it in read order at or above the
+  floor, and seats through the normal insert path (clamp included) with its
+  pinned `seq` — never renumbered (ADR-0040), pinned by
+  `a_settled_panel_keeps_the_identity_it_was_pinned_with`.
 
 ### Deliberate tightenings
 
@@ -179,7 +182,10 @@ and every existing test is unchanged.
   pending tool's late start never pushes it past a same-message continuation or
   a later message's placed part: the settled key is a **minimum** over the
   following entries at or above the floor, never the first one (after a tool
-  those keys need not be monotonic). Pinned by
+  those keys need not be monotonic). Its first half is the rekey clamp: a later
+  sighting's `started_at` becomes `max(pin-time floor, at)`, so a late start
+  cannot jump the floor the pin already carried either. Pinned by
+  `a_rekey_never_drops_below_the_pins_floor`,
   `a_tail_only_panels_late_start_cannot_jump_the_current_floors`,
   `a_late_start_is_capped_at_a_later_messages_placed_part`,
   `a_late_start_is_capped_at_the_following_minimum`.

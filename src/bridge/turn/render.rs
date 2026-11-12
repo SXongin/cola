@@ -321,7 +321,6 @@ fn render_part_scoped(
                     key_at: key,
                     shown_at: text.started_at,
                     source: Some(rewritten),
-                    index,
                 };
                 acc.replace_text_scoped(read_positions, message, &source, facts, text.text.clone())
                     .expect("the message scope accepts its own rewrite");
@@ -332,7 +331,6 @@ fn render_part_scoped(
                     key_at: order_at,
                     shown_at: text.started_at,
                     source,
-                    index,
                 };
                 acc.push_text_scoped(read_positions, message, facts, chunk, None)
                     .expect("the message scope accepts its own placement");
@@ -353,7 +351,6 @@ fn render_part_scoped(
                     key_at: key,
                     shown_at: reasoning.started_at,
                     source: Some(rewritten),
-                    index,
                 };
                 acc.replace_reasoning_scoped(read_positions, message, &source, facts, reasoning.text.clone())
                     .expect("the message scope accepts its own rewrite");
@@ -369,7 +366,6 @@ fn render_part_scoped(
                     key_at: order_at,
                     shown_at: reasoning.started_at,
                     source,
-                    index,
                 };
                 acc.push_reasoning_scoped(read_positions, message, facts, chunk, None)
                     .expect("the message scope accepts its own placement");
@@ -384,7 +380,6 @@ fn render_part_scoped(
                 acc.push_tool_scoped(
                     read_positions,
                     message,
-                    index,
                     order_at,
                     call.started_at,
                     &call.identity.call_id,
@@ -444,7 +439,6 @@ fn render_seeded_part_scoped(
             key_at: key,
             shown_at: started_at,
             source: Some(rewritten),
-            index,
         };
         let result = if is_text {
             acc.replace_text_scoped(read_positions, message, &source, facts, full.to_string())
@@ -480,7 +474,6 @@ fn render_seeded_part_scoped(
             key_at: order_at,
             shown_at: started_at,
             source: Some(source.clone()),
-            index,
         };
         let result = if is_text {
             acc.push_text_scoped(read_positions, message, facts, suffix.clone(), lead)
@@ -2155,7 +2148,6 @@ fn render_gap_part_scoped(
         key_at: order_at,
         shown_at: started_at,
         source: Some(source.clone()),
-        index,
     };
     if is_text {
         acc.push_text_scoped(read_positions, message, facts, suffix, lead)
@@ -2497,7 +2489,6 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                     acc.push_tool_scoped(
                         &seeded_positions,
                         message,
-                        index,
                         order_at,
                         call.started_at,
                         &call.identity.call_id,
@@ -6155,7 +6146,6 @@ Index: /x/src/main.rs
         acc.push_tool_scoped(
             &positions,
             early,
-            0,
             Some(1_500_000),
             Some(1_500_000),
             "call_early",
@@ -6236,7 +6226,6 @@ Index: /x/src/main.rs
         acc.push_tool_scoped(
             &positions,
             early,
-            0,
             Some(9_000),
             Some(9_000),
             "call_early",

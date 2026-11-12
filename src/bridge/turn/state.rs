@@ -3694,7 +3694,6 @@ impl StreamAccumulator {
             key_at,
             shown_at,
             source,
-            index: 0,
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
@@ -3744,7 +3743,6 @@ impl StreamAccumulator {
             key_at,
             shown_at,
             source,
-            index: 0,
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
@@ -3812,7 +3810,7 @@ impl StreamAccumulator {
     ) {
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        self.push_tool_scoped(&read_order, &message, 0, key_at, shown_at, call_id, panel, source)
+        self.push_tool_scoped(&read_order, &message, key_at, shown_at, call_id, panel, source)
             .expect("the scripted message scope accepts its own tool placement");
     }
 
@@ -3977,7 +3975,6 @@ impl StreamAccumulator {
         &mut self,
         read_positions: &HashMap<&str, usize>,
         message: &TranscriptMessage,
-        index: usize,
         key_at: Option<i64>,
         shown_at: Option<i64>,
         call_id: &str,
@@ -3992,7 +3989,6 @@ impl StreamAccumulator {
                 key_at,
                 shown_at,
                 source,
-                index,
             };
             if live {
                 let pinned = self.pinned_tail_facts();
@@ -5336,7 +5332,6 @@ impl StreamAccumulator {
             key_at: self.entry_key_of(source).or(key_at),
             shown_at,
             source: Some(self.rewrite_source(source, text, None)),
-            index: source.index(),
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
@@ -5358,7 +5353,6 @@ impl StreamAccumulator {
             key_at: self.entry_key_of(source).or(key_at),
             shown_at,
             source: Some(self.rewrite_source(source, text, Some(crate::feishu::card::REASONING_TEXT_CAP))),
-            index: source.index(),
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
@@ -8258,7 +8252,6 @@ mod tests {
             key_at: Some(reserved + 1),
             shown_at: Some(reserved + 1),
             source: Some(PartSource::at(post.id.clone(), 0)),
-            index: 0,
         };
         acc.push_text_scoped(&read_positions, &post, facts, "点击后到达".into(), None)
             .expect("the post-click part places");
