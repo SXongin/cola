@@ -128,9 +128,11 @@ content into them.**
   the finalized card keeps the `running` revision it was sent with — and the
   delivered bound must not suppress a position the live slice no longer carries.
   `owed_compactions` therefore keeps a **separate all-timeline "already carried"
-  probe**: a row it finds behind `render_from` was `running` and may render its
-  terminal revision on the live card, while a fresh Turn's Timeline carries no
-  such row and the session bound still applies there. Exactly-once becomes one
+  probe** that matches the row's **revision** (`same_row`, not position alone): a
+  `running` row found behind `render_from` may render its terminal revision on
+  the live card, a row already carrying that terminal revision is not recreated
+  (a second split moves it behind `render_from` too), and a fresh Turn's Timeline
+  carries no such row, so the session bound still applies there. Exactly-once becomes one
   revision per **live-timeline** body rather than one row per session (ADR-0082
   §3's amendment); the busy-follow static lead's copy is its standing exception. A reserved receipt key the live slice
   no longer reaches (a split finalized past it) is clamped to the slice's first
@@ -219,16 +221,23 @@ content into them.**
   the guards gain invariant tests (a message scope always clears its floor — a
   later transcript part with a key older than the dropped scope's floor is not
   floored; a walk always resets — the next message's first part carries a key
-  below the stale floor; a rewritten run keeps the boundary; a placed part keeps
-  its key; an untimed part after a timed one borrows that timed part's key; a pending tool that later reports its start time settles at that time
-  but never below its floor, a resolved click's receipt keeps its reserved key
-  while the slice reaches it and returns the clamped key after a split past it, a
-  rewritten run's later chunk merges into the new run, a rewrite whose source
-  names another part (or none) is rejected, a token from another scope is
-  rejected, a seeded cut inside a fence keeps its opener, a post-click compaction row still floors at the
-  receipt, a repeated compaction fact updates the row it already has, a Wake
-  ledger entry shows its `finished_at` across a minute boundary rather than its
-  keyed clock, and a compaction row shows no clock).
+  below the stale floor; a rewritten run keeps the boundary and its later chunk
+  merges into the new run; a rewrite whose source names another part (or none)
+  is rejected; a token from another scope is rejected; a placed part keeps its
+  key; an untimed part before a message's first tool borrows the previous timed
+  part's key (or the message's created time) while one after a tool keeps the
+  render-order fallback; a pending tool's late start time settles at that time
+  but never below its floor, and takes a fresh order above an equal-key entry of
+  an earlier message at the floor; a receipt recorded after the pin still floors
+  it at settle; a resolved click's receipt keeps its reserved key while the slice
+  reaches it and returns the clamped key after a split past it; a seeded cut
+  inside a fence keeps its opener; a post-click compaction row still floors at
+  the receipt; a repeated compaction fact updates the row it already has; a
+  compaction row finalized by a split takes a terminal-only live row when its
+  terminal fact arrives, the bound bypass keys on the carried revision, and a
+  second split does not recreate an already-terminal row; a Wake ledger entry
+  shows its `finished_at` across a minute boundary rather than its keyed clock;
+  and a compaction row shows no clock).
 
 ## Consequences
 

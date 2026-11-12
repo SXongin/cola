@@ -7,9 +7,10 @@
 > high-water mark, ADR-0038), then applies ADR-0038's late-part clamp — so the
 > panel cannot jump a receipt or content read before it. When that floor is at or
 > above the pinned key, the panel takes a fresh allocation order above the
-> equal-key entries of **earlier messages** but below its own message's following
-> entries, so it renders after the content that floored it without jumping a
-> same-message continuation.
+> equal-key entries of **earlier messages** at that floor but below its own
+> message's entries that **share the key**; placed content never moves, so a
+> same-message continuation at a lower key stays put and the panel lands after
+> it.
 
 A **Tool Panel** rendered as a timeline row: it sat where its tool call started,
 and a **Card Chain** split could finalize the card while the tool still ran. The
