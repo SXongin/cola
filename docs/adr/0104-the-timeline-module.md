@@ -7,14 +7,16 @@
 > to `turn/timeline.rs`. The Turn boundary this ADR records is unchanged — the
 > accumulator, the flush and the render poll stay internal to the Turn module.
 >
-> **Amends ADR-0038's keying sentence**: a synthetic entry may be keyed at its
-> own server time or at a key the caller already holds — a click's reserved
-> receipt key, the Wake 承接 line's server time, a message's created time — not
-> only at `next_order()`; the call sites already do this.
+> **Amends ADR-0038's keying and equal-key rules**: a synthetic entry may be
+> keyed at its own server time or at a key the caller already holds — a click's
+> reserved receipt key, the Wake 承接 line's server time, a message's created
+> time — not only at `next_order()`; and a tail-only Tool Panel seated at settle
+> takes a fresh allocation order above the equal-key run, because its allocation
+> predates content that became visible after it was pinned.
 >
 > **Amends ADR-0045's re-key rule**: a tail-only panel's allocated key is still
-> replaced by a later real start time, but clamped to the floor the placement
-> already carried.
+> replaced by a later real start time, but settle first floors it with the
+> current receipt cut and the current read floor for its message.
 
 Where a card entry lands has no owner. The rule is written three times, its
 protocol is re-armed by hand in four walks, and its inputs cross the seam as
@@ -73,12 +75,15 @@ content into them.**
   seeded cut's fence opener or table header: it renders before the chunk but is
   never counted as the part's delivered characters, exactly as today. The tool's
   panel body stays in the accumulator's tool map, which file delivery and
-  liveness keep updating, and the card build reads it from there as today. `place` applies the same floors a transcript part gets:
+  liveness keep updating, and the card build reads it from there as today.
+  `place` applies the same floors a transcript part gets:
   the message's `receipt_cut_floor(created)`, the read floor carried by the
   walk, the live-slice clamp, and placed-part stability (a part already on the
-  timeline keeps the key it was placed at). The message scope's `Drop` clears the
-  message floor and the walk's `Drop` clears the read floor, so the half-written
-  protocol that produced the fixes above is no longer representable.
+  **live slice** keeps the key it was placed at; a finalized entry is behind
+  `render_from`, so a grown part starts a continuation entry as today). The
+  message scope's `Drop` clears the message floor and the walk's `Drop` clears
+  the read floor, so the half-written protocol that produced the fixes above is
+  no longer representable.
 - **Synthetic entries have their own admission.** An Interaction Receipt, a
   compaction row, a ledger entry, the External Message's lead and a bot-authored
   notice (the Wake 承接 line, a busy-follow static lead) are not read-order
@@ -101,10 +106,12 @@ content into them.**
   no longer reaches (a split finalized past it) is clamped to the slice's first
   key, exactly the clamp `insert_item` applies today, and the returned key is
   the clamped one.
-- **The receipt seam.** The Timeline exposes `reserve_key` (minting a click's
-  receipt and floor keys from its order sequence), `retune_cut(floor_key, at)`
-  and `forget_cut(floor_key)`, so a mode change resolving several blocks can
-  retune or drop cuts. `reservation_seq`, `reserved_receipts` and every
+- **The receipt seam.** `reserve_key(asked_at)` mints a click's receipt and
+  floor keys from the order sequence **and installs the initial
+  `{asked_at, floor_key}` cut**, so content written during the reply is floored
+  before the receipt lands. `retune_cut(floor_key, at)` and
+  `forget_cut(floor_key)` adjust or drop it, so a mode change resolving several
+  blocks can retune or drop cuts. `reservation_seq`, `reserved_receipts` and every
   `request_id` stay in the accumulator, which owns the reservation's lifecycle.
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
   and `push` / `replace` consume it; it carries the entry key, an optional merge
@@ -147,11 +154,12 @@ content into them.**
   settle read so content that became visible after the pin still floors the
   panel. A key raised to that floor takes a **fresh `order` above any equal-key
   run** (the pinned `seq` is identity, not position), so the panel renders after
-  the content that floored it. So a tail-only panel cannot jump a receipt cut or
-  content read after it was pinned, before or after its start time arrives. This
-  clamp is
-  the ADR's one deliberate tightening, and a test pins it; every other placement
-  rule and every current test is unchanged. Content-keyed dedup and the rewritten
+  the content that floored it; this is the one place the equal-key allocation
+  rule defers to read order, and ADR-0038's note records it. So a tail-only panel cannot jump a receipt cut or
+  content read after it was pinned, before or after its start time arrives.
+  These two rules — the settle clamp and the equal-key exception — are the ADR's
+  deliberate tightenings, and tests pin them; every other placement rule and
+  every current test is unchanged. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
   replace defined above. The **Rendered Cursor** and its staging, the ledger,
   the interactions and the card build stay where they are. `StreamAccumulator`
@@ -162,7 +170,8 @@ content into them.**
   scope); no production caller gains a new path.
 - **Behaviour-preserving.** ADR-0038's receipt-skew window, ADR-0071's
   cursorless fallback and every current ordering test are unchanged, apart from
-  the tail-only re-key clamp above. The timeline tests move beside the module;
+  the tail-only settle clamp and its equal-key exception above. The timeline tests
+  move beside the module;
   the guards gain invariant tests (a message scope always clears its floor, a
   walk always resets, a rewritten run keeps the boundary, a placed part keeps
   its key, a pending tool that later reports its start time settles at that time

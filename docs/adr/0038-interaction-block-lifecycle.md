@@ -4,10 +4,13 @@
 > with the Session Snapshot card, so every **Interaction Block** lives on a live
 > card or its own standalone card, and `SnapshotClaims` no longer exists.
 >
-> **Amended by ADR-0104** (the keying sentence): synthetic entries may be keyed
-> at their own server time or at a key the caller already holds — a click's
-> reserved receipt key, the Wake 承接 line's server time — not only at
-> `next_order()`. The receipt's server-time cut is unchanged.
+> **Amended by ADR-0104** (the keying sentence and the equal-key rule): synthetic
+> entries may be keyed at their own server time or at a key the caller already
+> holds — a click's reserved receipt key, the Wake 承接 line's server time — not
+> only at `next_order()`; and a tail-only **Tool Panel** seated at settle takes a
+> fresh allocation order above the equal-key run, because its allocation predates
+> content that became visible after it was pinned. The receipt's server-time cut
+> is unchanged.
 
 A pending Permission/Question is rendered inline on the card the Host is already reading (an **Interaction Block**). Its updates were ad-hoc: discovery and first render came from the 3 s request poller; a click mostly repainted "the accumulator's current card" through a PATCH; a request resolved by another client was stripped from memory but never repainted; and a card that stopped being the accumulator's current card had no repaint path at all. Observed: a block clicked on an older card only toasted; a remotely-resolved block lingered on a finished turn's card forever; permission/answer disappearance lagged the click by one PATCH; a block whose turn ended froze in place. This ADR fixes the lifecycle: blocks stay inline and follow the live card, and every card showing a live block carries a handle that lets cola repaint it — cached last-rendered JSON plus a `request_id → message_id` registry — so a click updates the clicked card atomically in the callback ack and a remote resolution repaints within one sweep.
 
