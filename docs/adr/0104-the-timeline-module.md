@@ -87,27 +87,29 @@ content into them.**
   walk, the live-slice clamp, and placed-part stability (a part already on the
   **live slice** keeps the key it was placed at; a finalized entry is behind
   `render_from`, so a grown part starts a continuation entry as today). The
-  borrowed-key policy moves in too: a part that reports no server start time
-  takes the key of the part placed before it in its message (the V2 untimed-text
-  rule `part_order_times` applies today), falling back to `next_order()` only
-  when there is none. The
+  transcript-order policy `part_order_times` applies today moves in too: before
+  a message's first tool call, an untimed part takes the previous timed part's
+  key (or the message's `time.created` when there is none) and that key floors
+  the prefix; after a tool call an untimed part keeps the render-order fallback
+  (`next_order()`), because moving it onto the transcript position could carry it
+  above the Interaction Receipt the answer wrote. The
   message scope's `Drop` clears the message floor and the walk's `Drop` clears
   the read floor, so the half-written protocol that produced the fixes above is
   no longer representable.
 - **Synthetic entries have their own admission.** An Interaction Receipt, a
   compaction row, a ledger entry, the External Message's lead and a bot-authored
   notice (the Wake 承接 line, a busy-follow static lead) are not read-order
-  content, so they never take the read floor and never join a walk. Each variant
-  maps onto the stored `TimelineKind` its call site uses today, so a `Lead`
-  still merges as text and a `Receipt` is a click's receipt only They enter
+  content, so they never take the read floor and never join a walk. They enter
   through `Timeline::synthetic(entry: SyntheticEntry)` — one content-bearing
-  variant per kind: `Receipt { text, at }` (a click's receipt —
-  `TimelineKind::Receipt`), `Compaction { fact, at, message_time, row }`,
+  variant per kind: `Receipt { text, at }` (a receipt line — a click's receipt, a
+  merge opening, a receive hint, the residual marker, a skipped-content note or a
+  split line; `TimelineKind::Receipt`), `Compaction { fact, at, message_time, row }`,
   `Ledger { entry, ending, at }`, `UserMessage { text, at }`, and `Lead { text,
   at }` (the Wake 承接 line and the busy-follow static lead —
   `TimelineKind::Text`, where both still merge into a text run) — which inserts
-  directly and returns the key the entry
-  took. It yields no pushable `Placement`, so a synthetic row can never travel
+  directly and returns the key the entry took. Each variant maps onto the stored
+  `TimelineKind` its call site uses today, so a `Lead` still merges as text and a
+  `Receipt` covers every receipt line. It yields no pushable `Placement`, so a synthetic row can never travel
   the transcript path. Every synthetic kind's `at` is an **order key only** —
   a resolved click's **reserved receipt key** (ADR-0038), a Wake's or a message's
   server time — and never a display clock: a receipt, a lead and a user message
