@@ -1683,8 +1683,9 @@ impl MessageScope<'_> {
         }
         // A rewrite re-floors at its placement key exactly as the pre-#1040
         // replace did: `place` applied the message and read floor before the
-        // run dropped, and `push` re-applies the same floor after it. Parity,
-        // not a tightening.
+        // run dropped, and this explicit `max` restores the same floor after
+        // it — `push` applies no floor of its own, it seats at the key it is
+        // given. Parity, not a tightening.
         if let Some(floor) = placement.floor {
             placement.key = placement.key.max(floor);
         }
@@ -2421,6 +2422,37 @@ mod tests {
         let frontier = seed.frontier.as_ref().expect("a frontier");
         assert_eq!(frontier.part_index, 1);
         assert_eq!(frontier.delivered_chars, second.chars().count());
+    }
+
+    /// The scripted seam keeps the timeline ORDER key apart from the clock the
+    /// entry displays (issue #1022): `key_at` positions the entry and
+    /// `shown_at` is what the card may show, so a swap must fail.
+    #[test]
+    fn the_scripted_seam_keeps_the_order_key_apart_from_the_displayed_clock() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text_at_key(Some(1_000), Some(7_000), None, "有序无钟", None);
+
+        let entry = acc.timeline().entries().last().expect("one entry");
+        assert_eq!(entry.key(), 1_000, "the order key is `key_at`");
+        assert_eq!(entry.shown_at(), Some(7_000), "the displayed clock is `shown_at`");
+    }
+
+    /// The seam's `lead` rides the entry, rendered but never counted as the
+    /// part's own characters (spec #561's cut tail): the reply text stays the
+    /// chunk alone.
+    #[test]
+    fn the_scripted_seam_keeps_the_lead_on_the_entry_uncounted() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text_at_key(Some(1_000), Some(1_000), None, "正文", Some("```\n".to_string()));
+
+        let entry = acc.timeline().entries().last().expect("one entry");
+        assert_eq!(entry.lead(), Some("```\n"), "the lead rides the entry");
+        assert!(
+            matches!(entry.kind(), TimelineKind::Text(text) if text == "正文"),
+            "the counted content is the chunk alone: {:?}",
+            entry.kind()
+        );
+        assert_eq!(acc.text(), "正文", "the lead is not part of the reply text");
     }
 
     /// A chunk that arrives AFTER an abandonment must not merge into the
