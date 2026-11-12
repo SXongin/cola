@@ -118,7 +118,8 @@ content into them.**
 - **The rewrite path is the Timeline's.** `Timeline::replace(placement, source,
   kind)` serves a part the server re-sent with different content: the `kind`
   carries the new text, and `source` must name the same transcript part the token
-  does (`placement.source.same_part(&source)`, checked by the Timeline) so a
+  does (`placement.source.as_ref().is_some_and(|s| s.same_part(&source))`,
+  checked by the Timeline; a source-less token is rejected for a rewrite) so a
   token cannot be paired with another part's run. The Timeline prefers the key
   the part's existing entry already holds (else the placement's key), drops every
   entry of that `PartSource` across the boundary while keeping `render_from` on
@@ -127,23 +128,28 @@ content into them.**
   the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
   entry identity (`seq`, including the seq a live tool panel pins when it
-  settles, ADR-0045). `TimelineKind` keeps its current shape (`Tool(call_id)`
-  among the variants) and gains no generic parameter — there is no second entry
+  settles, ADR-0045). `part_order_key` retires and `insert_item` /
+  `insert_kind_after` become one private insert path, so the live-slice clamp is
+  computed once. `TimelineKind` keeps its current shape (`Tool(call_id)` among
+  the variants) and gains no generic parameter — there is no second entry
   adapter.
 - **What does not move.** The live (unsettled) tool tail stays in the
   accumulator as a `TailPlacement` — key, display clock, merge identity, the
-  floor it was placed under, the message's **created time** (the receipt cut's
-  input), the call id, and the pinned `seq` — plus its panel body in the tool
-  map. `MessageScope::pin(facts, call_id)` produces it; it cannot be pushed, only
-  settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
+  floor it was placed under, the pinned message's identity and **created time**
+  (the receipt cut's input), the call id, and the pinned `seq` — plus its panel
+  body in the tool map. `MessageScope::pin(facts, call_id)` produces it; it
+  cannot be pushed, only settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
   replacement, clamped to the floor the pin carried.
-  `Timeline::settle(tail, panel)` applies the **current** receipt cut for the
-  tail's message created time (a receipt recorded after the pin still floors it)
-  and the Timeline's **current read-order high-water mark** — a monotonic maximum
-  key over placed transcript entries, so a message that became visible after the
-  pin still floors the panel — then seats the panel with the stored `seq`. So a
-  tail-only panel cannot jump a receipt cut or content read after it was pinned,
-  before or after its start time arrives. This clamp is
+  `Timeline::settle(tail, panel, read_order)` re-applies the **current** receipt
+  cut for the tail's message created time (a receipt recorded after the pin still
+  floors it) and the current read floor for that message — the high-water mark of
+  **earlier** messages only, exactly ADR-0038's rule, recomputed against the
+  settle read so content that became visible after the pin still floors the
+  panel. A key raised to that floor takes a **fresh `order` above any equal-key
+  run** (the pinned `seq` is identity, not position), so the panel renders after
+  the content that floored it. So a tail-only panel cannot jump a receipt cut or
+  content read after it was pinned, before or after its start time arrives. This
+  clamp is
   the ADR's one deliberate tightening, and a test pins it; every other placement
   rule and every current test is unchanged. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
