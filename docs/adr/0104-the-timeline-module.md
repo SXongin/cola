@@ -151,7 +151,9 @@ content into them.**
   `reservation_seq`, `reserved_receipts` and every
   `request_id` stay in the accumulator, which owns the reservation's lifecycle.
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
-  and `push` / `replace` consume it, returning `Result<(), PlacementError>`:
+  with the `TranscriptKind` variant its part expects, and `push` / `replace`
+  consume it, returning `Result<(), PlacementError>` on a mismatched variant or
+  a stale token:
   a **stale** token (one whose scope generation differs from the live scope) or
   a rewrite whose source is missing or names another part is refused without
   inserting anything, never a panic in production. Reuse is already a compile
@@ -195,7 +197,9 @@ content into them.**
   entry identity (`seq`, including the seq a live tool panel keeps from first
   sighting when it settles, ADR-0045). `part_order_key` retires and `insert_item` /
   `insert_kind_after` become one private insert path, so the live-slice clamp is
-  computed once. `TimelineKind` keeps its current shape (`Tool(call_id)` among
+  computed once. The clamp also rewrites the clamped entry's read position to
+  sort before the run, so the read-position comparator keeps it at the slice's
+  top. `TimelineKind` keeps its current shape (`Tool(call_id)` among
   the variants) and gains no generic parameter — there is no second entry
   adapter.
 - **What does not move.** The live (unsettled) tool tail stays in the
@@ -205,19 +209,23 @@ content into them.**
   body in the tool map. `MessageScope::pin(facts, call_id)` produces it; it
   cannot be pushed, only settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
   replacement, clamped to the floor the pin carried.
-  `Timeline::settle(tail, panel, read_order, pinned_keys)` re-applies the
+  `Timeline::settle(tail, panel, read_order, pinned_tails)` re-applies the
   **current** receipt cut for the tail's message created time (a receipt recorded
   after the pin still floors it) and the current read floor for that message,
   recomputed against the settle read. That floor is ADR-0038's earlier-messages
   high-water mark **plus the keys of pinned tails**: an earlier message's pinned
   tail counts as placed content for every later message's `place` (deliberate
-  extension — otherwise a later message's part can sort above a pinned panel), and
-  `pinned_keys` carries **all** of them: earlier messages' tails plus the tails in
-  the panel's own message that precede it in part order. The panel seats at `max(current, floor)`, where
-  `current` is its key after any `rekey` (the original pin before one), through
-  the normal insert path (so the live-slice late-part clamp still applies), and
-  at that key it sorts by its own part's read position (see below) — after
-  earlier-message entries at the key and before its own message's later parts. A synthetic entry at that key sorts
+  extension — otherwise a later message's part can sort above a pinned panel).
+  `pinned_tails` carries each tail with its message identity and part index, so
+  the Timeline keeps only earlier messages' tails and the panel's own preceding
+  ones (a later same-message tail can never raise the floor). The panel seats at
+  `max(current, floor)` — `current` is its key after any `rekey`, the original pin
+  before one — capped at the first following entry of its own message when that
+  entry sits at or after the floor, so a real start time never pushes it past a
+  same-message continuation. It goes through the normal insert path (the
+  live-slice late-part clamp included), and at that key it sorts by its own
+  part's read position (see below) — after earlier-message entries at the key and
+  before its own message's later parts. A synthetic entry at that key sorts
   before both. Placed content never moves, no key or `order` is
   renumbered, and `seq` stays identity. When the panel's own following entry
   sits at a *lower* key (placed before that floor became visible), the floor
@@ -252,8 +260,9 @@ content into them.**
   render-order fallback; a pending tool's late start time settles at that time
   but never below its floor, and lands by read position after an equal-key entry
   of an earlier message; a later message's part whose server key is older than an
-  earlier message's pinned tail still lands below that panel; a receipt recorded
-  after the pin still floors it at settle; a resolved click's receipt keeps its reserved key while the slice
+  earlier message's pinned tail still lands below that panel; a late real start
+  time never pushes the panel past a same-message continuation; a receipt
+  recorded after the pin still floors it at settle; a resolved click's receipt keeps its reserved key while the slice
   reaches it and returns the clamped key after a split past it; a seeded cut
   inside a fence keeps its opener; a **source-bearing** post-click part floored
   to a receipt's key still sorts below that receipt; a post-click compaction row
