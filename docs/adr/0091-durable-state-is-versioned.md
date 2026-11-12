@@ -1,5 +1,11 @@
 # Durable state is versioned, and a Session record names its client
 
+> **Amended by ADR-0104 when it lands**: the Chain Record sidecar's format
+> version is bumped to carry one new **client-scoped session section**,
+> `delivered_compactions` (a bounded set keyed by part position and terminal
+> revision fingerprint). It follows this ADR's existing versioned, client-first
+> schema rules.
+
 cola's durable state was written for exactly one agent client and had no format
 version. Spec #860's second client turns that from a detail into a data-loss
 risk: a Codex process and an OpenCode process would key their records by the

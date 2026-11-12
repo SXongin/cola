@@ -13,12 +13,13 @@
 > suppress that position **for that chain's own accumulator** (a later Turn's
 > fresh Timeline carries no such row, so the session bound still applies). The
 > bound is positional, restart safety needs a revision-keyed fact: the Chain
-> Record gains a session-scoped, bounded **`delivered_compactions`** set, written
-> when a **terminal** revision's card write confirms, and `owed_compactions`
-> replays a terminal revision unless its position is in that set. A confirmed
-> `running` row never enters it (and is excluded from `frontier_for`), so a
-> refused or restarted terminal revision stays re-renderable, as §3's 2026-10-15
-> amendment requires. No live-timeline body repeats a revision; the 2026-11-07 busy-follow
+> Record gains a bounded **`delivered_compactions`** section keyed by
+> `(part position, terminal revision fingerprint)`, client-scoped under the
+> sidecar's bumped version (ADR-0091), written when a **terminal** revision's card
+> write confirms. A confirmed `running` row never enters it (and is excluded from
+> `frontier_for`). `owed_compactions` bypasses the positional bound only for a
+> position the Timeline still carries (the split case); a fresh Timeline keeps the
+> bound, so exactly-once across Turns holds. No live-timeline body repeats a revision; the 2026-11-07 busy-follow
 > static-lead copy is the standing exception and is unchanged.
 >
 > **Amended (2026-11-07)**: §3's exactly-once is a promise about the live
