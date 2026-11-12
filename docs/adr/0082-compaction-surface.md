@@ -11,9 +11,12 @@
 > its terminal one, the finalized card keeps `running`, the successor shows only
 > the terminal revision as a fresh row, and the `delivered` bound does not
 > suppress that position **for that chain's own accumulator** (a later Turn's
-> fresh Timeline carries no such row, so the session bound still applies). No
-> live-timeline body repeats a revision; the 2026-11-07 busy-follow static-lead
-> copy is the standing exception and is unchanged.
+> fresh Timeline carries no such row, so the session bound still applies). The
+> bound advances only for a **terminal** revision — a confirmed `running` row
+> does not move the delivered position past its message — so a refused or
+> restarted terminal revision stays re-renderable, as §3's 2026-10-15 amendment
+> requires. No live-timeline body repeats a revision; the 2026-11-07 busy-follow
+> static-lead copy is the standing exception and is unchanged.
 >
 > **Amended (2026-11-07)**: §3's exactly-once is a promise about the live
 > timeline's own render. The busy follow's static lead repeats the read tail's
