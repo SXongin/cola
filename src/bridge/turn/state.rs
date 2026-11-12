@@ -3662,8 +3662,9 @@ impl StreamAccumulator {
 
     /// [`Self::push_text_at_key`] with the order key set to the part's server
     /// start (`at_ms`, the server's `time.start`) and no typed part or lead.
-    /// `None` keys the item by a monotonic fallback (call order) and shows no
-    /// clock. Test-only.
+    /// `at_ms` lands in `shown_at` too (this form defaults two fields); `None`
+    /// keys the item by a monotonic fallback (call order) and shows no clock.
+    /// Test-only.
     #[cfg(test)]
     pub(super) fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
         self.push_text_at_key(at_ms, at_ms, None, chunk, None);
@@ -3671,7 +3672,8 @@ impl StreamAccumulator {
 
     /// The test-only scripted push body with every placement input spelled out
     /// (spec #1040): the render fixtures and the ordering tests use it, and it
-    /// is the one test path into the message scope. The source-less scripted
+    /// is the one text convenience path into the message scope (tests also
+    /// call the scoped pushes directly). The source-less scripted
     /// message ([`Self::scripted_transcript`]) sits outside the read, so a test
     /// push keeps its own ordering and the guards' floors stay the only ones
     /// applied. `key_at` positions the entry; `shown_at` is what it displays

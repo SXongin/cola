@@ -1020,6 +1020,31 @@ impl Timeline {
         }
     }
 
+    /// Seat one bounded text chunk of [`Self::push_text_at_slot`] at an
+    /// already-resolved slot: a fresh identity, the caller's equal-key `order`.
+    #[allow(clippy::too_many_arguments)]
+    fn seat_text_chunk(
+        &mut self,
+        slot: Slot,
+        order: Option<u64>,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        chunk: String,
+        lead: Option<String>,
+        position: Option<ReadPosition>,
+    ) -> usize {
+        self.seat(Entry {
+            slot,
+            seq: None,
+            order,
+            shown_at,
+            source,
+            kind: TimelineKind::Text(chunk),
+            lead,
+            position,
+        })
+    }
+
     /// The merge/chunk walk shared by transcript text and a synthetic lead.
     fn push_text_at_slot(
         &mut self,
@@ -1054,29 +1079,27 @@ impl Timeline {
                     Some(idx) => {
                         let order = self.items.get(idx).map(|item| item.order);
                         let slot = self.slot_after(idx, key);
-                        self.seat(Entry {
+                        self.seat_text_chunk(
                             slot,
-                            seq: None,
                             order,
                             shown_at,
-                            source: pushed,
-                            kind: TimelineKind::Text(take.clone()),
-                            lead: lead.take(),
+                            pushed,
+                            take.clone(),
+                            lead.take(),
                             position,
-                        })
+                        )
                     }
                     None => {
                         let slot = first.take().unwrap_or_else(|| self.slot_for_new(key, position));
-                        self.seat(Entry {
+                        self.seat_text_chunk(
                             slot,
-                            seq: None,
-                            order: None,
+                            None,
                             shown_at,
-                            source: pushed,
-                            kind: TimelineKind::Text(take.clone()),
-                            lead: lead.take(),
+                            pushed,
+                            take.clone(),
+                            lead.take(),
                             position,
-                        })
+                        )
                     }
                 });
                 remaining = &remaining[take.len()..];
@@ -1094,16 +1117,15 @@ impl Timeline {
                 None => {
                     let order = self.items.get(idx).map(|item| item.order);
                     let slot = self.slot_after(idx, key);
-                    target = Some(self.seat(Entry {
+                    target = Some(self.seat_text_chunk(
                         slot,
-                        seq: None,
                         order,
                         shown_at,
-                        source: source.clone(),
-                        kind: TimelineKind::Text(take.clone()),
-                        lead: lead.take(),
+                        source.clone(),
+                        take.clone(),
+                        lead.take(),
                         position,
-                    }));
+                    ));
                 }
             }
             remaining = &remaining[take.len()..];
@@ -2331,6 +2353,30 @@ mod tests {
         );
     }
 
+    /// Spec #1040: a part already on the live slice keeps the key it was placed
+    /// at. A later read that reports a different server time for the grown part
+    /// merges into its entry instead of starting a second one at the new key.
+    #[test]
+    fn a_placed_part_keeps_its_key_across_reads() {
+        let mut timeline = Timeline::default();
+        let order = HashMap::from([("m1", 0usize)]);
+        let source = PartSource::at(MessageId::new("m1"), 0);
+        push_text(&mut timeline, &order, "m1", 2_000, Some(source.clone()), "第一段");
+        // A later read grows the same part and reports a newer server time.
+        push_text(&mut timeline, &order, "m1", 5_000, Some(source), "第二段");
+
+        assert_eq!(timeline.entries().len(), 1, "the grown part keeps one entry");
+        assert_eq!(
+            timeline.entries()[0].key(),
+            2_000,
+            "the key it was placed at survives the read that re-delivers it"
+        );
+        assert!(
+            matches!(timeline.entries()[0].kind(), TimelineKind::Text(text) if text == "第一段第二段"),
+            "the later chunk merged into the placed entry"
+        );
+    }
+
     /// A block surfaced without a read (a re-host, a busy-follow seed, a
     /// restart re-adoption) carries no anchor, so its receipt records no cut
     /// and nothing a later read delivers is re-placed — the old behaviour.
@@ -2568,6 +2614,94 @@ mod tests {
             acc.timeline().len(),
             before,
             "a blank user message renders nothing"
+        );
+    }
+
+    /// Spec #1040: a Wake ledger entry shows its own payload's `finished_at` —
+    /// the completion's clock — never the order key it was placed at, across a
+    /// minute boundary.
+    #[test]
+    fn a_wake_ledger_entry_shows_its_finished_at_not_its_keyed_clock() {
+        let keyed = crate::feishu::card::test_local_ms(2026, 11, 13, 14, 2);
+        let finished = crate::feishu::card::test_local_ms(2026, 11, 13, 14, 5);
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_ledger_entry_at(
+            Some(keyed),
+            TaskCompletionEntry {
+                kind: TaskKind::Shell,
+                label: Some("sleep".into()),
+                id: None,
+                started_at: None,
+                finished_at: Some(finished),
+                ending: TaskEnding::RuntimeEnded,
+                output: None,
+            },
+            None,
+        );
+        let card = acc.build_card().to_string();
+        assert!(
+            card.contains("14:05"),
+            "the row shows its own finished_at: {card}"
+        );
+        assert!(
+            !card.contains("14:02"),
+            "the keyed clock never reaches the card: {card}"
+        );
+    }
+
+    /// Spec #1040: a post-click compaction row still floors at the receipt cut
+    /// through the synthetic admission, and it shows no clock — the server time
+    /// that keys it rides `shown_at` for the cursor frontier only.
+    #[test]
+    fn a_post_click_compaction_row_floors_at_the_cut_and_shows_no_clock() {
+        let asked = crate::feishu::card::test_local_ms(2026, 11, 13, 14, 1);
+        let at = crate::feishu::card::test_local_ms(2026, 11, 13, 14, 2);
+        let cut_key = crate::feishu::card::test_local_ms(2026, 11, 13, 14, 3);
+        let compaction = Compaction {
+            status: CompactionStatus::Completed,
+            reason: CompactionReason::Auto,
+            summary: "摘要".into(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.record_receipt_cut(asked, cut_key);
+        let source = PartSource::at(MessageId::new("msg_comp"), 0);
+        acc.push_compaction_at(Some(at), source, &compaction);
+
+        let row = &acc.timeline().entries()[0];
+        assert_eq!(
+            row.key(),
+            cut_key,
+            "the post-click row floors at its message's receipt cut"
+        );
+        assert_eq!(
+            row.shown_at(),
+            Some(at),
+            "the row keeps its start time for the cursor frontier"
+        );
+
+        let card = acc.build_card();
+        let panel = card["body"]["elements"]
+            .as_array()
+            .expect("body elements")
+            .iter()
+            .find(|element| {
+                element
+                    .pointer("/header/title/content")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|title| title.starts_with("已压缩上下文"))
+            })
+            .expect("the compaction row rendered");
+        assert!(
+            panel.to_string().contains("已压缩上下文"),
+            "the row renders its title"
+        );
+        let rendered = card.to_string();
+        assert!(
+            !rendered.contains("14:02") && !rendered.contains("14:03"),
+            "a compaction row shows no clock: {rendered}"
         );
     }
 
@@ -3192,6 +3326,145 @@ mod tests {
             "a follower below the floor stays put"
         );
         assert!(tool > 0, "the panel lands after the below-floor follower");
+    }
+
+    /// Spec #1040: a tail-only panel that only later reports a start time
+    /// cannot jump the floors its settle re-applies — the current Interaction
+    /// Receipt cut and the earlier messages' read floor. The settle lands it at
+    /// the floor (a fresh order above the work, never the stale start).
+    #[test]
+    fn a_tail_only_panels_late_start_cannot_jump_the_current_floors() {
+        let panel = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!("ls")),
+            Some("src"),
+        );
+        let pin = |timeline: &mut Timeline,
+                   order: &HashMap<&str, usize>,
+                   created: Option<i64>,
+                   message: &MessageId| {
+            let mut walk = timeline.walk(order);
+            let mut scope = walk.message(created, message, &[]);
+            scope.pin(
+                PartFacts {
+                    form: PartForm::Tool,
+                    key_at: None,
+                    shown_at: None,
+                    source: Some(PartSource::at(message.clone(), 0)),
+                    index: 0,
+                },
+                "call_bash".into(),
+            )
+        };
+
+        // (a) A receipt recorded AFTER the pin: the click's cut is the current
+        // one, so the late start cannot sort the panel above it.
+        let order = HashMap::from([("m1", 0usize)]);
+        let message = MessageId::new("m1");
+        let mut timeline = Timeline::default();
+        let mut tail = pin(&mut timeline, &order, Some(5_000), &message);
+        timeline.rekey(&mut tail, Some(1_000));
+        timeline.record_cut(4_000, 9_000);
+        timeline.settle(tail, &panel, &order, &[]);
+        assert_eq!(
+            timeline.entries()[0].key(),
+            9_000,
+            "the late start cannot drag the panel above the current receipt cut"
+        );
+
+        // (b) An earlier message's placed part lands after the pin: its key is
+        // the read floor the settle re-applies.
+        let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let mut timeline = Timeline::default();
+        let mut tail = pin(&mut timeline, &order, None, &message);
+        timeline.rekey(&mut tail, Some(1_000));
+        push_text(
+            &mut timeline,
+            &order,
+            "m0",
+            9_000,
+            Some(PartSource::at(MessageId::new("m0"), 0)),
+            "先阅读的内容",
+        );
+        timeline.settle(tail, &panel, &order, &[]);
+        let keys: Vec<i64> = timeline.entries().iter().map(|item| item.key()).collect();
+        assert_eq!(
+            keys,
+            vec![9_000, 9_000],
+            "the late start cannot drag the panel below the earlier message's read floor"
+        );
+        assert!(
+            matches!(timeline.entries()[0].kind(), TimelineKind::Text(_))
+                && matches!(timeline.entries()[1].kind(), TimelineKind::Tool(_)),
+            "the panel keeps its read position after the earlier message's part"
+        );
+    }
+
+    /// Spec #1040's settle clamp, for a follower in another message: a pending
+    /// tool's late start never carries it past a later message's already-placed
+    /// part — the key is capped at the following minimum, and placed content
+    /// stays put.
+    #[test]
+    fn a_late_start_is_capped_at_a_later_messages_placed_part() {
+        let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let panel = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!("ls")),
+            Some("src"),
+        );
+        let mut timeline = Timeline::default();
+        let m0 = MessageId::new("m0");
+        let mut tail = {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(Some(5_000), &m0, &[]);
+            scope.pin(
+                PartFacts {
+                    form: PartForm::Tool,
+                    key_at: Some(1_000),
+                    shown_at: Some(1_000),
+                    source: Some(PartSource::at(m0.clone(), 0)),
+                    index: 0,
+                },
+                "call_bash".into(),
+            )
+        };
+        // The later message's part was already placed while the tool ran.
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            2_000,
+            Some(PartSource::at(MessageId::new("m1"), 0)),
+            "后续消息",
+        );
+
+        // The server's late start is beyond every following key.
+        timeline.rekey(&mut tail, Some(9_000));
+        timeline.settle(tail, &panel, &order, &[]);
+
+        let tool = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the panel settled");
+        let later = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "后续消息"))
+            .expect("the later message's part");
+        assert_eq!(
+            timeline.entries()[tool].key(),
+            2_000,
+            "the settle is capped at the later message's placed key"
+        );
+        assert!(tool < later, "the panel lands before the later message's part");
+        assert_eq!(
+            timeline.entries()[later].key(),
+            2_000,
+            "placed content never moves"
+        );
     }
 
     /// An earlier message's pinned tail floors a later message's part (spec

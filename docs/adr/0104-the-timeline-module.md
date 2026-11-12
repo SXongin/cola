@@ -1,11 +1,11 @@
 # The Timeline module: one owner for card placement
 
-> **Names the deepening before it lands** (the ADR-0079 pattern); spec #1040. The
-> landing amendment records the finished mechanism and the tickets that landed
-> it.
+> **Landed** with spec #1040's batch (#1041–#1046). This ADR records the module
+> boundary and the ownership move; the landing amendment below records the
+> finished mechanism, the accumulator split as built, the rules as landed and
+> the tickets that landed them.
 >
-> **Amends, when it lands**: ADR-0038 (synthetic keying, the read floor and the
-> equal-key rule),
+> **Amends**: ADR-0038 (synthetic keying, the read floor and the equal-key rule),
 > ADR-0040 (`seq` assignment), ADR-0045 (a tail panel's settle rule), ADR-0050
 > (the entry types' home) and ADR-0082 (a compaction row's receipt cut). The
 > exact ordering rules and their invariants are #1040's acceptance criteria; this
@@ -98,5 +98,151 @@ content into them.**
 
 ## Landing amendment
 
-To be written with the batch: the finished module, the accumulator split as
-built, the exact rules as landed, and the tickets that landed them.
+**Landed** in the Timeline batch, tickets #1041–#1046, spec #1040. The module is
+`src/bridge/turn/timeline.rs`, `pub(super)` to the Turn; the Turn boundary
+ADR-0050 records is unchanged.
+
+### The module as built
+
+- **Types.** `TimelineItem` (key, `shown_at`, `order`, `seq`, kind, source,
+  lead, read position), `TimelineKind`, `PartSource`, `PartForm`, `PartFacts`,
+  `TranscriptKind`, `Placement`, `PlacementError`, `ReadPosition`, `ReceiptCut`,
+  `ReservationKeys`, `TailFact`, `TailPlacement`, `SyntheticEntry` and
+  `part_order_times`. `TimelineKind` keeps its shape — `Tool(call_id)` with the
+  panel body in the accumulator — and gains no generic parameter.
+- **One walk interface.** `Timeline::walk(&read_order)` yields a `Walk`;
+  `Walk::message(created, id, pinned_tails)` yields a `MessageScope`. The
+  scope's `place(PartFacts)` produces the linear `Placement`; `push(placement,
+  kind)` and `replace(placement, source, kind)` consume it and return
+  `Result<(), PlacementError>` after validating generation, kind and source.
+  `MessageScope::synthetic` admits a synthetic entry under the scope's message
+  floor; `MessageScope::pin` produces the `TailPlacement` a live panel carries.
+  The scope's `Drop` clears the message floor and the walk's `Drop` clears the
+  read floor, so a half-written protocol cannot survive either.
+- **One insert path.** `Timeline::seat` owns the live-slice clamp, the
+  equal-key partition (read position, then `order`), chunk continuation, `seq`
+  allocation and the `order` lowering a clamped slot needs. `place` and the
+  insert consume one key computation, so `part_order_key` and the mirrored
+  clamps are gone.
+- **What stays in the accumulator.** `StreamAccumulator` (name unchanged) keeps
+  the text and reasoning buffers, content-keyed dedup and the rewritten part's
+  prefix digest, the interactions and the `request_id → ReservedReceipt` map
+  (with `reservation_seq`), the Rendered Cursor and its staging, the ledger,
+  the header/footer, the card build and the live tool panel bodies (`tools`).
+  It holds `live_tools: IndexMap<String, TailPlacement>`; the tail token's type
+  is the Timeline's, but its panel body and lifecycle are the accumulator's.
+  The Timeline owns the entry list, the message and read floors, the receipt-cut
+  staircase, `render_from`, `sealed_entries`, merge-by-part lookup, key minting
+  and `seq`.
+
+### Rules as landed
+
+- `place` applies the message's `receipt_cut_floor(created)`, the walk's read
+  floor (earlier messages' placed entries **and their pinned tails**),
+  placed-part stability (`placed_source_key`: a part already on the live slice
+  keeps its key) and the live-slice clamp. A source-bearing placement carries
+  its read position; a source-less one clamps like the insert path always did.
+- A synthetic entry inserts directly and returns the key it took (`None` for a
+  `Lead`, which may merge or chunk, and for a blank `UserMessage`). Every
+  variant's `at` is an order key only: a receipt, a notice, a user lead and a
+  compaction row render no clock, and a ledger entry shows its payload's
+  `finished_at`. A compaction row takes its message's Interaction Receipt cut,
+  keeps its start time on `shown_at` for the cursor frontier only, and updates
+  in place by `PartSource`.
+- `replace` drops the part's run across the boundary (`drop_source_run` keeps
+  `render_from` on the same logical position) and re-floors the placement at
+  `max(placement.key, placement.floor)` before inserting the new run.
+- `settle` re-applies the CURRENT receipt cut and the CURRENT read floor for the
+  tail's message (earlier messages' entries and pinned tails, plus the panel's
+  own preceding tails), seats at `max(current, floor)`, caps at the minimum key
+  among the entries that follow it in read order at or above the floor, and
+  seats through the normal insert path (clamp included) with its pinned `seq`.
+
+### Deliberate tightenings
+
+Three rules are stricter than the pre-module code; every other ordering rule
+and every existing test is unchanged.
+
+- **The settle clamp.** A tail-only panel's late `started_at` cannot drag it
+  above the current receipt cut or the earlier messages' read floor, and a
+  pending tool's late start never pushes it past a same-message continuation or
+  a later message's placed part: the settled key is a **minimum** over the
+  following entries at or above the floor, never the first one (after a tool
+  those keys need not be monotonic). Pinned by
+  `a_tail_only_panels_late_start_cannot_jump_the_current_floors`,
+  `a_late_start_is_capped_at_a_later_messages_placed_part`,
+  `a_late_start_is_capped_at_the_following_minimum`.
+- **The equal-key read-position tie-break.** A source-bearing transcript entry
+  carries (message position in the read, part index) and sorts by it at equal
+  keys; a source-less or synthetic entry has no read position and sorts
+  **before** positioned entries at the same key (ADR-0038 rule 4: content
+  floored to a receipt's key stays below it), keeping allocation order among
+  its peers. Pinned by `equal_keys_order_by_read_position_then_class`.
+- **The pinned-tail read-floor extension.** An earlier message's live panel
+  floors a later message's part even when the later part's server key is older,
+  and the panel keeps the earlier read position at the tied key. Pinned by
+  `an_earlier_messages_pinned_tail_floors_a_later_message` and
+  `the_accumulators_scoped_push_uses_the_pinned_tail_floor`.
+
+### One interface, short-lived scopes
+
+The batch's "one walk" is one interface, not one long-lived borrow. A
+`MessageScope` holds `&mut Timeline`, so a walk cannot span the accumulator
+state a push also needs (the panel body, the reply buffers, the tool map). The
+production paths therefore open a scope per placement: `place_push`,
+`replace_place_push` and `push_tool_scoped`'s pin each open a walk, take one
+message scope, place (and push or pin), then let both drop; the compaction walk
+(`place_compactions`) opens one walk per read and one scope per row. The
+invariant is what matters: no caller holds a scope across a mutation it does
+not own, and no accessor sets a floor by hand — the four former walks
+(`render_turn_parts`, `render_pending_gap`, `render_seed_scope`,
+`resolve_seeded_calls`) contain no `set_message_floor`, `set_read_floor` or
+`reset_read_floor` call. The only remaining `Turn::set_message_floor` is the
+`#[cfg(test)]` scripted seam, which delegates to a real message scope.
+
+### The rewrite keeps ADR-0038's rule, re-floored
+
+ADR-0038 says a part already on the timeline "keeps the key it was placed at",
+because a later read's floor can differ and re-keying would split a growing
+part. The rewrite path keeps that rule and restores the floor `place` computed
+before the run dropped: `replace` takes `max(placement.key, placement.floor)`
+after `drop_source_run` and before `push`, because `push` applies no floor of
+its own. Same part, same key — unless the
+read's floor has moved past it, in which case the rewritten run takes the floor,
+exactly as the pre-module replace did. Pinned by
+`a_rewritten_run_keeps_the_boundary_on_its_entry`,
+`a_later_chunk_merges_into_the_rewritten_run`, and the rejection tests
+`a_refused_replace_keeps_the_run` and
+`a_stale_or_mismatched_placement_is_refused_before_inserting`.
+
+### The clamp and the cut stay consistent
+
+A receipt whose reserved key the live slice no longer reaches clamps to the
+slice's first key, and the returned key is the clamped one; its cut keeps the
+old floor key. Content floored to that now-behind cut clamps to the same slice
+key, and the class rule (source-less before positioned at equal keys) keeps it
+below the receipt. Pinned by
+`a_reserved_click_receipt_keeps_its_key_and_clamps_after_a_split` and
+`synthetic_admission_takes_cuts_merges_and_returns_the_clamped_key`.
+
+### Landed tickets
+
+- **#1041** — the module and its types; the accumulator delegates; the synthetic
+  admission; the ordering tests move beside the module.
+- **#1042** — the walk guard and the turn walk.
+- **#1043** — the gap, seed and compaction walks onto the guard.
+- **#1044** — the receipt-cut staircase and reservation key minting; the rewrite
+  path with the boundary-preserving replace.
+- **#1045** — delete the duplicates: `part_order_key`, the mirrored clamps and
+  the push wrapper layers; keep the `Turn::push_*` test seam.
+- **#1046** — the guard invariants and this amendment.
+
+### Out of scope
+
+- **#1049** — a compaction's terminal revision arriving after a confirmed
+  `running` one (the split/restart delivery gap) still needs its own durable
+  section; no durable-format change lands in this batch.
+- **The Rendered Cursor's staging/confirm/discard protocol** (the 2026-11-12
+  architecture review's candidate 2) remains the separate deepening: the
+  Timeline decides where an entry lands, the cursor decides how a delivered
+  body's frontier is confirmed, and the two stay different owners.
