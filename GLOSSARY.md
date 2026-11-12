@@ -314,7 +314,6 @@ _Avoid_: key (one field of it), order (a field, and the name of the rule), slot 
 **Tail Placement**:
 The non-pushable counterpart a live **Tool Panel** keeps while it rides the card tail: the key, display clock, merge identity, pin-time floor, the message's identity and created time, the call id and the pinned `seq`. A later real start time replaces its key (ADR-0045), clamped by the floor; at settle it is re-floored by the current **Interaction Receipt** cut and the current read floor for its message, then seated into the **Timeline** with the `seq` it was pinned with. Distinct from a **Placement**, which is the linear push token and dies with its message scope.
 _Avoid_: live tool (that is the panel, not its position), reservation (that is a click's receipt key).
-_Avoid_: key (one field of it), order (a field, and the name of the rule), slot (a physical position, not the identity-bearing value).
 
 **Session Sync** (会话同步):
 The Bridge flow that keeps a thread's **Active Session**'s card chain current without a user message: it notifies **External Messages**, refreshes a waiting card's ledger and renders **Wakes** — resuming a yielded card in place for a shell/subagent completion, a continuation card for a genuine restart/interrupt resumption, and the neutral **Residual Card** for a Wake-less late tail (ADR-0074) — and catches content its card missed (ADR-0059, ADR-0066). The successor of the external-message sync; still scoped to the thread's active Session (ADR-0017).
