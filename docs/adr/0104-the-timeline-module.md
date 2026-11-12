@@ -200,8 +200,9 @@ and every existing test is unchanged.
   floors a later message's part even when the later part's server key is older,
   and the panel keeps the earlier read position at the tied key. The floor is
   the tail's **effective** key — its raw pin/rekey key raised to the floor the
-  pin carried, `max(key, floor)`, which is where the panel will settle — never
-  the bare key a receipt cut may already outrank. Pinned by
+  pin carried, `max(key, floor)`, at or above which the panel settles (a
+  receipt recorded after the pin can push it higher) — never the bare key a
+  receipt cut may already outrank. Pinned by
   `a_pinned_tails_effective_key_includes_its_carried_floor`,
   `an_earlier_messages_pinned_tail_floors_a_later_message` and
   `the_accumulators_scoped_push_uses_the_pinned_tail_floor`.
