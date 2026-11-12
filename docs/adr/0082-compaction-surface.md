@@ -6,8 +6,11 @@
 >
 > **Amended by ADR-0104 when it lands**: §2's "at its server time" gains one
 > floor — a compaction created after a click takes the Interaction Receipt cut —
-> and its in-place update is scoped to the live slice, so a terminal fact after a
-> split starts a row on the live card.
+> and its in-place update is scoped to the live slice. §3's exactly-once becomes
+> per card body: when a split separates a compaction's `running` revision from
+> its terminal one, the finalized card keeps `running`, the successor shows only
+> the terminal revision as a fresh row, and the `delivered` bound does not
+> suppress that position. No body repeats a revision.
 >
 > **Amended (2026-11-07)**: §3's exactly-once is a promise about the live
 > timeline's own render. The busy follow's static lead repeats the read tail's
