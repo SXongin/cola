@@ -276,6 +276,9 @@ pub(super) enum TimelineKind {
 /// Every variant's `at` is an **order key only** — a resolved click's reserved
 /// receipt key, a server time, or a derived key just before the work it
 /// introduces — never a display clock. `None` mints a strictly increasing key.
+/// The one exception in the stored entry is a compaction's start time, which
+/// rides `shown_at` for the cursor frontier's `started_at` while the card still
+/// renders no clock for it.
 pub(super) enum SyntheticEntry<'a> {
     /// One receipt line: a click's receipt, a merge opening, a receive hint,
     /// the residual marker, a skipped-content note or a split line.
@@ -754,8 +757,29 @@ impl Timeline {
             Some(at) => self.message_floor.map_or(at, |floor| at.max(floor)),
             None => self.next_order(),
         };
-        let key = self.read_floor.map_or(key, |floor| key.max(floor));
+        let key = self.read_floor_key(key, true);
         self.slot_for_new(key)
+    }
+
+    /// Fill the merge metadata a chunk leaves on its entry: a first chunk
+    /// stamps the part source, a later chunk of the same part refreshes the
+    /// prefix digest, and the markdown lead rides whichever entry first has
+    /// room for it.
+    fn merge_part_metadata(item: &mut TimelineItem, source: Option<&PartSource>, lead: &mut Option<String>) {
+        if item.source.is_none() {
+            item.source = source.cloned();
+        }
+        // A later push of the same part refreshes the entry's prefix digest:
+        // it always covers the whole delivered prefix at each push (spec #561,
+        // review #569).
+        if let (Some(item_source), Some(pushed)) = (item.source.as_mut(), source)
+            && item_source.same_part(pushed)
+        {
+            item_source.prefix_digest = pushed.prefix_digest;
+        }
+        if item.lead.is_none() {
+            item.lead = lead.take();
+        }
     }
 
     /// Append a text chunk, merging consecutive chunks of the same part and
@@ -840,20 +864,7 @@ impl Timeline {
                     if let TimelineKind::Text(last) = &mut item.kind {
                         last.push_str(&take);
                     }
-                    if item.source.is_none() {
-                        item.source = source.clone();
-                    }
-                    // A later push of the same part refreshes the entry's
-                    // prefix digest: it always covers the whole delivered
-                    // prefix at each push (spec #561, review #569).
-                    if let (Some(item_source), Some(pushed)) = (item.source.as_mut(), source.as_ref())
-                        && item_source.same_part(pushed)
-                    {
-                        item_source.prefix_digest = pushed.prefix_digest;
-                    }
-                    if item.lead.is_none() {
-                        item.lead = lead.take();
-                    }
+                    Self::merge_part_metadata(item, source.as_ref(), &mut lead);
                 }
                 None => {
                     let order = self.items.get(idx).map(|item| item.order);
@@ -893,17 +904,8 @@ impl Timeline {
                 if let TimelineKind::Reasoning(last) = &mut item.kind {
                     last.push_str(chunk);
                 }
-                if item.source.is_none() {
-                    item.source = source.clone();
-                }
-                if let (Some(item_source), Some(pushed)) = (item.source.as_mut(), source.as_ref())
-                    && item_source.same_part(pushed)
-                {
-                    item_source.prefix_digest = pushed.prefix_digest;
-                }
-                if item.lead.is_none() {
-                    item.lead = lead;
-                }
+                let mut lead = lead;
+                Self::merge_part_metadata(item, source.as_ref(), &mut lead);
             }
             None => {
                 self.seat(Entry {
@@ -959,26 +961,41 @@ impl Timeline {
         }
     }
 
+    /// Seat one synthetic entry and return the key it actually took, clamped
+    /// to the live slice's first key when its position is behind the boundary.
+    fn seat_synthetic(
+        &mut self,
+        key: i64,
+        shown_at: Option<i64>,
+        source: Option<PartSource>,
+        kind: TimelineKind,
+    ) -> i64 {
+        let slot = self.slot_for_new(key);
+        let index = self.seat(Entry {
+            slot,
+            seq: None,
+            order: None,
+            shown_at,
+            source,
+            kind,
+            lead: None,
+        });
+        self.items[index].key
+    }
+
     /// Admit one synthetic entry (spec #1040): it inserts directly, takes no
-    /// read floor and never produces a pushable placement. The returned key is
-    /// the one the entry took — clamped to the live slice's first key when the
-    /// entry's position is behind it. Only a lead returns `None` (it may merge
-    /// or chunk).
+    /// read or message floor (synthetic content has no message scope — the old
+    /// `insert_item` floored every kind, but no synthetic caller runs inside a
+    /// walk; #1042's walk unifies the floor protocol) and never produces a
+    /// pushable placement. The returned key is the one the entry took — clamped
+    /// to the live slice's first key when the entry's position is behind it.
+    /// `None` means the variant owns no single key: a lead may merge or chunk,
+    /// and an empty user message renders nothing.
     pub(super) fn synthetic(&mut self, entry: SyntheticEntry<'_>) -> Option<i64> {
         match entry {
             SyntheticEntry::Receipt { text, at } => {
                 let key = at.unwrap_or_else(|| self.next_order());
-                let slot = self.slot_for_new(key);
-                let index = self.seat(Entry {
-                    slot,
-                    seq: None,
-                    order: None,
-                    shown_at: None,
-                    source: None,
-                    kind: TimelineKind::Receipt(text.to_string()),
-                    lead: None,
-                });
-                return Some(self.items[index].key);
+                return Some(self.seat_synthetic(key, None, None, TimelineKind::Receipt(text.to_string())));
             }
             SyntheticEntry::Compaction {
                 fact,
@@ -996,63 +1013,63 @@ impl Timeline {
                 // around it; a timeless compaction takes none.
                 let floor = message_time.and_then(|created| self.receipt_cut_floor(created));
                 let key = floor.map_or(key, |floor| key.max(floor));
-                let slot = self.slot_for_new(key);
-                let index = self.seat(Entry {
-                    slot,
-                    seq: None,
-                    order: None,
-                    shown_at: at,
-                    source: Some(row),
-                    kind: TimelineKind::Compaction(fact),
-                    lead: None,
-                });
-                return Some(self.items[index].key);
+                // `shown_at` is the cursor frontier's recorded start time, not
+                // a displayed clock: the card renders the row without one
+                // (`with_compaction`), while `frontier_for` reads it into
+                // `CursorFrontier.started_at` so a delivered compaction
+                // round-trips through the chain record.
+                return Some(self.seat_synthetic(key, at, Some(row), TimelineKind::Compaction(fact)));
             }
             SyntheticEntry::Ledger { entry, ending, at } => {
                 let key = at.unwrap_or_else(|| self.next_order());
-                let slot = self.slot_for_new(key);
-                let index = self.seat(Entry {
-                    slot,
-                    seq: None,
-                    order: None,
-                    shown_at: at,
-                    source: None,
-                    kind: TimelineKind::LedgerEntry(entry, ending.map(Box::new)),
-                    lead: None,
-                });
-                return Some(self.items[index].key);
+                return Some(self.seat_synthetic(
+                    key,
+                    None,
+                    None,
+                    TimelineKind::LedgerEntry(entry, ending.map(Box::new)),
+                ));
             }
             SyntheticEntry::UserMessage { text, at } => {
                 if text.trim().is_empty() {
                     return None;
                 }
                 let key = at.unwrap_or_else(|| self.next_order());
-                let slot = self.slot_for_new(key);
-                let index = self.seat(Entry {
-                    slot,
-                    seq: None,
-                    order: None,
-                    shown_at: at,
-                    source: None,
-                    kind: TimelineKind::UserMessage(text.to_string()),
-                    lead: None,
-                });
-                return Some(self.items[index].key);
+                return Some(self.seat_synthetic(
+                    key,
+                    None,
+                    None,
+                    TimelineKind::UserMessage(text.to_string()),
+                ));
             }
             SyntheticEntry::Lead { text, at } => {
-                let slot = match at {
-                    Some(key) => self.slot_for_new(key),
-                    None => {
-                        let key = self.next_order();
-                        self.slot_for_new(key)
-                    }
-                };
+                let key = at.unwrap_or_else(|| self.next_order());
+                let slot = self.slot_for_new(key);
                 // A lead is text today: it may merge into an equal-key run or
-                // chunk, so it returns no key.
-                self.push_text_at_slot(slot, at, None, text, None);
+                // chunk, so it returns no key. It has no display clock (the
+                // text path passes only `with_text`).
+                self.push_text_at_slot(slot, None, None, text, None);
             }
         }
         None
+    }
+
+    /// The live-slice/clamp seat a pre-allocated identity takes, for the
+    /// module's own clamp test: no production caller seats an arbitrary
+    /// identity outside a settle move.
+    #[cfg(test)]
+    pub(super) fn seat_for_test(&mut self, key: i64, seq: u64, kind: TimelineKind) -> usize {
+        let key = self.message_floor.map_or(key, |floor| key.max(floor));
+        let key = self.read_floor_key(key, false);
+        let slot = self.slot_for_seq(key, seq);
+        self.seat(Entry {
+            slot,
+            seq: Some(seq),
+            order: None,
+            shown_at: None,
+            source: None,
+            kind,
+            lead: None,
+        })
     }
 
     /// The Compaction row the timeline carries at `source`'s position, whatever
@@ -1215,49 +1232,8 @@ mod tests {
         CursorSeed, InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator,
     };
     use crate::feishu::card::MAX_CARD_TEXT_CHARS;
+    use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
     use crate::feishu::card::tool_render::ToolPanel;
-
-    /// The old `insert_item` test seam: seat a pre-allocated identity through
-    /// the module's one insert path, floors included.
-    fn insert_item(
-        timeline: &mut Timeline,
-        key: i64,
-        shown_at: Option<i64>,
-        source: Option<PartSource>,
-        seq: u64,
-        kind: TimelineKind,
-        lead: Option<String>,
-    ) -> usize {
-        let key = timeline.message_floor.map_or(key, |floor| key.max(floor));
-        let key = timeline.read_floor_key(key, source.is_some());
-        let slot = timeline.slot_for_seq(key, seq);
-        timeline.seat(Entry {
-            slot,
-            seq: Some(seq),
-            order: None,
-            shown_at,
-            source,
-            kind,
-            lead,
-        })
-    }
-
-    /// The old `insert_kind` test seam: a fresh identity through the module's
-    /// one insert path.
-    fn insert_kind(timeline: &mut Timeline, key: i64, shown_at: Option<i64>, kind: TimelineKind) -> usize {
-        let key = timeline.message_floor.map_or(key, |floor| key.max(floor));
-        let key = timeline.read_floor_key(key, false);
-        let slot = timeline.slot_for_new(key);
-        timeline.seat(Entry {
-            slot,
-            seq: None,
-            order: None,
-            shown_at,
-            source: None,
-            kind,
-            lead: None,
-        })
-    }
 
     /// `push_text` chunks one large blob into bounded timeline items so a single
     /// item never exceeds the per-card text budget.
@@ -1398,15 +1374,7 @@ mod tests {
         assert_eq!(acc.render_from(), 1);
 
         // An older identity (7) with a key behind the slice.
-        insert_item(
-            acc.timeline_mut(),
-            500,
-            None,
-            None,
-            7,
-            TimelineKind::Text("迟到".into()),
-            None,
-        );
+        acc.test_seat_identity(500, 7, TimelineKind::Text("迟到".into()));
         let clamped = &acc.timeline().entries()[acc.render_from()];
         assert_eq!(clamped.seq(), 7, "the identity is never renumbered");
         assert!(
@@ -1579,21 +1547,12 @@ mod tests {
         // must look the part up at that SAME clamped key (otherwise it starts
         // a second entry — a duplicated text run or a new reasoning panel).
         let mut acc = StreamAccumulator::new("test");
-        insert_kind(
-            acc.timeline_mut(),
-            1_000,
-            None,
-            TimelineKind::Receipt("✅ 已回答".into()),
-        );
-        insert_kind(
-            acc.timeline_mut(),
-            5_000,
-            None,
-            TimelineKind::Text("已发送卡片".into()),
-        );
+        acc.push_receipt_at(Some(1_000), "✅ 已回答");
+        acc.push_text_at(Some(5_000), "已发送卡片");
         let head = PartSource::at(MessageId::new("msg_head"), 0);
         acc.push_text_from(Some(9_000), Some(head), "新切片");
-        acc.timeline_mut().set_render_from(2);
+        // Finalize both pre-split entries, leaving the 9_000 entry live.
+        acc.skip_rejected_slice(0, 2);
         acc.record_receipt_cut(500, 1_000);
         let part = PartSource::at(MessageId::new("msg_part"), 0);
         acc.push_text_from(Some(3_000), Some(part.clone()), "甲");
@@ -1955,7 +1914,11 @@ mod tests {
         acc.push_compaction_at(Some(2_000), source.clone(), &compaction("old"));
         let row = acc.timeline().entries()[0].clone();
         assert_eq!(row.key(), 9_000, "the row takes its message's receipt cut");
-        assert_eq!(row.shown_at(), Some(2_000));
+        assert_eq!(
+            row.shown_at(),
+            Some(2_000),
+            "the compaction keeps its start time for the cursor frontier; the row displays no clock"
+        );
 
         acc.push_compaction_at(Some(2_000), source, &compaction("new"));
         assert_eq!(acc.timeline().len(), 1, "the repeated row updates in place");
@@ -1985,5 +1948,66 @@ mod tests {
             panic!("the lead is text");
         };
         assert_eq!(text, "ab");
+        assert_eq!(
+            acc.timeline().entries()[0].shown_at(),
+            None,
+            "a lead shows no clock"
+        );
+
+        // A ledger entry shows its payload's `finished_at`, not the keyed
+        // clock; a user message shows no clock; a blank user message owns no
+        // entry.
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_ledger_entry_at(
+            Some(4_000),
+            TaskCompletionEntry {
+                kind: TaskKind::Shell,
+                label: Some("sleep".into()),
+                id: None,
+                started_at: None,
+                finished_at: Some(4_000),
+                ending: TaskEnding::RuntimeEnded,
+                output: None,
+            },
+            None,
+        );
+        acc.push_user_message(Some(5_000), "external");
+        let ledger = &acc.timeline().entries()[0];
+        assert_eq!(ledger.shown_at(), None, "a ledger entry shows no clock");
+        let user = &acc.timeline().entries()[1];
+        assert_eq!(user.shown_at(), None, "a user message shows no clock");
+        let before = acc.timeline().len();
+        acc.push_user_message(Some(6_000), "   ");
+        assert_eq!(
+            acc.timeline().len(),
+            before,
+            "a blank user message renders nothing"
+        );
+    }
+
+    /// A settled tool joins the timeline under the message's receipt cut: the
+    /// floor belongs to the module's insert path, not the caller.
+    #[test]
+    fn a_settled_tool_takes_the_message_floor() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.record_receipt_cut(1_000, 9_000);
+        acc.set_message_floor(Some(2_000));
+        acc.push_tool_at(
+            Some(2_000),
+            "call_1",
+            ToolPanel::for_test(
+                "bash",
+                ToolStatus::Completed,
+                Some(serde_json::json!("ls")),
+                Some("src"),
+            ),
+        );
+        acc.set_message_floor(None);
+        assert_eq!(acc.timeline().len(), 1);
+        assert_eq!(
+            acc.timeline().entries()[0].key(),
+            9_000,
+            "the settled panel takes the message's receipt cut"
+        );
     }
 }

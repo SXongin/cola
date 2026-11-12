@@ -2699,16 +2699,17 @@ impl StreamAccumulator {
         self.timeline.len()
     }
 
-    /// The timeline module, for the internal test seam and read-only walks.
+    /// The timeline module, for the module's own read-only test assertions.
     #[cfg(test)]
     pub(super) fn timeline(&self) -> &Timeline {
         &self.timeline
     }
 
-    /// The timeline module, mutable for the internal test seam.
+    /// Seat a pre-allocated identity at `key` for the Timeline's clamp test:
+    /// no production path seats an arbitrary identity outside a settle move.
     #[cfg(test)]
-    pub(super) fn timeline_mut(&mut self) -> &mut Timeline {
-        &mut self.timeline
+    pub(super) fn test_seat_identity(&mut self, key: i64, seq: u64, kind: TimelineKind) -> usize {
+        self.timeline.seat_for_test(key, seq, kind)
     }
 
     /// The fate of the write carrying this flush's terminal slice (spec #602).
@@ -3057,8 +3058,7 @@ impl StreamAccumulator {
     /// `at_ms` — normally just before the Turn's anchor, so it heads the card.
     /// An empty message renders nothing. A distinct kind, so the reply's text
     /// run can never absorb it (see [`TimelineKind::UserMessage`]). `at_ms` is
-    /// a server time when present, so it is recorded as the entry's server
-    /// time too: the Interaction Receipt's cut compares against it (#1023).
+    /// an order key only: the user block shows no clock.
     pub(super) fn push_user_message(&mut self, at_ms: Option<i64>, text: &str) {
         let _ = self
             .timeline
@@ -3388,8 +3388,8 @@ impl StreamAccumulator {
         entry: TaskCompletionEntry,
         ending: Option<EndingKey>,
     ) {
-        // A server-stamped entry records its time as the entry's own server
-        // time, so the Interaction Receipt's cut can floor it (issue #1023).
+        // The server time is the entry's ORDER key; the folded row shows its
+        // payload's own `finished_at`, never that key as a clock.
         let _ = self.timeline.synthetic(SyntheticEntry::Ledger {
             entry,
             ending,
@@ -3634,8 +3634,8 @@ impl StreamAccumulator {
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
     /// — the card splitter can then break a long answer across cards at item
     /// boundaries instead of truncating it. Production renders go through
-    /// [`Self::push_text_at`] for chunks with no server part time; this
-    /// convenience form is test-only.
+    /// [`Self::push_text_at_key`]; [`Self::push_text`] and
+    /// [`Self::push_text_at`] are test-only convenience forms.
     #[cfg(test)]
     pub(super) fn push_text(&mut self, chunk: &str) {
         self.push_text_at(None, chunk);
@@ -3644,7 +3644,7 @@ impl StreamAccumulator {
     /// [`Self::push_text`] for a chunk from the part that started at `at_ms`
     /// (the server's `time.start`), which also places it on the timeline.
     /// `None` for a payload with no server time: the item is then keyed by a
-    /// monotonic fallback (call order) and shows no clock.
+    /// monotonic fallback (call order) and shows no clock. Test-only.
     #[cfg(test)]
     pub(super) fn push_text_at(&mut self, at_ms: Option<i64>, chunk: &str) {
         self.push_text_from(at_ms, None, chunk);
@@ -3808,11 +3808,14 @@ impl StreamAccumulator {
         self.tools.insert(call_id.to_string(), panel);
         if is_new {
             let key = key_at.unwrap_or_else(|| self.timeline.next_order());
-            let key = self.timeline.read_floor_key(key, source.is_some());
             if live {
                 // Unfinished: TAIL content. Allocate its identity and key now,
                 // but do not join the timeline — a split must never finalize a
-                // panel whose tool is still running (ADR-0045).
+                // panel whose tool is still running (ADR-0045). The tail's key
+                // is pinned at birth with the walk's read floor; #1042's `pin`
+                // will own that floor. A settled entry lets the Timeline apply
+                // its own message and read floors.
+                let key = self.timeline.read_floor_key(key, source.is_some());
                 let seq = self.timeline.allocate_seq();
                 self.live_tools.insert(
                     call_id.to_string(),
