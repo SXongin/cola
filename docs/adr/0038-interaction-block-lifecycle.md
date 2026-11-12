@@ -354,7 +354,10 @@ mis-ordered:
   of appending it after a part already pushed at the same key. The sort uses an
   internal `order`: an ordinary insert's `order` equals its `seq`, a chunked
   continuation shares its part's `order`, and the render-boundary clamp lowers
-  `order` alone — never the identity `seq` (ADR-0040).
+  `order` alone — never the identity `seq` (ADR-0040). One further rule may
+  renumber `order`: a tail panel settling at or above a floor that left no
+  integer gap renumbers the live slice's equal-key orders in one deterministic
+  pass (ADR-0104); `seq` is never touched.
 - A part already on the timeline **keeps the key it was placed at** — a rewrite
   captures the old key before it drops the run — because a later read's floor can
   differ, and re-keying would split a growing part into two entries.
