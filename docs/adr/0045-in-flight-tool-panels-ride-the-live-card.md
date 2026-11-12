@@ -1,8 +1,9 @@
 # In-flight Tool Panels ride the live card; settled panels join the timeline
 
-> **Amended by ADR-0104 when it lands**: a tail panel's re-key and settle floor
-> are owned by the Timeline module; #1040 carries the exact rule. The
-> tail-only-to-settled lifecycle below is unchanged.
+> **Amended by ADR-0104 when it lands**: a tail panel's re-key and its settle
+> floor **and cap** are owned by the Timeline module, so a late start cannot
+> carry the panel past the first following read-order entry; #1040 carries the
+> exact rule. The tail-only-to-settled lifecycle below is unchanged.
 
 A **Tool Panel** rendered as a timeline row: it sat where its tool call started,
 and a **Card Chain** split could finalize the card while the tool still ran. The

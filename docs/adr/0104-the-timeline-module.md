@@ -4,7 +4,8 @@
 > landing amendment records the finished mechanism and the tickets that landed
 > it.
 >
-> **Amends, when it lands**: ADR-0038 (the read floor and the equal-key rule),
+> **Amends, when it lands**: ADR-0038 (synthetic keying, the read floor and the
+> equal-key rule),
 > ADR-0040 (`seq` assignment), ADR-0045 (a tail panel's settle rule), ADR-0050
 > (the entry types' home) and ADR-0082 (a compaction row's receipt cut). The
 > exact ordering rules and their invariants are #1040's acceptance criteria; this
@@ -54,8 +55,8 @@ content into them.**
   half-written protocol is no longer representable and no accessor sets a floor
   from outside.
 - **`Placement` is an owned, linear token, not a borrow.** It carries the entry
-  key, the merge identity, the display clock, the floor it was placed under, and
-  a private scope generation. Its fields are private with no public constructor
+  key, the merge identity, the display clock, the floor it was placed under, the
+  `TranscriptKind` variant its part expects, and a private scope generation. Its fields are private with no public constructor
   and it is neither `Clone` nor `Copy`; `push`/`replace` return
   `Result<(), PlacementError>` and validate completely before mutating, so a
   stale or mismatched token is refused without touching the timeline.
@@ -76,7 +77,7 @@ content into them.**
   `TailPlacement` plus its panel body; a pin is settled through the Timeline but
   never through `push`. `StreamAccumulator` keeps its name.
 - **Behaviour-preserving, with named tightenings.** The ordering semantics and
-  the deliberate tightenings (the settle floor, the read-position tie-break and
+  the deliberate tightenings (the settle clamp, the read-position tie-break and
   the pinned-tail read floor) are #1040's acceptance criteria, and the batch's
   tests pin them. No wire or durable-format change lands here; the compaction
   split/restart delivery gap is #1049.
