@@ -8,8 +8,10 @@
 > entries may be keyed at their own server time or at a key the caller already
 > holds — a click's reserved receipt key, the Wake 承接 line's server time — not
 > only at `next_order()`; and a tail-only **Tool Panel** whose settle floor is at or above its key takes a
-> fresh allocation order above the equal-key entries of earlier messages (but
-> below its own message's following entries), because its allocation predates
+> fresh allocation order above the equal-key entries of earlier messages at that
+> floor (but below its own message's entries that share the key; placed content
+> never moves, so a lower-key continuation stays put and the panel lands after
+> it), because its allocation predates
 > content that became visible after it was pinned. The receipt's server-time cut
 > is unchanged.
 
@@ -381,7 +383,9 @@ messages against it. The rule applies to
 every walk that places transcript parts (the Turn window, the seed scope and the
 pending gap); synthetic content (receipts, wake markers) keeps `next_order()`,
 except the advisory-live opening line, which is keyed at the card head (`0`) so
-an older server position can never sort above it.
+an older server position can never sort above it. (The blanket `next_order()`
+above is superseded by ADR-0104's amendment: a synthetic entry may instead be
+keyed at its own server time or at a key the caller already holds.)
 
 **The receipt's server-time cut.** The borrow no longer stands alone: the
 surfacing work (#1023) carries the asking tool part's server time on the block,
