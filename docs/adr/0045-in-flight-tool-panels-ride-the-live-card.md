@@ -10,10 +10,12 @@
 > tail never raises it — ADR-0104's settle extension) — and
 > applies ADR-0038's late-part clamp, so the panel cannot jump a receipt or
 > content read before it. Its key is `max(current, floor)` (the current key after
-> any `rekey`); at that key it sorts by its own part's read position, landing
-> after earlier-message entries and before its own message's later parts. Placed
-> content never moves, and a same-message continuation at a lower key stays put,
-> with the panel landing after it.
+> any `rekey`), **capped at the first entry that follows the panel in read order**
+> — its own message's later parts, then later messages' — when that entry's key
+> is at or above the floor; at that key it sorts by its own part's read position,
+> landing after earlier-message entries and before those later parts. Placed
+> content never moves. A same-message continuation at a **lower** key stays put,
+> so the floor wins and the panel lands after it.
 
 A **Tool Panel** rendered as a timeline row: it sat where its tool call started,
 and a **Card Chain** split could finalize the card while the tool still ran. The
