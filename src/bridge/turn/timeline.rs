@@ -172,6 +172,16 @@ impl ReceiptCut {
     }
 }
 
+/// The two positions a click's receipt reservation holds (spec #1040): the key
+/// the receipt itself will take, and the floor already installed for content
+/// written during the reply. The Timeline mints both, so the accumulator never
+/// derives the floor from the receipt key itself.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReservationKeys {
+    pub(super) receipt_key: i64,
+    pub(super) floor_key: i64,
+}
+
 /// Where a timeline text/reasoning entry came from: the typed transcript
 /// part's own position (spec #561's cursor frontier). The payload carries no
 /// stable part id (AGENTS.md pitfall `wire-shapes`), so identity is the message plus the part's
@@ -730,9 +740,11 @@ impl Timeline {
 
     /// Mint a click's reserved receipt key and install its floor cut (issue
     /// #1023): the receipt takes `receipt_key`, content written during the
-    /// reply is floored at `receipt_key + 1`. The floor key is consumed, so the
-    /// next synthetic key cannot equal it.
-    pub(super) fn reserve_key(&mut self, asked_at: i64) -> i64 {
+    /// reply is floored at `floor_key` (`receipt_key + 1`). The floor key is
+    /// consumed, so the next synthetic key cannot equal it. Both keys come
+    /// from here, so the reservation's arithmetic never leaks into the
+    /// accumulator.
+    pub(super) fn reserve_key(&mut self, asked_at: i64) -> ReservationKeys {
         let receipt_key = self.next_order();
         let floor_key = receipt_key.saturating_add(1);
         self.receipt_cuts.push(ReceiptCut {
@@ -741,7 +753,10 @@ impl Timeline {
         });
         self.order_seq = floor_key;
         self.last_key = self.last_key.max(floor_key);
-        receipt_key
+        ReservationKeys {
+            receipt_key,
+            floor_key,
+        }
     }
 
     /// Drop a reservation's floor cut without writing its receipt.
@@ -1729,7 +1744,7 @@ mod tests {
         Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, MessageTime,
         SessionTranscript, ToolStatus, TranscriptMessage,
     };
-    use crate::bridge::chain::{CursorFrontier, CursorPartKind};
+    use crate::bridge::chain::{CursorFrontier, CursorPartKind, cursor_prefix_digest};
     use crate::bridge::turn::state::{
         CursorSeed, InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator,
     };
@@ -1762,6 +1777,39 @@ mod tests {
                 },
             )
             .expect("the scope accepts its own token");
+    }
+
+    /// Push one sourced text part through its message scope and hand back its
+    /// source — the observable a rewrite test reads back from the timeline.
+    fn push_sourced(
+        timeline: &mut Timeline,
+        order: &HashMap<&str, usize>,
+        message: &MessageId,
+        index: usize,
+        key: i64,
+        chunk: &str,
+    ) -> PartSource {
+        let source = PartSource::at(message.clone(), index);
+        let mut walk = timeline.walk(order);
+        let mut scope = walk.message(None, message, &[]);
+        let facts = PartFacts {
+            form: PartForm::Text,
+            key_at: Some(key),
+            shown_at: Some(key),
+            source: Some(source.clone()),
+            index,
+        };
+        let placement = scope.place(facts);
+        scope
+            .push(
+                placement,
+                TranscriptKind::Text {
+                    chunk: chunk.into(),
+                    lead: None,
+                },
+            )
+            .expect("the scope accepts its own token");
+        source
     }
 
     /// `push_text` chunks one large blob into bounded timeline items so a single
@@ -2818,6 +2866,115 @@ mod tests {
         assert!(
             matches!(timeline.entries()[0].kind(), TimelineKind::Text(text) if text == "原始"),
             "no refused replace dropped or overwrote the run"
+        );
+    }
+
+    /// `drop_source_run` re-bases the live-slice boundary by exactly the run
+    /// entries that sat before it (spec #561's replace rule, #1044): the entry
+    /// the boundary started at is still the entry it starts at, so a rewritten
+    /// finalized part cannot drag a sent entry back onto the live card.
+    #[test]
+    fn a_rewritten_run_keeps_the_boundary_on_its_entry() {
+        let mut timeline = Timeline::default();
+        let order = HashMap::from([("m1", 0usize)]);
+        let message = MessageId::new("m1");
+        push_sourced(&mut timeline, &order, &message, 0, 1_000, "A");
+        let rewritten = push_sourced(&mut timeline, &order, &message, 1, 2_000, "B");
+        push_sourced(&mut timeline, &order, &message, 2, 3_000, "C");
+        timeline.set_render_from(2);
+        let live_start = timeline.entries()[timeline.render_from()].seq();
+
+        timeline.drop_source_run(&rewritten);
+
+        assert_eq!(timeline.entries().len(), 2, "only the rewritten run left");
+        assert_eq!(
+            timeline.render_from(),
+            1,
+            "the boundary moved by the one removed pre-boundary entry"
+        );
+        assert_eq!(
+            timeline.entries()[timeline.render_from()].seq(),
+            live_start,
+            "the boundary still starts at the entry it started at"
+        );
+    }
+
+    /// A later chunk of a rewritten part merges into the run the rewrite
+    /// installed instead of starting a second entry (spec #561, #1044): the
+    /// new run is the part's one run, so the card cannot duplicate its text.
+    #[test]
+    fn a_later_chunk_merges_into_the_rewritten_run() {
+        let mut timeline = Timeline::default();
+        let order = HashMap::from([("m1", 0usize)]);
+        let message = MessageId::new("m1");
+        let source = push_sourced(&mut timeline, &order, &message, 0, 2_000, "ABC");
+
+        let rewritten = PartSource::new(message.clone(), 0, 0, Some(cursor_prefix_digest("XYZ")));
+        {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(None, &message, &[]);
+            let facts = PartFacts {
+                form: PartForm::Text,
+                key_at: Some(2_000),
+                shown_at: Some(2_000),
+                source: Some(rewritten),
+                index: 0,
+            };
+            let placement = scope.place(facts);
+            scope
+                .replace(
+                    placement,
+                    &source,
+                    TranscriptKind::Text {
+                        chunk: "XYZ".into(),
+                        lead: None,
+                    },
+                )
+                .expect("the scope accepts its own rewrite");
+        }
+        assert_eq!(timeline.entries().len(), 1, "the rewrite replaced the run");
+        assert!(
+            matches!(timeline.entries()[0].kind(), TimelineKind::Text(text) if text == "XYZ"),
+            "the rewrite's own content is the run"
+        );
+        let rewritten_seq = timeline.entries()[0].seq();
+
+        let grown = PartSource::new(message.clone(), 0, 0, Some(cursor_prefix_digest("XYZ更多")));
+        {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(None, &message, &[]);
+            let facts = PartFacts {
+                form: PartForm::Text,
+                key_at: Some(2_000),
+                shown_at: Some(2_000),
+                source: Some(grown),
+                index: 0,
+            };
+            let placement = scope.place(facts);
+            scope
+                .push(
+                    placement,
+                    TranscriptKind::Text {
+                        chunk: "更多".into(),
+                        lead: None,
+                    },
+                )
+                .expect("the scope accepts its own token");
+        }
+
+        assert_eq!(
+            timeline.entries().len(),
+            1,
+            "the later chunk did not start a second entry"
+        );
+        assert_eq!(
+            timeline.entries()[0].seq(),
+            rewritten_seq,
+            "the chunk merged into the rewrite's entry"
+        );
+        assert!(
+            matches!(timeline.entries()[0].kind(), TimelineKind::Text(text) if text == "XYZ更多"),
+            "the rewritten run grew by the later chunk"
         );
     }
 

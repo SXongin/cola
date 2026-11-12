@@ -2931,18 +2931,17 @@ impl StreamAccumulator {
         if let Some(old) = self.reserved_receipts.remove(request_id) {
             self.forget_reserved_cut(old.floor_key);
         }
-        // The Timeline mints the key and installs the floor cut; the floor key
-        // is consumed there too, so an unrelated receipt written in this same
-        // millisecond cannot share the reservation's cut.
-        let receipt_key = self.timeline.reserve_key(asked_at);
-        let floor_key = receipt_key.saturating_add(1);
+        // The Timeline mints both keys and installs the floor cut; the floor
+        // key is consumed there too, so an unrelated receipt written in this
+        // same millisecond cannot share the reservation's cut.
+        let keys = self.timeline.reserve_key(asked_at);
         self.reservation_seq += 1;
         let token = self.reservation_seq;
         self.reserved_receipts.insert(
             request_id.to_string(),
             ReservedReceipt {
-                receipt_key,
-                floor_key,
+                receipt_key: keys.receipt_key,
+                floor_key: keys.floor_key,
                 token,
             },
         );
@@ -8233,6 +8232,87 @@ mod tests {
         assert!(
             card.find("失败后可见").unwrap() < card.find("✅ 已回答").unwrap(),
             "content visible before the retry stays above its receipt: {card}"
+        );
+    }
+
+    /// A local click's reservation mints BOTH keys in the Timeline (spec
+    /// #1044): `take_reserved_receipt`'s `receipt_key` is the synthetic
+    /// admission's `at`, so the receipt keeps it — and a split past it clamps
+    /// the receipt to the live slice's first key instead of lifting it above
+    /// the body. `reserved_receipts` stays the accumulator's, keyed by
+    /// `request_id`.
+    #[test]
+    fn a_reserved_click_receipt_keeps_its_key_and_clamps_after_a_split() {
+        let question = |asked_at: i64| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: "q".into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "继续?".into(),
+                    header: "继续".into(),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![false],
+                open: 0,
+                drafts: vec![String::new()],
+                asked_at: Some(asked_at),
+            })
+        };
+        let receipt_key = |acc: &StreamAccumulator| {
+            acc.timeline()
+                .iter()
+                .find_map(|item| match item.kind() {
+                    TimelineKind::Receipt(text) if text.starts_with("✅") => Some(item.key()),
+                    _ => None,
+                })
+                .expect("the click's receipt landed")
+        };
+
+        // No split: the admission takes exactly the reserved key.
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(5_000));
+        assert!(acc.reserve_receipt("q").is_some(), "the click reserves");
+        let reserved = acc
+            .reserved_receipts
+            .get("q")
+            .expect("the reservation")
+            .receipt_key;
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
+        assert!(
+            acc.reserved_receipts.is_empty(),
+            "the resolution took the reservation"
+        );
+        assert_eq!(
+            receipt_key(&acc),
+            reserved,
+            "the receipt keeps the key its click reserved"
+        );
+
+        // A split past the reserved key: the synthetic admission's clamp seats
+        // the receipt at the live slice's first key.
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(question(5_000));
+        assert!(acc.reserve_receipt("q").is_some(), "the click reserves");
+        let reserved = acc
+            .reserved_receipts
+            .get("q")
+            .expect("the reservation")
+            .receipt_key;
+        acc.push_text_at(Some(reserved + 5_000), "已发送");
+        acc.push_text_at(Some(reserved + 6_000), "继续");
+        acc.skip_rejected_slice(0, 1);
+        assert_eq!(acc.render_from(), 1);
+        let slice_key = acc.timeline().entries()[1].key();
+        assert!(slice_key > reserved, "the live slice is past the reservation");
+        assert!(acc.resolve_interaction("q", |_| "✅ 已回答".to_string(), true));
+        assert_eq!(
+            receipt_key(&acc),
+            slice_key,
+            "a split past the reservation clamps the receipt to the slice start"
         );
     }
 
