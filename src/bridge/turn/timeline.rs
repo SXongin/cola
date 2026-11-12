@@ -340,8 +340,9 @@ pub(super) struct Placement {
 
 /// One live tail's fact, as the accumulator hands it to a walk or a settle
 /// (spec #1040): the message that owns it, the part index it was pinned at and
-/// its key. The Timeline keeps only the ones that precede the content being
-/// placed.
+/// its **effective** key — the raw pin/rekey key raised to the floor the pin
+/// carried, which is where the panel will finally sit. The Timeline keeps only
+/// the ones that precede the content being placed.
 #[derive(Debug, Clone)]
 pub(super) struct TailFact {
     pub(super) message: MessageId,
@@ -354,6 +355,8 @@ pub(super) struct TailFact {
 /// accumulator's `tools` map; this token never enters [`MessageScope::push`].
 #[derive(Debug, Clone)]
 pub(super) struct TailPlacement {
+    /// The raw pin/rekey key. It can sit below the carried `floor` before any
+    /// rekey; [`Self::fact`] publishes the effective `max(key, floor)`.
     key: i64,
     shown_at: Option<i64>,
     source: Option<PartSource>,
@@ -375,6 +378,28 @@ impl TailPlacement {
         self.shown_at
     }
 
+    /// The key the tail is actually placed under: the raw pin/rekey key raised
+    /// to the floor the pin carried. Before any rekey a pin's key can sit below
+    /// its floor (a receipt cut minted before the pin), so consumers of the
+    /// fact need the effective position, not the raw one.
+    fn effective_key(&self) -> i64 {
+        self.floor.map_or(self.key, |floor| self.key.max(floor))
+    }
+
+    /// The read position the tail occupies: the one pinned, or — for a pin
+    /// that was source-less and later adopted a source — its source's message
+    /// position in `read_order` plus the part index.
+    fn position_in(&self, read_order: &HashMap<&str, usize>) -> Option<ReadPosition> {
+        self.position.or_else(|| {
+            let source = self.source.as_ref()?;
+            let message = self.message.as_ref()?;
+            read_order
+                .get(message.as_str())
+                .copied()
+                .map(|message| (message, source.index()))
+        })
+    }
+
     /// A later sighting may carry the part source the first one lacked.
     pub(super) fn adopt_source(&mut self, source: Option<PartSource>) {
         if self.source.is_none() {
@@ -383,10 +408,10 @@ impl TailPlacement {
     }
 
     /// The fact a later walk or settle needs: which message owns the tail,
-    /// which part pinned it and where it sits. A pin whose message carries no
-    /// read position (the scripted test seam) still names its message and
-    /// part, so the fact is well-formed; only a pin that named no message at
-    /// all yields `None`.
+    /// which part pinned it and the effective key it will settle at. A pin
+    /// whose message carries no read position (the scripted test seam) still
+    /// names its message and part, so the fact is well-formed; only a pin that
+    /// named no message at all yields `None`.
     pub(super) fn fact(&self) -> Option<TailFact> {
         let message = self.message.clone()?;
         let part = self.position.map_or_else(
@@ -396,7 +421,7 @@ impl TailPlacement {
         Some(TailFact {
             message,
             part,
-            key: self.key,
+            key: self.effective_key(),
         })
     }
 }
@@ -1494,13 +1519,16 @@ impl Timeline {
         read_order: &HashMap<&str, usize>,
         pinned_tails: &[TailFact],
     ) {
+        // A pin may have been source-less and adopted a source later; its
+        // read position is then derived from the source and this read.
+        let position = tail.position_in(read_order);
         let receipt = tail.created.and_then(|created| self.receipt_cut_floor(created));
-        let read_floor = self.read_floor_for_tail(&tail, read_order, pinned_tails);
+        let read_floor = self.read_floor_for_tail(position, read_order, pinned_tails);
         let floor = tail.floor.into_iter().chain(receipt).chain(read_floor).max();
         let key = floor.map_or(tail.key, |floor| tail.key.max(floor));
-        let cap = self.min_following_key(tail.position, floor.unwrap_or(i64::MIN), read_order);
+        let cap = self.min_following_key(position, floor.unwrap_or(i64::MIN), read_order);
         let key = cap.map_or(key, |cap| key.min(cap));
-        let slot = self.slot_for_seq(key, tail.seq, tail.position);
+        let slot = self.slot_for_seq(key, tail.seq, position);
         self.seat(Entry {
             slot,
             seq: Some(tail.seq),
@@ -1509,7 +1537,7 @@ impl Timeline {
             source: tail.source,
             kind: TimelineKind::Tool(tail.call_id),
             lead: None,
-            position: tail.position,
+            position,
         });
     }
 
@@ -1519,17 +1547,17 @@ impl Timeline {
         self.message_floor.into_iter().chain(self.read_floor).max()
     }
 
-    /// The current read floor for a tail's message (spec #1040): every entry
-    /// that precedes the tail in read order — an earlier message's, or an
+    /// The current read floor for a tail at `position` (spec #1040): every
+    /// entry that precedes the tail in read order — an earlier message's, or an
     /// earlier part of the same message — and every pinned tail that precedes
     /// it, the panel's own preceding ones included.
     fn read_floor_for_tail(
         &self,
-        tail: &TailPlacement,
+        position: Option<ReadPosition>,
         read_order: &HashMap<&str, usize>,
         pinned_tails: &[TailFact],
     ) -> Option<i64> {
-        let tail_position = tail.position?;
+        let tail_position = position?;
         self.floor_before(read_order, pinned_tails, |position| position < tail_position)
     }
 
@@ -3626,6 +3654,8 @@ mod tests {
     /// An earlier message's pinned tail floors a later message's part (spec
     /// #1040's deliberate extension): its older server key cannot place it
     /// above the live panel, and the panel keeps the read order at the tie.
+    /// The pin's raw key sits below its carried floor here, so the fact must
+    /// publish the effective (floored) key.
     #[test]
     fn an_earlier_messages_pinned_tail_floors_a_later_message() {
         let mut timeline = Timeline::default();
@@ -3636,17 +3666,25 @@ mod tests {
             Some(serde_json::json!("ls")),
             Some("src"),
         );
+        // The asking message's cut is minted before the pin, so the pin's
+        // floor (9000) outranks its raw server key (100).
+        timeline.record_cut(4_000, 9_000);
         let tail = pin_tail(
             &mut timeline,
             &order,
             Some(5_000),
             &MessageId::new("m0"),
             0,
-            Some(9_000),
-            Some(9_000),
+            Some(100),
+            Some(100),
         );
+        assert_eq!(tail.key, 100, "the raw pin key is the server's start");
+        assert_eq!(tail.floor, Some(9_000), "the pin carries the receipt cut");
         let pinned = vec![tail.fact().expect("a scoped pin names its message")];
+        assert_eq!(pinned[0].key, 9_000, "the fact publishes the effective key");
         {
+            // The later message predates the ask, so it earns no cut of its
+            // own: only the pinned tail can floor its part.
             let mut walk = timeline.walk(&order);
             let mut scope = walk.message(Some(2_000), &MessageId::new("m1"), &pinned);
             let facts = PartFacts {
@@ -3684,6 +3722,155 @@ mod tests {
             kinds,
             vec!["tool", "later"],
             "the panel keeps the earlier read position at the tied key"
+        );
+    }
+
+    /// A pinned tail's fact key is where the panel will SETTLE — its raw key
+    /// raised to the floor the pin carried — not the bare server key. A receipt
+    /// cut minted before the pin (asked 1000, key 9000) floors a running tool
+    /// whose server key is 100 to 9000; a later message's part keyed 1000 must
+    /// clear that effective floor and stay below the settled panel.
+    #[test]
+    fn a_pinned_tails_effective_key_includes_its_carried_floor() {
+        let mut timeline = Timeline::default();
+        let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let panel = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!("ls")),
+            Some("src"),
+        );
+        timeline.record_cut(1_000, 9_000);
+        let tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(2_000),
+            &MessageId::new("m0"),
+            0,
+            Some(100),
+            Some(100),
+        );
+        assert_eq!(tail.key, 100, "the first sighting's server key is 100");
+        assert_eq!(tail.floor, Some(9_000), "the pin carries the receipt cut");
+        let pinned = vec![tail.fact().expect("a scoped pin names its message")];
+
+        // The later message predates the ask, so only the pinned tail floors
+        // its part — and it must floor it to the tail's EFFECTIVE key.
+        let placement_key = {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(Some(500), &MessageId::new("m1"), &pinned);
+            let facts = PartFacts {
+                form: PartForm::Text,
+                key_at: Some(1_000),
+                shown_at: Some(1_000),
+                source: Some(PartSource::at(MessageId::new("m1"), 0)),
+            };
+            let placement = scope.place(facts);
+            let key = placement.key;
+            scope
+                .push(
+                    placement,
+                    TranscriptKind::Text {
+                        chunk: "old key".into(),
+                        lead: None,
+                    },
+                )
+                .unwrap();
+            key
+        };
+        assert_eq!(
+            placement_key, 9_000,
+            "the pinned tail's effective key, not its raw 100, is the floor"
+        );
+
+        timeline.settle(tail, &panel, &order, &[]);
+        let tool = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the panel settled");
+        let later = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "old key"))
+            .expect("the later message's part landed");
+        assert!(
+            timeline.entries()[tool].key() >= 9_000,
+            "the panel settles at or above the cut"
+        );
+        assert!(
+            tool < later,
+            "the later message's part stays below the settled panel"
+        );
+    }
+
+    /// Spec #1040: a tail first pinned source-less may adopt its source on a
+    /// later sighting. Its read position is then derived from that source and
+    /// the read, so the settle still applies the read floor and the cap.
+    #[test]
+    fn an_adopted_source_settles_with_the_derived_read_floor_and_cap() {
+        let order = HashMap::from([("m1", 0usize)]);
+        let message = MessageId::new("m1");
+        let panel = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!("ls")),
+            Some("src"),
+        );
+        let mut timeline = Timeline::default();
+        // An earlier part sets the read floor; a later part caps the settle.
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            3_000,
+            Some(PartSource::at(message.clone(), 0)),
+            "之前",
+        );
+        push_text(
+            &mut timeline,
+            &order,
+            "m1",
+            4_000,
+            Some(PartSource::at(message.clone(), 2)),
+            "之后",
+        );
+        // The first sighting is source-less and pinned outside the read, so it
+        // carries no position; the later sighting adopts its source.
+        let no_order = HashMap::new();
+        let mut tail = {
+            let mut walk = timeline.walk(&no_order);
+            let mut scope = walk.message(None, &message, &[]);
+            scope.pin(
+                PartFacts {
+                    form: PartForm::Tool,
+                    key_at: Some(5_000),
+                    shown_at: Some(5_000),
+                    source: None,
+                },
+                "call_bash".into(),
+            )
+        };
+        assert!(
+            tail.position.is_none(),
+            "the source-less pin carries no read position"
+        );
+        tail.adopt_source(Some(PartSource::at(message.clone(), 1)));
+
+        timeline.settle(tail, &panel, &order, &[]);
+        let tool = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the panel settled");
+        assert_eq!(
+            timeline.entries()[tool].key(),
+            4_000,
+            "the derived position takes the earlier part's floor and the later part's cap"
+        );
+        assert!(
+            matches!(timeline.entries()[tool].source(), Some(source) if source.index() == 1),
+            "the adopted source rides the settled entry"
         );
     }
 

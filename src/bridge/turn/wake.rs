@@ -300,7 +300,6 @@ impl Turn {
     /// drops the running panels the successor resolved, ADR-0068's
     /// generalized collect).
     #[allow(clippy::too_many_arguments)] // the successor's whole arming fixture
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn arm_projected_card(
         cards: &CardsHandle,
         backend: &Arc<dyn crate::backend::Backend>,
