@@ -5,9 +5,11 @@
 > the **current** receipt cut for its message's created time and the Timeline's
 > then-current read floor for the panel's message (the **earlier** messages'
 > high-water mark, ADR-0038), then applies ADR-0038's late-part clamp — so the
-> panel cannot jump a receipt or content read before it. A raised key takes a
-> fresh allocation order above the equal-key run, so it renders after the content
-> that floored it.
+> panel cannot jump a receipt or content read before it. When that floor is at or
+> above the pinned key, the panel takes a fresh allocation order above the
+> equal-key entries of **earlier messages** but below its own message's following
+> entries, so it renders after the content that floored it without jumping a
+> same-message continuation.
 
 A **Tool Panel** rendered as a timeline row: it sat where its tool call started,
 and a **Card Chain** split could finalize the card while the tool still ran. The

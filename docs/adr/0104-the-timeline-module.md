@@ -91,18 +91,23 @@ content into them.**
 - **Synthetic entries have their own admission.** An Interaction Receipt, a
   compaction row, a ledger entry, the External Message's lead and a bot-authored
   notice (the Wake 承接 line, a busy-follow static lead) are not read-order
-  content, so they never take the read floor and never join a walk. They enter
+  content, so they never take the read floor and never join a walk. Each variant
+  maps onto the stored `TimelineKind` its call site uses today, so a `Lead`
+  still merges as text and a `Receipt` (the Wake line included) still flushes the
+  pending text run They enter
   through `Timeline::synthetic(entry: SyntheticEntry)` — one content-bearing
-  variant per kind: `Receipt { text, at }`, `Compaction { fact, at,
-  message_time, row }`, `Ledger { entry, ending, at }`, `UserMessage { text, at
-  }`, `Notice { text, at }` — which inserts directly and returns the key the
+  variant per kind: `Receipt { text, at }` (a click's receipt and the Wake 承接
+  line — `TimelineKind::Receipt`), `Compaction { fact, at, message_time, row }`,
+  `Ledger { entry, ending, at }`, `UserMessage { text, at }`, and `Lead { text,
+  at }` (the busy-follow static lead — `TimelineKind::Text`, where it still
+  merges into a text run) — which inserts directly and returns the key the
   entry
   took. It yields no pushable `Placement`, so a synthetic row can never travel
   the transcript path. Every synthetic kind's `at` is an **order key only** —
   a resolved click's **reserved receipt key** (ADR-0038), a Wake's or a message's
-  server time — and never a display clock: a receipt, a notice, a user lead and a
-  compaction row show no clock (as today), while a ledger entry shows its own
-  payload's `finished_at`, not `at`. A compaction's `at` is its order key
+  server time — and never a display clock: a receipt, a lead and a user message
+  show no clock (text blocks), a compaction row shows none, and a ledger entry
+  shows its own payload's `finished_at`, not `at`. A compaction's `at` is its order key
   (`message_time.unwrap_or_else(next_order)`), while `message_time` is the server
   time the **Interaction Receipt cut** compares against — the floor
   `render_compactions` sets around it today (ADR-0038, issue #1023); a timeless
@@ -133,8 +138,9 @@ content into them.**
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
   and `push` / `replace` consume it; it carries the entry key, an optional merge
   identity (`Option<PartSource>`; a source-less placement still takes the read
-  floor, exactly as `part_order_key` applies it today, and only the message-scoped
-  receipt cut distinguishes read-order content), the
+  floor, exactly as `part_order_key` applies it today, while the message-scoped
+  receipt cut applies only to a source-bearing transcript part, as
+  `insert_item` decides), the
   display clock, the floor it was placed under, and a private scope generation. Its fields are private with no public constructor and it is
   neither `Clone` nor `Copy`, so a second push of one token is a compile error; a
   token from another scope fails the generation check, so a placement cannot be
