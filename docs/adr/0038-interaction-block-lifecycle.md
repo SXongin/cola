@@ -387,7 +387,9 @@ pending gap); synthetic content (receipts, wake markers) keeps `next_order()`,
 except the advisory-live opening line, which is keyed at the card head (`0`) so
 an older server position can never sort above it. (The blanket `next_order()`
 above is superseded by ADR-0104's amendment: a synthetic entry may instead be
-keyed at its own server time or at a key the caller already holds.)
+keyed at its own server time, at a key the caller already holds, or at a derived
+key just before the work it introduces (a Wake line and the External Message lead
+use `created_ms - 1`).)
 
 **The receipt's server-time cut.** The borrow no longer stands alone: the
 surfacing work (#1023) carries the asking tool part's server time on the block,

@@ -213,16 +213,15 @@ content into them.**
   floors it) and the current read floor for that message — the high-water mark of
   **earlier** messages only, exactly ADR-0038's rule, recomputed against the
   settle read so content that became visible after the pin still floors the
-  panel. The base read floor is ADR-0038's earlier-messages high-water mark; at
-  settle it is widened, as the deliberate extension, to include **any pinned
-  tail** as placed content, so a later message's part can never sort below a
-  pinned panel (a no-start panel included). The panel's key is
-  `max(current, floor)`, where `current` is its key after any `rekey`. When the
-  floor is **at or above** that key, the panel takes a
-  **key `max(pinned, floor)`**, seated through the normal insert path (so the
-  live-slice late-part clamp still applies), and at that key it sorts by its own
-  part's read position (see below) — after earlier-message entries at the key and
-  before its own message's later parts. A synthetic entry at that key sorts
+  panel. At settle that base floor is widened, as the deliberate extension, to
+  include **any pinned tail** as placed content, so a later message's part can
+  never sort below a pinned panel (a no-start panel included): the accumulator
+  hands `settle` the keys of its other live tails (`settle(tail, panel,
+  read_order, pinned_keys)`). The panel seats at `max(current, floor)`, where
+  `current` is its key after any `rekey` (the original pin before one), through
+  the normal insert path (so the live-slice late-part clamp still applies), and
+  at that key it sorts by its own part's read position (see below) — after
+  earlier-message entries at the key and before its own message's later parts. A synthetic entry at that key sorts
   before both. Placed content never moves, no key or `order` is
   renumbered, and `seq` stays identity. When the panel's own following entry
   sits at a *lower* key (placed before that floor became visible), the floor

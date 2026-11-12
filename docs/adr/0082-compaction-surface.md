@@ -69,7 +69,7 @@ fact and render it.
 2. **It is renderable content.** A newly delivered compaction holds a card's settlement
    exactly as a new text part does — otherwise the marker is decided away on the read
    that carried it. An in-flight one renders a live row that updates in place when it
-   ends. The marker takes its ordered place in the card timeline at its server time: a
+   ends. The marker takes its ordered place in the card body's **Timeline** at its server time: a
    completed one a folded panel naming its reason, summary and usage, a failed one a
    visible failure row with the Backend's error.
 3. **Session-scoped, exactly once.** A compaction is a fact of the **Session**, not of a
@@ -119,7 +119,7 @@ fact and render it.
 - A `running` compaction the server never resolves (a crash mid-compaction) leaves a
   permanent ⏳ row, but wedges nothing: settlement is held for the one read that newly
   delivered it, and the next read may decide an ending.
-- The card timeline gains a `TimelineKind::Compaction`; a `Receipt`-style plain line does
+- The card body's **Timeline** gains a `TimelineKind::Compaction`; a `Receipt`-style plain line does
   not suffice, because the row is a fold.
 - A row's fold body is clipped at `MAX_COMPACTION_SUMMARY_CHARS` (6000 characters — the
   card text budget) with an explicit `…（摘要已截断）` element: one row cannot be split
