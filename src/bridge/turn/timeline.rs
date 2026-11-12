@@ -349,8 +349,9 @@ pub(super) struct TailPlacement {
     /// The floor the pin was placed under (message receipt cut and read
     /// floor). A later `rekey`/`settle` never drops below it.
     floor: Option<i64>,
-    /// The owning message, when a walk pinned it. The compatibility entry
-    /// points (the gap and seed walks, a test push) pin without one.
+    /// The owning message. Every pin on the guard names one: a walk's
+    /// `MessageScope::pin` names the message it scoped, and the scripted test
+    /// seam names its own out-of-read message.
     message: Option<MessageId>,
     created: Option<i64>,
     position: Option<ReadPosition>,
@@ -371,10 +372,10 @@ impl TailPlacement {
     }
 
     /// The fact a later walk or settle needs: which message owns the tail,
-    /// which part pinned it and where it sits. A compatibility pin names no
-    /// message position but still carries its part's identity through the
-    /// source, so the fact can floor a later message. `None` only when the pin
-    /// named neither a message nor a source.
+    /// which part pinned it and where it sits. A pin whose message carries no
+    /// read position (the scripted test seam) still names its message and
+    /// part, so the fact is well-formed; only a pin that named no message at
+    /// all yields `None`.
     pub(super) fn fact(&self) -> Option<TailFact> {
         let message = self.message.clone()?;
         let part = self.position.map_or_else(
@@ -615,9 +616,10 @@ pub(super) fn part_order_times(message: &TranscriptMessage) -> Vec<Option<i64>> 
 }
 
 /// The read position a transcript entry occupies (spec #1040): its own
-/// recorded position, or — for an entry the compatibility walks still push —
-/// its source's message position in the read plus the part index. Synthetic
-/// entries (a receipt, a compaction row, a ledger entry) have none.
+/// recorded position, or — for a source-bearing entry seated without one (the
+/// scripted test seam) — its source's message position in the read plus the
+/// part index. Synthetic entries (a receipt, a compaction row, a ledger entry)
+/// have none.
 fn item_read_position(item: &TimelineItem, read_order: &HashMap<&str, usize>) -> Option<ReadPosition> {
     if !matches!(
         item.kind,
@@ -1167,15 +1169,29 @@ impl Timeline {
         self.items[index].key
     }
 
-    /// Admit one synthetic entry (spec #1040): it inserts directly, takes no
-    /// read or message floor (synthetic content has no message scope — the old
-    /// `insert_item` floored every kind, but no synthetic caller runs inside a
-    /// walk; #1042's walk unifies the floor protocol) and never produces a
-    /// pushable placement. The returned key is the one the entry took — clamped
-    /// to the live slice's first key when the entry's position is behind it.
-    /// `None` means the variant owns no single key: a lead may merge or chunk,
-    /// and an empty user message renders nothing.
+    /// Admit one synthetic entry (spec #1040): it inserts directly, never takes
+    /// the walk's READ floor (synthetic content has no read position) and never
+    /// produces a pushable placement. The returned key is the one the entry
+    /// took — clamped to the live slice's first key when the entry's position
+    /// is behind it. `None` means the variant owns no single key: a lead may
+    /// merge or chunk, and an empty user message renders nothing.
+    ///
+    /// The MESSAGE floor is the caller's: a synthetic entry admitted inside a
+    /// message scope takes that scope's cut ([`Self::synthetic_seated`] via
+    /// [`MessageScope::synthetic`], the compaction walk), while a
+    /// session-scoped one (a receipt, a ledger row, a wake line) has no message
+    /// and keeps its own key. The compaction admission additionally takes its
+    /// own `receipt_cut_floor(message_time)`, which is the same cut for the
+    /// row's own message and so idempotent.
     pub(super) fn synthetic(&mut self, entry: SyntheticEntry<'_>) -> Option<i64> {
+        self.synthetic_seated(entry, None)
+    }
+
+    /// [`Self::synthetic`] with the caller's message floor: the scope a
+    /// compaction row is admitted under supplies its cut, while the row's
+    /// `shown_at` keeps the message's own server time (the cursor frontier's
+    /// recorded start, never a display clock).
+    fn synthetic_seated(&mut self, entry: SyntheticEntry<'_>, message_floor: Option<i64>) -> Option<i64> {
         match entry {
             SyntheticEntry::Receipt { text, at } => {
                 let key = at.unwrap_or_else(|| self.next_order());
@@ -1192,10 +1208,16 @@ impl Timeline {
                     return Some(self.items[index].key);
                 }
                 let key = at.unwrap_or_else(|| self.next_order());
-                // The row takes the Interaction Receipt cut its message earns
-                // (ADR-0038 rule 4), the floor `render_compactions` used to set
-                // around it; a timeless compaction takes none.
-                let floor = message_time.and_then(|created| self.receipt_cut_floor(created));
+                // The row takes the scope's message floor and the Interaction
+                // Receipt cut its own message earns (ADR-0038 rule 4, the floor
+                // `render_compactions` used to set around it); a timeless
+                // compaction takes neither. The two are the same cut for a row
+                // admitted under its own message, so applying both is
+                // idempotent.
+                let floor = message_floor
+                    .into_iter()
+                    .chain(message_time.and_then(|created| self.receipt_cut_floor(created)))
+                    .max();
                 let key = floor.map_or(key, |floor| key.max(floor));
                 // `shown_at` is the cursor frontier's recorded start time, not
                 // a displayed clock: the card renders the row without one
@@ -1685,27 +1707,18 @@ impl MessageScope<'_> {
         }
     }
 
-    /// Settle a pinned tail inside this message scope (spec #1040): the
-    /// timeline's settle, with the walk's read order the caller holds. The
-    /// scripted test seam passes an empty read order, because its pin names no
-    /// read position; production settles through
-    /// [`StreamAccumulator::push_tool_scoped`](super::state::StreamAccumulator).
-    #[cfg(test)]
-    pub(super) fn settle(
-        &mut self,
-        tail: TailPlacement,
-        panel: &ToolPanel,
-        read_order: &HashMap<&str, usize>,
-        pinned_tails: &[TailFact],
-    ) {
-        self.timeline.settle(tail, panel, read_order, pinned_tails);
-    }
-
-    /// Admit one synthetic entry inside this message scope (spec #1043): the
-    /// scope supplies the message floor, and the admission keeps its own
-    /// receipt cut for a compaction row.
+    /// Admit one synthetic entry inside this message scope (spec #1043).
+    ///
+    /// A compaction row takes the scope's **message** floor before the
+    /// admission seats it: the scope's receipt cut and the admission's own
+    /// `receipt_cut_floor(message_time)` are the same cut when the row's
+    /// message is the one the scope names, so applying both is idempotent —
+    /// but the scope's floor, not a caller's, is what makes the row follow a
+    /// click. Other variants keep their own keying (the admission takes no
+    /// read or message floor for them).
     pub(super) fn synthetic(&mut self, entry: SyntheticEntry<'_>) -> Option<i64> {
-        self.timeline.synthetic(entry)
+        let floor = self.timeline.message_floor;
+        self.timeline.synthetic_seated(entry, floor)
     }
 }
 
@@ -2500,6 +2513,45 @@ mod tests {
             before,
             "a blank user message renders nothing"
         );
+    }
+
+    /// Spec #1043: the message scope's floor reaches a compaction row. The row
+    /// names a `message_time` that predates the receipt — so its admission earns
+    /// no cut of its own — while the scope it is admitted under belongs to a
+    /// message created after the ask: the row follows the scope's floor.
+    #[test]
+    fn a_message_scope_floors_a_compaction_row() {
+        let compaction = Compaction {
+            status: CompactionStatus::Completed,
+            reason: CompactionReason::Auto,
+            summary: "floored".into(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        let mut timeline = Timeline::default();
+        timeline.record_cut(1_000, 9_000);
+        let order = HashMap::from([("msg_comp", 0usize)]);
+        let scope_message = MessageId::new("msg_scope");
+        let row = PartSource::at(MessageId::new("msg_comp"), 0);
+        let key = {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(Some(2_000), &scope_message, &[]);
+            scope
+                .synthetic(SyntheticEntry::Compaction {
+                    fact: compaction,
+                    at: Some(500),
+                    // The row's own message predates the ask: no cut of its own.
+                    message_time: Some(1_000),
+                    row,
+                })
+                .expect("a compaction owns one entry")
+        };
+        assert_eq!(
+            key, 9_000,
+            "the scope's message floor, not the row's own cut, places it"
+        );
+        assert_eq!(timeline.entries()[0].key(), 9_000);
     }
 
     /// Spec #1040's guard invariant: a message scope's `Drop` clears its

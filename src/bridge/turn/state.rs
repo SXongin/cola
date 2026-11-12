@@ -1221,6 +1221,15 @@ pub(super) enum EndingWrite {
     Failed,
 }
 
+/// One compaction fact a read owes a card (spec #1043): the transcript position
+/// that identifies its row, the message's server time (both the row's
+/// pre-floor seed and the receipt cut its message earns) and the fact itself.
+pub(super) struct CompactionRow {
+    pub(super) source: PartSource,
+    pub(super) at: Option<i64>,
+    pub(super) fact: Compaction,
+}
+
 /// Accumulates streaming state for one session.
 #[derive(Default, Clone)]
 pub(super) struct StreamAccumulator {
@@ -3078,7 +3087,14 @@ impl StreamAccumulator {
         compaction: &Compaction,
     ) {
         let read_order = HashMap::new();
-        self.place_compactions(&read_order, std::iter::once((source, at_ms, compaction.clone())));
+        self.place_compactions(
+            &read_order,
+            std::iter::once(CompactionRow {
+                source,
+                at: at_ms,
+                fact: compaction.clone(),
+            }),
+        );
     }
 
     /// Place the compaction rows this read owes through the walk guard (spec
@@ -3089,16 +3105,19 @@ impl StreamAccumulator {
     pub(super) fn place_compactions(
         &mut self,
         read_positions: &HashMap<&str, usize>,
-        rows: impl IntoIterator<Item = (PartSource, Option<i64>, Compaction)>,
+        rows: impl IntoIterator<Item = CompactionRow>,
     ) {
         let mut walk = self.timeline.walk(read_positions);
-        for (source, at_ms, compaction) in rows {
+        for CompactionRow { source, at, fact } in rows {
             let message = source.message_id().clone();
-            let mut scope = walk.message(at_ms, &message, &[]);
+            let mut scope = walk.message(at, &message, &[]);
+            // A row's own server time is both its pre-floor seed and the cut
+            // its message earns, so the scope's message floor and the
+            // admission's `receipt_cut_floor(message_time)` are the same cut.
             let _ = scope.synthetic(SyntheticEntry::Compaction {
-                fact: compaction,
-                at: at_ms,
-                message_time: at_ms,
+                fact,
+                at,
+                message_time: at,
                 row: source,
             });
         }
@@ -3639,8 +3658,8 @@ impl StreamAccumulator {
     /// consecutive text chunks so the card doesn't produce one element each).
     /// Text is chunked so no single timeline item exceeds `MAX_CARD_TEXT_CHARS`
     /// — the card splitter can then break a long answer across cards at item
-    /// boundaries instead of truncating it. Production renders go through
-    /// [`Self::push_text_at_key`]; [`Self::push_text`] and
+    /// boundaries instead of truncating it. Production renders place through
+    /// [`Self::push_text_scoped`] (the message scope); [`Self::push_text`] and
     /// [`Self::push_text_at`] are test-only convenience forms.
     #[cfg(test)]
     pub(super) fn push_text(&mut self, chunk: &str) {
@@ -3685,7 +3704,8 @@ impl StreamAccumulator {
     /// time at all, so the card sorts them by the transcript's own order while
     /// the Rendered Cursor frontier must keep the part's real (absent) start
     /// time. `key_at` positions the entries; `shown_at` is what the entry
-    /// displays and what the cursor records.
+    /// displays and what the cursor records. Test-only: production renders
+    /// place through [`Self::push_text_scoped`].
     #[cfg(test)]
     pub(super) fn push_text_at_key(
         &mut self,
@@ -3712,9 +3732,9 @@ impl StreamAccumulator {
 
     /// Append a reasoning chunk, keeping it in the chronological timeline
     /// (chunks of the same part merge into one panel; a part keyed apart is
-    /// its own panel). Production renders go through
-    /// [`Self::push_reasoning_at_key`]; this convenience form is for tests and
-    /// synthetic content.
+    /// its own panel). Production renders place through
+    /// [`Self::push_reasoning_scoped`] (the message scope); this convenience
+    /// form is for tests and synthetic content.
     #[cfg(test)]
     pub(super) fn push_reasoning(&mut self, chunk: &str) {
         self.push_reasoning_at(None, chunk);
@@ -3723,7 +3743,7 @@ impl StreamAccumulator {
     /// [`Self::push_reasoning`] for a reasoning part that started at `at_ms`
     /// (the server's `time.start`); `None` keys it by fallback and shows no
     /// clock. Test-only like [`Self::push_reasoning`]: production renders go
-    /// through [`Self::push_reasoning_at_key`].
+    /// through [`Self::push_reasoning_scoped`].
     #[cfg(test)]
     pub(super) fn push_reasoning_at(&mut self, at_ms: Option<i64>, chunk: &str) {
         self.push_reasoning_from(at_ms, None, chunk);
@@ -3732,7 +3752,7 @@ impl StreamAccumulator {
     /// [`Self::push_reasoning_at`] carrying the typed transcript part this
     /// chunk rendered from (spec #561's cursor frontier). Synthetic pushes
     /// pass `None`. Test-only: a production render that needs an order key
-    /// apart from the displayed time calls [`Self::push_reasoning_at_key`].
+    /// apart from the displayed time calls [`Self::push_reasoning_scoped`].
     #[cfg(test)]
     pub(super) fn push_reasoning_from(
         &mut self,
@@ -3761,6 +3781,8 @@ impl StreamAccumulator {
     /// the server time it may show: V2's reasoning time is optional, so an
     /// untimed part sorts by the transcript's own order while the entry (and
     /// its cursor frontier) keeps the absent server clock (issue #1022).
+    /// Test-only: production renders place through
+    /// [`Self::push_reasoning_scoped`].
     #[cfg(test)]
     pub(super) fn push_reasoning_at_key(
         &mut self,
@@ -3785,47 +3807,49 @@ impl StreamAccumulator {
         );
     }
 
-    /// The message time the integration suite's source-less test pushes script
-    /// (spec #1040's test seam, #1043).
+    /// The scripted message the integration suite's source-less test pushes
+    /// run in (spec #1040's test seam, #1043): a message created at the
+    /// scripted time, outside the read — so it names no read position and no
+    /// pinned tail, and a test push keeps its own ordering.
     #[cfg(test)]
-    fn scripted_message_time(&self) -> Option<i64> {
-        self.scripted_message
-    }
-
-    /// Push one source-less chunk through a scripted message scope (spec
-    /// #1040's test seam, #1043): the walk mints the placement, so the receipt
-    /// cut a message created at [`Self::scripted_message_time`] earns floors it
-    /// exactly as a real message scope would. The scripted message names no read
-    /// position and no pinned tail, so a test push keeps its own ordering.
-    #[cfg(test)]
-    fn push_scripted(&mut self, facts: PartFacts, kind: TranscriptKind) {
-        let created = self.scripted_message_time();
-        let read_order = HashMap::new();
-        let message = MessageId::new("cola:scripted");
-        let body = match &kind {
-            TranscriptKind::Text { chunk, .. } => Some((true, chunk.clone())),
-            TranscriptKind::Reasoning { chunk, .. } => Some((false, chunk.clone())),
-            TranscriptKind::Tool(_) => None,
-        };
-        let mut walk = self.timeline.walk(&read_order);
-        let mut scope = walk.message(created, &message, &[]);
-        let placement = scope.place(facts);
-        let result = scope.push(placement, kind);
-        drop(scope);
-        drop(walk);
-        result.expect("the scripted message scope accepts its own placement");
-        if let Some((is_text, chunk)) = body {
-            if is_text {
-                self.text.push_str(&chunk);
-            } else {
-                self.reasoning.push_str(&chunk);
-            }
+    fn scripted_transcript(&self) -> TranscriptMessage {
+        TranscriptMessage {
+            id: MessageId::new("cola:scripted"),
+            role: crate::backend::MessageRole::Assistant,
+            time: self.scripted_message.map(|created| crate::backend::MessageTime {
+                created,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: Vec::new(),
         }
     }
 
+    /// Push one source-less chunk through the production message scope (spec
+    /// #1040's test seam, #1043): the same `push_*_scoped` path a real walk
+    /// uses, with the scripted message's cut as the only floor, so the seam
+    /// has no body of its own to drift.
+    #[cfg(test)]
+    fn push_scripted(&mut self, facts: PartFacts, kind: TranscriptKind) {
+        let read_order = HashMap::new();
+        let message = self.scripted_transcript();
+        let result = match kind {
+            TranscriptKind::Text { chunk, lead } => {
+                self.push_text_scoped(&read_order, &message, facts, chunk, lead)
+            }
+            TranscriptKind::Reasoning { chunk, lead } => {
+                self.push_reasoning_scoped(&read_order, &message, facts, chunk, lead)
+            }
+            TranscriptKind::Tool(_) => unreachable!("a tool push goes through push_tool_scoped"),
+        };
+        result.expect("the scripted message scope accepts its own placement");
+    }
+
     /// Insert/update a tool panel; the timeline gets a marker only on the FIRST
-    /// appearance (state updates re-render in place). Production renders go
-    /// through [`Self::push_tool_at`]; this convenience form is test-only.
+    /// appearance (state updates re-render in place). Production renders place
+    /// through [`Self::push_tool_scoped`]; this convenience form is test-only.
     #[cfg(test)]
     pub(super) fn push_tool(&mut self, call_id: &str, panel: ToolPanel) {
         self.push_tool_at(None, call_id, panel);
@@ -3847,7 +3871,7 @@ impl StreamAccumulator {
     /// rendered from (spec #561, review #569): a settled panel's timeline entry
     /// keeps it, so it can become the Rendered Cursor frontier. Test-only: a
     /// production render that needs an order key apart from the displayed time
-    /// calls [`Self::push_tool_at_key`].
+    /// calls [`Self::push_tool_scoped`].
     #[cfg(test)]
     pub(super) fn push_tool_from(
         &mut self,
@@ -3861,7 +3885,8 @@ impl StreamAccumulator {
 
     /// [`Self::push_tool_from`] for a call whose timeline ORDER key is not the
     /// server time it may show (issue #1022): an untimed part borrows the
-    /// previous part's key while the panel keeps showing no clock.
+    /// previous part's key while the panel keeps showing no clock. Test-only:
+    /// production renders place through [`Self::push_tool_scoped`].
     #[cfg(test)]
     pub(super) fn push_tool_at_key(
         &mut self,
@@ -3871,65 +3896,10 @@ impl StreamAccumulator {
         panel: ToolPanel,
         source: Option<PartSource>,
     ) {
-        let live = panel.is_live();
-        let is_new = !self.tools.contains_key(call_id);
-        if is_new {
-            let facts = PartFacts {
-                form: PartForm::Tool,
-                key_at,
-                shown_at,
-                source,
-                index: 0,
-            };
-            if live {
-                // Unfinished: TAIL content. The pin consumes the scripted
-                // message's cut; a split must never finalize a panel whose tool
-                // is still running (ADR-0045).
-                let tail = {
-                    let created = self.scripted_message_time();
-                    let read_order = HashMap::new();
-                    let message = MessageId::new("cola:scripted");
-                    let mut walk = self.timeline.walk(&read_order);
-                    let mut scope = walk.message(created, &message, &[]);
-                    scope.pin(facts, call_id.to_string())
-                };
-                self.live_tools.insert(call_id.to_string(), tail);
-            } else {
-                self.push_scripted(facts, TranscriptKind::Tool(call_id.to_string()));
-            }
-            self.tools.insert(call_id.to_string(), panel);
-        } else if let Some(tail) = self.live_tools.get_mut(call_id) {
-            // A later sighting may carry the server start time the first one
-            // lacked (a pending call with no time). The panel is not on the
-            // timeline yet, so the real start time REPLACES the synthetic
-            // fallback key, clamped to the floor the pin carried.
-            self.timeline.rekey(tail, shown_at);
-            tail.adopt_source(source);
-            if !live {
-                // Settled: the panel joins the timeline at the key it was born
-                // with — clamped to the top of the live slice when that key is
-                // behind it (ADR-0038's late-part rule) — carrying the element
-                // identity it was born with, so its fold state survives.
-                let tail = self.live_tools.shift_remove(call_id).expect("checked");
-                let created = self.scripted_message_time();
-                let read_order = HashMap::new();
-                let message = MessageId::new("cola:scripted");
-                let mut walk = self.timeline.walk(&read_order);
-                let mut scope = walk.message(created, &message, &[]);
-                scope.settle(tail, &panel, &read_order, &[]);
-                drop(scope);
-                drop(walk);
-                self.tools.insert(call_id.to_string(), panel);
-            } else {
-                self.tools.insert(call_id.to_string(), panel);
-            }
-        } else {
-            self.timeline.adopt_tool_shown_at(call_id, shown_at);
-            self.tools.insert(call_id.to_string(), panel);
-        }
-        // A running-tool phase starts/exits here (running → completed), so the
-        // header timer must follow even though card_state stays Streaming.
-        self.refresh_phase();
+        let read_order = HashMap::new();
+        let message = self.scripted_transcript();
+        self.push_tool_scoped(&read_order, &message, 0, key_at, shown_at, call_id, panel, source)
+            .expect("the scripted message scope accepts its own tool placement");
     }
 
     /// Every live tail's fact, as the walk and the settle read them (spec
@@ -5479,33 +5449,23 @@ impl StreamAccumulator {
         );
     }
 
-    /// Replace a part's entry run through a scripted message scope (spec
-    /// #1040's test seam, #1043): the same guarded replace a real walk uses,
-    /// with the scripted message's cut as the only floor.
+    /// Replace a part's entry run through the production message scope (spec
+    /// #1040's test seam, #1043): the same `replace_*_scoped` path a real walk
+    /// uses, with the scripted message's cut as the only floor.
     #[cfg(test)]
     fn replace_scripted(&mut self, source: &PartSource, facts: PartFacts, kind: TranscriptKind) {
-        let created = self.scripted_message_time();
         let read_order = HashMap::new();
-        let message = MessageId::new("cola:scripted");
-        let body = match &kind {
-            TranscriptKind::Text { chunk, .. } => Some((true, chunk.clone())),
-            TranscriptKind::Reasoning { chunk, .. } => Some((false, chunk.clone())),
-            TranscriptKind::Tool(_) => None,
-        };
-        let mut walk = self.timeline.walk(&read_order);
-        let mut scope = walk.message(created, &message, &[]);
-        let placement = scope.place(facts);
-        let result = scope.replace(placement, source, kind);
-        drop(scope);
-        drop(walk);
-        result.expect("the scripted message scope accepts its own rewrite");
-        if let Some((is_text, chunk)) = body {
-            if is_text {
-                self.text.push_str(&chunk);
-            } else {
-                self.reasoning.push_str(&chunk);
+        let message = self.scripted_transcript();
+        let result = match kind {
+            TranscriptKind::Text { chunk, .. } => {
+                self.replace_text_scoped(&read_order, &message, source, facts, chunk)
             }
-        }
+            TranscriptKind::Reasoning { chunk, .. } => {
+                self.replace_reasoning_scoped(&read_order, &message, source, facts, chunk)
+            }
+            TranscriptKind::Tool(_) => unreachable!("a tool panel has no rewritten run"),
+        };
+        result.expect("the scripted message scope accepts its own rewrite");
     }
 
     /// The source a rewritten part's fresh run carries: its position with the
