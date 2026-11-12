@@ -5,7 +5,9 @@
 > replacement to the floor the pin carried. `settle` then floors the panel with
 > the **current** receipt cut for its message's created time and the Timeline's
 > current read floor for the panel's message — the **earlier** messages'
-> high-water mark, plus any **pinned tail** (ADR-0104's settle extension) — and
+> high-water mark, plus the **pinned tails** that precede it in read order
+> (earlier messages' and its own message's preceding ones; a later same-message
+> tail never raises it — ADR-0104's settle extension) — and
 > applies ADR-0038's late-part clamp, so the panel cannot jump a receipt or
 > content read before it. Its key is `max(current, floor)` (the current key after
 > any `rekey`); at that key it sorts by its own part's read position, landing

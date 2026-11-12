@@ -73,10 +73,12 @@ per ADR-0050) owns the ordered entries of a card body and the rule that places
 content into them.**
 
 - **The interface is a walk.** `timeline.walk(&read_order)` yields a walk, and
-  `walk.message(created, id, pinned_tail_keys)` yields a message scope, taking
-  the live tails at that message (the caller builds the list from the
-  accumulator's current map, so a tool pinned earlier in the same pass floors
-  later messages; pass an empty slice when there is none). The scope's
+  `walk.message(created, id, pinned_tails)` yields a message scope, taking the
+  live tails **as positioned facts** (message identity, part index, key) at that
+  message; the Timeline itself keeps only earlier messages' tails and the
+  message's own preceding ones, so the caller cannot pass a later sibling. The
+  list is built from the accumulator's current map, so a tool pinned earlier in
+  the same pass floors later messages. The scope's
   `place(part facts) -> Placement` and `push(placement, kind: TranscriptKind)`
   are the only
   way transcript content enters. Transcript content is a separate type at the
@@ -168,7 +170,7 @@ content into them.**
   five-layer push wrappers collapse.
 - **The walk's read floor includes pinned tails.** Each message's `place` floors
   the message at the highest key of earlier messages' placed entries **and their
-  pinned tails** (the per-message `pinned_tail_keys`), so a later message's part can
+  pinned tails** (the per-message `pinned_tails`), so a later message's part can
   never be placed above a panel still riding the tail under clock skew. This is
   the deliberate extension to ADR-0038's high-water mark. Within the panel's own
   message, `settle`'s `pinned_keys` covers only tails that precede it in part
@@ -220,9 +222,10 @@ content into them.**
   the Timeline keeps only earlier messages' tails and the panel's own preceding
   ones (a later same-message tail can never raise the floor). The panel seats at
   `max(current, floor)` — `current` is its key after any `rekey`, the original pin
-  before one — capped at the first following entry of its own message when that
-  entry sits at or after the floor, so a real start time never pushes it past a
-  same-message continuation. It goes through the normal insert path (the
+  before one — capped at the first entry that follows the panel in read order
+  (its own message's later parts, then later messages') when that entry's key is
+  at or above the floor, so a real start time never carries it past content the
+  read already placed after it. It goes through the normal insert path (the
   live-slice late-part clamp included), and at that key it sorts by its own
   part's read position (see below) — after earlier-message entries at the key and
   before its own message's later parts. A synthetic entry at that key sorts
