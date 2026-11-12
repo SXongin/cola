@@ -134,11 +134,13 @@ content into them.**
   rather than updating a finalized one. That successor row is **terminal only** —
   the finalized card keeps the `running` revision it was sent with — and the
   delivered bound must not suppress a position the live slice no longer carries.
-  The bound itself advances only for a **terminal** revision: a `running`
-  compaction row is excluded from `frontier_for` (only a terminal row names its
-  position), so a confirmed running write cannot push the session's delivered
-  position past its own message and a refused or restarted terminal revision is
-  still re-renderable.
+  Restart-safety needs a revision-keyed fact, not the positional bound: the
+  Chain Record gains a session-scoped, bounded **`delivered_compactions`** set
+  (position identity), written when a **terminal** revision's card write
+  confirms. `owed_compactions` replays a terminal revision unless its position is
+  in that set, regardless of where the content bound stands; a `running` revision
+  never enters it, and a `running` row is excluded from `frontier_for` so a
+  confirmed running write does not name a delivered position.
   `owed_compactions` therefore keeps a **separate all-timeline "already carried"
   probe** that matches the row's **revision** (`same_row`, not position alone): a
   `running` row found behind `render_from` may render its terminal revision on
@@ -174,6 +176,12 @@ content into them.**
   token from another scope fails the generation check, so a placement cannot be
   replayed into a later message. Bare order keys stop crossing the seam; the
   five-layer push wrappers collapse.
+- **The walk's read floor includes pinned tails.** Each message's `place` floors
+  the message at the highest key of earlier messages' placed entries **and their
+  pinned tails**, so a later message's part can never be placed above a panel
+  that is still riding the tail under clock skew. This is the deliberate
+  extension to ADR-0038's high-water mark; within the panel's own message,
+  `settle`'s `pinned_keys` covers the tails that precede it in part order.
 - **Equal keys order by class, then read position.** Every source-bearing
   transcript entry carries its part's read position (the message's position in
   the read, then the part index); at equal keys those entries compare by it,
@@ -208,16 +216,15 @@ content into them.**
   body in the tool map. `MessageScope::pin(facts, call_id)` produces it; it
   cannot be pushed, only settled. `Timeline::rekey(tail, started_at)` applies ADR-0045's
   replacement, clamped to the floor the pin carried.
-  `Timeline::settle(tail, panel, read_order)` re-applies the **current** receipt
-  cut for the tail's message created time (a receipt recorded after the pin still
-  floors it) and the current read floor for that message — the high-water mark of
-  **earlier** messages only, exactly ADR-0038's rule, recomputed against the
-  settle read so content that became visible after the pin still floors the
-  panel. At settle that base floor is widened, as the deliberate extension, to
-  include **any pinned tail** as placed content, so a later message's part can
-  never sort below a pinned panel (a no-start panel included): the accumulator
-  hands `settle` the keys of its other live tails (`settle(tail, panel,
-  read_order, pinned_keys)`). The panel seats at `max(current, floor)`, where
+  `Timeline::settle(tail, panel, read_order, pinned_keys)` re-applies the
+  **current** receipt cut for the tail's message created time (a receipt recorded
+  after the pin still floors it) and the current read floor for that message,
+  recomputed against the settle read. That floor is ADR-0038's earlier-messages
+  high-water mark **plus the keys of pinned tails**: an earlier message's pinned
+  tail counts as placed content for every later message's `place` (deliberate
+  extension — otherwise a later message's part can sort above a pinned panel), and
+  `pinned_keys` covers the tails in the panel's own message that precede it in
+  part order. The panel seats at `max(current, floor)`, where
   `current` is its key after any `rekey` (the original pin before one), through
   the normal insert path (so the live-slice late-part clamp still applies), and
   at that key it sorts by its own part's read position (see below) — after
