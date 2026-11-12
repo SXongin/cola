@@ -3,9 +3,11 @@
 > **Amended by ADR-0104** when it lands: a tail-only panel's allocated key may
 > still be replaced by a later real start time, but `settle` first floors it with
 > the **current** receipt cut for its message's created time and the Timeline's
-> **current read-order high-water mark** (a monotonic maximum key over placed
-> transcript entries), then applies ADR-0038's late-part clamp — so the panel
-> cannot jump a receipt or content read after it was pinned.
+> then-current read floor for the panel's message (the **earlier** messages'
+> high-water mark, ADR-0038), then applies ADR-0038's late-part clamp — so the
+> panel cannot jump a receipt or content read before it. A raised key takes a
+> fresh allocation order above the equal-key run, so it renders after the content
+> that floored it.
 
 A **Tool Panel** rendered as a timeline row: it sat where its tool call started,
 and a **Card Chain** split could finalize the card while the tool still ran. The
