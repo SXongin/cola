@@ -24,7 +24,7 @@ use crate::bridge::span;
 use crate::bridge::tasks::TaskRunId;
 use crate::bridge::turn::state;
 use crate::bridge::turn::state::{LedgerCadence, LedgerChange, RenderedPart, StreamAccumulator};
-use crate::bridge::turn::timeline::PartSource;
+use crate::bridge::turn::timeline::{PartFacts, PartForm, PartSource, part_order_times};
 use crate::config::ThreadKey;
 use crate::feishu::card::compaction::same_row;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
@@ -186,44 +186,6 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
     }
 }
 
-/// The timeline order key of every part in `message` (issue #1022). V2's text
-/// item carries no time at all, so — for the parts BEFORE the message's first
-/// tool call — the read's own order supplies it: a part without a time borrows
-/// the floor (the previous timed part's start, or the message's `time.created`),
-/// and a timed part behind the floor takes the floor too. The first tool call
-/// and everything after it keep the pre-#1022 order (the part's own time, or the
-/// render-order fallback): a part after a tool was produced after that call's
-/// result, and the resolution receipt's own ordering (ADR-0038 rule 4) stays
-/// untouched. Every entry's `shown_at` (and so the Rendered Cursor frontier)
-/// still carries only the server's time.
-fn part_order_times(message: &crate::backend::TranscriptMessage) -> Vec<Option<i64>> {
-    let first_tool = message
-        .parts
-        .iter()
-        .position(|part| matches!(part, Part::Tool(_)));
-    let mut floor = message.time.as_ref().map(|time| time.created);
-    let mut orders = Vec::with_capacity(message.parts.len());
-    for (index, part) in message.parts.iter().enumerate() {
-        if first_tool.is_none_or(|first| index >= first) {
-            orders.push(part.started_at());
-            continue;
-        }
-        let order = match part {
-            Part::Text(_) | Part::Reasoning(_) => match part.started_at() {
-                Some(own) => Some(floor.map_or(own, |floor| floor.max(own))),
-                None => floor,
-            },
-            _ => {
-                orders.push(None);
-                continue;
-            }
-        };
-        floor = order;
-        orders.push(order);
-    }
-    orders
-}
-
 /// Render one typed part into the accumulator, applying the dedup rules
 /// ([`renders_part`]): text and reasoning are tracked by their content
 /// (OpenCode part payloads carry NO `id`, AGENTS.md pitfall `wire-shapes`), and a tool call
@@ -320,6 +282,215 @@ fn render_part(
     // card_state / running-tool changes reset the header phase timer.
     acc.refresh_phase();
     true
+}
+
+/// Render one typed part through the Timeline's message scope (spec #1040):
+/// the turn walk's only content path. It mirrors [`render_part`]'s dedup and
+/// rewrite rules, but placement and the floors ride the scope's `Placement` /
+/// `TranscriptKind` instead of the accumulator's compatibility push wrappers.
+fn render_part_scoped(
+    acc: &mut StreamAccumulator,
+    message: &crate::backend::TranscriptMessage,
+    index: usize,
+    part: &Part,
+    order_at: Option<i64>,
+    read_positions: &std::collections::HashMap<&str, usize>,
+) -> bool {
+    let source = PartSource::at(message.id.clone(), index);
+    if acc.part_seeded_delivered(source.message_id(), part) {
+        return false;
+    }
+    if !renders_part(acc, part) {
+        return false;
+    }
+    match part {
+        Part::Text(text) => {
+            acc.mark_rendered(RenderedPart::Text(text.text.clone()));
+            if acc.source_rewritten(&source, &text.text) {
+                let key = acc.entry_key_of(&source).or(order_at);
+                let rewritten = acc.rewrite_source(&source, &text.text, None);
+                let facts = PartFacts {
+                    form: PartForm::Text,
+                    key_at: key,
+                    shown_at: text.started_at,
+                    source: Some(rewritten),
+                    index,
+                };
+                let _ = acc.replace_text_scoped(read_positions, message, &source, facts, text.text.clone());
+            } else {
+                let (source, chunk) = source_chunk(acc, Some(source), &text.text, None);
+                let facts = PartFacts {
+                    form: PartForm::Text,
+                    key_at: order_at,
+                    shown_at: text.started_at,
+                    source,
+                    index,
+                };
+                let _ = acc.push_text_scoped(read_positions, message, facts, chunk, None);
+            }
+            acc.mark_streaming();
+        }
+        Part::Reasoning(reasoning) => {
+            acc.mark_rendered(RenderedPart::Reasoning(reasoning.text.clone()));
+            if acc.source_rewritten(&source, &reasoning.text) {
+                let key = acc.entry_key_of(&source).or(order_at);
+                let rewritten = acc.rewrite_source(
+                    &source,
+                    &reasoning.text,
+                    Some(crate::feishu::card::REASONING_TEXT_CAP),
+                );
+                let facts = PartFacts {
+                    form: PartForm::Reasoning,
+                    key_at: key,
+                    shown_at: reasoning.started_at,
+                    source: Some(rewritten),
+                    index,
+                };
+                let _ = acc.replace_reasoning_scoped(
+                    read_positions,
+                    message,
+                    &source,
+                    facts,
+                    reasoning.text.clone(),
+                );
+            } else {
+                let (source, chunk) = source_chunk(
+                    acc,
+                    Some(source),
+                    &reasoning.text,
+                    Some(crate::feishu::card::REASONING_TEXT_CAP),
+                );
+                let facts = PartFacts {
+                    form: PartForm::Reasoning,
+                    key_at: order_at,
+                    shown_at: reasoning.started_at,
+                    source,
+                    index,
+                };
+                let _ = acc.push_reasoning_scoped(read_positions, message, facts, chunk, None);
+            }
+            acc.mark_reasoning();
+        }
+        Part::Tool(call) => {
+            if call.identity.name == "todowrite" {
+                acc.record_todo_call(call);
+            } else {
+                let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
+                let _ = acc.push_tool_scoped(
+                    read_positions,
+                    message,
+                    index,
+                    order_at,
+                    call.started_at,
+                    &call.identity.call_id,
+                    panel,
+                    Some(source),
+                );
+            }
+            if call.status == ToolStatus::Running {
+                acc.mark_streaming();
+            }
+        }
+        Part::StepStart(_) | Part::StepFinish(_) | Part::Patch(_) | Part::File(_) | Part::Other(_) => {
+            return false;
+        }
+        Part::Compaction(_) => return false,
+    }
+    acc.refresh_phase();
+    true
+}
+
+/// [`render_seeded_part`] through the Timeline's message scope (spec #1040).
+fn render_seeded_part_scoped(
+    acc: &mut StreamAccumulator,
+    message: &crate::backend::TranscriptMessage,
+    index: usize,
+    part: &Part,
+    delivered: usize,
+    order_at: Option<i64>,
+    read_positions: &std::collections::HashMap<&str, usize>,
+) -> bool {
+    let message_id = message.id.clone();
+    let (full, started_at, is_text) = match part {
+        Part::Text(text) => (text.text.as_str(), text.started_at, true),
+        Part::Reasoning(reasoning) => (reasoning.text.as_str(), reasoning.started_at, false),
+        _ => {
+            acc.mark_delivered_part(&message_id, part);
+            return false;
+        }
+    };
+    let full_len = full.chars().count();
+    let delivered = delivered.min(full_len);
+    let source = PartSource::at(message_id.clone(), index);
+    let held = acc.source_held_chars(&source);
+    let extent = acc.source_extent(&source);
+    let cap = (!is_text).then_some(crate::feishu::card::REASONING_TEXT_CAP);
+    if held > 0 && !acc.source_prefix_holds(&source, full, extent) {
+        acc.mark_delivered_part(&message_id, part);
+        let key = acc.entry_key_of(&source).or(order_at);
+        let rewritten = acc.rewrite_source(&source, full, cap);
+        let facts = PartFacts {
+            form: if is_text {
+                PartForm::Text
+            } else {
+                PartForm::Reasoning
+            },
+            key_at: key,
+            shown_at: started_at,
+            source: Some(rewritten),
+            index,
+        };
+        let result = if is_text {
+            acc.replace_text_scoped(read_positions, message, &source, facts, full.to_string())
+        } else {
+            acc.replace_reasoning_scoped(read_positions, message, &source, facts, full.to_string())
+        };
+        let _ = result;
+        if is_text {
+            acc.mark_streaming();
+        } else {
+            acc.mark_reasoning();
+        }
+        record_seed_extent(acc, &source, delivered);
+        return !full.is_empty();
+    }
+    let (cut, before) = if held == 0 {
+        (delivered, delivered)
+    } else {
+        (held, 0)
+    };
+    let prefix: String = full.chars().take(cut).collect();
+    let suffix: String = full.chars().skip(cut).collect();
+    acc.mark_delivered_part(&message_id, part);
+    if !suffix.is_empty() {
+        let lead = crate::feishu::card::sanitize::neutralize_tail(&prefix, &suffix);
+        let source = PartSource::new(message_id.clone(), index, before, None);
+        let facts = PartFacts {
+            form: if is_text {
+                PartForm::Text
+            } else {
+                PartForm::Reasoning
+            },
+            key_at: order_at,
+            shown_at: started_at,
+            source: Some(source.clone()),
+            index,
+        };
+        let result = if is_text {
+            acc.push_text_scoped(read_positions, message, facts, suffix.clone(), lead)
+        } else {
+            acc.push_reasoning_scoped(read_positions, message, facts, suffix.clone(), lead)
+        };
+        let _ = result;
+        if is_text {
+            acc.mark_streaming();
+        } else {
+            acc.mark_reasoning();
+        }
+        acc.stamp_source_digest(&source, full);
+    }
+    record_seed_extent(acc, &source, delivered);
+    !suffix.is_empty()
 }
 
 /// The chunk an ordinary source-carrying text/reasoning render still owes the
@@ -1635,13 +1806,11 @@ pub(super) fn render_turn_parts(
     bound: Option<usize>,
 ) -> bool {
     acc.capture_turn_anchor(transcript);
-    acc.reset_read_floor();
     // The orphan gap this accumulator owes (spec #561, review #569) renders
     // first, on the first read that can place its cursor: the content was never
     // on a card, while the chain's Rendered Cursor has already advanced past
     // the delivered content that follows it — one frontier cannot express both.
     let gap_rendered = render_pending_gap_once(acc, transcript);
-    acc.reset_read_floor();
     // The seed's live set (spec #561) reconciles on EVERY render read, before
     // the anchor gate below: a seeded call is resolved by call identity against
     // the whole read, so it needs no Turn anchor. In the canonical restart
@@ -1655,7 +1824,6 @@ pub(super) fn render_turn_parts(
     // The live set reconciles on every read — `||` would skip it whenever the
     // gap rendered (spec #561, review #569).
     let mut rendered_any = resolve_seeded_calls(acc, transcript);
-    acc.reset_read_floor();
     rendered_any |= gap_rendered;
     // The Session's compaction facts (ADR-0082) render before the anchor gate,
     // for the same reason the live set does: a compaction is a fact of the
@@ -1665,7 +1833,6 @@ pub(super) fn render_turn_parts(
     // chain's durable delivered frontier ([`rendered_bound`]), so a row an
     // earlier card already showed is never replayed onto this one.
     rendered_any |= render_compactions(acc, transcript, bound);
-    acc.reset_read_floor();
     // The seed (spec #561) resolves against THIS read: its at-or-before-the-
     // frontier rule uses the read's own message order. The positions map serves
     // both walks below — the seed's own scope and the accumulator's window.
@@ -1690,7 +1857,6 @@ pub(super) fn render_turn_parts(
     if let Some(scope) = seed_scope(acc) {
         rendered_any |= render_seed_scope(acc, transcript, &scope, &message_positions, &mut seeded_messages);
     }
-    acc.reset_read_floor();
     let Some(anchor) = acc.turn_anchor().cloned() else {
         return rendered_any;
     };
@@ -1750,13 +1916,10 @@ pub(super) fn render_turn_parts(
             }
         }
         let message_pos = message_positions.get(message.id.as_str()).copied();
-        // A message the server created after a receipt's ask is post-click
-        // content: every part of it sorts after the receipt (issue #1023).
-        acc.set_message_floor(message_floor_time(message));
-        let floor = acc.read_floor_before(&read_positions, &message.id);
-        acc.set_read_floor(floor);
         // The part order keys this message's card entries sort by (issue #1022):
-        // V2 text parts carry no time, so they borrow the previous part's.
+        // V2 text parts carry no time, so they borrow the previous part's. The
+        // walk's message scope applies the receipt cut, the read floor and the
+        // live-slice clamp; this loop never sets either floor by hand.
         let order_keys = part_order_times(message);
         for (index, part) in message.parts.iter().enumerate() {
             let cut = match (seed.as_ref(), message_pos) {
@@ -1772,8 +1935,15 @@ pub(super) fn render_turn_parts(
                 // — only a position the window actually renders retires it.
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
                 crate::bridge::turn::state::SeedCut::Frontier(delivered) => {
-                    if render_seeded_part(acc, message.id.clone(), index, part, delivered, order_keys[index])
-                    {
+                    if render_seeded_part_scoped(
+                        acc,
+                        message,
+                        index,
+                        part,
+                        delivered,
+                        order_keys[index],
+                        &read_positions,
+                    ) {
                         rendered_any = true;
                     }
                 }
@@ -1790,16 +1960,13 @@ pub(super) fn render_turn_parts(
                     // Cursor frontier (spec #561): parts carry no id (AGENTS.md
                     // pitfall `wire-shapes`), so the message identity plus the
                     // ordinal is the whole position.
-                    let source = PartSource::at(message.id.clone(), index);
-                    if render_part(acc, Some(source), part, order_keys[index]) {
+                    if render_part_scoped(acc, message, index, part, order_keys[index], &read_positions) {
                         rendered_any = true;
                     }
                 }
             }
         }
-        acc.set_message_floor(None);
     }
-    acc.reset_read_floor();
     rendered_any
 }
 

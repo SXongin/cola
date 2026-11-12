@@ -8,10 +8,13 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
-use super::timeline::{PartSource, SyntheticEntry, Timeline, TimelineItem, TimelineKind};
+use super::timeline::{
+    PartFacts, PartForm, PartSource, PlacementError, SyntheticEntry, TailFact, TailPlacement, Timeline,
+    TimelineItem, TimelineKind, TranscriptKind,
+};
 use crate::backend::{
-    Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor,
-    TurnDiffStats,
+    Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TranscriptMessage,
+    TurnAnchor, TurnDiffStats,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
 use crate::bridge::handles::CardsHandle;
@@ -383,19 +386,11 @@ pub(super) enum SeedCut {
     Undelivered,
 }
 
-/// Bookkeeping for a Tool Panel that is still live (ADR-0045): the timeline
-/// key and element identity allocated when its call first appeared, so the
-/// settle move into the timeline lands in the call's original order and keeps
-/// the reader's fold state. The typed part position it rendered from travels
-/// along (spec #561, review #569), so its settled entry can become the
-/// Rendered Cursor frontier.
-#[derive(Debug, Clone)]
-struct LiveTool {
-    key: i64,
-    shown_at: Option<i64>,
-    seq: u64,
-    source: Option<PartSource>,
-}
+// The live (unsettled) tool tail is the Timeline's `TailPlacement` (spec
+// #1040): the key, display clock, merge identity, floor, owning message and
+// part, call id and pinned `seq` allocated when its call first appeared, so the
+// settle move into the timeline lands in the call's original order and keeps
+// the reader's fold state (ADR-0045).
 
 /// A card as built for one message: the JSON, whether the timeline had to
 /// split (the caller then sends a continuation), and the element ranges of the
@@ -1280,7 +1275,7 @@ pub(super) struct StreamAccumulator {
     /// appeared. A live panel renders in the card TAIL, so a split can never
     /// strand it on a closed card; it joins `timeline` — with the identity it
     /// was born with — only when the tool settles (ADR-0045).
-    live_tools: IndexMap<String, LiveTool>,
+    live_tools: IndexMap<String, TailPlacement>,
     /// The seed's live set (spec #561): the tool call ids a takeover's
     /// projection seed handed this successor — the calls whose newest
     /// DELIVERED state was `running`, or, for a cursorless record's fallback,
@@ -2994,10 +2989,10 @@ impl StreamAccumulator {
         self.timeline.receipt_cut_floor(created)
     }
 
-    /// Set (or clear) the floor for the transcript message about to render: the
-    /// walk calls this per message, so every part it pushes — including chunks
-    /// that continue a part across reads — is placed at or after the receipt
-    /// written for a click that preceded the message.
+    /// Set (or clear) the floor for the transcript message about to render.
+    /// The compatibility walks (#1043 moves them) and the test seam call this
+    /// per message; the turn walk's [`super::timeline::MessageScope`] applies
+    /// the same cut itself.
     pub(super) fn set_message_floor(&mut self, created: Option<i64>) {
         self.timeline.set_message_floor(created);
     }
@@ -3812,60 +3807,35 @@ impl StreamAccumulator {
     ) {
         let live = panel.is_live();
         let is_new = !self.tools.contains_key(call_id);
-        self.tools.insert(call_id.to_string(), panel);
+        self.tools.insert(call_id.to_string(), panel.clone());
         if is_new {
-            let key = key_at.unwrap_or_else(|| self.timeline.next_order());
             if live {
-                // Unfinished: TAIL content. Allocate its identity and key now,
-                // but do not join the timeline — a split must never finalize a
-                // panel whose tool is still running (ADR-0045). The tail's key
-                // is pinned at birth with the walk's read floor; #1042's `pin`
-                // will own that floor. A settled entry lets the Timeline apply
-                // its own message and read floors.
-                let key = self.timeline.read_floor_key(key, source.is_some());
-                let seq = self.timeline.allocate_seq();
-                self.live_tools.insert(
-                    call_id.to_string(),
-                    LiveTool {
-                        key,
-                        shown_at,
-                        seq,
-                        source,
-                    },
-                );
+                // Unfinished: TAIL content. The pin consumes the current
+                // message and read floors; a split must never finalize a panel
+                // whose tool is still running (ADR-0045).
+                let tail = self
+                    .timeline
+                    .pin_compat(key_at, shown_at, source, call_id.to_string());
+                self.live_tools.insert(call_id.to_string(), tail);
             } else {
+                let key = key_at.unwrap_or_else(|| self.timeline.next_order());
                 self.timeline
                     .insert_tool(key, shown_at, source, None, call_id.to_string());
             }
-        } else if self.live_tools.contains_key(call_id) {
+        } else if let Some(tail) = self.live_tools.get_mut(call_id) {
             // A later sighting may carry the server start time the first one
-            // lacked (a pending call with no time). The panel is not on
-            // the timeline yet, so the real start time REPLACES the synthetic
-            // fallback key — the settle move must land where the call started.
-            if let Some(at) = shown_at {
-                let entry = self.live_tools.get_mut(call_id).expect("checked");
-                entry.shown_at = entry.shown_at.or(shown_at);
-                entry.key = at;
-            }
-            if let Some(source) = source
-                && let Some(entry) = self.live_tools.get_mut(call_id)
-                && entry.source.is_none()
-            {
-                entry.source = Some(source);
-            }
+            // lacked (a pending call with no time). The panel is not on the
+            // timeline yet, so the real start time REPLACES the synthetic
+            // fallback key, clamped to the floor the pin carried.
+            self.timeline.rekey(tail, shown_at);
+            tail.adopt_source(source);
             if !live {
                 // Settled: the panel joins the timeline at the key it was born
                 // with — clamped to the top of the live slice when that key is
                 // behind it (ADR-0038's late-part rule) — carrying the element
                 // identity it was born with, so its fold state survives.
-                let entry = self.live_tools.shift_remove(call_id).expect("checked");
-                self.timeline.insert_tool(
-                    entry.key,
-                    entry.shown_at,
-                    entry.source,
-                    Some(entry.seq),
-                    call_id.to_string(),
-                );
+                let tail = self.live_tools.shift_remove(call_id).expect("checked");
+                self.timeline.settle_compat(tail, &panel);
             }
         } else {
             self.timeline.adopt_tool_shown_at(call_id, shown_at);
@@ -3873,6 +3843,183 @@ impl StreamAccumulator {
         // A running-tool phase starts/exits here (running → completed), so the
         // header timer must follow even though card_state stays Streaming.
         self.refresh_phase();
+    }
+
+    /// Every live tail's fact, as the walk and the settle read them (spec
+    /// #1040): a pin earlier in the pass still floors later messages, and a
+    /// settle re-applies the earlier messages' and the panel's own preceding
+    /// tails. Compatibility pins (the walks #1043 moves) name no message and
+    /// contribute no fact.
+    pub(super) fn pinned_tail_facts(&self) -> Vec<TailFact> {
+        self.live_tools.values().filter_map(TailPlacement::fact).collect()
+    }
+
+    /// Place and push one transcript part through a message scope (spec
+    /// #1040): the only production path for transcript content. The walk and
+    /// its message scope drop immediately after, clearing both floors.
+    fn place_push(
+        &mut self,
+        read_positions: &HashMap<&str, usize>,
+        message: &TranscriptMessage,
+        facts: PartFacts,
+        kind: TranscriptKind,
+    ) -> Result<(), PlacementError> {
+        let pinned = self.pinned_tail_facts();
+        let mut walk = self.timeline.walk(read_positions);
+        let mut scope = walk.message(message.time.map(|time| time.created), &message.id, &pinned);
+        let placement = scope.place(facts);
+        scope.push(placement, kind)
+    }
+
+    /// Drop a rewritten part's entry run and push its fresh content through
+    /// one message scope (spec #561's replace rule; #1044 owns the public
+    /// replace path). The floors apply exactly as on the ordinary push.
+    fn replace_place_push(
+        &mut self,
+        read_positions: &HashMap<&str, usize>,
+        message: &TranscriptMessage,
+        replaced: &PartSource,
+        facts: PartFacts,
+        kind: TranscriptKind,
+    ) -> Result<(), PlacementError> {
+        let pinned = self.pinned_tail_facts();
+        let mut walk = self.timeline.walk(read_positions);
+        let mut scope = walk.message(message.time.map(|time| time.created), &message.id, &pinned);
+        let placement = scope.place(facts);
+        scope.replace(placement, replaced, kind)
+    }
+
+    /// [`Self::push_text_at_key`] through the message scope (spec #1040).
+    pub(super) fn push_text_scoped(
+        &mut self,
+        read_positions: &HashMap<&str, usize>,
+        message: &TranscriptMessage,
+        facts: PartFacts,
+        chunk: String,
+        lead: Option<String>,
+    ) -> Result<(), PlacementError> {
+        self.text.push_str(&chunk);
+        self.place_push(
+            read_positions,
+            message,
+            facts,
+            TranscriptKind::Text { chunk, lead },
+        )
+    }
+
+    /// [`Self::push_reasoning_at_key`] through the message scope (spec #1040).
+    pub(super) fn push_reasoning_scoped(
+        &mut self,
+        read_positions: &HashMap<&str, usize>,
+        message: &TranscriptMessage,
+        facts: PartFacts,
+        chunk: String,
+        lead: Option<String>,
+    ) -> Result<(), PlacementError> {
+        self.reasoning.push_str(&chunk);
+        self.place_push(
+            read_positions,
+            message,
+            facts,
+            TranscriptKind::Reasoning { chunk, lead },
+        )
+    }
+
+    /// [`Self::replace_text_run`] through the message scope (spec #1040).
+    pub(super) fn replace_text_scoped(
+        &mut self,
+        read_positions: &HashMap<&str, usize>,
+        message: &TranscriptMessage,
+        replaced: &PartSource,
+        facts: PartFacts,
+        chunk: String,
+    ) -> Result<(), PlacementError> {
+        self.text.push_str(&chunk);
+        self.replace_place_push(
+            read_positions,
+            message,
+            replaced,
+            facts,
+            TranscriptKind::Text { chunk, lead: None },
+        )
+    }
+
+    /// [`Self::replace_reasoning_run`] through the message scope (spec #1040).
+    pub(super) fn replace_reasoning_scoped(
+        &mut self,
+        read_positions: &HashMap<&str, usize>,
+        message: &TranscriptMessage,
+        replaced: &PartSource,
+        facts: PartFacts,
+        chunk: String,
+    ) -> Result<(), PlacementError> {
+        self.reasoning.push_str(&chunk);
+        self.replace_place_push(
+            read_positions,
+            message,
+            replaced,
+            facts,
+            TranscriptKind::Reasoning { chunk, lead: None },
+        )
+    }
+
+    /// [`Self::push_tool_at_key`] through the message scope (spec #1040): a
+    /// running call pins a [`TailPlacement`] that never enters `push`; a
+    /// settled first sighting pushes its entry; a settled live tail settles.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn push_tool_scoped(
+        &mut self,
+        read_positions: &HashMap<&str, usize>,
+        message: &TranscriptMessage,
+        index: usize,
+        key_at: Option<i64>,
+        shown_at: Option<i64>,
+        call_id: &str,
+        panel: ToolPanel,
+        source: Option<PartSource>,
+    ) -> Result<(), PlacementError> {
+        let live = panel.is_live();
+        let is_new = !self.tools.contains_key(call_id);
+        self.tools.insert(call_id.to_string(), panel.clone());
+        if is_new {
+            let facts = PartFacts {
+                form: PartForm::Tool,
+                key_at,
+                shown_at,
+                source,
+                index,
+            };
+            if live {
+                let pinned = self.pinned_tail_facts();
+                let mut walk = self.timeline.walk(read_positions);
+                let mut scope = walk.message(message.time.map(|time| time.created), &message.id, &pinned);
+                let tail = scope.pin(facts, call_id.to_string());
+                drop(scope);
+                drop(walk);
+                self.live_tools.insert(call_id.to_string(), tail);
+            } else {
+                self.place_push(
+                    read_positions,
+                    message,
+                    facts,
+                    TranscriptKind::Tool(call_id.to_string()),
+                )?;
+            }
+        } else if let Some(tail) = self.live_tools.get_mut(call_id) {
+            // A later sighting may carry the server start time the first one
+            // lacked: re-key it, never below the floor the pin carried.
+            self.timeline.rekey(tail, shown_at);
+            tail.adopt_source(source);
+            if !live {
+                let tail = self.live_tools.shift_remove(call_id).expect("checked");
+                let pinned = self.pinned_tail_facts();
+                self.timeline.settle(tail, &panel, read_positions, &pinned);
+            }
+        } else {
+            self.timeline.adopt_tool_shown_at(call_id, shown_at);
+        }
+        self.refresh_phase();
+        Ok(())
     }
 
     /// Record the latest whole TODO list and its write clock. This is the one
@@ -4873,7 +5020,7 @@ impl StreamAccumulator {
                 if let Some(panel) = self.tools.get(call_id) {
                     builder = builder.with_tool_at(
                         panel.clone(),
-                        live.shown_at,
+                        live.shown_at(),
                         Some(&format!("tool_{call_id}")),
                         self.session_id.as_deref(),
                     );
@@ -5064,7 +5211,7 @@ impl StreamAccumulator {
     /// later read must not move it — a `Now` key or a borrowed floor can differ
     /// between reads, and re-keying would split the part into two entries
     /// (issue #1022).
-    fn entry_key_of(&self, source: &PartSource) -> Option<i64> {
+    pub(super) fn entry_key_of(&self, source: &PartSource) -> Option<i64> {
         self.timeline.entry_key_of(source)
     }
 
@@ -5211,7 +5358,7 @@ impl StreamAccumulator {
     /// what the card can display — the same prefix [`Self::source_extent`]
     /// counts (issue #1025). A digest over the whole >cap part could never be
     /// verified against that extent, and every pass took the rewrite branch.
-    fn rewrite_source(&self, source: &PartSource, text: &str, cap: Option<usize>) -> PartSource {
+    pub(super) fn rewrite_source(&self, source: &PartSource, text: &str, cap: Option<usize>) -> PartSource {
         let shown = text.chars().count().min(cap.unwrap_or(usize::MAX));
         PartSource::new(
             source.message_id().clone(),
