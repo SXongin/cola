@@ -73,11 +73,12 @@ per ADR-0050) owns the ordered entries of a card body and the rule that places
 content into them.**
 
 - **The interface is a walk.** `timeline.walk(&read_order)` yields a walk, and
-  `walk.message(created, id, pinned_tail_keys)` takes the live tails at that
-  message (the caller builds the key list from the accumulator's current map, so
-  a tool pinned earlier in the same pass floors later messages);
-  `walk.message(created, id)` yields a message scope; the scope's `place(part
-  facts) -> Placement` and `push(placement, kind: TranscriptKind)` are the only
+  `walk.message(created, id, pinned_tail_keys)` yields a message scope, taking
+  the live tails at that message (the caller builds the list from the
+  accumulator's current map, so a tool pinned earlier in the same pass floors
+  later messages; pass an empty slice when there is none). The scope's
+  `place(part facts) -> Placement` and `push(placement, kind: TranscriptKind)`
+  are the only
   way transcript content enters. Transcript content is a separate type at the
   seam (`TranscriptKind::{Text { chunk, lead }, Reasoning { chunk, lead },
   Tool(call_id)}`; synthetic entries have their own admission below), so a
@@ -209,8 +210,8 @@ content into them.**
   high-water mark **plus the keys of pinned tails**: an earlier message's pinned
   tail counts as placed content for every later message's `place` (deliberate
   extension — otherwise a later message's part can sort above a pinned panel), and
-  `pinned_keys` covers the tails in the panel's own message that precede it in
-  part order. The panel seats at `max(current, floor)`, where
+  `pinned_keys` carries **all** of them: earlier messages' tails plus the tails in
+  the panel's own message that precede it in part order. The panel seats at `max(current, floor)`, where
   `current` is its key after any `rekey` (the original pin before one), through
   the normal insert path (so the live-slice late-part clamp still applies), and
   at that key it sorts by its own part's read position (see below) — after
@@ -236,7 +237,7 @@ content into them.**
 - **Behaviour-preserving.** ADR-0038's receipt-skew window, ADR-0071's
   cursorless fallback and every current ordering test are unchanged, apart from
   the tail-only settle clamp, the read-position tie-break and the compaction
-  live-slice lookup above. The timeline tests
+  whole-timeline compaction lookup above. The timeline tests
   move beside the module;
   the guards gain invariant tests (a message scope always clears its floor — a
   later transcript part with a key older than the dropped scope's floor is not
