@@ -3898,13 +3898,19 @@ impl StreamAccumulator {
         chunk: String,
         lead: Option<String>,
     ) -> Result<(), PlacementError> {
-        self.text.push_str(&chunk);
-        self.place_push(
+        let result = self.place_push(
             read_positions,
             message,
             facts,
-            TranscriptKind::Text { chunk, lead },
-        )
+            TranscriptKind::Text {
+                chunk: chunk.clone(),
+                lead,
+            },
+        );
+        if result.is_ok() {
+            self.text.push_str(&chunk);
+        }
+        result
     }
 
     /// [`Self::push_reasoning_at_key`] through the message scope (spec #1040).
@@ -3916,13 +3922,19 @@ impl StreamAccumulator {
         chunk: String,
         lead: Option<String>,
     ) -> Result<(), PlacementError> {
-        self.reasoning.push_str(&chunk);
-        self.place_push(
+        let result = self.place_push(
             read_positions,
             message,
             facts,
-            TranscriptKind::Reasoning { chunk, lead },
-        )
+            TranscriptKind::Reasoning {
+                chunk: chunk.clone(),
+                lead,
+            },
+        );
+        if result.is_ok() {
+            self.reasoning.push_str(&chunk);
+        }
+        result
     }
 
     /// [`Self::replace_text_run`] through the message scope (spec #1040).
@@ -3934,14 +3946,20 @@ impl StreamAccumulator {
         facts: PartFacts,
         chunk: String,
     ) -> Result<(), PlacementError> {
-        self.text.push_str(&chunk);
-        self.replace_place_push(
+        let result = self.replace_place_push(
             read_positions,
             message,
             replaced,
             facts,
-            TranscriptKind::Text { chunk, lead: None },
-        )
+            TranscriptKind::Text {
+                chunk: chunk.clone(),
+                lead: None,
+            },
+        );
+        if result.is_ok() {
+            self.text.push_str(&chunk);
+        }
+        result
     }
 
     /// [`Self::replace_reasoning_run`] through the message scope (spec #1040).
@@ -3953,14 +3971,20 @@ impl StreamAccumulator {
         facts: PartFacts,
         chunk: String,
     ) -> Result<(), PlacementError> {
-        self.reasoning.push_str(&chunk);
-        self.replace_place_push(
+        let result = self.replace_place_push(
             read_positions,
             message,
             replaced,
             facts,
-            TranscriptKind::Reasoning { chunk, lead: None },
-        )
+            TranscriptKind::Reasoning {
+                chunk: chunk.clone(),
+                lead: None,
+            },
+        );
+        if result.is_ok() {
+            self.reasoning.push_str(&chunk);
+        }
+        result
     }
 
     /// [`Self::push_tool_at_key`] through the message scope (spec #1040): a
@@ -3980,7 +4004,6 @@ impl StreamAccumulator {
     ) -> Result<(), PlacementError> {
         let live = panel.is_live();
         let is_new = !self.tools.contains_key(call_id);
-        self.tools.insert(call_id.to_string(), panel.clone());
         if is_new {
             let facts = PartFacts {
                 form: PartForm::Tool,
@@ -4005,6 +4028,7 @@ impl StreamAccumulator {
                     TranscriptKind::Tool(call_id.to_string()),
                 )?;
             }
+            self.tools.insert(call_id.to_string(), panel);
         } else if let Some(tail) = self.live_tools.get_mut(call_id) {
             // A later sighting may carry the server start time the first one
             // lacked: re-key it, never below the floor the pin carried.
@@ -4015,8 +4039,10 @@ impl StreamAccumulator {
                 let pinned = self.pinned_tail_facts();
                 self.timeline.settle(tail, &panel, read_positions, &pinned);
             }
+            self.tools.insert(call_id.to_string(), panel);
         } else {
             self.timeline.adopt_tool_shown_at(call_id, shown_at);
+            self.tools.insert(call_id.to_string(), panel);
         }
         self.refresh_phase();
         Ok(())
