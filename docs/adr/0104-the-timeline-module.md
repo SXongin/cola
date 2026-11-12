@@ -88,12 +88,11 @@ content into them.**
   `Ledger { entry, ending, at }`, `UserMessage { text, at }`,
   `Notice { text, at }` — which inserts directly and returns the key the entry
   took. It yields no pushable `Placement`, so a synthetic row can never travel
-  the transcript path. A **receipt's** `at` is an order key only — a resolved
-  click's **reserved receipt key** (ADR-0038) or a server time — and its card
-  shows no clock. The card renders a `Notice` and a `UserMessage` as text blocks,
-  which show no clock today; the **compaction row** and the **ledger entry** are
-  the only synthetic kinds that display `at` as a server time, and only when
-  `Some`. A minted fallback is never displayed anywhere. The **compaction row** is
+  the transcript path. Every synthetic kind's `at` is an **order key only** —
+  a resolved click's **reserved receipt key** (ADR-0038), a Wake's or a message's
+  server time — and never a display clock: a receipt, a notice, a user lead and a
+  compaction row show no clock (as today), while a ledger entry shows its own
+  payload's `finished_at`, not `at`. The **compaction row** is
   the one that takes the Interaction Receipt cut for its message time — the
   floor `render_compactions` sets around it today (ADR-0038, issue #1023); the
   others are placed outside any floor window today and keep that. `row` is the
@@ -108,9 +107,10 @@ content into them.**
   retune or drop cuts. `reservation_seq`, `reserved_receipts` and every
   `request_id` stay in the accumulator, which owns the reservation's lifecycle.
 - **A `Placement` is an owned, linear token, not a borrow.** `place` returns it
-  and `push` / `replace` consume it; it carries the entry key, the merge identity
-  (`PartSource`), the display clock, the floor it was placed under, and a private
-  scope generation. Its fields are private with no public constructor and it is
+  and `push` / `replace` consume it; it carries the entry key, an optional merge
+  identity (`Option<PartSource>` — a source-less placement is not read-order
+  content and takes no read floor, exactly as `insert_item` decides today), the
+  display clock, the floor it was placed under, and a private scope generation. Its fields are private with no public constructor and it is
   neither `Clone` nor `Copy`, so a second push of one token is a compile error; a
   token from another scope fails the generation check, so a placement cannot be
   replayed into a later message. Bare order keys stop crossing the seam; the
@@ -127,7 +127,9 @@ content into them.**
   the Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
   the sealed-entry set, merge-by-part lookup, key minting (`next_order`) and
   entry identity (`seq`, including the seq a live tool panel pins when it
-  settles, ADR-0045).
+  settles, ADR-0045). `TimelineKind` keeps its current shape (`Tool(call_id)`
+  among the variants) and gains no generic parameter — there is no second entry
+  adapter.
 - **What does not move.** The live (unsettled) tool tail stays in the
   accumulator as a `TailPlacement` — key, display clock, merge identity, the
   floor it was placed under, the message's **created time** (the receipt cut's
@@ -148,10 +150,10 @@ content into them.**
   replace defined above. The **Rendered Cursor** and its staging, the ledger,
   the interactions and the card build stay where they are. `StreamAccumulator`
   keeps its name.
-- **The integration suite's seam stays.** `Turn::push_text` / `Turn::push_tool`
-  and the test-only `Turn::push_text_at` / `Turn::push_tool_at` /
-  `Turn::set_message_floor` keep working through a test-only Timeline admission
-  (a scripted message scope); no production caller gains a new path.
+- **The integration suite's seam stays.** `Turn::push_text` / `Turn::push_tool` /
+  `Turn::push_reasoning`, their `_at` forms, and `Turn::set_message_floor` keep
+  working through a test-only Timeline admission (a scripted, source-less message
+  scope); no production caller gains a new path.
 - **Behaviour-preserving.** ADR-0038's receipt-skew window, ADR-0071's
   cursorless fallback and every current ordering test are unchanged, apart from
   the tail-only re-key clamp above. The timeline tests move beside the module;
@@ -162,7 +164,9 @@ content into them.**
   while the slice reaches it and returns the clamped key after a split past it, a
   rewritten run's later chunk merges into the new run, a seeded cut inside a
   fence keeps its opener, a post-click compaction row still floors at the
-  receipt, and a repeated compaction fact updates the row it already has).
+  receipt, a repeated compaction fact updates the row it already has, a Wake
+  ledger entry shows its `finished_at` across a minute boundary rather than its
+  keyed clock, and a compaction row shows no clock).
 
 ## Consequences
 
