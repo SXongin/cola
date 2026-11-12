@@ -72,9 +72,10 @@ bare `i64`s.
 per ADR-0050) owns the ordered entries of a card body and the rule that places
 content into them.**
 
-- **The interface is a walk.** `timeline.walk(&read_order, pinned_tail_keys)` yields
-  a walk; the accumulator passes its live tails' keys, each mapped to its message
-  (the walk is built once per pass, so this is a snapshot);
+- **The interface is a walk.** `timeline.walk(&read_order)` yields a walk, and
+  `walk.message(created, id, pinned_tail_keys)` takes the live tails at that
+  message (the caller builds the key list from the accumulator's current map, so
+  a tool pinned earlier in the same pass floors later messages);
   `walk.message(created, id)` yields a message scope; the scope's `place(part
   facts) -> Placement` and `push(placement, kind: TranscriptKind)` are the only
   way transcript content enters. Transcript content is a separate type at the
@@ -162,7 +163,7 @@ content into them.**
   five-layer push wrappers collapse.
 - **The walk's read floor includes pinned tails.** Each message's `place` floors
   the message at the highest key of earlier messages' placed entries **and their
-  pinned tails** (from `walk`'s `pinned_tail_keys`), so a later message's part can
+  pinned tails** (the per-message `pinned_tail_keys`), so a later message's part can
   never be placed above a panel still riding the tail under clock skew. This is
   the deliberate extension to ADR-0038's high-water mark. Within the panel's own
   message, `settle`'s `pinned_keys` covers only tails that precede it in part
@@ -219,11 +220,11 @@ content into them.**
   sits at a *lower* key (placed before that floor became visible), the floor
   wins and the panel lands after it. So a tail-only panel cannot jump a receipt cut or
   content read after it was pinned, before or after its start time arrives.
-  The deliberate tightenings are the settle clamp, the read-position tie-break
-  at equal keys, and the compaction row's live-slice lookup (a terminal fact
-  after a split lands on the live card instead of updating a finalized row);
-  tests pin them, and every other placement rule and every current test is
-  unchanged. Content-keyed dedup and the rewritten
+  The deliberate tightenings are the settle clamp and the read-position tie-break
+  at equal keys; tests pin them, and every other placement rule and every current
+  test is unchanged. The compaction row's update-in-place lookup keeps its
+  current whole-timeline behaviour: the split/restart case is #1049, out of this
+  batch. Content-keyed dedup and the rewritten
   part's prefix digest stay in the accumulator; the Timeline owns the entry-run
   replace defined above. The **Rendered Cursor** and its staging, the ledger,
   the interactions and the card build stay where they are. `StreamAccumulator`
@@ -252,10 +253,8 @@ content into them.**
   reaches it and returns the clamped key after a split past it; a seeded cut
   inside a fence keeps its opener; a **source-bearing** post-click part floored
   to a receipt's key still sorts below that receipt; a post-click compaction row
-  still floors at the receipt; a repeated compaction fact updates the row it already has; a
-  compaction row finalized by a split takes a terminal-only live row when its
-  terminal fact arrives, the bound bypass keys on the carried revision, and a
-  second split does not recreate an already-terminal row; a Wake ledger entry
+  still floors at the receipt; a repeated compaction fact updates the row it
+  already has; a Wake ledger entry
   shows its `finished_at` across a minute boundary rather than its keyed clock;
   and a compaction row shows no clock).
 

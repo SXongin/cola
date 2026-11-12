@@ -5,11 +5,16 @@
 > amendment at the end.
 >
 > **Amended by ADR-0104 when it lands**: §2's "at its server time" gains one
-> floor — a compaction created after a click takes the Interaction Receipt cut —
-> and its in-place update is scoped to the live slice. The split/restart case
-> where a terminal revision lands after the running one was confirmed is a
-> separate delivery gap tracked in #1049; this amendment does not change §3's
-> exactly-once across Turns.
+> floor — a compaction created after a click takes the Interaction Receipt cut.
+> The split/restart case where a terminal revision lands after the running one was
+> confirmed is a separate delivery gap tracked in #1049; neither §3's
+> exactly-once nor the 2026-11-07 busy-follow exception changes.
+>
+> **Amended (2026-11-07)**: §3's exactly-once is a promise about the live
+> timeline's own render. The busy follow's static lead repeats the read tail's
+> Compaction markers for #1002's equal-body contract, so a followed card may
+> show the same compaction twice — once in the lead, once in the timeline. See
+> the amendment at the end.
 
 V2 persists a compaction as a first-class message (`status` running/completed/failed,
 `reason` auto|manual, `summary`, `recent`, and the compaction request's own usage), and
