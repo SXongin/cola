@@ -1,5 +1,10 @@
 # In-flight Tool Panels ride the live card; settled panels join the timeline
 
+> **Amended by ADR-0104**: a tail-only panel's allocated key may still be
+> replaced by a later real start time, but the replacement is clamped to the
+> floor its placement already carried (the receipt cut and the read floor), so
+> it cannot jump a post-click receipt.
+
 A **Tool Panel** rendered as a timeline row: it sat where its tool call started,
 and a **Card Chain** split could finalize the card while the tool still ran. The
 finalized card then froze the panel at `⏳` forever, and the delta continuation
