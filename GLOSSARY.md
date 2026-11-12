@@ -308,7 +308,7 @@ The ordered entries one card body is built from, and the one owner of where an e
 _Avoid_: Card Timeline (it is `turn/timeline.rs`; the card renders it), entry list (it is ordered, and the ordering rule is the point), element list (that is the Feishu card JSON).
 
 **Placement**:
-The value a **Timeline** walk produces for one transcript part: the entry key it sorts at, the merge identity that keeps a later chunk in the same entry, and the server clock the card shows. It is what a push accepts, so a caller no longer passes a bare `i64` order key beside a bare `i64` display time. Distinct from a **Rendered Cursor** position: a Placement says where content goes on the body being built; the Cursor says how far a delivered body has got.
+The value a **Timeline** walk produces for one transcript part: the entry key it sorts at, the merge identity that keeps a later chunk in the same entry, the server clock the card shows, and the floor it was placed under. It is what a push accepts, so a caller no longer passes a bare `i64` order key beside a bare `i64` display time. The floor is what a tail-only **Tool Panel**'s late start time is clamped to. Distinct from a **Rendered Cursor** position: a Placement says where content goes on the body being built; the Cursor says how far a delivered body has got.
 _Avoid_: key (one field of it), order (a field, and the name of the rule), slot (a physical position, not the identity-bearing value).
 
 **Session Sync** (会话同步):
