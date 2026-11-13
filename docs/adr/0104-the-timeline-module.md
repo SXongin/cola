@@ -210,19 +210,20 @@ and every existing test is unchanged.
   `an_earlier_messages_pinned_tail_floors_a_later_message` and
   `the_accumulators_scoped_push_uses_the_pinned_tail_floor`.
 
-### One interface, short-lived scopes
+### One interface, one walk per pass
 
-The batch's "one walk" is one interface, not one long-lived borrow. A
-`MessageScope` holds `&mut Timeline`, so a walk cannot span the accumulator
-state a push also needs (the panel body, the reply buffers, the tool map). The
-production paths therefore open a scope per placement: `place_push`,
-`replace_place_push` and `push_tool_scoped`'s pin each open a walk, take one
-message scope, place (and push or pin), then let both drop; the compaction walk
-(`place_compactions`) opens one walk per read and one scope per row. The
-invariant is what matters: no caller holds a scope across a mutation it does
-not own, and no accessor sets a floor by hand — the four former walks
-(`render_turn_parts`, `render_pending_gap`, `render_seed_scope`,
-`resolve_seeded_calls`) contain no `set_message_floor`, `set_read_floor` or
+The walk is one interface per render pass, not a borrow of the timeline. A
+`Walk` carries only the read's message-position map; the accumulator hands the
+timeline to each `place` / `push` / `replace` / `pin` / `synthetic` call, so
+preparation — chunking, content dedup, the rewrite digest, the panel body —
+stays free to use the accumulator between placements. Each pass opens ONE walk
+and one `MessageScope` per message: `render_turn_parts`'s window,
+`render_pending_gap`, `render_seed_scope` and `resolve_seeded_calls`, plus the
+compaction walk (`place_compactions`, one walk per read and one scope per row).
+The scope owns the message floor, the read floor, the read position and the
+scope generation; its `Drop` clears both floors, so it is the only clearer and
+a half-written protocol cannot survive it. No accessor sets a floor by hand, and
+the four walks contain no `set_message_floor`, `set_read_floor` or
 `reset_read_floor` call. The only remaining `Turn::set_message_floor` is the
 `#[cfg(test)]` scripted seam, which delegates to a real message scope.
 
@@ -231,9 +232,9 @@ not own, and no accessor sets a floor by hand — the four former walks
 ADR-0038 says a part already on the timeline "keeps the key it was placed at",
 because a later read's floor can differ and re-keying would split a growing
 part. The rewrite path keeps that rule and restores the floor `place` computed
-before the run dropped: `replace` takes `max(placement.key, placement.floor)`
-after `drop_source_run` and before `push`, because `push` applies no floor of
-its own. Same part, same key — unless the
+before the run dropped: `replace` raises `placement.key` to
+`max(placement.key, placement.floor)` BEFORE dropping the run
+(`drop_source_run`), then pushes under it; `push` applies no floor of its own. Same part, same key — unless the
 read's floor has moved past it, in which case the rewritten run takes the floor,
 exactly as the pre-module replace did. Pinned by
 `a_rewritten_run_keeps_the_boundary_on_its_entry`,

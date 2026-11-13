@@ -8,13 +8,17 @@
 //! accumulator's own tests are the module's internal seam.
 
 use super::disposition::Disposition;
+#[cfg(test)]
+use super::timeline::PartForm;
 use super::timeline::{
-    PartFacts, PartForm, PartSource, PlacementError, ReservationKeys, SyntheticEntry, TailFact,
+    MessageScope, PartFacts, PartSource, PlacementError, ReservationKeys, SyntheticEntry, TailFact,
     TailPlacement, Timeline, TimelineItem, TimelineKind, TranscriptKind,
 };
+#[cfg(test)]
+use crate::backend::TranscriptMessage;
 use crate::backend::{
-    Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TranscriptMessage,
-    TurnAnchor, TurnDiffStats,
+    Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor,
+    TurnDiffStats,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
 use crate::bridge::handles::CardsHandle;
@@ -2716,6 +2720,26 @@ impl StreamAccumulator {
         &self.timeline
     }
 
+    /// The timeline module, for the render pass's per-message scopes: the
+    /// scope borrows no accumulation state, so a caller hands the timeline in
+    /// per placement and keeps using the accumulator between calls.
+    pub(super) fn timeline_mut(&mut self) -> &mut Timeline {
+        &mut self.timeline
+    }
+
+    /// How many message scopes the timeline has minted, for the render seam's
+    /// one-scope-per-message test.
+    #[cfg(test)]
+    pub(super) fn scopes_minted(&self) -> usize {
+        self.timeline.scopes_minted()
+    }
+
+    /// Restart the scope counter, for that same test.
+    #[cfg(test)]
+    pub(super) fn reset_scopes_minted(&mut self) {
+        self.timeline.reset_scopes_minted();
+    }
+
     /// Seat a pre-allocated identity at `key` for the Timeline's clamp test:
     /// no production path seats an arbitrary identity outside a settle move.
     #[cfg(test)]
@@ -3101,19 +3125,22 @@ impl StreamAccumulator {
         read_positions: &HashMap<&str, usize>,
         rows: impl IntoIterator<Item = CompactionRow>,
     ) {
-        let mut walk = self.timeline.walk(read_positions);
+        let walk = Timeline::walk(read_positions);
         for CompactionRow { source, at, fact } in rows {
             let message = source.message_id().clone();
-            let mut scope = walk.message(at, &message, &[]);
+            let mut scope = walk.message(&mut self.timeline, at, &message, &[]);
             // A row's own server time is both its pre-floor seed and the cut
             // its message earns, so the scope's message floor and the
             // admission's `receipt_cut_floor(message_time)` are the same cut.
-            let _ = scope.synthetic(SyntheticEntry::Compaction {
-                fact,
-                at,
-                message_time: at,
-                row: source,
-            });
+            let _ = scope.synthetic(
+                &mut self.timeline,
+                SyntheticEntry::Compaction {
+                    fact,
+                    at,
+                    message_time: at,
+                    row: source,
+                },
+            );
         }
     }
 
@@ -3697,7 +3724,14 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        self.push_text_scoped(&read_order, &message, facts, chunk.to_string(), lead)
+        let walk = Timeline::walk(&read_order);
+        let mut scope = walk.message(
+            &mut self.timeline,
+            message.time.map(|time| time.created),
+            &message.id,
+            &[],
+        );
+        self.push_text_scoped(&mut scope, facts, chunk.to_string(), lead)
             .expect("the scripted message scope accepts its own placement");
     }
 
@@ -3746,7 +3780,14 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        self.push_reasoning_scoped(&read_order, &message, facts, chunk.to_string(), lead)
+        let walk = Timeline::walk(&read_order);
+        let mut scope = walk.message(
+            &mut self.timeline,
+            message.time.map(|time| time.created),
+            &message.id,
+            &[],
+        );
+        self.push_reasoning_scoped(&mut scope, facts, chunk.to_string(), lead)
             .expect("the scripted message scope accepts its own placement");
     }
 
@@ -3808,9 +3849,22 @@ impl StreamAccumulator {
         panel: ToolPanel,
         source: Option<PartSource>,
     ) {
+        let facts = PartFacts {
+            form: PartForm::Tool,
+            key_at,
+            shown_at,
+            source,
+        };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        self.push_tool_scoped(&read_order, &message, key_at, shown_at, call_id, panel, source)
+        let walk = Timeline::walk(&read_order);
+        let mut scope = walk.message(
+            &mut self.timeline,
+            message.time.map(|time| time.created),
+            &message.id,
+            &[],
+        );
+        self.push_tool_scoped(&mut scope, facts, call_id, panel)
             .expect("the scripted message scope accepts its own tool placement");
     }
 
@@ -3828,55 +3882,46 @@ impl StreamAccumulator {
             .collect()
     }
 
-    /// Place and push one transcript part through a message scope (spec
-    /// #1040): the only production path for transcript content. The walk and
-    /// its message scope drop immediately after, clearing both floors.
+    /// Place and push one transcript part through the caller's message scope
+    /// (spec #1040): the only production path for transcript content. The
+    /// caller owns the walk and the per-message scope, so a render pass keeps
+    /// one of each and the floors ride the scope.
     fn place_push(
         &mut self,
-        read_positions: &HashMap<&str, usize>,
-        message: &TranscriptMessage,
+        scope: &mut MessageScope<'_>,
         facts: PartFacts,
         kind: TranscriptKind,
     ) -> Result<(), PlacementError> {
-        let pinned = self.pinned_tail_facts();
-        let mut walk = self.timeline.walk(read_positions);
-        let mut scope = walk.message(message.time.map(|time| time.created), &message.id, &pinned);
-        let placement = scope.place(facts);
-        scope.push(placement, kind)
+        let placement = scope.place(&mut self.timeline, facts);
+        scope.push(&mut self.timeline, placement, kind)
     }
 
     /// Drop a rewritten part's entry run and push its fresh content through
-    /// one message scope (spec #561's replace rule; #1044 owns the public
-    /// replace path). The floors apply exactly as on the ordinary push.
+    /// the caller's message scope (spec #561's replace rule; #1044 owns the
+    /// public replace path). The floors apply exactly as on the ordinary push.
     fn replace_place_push(
         &mut self,
-        read_positions: &HashMap<&str, usize>,
-        message: &TranscriptMessage,
+        scope: &mut MessageScope<'_>,
         replaced: &PartSource,
         facts: PartFacts,
         kind: TranscriptKind,
     ) -> Result<(), PlacementError> {
-        let pinned = self.pinned_tail_facts();
-        let mut walk = self.timeline.walk(read_positions);
-        let mut scope = walk.message(message.time.map(|time| time.created), &message.id, &pinned);
-        let placement = scope.place(facts);
-        scope.replace(placement, replaced, kind)
+        let placement = scope.place(&mut self.timeline, facts);
+        scope.replace(&mut self.timeline, placement, replaced, kind)
     }
 
-    /// Place and push one text part through the message scope (spec #1040):
-    /// the production render's text path. The test-only scripted convenience
-    /// [`Self::push_text_at_key`] and its siblings delegate here.
+    /// Place and push one text part through the caller's message scope (spec
+    /// #1040): the production render's text path. The test-only scripted
+    /// convenience [`Self::push_text_at_key`] and its siblings delegate here.
     pub(super) fn push_text_scoped(
         &mut self,
-        read_positions: &HashMap<&str, usize>,
-        message: &TranscriptMessage,
+        scope: &mut MessageScope<'_>,
         facts: PartFacts,
         chunk: String,
         lead: Option<String>,
     ) -> Result<(), PlacementError> {
         let result = self.place_push(
-            read_positions,
-            message,
+            scope,
             facts,
             TranscriptKind::Text {
                 chunk: chunk.clone(),
@@ -3889,21 +3934,19 @@ impl StreamAccumulator {
         result
     }
 
-    /// Place and push one reasoning part through the message scope (spec
-    /// #1040): the production render's reasoning path. The test-only scripted
-    /// convenience [`Self::push_reasoning_at_key`] and its siblings delegate
-    /// here.
+    /// Place and push one reasoning part through the caller's message scope
+    /// (spec #1040): the production render's reasoning path. The test-only
+    /// scripted convenience [`Self::push_reasoning_at_key`] and its siblings
+    /// delegate here.
     pub(super) fn push_reasoning_scoped(
         &mut self,
-        read_positions: &HashMap<&str, usize>,
-        message: &TranscriptMessage,
+        scope: &mut MessageScope<'_>,
         facts: PartFacts,
         chunk: String,
         lead: Option<String>,
     ) -> Result<(), PlacementError> {
         let result = self.place_push(
-            read_positions,
-            message,
+            scope,
             facts,
             TranscriptKind::Reasoning {
                 chunk: chunk.clone(),
@@ -3916,20 +3959,18 @@ impl StreamAccumulator {
         result
     }
 
-    /// Replace a rewritten text part's run through the message scope (spec
-    /// #1040): the production render's rewrite path. The test-only
+    /// Replace a rewritten text part's run through the caller's message scope
+    /// (spec #1040): the production render's rewrite path. The test-only
     /// [`Self::replace_text_run`] delegates here.
     pub(super) fn replace_text_scoped(
         &mut self,
-        read_positions: &HashMap<&str, usize>,
-        message: &TranscriptMessage,
+        scope: &mut MessageScope<'_>,
         replaced: &PartSource,
         facts: PartFacts,
         chunk: String,
     ) -> Result<(), PlacementError> {
         let result = self.replace_place_push(
-            read_positions,
-            message,
+            scope,
             replaced,
             facts,
             TranscriptKind::Text {
@@ -3943,20 +3984,18 @@ impl StreamAccumulator {
         result
     }
 
-    /// Replace a rewritten reasoning part's run through the message scope (spec
-    /// #1040): the production render's rewrite path. The test-only
+    /// Replace a rewritten reasoning part's run through the caller's message
+    /// scope (spec #1040): the production render's rewrite path. The test-only
     /// [`Self::replace_reasoning_run`] delegates here.
     pub(super) fn replace_reasoning_scoped(
         &mut self,
-        read_positions: &HashMap<&str, usize>,
-        message: &TranscriptMessage,
+        scope: &mut MessageScope<'_>,
         replaced: &PartSource,
         facts: PartFacts,
         chunk: String,
     ) -> Result<(), PlacementError> {
         let result = self.replace_place_push(
-            read_positions,
-            message,
+            scope,
             replaced,
             facts,
             TranscriptKind::Reasoning {
@@ -3970,61 +4009,42 @@ impl StreamAccumulator {
         result
     }
 
-    /// Place and push one tool call through the message scope (spec #1040):
-    /// the production render's tool path. A running call pins a
+    /// Place and push one tool call through the caller's message scope (spec
+    /// #1040): the production render's tool path. A running call pins a
     /// [`TailPlacement`] that never enters `push`; a settled first sighting
-    /// pushes its entry; a settled live tail settles. The test-only
-    /// [`Self::push_tool_at_key`] and its siblings delegate here.
-    #[allow(clippy::too_many_arguments)]
+    /// pushes its entry; a settled live tail settles. `facts` carries the order
+    /// key, the display clock and the merge identity — no two bare clocks cross
+    /// this seam. The test-only [`Self::push_tool_at_key`] delegates here.
     pub(super) fn push_tool_scoped(
         &mut self,
-        read_positions: &HashMap<&str, usize>,
-        message: &TranscriptMessage,
-        key_at: Option<i64>,
-        shown_at: Option<i64>,
+        scope: &mut MessageScope<'_>,
+        facts: PartFacts,
         call_id: &str,
         panel: ToolPanel,
-        source: Option<PartSource>,
     ) -> Result<(), PlacementError> {
         let live = panel.is_live();
         let is_new = !self.tools.contains_key(call_id);
         if is_new {
-            let facts = PartFacts {
-                form: PartForm::Tool,
-                key_at,
-                shown_at,
-                source,
-            };
             if live {
-                let pinned = self.pinned_tail_facts();
-                let mut walk = self.timeline.walk(read_positions);
-                let mut scope = walk.message(message.time.map(|time| time.created), &message.id, &pinned);
-                let tail = scope.pin(facts, call_id.to_string());
-                drop(scope);
-                drop(walk);
+                let tail = scope.pin(&mut self.timeline, facts, call_id.to_string());
                 self.live_tools.insert(call_id.to_string(), tail);
             } else {
-                self.place_push(
-                    read_positions,
-                    message,
-                    facts,
-                    TranscriptKind::Tool(call_id.to_string()),
-                )?;
+                self.place_push(scope, facts, TranscriptKind::Tool(call_id.to_string()))?;
             }
             self.tools.insert(call_id.to_string(), panel);
         } else if let Some(tail) = self.live_tools.get_mut(call_id) {
             // A later sighting may carry the server start time the first one
             // lacked: re-key it, never below the floor the pin carried.
-            self.timeline.rekey(tail, shown_at);
-            tail.adopt_source(source);
+            self.timeline.rekey(tail, facts.shown_at);
+            tail.adopt_source(facts.source.clone());
             if !live {
                 let tail = self.live_tools.shift_remove(call_id).expect("checked");
                 let pinned = self.pinned_tail_facts();
-                self.timeline.settle(tail, &panel, read_positions, &pinned);
+                self.timeline.settle(tail, &panel, scope.read_order(), &pinned);
             }
             self.tools.insert(call_id.to_string(), panel);
         } else {
-            self.timeline.adopt_tool_shown_at(call_id, shown_at);
+            self.timeline.adopt_tool_shown_at(call_id, facts.shown_at);
             self.tools.insert(call_id.to_string(), panel);
         }
         self.refresh_phase();
@@ -5340,7 +5360,14 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        self.replace_text_scoped(&read_order, &message, source, facts, text.to_string())
+        let walk = Timeline::walk(&read_order);
+        let mut scope = walk.message(
+            &mut self.timeline,
+            message.time.map(|time| time.created),
+            &message.id,
+            &[],
+        );
+        self.replace_text_scoped(&mut scope, source, facts, text.to_string())
             .expect("the scripted message scope accepts its own rewrite");
     }
 
@@ -5361,7 +5388,14 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        self.replace_reasoning_scoped(&read_order, &message, source, facts, text.to_string())
+        let walk = Timeline::walk(&read_order);
+        let mut scope = walk.message(
+            &mut self.timeline,
+            message.time.map(|time| time.created),
+            &message.id,
+            &[],
+        );
+        self.replace_reasoning_scoped(&mut scope, source, facts, text.to_string())
             .expect("the scripted message scope accepts its own rewrite");
     }
 
@@ -8258,7 +8292,15 @@ mod tests {
             shown_at: Some(reserved + 1),
             source: Some(PartSource::at(post.id.clone(), 0)),
         };
-        acc.push_text_scoped(&read_positions, &post, facts, "点击后到达".into(), None)
+        let walk = Timeline::walk(&read_positions);
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(
+            acc.timeline_mut(),
+            post.time.map(|time| time.created),
+            &post.id,
+            &pinned,
+        );
+        acc.push_text_scoped(&mut scope, facts, "点击后到达".into(), None)
             .expect("the post-click part places");
         let content = acc
             .timeline()
