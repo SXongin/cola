@@ -968,20 +968,26 @@ impl Timeline {
         if index < self.render_from {
             let boundary = self.render_from;
             let key = self.items.get(boundary).map_or(key, |item| item.key);
-            // The clamp moves the entry to the live slice's first key, but the
-            // equal-key rule still decides where it lands there: a source-less
-            // entry after its source-less peers and before the positioned
-            // ones, a positioned entry by read position. A blind seat at
-            // `render_from` would put a later part above an earlier one.
-            let offset = self.items[boundary..].partition_point(|item| {
-                item.key < key
-                    || (item.key == key
-                        && Self::equal_key_cmp(item, position, AFTER_EQUAL_POSITION)
-                            != std::cmp::Ordering::Greater)
-            });
+            // The clamp moves the entry to the live slice's first key. A
+            // positioned entry is then seated by the equal-key read-position
+            // rule, so a late part cannot jump an earlier one; a source-less
+            // (or synthetic) entry keeps the base clamp — at the boundary,
+            // with `seat` lowering its `order` ahead of the equal-key run.
+            let index = match position {
+                None => boundary,
+                Some(_) => {
+                    let offset = self.items[boundary..].partition_point(|item| {
+                        item.key < key
+                            || (item.key == key
+                                && Self::equal_key_cmp(item, position, AFTER_EQUAL_POSITION)
+                                    != std::cmp::Ordering::Greater)
+                    });
+                    boundary + offset
+                }
+            };
             Slot {
                 key,
-                index: boundary + offset,
+                index,
                 clamped: true,
             }
         } else {
@@ -1631,6 +1637,7 @@ impl Timeline {
         _panel: &ToolPanel,
         read_order: &HashMap<&str, usize>,
         pinned_tails: &[TailFact],
+        following: &[(usize, i64)],
     ) {
         // A pin may have been source-less and adopted a source later; its
         // read position is then derived from the source and this read.
@@ -1639,7 +1646,7 @@ impl Timeline {
         let read_floor = self.read_floor_for_tail(position, read_order, pinned_tails);
         let floor = tail.floor.into_iter().chain(receipt).chain(read_floor).max();
         let key = floor.map_or(tail.key, |floor| tail.key.max(floor));
-        let cap = self.min_following_key(position, floor.unwrap_or(i64::MIN), read_order);
+        let cap = self.min_following_key(position, floor.unwrap_or(i64::MIN), read_order, following);
         let key = cap.map_or(key, |cap| key.min(cap));
         let slot = self.slot_for_seq(key, tail.seq, position);
         self.seat(Entry {
@@ -1708,15 +1715,26 @@ impl Timeline {
         position: Option<ReadPosition>,
         floor: i64,
         read_order: &HashMap<&str, usize>,
+        following: &[(usize, i64)],
     ) -> Option<i64> {
         let position = position?;
-        self.items
+        let mut min = self
+            .items
             .iter()
             .filter_map(|item| {
                 let item_position = item_read_position(item, read_order)?;
                 (item_position > position && item.key >= floor).then_some(item.key)
             })
-            .min()
+            .min();
+        // Parts later in the SAME message that this read has not placed yet
+        // (a seeded settle runs before the window/seed walks): their
+        // transcript keys cap the entry too, so it cannot jump them.
+        for (part, key) in following {
+            if *part > position.1 && *key >= floor {
+                min = Some(min.map_or(*key, |min| min.min(*key)));
+            }
+        }
+        min
     }
 }
 
@@ -1986,7 +2004,7 @@ impl MessageScope<'_, '_> {
     /// earlier tool's settle cap sees every later same-message entry — the
     /// text/reasoning already placed, plus the later tools settled first.
     /// Called once per message, before the scope drops.
-    pub(super) fn finish(&mut self, timeline: &mut Timeline) {
+    pub(super) fn finish(&mut self, timeline: &mut Timeline, following: &[(usize, i64)]) {
         while let Some(tool) = self.deferred_tools.pop() {
             match tool {
                 DeferredTool::Insert { facts, call_id } => {
@@ -2001,6 +2019,7 @@ impl MessageScope<'_, '_> {
                         position,
                         placement.floor.unwrap_or(i64::MIN),
                         self.walk.read_order,
+                        following,
                     ) {
                         placement.key = placement.key.min(cap);
                     }
@@ -2013,6 +2032,7 @@ impl MessageScope<'_, '_> {
                         &action.panel,
                         self.walk.read_order,
                         &action.pinned_tails,
+                        following,
                     );
                 }
             }
@@ -2235,26 +2255,15 @@ mod tests {
 
         // An older identity (7) with a key behind the slice.
         acc.test_seat_identity(500, 7, TimelineKind::Text("迟到".into()));
-        let entries = acc.timeline().entries();
-        let clamped_index = entries
-            .iter()
-            .position(|item| item.seq() == 7)
-            .expect("the clamped entry landed");
-        let clamped = &entries[clamped_index];
+        let clamped = &acc.timeline().entries()[acc.render_from()];
         assert_eq!(clamped.seq(), 7, "the identity is never renumbered");
+        assert!(
+            clamped.order() < acc.timeline().entries()[acc.render_from() + 1].order(),
+            "the order sorts it ahead of the equal-key run"
+        );
         assert_eq!(
             clamped.key(),
-            entries[acc.render_from()].key(),
-            "the clamp takes the live slice's first key"
-        );
-        assert!(
-            clamped_index > acc.render_from(),
-            "a source-less clamped entry keeps allocation order after its peer"
-        );
-        assert_eq!(
-            clamped.order(),
-            7,
-            "the source-less clamp keeps its allocated order"
+            acc.timeline().entries()[acc.render_from() + 1].key()
         );
     }
 
@@ -3837,7 +3846,7 @@ mod tests {
             part: 2,
             key: 15_000,
         };
-        timeline.settle(tail, &panel, &order, &[earlier, following]);
+        timeline.settle(tail, &panel, &order, &[earlier, following], &[]);
         assert_eq!(
             timeline.entries()[0].key(),
             9_000,
@@ -3860,7 +3869,7 @@ mod tests {
             part: 0,
             key: 12_000,
         };
-        timeline.settle(tail, &panel, &order, &[preceding]);
+        timeline.settle(tail, &panel, &order, &[preceding], &[]);
         assert_eq!(
             timeline.entries()[0].key(),
             12_000,
@@ -3891,7 +3900,7 @@ mod tests {
             Some(2_000),
         );
         timeline.record_cut(4_000, 9_000);
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         assert_eq!(
             timeline.entries()[0].key(),
             9_000,
@@ -3924,7 +3933,7 @@ mod tests {
         );
         timeline.rekey(&mut tail, Some(1_000));
         assert_eq!(tail.key, 9_000, "the rekey clamps to the pin's floor");
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         assert_eq!(timeline.entries()[0].key(), 9_000);
     }
 
@@ -3965,7 +3974,7 @@ mod tests {
         );
         let follower_seq = timeline.entries()[0].seq();
         timeline.rekey(&mut tail, Some(9_000));
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
 
         let tool = timeline
             .entries()
@@ -4055,7 +4064,7 @@ mod tests {
         }
         // The server's late start time is beyond every following key.
         timeline.rekey(&mut tail, Some(9_000));
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         let tool = timeline
             .entries()
             .iter()
@@ -4095,7 +4104,7 @@ mod tests {
         let mut tail = pin_tail(&mut timeline, &order, Some(5_000), &message, 0, None, None);
         timeline.rekey(&mut tail, Some(1_000));
         timeline.record_cut(4_000, 9_000);
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         assert_eq!(
             timeline.entries()[0].key(),
             9_000,
@@ -4116,7 +4125,7 @@ mod tests {
             Some(PartSource::at(MessageId::new("m0"), 0)),
             "先阅读的内容",
         );
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         let keys: Vec<i64> = timeline.entries().iter().map(|item| item.key()).collect();
         assert_eq!(
             keys,
@@ -4166,7 +4175,7 @@ mod tests {
 
         // The server's late start is beyond every following key.
         timeline.rekey(&mut tail, Some(9_000));
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
 
         let tool = timeline
             .entries()
@@ -4249,7 +4258,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         let kinds: Vec<&str> = timeline
             .entries()
             .iter()
@@ -4325,7 +4334,7 @@ mod tests {
             "the pinned tail's effective key, not its raw 100, is the floor"
         );
 
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         let tool = timeline
             .entries()
             .iter()
@@ -4410,7 +4419,7 @@ mod tests {
             "the post-pin cut floors the later message's part"
         );
 
-        timeline.settle(tail, &panel, &order, &[]);
+        timeline.settle(tail, &panel, &order, &[], &[]);
         let tool = timeline
             .entries()
             .iter()
@@ -4532,7 +4541,7 @@ mod tests {
             );
             tail.adopt_source(Some(PartSource::at(message.clone(), 1)));
 
-            timeline.settle(tail, &panel, &order, &[]);
+            timeline.settle(tail, &panel, &order, &[], &[]);
             let tool = timeline
                 .entries()
                 .iter()

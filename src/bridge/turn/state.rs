@@ -3865,7 +3865,7 @@ impl StreamAccumulator {
         );
         self.push_tool_scoped(&mut scope, facts, call_id, panel)
             .expect("the scripted message scope accepts its own tool placement");
-        scope.finish(&mut self.timeline);
+        scope.finish(&mut self.timeline, &[]);
     }
 
     /// Every live tail's fact, as the walk and the settle read them (spec
