@@ -29,7 +29,11 @@ use crate::backend::{Compaction, MessageId, Part, TranscriptMessage};
 use crate::bridge::chain::EndingKey;
 use crate::feishu::card::ledger::TaskCompletionEntry;
 use crate::feishu::card::tool_render::ToolPanel;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -646,11 +650,21 @@ pub(super) struct MessageScope<'w, 'r> {
     message_floor: Option<i64>,
     /// Settled tools waiting for `finish`, in part order.
     deferred_tools: Vec<DeferredTool>,
+    /// Test witness of the message floor, cleared by `Drop` so the clear is
+    /// observable after the scope is gone.
+    #[cfg(test)]
+    message_witness: Rc<Cell<Option<i64>>>,
 }
 
 impl Drop for MessageScope<'_, '_> {
     fn drop(&mut self) {
+        debug_assert!(
+            self.deferred_tools.is_empty(),
+            "a message scope must finish before it drops"
+        );
         self.message_floor = None;
+        #[cfg(test)]
+        self.message_witness.set(None);
         self.walk.occupied = false;
     }
 }
@@ -1762,6 +1776,8 @@ impl<'r> Walk<'r> {
             created,
             message_floor,
             deferred_tools: Vec::new(),
+            #[cfg(test)]
+            message_witness: Rc::new(Cell::new(message_floor)),
         }
     }
 }
@@ -1771,6 +1787,13 @@ impl MessageScope<'_, '_> {
     #[cfg(test)]
     pub(super) fn message_floor(&self) -> Option<i64> {
         self.message_floor
+    }
+
+    /// A cloneable witness of the message floor, so a test can observe the
+    /// scope's own `Drop` clearing it after the scope is gone.
+    #[cfg(test)]
+    pub(super) fn message_floor_witness(&self) -> Rc<Cell<Option<i64>>> {
+        Rc::clone(&self.message_witness)
     }
 
     /// The walk's read floor, for the guard invariant tests.
@@ -1967,7 +1990,20 @@ impl MessageScope<'_, '_> {
         while let Some(tool) = self.deferred_tools.pop() {
             match tool {
                 DeferredTool::Insert { facts, call_id } => {
-                    let placement = self.place(timeline, facts);
+                    let position = facts
+                        .source
+                        .as_ref()
+                        .and_then(|source| self.position.map(|message| (message, source.index())));
+                    let mut placement = self.place(timeline, facts);
+                    // A late start still must not jump content placed later in
+                    // the message: cap it like a settle, at the queued key.
+                    if let Some(cap) = timeline.min_following_key(
+                        position,
+                        placement.floor.unwrap_or(i64::MIN),
+                        self.walk.read_order,
+                    ) {
+                        placement.key = placement.key.min(cap);
+                    }
                     self.push(timeline, placement, TranscriptKind::Tool(call_id))
                         .expect("the scope accepts its own tool placement");
                 }
@@ -3282,6 +3318,10 @@ mod tests {
                 Some(500),
                 "the walk carries the earlier entry's key as the read floor"
             );
+            let witness = scope.message_floor_witness();
+            assert_eq!(witness.get(), Some(9_000), "the scope owns the message floor");
+            drop(scope);
+            assert_eq!(witness.get(), None, "the scope's Drop cleared the message floor");
         }
         // The next message opens on the SAME walk (the dropped scope freed it),
         // and the read floor survived the scope drop.

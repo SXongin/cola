@@ -3,9 +3,10 @@
 > **Retired by ADR-0100** (the Session Snapshot tail's fold ids): the snapshot
 > card and its rebuild path are gone, so the `snap_{i}` example no longer exists.
 >
-> **Amended by ADR-0104**: `seq` is now assigned once by the Timeline
-> (the successor of `insert_kind`), and the equal-key ordering changed; #1040
-> carries the exact rules. The never-reuse/never-renumber invariant is unchanged.
+> **Amended by ADR-0104**: `seq` is now minted once by the Timeline
+> (`place`/`seat`, and kept through a settle), and the equal-key ordering
+> changed; #1040 carries the exact rules. The never-reuse/never-renumber
+> invariant is unchanged.
 
 Every flush PATCHes the whole card JSON (`update_message`), and a collapsible
 panel's open/closed state lives in the client: toggling a panel fires no
@@ -31,7 +32,7 @@ keeps the plan size and status counts readable.
   operator's choice. Whatever state survives an update is the client's own.
 - **Position is not stable; identity is.** The timeline is ordered by server part
   time, and a part rendered late is inserted at its key's position
-  (`insert_kind`, `src/bridge/turn/state.rs:845`) — an item's index can change
+  (the Timeline's one insert path, `Timeline::seat`, `src/bridge/turn/timeline.rs`) — an item's index can change
   after it was first rendered. (ADR-0038's 2026-11-09 amendment narrows the key
   for a part with no server time — V2's text — to the transcript's own part
   order, and orders equal keys by an internal `order` derived from allocation;
@@ -66,8 +67,8 @@ timeline entry it renders.**
   rebuilt in place on a claim ack and on remote resolution
   (`SnapshotClaims::rebuild`, `src/bridge/snapshot_claims.rs:129-144`), its tail
   order is fixed, so the entry index is a stable id.
-- `seq` is assigned once per accumulator, in `insert_kind`, and never reused or
-  renumbered within it.
+- `seq` is minted once by the Timeline (`place`/`seat`) or carried through a
+  settle, and never reused or renumbered within it.
 - **A Card Chain split's continuation starts folded.** Accepted: a new card is a
   new message with no local state to inherit, and the todo panel's header still
   carries the plan size and the non-empty status counts.
