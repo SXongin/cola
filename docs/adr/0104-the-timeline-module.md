@@ -229,7 +229,8 @@ preparation — chunking, content dedup, the rewrite digest, the panel body —
 stays free to use the accumulator between placements. Each pass opens ONE walk
 and one `MessageScope` per message: `render_turn_parts`'s window,
 `render_pending_gap`, `render_seed_scope` and `resolve_seeded_calls`, plus the
-compaction walk (`place_compactions`, one walk per read and one scope per row).
+compaction walk (`place_compactions`, one walk per read and one scope per
+message — a message may carry several compaction rows).
 The walk owns the read floor and clears it at its own `Drop`; the scope borrows
 the walk, owns the message floor, carries the read position and generation, and
 marks the walk occupied. Its `Drop` frees the walk and clears the message floor,

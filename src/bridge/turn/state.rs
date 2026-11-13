@@ -3125,22 +3125,40 @@ impl StreamAccumulator {
         rows: impl IntoIterator<Item = CompactionRow>,
     ) {
         let mut walk = Timeline::walk(read_positions);
-        for CompactionRow { source, at, fact } in rows {
+        let mut rows = rows.into_iter().peekable();
+        // Rows arrive in transcript order: one message scope serves every row
+        // of a message (a message may carry several compaction parts).
+        while let Some(CompactionRow { source, at, fact }) = rows.next() {
             let message = source.message_id().clone();
             let mut scope = walk.message(&self.timeline, at, &message, &[]);
-            // A row's own server time is both its pre-floor seed and the cut
-            // its message earns, so the scope's message floor and the
-            // admission's `receipt_cut_floor(message_time)` are the same cut.
-            let _ = scope.synthetic(
-                &mut self.timeline,
-                SyntheticEntry::Compaction {
-                    fact,
-                    at,
-                    message_time: at,
-                    row: source,
-                },
-            );
+            self.admit_compaction(&mut scope, source, at, fact);
+            while rows.peek().is_some_and(|row| row.source.message_id() == &message) {
+                let CompactionRow { source, at, fact } = rows.next().expect("peeked");
+                self.admit_compaction(&mut scope, source, at, fact);
+            }
         }
+    }
+
+    /// Admit one compaction row under the message scope its pass opened.
+    fn admit_compaction(
+        &mut self,
+        scope: &mut MessageScope<'_, '_>,
+        source: PartSource,
+        at: Option<i64>,
+        fact: Compaction,
+    ) {
+        // A row's own server time is both its pre-floor seed and the cut its
+        // message earns, so the scope's message floor and the admission's
+        // `receipt_cut_floor(message_time)` are the same cut.
+        let _ = scope.synthetic(
+            &mut self.timeline,
+            SyntheticEntry::Compaction {
+                fact,
+                at,
+                message_time: at,
+                row: source,
+            },
+        );
     }
 
     /// Mark `wake_id`'s resumed work as handed to a card: the handoff a 承接

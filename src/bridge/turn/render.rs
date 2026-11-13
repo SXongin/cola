@@ -6751,6 +6751,123 @@ Index: /x/src/main.rs
         );
     }
 
+    /// Spec #1040: an unplaced follower below the floor still caps the settle
+    /// at its EFFECTIVE key. m0 places a part at 7000; m1 has a completed tool
+    /// at 8000 and a later text part at 6000, so the settle's floor is 7000
+    /// and the follower's effective key is max(6000, 7000) = 7000.
+    #[test]
+    fn a_seeded_settle_caps_at_a_below_floor_follower() {
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000_000),
+                vec![text_part("提问")],
+            ),
+            message("m0", 900_000, vec![text_at("之前", 7_000)]),
+            message(
+                "m1",
+                2_000_000,
+                vec![
+                    tool(
+                        "shell",
+                        "call_a",
+                        ToolStatus::Completed,
+                        Some(8_000),
+                        Some(serde_json::json!({"command": "a"})),
+                        None,
+                    ),
+                    text_at("回答", 6_000),
+                ],
+            ),
+        ]);
+        let positions = read_position_map(&transcript);
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_cola_message_id("msg_cola_anchor");
+        // Place m0's part before the seeded settle runs.
+        let m0 = &transcript.messages[1];
+        let mut walk = Timeline::walk(&positions);
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(acc.timeline(), m0.time.map(|time| time.created), &m0.id, &pinned);
+        let facts = PartFacts {
+            form: PartForm::Text,
+            key_at: Some(7_000),
+            shown_at: Some(7_000),
+            source: Some(PartSource::at(m0.id.clone(), 0)),
+        };
+        acc.push_text_scoped(&mut scope, facts, "之前".into(), None)
+            .expect("m0's part places");
+        scope.finish(acc.timeline_mut(), &[]);
+        acc.seed_projection(
+            &RenderedCursor::default(),
+            CursorSeed {
+                frontier: None,
+                live_calls: ["call_a".to_string()].into(),
+                resolved_live_calls: ["call_a".to_string()].into(),
+                scope: None,
+            },
+        );
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let entries = acc.timeline();
+        let tool = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the seeded call settled");
+        let text = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(t) if t == "回答"))
+            .expect("the text landed");
+        assert_eq!(
+            entries.entries()[tool].key(),
+            7_000,
+            "the follower floors to 7000, so it caps the panel there"
+        );
+        assert!(tool < text, "the tool stays above the floored text: {entries:?}");
+    }
+
+    /// Spec #1043: one message scope serves every compaction row of a message,
+    /// however many parts carry one.
+    #[test]
+    fn two_compaction_parts_in_one_message_mint_one_scope() {
+        let compaction = |summary: &str| crate::backend::Compaction {
+            status: crate::backend::CompactionStatus::Completed,
+            reason: crate::backend::CompactionReason::Auto,
+            summary: summary.into(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        let m1 = MessageId::new("m1");
+        let positions = std::collections::HashMap::from([("m1", 1usize)]);
+        let rows = vec![
+            crate::bridge::turn::state::CompactionRow {
+                source: PartSource::at(m1.clone(), 0),
+                at: Some(2_000),
+                fact: compaction("一"),
+            },
+            crate::bridge::turn::state::CompactionRow {
+                source: PartSource::at(m1.clone(), 1),
+                at: Some(2_000),
+                fact: compaction("二"),
+            },
+        ];
+        let mut acc = StreamAccumulator::new("test");
+        acc.reset_scopes_minted();
+        acc.place_compactions(&positions, rows);
+        assert_eq!(
+            acc.scopes_minted(),
+            1,
+            "both compaction rows of one message share one scope"
+        );
+        let rows = acc
+            .timeline()
+            .iter()
+            .filter(|item| matches!(item.kind(), TimelineKind::Compaction(_)))
+            .count();
+        assert_eq!(rows, 2, "both rows landed");
+    }
+
     /// The cursorless record's fallback seed (spec #561, ticket #565): the
     /// orphaned Turn's still-live calls enter the seed's live set and the
     /// accumulator, exactly as ADR-0068's carry once did. Returns how many
