@@ -341,8 +341,9 @@ pub(super) struct Placement {
 /// One live tail's fact, as the accumulator hands it to a walk or a settle
 /// (spec #1040): the message that owns it, the part index it was pinned at and
 /// its **effective** key — the raw pin/rekey key raised to the floor the pin
-/// carried, which is where the panel will finally sit. The Timeline keeps only
-/// the ones that precede the content being placed.
+/// carried and to the CURRENT Interaction Receipt cut for its message, which
+/// is the lower bound the panel will settle at. The Timeline keeps only the
+/// ones that precede the content being placed.
 #[derive(Debug, Clone)]
 pub(super) struct TailFact {
     pub(super) message: MessageId,
@@ -355,8 +356,9 @@ pub(super) struct TailFact {
 /// accumulator's `tools` map; this token never enters [`MessageScope::push`].
 #[derive(Debug, Clone)]
 pub(super) struct TailPlacement {
-    /// The raw pin/rekey key. It can sit below the carried `floor` before any
-    /// rekey; [`Self::fact`] publishes the effective `max(key, floor)`.
+    /// The raw pin/rekey key. It can sit below the carried `floor` or a later
+    /// receipt cut before any rekey; [`Self::fact`] publishes the effective
+    /// `max(key, floor, current cut)`.
     key: i64,
     shown_at: Option<i64>,
     source: Option<PartSource>,
@@ -378,12 +380,22 @@ impl TailPlacement {
         self.shown_at
     }
 
-    /// The key the tail is actually placed under: the raw pin/rekey key raised
-    /// to the floor the pin carried. Before any rekey a pin's key can sit below
-    /// its floor (a receipt cut minted before the pin), so consumers of the
-    /// fact need the effective position, not the raw one.
-    fn effective_key(&self) -> i64 {
-        self.floor.map_or(self.key, |floor| self.key.max(floor))
+    /// The effective key the tail will settle at or above: the raw pin/rekey
+    /// key raised to the floor the pin carried **and** to the CURRENT receipt
+    /// cut for the tail's message. The cut is re-derived here (not just at
+    /// `settle`) because a receipt recorded after the pin must floor the
+    /// content a later read places, exactly as it floors the panel when it
+    /// settles.
+    fn effective_key(&self, timeline: &Timeline) -> i64 {
+        let floor = self
+            .floor
+            .into_iter()
+            .chain(
+                self.created
+                    .and_then(|created| timeline.receipt_cut_floor(created)),
+            )
+            .max();
+        floor.map_or(self.key, |floor| self.key.max(floor))
     }
 
     /// The read position the tail occupies: the one pinned, or — for a pin
@@ -408,11 +420,12 @@ impl TailPlacement {
     }
 
     /// The fact a later walk or settle needs: which message owns the tail,
-    /// which part pinned it and the effective key it will settle at. A pin
-    /// whose message carries no read position (the scripted test seam) still
-    /// names its message and part, so the fact is well-formed; only a pin that
-    /// named no message at all yields `None`.
-    pub(super) fn fact(&self) -> Option<TailFact> {
+    /// which part pinned it and the effective key it will settle at or above
+    /// (the current receipt cut included). A pin whose message carries no read
+    /// position (the scripted test seam) still names its message and part, so
+    /// the fact is well-formed; only a pin that named no message at all yields
+    /// `None`.
+    pub(super) fn fact(&self, timeline: &Timeline) -> Option<TailFact> {
         let message = self.message.clone()?;
         let part = self.position.map_or_else(
             || self.source.as_ref().map_or(0, |source| source.index()),
@@ -421,7 +434,7 @@ impl TailPlacement {
         Some(TailFact {
             message,
             part,
-            key: self.effective_key(),
+            key: self.effective_key(timeline),
         })
     }
 }
@@ -3680,7 +3693,7 @@ mod tests {
         );
         assert_eq!(tail.key, 100, "the raw pin key is the server's start");
         assert_eq!(tail.floor, Some(9_000), "the pin carries the receipt cut");
-        let pinned = vec![tail.fact().expect("a scoped pin names its message")];
+        let pinned = vec![tail.fact(&timeline).expect("a scoped pin names its message")];
         assert_eq!(pinned[0].key, 9_000, "the fact publishes the effective key");
         {
             // The later message predates the ask, so it earns no cut of its
@@ -3752,7 +3765,7 @@ mod tests {
         );
         assert_eq!(tail.key, 100, "the first sighting's server key is 100");
         assert_eq!(tail.floor, Some(9_000), "the pin carries the receipt cut");
-        let pinned = vec![tail.fact().expect("a scoped pin names its message")];
+        let pinned = vec![tail.fact(&timeline).expect("a scoped pin names its message")];
 
         // The later message predates the ask, so only the pinned tail floors
         // its part — and it must floor it to the tail's EFFECTIVE key.
@@ -3797,6 +3810,90 @@ mod tests {
         assert!(
             timeline.entries()[tool].key() >= 9_000,
             "the panel settles at or above the cut"
+        );
+        assert!(
+            tool < later,
+            "the later message's part stays below the settled panel"
+        );
+    }
+
+    /// A receipt cut recorded AFTER a pin reaches later messages through the
+    /// tail's published fact: the fact derives the CURRENT cut staircase, not
+    /// just the floor the pin captured. `m0` is created at 2000 and its running
+    /// tool pinned at raw key 100 before any cut; the cut `(1000, 9000)` lands
+    /// afterwards; a later message with no time of its own places a part at
+    /// 1000, which must clear 9000 and stay below the panel that settles there.
+    #[test]
+    fn a_post_pin_receipt_cut_floors_later_messages_through_the_fact() {
+        let mut timeline = Timeline::default();
+        let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let panel = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!("ls")),
+            Some("src"),
+        );
+        let tail = pin_tail(
+            &mut timeline,
+            &order,
+            Some(2_000),
+            &MessageId::new("m0"),
+            0,
+            Some(100),
+            Some(100),
+        );
+        assert_eq!(tail.floor, None, "the pin captured no floor: no cut existed yet");
+        // The click's receipt cut lands after the pin.
+        timeline.record_cut(1_000, 9_000);
+        let pinned = vec![tail.fact(&timeline).expect("a scoped pin names its message")];
+        assert_eq!(
+            pinned[0].key, 9_000,
+            "the fact derives the current receipt cut, not just the pin-time floor"
+        );
+
+        // The later message carries no time of its own, so only the pinned
+        // tail can floor its part.
+        let placement_key = {
+            let mut walk = timeline.walk(&order);
+            let mut scope = walk.message(None, &MessageId::new("m1"), &pinned);
+            let facts = PartFacts {
+                form: PartForm::Text,
+                key_at: Some(1_000),
+                shown_at: Some(1_000),
+                source: Some(PartSource::at(MessageId::new("m1"), 0)),
+            };
+            let placement = scope.place(facts);
+            let key = placement.key;
+            scope
+                .push(
+                    placement,
+                    TranscriptKind::Text {
+                        chunk: "timeless later".into(),
+                        lead: None,
+                    },
+                )
+                .unwrap();
+            key
+        };
+        assert_eq!(
+            placement_key, 9_000,
+            "the post-pin cut floors the later message's part"
+        );
+
+        timeline.settle(tail, &panel, &order, &[]);
+        let tool = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the panel settled");
+        let later = timeline
+            .entries()
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "timeless later"))
+            .expect("the later message's part landed");
+        assert!(
+            timeline.entries()[tool].key() >= 9_000,
+            "the panel settles at or above the post-pin cut"
         );
         assert!(
             tool < later,

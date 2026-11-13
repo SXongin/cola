@@ -3817,10 +3817,15 @@ impl StreamAccumulator {
     /// Every live tail's fact, as the walk and the settle read them (spec
     /// #1040): a pin earlier in the pass still floors later messages, and a
     /// settle re-applies the earlier messages' and the panel's own preceding
-    /// tails. Every pin on the guard names its message, so every live tail
+    /// tails. The fact's key is derived against the CURRENT receipt-cut
+    /// staircase, so a receipt recorded after the pin floors later messages
+    /// too. Every pin on the guard names its message, so every live tail
     /// contributes a fact.
     pub(super) fn pinned_tail_facts(&self) -> Vec<TailFact> {
-        self.live_tools.values().filter_map(TailPlacement::fact).collect()
+        self.live_tools
+            .values()
+            .filter_map(|tail| tail.fact(&self.timeline))
+            .collect()
     }
 
     /// Place and push one transcript part through a message scope (spec
