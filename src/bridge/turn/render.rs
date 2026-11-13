@@ -26,7 +26,9 @@ use crate::bridge::turn::state;
 use crate::bridge::turn::state::{
     CompactionRow, LedgerCadence, LedgerChange, RenderedPart, StreamAccumulator,
 };
-use crate::bridge::turn::timeline::{PartFacts, PartForm, PartSource, part_order_times};
+use crate::bridge::turn::timeline::{
+    MessageScope, PartFacts, PartForm, PartSource, Timeline, part_order_times,
+};
 use crate::config::ThreadKey;
 use crate::feishu::card::compaction::same_row;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
@@ -301,7 +303,7 @@ fn render_part_scoped(
     index: usize,
     part: &Part,
     order_at: Option<i64>,
-    read_positions: &std::collections::HashMap<&str, usize>,
+    scope: &mut MessageScope<'_>,
 ) -> bool {
     let source = PartSource::at(message.id.clone(), index);
     if acc.part_seeded_delivered(source.message_id(), part) {
@@ -322,7 +324,7 @@ fn render_part_scoped(
                     shown_at: text.started_at,
                     source: Some(rewritten),
                 };
-                acc.replace_text_scoped(read_positions, message, &source, facts, text.text.clone())
+                acc.replace_text_scoped(scope, &source, facts, text.text.clone())
                     .expect("the message scope accepts its own rewrite");
             } else {
                 let (source, chunk) = source_chunk(acc, Some(source), &text.text, None);
@@ -332,7 +334,7 @@ fn render_part_scoped(
                     shown_at: text.started_at,
                     source,
                 };
-                acc.push_text_scoped(read_positions, message, facts, chunk, None)
+                acc.push_text_scoped(scope, facts, chunk, None)
                     .expect("the message scope accepts its own placement");
             }
             acc.mark_streaming();
@@ -352,7 +354,7 @@ fn render_part_scoped(
                     shown_at: reasoning.started_at,
                     source: Some(rewritten),
                 };
-                acc.replace_reasoning_scoped(read_positions, message, &source, facts, reasoning.text.clone())
+                acc.replace_reasoning_scoped(scope, &source, facts, reasoning.text.clone())
                     .expect("the message scope accepts its own rewrite");
             } else {
                 let (source, chunk) = source_chunk(
@@ -367,7 +369,7 @@ fn render_part_scoped(
                     shown_at: reasoning.started_at,
                     source,
                 };
-                acc.push_reasoning_scoped(read_positions, message, facts, chunk, None)
+                acc.push_reasoning_scoped(scope, facts, chunk, None)
                     .expect("the message scope accepts its own placement");
             }
             acc.mark_reasoning();
@@ -377,16 +379,14 @@ fn render_part_scoped(
                 acc.record_todo_call(call);
             } else {
                 let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
-                acc.push_tool_scoped(
-                    read_positions,
-                    message,
-                    order_at,
-                    call.started_at,
-                    &call.identity.call_id,
-                    panel,
-                    Some(source),
-                )
-                .expect("the message scope accepts its own tool placement");
+                let facts = PartFacts {
+                    form: PartForm::Tool,
+                    key_at: order_at,
+                    shown_at: call.started_at,
+                    source: Some(source),
+                };
+                acc.push_tool_scoped(scope, facts, &call.identity.call_id, panel)
+                    .expect("the message scope accepts its own tool placement");
             }
             if call.status == ToolStatus::Running {
                 acc.mark_streaming();
@@ -409,7 +409,7 @@ fn render_seeded_part_scoped(
     part: &Part,
     delivered: usize,
     order_at: Option<i64>,
-    read_positions: &std::collections::HashMap<&str, usize>,
+    scope: &mut MessageScope<'_>,
 ) -> bool {
     let message_id = message.id.clone();
     let (full, started_at, is_text) = match part {
@@ -441,9 +441,9 @@ fn render_seeded_part_scoped(
             source: Some(rewritten),
         };
         let result = if is_text {
-            acc.replace_text_scoped(read_positions, message, &source, facts, full.to_string())
+            acc.replace_text_scoped(scope, &source, facts, full.to_string())
         } else {
-            acc.replace_reasoning_scoped(read_positions, message, &source, facts, full.to_string())
+            acc.replace_reasoning_scoped(scope, &source, facts, full.to_string())
         };
         result.expect("the message scope accepts its own rewrite");
         if is_text {
@@ -476,9 +476,9 @@ fn render_seeded_part_scoped(
             source: Some(source.clone()),
         };
         let result = if is_text {
-            acc.push_text_scoped(read_positions, message, facts, suffix.clone(), lead)
+            acc.push_text_scoped(scope, facts, suffix.clone(), lead)
         } else {
-            acc.push_reasoning_scoped(read_positions, message, facts, suffix.clone(), lead)
+            acc.push_reasoning_scoped(scope, facts, suffix.clone(), lead)
         };
         result.expect("the message scope accepts its own placement");
         if is_text {
@@ -1865,6 +1865,10 @@ pub(super) fn render_turn_parts(
     let seed = acc.seed().cloned();
     let turn = transcript.turn_for_user(&anchor);
     let read_positions = read_position_map(transcript);
+    // One walk for the whole pass (spec #1040): it carries the read's message
+    // positions and nothing else, so the accumulator stays free for preparation
+    // between placements.
+    let walk = Timeline::walk(&read_positions);
     // A card rendering an unanswered free-text field must not consume this
     // background update: otherwise the first pass removes it from "new" and
     // the post-answer pass has nothing left to show (#917 / card-repaints).
@@ -1904,10 +1908,18 @@ pub(super) fn render_turn_parts(
         }
         let message_pos = message_positions.get(message.id.as_str()).copied();
         // The part order keys this message's card entries sort by (issue #1022):
-        // V2 text parts carry no time, so they borrow the previous part's. The
-        // walk's message scope applies the receipt cut, the read floor and the
-        // live-slice clamp; this loop never sets either floor by hand.
+        // V2 text parts carry no time, so they borrow the previous part's. One
+        // message scope serves every part of this message (spec #1040): it
+        // applies the receipt cut, the read floor and the live-slice clamp, so
+        // this loop never sets either floor by hand.
         let order_keys = part_order_times(message);
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(
+            acc.timeline_mut(),
+            message.time.map(|time| time.created),
+            &message.id,
+            &pinned,
+        );
         for (index, part) in message.parts.iter().enumerate() {
             let cut = match (seed.as_ref(), message_pos) {
                 (Some(seed), Some(pos)) => seed.cut(pos, index),
@@ -1929,7 +1941,7 @@ pub(super) fn render_turn_parts(
                         part,
                         delivered,
                         order_keys[index],
-                        &read_positions,
+                        &mut scope,
                     ) {
                         rendered_any = true;
                     }
@@ -1947,7 +1959,7 @@ pub(super) fn render_turn_parts(
                     // Cursor frontier (spec #561): parts carry no id (AGENTS.md
                     // pitfall `wire-shapes`), so the message identity plus the
                     // ordinal is the whole position.
-                    if render_part_scoped(acc, message, index, part, order_keys[index], &read_positions) {
+                    if render_part_scoped(acc, message, index, part, order_keys[index], &mut scope) {
                         rendered_any = true;
                     }
                 }
@@ -2013,6 +2025,8 @@ fn render_pending_gap(
         return false;
     }
     let message_positions = read_position_map(transcript);
+    // One walk for the whole gap pass (spec #1040).
+    let walk = Timeline::walk(&message_positions);
     // The gap's window ends where the NEXT Turn begins (spec #561, review
     // #569): `turn_for_user` has no upper end, so without a bound the walk
     // would swallow every later Turn — content a later card already showed,
@@ -2038,6 +2052,14 @@ fn render_pending_gap(
             continue;
         }
         let order_keys = part_order_times(message);
+        // One message scope serves every part of this message (spec #1040).
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(
+            acc.timeline_mut(),
+            message.time.map(|time| time.created),
+            &message.id,
+            &pinned,
+        );
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => {
@@ -2056,7 +2078,7 @@ fn render_pending_gap(
                         part,
                         delivered,
                         order_keys[index],
-                        &message_positions,
+                        &mut scope,
                     ) {
                         rendered = true;
                     }
@@ -2069,7 +2091,7 @@ fn render_pending_gap(
                     if let Part::Tool(call) = part {
                         acc.retire_seeded_call(&call.identity.call_id);
                     }
-                    if render_part_scoped(acc, message, index, part, order_keys[index], &message_positions) {
+                    if render_part_scoped(acc, message, index, part, order_keys[index], &mut scope) {
                         rendered = true;
                     }
                 }
@@ -2114,7 +2136,7 @@ fn render_gap_part_scoped(
     part: &Part,
     delivered: usize,
     order_at: Option<i64>,
-    read_positions: &std::collections::HashMap<&str, usize>,
+    scope: &mut MessageScope<'_>,
 ) -> bool {
     let message_id = message.id.clone();
     let (full, started_at, is_text) = match part {
@@ -2122,7 +2144,7 @@ fn render_gap_part_scoped(
         Part::Reasoning(reasoning) => (reasoning.text.as_str(), reasoning.started_at, false),
         // The gap's cut resolved to a tool: render it whole — the ordinary
         // scoped render's own dedup decides.
-        _ => return render_part_scoped(acc, message, index, part, order_at, read_positions),
+        _ => return render_part_scoped(acc, message, index, part, order_at, scope),
     };
     let full_len = full.chars().count();
     // The CUT reads the content this accumulator already pushed, never the
@@ -2150,11 +2172,11 @@ fn render_gap_part_scoped(
         source: Some(source.clone()),
     };
     if is_text {
-        acc.push_text_scoped(read_positions, message, facts, suffix, lead)
+        acc.push_text_scoped(scope, facts, suffix, lead)
             .expect("the message scope accepts its own placement");
         acc.mark_streaming();
     } else {
-        acc.push_reasoning_scoped(read_positions, message, facts, suffix, lead)
+        acc.push_reasoning_scoped(scope, facts, suffix, lead)
             .expect("the message scope accepts its own placement");
         acc.mark_reasoning();
     }
@@ -2206,6 +2228,8 @@ fn render_seed_scope(
         .is_some_and(|gap| gap.anchor.message_id == scope.message_id);
     let mut rendered = false;
 
+    // One walk for the whole seed pass (spec #1040).
+    let walk = Timeline::walk(message_positions);
     let messages = transcript.turn_for_user(scope).messages;
     for message in messages.iter().copied() {
         walked.insert(message.id.clone());
@@ -2213,6 +2237,14 @@ fn render_seed_scope(
             continue;
         };
         let order_keys = part_order_times(message);
+        // One message scope serves every part of this message.
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(
+            acc.timeline_mut(),
+            message.time.map(|time| time.created),
+            &message.id,
+            &pinned,
+        );
         for (index, part) in message.parts.iter().enumerate() {
             match seed.cut(pos, index) {
                 crate::bridge::turn::state::SeedCut::Delivered => acc.mark_delivered_part(&message.id, part),
@@ -2227,7 +2259,7 @@ fn render_seed_scope(
                         part,
                         delivered,
                         order_keys[index],
-                        message_positions,
+                        &mut scope,
                     ) {
                         rendered = true;
                     }
@@ -2242,7 +2274,7 @@ fn render_seed_scope(
                     if gap_scope {
                         acc.mark_gap_message(message.id.clone());
                     }
-                    if render_part_scoped(acc, message, index, part, order_keys[index], message_positions) {
+                    if render_part_scoped(acc, message, index, part, order_keys[index], &mut scope) {
                         rendered = true;
                     }
                 }
@@ -2466,6 +2498,10 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
         })
         .collect();
     calls.sort_by_key(|(position, _)| *position);
+    // One walk for the whole live-set pass (spec #1040); calls are sorted by
+    // position, so one scope serves a message's whole run of calls.
+    let walk = Timeline::walk(&seeded_positions);
+    let mut current: Option<(usize, MessageScope<'_>)> = None;
     for (position, call_id) in calls {
         // The call's typed position — the seeded panel keeps it, so once it
         // settles its timeline entry can become the Rendered Cursor frontier
@@ -2486,14 +2522,31 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                     acc.refresh_phase();
                 } else {
                     let order_at = part_order_times(message).get(index).copied().flatten();
+                    let facts = PartFacts {
+                        form: PartForm::Tool,
+                        key_at: order_at,
+                        shown_at: call.started_at,
+                        source: Some(source),
+                    };
+                    if current
+                        .as_ref()
+                        .is_none_or(|(message_pos, _)| *message_pos != position)
+                    {
+                        let pinned = acc.pinned_tail_facts();
+                        let next = walk.message(
+                            acc.timeline_mut(),
+                            message.time.map(|time| time.created),
+                            &message.id,
+                            &pinned,
+                        );
+                        current = Some((position, next));
+                    }
+                    let scope = &mut current.as_mut().expect("the scope was just ensured").1;
                     acc.push_tool_scoped(
-                        &seeded_positions,
-                        message,
-                        order_at,
-                        call.started_at,
+                        scope,
+                        facts,
                         &call.identity.call_id,
                         crate::feishu::card::tool_render::ToolPanel::new(call.clone()),
-                        Some(source),
                     )
                     .expect("the message scope accepts its own tool placement");
                 }
@@ -4893,6 +4946,26 @@ Index: /x/src/main.rs
         );
     }
 
+    /// Spec #1040: the window pass keeps one walk and mints one message scope
+    /// per message — a two-part assistant message costs one scope, not one per
+    /// part.
+    #[test]
+    fn a_multi_part_message_opens_one_walk_scope() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(1_000));
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(1_000), vec![text_part("问题")]),
+            message("a1", 1_000, vec![text_part("第一段"), text_part("第二段")]),
+        ]);
+        acc.reset_scopes_minted();
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        assert_eq!(
+            acc.scopes_minted(),
+            1,
+            "the two-part assistant message opens one scope, not one per part"
+        );
+    }
+
     /// A TIMED text sharing a still-running panel's server start key sorts by
     /// allocation when the panel settles: on the base the text was keyed after
     /// the panel, so only a reverted tie-break regresses it (issue #1022).
@@ -6143,11 +6216,23 @@ Index: /x/src/main.rs
         acc.record_receipt_cut(orphan_anchor, 1_200_000);
         // An earlier message's live panel sits ABOVE the receipt's key.
         let early = &transcript.messages[0];
+        let walk = Timeline::walk(&positions);
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(
+            acc.timeline_mut(),
+            early.time.map(|time| time.created),
+            &early.id,
+            &pinned,
+        );
+        let facts = PartFacts {
+            form: PartForm::Tool,
+            key_at: Some(1_500_000),
+            shown_at: Some(1_500_000),
+            source: Some(PartSource::at(early.id.clone(), 0)),
+        };
         acc.push_tool_scoped(
-            &positions,
-            early,
-            Some(1_500_000),
-            Some(1_500_000),
+            &mut scope,
+            facts,
             "call_early",
             ToolPanel::for_test(
                 "bash",
@@ -6155,7 +6240,6 @@ Index: /x/src/main.rs
                 Some(serde_json::json!({"command": "sleep 30"})),
                 None,
             ),
-            Some(PartSource::at(early.id.clone(), 0)),
         )
         .expect("the earlier message's panel pins");
 
@@ -6223,11 +6307,23 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("test");
         let early = &transcript.messages[0];
+        let walk = Timeline::walk(&positions);
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(
+            acc.timeline_mut(),
+            early.time.map(|time| time.created),
+            &early.id,
+            &pinned,
+        );
+        let facts = PartFacts {
+            form: PartForm::Tool,
+            key_at: Some(9_000),
+            shown_at: Some(9_000),
+            source: Some(PartSource::at(early.id.clone(), 0)),
+        };
         acc.push_tool_scoped(
-            &positions,
-            early,
-            Some(9_000),
-            Some(9_000),
+            &mut scope,
+            facts,
             "call_early",
             ToolPanel::for_test(
                 "bash",
@@ -6235,7 +6331,6 @@ Index: /x/src/main.rs
                 Some(serde_json::json!({"command": "sleep 30"})),
                 None,
             ),
-            Some(PartSource::at(early.id.clone(), 0)),
         )
         .expect("the earlier message's panel pins");
         acc.seed_projection(
