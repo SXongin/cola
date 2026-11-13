@@ -1727,11 +1727,14 @@ impl Timeline {
             })
             .min();
         // Parts later in the SAME message that this read has not placed yet
-        // (a seeded settle runs before the window/seed walks): their
-        // transcript keys cap the entry too, so it cannot jump them.
+        // (a seeded settle runs before the window/seed walks): their eventual
+        // key is max(transcript key, floor), so that effective key caps the
+        // entry too — a raw key below the floor still floors to the floor and
+        // must not be discarded.
         for (part, key) in following {
-            if *part > position.1 && *key >= floor {
-                min = Some(min.map_or(*key, |min| min.min(*key)));
+            if *part > position.1 {
+                let key = (*key).max(floor);
+                min = Some(min.map_or(key, |min| min.min(key)));
             }
         }
         min
