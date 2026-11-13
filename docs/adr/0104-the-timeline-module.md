@@ -56,9 +56,10 @@ content into them.**
   pinned_tails)` yields a message scope. Every method takes the `&mut Timeline`
   for the call — `place` returns a `Placement`, `push`/`replace` consume it — so
   one walk serves a whole render pass and one scope a whole message without
-  borrowing the accumulator. The scope owns the message floor and the read
-  floor, and its `Drop` is the only clearer, so the half-written protocol is no
-  longer representable and no accessor sets a floor from outside.
+  borrowing the accumulator. The walk owns the read floor; the scope owns the
+  message floor and clears both on `Drop` (the walk's own `Drop` also clears the
+  read floor), so the half-written protocol is no longer representable and no
+  accessor sets a floor from outside.
 - **`Placement` is an owned, linear token, not a borrow.** It carries the entry
   key, the merge identity, the display clock, the floor it was placed under, the
   `TranscriptKind` variant its part expects, and a private scope generation. Its fields are private with no public constructor
@@ -124,8 +125,9 @@ ADR-0050 records is unchanged.
   `Result<(), PlacementError>` after validating generation, kind and source.
   `MessageScope::synthetic(timeline, entry)` admits a synthetic entry under the
   scope's message floor; `MessageScope::pin(timeline, facts, call_id)` produces
-  the `TailPlacement` a live panel carries. The scope's `Drop` clears both
-  floors — the only clearer — so a half-written protocol cannot survive. One
+  the `TailPlacement` a live panel carries. The walk owns the read floor and the
+  scope the message floor; the scope's `Drop` clears both, and the walk's own
+  `Drop` clears the read floor, so a half-written protocol cannot survive. One
   walk serves a whole render pass and one scope a whole message, so preparation
   may use the accumulator between placements.
 - **One insert path.** `Timeline::seat` seats an entry at its already-resolved
@@ -225,9 +227,10 @@ stays free to use the accumulator between placements. Each pass opens ONE walk
 and one `MessageScope` per message: `render_turn_parts`'s window,
 `render_pending_gap`, `render_seed_scope` and `resolve_seeded_calls`, plus the
 compaction walk (`place_compactions`, one walk per read and one scope per row).
-The scope owns the message floor, the read floor, the read position and the
-scope generation; its `Drop` clears both floors, so it is the only clearer and
-a half-written protocol cannot survive it. No accessor sets a floor by hand, and
+The walk owns the read floor, and the scope borrows the walk, owns the message
+floor, and carries the read position and generation; the scope's `Drop` clears
+both floors (and the walk's own `Drop` also clears the read floor), so the
+transient protocol cannot survive either. No accessor sets a floor by hand, and
 the four walks contain no `set_message_floor`, `set_read_floor` or
 `reset_read_floor` call. The only remaining `Turn::set_message_floor` is the
 `#[cfg(test)]` scripted seam, which delegates to a real message scope.

@@ -3119,7 +3119,7 @@ impl StreamAccumulator {
         read_positions: &HashMap<&str, usize>,
         rows: impl IntoIterator<Item = CompactionRow>,
     ) {
-        let walk = Timeline::walk(read_positions);
+        let mut walk = Timeline::walk(read_positions);
         for CompactionRow { source, at, fact } in rows {
             let message = source.message_id().clone();
             let mut scope = walk.message(&self.timeline, at, &message, &[]);
@@ -3718,7 +3718,7 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        let walk = Timeline::walk(&read_order);
+        let mut walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
             &self.timeline,
             message.time.map(|time| time.created),
@@ -3774,7 +3774,7 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        let walk = Timeline::walk(&read_order);
+        let mut walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
             &self.timeline,
             message.time.map(|time| time.created),
@@ -3851,7 +3851,7 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        let walk = Timeline::walk(&read_order);
+        let mut walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
             &self.timeline,
             message.time.map(|time| time.created),
@@ -3882,7 +3882,7 @@ impl StreamAccumulator {
     /// one of each and the floors ride the scope.
     fn place_push(
         &mut self,
-        scope: &mut MessageScope<'_>,
+        scope: &mut MessageScope<'_, '_>,
         facts: PartFacts,
         kind: TranscriptKind,
     ) -> Result<(), PlacementError> {
@@ -3895,7 +3895,7 @@ impl StreamAccumulator {
     /// public replace path). The floors apply exactly as on the ordinary push.
     fn replace_place_push(
         &mut self,
-        scope: &mut MessageScope<'_>,
+        scope: &mut MessageScope<'_, '_>,
         replaced: &PartSource,
         facts: PartFacts,
         kind: TranscriptKind,
@@ -3909,7 +3909,7 @@ impl StreamAccumulator {
     /// convenience [`Self::push_text_at_key`] and its siblings delegate here.
     pub(super) fn push_text_scoped(
         &mut self,
-        scope: &mut MessageScope<'_>,
+        scope: &mut MessageScope<'_, '_>,
         facts: PartFacts,
         chunk: String,
         lead: Option<String>,
@@ -3934,7 +3934,7 @@ impl StreamAccumulator {
     /// delegate here.
     pub(super) fn push_reasoning_scoped(
         &mut self,
-        scope: &mut MessageScope<'_>,
+        scope: &mut MessageScope<'_, '_>,
         facts: PartFacts,
         chunk: String,
         lead: Option<String>,
@@ -3958,7 +3958,7 @@ impl StreamAccumulator {
     /// [`Self::replace_text_run`] delegates here.
     pub(super) fn replace_text_scoped(
         &mut self,
-        scope: &mut MessageScope<'_>,
+        scope: &mut MessageScope<'_, '_>,
         replaced: &PartSource,
         facts: PartFacts,
         chunk: String,
@@ -3983,7 +3983,7 @@ impl StreamAccumulator {
     /// [`Self::replace_reasoning_run`] delegates here.
     pub(super) fn replace_reasoning_scoped(
         &mut self,
-        scope: &mut MessageScope<'_>,
+        scope: &mut MessageScope<'_, '_>,
         replaced: &PartSource,
         facts: PartFacts,
         chunk: String,
@@ -4011,7 +4011,7 @@ impl StreamAccumulator {
     /// this seam. The test-only [`Self::push_tool_at_key`] delegates here.
     pub(super) fn push_tool_scoped(
         &mut self,
-        scope: &mut MessageScope<'_>,
+        scope: &mut MessageScope<'_, '_>,
         facts: PartFacts,
         call_id: &str,
         panel: ToolPanel,
@@ -5354,7 +5354,7 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        let walk = Timeline::walk(&read_order);
+        let mut walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
             &self.timeline,
             message.time.map(|time| time.created),
@@ -5382,7 +5382,7 @@ impl StreamAccumulator {
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
-        let walk = Timeline::walk(&read_order);
+        let mut walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
             &self.timeline,
             message.time.map(|time| time.created),
@@ -8286,7 +8286,7 @@ mod tests {
             shown_at: Some(reserved + 1),
             source: Some(PartSource::at(post.id.clone(), 0)),
         };
-        let walk = Timeline::walk(&read_positions);
+        let mut walk = Timeline::walk(&read_positions);
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
             acc.timeline(),

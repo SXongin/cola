@@ -303,7 +303,7 @@ fn render_part_scoped(
     index: usize,
     part: &Part,
     order_at: Option<i64>,
-    scope: &mut MessageScope<'_>,
+    scope: &mut MessageScope<'_, '_>,
 ) -> bool {
     let source = PartSource::at(message.id.clone(), index);
     if acc.part_seeded_delivered(source.message_id(), part) {
@@ -409,7 +409,7 @@ fn render_seeded_part_scoped(
     part: &Part,
     delivered: usize,
     order_at: Option<i64>,
-    scope: &mut MessageScope<'_>,
+    scope: &mut MessageScope<'_, '_>,
 ) -> bool {
     let message_id = message.id.clone();
     let (full, started_at, is_text) = match part {
@@ -1868,7 +1868,7 @@ pub(super) fn render_turn_parts(
     // One walk for the whole pass (spec #1040): it carries the read's message
     // positions and nothing else, so the accumulator stays free for preparation
     // between placements.
-    let walk = Timeline::walk(&read_positions);
+    let mut walk = Timeline::walk(&read_positions);
     // A card rendering an unanswered free-text field must not consume this
     // background update: otherwise the first pass removes it from "new" and
     // the post-answer pass has nothing left to show (#917 / card-repaints).
@@ -2026,7 +2026,7 @@ fn render_pending_gap(
     }
     let message_positions = read_position_map(transcript);
     // One walk for the whole gap pass (spec #1040).
-    let walk = Timeline::walk(&message_positions);
+    let mut walk = Timeline::walk(&message_positions);
     // The gap's window ends where the NEXT Turn begins (spec #561, review
     // #569): `turn_for_user` has no upper end, so without a bound the walk
     // would swallow every later Turn — content a later card already showed,
@@ -2136,7 +2136,7 @@ fn render_gap_part_scoped(
     part: &Part,
     delivered: usize,
     order_at: Option<i64>,
-    scope: &mut MessageScope<'_>,
+    scope: &mut MessageScope<'_, '_>,
 ) -> bool {
     let message_id = message.id.clone();
     let (full, started_at, is_text) = match part {
@@ -2229,7 +2229,7 @@ fn render_seed_scope(
     let mut rendered = false;
 
     // One walk for the whole seed pass (spec #1040).
-    let walk = Timeline::walk(message_positions);
+    let mut walk = Timeline::walk(message_positions);
     let messages = transcript.turn_for_user(scope).messages;
     for message in messages.iter().copied() {
         walked.insert(message.id.clone());
@@ -2500,64 +2500,73 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
     calls.sort_by_key(|(position, _)| *position);
     // One walk for the whole live-set pass (spec #1040); calls are sorted by
     // position, so one scope serves a message's whole run of calls.
-    let walk = Timeline::walk(&seeded_positions);
-    let mut current: Option<(usize, MessageScope<'_>)> = None;
-    for (position, call_id) in calls {
-        // The call's typed position — the seeded panel keeps it, so once it
-        // settles its timeline entry can become the Rendered Cursor frontier
-        // (spec #561, review #569).
-        if let Some((position, index)) = position
-            && let Some(call) = transcript.tool_call(&call_id)
-        {
-            let message = &transcript.messages[position];
-            let source = PartSource::at(message.id.clone(), index);
-            let part = Part::Tool(call.clone());
-            // The message scope carries the floor the settlement takes (issue
-            // #1023): a post-click message's parts follow the receipt — and
-            // the call's read position orders it, exactly like the window walk
-            // (issue #1022).
-            if !acc.part_seeded_delivered(source.message_id(), &part) && renders_part(acc, &part) {
-                if call.identity.name == "todowrite" {
-                    acc.record_todo_call(call);
-                    acc.refresh_phase();
-                } else {
-                    let order_at = part_order_times(message).get(index).copied().flatten();
-                    let facts = PartFacts {
-                        form: PartForm::Tool,
-                        key_at: order_at,
-                        shown_at: call.started_at,
-                        source: Some(source),
-                    };
-                    if current
-                        .as_ref()
-                        .is_none_or(|(message_pos, _)| *message_pos != position)
-                    {
-                        let pinned = acc.pinned_tail_facts();
-                        let next = walk.message(
-                            acc.timeline(),
-                            message.time.map(|time| time.created),
-                            &message.id,
-                            &pinned,
-                        );
-                        current = Some((position, next));
-                    }
-                    let scope = &mut current.as_mut().expect("the scope was just ensured").1;
-                    acc.push_tool_scoped(
-                        scope,
-                        facts,
-                        &call.identity.call_id,
-                        crate::feishu::card::tool_render::ToolPanel::new(call.clone()),
-                    )
-                    .expect("the message scope accepts its own tool placement");
-                }
-                if call.status == ToolStatus::Running {
-                    acc.mark_streaming();
-                }
-                rendered = true;
+    let mut walk = Timeline::walk(&seeded_positions);
+    let mut index = 0;
+    while index < calls.len() {
+        let Some((message_pos, _)) = calls[index].0 else {
+            let call_id = &calls[index].1;
+            if acc.tool_settled(call_id) {
+                acc.retire_seeded_call(call_id);
             }
-        }
-        if acc.tool_settled(&call_id) {
-            acc.retire_seeded_call(&call_id);
+            index += 1;
+            continue;
+        };
+        let message = &transcript.messages[message_pos];
+        let pinned = acc.pinned_tail_facts();
+        let mut scope = walk.message(
+            acc.timeline(),
+            message.time.map(|time| time.created),
+            &message.id,
+            &pinned,
+        );
+        while index < calls.len() {
+            let Some((pos, part_index)) = calls[index].0 else {
+                break;
+            };
+            if pos != message_pos {
+                break;
+            }
+            let call_id = &calls[index].1;
+            // The call's typed position — the seeded panel keeps it, so once it
+            // settles its timeline entry can become the Rendered Cursor
+            // frontier (spec #561, review #569).
+            if let Some(call) = transcript.tool_call(call_id) {
+                let source = PartSource::at(message.id.clone(), part_index);
+                let part = Part::Tool(call.clone());
+                // The message scope carries the floor the settlement takes
+                // (issue #1023): a post-click message's parts follow the
+                // receipt, and the call's read position orders it, exactly
+                // like the window walk (issue #1022).
+                if !acc.part_seeded_delivered(source.message_id(), &part) && renders_part(acc, &part) {
+                    if call.identity.name == "todowrite" {
+                        acc.record_todo_call(call);
+                        acc.refresh_phase();
+                    } else {
+                        let order_at = part_order_times(message).get(part_index).copied().flatten();
+                        let facts = PartFacts {
+                            form: PartForm::Tool,
+                            key_at: order_at,
+                            shown_at: call.started_at,
+                            source: Some(source),
+                        };
+                        acc.push_tool_scoped(
+                            &mut scope,
+                            facts,
+                            &call.identity.call_id,
+                            crate::feishu::card::tool_render::ToolPanel::new(call.clone()),
+                        )
+                        .expect("the message scope accepts its own tool placement");
+                    }
+                    if call.status == ToolStatus::Running {
+                        acc.mark_streaming();
+                    }
+                    rendered = true;
+                }
+            }
+            if acc.tool_settled(call_id) {
+                acc.retire_seeded_call(call_id);
+            }
+            index += 1;
         }
     }
     rendered
@@ -6224,7 +6233,7 @@ Index: /x/src/main.rs
         acc.record_receipt_cut(orphan_anchor, 1_200_000);
         // An earlier message's live panel sits ABOVE the receipt's key.
         let early = &transcript.messages[0];
-        let walk = Timeline::walk(&positions);
+        let mut walk = Timeline::walk(&positions);
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
             acc.timeline(),
@@ -6321,7 +6330,7 @@ Index: /x/src/main.rs
 
         let mut acc = StreamAccumulator::new("test");
         let early = &transcript.messages[0];
-        let walk = Timeline::walk(&positions);
+        let mut walk = Timeline::walk(&positions);
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
             acc.timeline(),
