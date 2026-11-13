@@ -2714,17 +2714,11 @@ impl StreamAccumulator {
         self.timeline.len()
     }
 
-    /// The timeline module, for the module's own read-only test assertions.
-    #[cfg(test)]
+    /// The timeline module, for a render pass's per-message scope and the
+    /// module's own read-only test assertions. The scope borrows it only for
+    /// the duration of a `message`/`place`/`push` call.
     pub(super) fn timeline(&self) -> &Timeline {
         &self.timeline
-    }
-
-    /// The timeline module, for the render pass's per-message scopes: the
-    /// scope borrows no accumulation state, so a caller hands the timeline in
-    /// per placement and keeps using the accumulator between calls.
-    pub(super) fn timeline_mut(&mut self) -> &mut Timeline {
-        &mut self.timeline
     }
 
     /// How many message scopes the timeline has minted, for the render seam's
@@ -3128,7 +3122,7 @@ impl StreamAccumulator {
         let walk = Timeline::walk(read_positions);
         for CompactionRow { source, at, fact } in rows {
             let message = source.message_id().clone();
-            let mut scope = walk.message(&mut self.timeline, at, &message, &[]);
+            let mut scope = walk.message(&self.timeline, at, &message, &[]);
             // A row's own server time is both its pre-floor seed and the cut
             // its message earns, so the scope's message floor and the
             // admission's `receipt_cut_floor(message_time)` are the same cut.
@@ -3726,7 +3720,7 @@ impl StreamAccumulator {
         let message = self.scripted_transcript();
         let walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
-            &mut self.timeline,
+            &self.timeline,
             message.time.map(|time| time.created),
             &message.id,
             &[],
@@ -3782,7 +3776,7 @@ impl StreamAccumulator {
         let message = self.scripted_transcript();
         let walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
-            &mut self.timeline,
+            &self.timeline,
             message.time.map(|time| time.created),
             &message.id,
             &[],
@@ -3859,7 +3853,7 @@ impl StreamAccumulator {
         let message = self.scripted_transcript();
         let walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
-            &mut self.timeline,
+            &self.timeline,
             message.time.map(|time| time.created),
             &message.id,
             &[],
@@ -5362,7 +5356,7 @@ impl StreamAccumulator {
         let message = self.scripted_transcript();
         let walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
-            &mut self.timeline,
+            &self.timeline,
             message.time.map(|time| time.created),
             &message.id,
             &[],
@@ -5390,7 +5384,7 @@ impl StreamAccumulator {
         let message = self.scripted_transcript();
         let walk = Timeline::walk(&read_order);
         let mut scope = walk.message(
-            &mut self.timeline,
+            &self.timeline,
             message.time.map(|time| time.created),
             &message.id,
             &[],
@@ -8295,7 +8289,7 @@ mod tests {
         let walk = Timeline::walk(&read_positions);
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
-            acc.timeline_mut(),
+            acc.timeline(),
             post.time.map(|time| time.created),
             &post.id,
             &pinned,

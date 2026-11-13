@@ -3,10 +3,12 @@
 //!
 //! Private to the Turn module (ADR-0050, ADR-0104): the accumulator holds one
 //! [`Timeline`] and delegates its timeline accessors here. The entries, the
-//! message and read floors, the Interaction Receipt cut staircase, the
-//! live-slice boundary (`render_from`), the sealed-entry set, merge-by-part
-//! lookup and key/identity minting live in this file; nothing outside it
-//! mutates one of them.
+//! Interaction Receipt cut staircase, the live-slice boundary (`render_from`),
+//! the sealed-entry set, merge-by-part lookup and key/identity minting live in
+//! this file; nothing outside it mutates one of them directly. A render pass
+//! hands the timeline to its message scope through
+//! `StreamAccumulator::timeline_mut()` for each placement — the scope itself
+//! borrows the accumulator not at all.
 //!
 //! The placement interface is a walk (ticket #1042): [`Timeline::walk`] yields
 //! a [`Walk`] carrying the read's message positions, `walk.message(...)` yields
@@ -26,7 +28,12 @@ use crate::backend::{Compaction, MessageId, Part, TranscriptMessage};
 use crate::bridge::chain::EndingKey;
 use crate::feishu::card::ledger::TaskCompletionEntry;
 use crate::feishu::card::tool_render::ToolPanel;
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// An entry's read position (spec #1040): the message's position in the read,
 /// then the part's index in that message. `None` for a source-less or
@@ -36,6 +43,20 @@ pub(super) type ReadPosition = (usize, usize);
 /// The tie-break order a fresh entry uses at its equal-key position: after
 /// every entry already seated there (`order` breaks ties only within a class).
 const AFTER_EQUAL_POSITION: u64 = u64::MAX;
+
+/// The next message scope's generation (spec #1040). Process-wide, so two
+/// scopes can never coincide even when they come from different Timelines: a
+/// `Placement` minted by one scope is always refused by another.
+static SCOPE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The two transient floors a message scope owns (spec #1040), named so a
+/// message/read swap cannot compile-and-pass in the guard tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ScopeFloors {
+    pub(super) message: Option<i64>,
+    pub(super) read: Option<i64>,
+}
 
 /// One entry on a turn's chronological timeline: a rendered item plus the
 /// server-side start time (epoch ms) of the part it came from — its **key**.
@@ -562,13 +583,12 @@ pub(super) struct Timeline {
     /// the same streaming part must start a NEW entry, never merge into a
     /// skipped one — no card will ever render it again.
     sealed_entries: HashSet<u64>,
-    /// Bumped whenever a message scope is created (spec #1040): a `Placement`
-    /// from an earlier scope is stale and refused.
-    scope_generation: u64,
     /// How many message scopes this Timeline has minted, for the render seam's
-    /// one-scope-per-message test. Test-only; never read by production.
+    /// one-scope-per-message tests. Test-only; never read by production. An
+    /// `Arc<AtomicUsize>` keeps `Timeline` `Sync` (the accumulator crosses
+    /// async boundaries) and survives a clone.
     #[cfg(test)]
-    scopes_minted: usize,
+    scopes_minted: std::sync::Arc<AtomicUsize>,
 }
 
 /// A resolved insertion position: the final key and the index the entry takes.
@@ -600,7 +620,7 @@ pub(super) struct Walk<'r> {
     /// and `MessageScope::drop` clears it, so the guard test observes that the
     /// Drop is the only clearer. Compiled only for tests.
     #[cfg(test)]
-    floors: std::rc::Rc<std::cell::Cell<(Option<i64>, Option<i64>)>>,
+    floors: std::rc::Rc<Cell<ScopeFloors>>,
 }
 
 /// One message's scope within a [`Walk`] (spec #1040): the read position, the
@@ -619,7 +639,7 @@ pub(super) struct MessageScope<'r> {
     /// The walk's test witness, cleared by the same `Drop` that clears the
     /// scope's own floors. Test-only.
     #[cfg(test)]
-    witness: std::rc::Rc<std::cell::Cell<(Option<i64>, Option<i64>)>>,
+    witness: std::rc::Rc<Cell<ScopeFloors>>,
 }
 
 impl Drop for MessageScope<'_> {
@@ -627,7 +647,7 @@ impl Drop for MessageScope<'_> {
         self.message_floor = None;
         self.read_floor = None;
         #[cfg(test)]
-        self.witness.set((None, None));
+        self.witness.set(ScopeFloors::default());
     }
 }
 
@@ -841,16 +861,16 @@ impl Timeline {
     }
 
     /// How many message scopes this Timeline has minted, for the render seam's
-    /// one-scope-per-message test.
+    /// one-scope-per-message tests.
     #[cfg(test)]
     pub(super) fn scopes_minted(&self) -> usize {
-        self.scopes_minted
+        self.scopes_minted.load(Ordering::Relaxed)
     }
 
-    /// Restart the scope counter, for that same test.
+    /// Restart the scope counter, for those same tests.
     #[cfg(test)]
-    pub(super) fn reset_scopes_minted(&mut self) {
-        self.scopes_minted = 0;
+    pub(super) fn reset_scopes_minted(&self) {
+        self.scopes_minted.store(0, Ordering::Relaxed);
     }
 
     /// Key for a push with no server part time (tests, synthetic content), and
@@ -1625,20 +1645,26 @@ impl Timeline {
 }
 
 impl<'r> Walk<'r> {
-    /// The floors the current scope owns, for the guard invariant test.
+    /// The message floor the current scope owns, for the guard invariant tests.
     #[cfg(test)]
-    pub(super) fn floors(&self) -> (Option<i64>, Option<i64>) {
-        self.floors.get()
+    pub(super) fn message_floor(&self) -> Option<i64> {
+        self.floors.get().message
+    }
+
+    /// The read floor the current scope owns, for the guard invariant tests.
+    #[cfg(test)]
+    pub(super) fn read_floor(&self) -> Option<i64> {
+        self.floors.get().read
     }
 
     /// Scope the walk to one message (spec #1040): the message's receipt cut
     /// and the read floor made of earlier messages' placed entries plus their
     /// pinned tails, owned by the returned scope. The Timeline is borrowed only
     /// to read the entries and mint the scope's generation; the scope itself
-    /// borrows nothing, so a pass keeps one walk and one scope per message.
+    /// borrows neither, so a pass keeps one walk and one scope per message.
     pub(super) fn message(
         &self,
-        timeline: &mut Timeline,
+        timeline: &Timeline,
         created: Option<i64>,
         id: &MessageId,
         pinned_tail_keys: &[TailFact],
@@ -1650,14 +1676,17 @@ impl<'r> Walk<'r> {
             })
         });
         let message_floor = created.and_then(|created| timeline.receipt_cut_floor(created));
-        timeline.scope_generation = timeline.scope_generation.saturating_add(1);
-        let generation = timeline.scope_generation;
+        // Process-wide, so a token from another scope — or another Timeline's
+        // scope — can never match this one's generation.
+        let generation = SCOPE_GENERATION.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         #[cfg(test)]
         {
-            timeline.scopes_minted += 1;
+            timeline.scopes_minted.fetch_add(1, Ordering::Relaxed);
+            self.floors.set(ScopeFloors {
+                message: message_floor,
+                read: read_floor,
+            });
         }
-        #[cfg(test)]
-        self.floors.set((message_floor, read_floor));
         MessageScope {
             read_order: self.read_order,
             generation,
@@ -2860,7 +2889,7 @@ mod tests {
         let row = PartSource::at(MessageId::new("msg_comp"), 0);
         let key = {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, Some(2_000), &scope_message, &[]);
+            let mut scope = walk.message(&timeline, Some(2_000), &scope_message, &[]);
             scope
                 .synthetic(
                     &mut timeline,
@@ -2890,7 +2919,7 @@ mod tests {
         let order = HashMap::from([("m1", 0usize)]);
         let message = MessageId::new("m1");
         let walk = Timeline::walk(&order);
-        let scope = walk.message(&mut timeline, Some(2_000), &message, &[]);
+        let scope = walk.message(&timeline, Some(2_000), &message, &[]);
         assert_eq!(
             scope.message_floor(),
             Some(9_000),
@@ -2898,16 +2927,18 @@ mod tests {
         );
         assert_eq!(scope.read_floor(), None, "the scope reads no earlier entry");
         assert_eq!(
-            walk.floors(),
-            (Some(9_000), None),
-            "the scope owns the floors while it lives"
+            walk.message_floor(),
+            Some(9_000),
+            "the scope owns the message floor while it lives"
         );
+        assert_eq!(walk.read_floor(), None, "no read floor was set");
         drop(scope);
         assert_eq!(
-            walk.floors(),
-            (None, None),
-            "the scope's Drop is the only clearer of the floors it owned"
+            walk.message_floor(),
+            None,
+            "the scope's Drop is the only clearer of the message floor"
         );
+        assert_eq!(walk.read_floor(), None, "no read floor outlives the scope");
 
         // The ticket's observable: a later part with an older key is not
         // floored by the dropped scope's receipt cut.
@@ -2920,10 +2951,10 @@ mod tests {
         assert_eq!(after.key(), 2_000, "the dropped scope's floor is cleared");
     }
 
-    /// Spec #1040's guard invariant: a walk's `Drop` clears the read floor. A
-    /// scope in the same walk sets 9000 as the floor; after the walk drops, a
-    /// push outside any walk and a FRESH scope whose message is first in the
-    /// new read both land at their own server key, never the stale floor.
+    /// Spec #1040's guard invariant: the message scope's `Drop` clears the read
+    /// floor it owns. A later message's scope sees 9000 while it lives and
+    /// clears it on drop; the next message's first part then lands at its own
+    /// server key below the stale floor.
     #[test]
     fn a_dropped_walk_clears_the_read_floor() {
         let mut timeline = Timeline::default();
@@ -2938,7 +2969,7 @@ mod tests {
         };
         let walk = Timeline::walk(&order);
         {
-            let mut scope = walk.message(&mut timeline, None, &m0, &[]);
+            let mut scope = walk.message(&timeline, None, &m0, &[]);
             let placement = scope.place(&mut timeline, facts(&m0, 9_000));
             scope
                 .push(
@@ -2952,24 +2983,26 @@ mod tests {
                 .unwrap();
         }
         // A later message in this walk sees m0's 9000 as its read floor.
-        let later = walk.message(&mut timeline, None, &m1, &[]);
+        let later = walk.message(&timeline, None, &m1, &[]);
         assert_eq!(
             later.read_floor(),
             Some(9_000),
             "a later message sees the earlier entry's key as its read floor"
         );
         assert_eq!(later.message_floor(), None, "m1 earned no receipt cut");
+        assert_eq!(walk.message_floor(), None, "m1 earned no receipt cut");
         assert_eq!(
-            walk.floors(),
-            (None, Some(9_000)),
+            walk.read_floor(),
+            Some(9_000),
             "the scope owns the read floor while it lives"
         );
         drop(later);
         assert_eq!(
-            walk.floors(),
-            (None, None),
+            walk.read_floor(),
+            None,
             "the scope's Drop is the only clearer of the read floor"
         );
+        assert_eq!(walk.message_floor(), None, "no message floor outlives the scope");
 
         // The ticket's observable: the next message's first part carries a key
         // below the stale floor and still lands at its own server time. In a
@@ -3065,10 +3098,10 @@ mod tests {
 
         let (stale, mismatch) = {
             let walk = Timeline::walk(&order);
-            let mut first = walk.message(&mut timeline, None, &message, &[]);
+            let mut first = walk.message(&timeline, None, &message, &[]);
             let token = first.place(&mut timeline, facts());
             drop(first);
-            let mut second = walk.message(&mut timeline, None, &message, &[]);
+            let mut second = walk.message(&timeline, None, &message, &[]);
             let stale = second.push(
                 &mut timeline,
                 token,
@@ -3093,6 +3126,39 @@ mod tests {
         assert!(timeline.is_empty(), "a refused placement inserts nothing");
     }
 
+    /// Spec #1040: the generation is process-wide, so a token from another
+    /// Timeline's scope is refused even though both timelines are fresh.
+    #[test]
+    fn a_token_from_another_timelines_scope_is_refused() {
+        let order = HashMap::from([("m1", 0usize)]);
+        let message = MessageId::new("m1");
+        let facts = || PartFacts {
+            form: PartForm::Text,
+            key_at: Some(1_000),
+            shown_at: Some(1_000),
+            source: Some(PartSource::at(MessageId::new("m1"), 0)),
+        };
+        let mut first = Timeline::default();
+        let mut second = Timeline::default();
+        let walk = Timeline::walk(&order);
+        let mut a = walk.message(&first, None, &message, &[]);
+        let token = a.place(&mut first, facts());
+        let mut b = walk.message(&second, None, &message, &[]);
+        let refused = b.push(
+            &mut second,
+            token,
+            TranscriptKind::Text {
+                chunk: "foreign".into(),
+                lead: None,
+            },
+        );
+        assert_eq!(refused, Err(PlacementError::Stale));
+        assert!(
+            first.is_empty() && second.is_empty(),
+            "a refused cross-timeline token inserts nothing"
+        );
+    }
+
     /// A replace validates generation, kind and source BEFORE dropping the
     /// part's run: every refusal leaves the original entries intact.
     #[test]
@@ -3103,7 +3169,7 @@ mod tests {
         let source = PartSource::at(MessageId::new("m1"), 0);
         {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, None, &message, &[]);
+            let mut scope = walk.message(&timeline, None, &message, &[]);
             let facts = PartFacts {
                 form: PartForm::Text,
                 key_at: Some(1_000),
@@ -3124,7 +3190,7 @@ mod tests {
         }
         let (mismatch, source_less, other_source) = {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, None, &message, &[]);
+            let mut scope = walk.message(&timeline, None, &message, &[]);
             let text = || TranscriptKind::Text {
                 chunk: "改写".into(),
                 lead: None,
@@ -3207,7 +3273,7 @@ mod tests {
         let rewritten = PartSource::new(MessageId::new("m1"), 1, 0, Some(cursor_prefix_digest("XYZ")));
         {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, None, &MessageId::new("m1"), &[]);
+            let mut scope = walk.message(&timeline, None, &MessageId::new("m1"), &[]);
             let facts = PartFacts {
                 form: PartForm::Text,
                 key_at: Some(1_000),
@@ -3266,7 +3332,7 @@ mod tests {
         let rewritten = PartSource::new(message.clone(), 0, 0, Some(cursor_prefix_digest("XYZ")));
         {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, None, &message, &[]);
+            let mut scope = walk.message(&timeline, None, &message, &[]);
             let facts = PartFacts {
                 form: PartForm::Text,
                 key_at: Some(2_000),
@@ -3545,7 +3611,7 @@ mod tests {
         );
         for (index, key) in [(1, 3_000), (2, 2_000)] {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, Some(5_000), &message, &[]);
+            let mut scope = walk.message(&timeline, Some(5_000), &message, &[]);
             let facts = PartFacts {
                 form: PartForm::Text,
                 key_at: Some(key),
@@ -3737,7 +3803,7 @@ mod tests {
             // The later message predates the ask, so it earns no cut of its
             // own: only the pinned tail can floor its part.
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, Some(2_000), &MessageId::new("m1"), &pinned);
+            let mut scope = walk.message(&timeline, Some(2_000), &MessageId::new("m1"), &pinned);
             let facts = PartFacts {
                 form: PartForm::Text,
                 key_at: Some(1_000),
@@ -3810,7 +3876,7 @@ mod tests {
         // its part — and it must floor it to the tail's EFFECTIVE key.
         let placement_key = {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, Some(500), &MessageId::new("m1"), &pinned);
+            let mut scope = walk.message(&timeline, Some(500), &MessageId::new("m1"), &pinned);
             let facts = PartFacts {
                 form: PartForm::Text,
                 key_at: Some(1_000),
@@ -3895,7 +3961,7 @@ mod tests {
         // tail can floor its part.
         let placement_key = {
             let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, None, &MessageId::new("m1"), &pinned);
+            let mut scope = walk.message(&timeline, None, &MessageId::new("m1"), &pinned);
             let facts = PartFacts {
                 form: PartForm::Text,
                 key_at: Some(1_000),
@@ -3951,7 +4017,7 @@ mod tests {
         let order = HashMap::from([("m1", 0usize), ("m2", 1usize)]);
         let walk = Timeline::walk(&order);
         let m1 = MessageId::new("m1");
-        let mut scope = walk.message(&mut timeline, None, &m1, &[]);
+        let mut scope = walk.message(&timeline, None, &m1, &[]);
         let generation = scope.generation();
         for index in 0..2 {
             let key = 1_000 + index as i64;
@@ -3979,7 +4045,7 @@ mod tests {
             "both parts of the message used the same scope"
         );
         assert_eq!(timeline.entries().len(), 2);
-        let other = walk.message(&mut timeline, None, &MessageId::new("m2"), &[]);
+        let other = walk.message(&timeline, None, &MessageId::new("m2"), &[]);
         assert_ne!(
             other.generation(),
             generation,
@@ -4000,63 +4066,64 @@ mod tests {
             Some(serde_json::json!("ls")),
             Some("src"),
         );
-        let mut timeline = Timeline::default();
-        // An earlier part sets the read floor once the position is derived; a
-        // later part caps the settle.
-        push_text(
-            &mut timeline,
-            &order,
-            "m1",
-            5_000,
-            Some(PartSource::at(message.clone(), 0)),
-            "之前",
-        );
-        push_text(
-            &mut timeline,
-            &order,
-            "m1",
-            6_000,
-            Some(PartSource::at(message.clone(), 2)),
-            "之后",
-        );
-        // The first sighting is source-less but pinned INSIDE the read: it must
-        // still carry no position, because it names no part. The later
-        // sighting adopts its source.
-        let mut tail = {
-            let walk = Timeline::walk(&order);
-            let mut scope = walk.message(&mut timeline, None, &message, &[]);
-            scope.pin(
+        // The earlier part sets the read floor; the later part caps the settle.
+        let scenario = |pin_key: i64, expected: i64, why: &str| {
+            let mut timeline = Timeline::default();
+            push_text(
                 &mut timeline,
-                PartFacts {
-                    form: PartForm::Tool,
-                    key_at: Some(4_000),
-                    shown_at: Some(4_000),
-                    source: None,
-                },
-                "call_bash".into(),
-            )
-        };
-        assert!(
-            tail.position.is_none(),
-            "a source-less pin carries no read position even inside the read"
-        );
-        tail.adopt_source(Some(PartSource::at(message.clone(), 1)));
+                &order,
+                "m1",
+                5_000,
+                Some(PartSource::at(message.clone(), 0)),
+                "之前",
+            );
+            push_text(
+                &mut timeline,
+                &order,
+                "m1",
+                6_000,
+                Some(PartSource::at(message.clone(), 2)),
+                "之后",
+            );
+            // The first sighting is source-less but pinned INSIDE the read: it
+            // must still carry no position, because it names no part. The later
+            // sighting adopts its source.
+            let mut tail = {
+                let walk = Timeline::walk(&order);
+                let mut scope = walk.message(&timeline, None, &message, &[]);
+                scope.pin(
+                    &mut timeline,
+                    PartFacts {
+                        form: PartForm::Tool,
+                        key_at: Some(pin_key),
+                        shown_at: Some(pin_key),
+                        source: None,
+                    },
+                    "call_bash".into(),
+                )
+            };
+            assert!(
+                tail.position.is_none(),
+                "a source-less pin carries no read position even inside the read"
+            );
+            tail.adopt_source(Some(PartSource::at(message.clone(), 1)));
 
-        timeline.settle(tail, &panel, &order, &[]);
-        let tool = timeline
-            .entries()
-            .iter()
-            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
-            .expect("the panel settled");
-        assert_eq!(
-            timeline.entries()[tool].key(),
-            5_000,
-            "the adopted source derives the position, taking the earlier part's floor"
-        );
-        assert!(
-            matches!(timeline.entries()[tool].source(), Some(source) if source.index() == 1),
-            "the adopted source rides the settled entry"
-        );
+            timeline.settle(tail, &panel, &order, &[]);
+            let tool = timeline
+                .entries()
+                .iter()
+                .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+                .expect("the panel settled");
+            assert_eq!(timeline.entries()[tool].key(), expected, "{why}");
+            assert!(
+                matches!(timeline.entries()[tool].source(), Some(source) if source.index() == 1),
+                "the adopted source rides the settled entry"
+            );
+        };
+        // A pin above the following part is pulled down by the cap...
+        scenario(7_000, 6_000, "the following part caps the settle");
+        // ...and a pin below the earlier part is raised by the derived floor.
+        scenario(4_000, 5_000, "the earlier part raises the settle");
     }
 
     /// The accumulator's scoped path feeds every pinned tail into the walk
@@ -4082,12 +4149,7 @@ mod tests {
         let m1 = message("m1", 2_000);
         let walk = Timeline::walk(&read_positions);
         let pinned = acc.pinned_tail_facts();
-        let mut scope = walk.message(
-            acc.timeline_mut(),
-            m0.time.map(|time| time.created),
-            &m0.id,
-            &pinned,
-        );
+        let mut scope = walk.message(acc.timeline(), m0.time.map(|time| time.created), &m0.id, &pinned);
         let tool_facts = PartFacts {
             form: PartForm::Tool,
             key_at: Some(9_000),
@@ -4114,12 +4176,7 @@ mod tests {
         };
         let walk = Timeline::walk(&read_positions);
         let pinned = acc.pinned_tail_facts();
-        let mut scope = walk.message(
-            acc.timeline_mut(),
-            m1.time.map(|time| time.created),
-            &m1.id,
-            &pinned,
-        );
+        let mut scope = walk.message(acc.timeline(), m1.time.map(|time| time.created), &m1.id, &pinned);
         acc.push_text_scoped(&mut scope, facts, "later".into(), None)
             .expect("the later part places");
         let later = acc

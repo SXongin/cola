@@ -1915,7 +1915,7 @@ pub(super) fn render_turn_parts(
         let order_keys = part_order_times(message);
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
-            acc.timeline_mut(),
+            acc.timeline(),
             message.time.map(|time| time.created),
             &message.id,
             &pinned,
@@ -2055,7 +2055,7 @@ fn render_pending_gap(
         // One message scope serves every part of this message (spec #1040).
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
-            acc.timeline_mut(),
+            acc.timeline(),
             message.time.map(|time| time.created),
             &message.id,
             &pinned,
@@ -2240,7 +2240,7 @@ fn render_seed_scope(
         // One message scope serves every part of this message.
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
-            acc.timeline_mut(),
+            acc.timeline(),
             message.time.map(|time| time.created),
             &message.id,
             &pinned,
@@ -2534,7 +2534,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                     {
                         let pinned = acc.pinned_tail_facts();
                         let next = walk.message(
-                            acc.timeline_mut(),
+                            acc.timeline(),
                             message.time.map(|time| time.created),
                             &message.id,
                             &pinned,
@@ -6197,10 +6197,18 @@ Index: /x/src/main.rs
                 "msg_a_orphan",
                 orphan_anchor + 500,
                 None,
-                vec![Part::Text(crate::backend::TextPart {
-                    text: full.clone(),
-                    started_at: Some(orphan_anchor + 500),
-                })],
+                vec![
+                    Part::Text(crate::backend::TextPart {
+                        text: full.clone(),
+                        started_at: Some(orphan_anchor + 500),
+                    }),
+                    // A second part proves the pass reuses one scope for the
+                    // whole message.
+                    Part::Text(crate::backend::TextPart {
+                        text: "第二部分。".into(),
+                        started_at: Some(orphan_anchor + 600),
+                    }),
+                ],
             ),
             typed_message(
                 "msg_cola_new",
@@ -6219,7 +6227,7 @@ Index: /x/src/main.rs
         let walk = Timeline::walk(&positions);
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
-            acc.timeline_mut(),
+            acc.timeline(),
             early.time.map(|time| time.created),
             &early.id,
             &pinned,
@@ -6261,9 +6269,15 @@ Index: /x/src/main.rs
             },
             bound: Some(MessageId::new("msg_cola_new")),
         };
+        acc.reset_scopes_minted();
         assert!(
             render_pending_gap(&mut acc, &transcript, &gap),
             "the gap's tail renders"
+        );
+        assert_eq!(
+            acc.scopes_minted(),
+            1,
+            "the gap pass opens one scope for its one message, not one per part"
         );
         let tail = acc
             .timeline()
@@ -6310,7 +6324,7 @@ Index: /x/src/main.rs
         let walk = Timeline::walk(&positions);
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
-            acc.timeline_mut(),
+            acc.timeline(),
             early.time.map(|time| time.created),
             &early.id,
             &pinned,
@@ -6455,6 +6469,103 @@ Index: /x/src/main.rs
             "the orphan's continuation reads before the new answer: {text}"
         );
         assert!(!render_new_turn_parts(&mut acc, &answered(&full)));
+    }
+
+    /// Spec #1040: the seed-scope pass keeps one walk and opens one message
+    /// scope for a two-part orphan message.
+    #[test]
+    fn the_seed_pass_opens_one_scope_per_message() {
+        let new_anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: new_anchor - 31 * 60_000,
+        };
+        let prefix = "第一段回答。";
+        let full = format!("{prefix}没送达的尾巴。");
+        let queued = SessionTranscript::new(vec![message_in_flight(
+            "a_orphan",
+            new_anchor - 30 * 60_000,
+            None,
+            vec![
+                text_at(&full, new_anchor - 30 * 60_000),
+                text_at("第二部分。", new_anchor - 30 * 60_000 + 1),
+            ],
+        )]);
+        let mut acc = StreamAccumulator::new("proj");
+        acc.set_cola_message_id("msg_cola_new");
+        let cursor = projection_cursor_at(
+            "a_orphan",
+            0,
+            CursorPartKind::Text,
+            Some(new_anchor - 30 * 60_000),
+            prefix,
+            &[],
+        );
+        let seed = CursorSeed::for_orphan_resolving(&queued, &cursor, &orphan).expect("the cursor resolves");
+        acc.seed_projection(&cursor, seed);
+        acc.reset_scopes_minted();
+        assert!(render_new_turn_parts(&mut acc, &queued));
+        assert_eq!(
+            acc.scopes_minted(),
+            1,
+            "the seed pass opens one scope for its one message, not one per part"
+        );
+    }
+
+    /// Spec #1040: the seeded-call pass opens one scope per message — two
+    /// seeded calls in one message share it.
+    #[test]
+    fn the_seeded_call_pass_opens_one_scope_per_message() {
+        let anchor = 2_000_000;
+        let orphan = TurnAnchor {
+            message_id: MessageId::new("msg_cola_old"),
+            created_ms: anchor - 31 * 60_000,
+        };
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_new",
+                MessageRole::User,
+                Some(anchor),
+                vec![text_part("新的问题")],
+            ),
+            message_in_flight(
+                "a_stale",
+                anchor - 30 * 60_000,
+                None,
+                vec![
+                    tool(
+                        "shell",
+                        "call_a",
+                        ToolStatus::Running,
+                        Some(anchor - 11 * 60_000),
+                        Some(serde_json::json!({"command": "sleep 1"})),
+                        None,
+                    ),
+                    tool(
+                        "shell",
+                        "call_b",
+                        ToolStatus::Running,
+                        Some(anchor - 10 * 60_000),
+                        Some(serde_json::json!({"command": "sleep 2"})),
+                        None,
+                    ),
+                ],
+            ),
+        ]);
+        let mut acc = StreamAccumulator::new("proj");
+        acc.set_cola_message_id("msg_cola_new");
+        assert_eq!(
+            seed_live_calls(&mut acc, &transcript, &orphan),
+            2,
+            "both running calls are seeded"
+        );
+        acc.reset_scopes_minted();
+        assert!(resolve_seeded_calls(&mut acc, &transcript));
+        assert_eq!(
+            acc.scopes_minted(),
+            1,
+            "the two seeded calls of one message share one scope"
+        );
     }
 
     /// A NEW Turn's answer identical to the orphan's delivered text still

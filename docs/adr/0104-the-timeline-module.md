@@ -51,12 +51,14 @@ bare `i64`s.
 per ADR-0050) owns the ordered entries of a card body and the rule that places
 content into them.**
 
-- **One walk interface.** `timeline.walk(&read_order)` yields a walk;
-  `walk.message(created, id, pinned_tails)` yields a message scope; its `place`
-  returns a `Placement` and `push`/`replace` consume it. The scope's `Drop`
-  clears the message floor and the walk's `Drop` clears the read floor, so the
-  half-written protocol is no longer representable and no accessor sets a floor
-  from outside.
+- **One walk interface.** `Timeline::walk(&read_order)` yields a walk carrying
+  the read's message positions; `walk.message(timeline, created, id,
+  pinned_tails)` yields a message scope. Every method takes the `&mut Timeline`
+  for the call — `place` returns a `Placement`, `push`/`replace` consume it — so
+  one walk serves a whole render pass and one scope a whole message without
+  borrowing the accumulator. The scope owns the message floor and the read
+  floor, and its `Drop` is the only clearer, so the half-written protocol is no
+  longer representable and no accessor sets a floor from outside.
 - **`Placement` is an owned, linear token, not a borrow.** It carries the entry
   key, the merge identity, the display clock, the floor it was placed under, the
   `TranscriptKind` variant its part expects, and a private scope generation. Its fields are private with no public constructor
@@ -115,14 +117,17 @@ ADR-0050 records is unchanged.
   `part_order_times`. `TimelineKind` keeps its shape — `Tool(call_id)` with the
   panel body in the accumulator — and gains no generic parameter.
 - **One walk interface.** `Timeline::walk(&read_order)` yields a `Walk`;
-  `Walk::message(created, id, pinned_tails)` yields a `MessageScope`. The
-  scope's `place(PartFacts)` produces the linear `Placement`; `push(placement,
-  kind)` and `replace(placement, source, kind)` consume it and return
+  `Walk::message(timeline, created, id, pinned_tails)` yields a `MessageScope`
+  that owns the message and read floors. Its `place(timeline, PartFacts)`
+  produces the linear `Placement`; `push(timeline, placement, kind)` and
+  `replace(timeline, placement, source, kind)` consume it and return
   `Result<(), PlacementError>` after validating generation, kind and source.
-  `MessageScope::synthetic` admits a synthetic entry under the scope's message
-  floor; `MessageScope::pin` produces the `TailPlacement` a live panel carries.
-  The scope's `Drop` clears the message floor and the walk's `Drop` clears the
-  read floor, so a half-written protocol cannot survive either.
+  `MessageScope::synthetic(timeline, entry)` admits a synthetic entry under the
+  scope's message floor; `MessageScope::pin(timeline, facts, call_id)` produces
+  the `TailPlacement` a live panel carries. The scope's `Drop` clears both
+  floors — the only clearer — so a half-written protocol cannot survive. One
+  walk serves a whole render pass and one scope a whole message, so preparation
+  may use the accumulator between placements.
 - **One insert path.** `Timeline::seat` seats an entry at its already-resolved
   slot, allocates `seq` when the caller has none and lowers a clamped entry's
   `order`; the live-slice clamp is `slot_at`, the equal-key partition is
