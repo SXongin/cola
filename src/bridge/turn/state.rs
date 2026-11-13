@@ -11,8 +11,8 @@ use super::disposition::Disposition;
 #[cfg(test)]
 use super::timeline::PartForm;
 use super::timeline::{
-    MessageScope, PartFacts, PartSource, PlacementError, ReservationKeys, SyntheticEntry, TailFact,
-    TailPlacement, Timeline, TimelineItem, TimelineKind, TranscriptKind,
+    DeferredSettle, DeferredTool, MessageScope, PartFacts, PartSource, PlacementError, ReservationKeys,
+    SyntheticEntry, TailFact, TailPlacement, Timeline, TimelineItem, TimelineKind, TranscriptKind,
 };
 #[cfg(test)]
 use crate::backend::TranscriptMessage;
@@ -2721,6 +2721,11 @@ impl StreamAccumulator {
         &self.timeline
     }
 
+    /// The timeline module, for applying a message scope's deferred tools.
+    pub(super) fn timeline_mut(&mut self) -> &mut Timeline {
+        &mut self.timeline
+    }
+
     /// How many message scopes the timeline has minted, for the render seam's
     /// one-scope-per-message test.
     #[cfg(test)]
@@ -3860,6 +3865,7 @@ impl StreamAccumulator {
         );
         self.push_tool_scoped(&mut scope, facts, call_id, panel)
             .expect("the scripted message scope accepts its own tool placement");
+        scope.finish(&mut self.timeline);
     }
 
     /// Every live tail's fact, as the walk and the settle read them (spec
@@ -4023,7 +4029,12 @@ impl StreamAccumulator {
                 let tail = scope.pin(&mut self.timeline, facts, call_id.to_string());
                 self.live_tools.insert(call_id.to_string(), tail);
             } else {
-                self.place_push(scope, facts, TranscriptKind::Tool(call_id.to_string()))?;
+                // Defer the entry to the end of the message: the settle cap
+                // must see the message's later parts (see `finish`).
+                scope.defer_tool(DeferredTool::Insert {
+                    facts,
+                    call_id: call_id.to_string(),
+                });
             }
             self.tools.insert(call_id.to_string(), panel);
         } else if let Some(tail) = self.live_tools.get_mut(call_id) {
@@ -4034,7 +4045,11 @@ impl StreamAccumulator {
             if !live {
                 let tail = self.live_tools.shift_remove(call_id).expect("checked");
                 let pinned = self.pinned_tail_facts();
-                self.timeline.settle(tail, &panel, scope.read_order(), &pinned);
+                scope.defer_tool(DeferredTool::Settle(Box::new(DeferredSettle {
+                    tail,
+                    panel: panel.clone(),
+                    pinned_tails: pinned,
+                })));
             }
             self.tools.insert(call_id.to_string(), panel);
         } else {

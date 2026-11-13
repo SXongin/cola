@@ -1965,6 +1965,9 @@ pub(super) fn render_turn_parts(
                 }
             }
         }
+        // Settled tools are seated after the message's parts, so a settle's
+        // cap sees every later same-message entry.
+        scope.finish(acc.timeline_mut());
     }
     rendered_any
 }
@@ -2097,6 +2100,7 @@ fn render_pending_gap(
                 }
             }
         }
+        scope.finish(acc.timeline_mut());
     }
     rendered
 }
@@ -2280,6 +2284,7 @@ fn render_seed_scope(
                 }
             }
         }
+        scope.finish(acc.timeline_mut());
     }
     if gap_scope && rendered {
         acc.mark_gap_rendered();
@@ -2568,6 +2573,8 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             }
             index += 1;
         }
+        // Apply this message's settled tools after all its calls are queued.
+        scope.finish(acc.timeline_mut());
     }
     rendered
 }
@@ -4972,6 +4979,64 @@ Index: /x/src/main.rs
             acc.scopes_minted(),
             1,
             "the two-part assistant message opens one scope, not one per part"
+        );
+    }
+
+    /// Spec #1040: a running tool first seen without a start time, completed
+    /// at a late 9000 in a read whose same message also carries new text at
+    /// 1000, settles at the capped key below that text. The settle cap must
+    /// see the message's later parts, so settled tools are applied after them.
+    #[test]
+    fn a_completed_late_start_tool_settles_below_a_later_same_message_part() {
+        let anchor = 2_000;
+        let transcript = |status: ToolStatus, started: Option<i64>, with_text: bool| {
+            let mut parts = vec![tool(
+                "bash",
+                "call_1",
+                status,
+                started,
+                Some(serde_json::json!({"command": "ls"})),
+                None,
+            )];
+            if with_text {
+                parts.push(text_at("回答", 1_000));
+            }
+            SessionTranscript::new(vec![
+                typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+                message("a1", anchor, parts),
+            ])
+        };
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        // First read: running, no start time — a tail-only pin.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Running, None, false)
+        ));
+        // Second read: completed at 9000, followed by new text at 1000.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Completed, Some(9_000), true)
+        ));
+
+        let entries = acc.timeline();
+        let tool = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the panel settled");
+        let text = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(t) if t == "回答"))
+            .expect("the later text landed");
+        assert!(
+            tool < text,
+            "the tool sorts before the later same-message text: {entries:?}"
+        );
+        assert_eq!(
+            entries.entries()[tool].key(),
+            1_000,
+            "the settle is capped at the text's key"
         );
     }
 
