@@ -13,11 +13,11 @@
 //! The placement interface is a walk (ticket #1042): [`Timeline::walk`] yields
 //! a [`Walk`] carrying the read's message positions, `walk.message(...)` yields
 //! a [`MessageScope`] whose `place` returns a linear [`Placement`] and whose
-//! `push` consumes it. The walk owns the read floor and the scope owns the
-//! message floor; the scope's `Drop` clears both and the walk's own `Drop`
-//! clears the read floor. Neither borrows the timeline — every placement takes
-//! it per call — so one walk spans a whole render pass and one scope a whole
-//! message. A live tool tail is pinned as a [`TailPlacement`] and settled
+//! `push` consumes it. The walk owns the read floor and clears it at its own
+//! `Drop`; a scope owns the message floor, marks the walk occupied and clears
+//! the floor and the mark at its `Drop`, so a second scope cannot open over an
+//! undropped one. Neither borrows the timeline — every placement takes it per
+//! call — so one walk spans a whole render pass and one scope a whole message. A live tool tail is pinned as a [`TailPlacement`] and settled
 //! through [`Timeline::settle`].
 //!
 //! One private insert path ([`Timeline::seat`]) owns the live-slice clamp, the
@@ -607,25 +607,36 @@ struct Entry {
 /// `Drop` clears the read floor.
 pub(super) struct Walk<'r> {
     read_order: &'r HashMap<&'r str, usize>,
-    /// The highest key this walk's current message has placed (issue #1022):
-    /// the next message's parts may not sort above content already read before
-    /// them. Set by [`Self::message`], cleared by the message scope's `Drop`
-    /// and by the walk's own `Drop`.
+    /// The highest key this walk's messages have placed (issue #1022): the
+    /// next message's parts may not sort above content already read before
+    /// them. A high-water mark set by [`Self::message`] and cleared only by the
+    /// walk's own `Drop` — a message scope must not lower it.
     read_floor: Option<i64>,
+    /// Whether a message scope is open. The scope borrows the walk mutably, so
+    /// a second one is a compile error in production; the flag makes a missed
+    /// `MessageScope::drop` loud in tests.
+    occupied: bool,
+    /// Test witness for the read floor, so a test can observe the walk's own
+    /// `Drop` clearing it after the walk is gone.
+    #[cfg(test)]
+    floor: std::rc::Rc<std::cell::Cell<Option<i64>>>,
 }
 
 impl Drop for Walk<'_> {
     fn drop(&mut self) {
         self.read_floor = None;
+        #[cfg(test)]
+        self.floor.set(None);
     }
 }
 
 /// One message's scope within a [`Walk`] (spec #1040): the walk it belongs to,
 /// the read position, the message identity and created time, and the
 /// per-message floor. Every placement takes the timeline per call, so the scope
-/// borrows the accumulator not at all; its `Drop` clears the message floor and
-/// the walk's read floor, so a half-written protocol cannot leak. `place`
-/// produces a [`Placement`]; `push` consumes it.
+/// borrows the accumulator not at all. Its `Drop` clears the message floor and
+/// frees the walk (marks it unoccupied); the walk's own read floor survives
+/// until the walk's `Drop`. `place` produces a [`Placement`]; `push` consumes
+/// it.
 pub(super) struct MessageScope<'w, 'r> {
     walk: &'w mut Walk<'r>,
     generation: u64,
@@ -638,7 +649,7 @@ pub(super) struct MessageScope<'w, 'r> {
 impl Drop for MessageScope<'_, '_> {
     fn drop(&mut self) {
         self.message_floor = None;
-        self.walk.read_floor = None;
+        self.walk.occupied = false;
     }
 }
 
@@ -713,7 +724,7 @@ impl Timeline {
         self.items.is_empty()
     }
 
-    /// The entry list, for the accumulator's read-only walks.
+    /// The Timeline's ordered entries, for the accumulator's read-only walks.
     pub(super) fn iter(&self) -> std::slice::Iter<'_, TimelineItem> {
         self.items.iter()
     }
@@ -847,6 +858,9 @@ impl Timeline {
         Walk {
             read_order,
             read_floor: None,
+            occupied: false,
+            #[cfg(test)]
+            floor: Default::default(),
         }
     }
 
@@ -1671,10 +1685,17 @@ impl Timeline {
 }
 
 impl<'r> Walk<'r> {
-    /// The read floor the current message set, for the guard invariant tests.
+    /// The read floor the walk carries, for the guard invariant tests.
     #[cfg(test)]
     pub(super) fn read_floor(&self) -> Option<i64> {
         self.read_floor
+    }
+
+    /// A cloneable witness of the read floor, so a test can observe the walk's
+    /// own `Drop` clearing it after the walk itself is gone.
+    #[cfg(test)]
+    pub(super) fn floor_witness(&self) -> std::rc::Rc<std::cell::Cell<Option<i64>>> {
+        std::rc::Rc::clone(&self.floor)
     }
 
     /// Scope the walk to one message (spec #1040): record the message's receipt
@@ -1689,6 +1710,9 @@ impl<'r> Walk<'r> {
         id: &MessageId,
         pinned_tail_keys: &[TailFact],
     ) -> MessageScope<'_, 'r> {
+        // A message scope borrows the walk mutably, so a second one is already
+        // a compile error in production; this makes a missed `Drop` loud.
+        debug_assert!(!self.occupied, "a message scope must be dropped before the next");
         let position = self.read_order.get(id.as_str()).copied();
         let read_floor = position.and_then(|position| {
             timeline.floor_before(self.read_order, pinned_tail_keys, |(message, _)| {
@@ -1696,7 +1720,13 @@ impl<'r> Walk<'r> {
             })
         });
         let message_floor = created.and_then(|created| timeline.receipt_cut_floor(created));
-        self.read_floor = read_floor;
+        // The read floor is the walk's high-water mark: the computed value is
+        // non-decreasing in read order, so retaining the maximum changes no
+        // placement and lets the floor outlive each message scope.
+        self.read_floor = self.read_floor.max(read_floor);
+        #[cfg(test)]
+        self.floor.set(self.read_floor);
+        self.occupied = true;
         // Process-wide, so a token from another scope — or another Timeline's
         // scope — can never match this one's generation.
         let generation = SCOPE_GENERATION.fetch_add(1, Ordering::Relaxed).saturating_add(1);
@@ -3162,9 +3192,10 @@ mod tests {
     fn a_dropped_message_scope_clears_its_floor() {
         let mut timeline = Timeline::default();
         timeline.record_cut(1_000, 9_000);
-        let order = HashMap::from([("m0", 0usize), ("m1", 1usize)]);
+        let order = HashMap::from([("m0", 0usize), ("m1", 1usize), ("m2", 2usize)]);
         let m0 = MessageId::new("m0");
         let m1 = MessageId::new("m1");
+        let m2 = MessageId::new("m2");
         let mut walk = Timeline::walk(&order);
         // An earlier message's placed part gives the walk a read floor.
         {
@@ -3173,8 +3204,8 @@ mod tests {
                 &mut timeline,
                 PartFacts {
                     form: PartForm::Text,
-                    key_at: Some(9_000),
-                    shown_at: Some(9_000),
+                    key_at: Some(500),
+                    shown_at: Some(500),
                     source: Some(PartSource::at(m0.clone(), 0)),
                 },
             );
@@ -3189,34 +3220,59 @@ mod tests {
                 )
                 .unwrap();
         }
-        // m1 is created after the ask: its scope sets both floors.
-        let scope = walk.message(&timeline, Some(2_000), &m1, &[]);
-        assert_eq!(
-            scope.message_floor(),
-            Some(9_000),
-            "the scope sets the message's receipt cut as its floor"
-        );
-        assert_eq!(
-            scope.read_floor(),
-            Some(9_000),
-            "the walk carries the earlier entry's key as the read floor"
-        );
-        drop(scope);
+        // m1 is created after the ask: its scope sets the message floor (9000)
+        // and the walk's read floor (m0's 500).
+        {
+            let scope = walk.message(&timeline, Some(2_000), &m1, &[]);
+            assert_eq!(
+                scope.message_floor(),
+                Some(9_000),
+                "the scope sets the message's receipt cut as its floor"
+            );
+            assert_eq!(
+                scope.read_floor(),
+                Some(500),
+                "the walk carries the earlier entry's key as the read floor"
+            );
+        }
+        // The next message opens on the SAME walk (the dropped scope freed it),
+        // and the read floor survived the scope drop.
         assert_eq!(
             walk.read_floor(),
-            None,
-            "the scope's Drop cleared the walk's read floor"
+            Some(500),
+            "the walk keeps its read floor across the message scope"
         );
-
-        // The ticket's observable: a later part with an older key is not
-        // floored by the dropped scope's receipt cut.
-        push_text(&mut timeline, &order, "after", 2_000, None, "无作用域");
+        let mut scope = walk.message(&timeline, None, &m2, &[]);
+        assert_eq!(scope.message_floor(), None, "m2 earned no receipt cut");
+        let placement = scope.place(
+            &mut timeline,
+            PartFacts {
+                form: PartForm::Text,
+                key_at: Some(1_000),
+                shown_at: Some(1_000),
+                source: Some(PartSource::at(m2.clone(), 0)),
+            },
+        );
+        assert_eq!(
+            placement.key, 1_000,
+            "the next part lands at its own server time, not the dropped scope's cut"
+        );
+        scope
+            .push(
+                &mut timeline,
+                placement,
+                TranscriptKind::Text {
+                    chunk: "无作用域".into(),
+                    lead: None,
+                },
+            )
+            .unwrap();
         let after = timeline
             .entries()
             .iter()
             .find(|item| matches!(item.kind(), TimelineKind::Text(text) if text == "无作用域"))
-            .expect("the after-scope push landed");
-        assert_eq!(after.key(), 2_000, "the dropped scope's floor is cleared");
+            .expect("the after-scope part landed");
+        assert_eq!(after.key(), 1_000, "the dropped scope's floor is cleared");
     }
 
     /// Spec #1040's guard invariant: the message scope's `Drop` clears the read
@@ -3261,12 +3317,17 @@ mod tests {
         drop(later);
         assert_eq!(
             walk.read_floor(),
-            None,
-            "the scope's Drop cleared the walk's read floor"
+            Some(9_000),
+            "the read floor survives the message scope's Drop"
         );
-        // Drop the walk itself, then a fresh read whose first message is keyed
-        // below the stale floor.
+        // The witness outlives the walk, so its own Drop is observable.
+        let witness = walk.floor_witness();
+        assert_eq!(witness.get(), Some(9_000), "the walk owns the floor");
         drop(walk);
+        assert_eq!(witness.get(), None, "the walk's Drop cleared the read floor");
+
+        // A fresh walk starts with no floor and lands the next message's part
+        // at its own server key.
         let second_order = HashMap::from([("m1", 0usize), ("m0", 1usize)]);
         let mut walk = Timeline::walk(&second_order);
         let mut scope = walk.message(&timeline, None, &m1, &[]);
