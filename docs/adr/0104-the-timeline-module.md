@@ -206,6 +206,7 @@ and every existing test is unchanged.
   same cut, so the fact and the settle agree) — never the bare key a receipt
   cut may already outrank. Pinned by
   `a_pinned_tails_effective_key_includes_its_carried_floor`,
+  `a_post_pin_receipt_cut_floors_later_messages_through_the_fact`,
   `an_earlier_messages_pinned_tail_floors_a_later_message` and
   `the_accumulators_scoped_push_uses_the_pinned_tail_floor`.
 
