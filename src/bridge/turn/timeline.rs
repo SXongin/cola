@@ -644,6 +644,8 @@ pub(super) struct MessageScope<'w, 'r> {
     message: MessageId,
     created: Option<i64>,
     message_floor: Option<i64>,
+    /// Settled tools waiting for `finish`, in part order.
+    deferred_tools: Vec<DeferredTool>,
 }
 
 impl Drop for MessageScope<'_, '_> {
@@ -651,6 +653,26 @@ impl Drop for MessageScope<'_, '_> {
         self.message_floor = None;
         self.walk.occupied = false;
     }
+}
+
+/// A settled tool entry deferred to the end of its message scope (spec #1040):
+/// a settle's cap must see every later same-message entry, so tools are applied
+/// in reverse part order once the message's parts are placed. Only the timeline
+/// entry is deferred — the accumulator's tools map and live-tail bookkeeping
+/// stay immediate.
+pub(super) enum DeferredTool {
+    /// A settled call seen for the first time: place and insert it.
+    Insert { facts: PartFacts, call_id: String },
+    /// A live tail that completed: re-seat it through `settle`. Boxed: the
+    /// panel body makes this variant much larger than `Insert`.
+    Settle(Box<DeferredSettle>),
+}
+
+/// The [`DeferredTool::Settle`] payload.
+pub(super) struct DeferredSettle {
+    pub(super) tail: TailPlacement,
+    pub(super) panel: ToolPanel,
+    pub(super) pinned_tails: Vec<TailFact>,
 }
 
 /// The transcript-order policy (issue #1022), owned beside the Timeline (spec
@@ -1739,6 +1761,7 @@ impl<'r> Walk<'r> {
             message: id.clone(),
             created,
             message_floor,
+            deferred_tools: Vec::new(),
         }
     }
 }
@@ -1760,12 +1783,6 @@ impl MessageScope<'_, '_> {
     #[cfg(test)]
     pub(super) fn generation(&self) -> u64 {
         self.generation
-    }
-
-    /// The read's message-position map, for a settle the scope's message
-    /// hosts (the settle re-reads the tail's own read floor from it).
-    pub(super) fn read_order(&self) -> &HashMap<&str, usize> {
-        self.walk.read_order
     }
 
     /// The floor a placed or pinned part takes from this scope: the message's
@@ -1933,6 +1950,37 @@ impl MessageScope<'_, '_> {
     /// read or message floor for them).
     pub(super) fn synthetic(&mut self, timeline: &mut Timeline, entry: SyntheticEntry<'_>) -> Option<i64> {
         timeline.synthetic_seated(entry, self.message_floor)
+    }
+
+    /// Queue a settled tool for the end of this message (spec #1040): a
+    /// settle's cap must see every later same-message entry, which are only
+    /// placed as the pass continues.
+    pub(super) fn defer_tool(&mut self, tool: DeferredTool) {
+        self.deferred_tools.push(tool);
+    }
+
+    /// Apply the queued tools in reverse part order (last first), so each
+    /// earlier tool's settle cap sees every later same-message entry — the
+    /// text/reasoning already placed, plus the later tools settled first.
+    /// Called once per message, before the scope drops.
+    pub(super) fn finish(&mut self, timeline: &mut Timeline) {
+        while let Some(tool) = self.deferred_tools.pop() {
+            match tool {
+                DeferredTool::Insert { facts, call_id } => {
+                    let placement = self.place(timeline, facts);
+                    self.push(timeline, placement, TranscriptKind::Tool(call_id))
+                        .expect("the scope accepts its own tool placement");
+                }
+                DeferredTool::Settle(action) => {
+                    timeline.settle(
+                        action.tail,
+                        &action.panel,
+                        self.walk.read_order,
+                        &action.pinned_tails,
+                    );
+                }
+            }
+        }
     }
 }
 
