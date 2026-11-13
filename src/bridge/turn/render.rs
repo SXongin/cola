@@ -4982,6 +4982,112 @@ Index: /x/src/main.rs
         );
     }
 
+    /// Spec #1040: two completed untimed tools in one message keep their
+    /// encounter order. Their keys are captured when each is encountered, so
+    /// deferring the entries to the end of the message cannot reorder them.
+    #[test]
+    fn two_completed_untimed_tools_keep_encounter_order() {
+        let anchor = 2_000;
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message(
+                "a1",
+                anchor,
+                vec![
+                    tool(
+                        "shell",
+                        "call_a",
+                        ToolStatus::Completed,
+                        None,
+                        Some(serde_json::json!({"command": "a"})),
+                        None,
+                    ),
+                    tool(
+                        "shell",
+                        "call_b",
+                        ToolStatus::Completed,
+                        None,
+                        Some(serde_json::json!({"command": "b"})),
+                        None,
+                    ),
+                ],
+            ),
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let tools: Vec<(&str, i64)> = acc
+            .timeline()
+            .iter()
+            .filter_map(|item| match item.kind() {
+                TimelineKind::Tool(id) => Some((id.as_str(), item.key())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["call_a", "call_b"],
+            "the tools render in encounter order: {tools:?}"
+        );
+        assert!(
+            tools[0].1 < tools[1].1,
+            "the first tool keeps the earlier encounter key: {tools:?}"
+        );
+        let card = acc.build_card().to_string();
+        assert!(
+            card.find("call_a").unwrap() < card.find("call_b").unwrap(),
+            "the card lists them in encounter order: {card}"
+        );
+    }
+
+    /// Spec #1040: one completed untimed tool followed by untimed V2 text
+    /// keeps the tool above the text — the tool captures its render-order key
+    /// at encounter time, before the text mints a later one.
+    #[test]
+    fn an_untimed_tool_stays_above_untimed_v2_text() {
+        let anchor = 2_000;
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message(
+                "a1",
+                anchor,
+                vec![
+                    tool(
+                        "shell",
+                        "call_a",
+                        ToolStatus::Completed,
+                        None,
+                        Some(serde_json::json!({"command": "a"})),
+                        None,
+                    ),
+                    Part::Text(crate::backend::TextPart {
+                        text: "回答".into(),
+                        started_at: None,
+                    }),
+                ],
+            ),
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let entries = acc.timeline();
+        let tool = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the tool landed");
+        let text = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(t) if t == "回答"))
+            .expect("the text landed");
+        assert!(tool < text, "the tool stays above the untimed text: {entries:?}");
+        assert!(
+            entries.entries()[tool].key() < entries.entries()[text].key(),
+            "the tool's encounter key precedes the text's render-order key"
+        );
+    }
+
     /// Spec #1040: a running tool first seen without a start time, completed
     /// at a late 9000 in a read whose same message also carries new text at
     /// 1000, settles at the capped key below that text. The settle cap must

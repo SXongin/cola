@@ -120,7 +120,8 @@ ADR-0050 records is unchanged.
   panel body in the accumulator — and gains no generic parameter.
 - **One walk interface.** `Timeline::walk(&read_order)` yields a `Walk`;
   `Walk::message(timeline, created, id, pinned_tails)` yields a `MessageScope`
-  that owns the message and read floors. Its `place(timeline, PartFacts)`
+  that owns the message floor against the walk's read floor and marks the walk
+  occupied. Its `place(timeline, PartFacts)`
   produces the linear `Placement`; `push(timeline, placement, kind)` and
   `replace(timeline, placement, source, kind)` consume it and return
   `Result<(), PlacementError>` after validating generation, kind and source.

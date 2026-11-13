@@ -4018,7 +4018,7 @@ impl StreamAccumulator {
     pub(super) fn push_tool_scoped(
         &mut self,
         scope: &mut MessageScope<'_, '_>,
-        facts: PartFacts,
+        mut facts: PartFacts,
         call_id: &str,
         panel: ToolPanel,
     ) -> Result<(), PlacementError> {
@@ -4029,8 +4029,12 @@ impl StreamAccumulator {
                 let tail = scope.pin(&mut self.timeline, facts, call_id.to_string());
                 self.live_tools.insert(call_id.to_string(), tail);
             } else {
-                // Defer the entry to the end of the message: the settle cap
-                // must see the message's later parts (see `finish`).
+                // Defer the entry to the end of the message, but capture an
+                // untimed key NOW: the encounter order must be kept across two
+                // untimed tools or a following untimed text part.
+                if facts.key_at.is_none() {
+                    facts.key_at = Some(self.timeline.next_order());
+                }
                 scope.defer_tool(DeferredTool::Insert {
                     facts,
                     call_id: call_id.to_string(),
