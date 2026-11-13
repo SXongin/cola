@@ -3363,10 +3363,10 @@ mod tests {
         assert_eq!(after.key(), 1_000, "the dropped scope's floor is cleared");
     }
 
-    /// Spec #1040's guard invariant: the message scope's `Drop` clears the read
-    /// floor it owns. A later message's scope sees 9000 while it lives and
-    /// clears it on drop; the next message's first part then lands at its own
-    /// server key below the stale floor.
+    /// Spec #1040's guard invariant: the walk owns the read floor. A later
+    /// message's scope sees 9000 while it lives, the floor survives the scope's
+    /// `Drop`, and the walk's own `Drop` clears it; the next message's first
+    /// part then lands at its own server key below the stale floor.
     #[test]
     fn a_dropped_walk_clears_the_read_floor() {
         let mut timeline = Timeline::default();
