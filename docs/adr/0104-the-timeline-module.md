@@ -147,9 +147,9 @@ ADR-0050 records is unchanged.
   the header/footer, the card build and the live tool panel bodies (`tools`).
   It holds `live_tools: IndexMap<String, TailPlacement>`; the tail token's type
   is the Timeline's, but its panel body and lifecycle are the accumulator's.
-  The Timeline owns the Timeline's ordered entries, the message and read floors, the receipt-cut
-  staircase, `render_from`, `sealed_entries`, merge-by-part lookup, key minting
-  and `seq`.
+  The Timeline owns its ordered entries, the receipt-cut staircase,
+  `render_from`, `sealed_entries`, merge-by-part lookup, key minting and `seq`;
+  the walk owns the read floor and the message scope the message floor.
 
 ### Rules as landed
 

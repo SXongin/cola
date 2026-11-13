@@ -5088,6 +5088,124 @@ Index: /x/src/main.rs
         );
     }
 
+    /// Spec #1040: a settled first-sighting tool with a late start is capped
+    /// below a same-message part the loop places after it.
+    #[test]
+    fn a_settled_first_sighting_tool_is_capped_below_a_later_same_message_part() {
+        let anchor = 2_000;
+        let transcript = SessionTranscript::new(vec![
+            typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+            message(
+                "a1",
+                anchor,
+                vec![
+                    tool(
+                        "shell",
+                        "call_a",
+                        ToolStatus::Completed,
+                        Some(9_000),
+                        Some(serde_json::json!({"command": "a"})),
+                        None,
+                    ),
+                    text_at("回答", 6_000),
+                ],
+            ),
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let entries = acc.timeline();
+        let tool = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the tool landed");
+        let text = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(t) if t == "回答"))
+            .expect("the text landed");
+        assert!(
+            tool < text,
+            "the tool is capped below the later same-message text: {entries:?}"
+        );
+        assert_eq!(
+            entries.entries()[tool].key(),
+            6_000,
+            "the deferred insert takes the following part's key"
+        );
+    }
+
+    /// Spec #1040: two live tails completing in one message settle in reverse
+    /// part order, so the earlier tool's late 9000 is capped by the later
+    /// tool's 5000 and both keep transcript order at the tied key.
+    #[test]
+    fn two_completed_live_tails_settle_in_reverse_part_order() {
+        let anchor = 2_000;
+        let transcript = |a: ToolStatus, a_start: Option<i64>, b: ToolStatus, b_start: Option<i64>| {
+            SessionTranscript::new(vec![
+                typed_message("user", MessageRole::User, Some(anchor), vec![text_part("问题")]),
+                message(
+                    "a1",
+                    anchor,
+                    vec![
+                        tool(
+                            "shell",
+                            "call_a",
+                            a,
+                            a_start,
+                            Some(serde_json::json!({"command": "a"})),
+                            None,
+                        ),
+                        tool(
+                            "shell",
+                            "call_b",
+                            b,
+                            b_start,
+                            Some(serde_json::json!({"command": "b"})),
+                            None,
+                        ),
+                    ],
+                ),
+            ])
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.repoint_turn_anchor(&turn_anchor(anchor));
+        // First read: both calls are live tails with no start time.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(ToolStatus::Running, None, ToolStatus::Running, None)
+        ));
+        // Second read: both complete; the earlier one reports a late 9000.
+        assert!(render_new_turn_parts(
+            &mut acc,
+            &transcript(
+                ToolStatus::Completed,
+                Some(9_000),
+                ToolStatus::Completed,
+                Some(5_000)
+            )
+        ));
+
+        let tools: Vec<(&str, i64)> = acc
+            .timeline()
+            .iter()
+            .filter_map(|item| match item.kind() {
+                TimelineKind::Tool(id) => Some((id.as_str(), item.key())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["call_a", "call_b"],
+            "the panels keep transcript order: {tools:?}"
+        );
+        assert_eq!(
+            tools[0].1, 5_000,
+            "the earlier tool is capped by the later tool's key: {tools:?}"
+        );
+        assert_eq!(tools[1].1, 5_000, "the later tool keeps its key");
+    }
+
     /// Spec #1040: a running tool first seen without a start time, completed
     /// at a late 9000 in a read whose same message also carries new text at
     /// 1000, settles at the capped key below that text. The settle cap must
