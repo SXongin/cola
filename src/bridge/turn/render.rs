@@ -1913,6 +1913,11 @@ pub(super) fn render_turn_parts(
         // applies the receipt cut, the read floor and the live-slice clamp, so
         // this loop never sets either floor by hand.
         let order_keys = part_order_times(message);
+        let following: Vec<(usize, i64)> = order_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| key.map(|key| (index, key)))
+            .collect();
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
             acc.timeline(),
@@ -1967,7 +1972,7 @@ pub(super) fn render_turn_parts(
         }
         // Settled tools are seated after the message's parts, so a settle's
         // cap sees every later same-message entry.
-        scope.finish(acc.timeline_mut());
+        scope.finish(acc.timeline_mut(), &following);
     }
     rendered_any
 }
@@ -2055,6 +2060,11 @@ fn render_pending_gap(
             continue;
         }
         let order_keys = part_order_times(message);
+        let following: Vec<(usize, i64)> = order_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| key.map(|key| (index, key)))
+            .collect();
         // One message scope serves every part of this message (spec #1040).
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
@@ -2100,7 +2110,7 @@ fn render_pending_gap(
                 }
             }
         }
-        scope.finish(acc.timeline_mut());
+        scope.finish(acc.timeline_mut(), &following);
     }
     rendered
 }
@@ -2241,6 +2251,11 @@ fn render_seed_scope(
             continue;
         };
         let order_keys = part_order_times(message);
+        let following: Vec<(usize, i64)> = order_keys
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| key.map(|key| (index, key)))
+            .collect();
         // One message scope serves every part of this message.
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
@@ -2284,7 +2299,7 @@ fn render_seed_scope(
                 }
             }
         }
-        scope.finish(acc.timeline_mut());
+        scope.finish(acc.timeline_mut(), &following);
     }
     if gap_scope && rendered {
         acc.mark_gap_rendered();
@@ -2517,6 +2532,11 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             continue;
         };
         let message = &transcript.messages[message_pos];
+        let following: Vec<(usize, i64)> = part_order_times(message)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, key)| key.map(|key| (index, key)))
+            .collect();
         let pinned = acc.pinned_tail_facts();
         let mut scope = walk.message(
             acc.timeline(),
@@ -2574,7 +2594,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
             index += 1;
         }
         // Apply this message's settled tools after all its calls are queued.
-        scope.finish(acc.timeline_mut());
+        scope.finish(acc.timeline_mut(), &following);
     }
     rendered
 }
@@ -5264,9 +5284,11 @@ Index: /x/src/main.rs
         );
     }
 
-    /// A TIMED text sharing a still-running panel's server start key sorts by
-    /// allocation when the panel settles: on the base the text was keyed after
-    /// the panel, so only a reverted tie-break regresses it (issue #1022).
+    /// A TIMED text sharing a still-running panel's server start key keeps the
+    /// transcript's part order once the panel settles (the panel is part 0 and
+    /// the text part 1). The equal-key allocation rule itself is pinned by
+    /// `equal_keys_order_by_read_position_then_class`; this test keeps the
+    /// end-to-end ordering (issue #1022).
     #[test]
     fn a_settled_panel_inserts_before_equal_key_text_that_followed_it() {
         let anchor = 2_000;
@@ -6664,6 +6686,68 @@ Index: /x/src/main.rs
             seeded.key(),
             9_000,
             "the earlier message's live panel floors the settlement, not the call's own server key"
+        );
+    }
+
+    /// Spec #1040: a seeded settle runs before the window/seed walks, so its
+    /// cap must also consult the transcript's later part keys. `call_a`
+    /// completes at 9000 in a message whose later text part is at 1000: the
+    /// settle lands at 1000 and the text stays below it.
+    #[test]
+    fn a_seeded_settle_is_capped_by_an_unplaced_transcript_follower() {
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000_000),
+                vec![text_part("提问")],
+            ),
+            message(
+                "msg_a_seeded",
+                2_000_000,
+                vec![
+                    tool(
+                        "shell",
+                        "call_a",
+                        ToolStatus::Completed,
+                        Some(9_000),
+                        Some(serde_json::json!({"command": "a"})),
+                        None,
+                    ),
+                    text_at("回答", 1_000),
+                ],
+            ),
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_cola_message_id("msg_cola_anchor");
+        acc.seed_projection(
+            &RenderedCursor::default(),
+            CursorSeed {
+                frontier: None,
+                live_calls: ["call_a".to_string()].into(),
+                resolved_live_calls: ["call_a".to_string()].into(),
+                scope: None,
+            },
+        );
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let entries = acc.timeline();
+        let tool = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Tool(_)))
+            .expect("the seeded call settled");
+        let text = entries
+            .iter()
+            .position(|item| matches!(item.kind(), TimelineKind::Text(t) if t == "回答"))
+            .expect("the text landed");
+        assert!(
+            tool < text,
+            "the seeded tool stays above the later text: {entries:?}"
+        );
+        assert_eq!(
+            entries.entries()[tool].key(),
+            1_000,
+            "the seeded settle is capped by the transcript follower"
         );
     }
 
