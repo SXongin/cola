@@ -63,8 +63,9 @@ declaration.
 
 **2. `ToolKind` is ACP's ten, declared by the adapter.** `Read`, `Edit`,
 `Delete`, `Move`, `Search`, `Execute`, `Think`, `Fetch`, `SwitchMode`, `Other`.
-`Other` is the default and the fallback; a tool the adapter does not recognise is
-`Other` + opaque detail and renders raw (ADR-0042). A kind is never inferred from
+`Other` is the default **for a third-party id**; an unmapped shared id fails the
+conformance test rather than silently becoming opaque. A tool the adapter does
+not recognise is `Other` + opaque detail and renders raw (ADR-0042). A kind is never inferred from
 a third-party payload — the adapter owns its Agent Client's contract and is the only
 writer.
 
@@ -168,7 +169,7 @@ order and the P1 invariant are the decision recorded here.
 ## Not decided here
 
 - Whether the *card* needs a general block model. The six detail shapes and one
-  opaque path are sufficient; a block tree remains optional (research note §4.5).
+  opaque path are sufficient; a block tree remains optional (the research note's §4 is now a pointer).
 - How Codex's addressed calls render on the timeline. ADR-0106 records the
   receipt rule; the exact row is P4's UI work.
 - Per-chat multi-client routing. ADR-0090 defers it; the read model above is a

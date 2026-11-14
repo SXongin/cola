@@ -1,5 +1,10 @@
 # Background-task exits II: one shared reconcile, subagent evidence, manual cleanup, output tails
 
+> **Amended by ADR-0106**: the reconciliation's early return gates on
+> `reports_live_runs()`, not `background_tasks_supported()`, so a child-only
+> Agent Run is reconciled too.
+
+
 > **Reopened by ADR-0080**: the accepted-write gate below ("a permanently refused
 > carrier records nothing") and the deferred durable dismissal both give way to
 > the durable **Task Ending** — the ending is recorded when it is derived, except
