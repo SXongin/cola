@@ -1,6 +1,6 @@
 use crate::backend::{
-    ContentBlock, FileContent, NestedCall, TodoList, TodoStatus, TodoStep, ToolCall, ToolDetail, ToolKind,
-    ToolStatus,
+    ContentBlock, FileAction, FileContent, FileEdit, NestedCall, SearchScope, TodoList, TodoStatus, TodoStep,
+    ToolCall, ToolDetail, ToolKind, ToolStatus,
 };
 
 use super::lang::{PLAIN_TEXT, language_for_path};
@@ -204,7 +204,28 @@ impl TodoPanel {
 }
 
 impl ToolPanel {
+    /// A hand-built fixture in a test may omit the adapter's semantic fields;
+    /// derive them from a local fixture table, so a renderer test exercises
+    /// the shape production produces. A decoded call always carries them, and
+    /// an unknown/third-party id stays opaque — the adapter is still the only
+    /// writer in production.
+    #[cfg(test)]
+    pub(crate) fn normalized_call(mut call: ToolCall) -> ToolCall {
+        if call.kind == ToolKind::Other && call.detail == ToolDetail::Opaque {
+            let (kind, detail) =
+                tests::fixture_semantics(&call.identity.name, call.input.as_ref(), call.metadata.as_ref());
+            if !(kind == ToolKind::Other && detail == ToolDetail::Opaque) {
+                call.locations = detail.locations();
+                call.kind = kind;
+                call.detail = detail;
+            }
+        }
+        call
+    }
+
     pub fn new(call: ToolCall) -> Self {
+        #[cfg(test)]
+        let call = Self::normalized_call(call);
         // The call's file blocks become the panel's File Content carriers, so
         // the card build reads them without re-parsing any tool output.
         let files = call
@@ -345,54 +366,52 @@ impl ToolPanel {
     }
 
     /// The structured path a 「📂 打开」 button would open for this panel
-    /// (ADR-0083 §8, #743): a `write`/`edit` call's own `filePath` (V1) —
-    /// `path` on V2 — read through the one [`input_path`] rule every file
-    /// formatter shares, so the button and the Input line can never disagree
-    /// about which file the call touched. A FILE `read` names one too
-    /// (ADR-0083 §8 amendment, #770): its panel is a preview of the file
-    /// clipped to [`TOOL_OUTPUT_MAX_CHARS`], so the whole file is a tap away
-    /// rather than on the card. Two read shapes are excluded, both of which
-    /// already reach the reader whole: a read carrying a File Content (an
-    /// image or a PDF has its own delivery, ADR-0076) and a DIRECTORY read
-    /// ([`read_output_is_directory`]), which names no file at all. A Codex
-    /// `fileChange` names one too when it touched exactly ONE file (its paths
-    /// live in `changes[].path`, not a top-level key); a rename opens its
-    /// destination and a delete opens nothing, and several files have no single
-    /// target. `None` for every other tool, and for a call whose path is absent
-    /// or unusable (no input, a non-object input, a missing or non-string key,
-    /// or a blank string) — or whose output has not arrived yet, a still-running
+    /// (ADR-0083 §8, #743): a FileEdits call's one file — a rename's
+    /// destination, a delete nothing at all, several no single target — read
+    /// from the adapter's typed detail, so the button, the Input line and the
+    /// folded title cannot disagree about which file the call touched. A FILE
+    /// `read` names one too (ADR-0083 §8 amendment, #770): its panel is a
+    /// preview of the file clipped to [`TOOL_OUTPUT_MAX_CHARS`], so the whole
+    /// file is a tap away rather than on the card. Two read shapes are
+    /// excluded, both of which already reach the reader whole: a read carrying
+    /// a File Content (an image or a PDF has its own delivery, ADR-0076) and a
+    /// DIRECTORY read ([`read_output_is_directory`]), which names no file at
+    /// all. `None` for every other tool, and for a call whose path is absent
+    /// or unusable — or whose output has not arrived yet, a still-running
     /// `read` having no directory verdict to decide on. Those panels carry no
-    /// button
-    /// rather than a broken one. A path that merely carries surrounding
+    /// button rather than a broken one. A path that merely carries surrounding
     /// whitespace is still a name Unix allows, so it stays verbatim — only a
     /// path with nothing printable is unusable. Natural-language paths in the
-    /// agent's prose never reach here — only the call's structured input is
+    /// agent's prose never reach here — only the adapter's typed detail is
     /// read.
     pub(crate) fn file_open_path(&self) -> Option<&str> {
-        let obj = self.input()?.as_object()?;
-        let path = input_path(obj).filter(|path| !path.trim().is_empty());
-        match self.name() {
-            "write" | "edit" => path,
-            "read" => {
-                // A panel of a file the viewer can show WHOLE: the body is a
-                // preview, so the way in is what the panel lacks. The two
-                // exclusions already reach the reader whole (a File Content's
-                // own delivery; a directory, which is no file at all), and a
-                // call with no output yet has no verdict — `?` leaves a
-                // still-running read buttonless until it renders one.
-                if !self.files.is_empty() || read_output_is_directory(&self.output()?) {
-                    return None;
-                }
-                path
+        if let Some(edits) = file_edits(self) {
+            let [only] = edits else {
+                return None;
+            };
+            if only.action == FileAction::Delete {
+                return None;
             }
-            // Codex's `fileChange` names its files in `changes[].path` instead
-            // of a top-level key. One change is one file the viewer can open
-            // (a rename opens its destination, a delete nothing at all);
-            // several have no single target. Gated on the adapter's own shape
-            // (ADR-0042's amendment), like every other `codex/` arm.
-            "codex/file_change" if is_codex_file_change(self) => codex_open_path(self.input()),
-            _ => None,
+            let path = file_edit_display_path(only);
+            return (!path.trim().is_empty()).then_some(path);
         }
+        // A Codex `imageView` reads a file, but its panel is not a preview of
+        // one (P1's read, out of the FileEdits ticket's scope): no button.
+        if is_codex_image(self) {
+            return None;
+        }
+        let read = read_detail(self)?;
+        let path = read.path.filter(|path| !path.trim().is_empty())?;
+        // A panel of a file the viewer can show WHOLE: the body is a preview,
+        // so the way in is what the panel lacks. The two exclusions already
+        // reach the reader whole (a File Content's own delivery; a directory,
+        // which is no file at all), and a call with no output yet has no
+        // verdict — `?` leaves a still-running read buttonless until it
+        // renders one.
+        if read.directory || !self.files.is_empty() || read_output_is_directory(&self.output()?) {
+            return None;
+        }
+        Some(path)
     }
 
     /// How many card elements the 「📂 打开」 button adds (ADR-0083 §8, #743):
@@ -433,19 +452,15 @@ impl ToolPanel {
     }
 
     /// The output text the panel renders: the decoder's text blocks joined (in
-    /// decoder order) with a failure's message appended on its own line, or —
-    /// for a file-editing tool — the real diff recorded in the call's raw
-    /// metadata.
+    /// decoder order) with a failure's message appended on its own line. A
+    /// file-editing call's hunks come from its typed [`ToolDetail`]
+    /// ([`file_edits_output`]), not from this text.
     ///
     /// This is presentation assembly, not protocol decoding: the decoder
     /// already applied the sources' precedence into the typed output's blocks,
     /// so a payload carrying more than one text source can never render twice.
     pub fn output(&self) -> Option<String> {
-        if is_file_editing(&self.call.identity.name) {
-            edit_tool_output(&self.call)
-        } else {
-            tool_output(&self.call)
-        }
+        tool_output(&self.call)
     }
 
     /// The child-session liveness gathered for a live `task` call (ADR-0054).
@@ -549,6 +564,230 @@ fn is_command(tool: &ToolPanel) -> bool {
 /// title.
 fn is_program(tool: &ToolPanel) -> bool {
     matches!(ExecuteShape::of(tool), Some(ExecuteShape::Program { .. }))
+}
+
+/// The **FileEdits** family (ADR-0105, spec #1057's P3): a call that touched
+/// files, each with its action and diff. Selection is `(kind, detail)` — never
+/// the vendor name — so `edit`, `write`, `patch`, `apply_patch` and
+/// `codex/file_change` reach one renderer in one SHAPE, and a third adapter
+/// inherits it by declaring the same detail.
+///
+/// The kind must agree with the detail: a `FileEdits` on an unrelated kind is
+/// not this family (a lying detail gets the opaque path, ADR-0105's
+/// consequence).
+fn file_edits(tool: &ToolPanel) -> Option<&[FileEdit]> {
+    match (tool.call().kind, &tool.call().detail) {
+        (ToolKind::Edit | ToolKind::Delete | ToolKind::Move, ToolDetail::FileEdits(edits))
+            if !edits.is_empty() =>
+        {
+            Some(edits)
+        }
+        _ => None,
+    }
+}
+
+/// The `#947` action word for one file: add/update/delete/rename, never
+/// inferred from a hunk (a pure rename or a binary change has none).
+fn file_action_word(action: FileAction) -> &'static str {
+    match action {
+        FileAction::Add => "➕ 新增",
+        FileAction::Update => "✏️ 编辑",
+        FileAction::Delete => "🗑 删除",
+        FileAction::Rename => "📦 重命名",
+    }
+}
+
+/// The file a [`FileEdit`] names to the reader: a rename's destination (the
+/// file that now exists), otherwise its own path.
+fn file_edit_display_path(edit: &FileEdit) -> &str {
+    match edit.action {
+        FileAction::Rename => edit.rename_to.as_deref().unwrap_or(&edit.path),
+        _ => &edit.path,
+    }
+}
+
+/// The **Read** shape (ADR-0105 decision 5): a file or directory a call read.
+/// Keyed on `(kind, detail)`, so `read` and a future client's read reach the
+/// same renderer.
+struct ReadShape<'a> {
+    path: Option<&'a str>,
+    directory: bool,
+}
+
+fn read_detail(tool: &ToolPanel) -> Option<ReadShape<'_>> {
+    match (tool.call().kind, &tool.call().detail) {
+        (ToolKind::Read, ToolDetail::Read { path, directory, .. }) => Some(ReadShape {
+            path: path.as_deref(),
+            directory: *directory,
+        }),
+        _ => None,
+    }
+}
+
+/// The **Search** shape (ADR-0105 decision 5): a filename, content or web
+/// search. The scope picks the word and the body parser; the vendor name is
+/// never read.
+struct SearchShape<'a> {
+    query: Option<&'a String>,
+    scope: SearchScope,
+}
+
+fn search_detail(tool: &ToolPanel) -> Option<SearchShape<'_>> {
+    match (tool.call().kind, &tool.call().detail) {
+        (ToolKind::Search, ToolDetail::Search { query, scope, .. }) => Some(SearchShape {
+            query: query.as_ref(),
+            scope: *scope,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether the panel is Codex's `imageView` — a `Read` in the neutral model
+/// (P1's table) whose panel keeps its own `🖼` word and no open button. It is
+/// out of the FileEdits pass's scope; the name check is only this one id's
+/// presentation, never a renderer key for a shared shape.
+fn is_codex_image(tool: &ToolPanel) -> bool {
+    tool.name() == "codex/image" && image_shape(tool.input())
+}
+
+/// One file's action on the Input line (#947): the word, then the path (or a
+/// rename's source → destination). The Input line is where the file is already
+/// named, so this is where the action belongs for a list.
+fn file_edit_action_line(edit: &FileEdit) -> String {
+    match edit.action {
+        FileAction::Rename => match edit.rename_to.as_deref().filter(|to| !to.is_empty()) {
+            Some(to) => format!(
+                "{} {} → {}",
+                file_action_word(edit.action),
+                inline_code(&edit.path),
+                inline_code(to)
+            ),
+            None => format!("{} {}", file_action_word(edit.action), inline_code(&edit.path)),
+        },
+        _ => format!("{} {}", file_action_word(edit.action), inline_code(&edit.path)),
+    }
+}
+
+/// The folded title's fragment for one file: the action word and the short
+/// name (a rename names both ends). The title is one `plain_text` line, so a
+/// deep path keeps its tail; several files keep the count/totals fragment
+/// ([`multi_file_detail`]) instead.
+fn file_edit_title(edit: &FileEdit) -> String {
+    match edit.action {
+        FileAction::Rename => match edit.rename_to.as_deref().filter(|to| !to.is_empty()) {
+            Some(to) => format!(
+                "{} {} → {}",
+                file_action_word(edit.action),
+                header_file_name(&edit.path),
+                header_file_name(to)
+            ),
+            None => format!(
+                "{} {}",
+                file_action_word(edit.action),
+                header_file_name(&edit.path)
+            ),
+        },
+        _ => format!(
+            "{} {}",
+            file_action_word(edit.action),
+            header_file_name(&edit.path)
+        ),
+    }
+}
+
+/// The Input line a FileEdits panel renders: one action line per touched file
+/// (#947), so a multi-file patch names every file's action rather than only
+/// its first path.
+fn file_edits_input(edits: &[FileEdit]) -> String {
+    edits
+        .iter()
+        .map(file_edit_action_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The additions and deletions every file's hunks record: `+`/`-` lines, as a
+/// unified diff writes them. One count for the totals the panel heads and the
+/// folded title carries, so they cannot disagree.
+fn file_edits_totals(edits: &[FileEdit]) -> (usize, usize) {
+    let mut additions = 0;
+    let mut deletions = 0;
+    for diff in edits.iter().filter_map(|edit| edit.diff.as_deref()) {
+        for line in diff.lines() {
+            if line.starts_with('+') {
+                additions += 1;
+            } else if line.starts_with('-') {
+                deletions += 1;
+            }
+        }
+    }
+    (additions, deletions)
+}
+
+/// The FileEdits panel's Output: the hunks of every file, clipped under the
+/// diff byte budget by its caller. A multi-file list prefixes each file's
+/// hunks with its action line, so a hunk is always attributable; a single file
+/// is already named by the Input line and the folded title. `None` for a
+/// FAILED call (its error text is the body) and for a list with no hunk and no
+/// action line to show.
+fn file_edits_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
+    if call_failed(tool) {
+        return None;
+    }
+    let edits = file_edits(tool)?;
+    let multi = edits.len() > 1;
+    let mut body = String::new();
+    for edit in edits {
+        let diff = edit
+            .diff
+            .as_deref()
+            .map(str::trim_end)
+            .filter(|diff| !diff.is_empty());
+        if multi || diff.is_none() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&file_edit_action_line(edit));
+            if diff.is_none() {
+                continue;
+            }
+            body.push('\n');
+        }
+        if let Some(diff) = diff {
+            body.push_str(diff);
+            body.push('\n');
+        }
+    }
+    if let Some(tail) = file_edits_tail(tool) {
+        body.push_str(&tail);
+        body.push('\n');
+    }
+    if body.trim().is_empty() {
+        return None;
+    }
+    let lang = diff_language_for(edits.iter().map(file_edit_display_path));
+    let header = match edits {
+        [only] => only.diff.as_deref().map(|_| {
+            let (additions, deletions) = file_edits_totals(std::slice::from_ref(only));
+            format!("+{additions} −{deletions}")
+        }),
+        _ => None,
+    };
+    Some((header, BodyStyle::Code(Some(lang)), body))
+}
+
+/// The tool's own trailing note after its success summary (V1's LSP
+/// diagnostics), kept inside the diff's fence after the hunks the way the
+/// pre-P3 panel did. `None` for a successful call with no note.
+fn file_edits_tail(tool: &ToolPanel) -> Option<String> {
+    if call_failed(tool) {
+        return None;
+    }
+    tool.output()
+        .as_deref()
+        .and_then(summary_tail)
+        .map(|tail| tail.trim_end().to_string())
+        .filter(|tail| !tail.is_empty())
 }
 
 /// The built-in tools whose calls spawn a child session — V1's `task` and V2's
@@ -691,28 +930,6 @@ fn tool_output(call: &ToolCall) -> Option<String> {
     has_output.then_some(out)
 }
 
-/// For a file-editing tool (`edit`, `apply_patch`), prefer the REAL diff
-/// recorded in the call's raw metadata over the tool's plain text output
-/// ("Edit applied successfully." / "Success. Updated the following files: …" /
-/// V2's "Edited <file> (N replacement)"), which tells the reader nothing about
-/// what changed. Failures keep their extracted error text.
-fn edit_tool_output(call: &ToolCall) -> Option<String> {
-    let text = tool_output(call);
-    if call.status == ToolStatus::Error {
-        return text;
-    }
-    let diff = recorded_diff(call)?;
-    // Everything up to the text output's first blank line is the tool's
-    // success summary — noise once the hunks are shown, whatever generation
-    // generated it. A note the tool reported after it (V1's "LSP errors
-    // detected …") keeps its place as a tail after the diff.
-    let tail = text.as_deref().and_then(summary_tail);
-    Some(match tail {
-        Some(t) => format!("{diff}\n\n{t}"),
-        None => diff,
-    })
-}
-
 /// The trailing note after a file-editing call's success summary: everything
 /// following the output's first blank line, trimmed. `None` when the text IS
 /// the summary (or nothing) — the summary is dropped, never shown beside the
@@ -722,12 +939,6 @@ fn summary_tail(output: &str) -> Option<&str> {
         .split_once("\n\n")
         .map(|(_, tail)| tail.trim())
         .filter(|tail| !tail.is_empty())
-}
-
-/// The unified diff a file-editing call recorded, whichever generation wrote
-/// it: see [`diff_from_metadata`]. `None` when the call carries no metadata.
-pub(crate) fn recorded_diff(call: &ToolCall) -> Option<String> {
-    diff_from_metadata(call.metadata.as_ref())
 }
 
 /// The diff a raw metadata payload carries: V1 stores one plain string at
@@ -771,11 +982,18 @@ impl ToolPanel {
         input: Option<serde_json::Value>,
         output: Option<&str>,
     ) -> Self {
+        // A fixture built by an id takes the adapter's own semantics, so a
+        // renderer test exercises the shape production produces rather than a
+        // bare `Opaque` call. (Codex's ids are opaque here; their fixtures
+        // declare `detail` directly.)
+        let (kind, detail) = tests::fixture_semantics(name, input.as_ref(), None);
         Self::new(ToolCall {
             identity: crate::backend::ToolIdentity {
                 name: name.to_string(),
                 call_id: format!("call_{name}"),
             },
+            kind,
+            detail,
             status,
             started_at: None,
             input,
@@ -975,19 +1193,17 @@ fn header_file_name(name: &str) -> String {
 
 /// The file a file-touching panel is about, as its FOLDED header names it
 /// (ADR-0083 §8 amendment, #766). The panel body carries the path in its Input
-/// line, but the body starts collapsed, so a `write`/`edit` panel used to say
+/// line, but the body starts collapsed, so a file-editing panel used to say
 /// nothing about the file it touched until the reader unfolded it — and a text
 /// `read` likewise.
 ///
-/// A MULTI-file patch is the exception that names no path (#793): its folded
-/// header carries the deduped file count and the change totals instead
+/// A MULTI-file list is the exception that names no path (#793): its folded
+/// header carries the file count and the change totals instead
 /// (`📄 3 files · +42 −7`). One path could not describe several files, the
-/// `Index:` lines that separate them are inside the fold, and the count is what
-/// tells the reader whether expanding is worth it. The [`EditDiff`] comes from
-/// the same parse rule the body's header used ([`file_edit_diff_for`]), so the
-/// count and the totals cannot disagree with the hunks below. A single file —
-/// an `edit`, a `patch`, or a Codex `fileChange` — keeps the path fragment
-/// instead, through the same short-name rule.
+/// action lines that separate them are inside the fold, and the count is what
+/// tells the reader whether expanding is worth it. The totals come from the
+/// same typed [`FileEdit`] hunks the body renders, so they cannot disagree. A
+/// single file names its action and its short name — a rename names both ends.
 ///
 /// The name is the same short form the File Content marker/caption uses
 /// ([`header_file_name`]): basename first, one printable line, tail-clipped to
@@ -1000,64 +1216,32 @@ fn header_file_name(name: &str) -> String {
 /// the embedded image's caption, and two names for one file on one line is
 /// noise. `None` for every other tool and for a call with no usable path.
 fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
-    // A Codex change counts its INPUT files, not the entries that happened to
-    // parse a hunk: a rename or binary entry still belongs to the list, and a
-    // patch with no hunk at all still says how many files it touched. The
-    // totals come from the hunks that did parse (zero when none did) — except
-    // on a FAILED call, whose body is the error text and whose change is
-    // unknown, so a `+0 −0` there would claim nothing changed.
-    if is_codex_file_change(tool)
-        && let Some(paths) = codex_change_paths(tool.input())
-        && paths.len() > 1
-    {
-        let totals = if call_failed(tool) {
-            None
-        } else {
-            Some(
-                file_edit_diff_for(tool)
-                    .map(|diff| (diff.additions, diff.deletions))
-                    .unwrap_or_default(),
-            )
-        };
-        return Some(multi_file_detail(paths.len(), totals));
-    }
-    if let Some(diff) = file_edit_diff_for(tool)
-        && diff.paths.len() > 1
-    {
-        return Some(multi_file_detail(
-            diff.paths.len(),
-            Some((diff.additions, diff.deletions)),
-        ));
-    }
-    let (icon, path) = match tool.name() {
-        "write" | "edit" => ("📄", tool.file_open_path()?),
-        // A single `fileChange` names the file its button opens — a rename
-        // names its destination — and a delete, which has no way in, still
-        // names the file it removed. Gated like every other `codex/` arm.
-        "codex/file_change" if is_codex_file_change(tool) => (
-            "📄",
-            codex_open_path(tool.input()).or_else(|| codex_title_path(tool.input()))?,
-        ),
-        // The book icon the read panel's Input line already uses — and the one
-        // that still reads correctly for a directory read. Only a read WITHOUT
-        // a File Content gets the fragment: one with one is already named by
-        // the `📎` marker or the image caption.
-        "read" => {
-            if !tool.files().is_empty() {
-                return None;
-            }
-            let obj = tool.input()?.as_object()?;
-            ("📖", input_path(obj).filter(|path| !path.trim().is_empty())?)
+    if let Some(edits) = file_edits(tool) {
+        // A failed call's body is the error text and its change is unknown, so
+        // `+0 −0` there would claim nothing changed; the count still stands.
+        if edits.len() > 1 {
+            let totals = (!call_failed(tool)).then(|| file_edits_totals(edits));
+            return Some(multi_file_detail(edits.len(), totals));
         }
-        _ => return None,
-    };
+        return Some(format!(" · {}", file_edit_title(edits.first()?)));
+    }
+    if is_codex_image(tool) {
+        return None;
+    }
+    let read = read_detail(tool)?;
+    if !tool.files().is_empty() {
+        return None;
+    }
+    let path = read.path.filter(|path| !path.trim().is_empty())?;
+    // The book icon the read panel's Input line already uses — and the one
+    // that still reads correctly for a directory read.
     // A directory read may name its path with a trailing separator. Dropping it
     // lets the short-name rule reach the directory's own name instead of
     // rendering the whole path; a path that is nothing BUT separators keeps its
     // form (`header_file_name` then falls back to it).
     let trimmed = path.trim_end_matches(['/', '\\']);
     let name = if trimmed.is_empty() { path } else { trimmed };
-    Some(format!(" · {icon} {}", header_file_name(name)))
+    Some(format!(" · 📖 {}", header_file_name(name)))
 }
 
 /// The folded-title fragment a multi-file patch carries: the file count and,
@@ -1549,112 +1733,6 @@ fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option
     preview_body_clipped(tool).then_some(PREVIEW_TRUNCATION_NOTE)
 }
 
-/// Whether a panel is Codex's `fileChange` as cola's own adapter writes it:
-/// the namespaced id plus the full `{changes: [{path, kind}]}` input shape
-/// (ADR-0042's amendment). A foreign tool that squats the id with a partial
-/// payload stays on the opaque path.
-fn is_codex_file_change(tool: &ToolPanel) -> bool {
-    tool.name() == "codex/file_change" && file_change_shape(tool.input())
-}
-
-/// Whether a panel is Codex's `webSearch` as cola's own adapter writes it:
-/// the namespaced id plus `{query, action}` (ADR-0042's amendment).
-fn is_codex_web_search(tool: &ToolPanel) -> bool {
-    tool.name() == "codex/web_search" && web_search_shape(tool.input())
-}
-
-/// The parsed diff a file-editing panel shows, whichever generation wrote it:
-/// OpenCode's `edit` / `apply_patch` / `patch` from the call's output text, or
-/// Codex's `file_change` from the adapter's per-file metadata. The ONE
-/// derivation the panel body, its folded title, the clip note and the size
-/// estimate share.
-fn file_edit_diff_for(tool: &ToolPanel) -> Option<EditDiff> {
-    if is_file_editing(tool.name()) {
-        return tool
-            .output()
-            .as_deref()
-            .and_then(|output| file_edit_diff(tool.name(), output));
-    }
-    codex_file_change_diff(tool)
-}
-
-/// The diff a Codex `fileChange` panel renders, built from
-/// `metadata.changes[]` (one `{path, kind, diff}` per touched file). Codex's
-/// per-file `diff` is the bare hunk body — no `Index:` and no `---`/`+++`
-/// header — so the path comes from the change entry, not the text: one change
-/// parses as a single-file diff whose Input line names the file, several join
-/// behind `Index:` lines the way [`recorded_diff`] joins a multi-file patch.
-/// [`codex_display_path`] names a rename's destination, the same file the
-/// Input line, folded title and button name.
-///
-/// `None` for a FAILED call (its error text is the body, by the one
-/// [`call_failed`] rule) and for a payload without a parseable hunk, so the
-/// generic output path still shows the text.
-fn codex_file_change_diff(tool: &ToolPanel) -> Option<EditDiff> {
-    if !is_codex_file_change(tool) || call_failed(tool) {
-        return None;
-    }
-    let changes = tool.metadata()?.get("changes")?.as_array()?;
-    // A one-file change is a single-file diff (its Input line names the file);
-    // every other count joins behind `Index:` lines, so each file stays
-    // attributable and the parsed `paths` match the input's file count even
-    // when one entry records no diff. Each diff's own trailing newline is
-    // dropped before joining: a real blank line between files is what
-    // `parse_diff` reads as the trailing-note boundary.
-    if let [only] = changes.as_slice() {
-        let path = codex_display_path(only)?;
-        let diff = only
-            .get("diff")
-            .and_then(serde_json::Value::as_str)
-            .filter(|diff| !diff.trim().is_empty())?;
-        let mut parsed = parse_edit_diff(diff)?;
-        parsed.path = Some(path.to_string());
-        parsed.paths = vec![path.to_string()];
-        return Some(parsed);
-    }
-    // Only a diff with a `@@` hunk header can enter the joined patch: a non-empty
-    // no-hunk value (e.g. "Binary files … differ") is not diff syntax, and
-    // `parse_diff` would read it as the trailing note — swallowing every file
-    // after it. Such values are appended after all hunks instead, where the
-    // parser keeps them in `EditDiff::tail` and the panel still shows them.
-    let (mut hunks, mut notes) = (Vec::new(), Vec::new());
-    for change in changes {
-        let Some(path) = codex_display_path(change) else {
-            continue;
-        };
-        let diff = change
-            .get("diff")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .trim_end_matches(['\r', '\n']);
-        if diff.is_empty() {
-            hunks.push(format!("Index: {path}"));
-        } else if diff.lines().any(|line| line.starts_with("@@")) {
-            hunks.push(format!("Index: {path}\n{diff}"));
-        } else {
-            notes.push(format!("Index: {path}\n{diff}"));
-        }
-    }
-    let joined = hunks.into_iter().chain(notes).collect::<Vec<_>>().join("\n");
-    parse_multi_file_diff(&joined)
-}
-
-/// The Output triple a parsed diff renders: the count header, the hunks in a
-/// language-coloured fence (with the tool's trailing note inside it). Shared by
-/// the OpenCode editing tools and Codex's `file_change`, so the two panels
-/// cannot drift.
-fn diff_panel(diff: EditDiff) -> (Option<String>, BodyStyle, String) {
-    let lang = diff_language(&diff);
-    let header = diff_header(&diff);
-    let mut body = diff.body;
-    if !diff.tail.is_empty() {
-        body.push('\n');
-        body.push_str(diff.tail.trim_end());
-        body.push('\n');
-    }
-    (header, BodyStyle::Code(Some(lang)), body)
-}
-
 /// The Output triple a Codex `webSearch` panel renders. The app-server schema
 /// calls `results` opaque JSON, so only one shape is read as a result list —
 /// an array whose every entry has a non-empty `url` (a `title` is optional) —
@@ -1685,18 +1763,27 @@ fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyl
     ))
 }
 
-/// The opaque `results` a shape-gated Codex search carries: its metadata first,
-/// then the raw output (the adapter writes both; the fallback covers a call from
-/// before the field existed). `None` while the search has no results yet.
+/// The opaque `results` a web search carries: its metadata first, then the raw
+/// output when it is a structured value (the adapter writes both; the fallback
+/// covers a call from before the field existed). A text output is the search's
+/// own rendering envelope, not a `results` value, so a Web search with only
+/// text falls through to [`web_output`]. `None` while the search has no
+/// results yet.
 fn codex_search_results(tool: &ToolPanel) -> Option<&serde_json::Value> {
-    if !is_codex_web_search(tool) {
+    if search_detail(tool)?.scope != SearchScope::Web {
         return None;
     }
     let results = tool
         .metadata()
         .and_then(|metadata| metadata.get("results"))
         .filter(|value| !value.is_null())
-        .or_else(|| tool.call().output.raw.as_ref().filter(|value| !value.is_null()))?;
+        .or_else(|| {
+            tool.call()
+                .output
+                .raw
+                .as_ref()
+                .filter(|value| !value.is_null() && !value.is_string())
+        })?;
     // A provider's empty message is no result, not an empty Output.
     (!results.as_str().is_some_and(|text| text.trim().is_empty())).then_some(results)
 }
@@ -1710,17 +1797,6 @@ fn codex_search_raw_body(results: &serde_json::Value) -> String {
     }
 }
 
-/// Whether a panel's body is a file-editing DIFF ([`BodyStyle::Code`] from an
-/// `edit` / `apply_patch` / `patch` / `codex/file_change` panel): the one body
-/// shape under the diff byte budget ([`DIFF_MAX_ESCAPED_BYTES`]). Every other
-/// body — a `read` or `write` preview, an `Auto` block — stays on
-/// [`TOOL_OUTPUT_MAX_CHARS`]. The `codex/` arm relies on its producer: the
-/// generic formatter never yields a `Code` body for that id, so only a body
-/// from the shape-gated [`codex_file_change_diff`] reaches it.
-fn is_diff_body(name: &str, style: &BodyStyle) -> bool {
-    (is_file_editing(name) || name == "codex/file_change") && matches!(style, BodyStyle::Code(_))
-}
-
 /// The language token a [`BodyStyle::Code`] body renders its opening fence
 /// with, `None` for every other style. The token is part of the fenced block,
 /// so the diff budget, its note and its estimate all read it here.
@@ -1731,20 +1807,14 @@ fn code_lang(style: &BodyStyle) -> Option<&'static str> {
     }
 }
 
-/// The diff body a file-editing panel renders, UNclipped: the parsed hunks of
-/// an `edit` / `apply_patch` / `patch` call, or a shape-gated Codex
-/// `file_change`. `None` for every other panel and for an editing call whose
-/// output is not a recognized diff (a FAILED call's error text falls back to
+/// The diff body a FileEdits panel renders, UNclipped. `None` for every other
+/// panel and for a FAILED call (its error text falls back to
 /// [`BodyStyle::Auto`]), which keeps the preview path untouched. The ONE
 /// derivation the render, [`diff_truncation_note`] and
 /// [`panel_output_estimate`] share, so the clip, its note and its charge
 /// cannot drift.
 fn diff_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    if !is_file_editing(tool.name()) && !is_codex_file_change(tool) {
-        return None;
-    }
-    let (header, style, body) = panel_output(tool)?;
-    is_diff_body(tool.name(), &style).then_some((header, style, body))
+    file_edits_output(tool)
 }
 
 /// The note a file-editing panel appends under a diff its budget CLIPPED
@@ -1774,34 +1844,29 @@ fn codex_search_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
     (!fenced_body_fits(&body, Some("json"), TOOL_OUTPUT_MAX_CHARS)).then_some(SEARCH_TRUNCATION_NOTE)
 }
 
-/// The note a panel appends under a body its budget clipped: a `read`/`write`
-/// preview's way-in note, or a file-editing diff's bare clip signal. One
-/// function, because the render and the size estimate must agree on exactly one
-/// note (a panel never carries both: a tool is either an editing tool or it
-/// isn't).
+/// The note a panel appends under a body its budget clipped: a `read` preview's
+/// way-in note, a FileEdits diff's bare clip signal, or a Codex search's raw
+/// payload note. One function, because the render and the size estimate must
+/// agree on exactly one note (a panel never carries two: its body is one shape).
 fn truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
     preview_truncation_note(tool, session_id)
         .or_else(|| diff_truncation_note(tool))
         .or_else(|| codex_search_truncation_note(tool))
 }
 
-/// Whether a `read`/`write` panel's rendered body is clipped by its own budget
-/// — the clamp [`tool_panel_element`] applies ([`truncate_md`] at
+/// Whether a `read` panel's rendered body is clipped by its own budget — the
+/// clamp [`tool_panel_element`] applies ([`truncate_md`] at
 /// [`TOOL_OUTPUT_MAX_CHARS`]) — measured from the same body the render shows,
 /// the way every size estimate here re-derives its render, so the note
-/// [`preview_truncation_note`] renders is the one charged. Only the panel's own
-/// file PREVIEW counts: a FAILED `write` renders its error text instead
-/// ([`write_body`] is `None`), which the note must never promise the way into.
-/// A file-editing diff is [`diff_truncation_note`]'s, not this one's.
+/// [`preview_truncation_note`] renders is the one charged. A FileEdits diff is
+/// [`diff_truncation_note`]'s, not this one's.
 fn preview_body_clipped(tool: &ToolPanel) -> bool {
-    let body = if tool.name() == "write" {
-        write_body(tool).map(|(_, _, body)| body)
-    } else if tool.name() == "read" {
-        tool.output().map(|raw| format_tool_output("read", &raw).2)
-    } else {
-        None
-    };
-    body.is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
+    if is_codex_image(tool) || read_detail(tool).is_none() {
+        return false;
+    }
+    tool.output()
+        .map(|raw| format_tool_output(tool, &raw).2)
+        .is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
 }
 
 /// The serialized byte length the truncation note [`truncation_note`] appends
@@ -1817,20 +1882,18 @@ pub(crate) fn preview_truncation_note_estimate(tool: &ToolPanel, session_id: Opt
 }
 
 /// The Output triple a panel renders: a Code Mode `Program`'s nested-call body,
-/// a `write` call's own `content` ([`write_body`]), a Codex `file_change`'s diff
-/// or `web_search`'s results (both assembled from the adapter's metadata, not
-/// the text output), or the tool's output text through the per-tool formatter.
-/// One function, because the render and the size estimate must agree on which
-/// body a panel shows. A `Command` needs no branch here: its body is the call's
-/// output text, rendered through the shared command block
-/// ([`command_output_block`]) exactly where every panel's body is.
+/// a FileEdits panel's hunks, a Codex `web_search`'s results (assembled from
+/// the adapter's metadata, not the text output), or the tool's output text
+/// through the shape-keyed formatter. One function, because the render and the
+/// size estimate must agree on which body a panel shows. A `Command` needs no
+/// branch here: its body is the call's output text, rendered through the shared
+/// command block ([`command_output_block`]) exactly where every panel's body
+/// is.
 fn panel_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
     if is_program(tool) {
         program_output(tool)
-    } else if let Some(write) = write_body(tool) {
-        Some(write)
-    } else if let Some(diff) = codex_file_change_diff(tool) {
-        Some(diff_panel(diff))
+    } else if let Some(edits) = file_edits_output(tool) {
+        Some(edits)
     } else if let Some(search) = codex_web_search_output(tool) {
         Some(search)
     } else if let Some(collab) = codex_collab_output(tool) {
@@ -1841,73 +1904,15 @@ fn panel_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)>
         // owns how it is clipped and fenced.
         tool.output().map(|raw| (None, BodyStyle::Auto, raw))
     } else {
-        tool.output().map(|raw| format_tool_output(tool.name(), &raw))
+        tool.output().map(|raw| format_tool_output(tool, &raw))
     }
-}
-
-/// The body a `write` panel renders in place of its success sentence (#788):
-/// the call's own `content` input — the file it produced, which is what a reader
-/// wants and what the panel's 「📂 打开」 already opens the way to.
-///
-/// `None` — the panel then renders its output text as before — for a call that
-/// FAILED ([`call_failed`]: its error text is the body) and for one whose input
-/// carries no usable `content` string. The header is the same `📄 <path>` shape
-/// the `read` panel's body carries, and the fence takes the touched file's
-/// language ([`language_for_path`]), so a written `.md` previews its SOURCE like
-/// the viewer's default.
-fn write_body(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    if tool.name() != "write" || call_failed(tool) {
-        return None;
-    }
-    let obj = tool.input()?.as_object()?;
-    let content = obj.get("content")?.as_str()?;
-    let path = input_path(obj).filter(|path| !path.trim().is_empty());
-    let header = path.map(|path| format!("📄 `{path}`"));
-    let lang = path.map(language_for_path).unwrap_or(PLAIN_TEXT);
-    Some((header, BodyStyle::Code(Some(lang)), content.to_string()))
 }
 
 /// Whether the call settled as a FAILURE, by the same rule its status icon
 /// draws ([`ToolPanel::status_icon`]): [`ToolStatus::is_failure`], or a
-/// recorded fact in the call's shape that reports one. A failed `write` keeps
-/// its error text rather than the content it never wrote (#788).
+/// recorded fact in the call's shape that reports one.
 fn call_failed(tool: &ToolPanel) -> bool {
     tool.detail_failure() || tool.status().is_failure()
-}
-
-/// The character cap on a `write` panel's trailing note (#788). The note is a
-/// preview like the content, and one panel carries BOTH: a content of
-/// [`TOOL_OUTPUT_MAX_CHARS`] characters can serialize to six bytes a character
-/// (JSON's widest escape), so the note's own cap must leave that worst case plus
-/// the panel's fixed overhead under the card budget — a single panel cannot be
-/// split, and an oversized one would be sent whole and rejected by Feishu.
-const WRITE_TAIL_MAX_CHARS: usize = 500;
-
-/// The trailing note a `write` panel keeps after its fenced content (#788): the
-/// text the tool reported after its success summary (V1's diagnostics), shown as
-/// its own paragraph OUTSIDE the content's [`TOOL_OUTPUT_MAX_CHARS`] preview
-/// budget, so a long note is never clipped by the content's clamp nor mistaken
-/// for a clipped content — while its own
-/// [`WRITE_TAIL_MAX_CHARS`] cap keeps a single panel under the card budget.
-/// `None` whenever the panel renders no content body ([`write_body`]), or the
-/// tool reported no note.
-fn write_tail(tool: &ToolPanel) -> Option<String> {
-    write_body(tool)?;
-    tool.output()
-        .as_deref()
-        .and_then(summary_tail)
-        .map(|tail| truncate_md(tail, WRITE_TAIL_MAX_CHARS))
-}
-
-/// The serialized byte length the trailing note [`write_tail`] appends to a
-/// `write` panel (#788), for the size estimate — the note is card JSON like the
-/// truncation note whose charge [`preview_truncation_note_estimate`] measures.
-/// `0` when the note does not render. Kept beside the render so the two cannot
-/// drift.
-pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
-    write_tail(tool)
-        .map(|tail| json_escaped_len(&CardMarkdown::new().element(&tail)))
-        .unwrap_or(0)
 }
 
 /// The card bytes one adapter-assembled Output body contributes: its header
@@ -1964,22 +1969,8 @@ pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
             .map(|(_, style, body)| assembled_body_estimate(None, style, &body))
             .unwrap_or(0);
     }
-    let write = write_body(tool);
-    if let Some((header, _, body)) = &write {
-        // The header rides the body's markdown OUTSIDE any fence, so it is
-        // charged through the card's own sanitizer — a path that closes its
-        // inline code span (`a\`<<<<.rs`) has its `<`-es expanded there, and
-        // the raw length would under-count them. The content itself is a
-        // fenced `Code` body clipped at the preview cap.
-        let header = header
-            .as_deref()
-            .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
-            .unwrap_or(0);
-        let body = truncate_md(body, TOOL_OUTPUT_MAX_CHARS);
-        return header + json_escaped_len(&body) + fenced_overhead(&body);
-    }
-    // A diff renders its parsed hunks clipped at the byte budget, not the raw
-    // recorded diff at the preview cap: charge exactly that body, the count
+    // A FileEdits panel renders its hunks clipped at the byte budget, not the
+    // raw recorded diff at the preview cap: charge exactly that body, the count
     // header above it and the WHOLE fence around it, language tag included.
     // The clip includes the same three in its budget, so the charge is exactly
     // what the render writes and can never trail a backtick run's fence or the
@@ -2041,8 +2032,7 @@ pub(super) fn tool_panel_element(
     // [`panel_output`]). The result-count header (glob/grep) is metadata-side,
     // so it is applied over either path.
     let output = panel_output(tool);
-    let output = output
-        .map(|(header, style, body)| (search_count_header(name, tool.metadata()).or(header), style, body));
+    let output = output.map(|(header, style, body)| (search_count_header(tool).or(header), style, body));
     // The todo panel is a status section, not a transcript: a parsed list is
     // the panel, so the generic Input line and Output marker would only frame
     // the checklist (a still-running call has no parsed output yet — the Input
@@ -2103,28 +2093,28 @@ pub(super) fn tool_panel_element(
             // clips bare: the `…` immediately before the closing fence stops
             // Feishu rendering the block as code at all (measured, #788), and
             // the note below already says it was clipped — the only signal a
-            // clipped diff has. A `read`/`write` preview keeps its 3,000-CHAR
-            // budget and `truncate_md`'s marker (or `clip_md` when it carries
-            // the way-in note), exactly as before.
+            // clipped diff has. A `read` preview keeps its 3,000-CHAR budget
+            // and `truncate_md`'s marker (or `clip_md` when it carries the
+            // way-in note), exactly as before.
             let note = truncation_note(tool, session_id);
             if is_command(tool) {
                 // A `Command`'s body is the shared command output block
                 // (ADR-0105, ADR-0086's "one render block, never a lifecycle"):
                 // the same clip and fence the Host Terminal Card puts its log
-                // through. No diff note or write tail belongs to a command.
+                // through. No diff note belongs to a command.
                 let clip = OutputClip::Chars {
                     max_chars: TOOL_OUTPUT_MAX_CHARS,
                 };
                 content.push_str(&command_output_block(&body, clip, false).0);
             } else {
-                let body = if is_diff_body(name, &style) {
+                let body = if file_edits(tool).is_some() {
                     clip_fenced_body(&body, code_lang(&style), DIFF_MAX_ESCAPED_BYTES)
                 } else if note.is_some() && matches!(style, BodyStyle::Code(_)) {
                     clip_md(&body, TOOL_OUTPUT_MAX_CHARS)
                 } else {
                     truncate_md(&body, TOOL_OUTPUT_MAX_CHARS)
                 };
-                // File content (read) and edit/apply_patch hunks always render as a
+                // File content (read) and FileEdits hunks always render as a
                 // fenced code block; a `Markdown` body (websearch results) never
                 // does; anything else fences when Feishu markdown would wrap a long
                 // line or fold lines above a Setext underline into one heading.
@@ -2136,16 +2126,10 @@ pub(super) fn tool_panel_element(
                     }
                     BodyStyle::Auto => content.push_str(&body),
                 }
-                // The tool's own trailing note rides after the fenced body, outside
-                // the content's preview budget (#788), the way the truncation note
-                // closes the section below it (ADR-0083 §8 amendment, #770/#788).
-                if let Some(tail) = write_tail(tool) {
-                    content.push_str(&format!("\n\n{tail}"));
-                }
-                // A clipped `read`/`write` body says so, naming the button above it
-                // (ADR-0083 §8 amendment, #770/#788). Only those two get it: they
-                // are the panels whose clip hides a file the viewer can show whole,
-                // and the note appears exactly when that button does.
+                // A clipped `read` body says so, naming the button above it
+                // (ADR-0083 §8 amendment, #770). Only a read gets it: it is the
+                // panel whose clip hides a file the viewer can show whole, and
+                // the note appears exactly when that button does.
                 if let Some(note) = note {
                     content.push_str(&format!("\n\n{note}"));
                 }
@@ -2289,14 +2273,6 @@ pub(crate) struct EditDiff {
 /// output, an error message), so callers fall back to showing it unchanged.
 pub(crate) fn parse_edit_diff(diff: &str) -> Option<EditDiff> {
     parse_diff(diff, false)
-}
-
-/// [`parse_edit_diff`] for a multi-file patch (`apply_patch`): each `Index:`
-/// line stays in the body, because a patch can touch several files and —
-/// unlike `edit`, whose single target is named by the input panel — the hunks
-/// alone would not say which file they belong to.
-fn parse_multi_file_diff(diff: &str) -> Option<EditDiff> {
-    parse_diff(diff, true)
 }
 
 /// Scan a unified diff into an [`EditDiff`]: the file headers name the target,
@@ -2488,48 +2464,7 @@ pub(crate) fn diff_header_path(line: &str) -> Option<String> {
     (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
 }
 
-/// The header a diff panel's Output section leads with: the change count.
-/// `None` for a MULTI-file patch — its count and totals ride the FOLDED title
-/// ([`panel_file_detail`], #793), which stays visible when the panel expands,
-/// so repeating the line under `**Output**` would say it twice. A single file
-/// keeps the bare totals: an `edit` names its target on the Input line, and a
-/// path repeated in one patch counts once, because `paths` is deduped. The
-/// count and the totals come from this one [`EditDiff`], never from a second
-/// scan of the body.
-fn diff_header(diff: &EditDiff) -> Option<String> {
-    (diff.paths.len() <= 1).then(|| format!("+{} −{}", diff.additions, diff.deletions))
-}
-
-/// The [`EditDiff`] a file-editing tool's output parses to, with that tool's
-/// framing: `edit` drops the file-header block (its Input line names the one
-/// target), `apply_patch`/`patch` keep each file's `Index:` line. `None` for
-/// any other tool and for an output that is not a recognized diff. The one
-/// parse rule the Output header and the folded title share, so the two cannot
-/// disagree.
-fn file_edit_diff(name: &str, output: &str) -> Option<EditDiff> {
-    if !is_file_editing(name) {
-        return None;
-    }
-    if name == "edit" {
-        parse_edit_diff(output)
-    } else {
-        parse_multi_file_diff(output)
-    }
-}
-
-/// The language token a diff's hunks are fenced with (measured 2026-10-18: a
-/// `rust` fence colours the keywords and strings inside a `+`/`-` hunk, where
-/// Feishu's documented `diff` token renders plain).
-///
-/// A multi-file patch uses the one language every touched file shares, and
-/// [`PLAIN_TEXT`] when they disagree, so a `.rs` hunk is never coloured with a
-/// `.md` file's grammar. The paths come from [`EditDiff::paths`] — an `Index:`
-/// line when the patch has one, else the `---`/`+++` header (V2's `edit`).
-fn diff_language(diff: &EditDiff) -> &'static str {
-    diff_language_for(diff.paths.iter().map(String::as_str).chain(diff.path.as_deref()))
-}
-
-/// [`diff_language`] over an explicit path list: the one language every path
+/// [`diff_language_for`] over an explicit path list: the one language every path
 /// shares, [`PLAIN_TEXT`] when they disagree or when the list is empty.
 ///
 /// This is the Tool Panel's rule for a patch that may touch several files. The
@@ -2704,45 +2639,48 @@ fn read_output_is_directory(output: &str) -> bool {
         .is_some_and(|first| first.starts_with(V2_DIRECTORY_HEADER_PREFIX))
 }
 
-/// Whether a tool is one whose panel shows its recorded diff in place of the
-/// tool's success sentence ([`edit_tool_output`]) — the names the diff parser
-/// and the clip note both key on. `edit` records a single file's diff; V1's
-/// `apply_patch` and V2's `patch` record a multi-file patch.
-fn is_file_editing(name: &str) -> bool {
-    matches!(name, "edit" | "apply_patch" | "patch")
-}
-
-/// Render a tool's raw output string human-friendly. OpenCode's `read` tool
-/// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
-/// `<content>…</content>`) — strip them so the card shows just the file path
-/// and the numbered lines; a `task`/`subagent` output is an XML envelope around
-/// the content the reader wants. An `edit`, `apply_patch` or `patch` output is
-/// substituted by its unified diff (`apply_patch`/`patch` keep each file's
-/// `Index:` line) — keep only the hunks and report the change count, led by the
-/// touched-file count when the patch names more than one file. A
-/// `todowrite` output is its todo list JSON-encoded — render it as a status
-/// checklist; a `websearch` output is a result envelope — render it as a
-/// title+url list. Other tools pass through unchanged.
-///
-/// **OpenCode 2 shapes.** The same arms also recognize the current
-/// generation's shapes: `subagent`'s `<subagent sessionID state>` envelope,
-/// `read`'s `Read file <path>, lines N-M` header line (no XML wrapper), and
-/// `websearch`'s markdown result blocks (`## [title](url)` + `Published:`).
-/// `patch` is V2's `apply_patch`.
+/// Render a tool's raw output string where the neutral shape says it has one.
+/// A **Read** output is OpenCode's envelope — V1's XML wrapper
+/// (`<path>…</path>`, `<type>…</type>`, `<content>…</content>`) or V2's header
+/// line over numbered lines — so the card shows the file's path and lines
+/// rather than the wrapper. A **Search** with web scope is a result envelope —
+/// render it as a title+url list. A tool with no typed detail keeps its own
+/// renderer (a `task`/`subagent` envelope, a `todowrite` list, a `skill`
+/// envelope); everything else passes through unchanged.
 ///
 /// Returns `(header, body style, body)`: the header is the short markdown line
 /// above the body (file path, change count, result count); the style decides
-/// how the body blocks (see [`BodyStyle`]). A `todowrite` header is the list's
-/// size and per-status counts — the folded panel's progress line. A multi-file
-/// diff returns no header: its count and totals ride the folded title
-/// ([`panel_file_detail`], #793), which stays visible when the panel expands.
-fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
-    if is_file_editing(name) {
-        return match file_edit_diff(name, output) {
-            Some(d) => diff_panel(d),
-            None => (None, BodyStyle::Auto, output.to_string()),
-        };
+/// how the body blocks (see [`BodyStyle`]).
+fn format_tool_output(tool: &ToolPanel, output: &str) -> (Option<String>, BodyStyle, String) {
+    // A Codex `imageView` is a `Read` in the neutral model but keeps P1's
+    // presentation (its panel is not a text preview): show its output raw.
+    if is_codex_image(tool) {
+        return (None, BodyStyle::Auto, output.to_string());
     }
+    if read_detail(tool).is_some() {
+        return read_output(output);
+    }
+    if search_detail(tool).is_some_and(|search| search.scope == SearchScope::Web) {
+        return web_output(output);
+    }
+    format_named_output(tool.name(), output)
+}
+
+/// A **web search**'s raw output: V1 emits a JSON envelope (`parallel`) or
+/// plain-text blocks (`exa`); V2 emits markdown result blocks. Each parser
+/// shape-gates itself, so an unrecognized provider output still passes through
+/// unchanged.
+fn web_output(output: &str) -> (Option<String>, BodyStyle, String) {
+    match parse_websearch_results(output) {
+        Some((count, body)) => (Some(format!("🔎 {} 条结果", count)), BodyStyle::Markdown, body),
+        None => (None, BodyStyle::Auto, output.to_string()),
+    }
+}
+
+/// Render a tool's raw output for the ids whose ENVELOPE is vendor-specific
+/// and has no shared shape: a `task`/`subagent` XML envelope around the content
+/// the reader wants, a `skill` envelope, or a `todowrite` checklist.
+fn format_named_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
     if name == "task"
         && output.starts_with("<task ")
         && let Some((header, body)) = parse_task_envelope(output)
@@ -2761,50 +2699,38 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
     {
         return (None, BodyStyle::Auto, body);
     }
-    if name == "todowrite" {
-        // OpenCode's output is the list itself and Codex's neutral panel
-        // carries the same shape. Parse it back into a checklist; a payload
-        // that doesn't parse (a running call, an error, a truncated dump) falls
-        // through unchanged.
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
-            && let Some(todo) = parse_todo_list(&value)
-            && !todo.is_empty()
-        {
-            return (
-                Some(format!(
-                    "共 {} 项 · {}",
-                    todo.steps.len(),
-                    todo_counts(&todo.steps)
-                )),
-                BodyStyle::Markdown,
-                format_todo_list_with_explanation(&todo),
-            );
-        }
+    if name == "todowrite"
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
+        && let Some(todo) = parse_todo_list(&value)
+        && !todo.is_empty()
+    {
+        return (
+            Some(format!(
+                "共 {} 项 · {}",
+                todo.steps.len(),
+                todo_counts(&todo.steps)
+            )),
+            BodyStyle::Markdown,
+            format_todo_list_with_explanation(&todo),
+        );
     }
-    if name == "websearch" {
-        // V1 emits a JSON envelope (`parallel`) or plain-text blocks (`exa`);
-        // V2 emits markdown result blocks. Each parser shape-gates itself, so
-        // an unrecognized provider output still passes through unchanged.
-        if let Some((count, body)) = parse_websearch_results(output) {
-            return (Some(format!("🔎 {} 条结果", count)), BodyStyle::Markdown, body);
-        }
-    }
-    // V1's read output *starts* with the `<path>…</path>` wrapper; V2's carries
-    // no wrapper at all. The test is on the **head**, not the whole output: a V2
-    // read whose body merely *mentions* the literal `<path>` (any file quoting
-    // it, e.g. a README documenting `--config <path>`) must still take the V2
-    // branch below, or its path header, language token and first body line are
-    // all lost. `trim_start` matches the V1 loop treating a leading blank line
-    // as decoration.
-    let v1_read_wrapper = name == "read" && output.trim_start().starts_with("<path>");
-    if name == "read" && !v1_read_wrapper {
+    (None, BodyStyle::Auto, output.to_string())
+}
+
+/// A **Read** tool's raw output, whichever generation wrote it. V1's output
+/// *starts* with the `<path>…</path>` wrapper; V2's carries no wrapper at all.
+/// The test is on the **head**, not the whole output: a V2 read whose body
+/// merely *mentions* the literal `<path>` (any file quoting it, e.g. a README
+/// documenting `--config <path>`) must still take the V2 branch below, or its
+/// path header, language token and first body line are all lost.
+fn read_output(output: &str) -> (Option<String>, BodyStyle, String) {
+    let v1_read_wrapper = output.trim_start().starts_with("<path>");
+    if !v1_read_wrapper {
         // V2's read output carries no XML wrapper: a header line over numbered
         // lines or a directory listing. Anything else falls through to raw.
         if let Some(parsed) = parse_v2_read_output(output) {
             return parsed;
         }
-    }
-    if !v1_read_wrapper {
         return (None, BodyStyle::Auto, output.to_string());
     }
     let mut path = String::new();
@@ -2841,15 +2767,16 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
 }
 
 /// The result-count header V2 records in a search call's metadata (`count` for
-/// `glob`, `matches` for `grep`, plus its `truncated` flag). `None` when the
-/// call carries neither — a generation that doesn't record it, or a third-party
-/// tool that merely claims the id — so the panel keeps its raw shape.
-fn search_count_header(name: &str, metadata: Option<&serde_json::Value>) -> Option<String> {
-    let metadata = metadata?;
-    let (count, unit) = match name {
-        "glob" => (metadata.get("count")?.as_u64()?, "个文件"),
-        "grep" => (metadata.get("matches")?.as_u64()?, "处匹配"),
-        _ => return None,
+/// a filename search, `matches` for a content search, plus its `truncated`
+/// flag). `None` when the shape is not one of those or the call carries no
+/// count — a generation that doesn't record it, or a third-party tool that
+/// merely claims an id — so the panel keeps its raw shape.
+fn search_count_header(tool: &ToolPanel) -> Option<String> {
+    let metadata = tool.metadata()?;
+    let (count, unit) = match search_detail(tool)?.scope {
+        SearchScope::FileName => (metadata.get("count")?.as_u64()?, "个文件"),
+        SearchScope::Content => (metadata.get("matches")?.as_u64()?, "处匹配"),
+        SearchScope::Web => return None,
     };
     let truncated = metadata.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
     Some(if truncated {
@@ -3251,7 +3178,7 @@ pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
         // the `codex/` namespace already keeps its ids apart from a third
         // party's.
         "codex/command_execution" if command_execution_shape(tool.input()) => "命令",
-        "codex/file_change" if is_codex_file_change(tool) => "文件修改",
+        "codex/file_change" if file_change_shape(tool.input()) => "文件修改",
         "codex/web_search" if web_search_shape(tool.input()) => "网页搜索",
         "codex/image" if image_shape(tool.input()) => "图片",
         // One card per collaboration call (issue #962): the title names the
@@ -3299,6 +3226,10 @@ fn command_execution_shape(input: Option<&serde_json::Value>) -> bool {
 /// the item with an **empty** list and fills it through its patch-update
 /// notification, so an empty array is its shape too; every entry that is
 /// present must still carry both keys.
+///
+/// Kept for the display word and the ADR-0042 gate on the raw payload; the
+/// RENDERER for the change reads the typed detail, so a third-party id with a
+/// partial shape stays opaque.
 fn file_change_shape(input: Option<&serde_json::Value>) -> bool {
     input
         .and_then(|input| input.get("changes"))
@@ -3312,61 +3243,6 @@ fn file_change_shape(input: Option<&serde_json::Value>) -> bool {
                     && change.get("kind").is_some()
             })
         })
-}
-
-/// The files a shape-gated `fileChange` input names, in order, as the reader
-/// sees them: a rename names its destination. `None` when any entry lacks a
-/// usable path, so a caller renders generically rather than reporting a
-/// partial list. The one walk the Input line, the folded title and the diff
-/// builder share.
-fn codex_change_paths(input: Option<&serde_json::Value>) -> Option<Vec<&str>> {
-    input?
-        .get("changes")?
-        .as_array()?
-        .iter()
-        .map(codex_display_path)
-        .collect()
-}
-
-/// The file one change names as the reader sees it: a rename's destination
-/// (`movePath` — the file that now exists), otherwise its own `path`.
-fn codex_display_path(change: &serde_json::Value) -> Option<&str> {
-    change
-        .get("kind")
-        .and_then(|kind| kind.get("movePath"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-        .or_else(|| change.get("path").and_then(serde_json::Value::as_str))
-        .filter(|path| !path.trim().is_empty())
-}
-
-/// The one file a `fileChange` names, when it names exactly one — the folded
-/// title's fallback when [`codex_open_path`] has no target. It is kind-agnostic:
-/// a delete still says which file went away.
-fn codex_title_path(input: Option<&serde_json::Value>) -> Option<&str> {
-    match codex_change_paths(input)?.as_slice() {
-        [only] => Some(*only),
-        _ => None,
-    }
-}
-
-/// The file a single-change `fileChange` panel's 「📂 打开」 opens: a rename
-/// opens its destination, and a delete opens nothing at all (the file no
-/// longer exists). `None` for several changes and for a path that is absent,
-/// blank or non-string-shaped.
-fn codex_open_path(input: Option<&serde_json::Value>) -> Option<&str> {
-    let [only] = input?.get("changes")?.as_array()?.as_slice() else {
-        return None;
-    };
-    if only
-        .get("kind")
-        .and_then(|kind| kind.get("type"))
-        .and_then(serde_json::Value::as_str)
-        == Some("delete")
-    {
-        return None;
-    }
-    codex_display_path(only)
 }
 
 /// `webSearch`: `{query: string, action: …}` — the adapter always writes the
@@ -3469,28 +3345,51 @@ fn inline_code(text: &str) -> String {
 
 /// Render a tool call as the panel's Input line.
 ///
-/// The **Execute** family is selected by `(kind, detail)` — never by a name: one
-/// renderer per shape covers `bash`, `shell`, `codex/command_execution` and Code
-/// Mode's `execute` alike (ADR-0105, spec #1057's P2). Every other built-in still
-/// has its own name arm until its migration ticket moves it (P3).
+/// Every migrated family is selected by `(kind, detail)` — never by a name: one
+/// renderer per shape covers `bash`/`shell`/`codex/command_execution` and Code
+/// Mode's `execute` (Execute), `edit`/`write`/`patch`/`apply_patch`/
+/// `codex/file_change` (FileEdits), the read, search and fetch shapes
+/// (ADR-0105, spec #1057's P2/P3). Only ids whose ENVELOPE is vendor-specific
+/// and has no shared shape (`task`, `skill`, `question`, `todowrite`, Codex's
+/// collaboration rows, `codex/image`) still read their name.
 ///
 /// A declared shape owns its Input line, the empty one included: an empty line
 /// renders no section, and it never falls through to the raw payload's key table
 /// (which would print `- command:` for a call the adapter already described).
 fn format_tool_input(tool: &ToolPanel) -> String {
-    match ExecuteShape::of(tool) {
-        Some(ExecuteShape::Command {
-            command,
-            cwd,
-            description,
-            ..
-        }) => command_input(command, cwd, description),
-        Some(ExecuteShape::Program { source, language, .. }) => program_input(source, language),
-        None => tool
+    if let Some(ExecuteShape::Command {
+        command,
+        cwd,
+        description,
+        ..
+    }) = ExecuteShape::of(tool)
+    {
+        return command_input(command, cwd, description);
+    }
+    if let Some(ExecuteShape::Program { source, language, .. }) = ExecuteShape::of(tool) {
+        return program_input(source, language);
+    }
+    if let Some(edits) = file_edits(tool) {
+        return file_edits_input(edits);
+    }
+    if is_codex_image(tool) {
+        return tool
             .input()
             .map(|input| format_named_input(tool.name(), input))
-            .unwrap_or_default(),
+            .unwrap_or_default();
     }
+    if let Some(read) = read_detail(tool) {
+        return read_input(tool, read);
+    }
+    if let Some(search) = search_detail(tool) {
+        return search_input(tool, search);
+    }
+    if tool.call().kind == ToolKind::Fetch {
+        return fetch_input(tool.input());
+    }
+    tool.input()
+        .map(|input| format_named_input(tool.name(), input))
+        .unwrap_or_default()
 }
 
 /// The Input line a `Command` renders: the command, its working directory and
@@ -3526,11 +3425,97 @@ fn program_input(source: &str, language: Option<&str>) -> String {
     fenced_code(&truncate_md(source, TOOL_OUTPUT_MAX_CHARS - 64), Some(lang))
 }
 
-/// Render a tool's input JSON as human-readable markdown, keyed on the tool
-/// name. Recognized tools get tailored one-liners (read → the file path, edit →
-/// the file; the edit's actual change comes from its diff output); anything else
-/// falls back to a generic key-value list. The `Execute` family is selected by its
-/// shape ([`format_tool_input`]), not here.
+/// The Input line a **Read** renders: the book icon and the path, plus the
+/// page window when the raw input records one. The path comes from the typed
+/// detail; `offset`/`limit` are the call's own paging arguments and stay raw
+/// facts beside it.
+fn read_input(tool: &ToolPanel, read: ReadShape<'_>) -> String {
+    let Some(path) = read.path.filter(|path| !path.trim().is_empty()) else {
+        // A path-less read keeps its raw payload (a bare string, an unknown
+        // shape) rather than rendering an empty line.
+        return tool
+            .input()
+            .map(|input| format_named_input(tool.name(), input))
+            .unwrap_or_default();
+    };
+    let mut line = format!("📖 {}", inline_code(path));
+    if let Some(obj) = tool.input().and_then(serde_json::Value::as_object) {
+        if let Some(offset) = obj.get("offset").and_then(serde_json::Value::as_i64) {
+            line.push_str(&format!("\n从第 {} 行起", offset));
+        }
+        if let Some(limit) = obj.get("limit").and_then(serde_json::Value::as_i64) {
+            line.push_str(&format!("\n最多 {} 行", limit));
+        }
+    }
+    line
+}
+
+/// The Input line a **Search** renders, keyed by its scope: a web search names
+/// its query with the magnifier; a filename/content search names the pattern
+/// (`匹配 …`), then the path it was limited to, its `include` filter and its
+/// paging window when the raw input records them.
+fn search_input(tool: &ToolPanel, search: SearchShape<'_>) -> String {
+    let obj = tool.input().and_then(serde_json::Value::as_object);
+    let query = search.query.map(String::as_str).filter(|q| !q.is_empty());
+    if search.scope == SearchScope::Web {
+        return match query {
+            Some(query) => format!("🔎 {}", inline_code(query)),
+            None => obj.map(generic_tool_input).unwrap_or_default(),
+        };
+    }
+    let mut parts = Vec::new();
+    if let Some(query) = query {
+        parts.push(format!("匹配 {}", inline_code(query)));
+    }
+    if let Some(obj) = obj {
+        if let Some(path) = input_path(obj) {
+            parts.push(inline_code(path));
+        }
+        if let Some(include) = obj.get("include").and_then(serde_json::Value::as_str) {
+            parts.push(format!("include {}", inline_code(include)));
+        }
+    }
+    if parts.is_empty() {
+        return obj.map(generic_tool_input).unwrap_or_default();
+    }
+    let mut line = format!("🔍 {}", parts.join(" · "));
+    if let Some(obj) = obj {
+        if let Some(offset) = obj.get("offset").and_then(serde_json::Value::as_i64) {
+            line.push_str(&format!("\n从第 {} 行起", offset));
+        }
+        if let Some(limit) = obj.get("limit").and_then(serde_json::Value::as_i64) {
+            // `limit` counts the tool's own unit: a filename search counts
+            // files, a content search counts matching lines.
+            let unit = if search.scope == SearchScope::FileName {
+                "个文件"
+            } else {
+                "行"
+            };
+            line.push_str(&format!("\n最多 {} {}", limit, unit));
+        }
+    }
+    line
+}
+
+/// The Input line a **Fetch** renders: the URL it fetched.
+fn fetch_input(input: Option<&serde_json::Value>) -> String {
+    let Some(obj) = input.and_then(serde_json::Value::as_object) else {
+        return input
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+    };
+    match obj.get("url").and_then(serde_json::Value::as_str) {
+        Some(url) => format!("🌐 {}", inline_code(url)),
+        None => generic_tool_input(obj),
+    }
+}
+
+/// Render a tool's input JSON as human-readable markdown, for the ids whose
+/// ENVELOPE is vendor-specific and has no shared shape. Anything else falls
+/// back to a generic key-value list. The migrated families (Execute,
+/// FileEdits, Read, Search, Fetch) are selected by their shape
+/// ([`format_tool_input`]), not here.
 fn format_named_input(name: &str, input: &serde_json::Value) -> String {
     // Non-object inputs (a bare path string, a number) just display as-is.
     let obj = match input.as_object() {
@@ -3539,94 +3524,6 @@ fn format_named_input(name: &str, input: &serde_json::Value) -> String {
     };
     let get = |k: &str| obj.get(k).and_then(|v| v.as_str());
     match name {
-        "edit" => {
-            // Only the target file. oldString/newString are near-identical
-            // full-block snapshots (the change is usually a few lines deep in
-            // them), so showing their -/+ first lines reads as duplicated
-            // content and hides the real change — which now comes from the
-            // tool's unified diff (see `parse_edit_diff`).
-            format!("📄 `{}`", input_path(obj).unwrap_or("?"))
-        }
-        "read" | "write" | "glob" | "grep" => {
-            let mut parts = Vec::new();
-            // `pattern` is the search key for glob/grep — show it as "匹配",
-            // not twice. File paths render as plain paths.
-            if (name == "grep" || name == "glob")
-                && let Some(v) = get("pattern")
-            {
-                parts.push(format!("匹配 `{}`", v));
-            }
-            if let Some(path) = input_path(obj) {
-                parts.push(format!("`{}`", path));
-            }
-            if let Some(v) = get("include") {
-                parts.push(format!("include `{}`", v));
-            }
-            let mut s = match name {
-                "read" => "📖",
-                "write" => "✏️",
-                "glob" | "grep" => "🔍",
-                _ => "🔧",
-            }
-            .to_string();
-            s.push(' ');
-            s.push_str(&parts.join(" · "));
-            if let Some(offset) = obj.get("offset").and_then(|v| v.as_i64()) {
-                s.push_str(&format!("\n从第 {} 行起", offset));
-            }
-            if let Some(limit) = obj.get("limit").and_then(|v| v.as_i64()) {
-                // `limit` counts the tool's own unit: read pages lines, glob
-                // counts files (grep's limit counts matching lines).
-                let unit = if name == "glob" { "个文件" } else { "行" };
-                s.push_str(&format!("\n最多 {} {}", limit, unit));
-            }
-            if s.len() <= 1 { input.to_string() } else { s }
-        }
-        // V2's `patch` gets the touched-file summary. V1's `apply_patch` keeps
-        // its pre-V2 generic fallback: spec #467 US18 puts every V1 rendering
-        // change out of scope, so only the V2 id takes this arm.
-        "patch" => {
-            let files = patch_files(get("patchText").unwrap_or(""));
-            match files.as_slice() {
-                [] => generic_tool_input(obj),
-                [only] => format!("📄 `{only}`"),
-                [first, ..] => format!("📄 `{first}` 等 {} 个文件", files.len()),
-            }
-        }
-        "webfetch" => {
-            if let Some(url) = get("url") {
-                format!("🌐 `{}`", url)
-            } else {
-                input.to_string()
-            }
-        }
-        "websearch" => match get("query") {
-            Some(query) => format!("🔎 `{}`", query),
-            None => generic_tool_input(obj),
-        },
-        // Codex's `webSearch` always writes `action`, even as `null`; a
-        // payload without it is not the adapter's shape and stays opaque.
-        "codex/web_search" if web_search_shape(Some(input)) => match get("query") {
-            Some(query) => format!("🔎 `{}`", query),
-            None => generic_tool_input(obj),
-        },
-        // Codex's `fileChange` names its targets in `changes[].path` (one entry
-        // per file), not in a top-level `path`. A rename names its destination
-        // (`movePath`) — the same file the folded title and the button name.
-        // Gated on the adapter's whole shape like every other `codex/` arm: a
-        // payload missing `kind`, or with an unusable path, is rendered
-        // generically rather than reporting a partial file list. Backticks are
-        // flattened (`permission_target`'s rule) so a path cannot break the
-        // inline code span it sits in.
-        "codex/file_change" if file_change_shape(Some(input)) => {
-            match codex_change_paths(Some(input)).as_deref() {
-                None | Some([]) => generic_tool_input(obj),
-                Some([only]) => format!("📄 {}", inline_code(only)),
-                Some([first, rest @ ..]) => {
-                    format!("📄 {} 等 {} 个文件", inline_code(first), rest.len() + 1)
-                }
-            }
-        }
         // Codex's `imageView`: the file it looked at. Unlike a `read` there is
         // no preview body to fold, so the panel only names it — with the same
         // backtick flattening as a file change's path.
@@ -3920,20 +3817,6 @@ fn generic_tool_input(obj: &serde_json::Map<String, serde_json::Value>) -> Strin
     }
 }
 
-/// The files a patch text touches, in the order it names them: the
-/// `*** Update File: <path>` / `*** Add File:` / `*** Delete File:` headers of
-/// OpenCode's patch format (V1 `apply_patch` and V2 `patch`).
-fn patch_files(patch_text: &str) -> Vec<&str> {
-    patch_text
-        .lines()
-        .filter_map(|line| {
-            ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
-                .iter()
-                .find_map(|prefix| line.strip_prefix(prefix))
-        })
-        .collect()
-}
-
 /// The first line of `s`, clipped to `max_chars` (with a "…" marker). Used to
 /// summarize multi-line tool inputs (edit diffs, task prompts) instead of
 /// flooding the card.
@@ -3954,6 +3837,287 @@ mod tests {
     use crate::feishu::card::CardState;
     use crate::feishu::card::shell::CardBuilder;
     use serde_json::json;
+
+    /// A fixture's stand-in for the adapter's own mapping: a hand-built
+    /// `ToolCall` in a test often omits the semantic fields, and the card no
+    /// longer sniffs raw payloads. This is TEST-ONLY (the client seam keeps the
+    /// card from importing the adapter); production calls always arrive with
+    /// their `(kind, detail)` already declared.
+    pub(super) fn fixture_semantics(
+        name: &str,
+        input: Option<&serde_json::Value>,
+        metadata: Option<&serde_json::Value>,
+    ) -> (ToolKind, ToolDetail) {
+        let text = |value: Option<&serde_json::Value>, key: &str| {
+            value
+                .and_then(|value| value.get(key))
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        };
+        let path = input
+            .and_then(|input| input.get("filePath").or_else(|| input.get("path")))
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(str::to_string);
+        match name {
+            "bash" | "shell" => (
+                ToolKind::Execute,
+                ToolDetail::Command {
+                    command: text(input, "command").unwrap_or_default(),
+                    cwd: text(input, "workdir").or_else(|| text(input, "cwd")),
+                    description: text(input, "description"),
+                    exit: metadata
+                        .and_then(|metadata| metadata.get("exit"))
+                        .and_then(serde_json::Value::as_i64),
+                    timeout: metadata
+                        .and_then(|metadata| metadata.get("timeout"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true),
+                },
+            ),
+            "read" => (
+                ToolKind::Read,
+                ToolDetail::Read {
+                    path,
+                    preview: None,
+                    directory: false,
+                },
+            ),
+            "write" => {
+                let recorded = fixture_metadata_files(metadata, Some(FileAction::Add));
+                let edits = if recorded.is_empty() {
+                    match path {
+                        Some(path) => vec![FileEdit {
+                            path,
+                            action: FileAction::Add,
+                            rename_to: None,
+                            diff: text(input, "content").and_then(|content| add_diff(&content)),
+                        }],
+                        None => Vec::new(),
+                    }
+                } else {
+                    recorded
+                };
+                (ToolKind::Edit, ToolDetail::FileEdits(edits))
+            }
+            "edit" => {
+                let recorded = fixture_metadata_files(metadata, None);
+                let edits = if !recorded.is_empty() {
+                    recorded
+                } else {
+                    let diff = diff_from_metadata(metadata).and_then(|diff| hunk_only(&diff));
+                    match path {
+                        Some(path) => vec![FileEdit {
+                            path,
+                            action: FileAction::Update,
+                            rename_to: None,
+                            diff,
+                        }],
+                        None => Vec::new(),
+                    }
+                };
+                (ToolKind::Edit, ToolDetail::FileEdits(edits))
+            }
+            "patch" | "apply_patch" => {
+                let text_files = text(input, "patchText")
+                    .map(|patch| fixture_patch_edits(&patch))
+                    .unwrap_or_default();
+                let recorded = fixture_metadata_files(metadata, None);
+                let edits = if !text_files.is_empty() {
+                    text_files
+                } else if !recorded.is_empty() {
+                    recorded
+                } else {
+                    let diff = diff_from_metadata(metadata).and_then(|diff| hunk_only(&diff));
+                    match diff {
+                        Some(diff) => vec![FileEdit {
+                            path: path.or_else(|| fixture_diff_path(metadata)).unwrap_or_default(),
+                            action: FileAction::Update,
+                            rename_to: None,
+                            diff: Some(diff),
+                        }],
+                        None => Vec::new(),
+                    }
+                };
+                (ToolKind::Edit, ToolDetail::FileEdits(edits))
+            }
+            "glob" => (
+                ToolKind::Search,
+                ToolDetail::Search {
+                    query: text(input, "pattern"),
+                    matches: metadata
+                        .and_then(|metadata| metadata.get("count"))
+                        .and_then(serde_json::Value::as_u64),
+                    scope: SearchScope::FileName,
+                },
+            ),
+            "grep" => (
+                ToolKind::Search,
+                ToolDetail::Search {
+                    query: text(input, "pattern"),
+                    matches: metadata
+                        .and_then(|metadata| metadata.get("matches"))
+                        .and_then(serde_json::Value::as_u64),
+                    scope: SearchScope::Content,
+                },
+            ),
+            "websearch" => (
+                ToolKind::Search,
+                ToolDetail::Search {
+                    query: text(input, "query"),
+                    matches: None,
+                    scope: SearchScope::Web,
+                },
+            ),
+            "webfetch" => (ToolKind::Fetch, ToolDetail::None),
+            _ => (ToolKind::Other, ToolDetail::Opaque),
+        }
+    }
+
+    fn fixture_metadata_files(
+        metadata: Option<&serde_json::Value>,
+        action: Option<FileAction>,
+    ) -> Vec<FileEdit> {
+        let Some(files) = metadata
+            .and_then(|metadata| metadata.get("files"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Vec::new();
+        };
+        files
+            .iter()
+            .filter_map(|file| {
+                let path = file.get("file").and_then(serde_json::Value::as_str)?;
+                Some(FileEdit {
+                    path: path.to_string(),
+                    action: action.unwrap_or_else(|| {
+                        match file.get("status").and_then(serde_json::Value::as_str) {
+                            Some("added") => FileAction::Add,
+                            Some("deleted") => FileAction::Delete,
+                            _ => FileAction::Update,
+                        }
+                    }),
+                    rename_to: None,
+                    diff: file
+                        .get("patch")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(hunk_only),
+                })
+            })
+            .collect()
+    }
+
+    fn fixture_diff_path(metadata: Option<&serde_json::Value>) -> Option<String> {
+        let diff = metadata?.get("diff")?.as_str()?;
+        diff.lines().find_map(|line| {
+            let rest = line
+                .strip_prefix("Index: ")
+                .or_else(|| line.strip_prefix("+++ "))?;
+            let path = rest.split('\t').next().unwrap_or(rest).trim();
+            let path = path.strip_prefix("b/").unwrap_or(path);
+            (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
+        })
+    }
+
+    fn fixture_patch_edits(patch: &str) -> Vec<FileEdit> {
+        struct Pending {
+            path: String,
+            action: FileAction,
+            rename_to: Option<String>,
+            body: Vec<String>,
+        }
+        fn finish(pending: Pending) -> FileEdit {
+            let diff = match pending.action {
+                FileAction::Add => {
+                    let content = pending
+                        .body
+                        .iter()
+                        .map(|line| line.strip_prefix('+').unwrap_or(line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    add_diff(&content)
+                }
+                FileAction::Delete => None,
+                _ => {
+                    let body = pending.body.join("\n");
+                    let body = body.trim_end();
+                    (!body.is_empty()).then(|| body.to_string())
+                }
+            };
+            FileEdit {
+                path: pending.path,
+                action: pending.action,
+                rename_to: pending.rename_to,
+                diff,
+            }
+        }
+        let mut edits = Vec::new();
+        let mut current: Option<Pending> = None;
+        for raw in patch.lines() {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            let header = if current.is_some() {
+                line.trim_end()
+            } else {
+                line.trim()
+            };
+            if header == "*** End Patch" {
+                if let Some(pending) = current.take() {
+                    edits.push(finish(pending));
+                }
+                break;
+            }
+            if header == "*** Begin Patch" || header.starts_with("*** Environment ID:") {
+                continue;
+            }
+            let start = |action: FileAction, path: &str| Pending {
+                path: path.trim().to_string(),
+                action,
+                rename_to: None,
+                body: Vec::new(),
+            };
+            if let Some(path) = header.strip_prefix("*** Add File: ") {
+                if let Some(pending) = current.take() {
+                    edits.push(finish(pending));
+                }
+                current = Some(start(FileAction::Add, path));
+                continue;
+            }
+            if let Some(path) = header.strip_prefix("*** Delete File: ") {
+                if let Some(pending) = current.take() {
+                    edits.push(finish(pending));
+                }
+                current = Some(start(FileAction::Delete, path));
+                continue;
+            }
+            if let Some(path) = header.strip_prefix("*** Update File: ") {
+                if let Some(pending) = current.take() {
+                    edits.push(finish(pending));
+                }
+                current = Some(start(FileAction::Update, path));
+                continue;
+            }
+            let Some(pending) = current.as_mut() else {
+                continue;
+            };
+            if let Some(destination) = header.strip_prefix("*** Move to: ") {
+                let destination = destination.trim();
+                if !destination.is_empty() {
+                    pending.action = FileAction::Rename;
+                    pending.rename_to = Some(destination.to_string());
+                }
+                continue;
+            }
+            if header == "*** Move to:" || header == "*** End of File" {
+                continue;
+            }
+            pending.body.push(line.to_string());
+        }
+        if let Some(pending) = current.take() {
+            edits.push(finish(pending));
+        }
+        edits
+    }
 
     /// A `read` panel whose one output block is a File Content, with the given
     /// resolved delivery (ADR-0076).
@@ -4748,55 +4912,32 @@ mod tests {
         (1..=300).map(|n| format!("{n}: {}\n", "x".repeat(40))).collect()
     }
 
-    /// #788: a `write` panel renders the call's own `content` as its body —
-    /// fenced with the touched file's language from the shared table — instead
-    /// of the tool's bare success sentence, so the file the agent just produced
-    /// is on the card. The body names the file (`📄 <path>`, the `read` panel's
-    /// shape), the call's own Input line stays, and the folded header and
-    /// 「📂 打开」 are unchanged.
+    /// #1060: a `write` is one `Add` FileEdit — the same renderer the edit and
+    /// patch families use — so its content reads as additions with the action
+    /// word and the `+A −D` totals, fenced with the file's language.
     #[test]
-    fn a_write_panels_content_renders_as_a_fenced_body() {
-        // V1's `filePath` and V2's `path`; the fence follows the extension — a
-        // known one, a `.md` (its SOURCE, like the viewer's default) and an
-        // unknown one that stays plain.
-        for (input, path, lang) in [
-            (
-                json!({"filePath": "src/main.rs", "content": "line one\nline two"}),
-                "src/main.rs",
-                "rust",
-            ),
-            (
-                json!({"path": "notes.md", "content": "line one\nline two"}),
-                "notes.md",
-                "markdown",
-            ),
-            (
-                json!({"filePath": "data.unknownext", "content": "line one\nline two"}),
-                "data.unknownext",
-                "plain_text",
-            ),
+    fn a_write_renders_as_one_add_file_edit() {
+        for (path, lang) in [
+            ("src/main.rs", "rust"),
+            ("notes.md", "markdown"),
+            ("data.unknownext", "plain_text"),
         ] {
-            let panel = ToolPanel::for_test(
-                "write",
+            let panel = write_panel(
+                path,
+                "line one\nline two",
                 ToolStatus::Completed,
-                Some(input),
                 Some("Wrote file successfully."),
             );
             let md = panel_md_with_session(panel.clone(), "ses_1");
-            assert!(md.contains("line one\nline two"), "the content is the body: {md}");
+            assert!(md.contains("➕ 新增"), "the action word: {md}");
+            assert!(md.contains("+line one"), "the content is an addition: {md}");
+            assert!(md.contains("+line two"), "the content is an addition: {md}");
+            assert!(md.contains("+2 −0"), "the totals: {md}");
+            assert!(md.contains(&format!("```{lang}")), "the fence: {md}");
             assert!(
                 !md.contains("Wrote file successfully."),
-                "the success sentence is dropped as noise: {md}"
+                "the summary is dropped: {md}"
             );
-            assert!(
-                md.contains(&format!("📄 `{path}`")),
-                "the body names the file: {md}"
-            );
-            assert!(
-                md.contains(&format!("```{lang}")),
-                "the fence follows the extension: {md}"
-            );
-            assert!(md.contains("**Input**"), "the call's own Input line stays: {md}");
             assert_eq!(panel.file_open_path(), Some(path), "the way in is unchanged");
             assert!(
                 tool_open_button_element(&panel, Some("ses_1")).is_some(),
@@ -4805,130 +4946,73 @@ mod tests {
         }
     }
 
-    /// A `write` body is clipped to [`TOOL_OUTPUT_MAX_CHARS`] exactly like a
-    /// `read` preview, and says so through the same note — and only when the
-    /// panel carries the way-in button, so a Session-less one promises nothing
-    /// (ADR-0083 §8 amendment, #770/#788).
+    /// A `write` body is a diff now: it clips under the diff byte budget and
+    /// says so with the diff note, not the read-preview note.
     #[test]
-    fn a_clipped_write_body_says_the_preview_was_clipped() {
-        let content = "x".repeat(TOOL_OUTPUT_MAX_CHARS + 1_000);
-        let clipped = ToolPanel::for_test(
-            "write",
+    fn a_clipped_write_diff_says_the_change_was_clipped() {
+        let content = "x".repeat(20_000);
+        let clipped = write_panel(
+            "/x/big.rs",
+            &content,
             ToolStatus::Completed,
-            Some(json!({"path": "/x/big.rs", "content": content})),
             Some("Wrote file successfully."),
         );
-        assert!(preview_truncation_note(&clipped, Some("ses_1")).is_some());
+        assert!(diff_truncation_note(&clipped).is_some());
         assert_eq!(
             preview_truncation_note_estimate(&clipped, Some("ses_1")),
-            PREVIEW_TRUNCATION_NOTE.len(),
-            "the note's bytes are charged"
+            DIFF_TRUNCATION_NOTE.len(),
+            "the diff note's bytes are charged"
         );
-        let md = panel_md_with_session(clipped.clone(), "ses_1");
+        let md = panel_md_with_session(clipped, "ses_1");
         assert!(
-            md.ends_with(&format!("\n\n{PREVIEW_TRUNCATION_NOTE}")),
-            "the note closes a clipped write body: {md}"
+            md.ends_with(&format!("\n\n{DIFF_TRUNCATION_NOTE}")),
+            "the diff note closes the body: {md}"
         );
-        assert!(
-            !md.contains('…'),
-            "a clipped fenced body carries NO `…`: the marker stops Feishu \
-             rendering the block as code (#788), so the note is the signal: {md}"
-        );
-        assert!(
-            !md.contains("Wrote file successfully."),
-            "a clipped body still drops the success sentence: {md}"
-        );
+        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "not a preview note: {md}");
+        assert!(!md.contains("Wrote file successfully."));
 
-        // A body that fits carries nothing.
-        let small = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"path": "/x/small.rs", "content": "fn main() {}"})),
-            Some("Wrote file successfully."),
-        );
+        // A body that fits carries no note.
+        let small = write_panel("/x/small.rs", "fn main() {}", ToolStatus::Completed, None);
         assert_eq!(preview_truncation_note_estimate(&small, Some("ses_1")), 0);
-        let md = panel_md_with_session(small, "ses_1");
-        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "nothing was cut: {md}");
-
-        // No Session to route the button by: no button, no note.
-        assert_eq!(preview_truncation_note_estimate(&clipped, None), 0);
-        let md = panel_md(clipped);
-        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no button, no note: {md}");
     }
 
-    /// The body is only replaced by the content when a `write` really carries
-    /// one (#788): a call with no usable `content` — and a FAILED write, whose
-    /// error text is the body — keeps today's output panel, while a trailing
-    /// note the tool reported after its success summary is kept below the fenced
-    /// content, the way [`edit_tool_output`] treats an edit's tail.
+    /// A failed write keeps its error text: the hunks it never wrote are not a
+    /// body, and a failure with only a recorded error still reaches the panel.
     #[test]
-    fn a_write_falls_back_to_its_output_when_it_has_no_content() {
-        // No `content`: today's panel, the output text and all.
-        let bare = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"filePath": "report.md"})),
-            Some("Wrote file successfully."),
-        );
-        let md = panel_md_with_session(bare, "ses_1");
-        assert!(
-            md.contains("Wrote file successfully."),
-            "the output text stays: {md}"
-        );
-        assert!(!md.contains("```"), "no content, no fence: {md}");
-
-        // A FAILED write keeps its error rather than content it never wrote.
-        let failed = ToolPanel::for_test(
-            "write",
+    fn a_failed_write_keeps_its_error() {
+        let failed = write_panel(
+            "report.md",
+            "secret",
             ToolStatus::Error,
-            Some(json!({"filePath": "report.md", "content": "secret"})),
             Some("Unable to write report.md"),
         );
         let md = panel_md_with_session(failed, "ses_1");
-        assert!(
-            md.contains("Unable to write report.md"),
-            "the error is the body: {md}"
-        );
+        assert!(md.contains("Unable to write report.md"), "the error: {md}");
         assert!(
             !md.contains("secret"),
             "the content cannot replace an error: {md}"
         );
 
-        // A status this build does not model but the server named "failed" is a
-        // failure too — its error text must not be replaced by the content.
-        let failed = ToolPanel::for_test(
-            "write",
-            ToolStatus::Other("failed".into()),
-            Some(json!({"filePath": "report.md", "content": "secret"})),
-            Some("write failed"),
-        );
-        let md = panel_md_with_session(failed, "ses_1");
-        assert!(
-            md.contains("write failed"),
-            "a named failure keeps its error: {md}"
-        );
-        assert!(
-            !md.contains("secret"),
-            "the content cannot replace a failure: {md}"
-        );
-
-        // The wire shape an error-only `"failed"` call carries (V2's
-        // `state.error`, no text block): the error still reaches the panel —
-        // suppressing the content must not lose it (#788).
-        let error_only = ToolPanel::new(crate::backend::ToolCall {
-            identity: crate::backend::ToolIdentity {
+        let error_only = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
                 name: "write".into(),
                 call_id: "call_write".into(),
             },
             status: ToolStatus::Other("failed".into()),
             started_at: None,
             input: Some(json!({"path": "src/main.rs", "content": "fn main() {}"})),
-            metadata: None,
-            output: crate::backend::ToolOutput {
+            output: ToolOutput {
                 raw: None,
                 blocks: Vec::new(),
                 error: Some("permission denied".into()),
             },
+            kind: ToolKind::Edit,
+            detail: ToolDetail::FileEdits(vec![FileEdit {
+                path: "src/main.rs".into(),
+                action: FileAction::Add,
+                rename_to: None,
+                diff: add_diff("fn main() {}"),
+            }]),
             ..ToolCall::default()
         });
         let md = panel_md_with_session(error_only, "ses_1");
@@ -4940,170 +5024,33 @@ mod tests {
             !md.contains("fn main() {}"),
             "the content cannot replace the error: {md}"
         );
-
-        // A long FAILED-write error is not a file preview: its panel carries no
-        // "open the full file" note, whatever its length (#788).
-        let long_error = format!("write failed: {}", "e".repeat(TOOL_OUTPUT_MAX_CHARS * 2));
-        let failed = ToolPanel::for_test(
-            "write",
-            ToolStatus::Error,
-            Some(json!({"filePath": "report.md", "content": "secret"})),
-            Some(&long_error),
-        );
-        assert_eq!(
-            preview_truncation_note_estimate(&failed, Some("ses_1")),
-            0,
-            "an error body is not a clipped preview"
-        );
-        let md = panel_md_with_session(failed, "ses_1");
-        assert!(md.contains("write failed:"), "the error is the body: {md}");
-        assert!(
-            !md.contains(PREVIEW_TRUNCATION_NOTE),
-            "no note over an error: {md}"
-        );
-
-        // The tool's trailing note survives AFTER the fence, outside the
-        // content's preview budget.
-        let noted = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"filePath": "src/main.rs", "content": "fn main() {}"})),
-            Some("Wrote file successfully.\n\nLSP errors detected in this file, please fix:"),
-        );
-        let md = panel_md_with_session(noted, "ses_1");
-        assert!(md.contains("fn main() {}"), "the content is the body: {md}");
-        assert!(
-            md.contains("```\n\nLSP errors detected"),
-            "the trailing note rides outside the fence: {md}"
-        );
-        assert!(
-            !md.contains("Wrote file successfully."),
-            "the summary is still dropped: {md}"
-        );
-
-        // A note is never counted against the content's budget, so a note larger
-        // than the content cannot fake a truncated preview (#788).
-        let long_tail = "N".repeat(400);
-        let noted = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"filePath": "src/main.rs", "content": "fn main() {}"})),
-            Some(&format!("Wrote file successfully.\n\n{long_tail}")),
-        );
-        assert_eq!(
-            preview_truncation_note_estimate(&noted, Some("ses_1")),
-            0,
-            "the content fits; a long note cannot fake a clip"
-        );
-        let md = panel_md_with_session(noted, "ses_1");
-        assert!(md.contains(&long_tail), "the note is not clipped: {md}");
-        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no clip, no note: {md}");
-
-        // A note past its own cap is clipped there, not rendered whole: a lone
-        // panel cannot split, so one panel must stay bounded.
-        let huge_tail = "N".repeat(4 * TOOL_OUTPUT_MAX_CHARS);
-        let noted = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"filePath": "src/main.rs", "content": "fn main() {}"})),
-            Some(&format!("Wrote file successfully.\n\n{huge_tail}")),
-        );
-        assert_eq!(
-            write_tail_estimate(&noted),
-            json_escaped_len(&truncate_md(&huge_tail, WRITE_TAIL_MAX_CHARS)),
-            "the clipped note's bytes are charged"
-        );
-        let md = panel_md_with_session(noted, "ses_1");
-        assert!(!md.contains(&huge_tail), "the whole note is not rendered: {md}");
-        assert!(md.contains('…'), "the oversized note is marked as clipped: {md}");
     }
 
-    /// A body full of backticks sizes a fence longer than its content, and the
-    /// estimate charges that fence: a 3,000-backtick content renders ~6 KB of
-    /// fence nothing counted, letting a near-budget card evade the split (#788).
+    /// The FileEdits estimate charges the JSON-escaped diff body clipped under
+    /// the diff budget, its fence and its language tag — the same body the
+    /// panel renders, never the old 3,000-character preview charge.
     #[test]
-    fn the_write_body_estimate_charges_the_dynamic_fence() {
-        let content = "`".repeat(TOOL_OUTPUT_MAX_CHARS);
-        let panel = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"filePath": "notes.md", "content": content.clone()})),
-            Some("Wrote file successfully."),
-        );
-        assert!(
-            fenced_overhead(&content) > TOOL_OUTPUT_MAX_CHARS,
-            "the fence dwarfs the body it wraps"
-        );
-        assert_eq!(
-            panel_output_estimate(&panel),
-            TOOL_OUTPUT_MAX_CHARS + fenced_overhead(&content) + json_escaped_len("📄 `notes.md`"),
-            "the fence beyond the minimum is charged"
-        );
-    }
-
-    /// A `write` panel's Output section renders its own `📄 <path>` header, and
-    /// that path is not part of the content: a long path is charged beside the
-    /// body, or a turn heavy on deep paths would undercount its cards (#788).
-    #[test]
-    fn the_write_body_estimate_charges_the_output_header_path() {
-        let long_path = format!("{}.rs", "dir/".repeat(1_000));
-        let panel = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"filePath": long_path, "content": "x"})),
-            Some("Wrote file successfully."),
-        );
-        assert_eq!(
-            panel_output_estimate(&panel),
-            json_escaped_len(&format!("📄 `{long_path}`")) + 1,
-            "the header's path and the one-char body are both charged"
-        );
-
-        // A path that closes its inline code span early (`a`<<<<.rs`) is charged
-        // as the SANITIZER renders it: its bare `<`s expand to `&lt;`, which a
-        // raw-length charge would miss (#788).
-        let tricky = "a`<<<<<<<<<<<<.rs";
-        let panel = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(json!({"filePath": tricky, "content": "x"})),
-            Some("Wrote file successfully."),
-        );
-        let header = format!("📄 `{tricky}`");
-        let rendered = CardMarkdown::new().element(&header);
-        assert!(
-            rendered.len() > header.len(),
-            "the sanitizer expands the bare `<`s: {rendered}"
-        );
-        assert_eq!(
-            panel_output_estimate(&panel),
-            json_escaped_len(&rendered) + 1,
-            "the expanded header is charged, not the raw path"
-        );
-    }
-
-    /// The body charge is the JSON-ESCAPED length the card serializes, not the
-    /// raw UTF-8 length: a written file full of newlines and quotes costs two
-    /// bytes each inside the card's `content` string, and a raw-length estimate
-    /// would let a near-budget card pass the split check while the serialized
-    /// card exceeds Feishu's cap (#788).
-    #[test]
-    fn the_write_body_estimate_charges_the_escaped_bytes() {
+    fn the_file_edits_estimate_charges_the_body_it_renders() {
         let content = "\n".repeat(1_000);
-        let panel = ToolPanel::for_test(
-            "write",
+        let panel = write_panel(
+            "src/main.rs",
+            &content,
             ToolStatus::Completed,
-            Some(json!({"filePath": "src/main.rs", "content": content})),
             Some("Wrote file successfully."),
         );
-        assert_eq!(
-            panel_output_estimate(&panel),
-            2 * 1_000 + json_escaped_len("📄 `src/main.rs`"),
-            "each newline costs its escaped byte pair inside the card"
+        let md = panel_md(panel.clone());
+        let (body, _) = md
+            .split_once("```rust\n")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n```"))
+            .expect("the fenced body");
+        assert!(
+            json_escaped_len(body) > TOOL_OUTPUT_MAX_CHARS,
+            "the fixture is past the old preview cap"
         );
         assert!(
-            panel_output_estimate(&panel) > content.len(),
-            "the raw byte length would under-charge"
+            panel_output_estimate(&panel) >= json_escaped_len(body),
+            "the rendered body is charged"
         );
     }
 
@@ -5204,19 +5151,21 @@ mod tests {
     /// the one-line header.
     #[test]
     fn write_and_edit_headers_name_the_touched_file() {
-        for (name, input, want) in [
+        for (name, input, word, want) in [
             (
                 "write",
                 json!({"filePath": "report.md", "content": "hi"}),
+                "➕ 新增",
                 "report.md",
             ),
-            ("write", json!({"path": "src/v2w.rs"}), "v2w.rs"),
+            ("write", json!({"path": "src/v2w.rs"}), "➕ 新增", "v2w.rs"),
             (
                 "edit",
                 json!({"filePath": "/root/workspace/dev/cola/src/feishu/card/tool_render.rs"}),
+                "✏️ 编辑",
                 "tool_render.rs",
             ),
-            ("edit", json!({"path": "src/v2.rs"}), "v2.rs"),
+            ("edit", json!({"path": "src/v2.rs"}), "✏️ 编辑", "v2.rs"),
         ] {
             let title = panel_title(ToolPanel::for_test(
                 name,
@@ -5225,8 +5174,8 @@ mod tests {
                 Some("ok"),
             ));
             assert!(
-                title.ends_with(&format!(" · 📄 {want}")),
-                "{name} header must name {want}: {title}"
+                title.ends_with(&format!(" · {word} {want}")),
+                "{name} header must name {want} with its action: {title}"
             );
             assert!(
                 !title.contains("/root/") && !title.contains("src/"),
@@ -5278,7 +5227,7 @@ mod tests {
             Some(json!({"filePath": long})),
             Some("ok"),
         ));
-        let shown = clipped.rsplit("📄 ").next().expect("the detail");
+        let shown = clipped.rsplit("➕ 新增 ").next().expect("the detail");
         assert!(
             shown.starts_with('…') && shown.ends_with(".md"),
             "a long name keeps its tail: {clipped}"
@@ -5294,7 +5243,10 @@ mod tests {
             Some(json!({"filePath": "re\nport.md"})),
             Some("ok"),
         ));
-        assert!(folded.contains("📄 re port.md"), "folded to one line: {folded}");
+        assert!(
+            folded.contains("✏️ 编辑 re port.md"),
+            "folded to one line: {folded}"
+        );
     }
 
     /// The header detail is charged at its JSON-escaped length, exactly like
@@ -6077,7 +6029,7 @@ mod tests {
 2:     println!(\"hi\");
 3: }
 </content>";
-        let (header, style, body) = format_tool_output("read", raw);
+        let (header, style, body) = read_output(raw);
         assert_eq!(style, BodyStyle::Code(Some("rust")), "language hint from .rs");
         let header = header.unwrap_or_default();
         assert!(
@@ -6111,10 +6063,10 @@ mod tests {
     #[test]
     fn non_read_tool_output_passes_through() {
         let raw = "some\nplain output";
-        assert_eq!(format_tool_output("bash", raw).2, raw);
-        assert_eq!(format_tool_output("bash", raw).0, None);
+        assert_eq!(format_named_output("bash", raw).2, raw);
+        assert_eq!(format_named_output("bash", raw).0, None);
         // Even a read-named tool without the wrapper is left alone.
-        assert_eq!(format_tool_output("read", "no wrapper here").2, "no wrapper here");
+        assert_eq!(read_output("no wrapper here").2, "no wrapper here");
     }
 
     /// #783: the V1-vs-V2 read decision keys off the output's **head**, not a
@@ -6128,7 +6080,7 @@ mod tests {
         let raw = "Read file /root/workspace/dev/cola/README.md, lines 1-2\n\
                    1: see `cola --config <path>`\n\
                    2: done";
-        let (header, style, body) = format_tool_output("read", raw);
+        let (header, style, body) = read_output(raw);
         assert_eq!(
             header.as_deref(),
             Some("📄 `/root/workspace/dev/cola/README.md`"),
@@ -6157,7 +6109,7 @@ mod tests {
     #[test]
     fn read_v1_output_with_leading_blank_line_still_parses() {
         let raw = "\n<path>/x/y.rs</path>\n<type>file</type>\n<content>\n1: use std::fs;\n</content>";
-        let (header, style, body) = format_tool_output("read", raw);
+        let (header, style, body) = read_output(raw);
         assert_eq!(header.as_deref(), Some("📄 `/x/y.rs`"));
         assert_eq!(style, BodyStyle::Code(Some("rust")));
         assert!(!body.contains("<path>"), "wrapper stripped: {}", body);
@@ -6177,7 +6129,7 @@ Report line 1
 Report line 2
 </task_result>
 </task>";
-        let (header, style, body) = format_tool_output("task", raw);
+        let (header, style, body) = format_named_output("task", raw);
         assert_eq!(header, None, "no summary, no header");
         assert_eq!(style, BodyStyle::Auto);
         assert!(body.starts_with("Report line 1"), "report kept: {body:?}");
@@ -6197,10 +6149,10 @@ Report line 2
 boom
 </task_error>
 </task>";
-        let (header, _, body) = format_tool_output("task", raw);
+        let (header, _, body) = format_named_output("task", raw);
         assert_eq!(header.as_deref(), Some("Background task failed: research"));
         assert_eq!(body.trim(), "boom");
-        assert_eq!(format_tool_output("task", "plain text").2, "plain text");
+        assert_eq!(format_named_output("task", "plain text").2, "plain text");
     }
 
     /// An empty `<task_result>` must still lose its envelope — dumping the raw
@@ -6241,7 +6193,7 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
 <file>/root/.agents/skills/implement/other.md</file>
 </skill_files>
 </skill_content>";
-        let (header, style, body) = format_tool_output("skill", raw);
+        let (header, style, body) = format_named_output("skill", raw);
         assert_eq!(header, None, "the input names the skill");
         assert_eq!(style, BodyStyle::Auto);
         assert!(body.contains("Do the work."), "content kept: {body:?}");
@@ -6249,7 +6201,7 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
         assert!(!body.contains("skill_files"), "file list stripped: {body:?}");
         assert!(!body.contains("other.md"), "sampled files stripped: {body:?}");
         // An empty envelope is stripped too, never leaked raw.
-        let (_, _, empty) = format_tool_output("skill", "<skill_content name=\"x\">\n</skill_content>");
+        let (_, _, empty) = format_named_output("skill", "<skill_content name=\"x\">\n</skill_content>");
         assert_eq!(empty, "");
     }
 
@@ -6270,7 +6222,7 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
             ]
         })
         .to_string();
-        let (header, _, body) = format_tool_output("websearch", &raw);
+        let (header, _, body) = web_output(&raw);
         assert_eq!(header.as_deref(), Some("🔎 2 条结果"));
         assert!(
             body.contains("1. [First result](https://a.example/one) · 2026-01-02"),
@@ -6299,7 +6251,7 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
         assert!(!md.contains("```"), "the list must not be fenced: {md}");
 
         // An unparseable output (the provider's no-results text) passes through.
-        let plain = format_tool_output("websearch", "No search results found.");
+        let plain = web_output("No search results found.");
         assert_eq!(plain.0, None);
         assert_eq!(plain.2, "No search results found.");
     }
@@ -6325,7 +6277,7 @@ Published: N/A
 Author: N/A
 Highlights:
 more text";
-        let (header, _, body) = format_tool_output("websearch", raw);
+        let (header, _, body) = web_output(raw);
         assert_eq!(header.as_deref(), Some("🔎 2 条结果"));
         assert!(
             body.contains("1. [First doc](https://a.example/doc) · 2026-01-02"),
@@ -6355,11 +6307,13 @@ Index: /x/src/main.rs
 +let b = 3;
  let c = 4;
 \\ No newline at end of file";
-        let (header, style, body) = format_tool_output("edit", diff);
-        assert_eq!(header.as_deref(), Some("+1 −1"), "count header: {:?}", header);
+        let parsed = parse_edit_diff(diff).expect("a real edit diff parses");
+        let header = format!("+{} −{}", parsed.additions, parsed.deletions);
+        let body = parsed.body;
+        assert_eq!(header, "+1 −1", "count header: {header:?}");
         assert_eq!(
-            style,
-            BodyStyle::Code(Some("rust")),
+            diff_language_for(parsed.paths.iter().map(String::as_str)),
+            "rust",
             "the hunks take the edited file's language"
         );
         assert!(body.contains("@@ -10,3 +10,3 @@"), "hunk header kept: {}", body);
@@ -6373,13 +6327,34 @@ Index: /x/src/main.rs
 
     #[test]
     fn edit_tool_plain_output_passes_through() {
-        // An edit without a parseable diff (running / error text) stays as-is.
+        // An edit without a parseable diff (running / error text) shows its
+        // raw error text; the adapter records no hunk to render.
         let raw = "❌ Could not find oldString in the file.";
-        let (header, style, body) = format_tool_output("edit", raw);
-        assert_eq!(header, None);
-        assert_eq!(style, BodyStyle::Auto);
-        assert_eq!(body, raw);
         assert_eq!(parse_edit_diff(raw), None);
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_edit".into(),
+            },
+            status: ToolStatus::Error,
+            started_at: None,
+            input: Some(json!({"filePath": "src/main.rs"})),
+            output: ToolOutput {
+                raw: Some(json!(raw)),
+                blocks: vec![ContentBlock::Text(raw.into())],
+                error: Some(raw.into()),
+            },
+            kind: ToolKind::Edit,
+            detail: ToolDetail::FileEdits(vec![FileEdit {
+                path: "src/main.rs".into(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: None,
+            }]),
+            ..ToolCall::default()
+        });
+        let md = panel_md(tool);
+        assert!(md.contains(raw), "the error text is the body: {md}");
     }
 
     #[test]
@@ -6425,7 +6400,7 @@ Index: src/main.rs
             .as_str()
             .expect("panel markdown content");
         assert!(
-            md.contains("**Input**\n📄 `src/main.rs`"),
+            md.contains("**Input**\n✏️ 编辑 `src/main.rs`"),
             "file in input: {}",
             md
         );
@@ -6452,6 +6427,28 @@ Index: src/main.rs
             .iter()
             .map(|change| json!({"path": change["path"], "kind": change["kind"]}))
             .collect::<Vec<_>>();
+        // The adapter's own mapping, mirrored for the renderer's fixtures: the
+        // wire `kind` union picks the action, `movePath` makes it a rename, and
+        // a per-file `diff` is reduced to its hunks.
+        let edits = changes
+            .iter()
+            .map(|change| {
+                let (action, rename_to) = match change["kind"]["type"].as_str() {
+                    Some("add") => (FileAction::Add, None),
+                    Some("delete") => (FileAction::Delete, None),
+                    _ => match change["kind"]["movePath"].as_str() {
+                        Some(destination) => (FileAction::Rename, Some(destination.to_string())),
+                        None => (FileAction::Update, None),
+                    },
+                };
+                FileEdit {
+                    path: change["path"].as_str().unwrap_or_default().to_string(),
+                    action,
+                    rename_to,
+                    diff: change["diff"].as_str().and_then(hunk_only),
+                }
+            })
+            .collect();
         ToolPanel::new(ToolCall {
             identity: ToolIdentity {
                 name: "codex/file_change".into(),
@@ -6470,6 +6467,8 @@ Index: src/main.rs
                 },
                 error: None,
             },
+            kind: ToolKind::Edit,
+            detail: ToolDetail::FileEdits(edits),
             ..ToolCall::default()
         })
     }
@@ -6491,7 +6490,10 @@ Index: src/main.rs
             "a diff that fits carries no note"
         );
         let md = panel_md_with_session(tool.clone(), "sess");
-        assert!(md.contains("**Input**\n📄 `src/main.rs`"), "file in input: {md}");
+        assert!(
+            md.contains("**Input**\n✏️ 编辑 `src/main.rs`"),
+            "file in input: {md}"
+        );
         assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
         assert!(
             md.contains("```rust\n@@ -1,4 +1,4 @@"),
@@ -6504,7 +6506,10 @@ Index: src/main.rs
 
         let title = panel_title(tool.clone());
         assert!(title.contains("文件修改"), "own vocabulary: {title}");
-        assert!(title.contains("· 📄 main.rs"), "named while folded: {title}");
+        assert!(
+            title.contains("· ✏️ 编辑 main.rs"),
+            "named with its action while folded: {title}"
+        );
 
         let card = CardBuilder::new()
             .with_state(CardState::Done)
@@ -6543,10 +6548,10 @@ Index: src/main.rs
             "count and totals: {title}"
         );
         let md = panel_md_with_session(tool.clone(), "sess");
-        assert!(md.contains("Index: src/a.rs"), "first file named: {md}");
-        assert!(md.contains("Index: src/b.rs"), "second file named: {md}");
+        assert!(md.contains("✏️ 编辑 `src/a.rs`"), "first file named: {md}");
+        assert!(md.contains("➕ 新增 `src/b.rs`"), "second file named: {md}");
         assert!(
-            md.contains("```rust\nIndex: src/a.rs"),
+            md.contains("```rust\n✏️ 编辑 `src/a.rs`"),
             "one fence for the patch, with the shared language: {md}"
         );
         let card = CardBuilder::new()
@@ -6585,7 +6590,7 @@ Index: src/main.rs
         );
         let md = panel_md(tool.clone());
         assert!(
-            md.contains("Index: assets/logo.png"),
+            md.contains("➕ 新增 `assets/logo.png`"),
             "the diff-less file is named in the body: {md}"
         );
         assert_eq!(tool.file_open_path(), None, "three files have no single target");
@@ -6598,8 +6603,8 @@ Index: src/main.rs
         })]);
         assert_eq!(rename.file_open_path(), Some("src/new.rs"));
         assert!(
-            panel_title(rename).contains("· 📄 new.rs"),
-            "the title names the file the button opens"
+            panel_title(rename).contains("· 📦 重命名 old.rs → new.rs"),
+            "the title names both ends of the rename"
         );
 
         let delete = codex_file_change_panel(vec![json!({
@@ -6609,7 +6614,7 @@ Index: src/main.rs
         })]);
         assert_eq!(delete.file_open_path(), None, "a deleted file cannot open");
         assert!(
-            panel_title(delete).contains("· 📄 gone.rs"),
+            panel_title(delete).contains("· 🗑 删除 gone.rs"),
             "the folded title still names what was deleted"
         );
 
@@ -6638,9 +6643,14 @@ Index: src/main.rs
             }),
         ]);
         let md = panel_md(multi_rename);
-        assert!(md.contains("Index: src/new.py"), "destination in body: {md}");
-        assert!(md.contains("Index: lib/other.py"), "second: {md}");
-        assert!(!md.contains("old.rs"), "no stale source path: {md}");
+        assert!(
+            md.contains("📦 重命名 `src/old.rs` → `src/new.py`"),
+            "destination in body: {md}"
+        );
+        assert!(
+            md.contains("📦 重命名 `lib/other.rs` → `lib/other.py`"),
+            "second: {md}"
+        );
         assert!(
             md.contains("```python"),
             "the fence follows the destination: {md}"
@@ -6670,7 +6680,7 @@ Index: src/main.rs
         );
         let md = panel_md(tool);
         assert!(
-            md.contains("Index: src/main.rs"),
+            md.contains("✏️ 编辑 `src/main.rs`"),
             "the later hunk still renders: {md}"
         );
         assert!(md.contains("+new"), "the later hunk body: {md}");
@@ -6678,6 +6688,111 @@ Index: src/main.rs
             md.contains("Binary files a/logo.png"),
             "the note rides the tail: {md}"
         );
+    }
+
+    /// #1060: one FileEdits renderer, chosen by `(kind, detail)`, names each
+    /// file's action for both producers — Codex's `file_change` and OpenCode's
+    /// `patch` share the shape, so they share the words, totals and fence.
+    #[test]
+    fn one_file_edits_renderer_names_each_action_for_each_producer() {
+        let diff = "@@ -1 +1 @@\n-old\n+new";
+        let cases = [
+            (FileAction::Add, "a.rs", None, "➕ 新增"),
+            (FileAction::Update, "b.rs", None, "✏️ 编辑"),
+            (FileAction::Delete, "c.rs", None, "🗑 删除"),
+            (FileAction::Rename, "old.rs", Some("new.rs"), "📦 重命名"),
+        ];
+        for producer in ["codex/file_change", "patch"] {
+            for (action, path, rename_to, word) in cases {
+                let edit = FileEdit {
+                    path: path.to_string(),
+                    action,
+                    rename_to: rename_to.map(str::to_string),
+                    diff: Some(diff.to_string()),
+                };
+                let tool = panel_with_edits(
+                    producer,
+                    ToolStatus::Completed,
+                    json!({"changes": [{"path": path, "kind": {"type": "update"}}]}),
+                    vec![edit],
+                    None,
+                );
+                let md = panel_md(tool);
+                assert!(md.contains(word), "{producer}/{action:?}: {md}");
+                assert!(md.contains("+1 −1"), "{producer}/{action:?}: {md}");
+                assert!(md.contains("```rust"), "{producer}/{action:?}: {md}");
+                assert!(md.contains("+new"), "{producer}/{action:?}: {md}");
+            }
+        }
+    }
+
+    /// A pure rename carries no hunk at all; the action and its destination
+    /// still show, and the open button follows the destination.
+    #[test]
+    fn a_no_hunk_rename_names_its_action_and_destination() {
+        let rename = panel_with_edits(
+            "codex/file_change",
+            ToolStatus::Completed,
+            json!({"changes": [{"path": "old.rs", "kind": {"type": "update", "movePath": "new.rs"}}]}),
+            vec![FileEdit {
+                path: "old.rs".into(),
+                action: FileAction::Rename,
+                rename_to: Some("new.rs".into()),
+                diff: None,
+            }],
+            Some("done"),
+        );
+        assert_eq!(rename.file_open_path(), Some("new.rs"));
+        let title = panel_title(rename.clone());
+        assert!(title.contains("📦 重命名 old.rs → new.rs"), "title: {title}");
+        let md = panel_md_with_session(rename, "ses_1");
+        assert!(md.contains("📦 重命名 `old.rs` → `new.rs`"), "input: {md}");
+        assert!(md.contains("📦 重命名 `old.rs` → `new.rs`"), "body: {md}");
+        assert!(!md.contains("@@"), "no hunk: {md}");
+    }
+
+    /// A delete is an action with no way in: the folded title and the Input
+    /// line name it, and the panel carries no 「📂 打开」 button.
+    #[test]
+    fn a_delete_carries_no_open_button_for_either_producer() {
+        for producer in ["codex/file_change", "patch"] {
+            let delete = panel_with_edits(
+                producer,
+                ToolStatus::Completed,
+                json!({"changes": [{"path": "gone.rs", "kind": {"type": "delete"}}]}),
+                vec![FileEdit {
+                    path: "gone.rs".into(),
+                    action: FileAction::Delete,
+                    rename_to: None,
+                    diff: None,
+                }],
+                None,
+            );
+            assert_eq!(delete.file_open_path(), None, "{producer}: no way in");
+            assert!(
+                tool_open_button_element(&delete, Some("ses_1")).is_none(),
+                "{producer}: no button"
+            );
+            let md = panel_md_with_session(delete, "ses_1");
+            assert!(md.contains("🗑 删除 `gone.rs`"), "{producer}: {md}");
+        }
+    }
+
+    /// A third-party id that squats `codex/file_change` — even with a
+    /// complete-looking payload — has no typed detail, so it stays opaque: the
+    /// card renders its own text, never a FileEdits panel.
+    #[test]
+    fn a_squatted_file_change_shape_without_detail_stays_opaque() {
+        let tool = ToolPanel::for_test(
+            "codex/file_change",
+            ToolStatus::Completed,
+            Some(json!({"changes": [{"path": "a.rs", "kind": {"type": "update"}}]})),
+            Some("third-party output"),
+        );
+        let md = panel_md(tool);
+        assert!(md.contains("third-party output"), "own text: {md}");
+        assert!(!md.contains("✏️ 编辑"), "no FileEdits renderer: {md}");
+        assert!(!md.contains("+1 −1"), "no diff totals: {md}");
     }
 
     /// A failed `fileChange` is not a diff panel: its change stays in metadata,
@@ -6692,7 +6807,7 @@ Index: src/main.rs
         tool.call.status = ToolStatus::Error;
         tool.call.output.blocks = vec![ContentBlock::Text("patch rejected".into())];
         tool.call.output.error = Some("patch rejected".into());
-        assert_eq!(codex_file_change_diff(&tool), None);
+        assert_eq!(diff_output(&tool), None);
         let md = panel_md(tool);
         assert!(!md.contains("+1 −1"), "no diff panel: {md}");
         assert!(md.contains("patch rejected"), "the error text: {md}");
@@ -6909,7 +7024,7 @@ Index: src/main.rs
         for n in 0..200 {
             ascii.push_str(&format!("+let value_{n:03} = compute({n:03});\n"));
         }
-        let (_, _, ascii_body) = format_tool_output("edit", &ascii);
+        let ascii_body = parse_edit_diff(&ascii).expect("a hunk diff parses").body;
         let ascii_fenced = json_escaped_len(&ascii_body) + fenced_block_overhead(&ascii_body) + "rust".len();
         assert!(
             ascii_fenced <= DIFF_MAX_ESCAPED_BYTES,
@@ -6975,8 +7090,10 @@ Index: src/main.rs
             String::from("Index: src/main.rs\n--- src/main.rs\n+++ src/main.rs\n@@ -1,1 +1,1 @@\n+");
         cjk.push_str(&"中".repeat(5_000));
         let panel = edit_panel(&cjk);
-        let (header, _, _) = format_tool_output("edit", &cjk);
-        let header = header.expect("the count header");
+        let header = {
+            let parsed = parse_edit_diff(&cjk).expect("a hunk diff parses");
+            format!("+{} −{}", parsed.additions, parsed.deletions)
+        };
         let estimate = panel_output_estimate(&panel);
         let md = panel_md(panel);
         let (body, _) = md
@@ -7004,7 +7121,7 @@ Index: src/main.rs
         for n in 0..200 {
             ascii.push_str(&format!("+let value_{n:03} = compute({n:03});\n"));
         }
-        let (_, _, ascii_body) = format_tool_output("edit", &ascii);
+        let ascii_body = parse_edit_diff(&ascii).expect("a hunk diff parses").body;
         assert!(
             json_escaped_len(&ascii_body) > TOOL_OUTPUT_MAX_CHARS,
             "the fixture is past the old character cap: {}",
@@ -7022,6 +7139,29 @@ Index: src/main.rs
 
     /// A file-editing panel carrying `diff` in V1's `metadata.diff`, the shape
     /// the render reads (#792).
+    /// One `FileEdit` from a raw unified diff, reduced to its hunk body the way
+    /// the adapter stores it (the path and action are fields, so the header
+    /// block would only repeat them).
+    fn file_edit(path: &str, action: FileAction, diff: &str) -> FileEdit {
+        FileEdit {
+            path: path.to_string(),
+            action,
+            rename_to: None,
+            diff: hunk_only(diff),
+        }
+    }
+
+    /// A unified diff's hunk body, or its whole text when it carries no hunk (a
+    /// binary change's note).
+    fn hunk_only(diff: &str) -> Option<String> {
+        parse_edit_diff(diff)
+            .map(|parsed| parsed.body.trim_end().to_string())
+            .or_else(|| {
+                let text = diff.trim();
+                (!text.is_empty()).then(|| text.to_string())
+            })
+    }
+
     fn edit_panel(diff: &str) -> ToolPanel {
         ToolPanel::new(ToolCall {
             identity: ToolIdentity {
@@ -7037,6 +7177,53 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            kind: ToolKind::Edit,
+            detail: ToolDetail::FileEdits(vec![file_edit("src/main.rs", FileAction::Update, diff)]),
+            ..ToolCall::default()
+        })
+    }
+
+    /// An `Add` file's hunks: every content line is an addition, numbered from
+    /// the empty side — the adapter's own synthesis for a `write`.
+    fn add_diff(content: &str) -> Option<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            return None;
+        }
+        let mut diff = format!("@@ -0,0 +1,{} @@\n", lines.len());
+        for line in lines {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        Some(diff.trim_end().to_string())
+    }
+
+    /// A `write` panel: one `Add` FileEdit with the content as its additions,
+    /// the shape the adapter declares for V1 and V2 alike.
+    fn write_panel(path: &str, content: &str, status: ToolStatus, output: Option<&str>) -> ToolPanel {
+        ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "write".into(),
+                call_id: "call_write".into(),
+            },
+            status,
+            started_at: None,
+            input: Some(json!({"path": path, "content": content})),
+            output: ToolOutput {
+                raw: output.map(|text| json!(text)),
+                blocks: output
+                    .map(|text| vec![ContentBlock::Text(text.to_string())])
+                    .unwrap_or_default(),
+                error: None,
+            },
+            kind: ToolKind::Edit,
+            detail: ToolDetail::FileEdits(vec![FileEdit {
+                path: path.to_string(),
+                action: FileAction::Add,
+                rename_to: None,
+                diff: add_diff(content),
+            }]),
             ..ToolCall::default()
         })
     }
@@ -7070,6 +7257,8 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            detail: ToolDetail::FileEdits(vec![file_edit("src/main.rs", FileAction::Update, &diff)]),
+            kind: ToolKind::Edit,
             ..ToolCall::default()
         })
     }
@@ -7135,7 +7324,7 @@ Index: .config/opencode/AGENTS.md
             .as_str()
             .expect("panel markdown content");
         assert!(
-            md.contains("**Input**\n📄 `/root/.config/opencode/AGENTS.md`"),
+            md.contains("**Input**\n✏️ 编辑 `.config/opencode/AGENTS.md`"),
             "file in input: {md}"
         );
         assert!(md.contains("**Output**\n\n+1 −3"), "count header: {md}");
@@ -7302,10 +7491,7 @@ Index: /x/one.rs
             .as_str()
             .expect("panel markdown content");
         assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
-        assert!(
-            md.contains("```rust\nIndex: /x/one.rs"),
-            "fenced body with the patched file: {md}"
-        );
+        assert!(md.contains("```rust\n@@ -1,3 +1,3 @@"), "fenced hunks: {md}");
         assert!(md.contains("-let b = 2;"), "removed line: {md}");
         assert!(md.contains("+let b = 3;"), "added line: {md}");
         assert!(md.contains(" let a = 1;"), "context line kept: {md}");
@@ -7493,7 +7679,7 @@ index 3333333..4444444 100644
 -c
 +d";
         let diff = format!("{first}\n{second}");
-        let d = parse_multi_file_diff(&diff).expect("parsed");
+        let d = parse_edit_diff(&diff).expect("parsed");
         assert_eq!(d.paths, vec!["src/one.rs", "src/two.rs"]);
         assert_eq!(
             (d.additions, d.deletions),
@@ -7569,8 +7755,11 @@ see the compiler's note above
         let d = parse_edit_diff(one).expect("parsed");
         assert_eq!(d.path.as_deref(), Some("/a/one.rs"));
         assert_eq!(d.paths, vec!["/a/one.rs"]);
-        let (_, style, _) = format_tool_output("edit", one);
-        assert_eq!(style, BodyStyle::Code(Some("rust")));
+        assert_eq!(
+            diff_language_for(d.paths.iter().map(String::as_str)),
+            "rust",
+            "the hunk takes the edited file's language"
+        );
 
         let two = format!(
             "{one}\n===================================================================\n\
@@ -7583,11 +7772,9 @@ see the compiler's note above
             (2, 2),
             "the second file's header is not a +/- line"
         );
-        let (header, style, _) = format_tool_output("apply_patch", &two);
-        assert_eq!(header, None, "two files: the folded title owns the count (#793)");
         assert_eq!(
-            style,
-            BodyStyle::Code(Some(PLAIN_TEXT)),
+            diff_language_for(d.paths.iter().map(String::as_str)),
+            PLAIN_TEXT,
             "mixed languages stay plain"
         );
     }
@@ -7629,82 +7816,69 @@ Index: /a/lua.lua
         assert!(d.body.contains(" return 1"), "context kept: {}", d.body);
     }
 
-    /// #202: an `apply_patch` can touch several files, so its hunks keep each
-    /// file's `Index:` line in the body — unlike `edit`, whose single target is
-    /// named by the input panel.
+    /// A multi-file `apply_patch` names each file's action in the Input line
+    /// and the body, so every hunk is attributable — no `Index:` header is
+    /// parsed by the card any more.
     #[test]
     fn apply_patch_output_keeps_per_file_attribution() {
-        let diff = "\
-Index: /a/one.rs
-===================================================================
---- /a/one.rs
-+++ /a/one.rs
+        let one = "\
 @@ -1,3 +1,3 @@
  let a = 1;
 -let b = 2;
 +let b = 3;
- let c = 4;
-Index: /a/two.rs
-===================================================================
---- /a/two.rs
-+++ /a/two.rs
-@@ -1 +1 @@
--x
-+y";
-        let (header, style, body) = format_tool_output("apply_patch", diff);
-        assert_eq!(
-            header, None,
-            "a multi-file patch has no body header: the folded title owns it (#793)"
+ let c = 4;";
+        let two = "@@ -1 +1 @@\n-x\n+y";
+        let tool = panel_with_edits(
+            "apply_patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            vec![
+                file_edit("/a/one.rs", FileAction::Update, one),
+                file_edit("/a/two.rs", FileAction::Update, two),
+            ],
+            Some("Success. Updated the following files"),
         );
         assert_eq!(
-            style,
-            BodyStyle::Code(Some("rust")),
-            "both touched files share one language"
+            panel_title(tool.clone()),
+            "✅ apply_patch · 📄 2 files · +2 −2",
+            "the folded title owns the count and the totals"
         );
-        assert!(body.contains("Index: /a/one.rs"), "first file named: {body}");
-        assert!(body.contains("Index: /a/two.rs"), "second file named: {body}");
+        let body = panel_md(tool);
+        assert!(
+            body.contains("✏️ 编辑 `/a/one.rs`"),
+            "first file named with its action: {body}"
+        );
+        assert!(
+            body.contains("✏️ 编辑 `/a/two.rs`"),
+            "second file named with its action: {body}"
+        );
         assert!(body.contains("+let b = 3;"), "hunk kept: {body}");
         assert!(body.contains("+y"), "second hunk kept: {body}");
         assert!(body.contains(" let a = 1;"), "context kept: {body}");
         assert!(!body.contains("+++"), "file header noise dropped: {body}");
+        assert!(
+            body.contains("```rust"),
+            "both touched files share one language: {body}"
+        );
     }
 
-    /// #793: a multi-file patch's COLLAPSED title says how many files it
-    /// touched ahead of the totals — the body's `Index:` separators are
-    /// invisible until the reader expands, so the count is what says whether
-    /// expanding is worth it. The title owns that line, so the expanded body
-    /// does not repeat it, and the count and totals are one `EditDiff`: the
-    /// paths it deduped and the lines it summed.
+    /// #1060/#793: a multi-file list's COLLAPSED title says how many files it
+    /// touched ahead of the totals, and the expanded body names each file's
+    /// action instead of repeating the count.
     #[test]
     fn a_multi_file_patch_title_names_the_file_count() {
-        let diff = "\
-Index: /a/one.rs
-===================================================================
---- /a/one.rs
-+++ /a/one.rs
-@@ -1 +1,2 @@
--old
-+new
-+extra
-Index: /a/two.rs
-===================================================================
---- /a/two.rs
-+++ /a/two.rs
-@@ -1 +1 @@
--x
-+y
-Index: /a/three.md
-===================================================================
---- /a/three.md
-+++ /a/three.md
-@@ -1 +1 @@
--old
-+new";
-        let tool = panel_with(
+        let first = "@@ -1 +1,2 @@\n-old\n+new\n+extra";
+        let second = "@@ -1 +1 @@\n-x\n+y";
+        let third = "@@ -1 +1 @@\n-old\n+new";
+        let tool = panel_with_edits(
             "patch",
             ToolStatus::Completed,
             json!({"patchText": "*** Begin Patch"}),
-            json!({"diff": diff}),
+            vec![
+                file_edit("/a/one.rs", FileAction::Update, first),
+                file_edit("/a/two.rs", FileAction::Update, second),
+                file_edit("/a/three.md", FileAction::Update, third),
+            ],
             Some("Success. Updated the following files"),
         );
         assert_eq!(
@@ -7717,10 +7891,11 @@ Index: /a/three.md
             !body.contains("📄 3 files") && !body.contains("+4 −3"),
             "the body does not repeat the title's count: {body}"
         );
+        let output = body.split("**Output**").nth(1).expect("the output section");
         assert_eq!(
-            body.matches("Index: ").count(),
+            output.matches("✏️ 编辑").count(),
             3,
-            "the body keeps one `Index:` separator per file: {body}"
+            "the body names each file's action: {body}"
         );
     }
 
@@ -7730,26 +7905,15 @@ Index: /a/three.md
     /// missed would let a near-budget card grow past the serialized cap.
     #[test]
     fn the_multi_file_title_detail_is_charged() {
-        let diff = "\
-Index: /a/one.rs
-===================================================================
---- /a/one.rs
-+++ /a/one.rs
-@@ -1 +1 @@
--old
-+new
-Index: /a/two.rs
-===================================================================
---- /a/two.rs
-+++ /a/two.rs
-@@ -1 +1 @@
--old
-+new";
-        let tool = panel_with(
+        let diff = "@@ -1 +1 @@\n-old\n+new";
+        let tool = panel_with_edits(
             "patch",
             ToolStatus::Completed,
             json!({"patchText": "*** Begin Patch"}),
-            json!({"diff": diff}),
+            vec![
+                file_edit("/a/one.rs", FileAction::Update, diff),
+                file_edit("/a/two.rs", FileAction::Update, diff),
+            ],
             Some("Success. Updated the following files"),
         );
         assert_eq!(
@@ -7759,114 +7923,55 @@ Index: /a/two.rs
         );
     }
 
-    /// #793: a patch that names the same file twice is still one file — the
-    /// deduped `paths` decide, so the title never claims `2 files` for one
-    /// target. A lone file also gets no `1 file` prefix, which would only
-    /// repeat the path the Input line already shows.
+    /// #1060: a single-file list names the file's ACTION in the folded title
+    /// (and the body heads with the bare totals), replacing the old bare path.
     #[test]
-    fn a_repeated_file_keeps_the_bare_change_count() {
-        let diff = "\
-Index: /a/one.rs
-===================================================================
---- /a/one.rs
-+++ /a/one.rs
-@@ -1 +1 @@
--old
-+new
-Index: /a/one.rs
-===================================================================
---- /a/one.rs
-+++ /a/one.rs
-@@ -5 +5 @@
--old
-+new";
-        let (header, _, body) = format_tool_output("patch", diff);
-        assert_eq!(header.as_deref(), Some("+2 −2"), "one file, bare totals");
-        assert_eq!(
-            body.lines().filter(|l| l.starts_with("Index: ")).count(),
-            2,
-            "the body is untouched: {body}"
-        );
-        let tool = panel_with(
-            "patch",
-            ToolStatus::Completed,
-            json!({"patchText": "*** Begin Patch"}),
-            json!({"diff": diff}),
-            Some("Success. Updated the following files"),
-        );
-        assert_eq!(
-            panel_title(tool.clone()),
-            "✅ patch",
-            "one file gets no count detail in the title"
-        );
-        assert!(panel_md(tool).contains("+2 −2"), "the body keeps the totals");
-    }
-
-    /// #793 regression: a single-file `edit`/`patch` panel's folded title and
-    /// body stay byte-identical to before the file count existed — the title
-    /// names the edited file, and the body heads with the bare totals.
-    #[test]
-    fn a_single_file_edit_keeps_todays_title_and_body() {
-        let diff = "\
-Index: /a/one.rs
-===================================================================
---- /a/one.rs
-+++ /a/one.rs
-@@ -1 +1 @@
--old
-+new";
-        let (header, _, _) = format_tool_output("edit", diff);
-        assert_eq!(header.as_deref(), Some("+1 −1"));
-
-        let edit = panel_with(
+    fn a_single_file_edit_names_its_action_in_the_title() {
+        let diff = "@@ -1 +1 @@\n-old\n+new";
+        let edit = panel_with_edits(
             "edit",
             ToolStatus::Completed,
-            json!({"filePath": "src/main.rs"}),
-            json!({"diff": diff}),
+            json!({"filePath": "/a/one.rs"}),
+            vec![file_edit("/a/one.rs", FileAction::Update, diff)],
             Some("Edit applied successfully."),
         );
-        assert_eq!(panel_title(edit.clone()), "✅ edit · 📄 main.rs");
+        assert_eq!(panel_title(edit.clone()), "✅ edit · ✏️ 编辑 one.rs");
         assert!(
             panel_md(edit).contains("**Output**\n\n+1 −1"),
-            "the body keeps today's bare header"
+            "the body keeps the bare header"
         );
 
-        let patch = panel_with(
+        let patch = panel_with_edits(
             "patch",
             ToolStatus::Completed,
             json!({"patchText": "*** Begin Patch"}),
-            json!({"diff": diff}),
+            vec![file_edit("/a/one.rs", FileAction::Update, diff)],
             Some("Success. Updated the following files"),
         );
-        assert_eq!(
-            panel_title(patch.clone()),
-            "✅ patch",
-            "a one-file patch never gained a detail"
-        );
+        assert_eq!(panel_title(patch.clone()), "✅ patch · ✏️ 编辑 one.rs");
         assert!(panel_md(patch).contains("**Output**\n\n+1 −1"));
     }
 
-    /// A patch that touches two languages has no honest grammar to fence with:
+    /// A list that touches two languages has no honest grammar to fence with:
     /// it stays plain rather than colouring one file's hunks with the other's.
     #[test]
     fn a_mixed_language_patch_stays_plain() {
-        let diff = "\
-Index: /a/one.rs
-===================================================================
---- /a/one.rs
-+++ /a/one.rs
-@@ -1 +1 @@
--old
-+new
-Index: /a/two.md
-===================================================================
---- /a/two.md
-+++ /a/two.md
-@@ -1 +1 @@
--old
-+new";
-        let (_, style, _) = format_tool_output("apply_patch", diff);
-        assert_eq!(style, BodyStyle::Code(Some(PLAIN_TEXT)));
+        let diff = "@@ -1 +1 @@\n-old\n+new";
+        let tool = panel_with_edits(
+            "apply_patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            vec![
+                file_edit("/a/one.rs", FileAction::Update, diff),
+                file_edit("/a/two.md", FileAction::Update, diff),
+            ],
+            Some("Success. Updated the following files"),
+        );
+        let md = panel_md(tool);
+        assert!(
+            md.contains(&format!("```{PLAIN_TEXT}")),
+            "mixed languages stay plain: {md}"
+        );
     }
 
     /// #202 review: the bridge appends the tool's LSP note after the diff; the
@@ -8045,7 +8150,7 @@ LSP errors detected in a.rs, please fix:
             r#"[{"content":"ok","status":"pending"},{"status":"pending"}]"#,
             r#"[{"content":"","status":"pending"}]"#,
         ] {
-            let (header, style, body) = format_tool_output("todowrite", raw);
+            let (header, style, body) = format_named_output("todowrite", raw);
             assert_eq!(header, None, "no header for {raw:?}");
             assert_eq!(style, BodyStyle::Auto, "raw fallback for {raw:?}");
             assert_eq!(body, raw, "raw output kept for {raw:?}");
@@ -8247,7 +8352,7 @@ LSP errors detected in a.rs, please fix:
             ("/x/noext", PLAIN_TEXT),
         ] {
             let output = format!("Read file {path}, lines 1-1\n1: x");
-            let (_, style, _) = format_tool_output("read", &output);
+            let (_, style, _) = read_output(&output);
             assert_eq!(
                 style,
                 BodyStyle::Code(Some(token)),
@@ -8315,11 +8420,11 @@ LSP errors detected in a.rs, please fix:
             .build();
         let text = card.to_string();
         assert!(
-            text.contains("📄 `/root/.config/opencode/AGENTS.md`"),
+            text.contains("✏️ 编辑 `/root/.config/opencode/AGENTS.md`"),
             "file missing: {}",
             text
         );
-        assert!(!text.contains("📄 `?`"), "placeholder shown: {}", text);
+        assert!(!text.contains("✏️ 编辑 `?`"), "placeholder shown: {}", text);
     }
 
     #[test]
@@ -8551,6 +8656,37 @@ LSP errors detected in a.rs, please fix:
         })
     }
 
+    /// A panel with an explicit typed `FileEdits` detail, the adapter's own
+    /// shape: named separately so a renderer fixture cannot disagree with
+    /// itself about what the call touched.
+    fn panel_with_edits(
+        name: &str,
+        status: ToolStatus,
+        input: serde_json::Value,
+        edits: Vec<FileEdit>,
+        output: Option<&str>,
+    ) -> ToolPanel {
+        ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: name.into(),
+                call_id: format!("call_{name}"),
+            },
+            status,
+            started_at: None,
+            input: Some(input),
+            output: ToolOutput {
+                raw: output.map(|text| serde_json::Value::String(text.to_string())),
+                blocks: output
+                    .map(|text| vec![ContentBlock::Text(text.to_string())])
+                    .unwrap_or_default(),
+                error: None,
+            },
+            kind: ToolKind::Edit,
+            detail: ToolDetail::FileEdits(edits),
+            ..ToolCall::default()
+        })
+    }
+
     fn panel_md(tool: ToolPanel) -> String {
         let card = CardBuilder::new()
             .with_state(CardState::Done)
@@ -8672,40 +8808,51 @@ Index: /a/one.rs
             Some("Success. Updated the following files:\nM /a/one.rs"),
         );
         let md = panel_md(tool);
-        assert!(md.contains("**Input**\n📄 `/a/one.rs`"), "file in input: {md}");
+        assert!(
+            md.contains("**Input**\n✏️ 编辑 `/a/one.rs`"),
+            "file in input: {md}"
+        );
         assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
-        assert!(md.contains("```rust\nIndex: /a/one.rs"), "fenced hunks: {md}");
+        assert!(md.contains("```rust\n@@"), "fenced hunks: {md}");
         assert!(
             md.contains("-let b = 2;") && md.contains("+let b = 3;"),
             "hunks: {md}"
         );
-        assert!(md.contains(" let a = 1;"), "context kept: {md}");
         assert!(!md.contains("Success. Updated"), "summary dropped: {md}");
 
-        // Several files: the input names the first and counts the rest.
-        assert_eq!(
-            format_named_input(
-                "patch",
-                &json!({"patchText": "*** Begin Patch\n*** Add File: a.rs\n*** Delete File: b.rs\n*** End Patch"})
+        // Several files: the input names each file's action.
+        let several = ToolPanel::for_test(
+            "patch",
+            ToolStatus::Completed,
+            Some(
+                json!({"patchText": "*** Begin Patch\n*** Add File: a.rs\n*** Delete File: b.rs\n*** End Patch"}),
             ),
-            "📄 `a.rs` 等 2 个文件"
+            None,
         );
+        assert_eq!(format_tool_input(&several), "➕ 新增 `a.rs`\n🗑 删除 `b.rs`");
         // An unparseable patchText falls back to the generic key-value list,
         // never a raw JSON dump.
         assert_eq!(
-            format_named_input("patch", &json!({"patchText": "not a patch"})),
+            format_tool_input(&ToolPanel::for_test(
+                "patch",
+                ToolStatus::Completed,
+                Some(json!({"patchText": "not a patch"})),
+                None
+            )),
             "- patchText: not a patch"
         );
-        // V1's `apply_patch` keeps its historical generic rendering even when
-        // its patchText carries the same `*** … File:` headers (#467 US18:
-        // every V1 rendering change is out of scope). Only the V2 id takes the
-        // file-summary arm.
+        // V1's `apply_patch` answers the same patch-text shape (P3 completes
+        // the mapping on both generations).
         assert_eq!(
-            format_named_input(
+            format_tool_input(&ToolPanel::for_test(
                 "apply_patch",
-                &json!({"patchText": "*** Begin Patch\n*** Update File: a.rs\n*** End Patch"})
-            ),
-            "- patchText: *** Begin Patch"
+                ToolStatus::Completed,
+                Some(
+                    json!({"patchText": "*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n*** End Patch"})
+                ),
+                None
+            )),
+            "✏️ 编辑 `a.rs`"
         );
     }
 
@@ -8739,7 +8886,7 @@ Index: /a/one.rs
     fn subagent_v2_output_strips_the_envelope() {
         let raw = "<subagent sessionID=\"ses_child\" state=\"completed\">\n\
                    Report line 1\n\nReport line 2\n</subagent>";
-        let (header, style, body) = format_tool_output("subagent", raw);
+        let (header, style, body) = format_named_output("subagent", raw);
         assert_eq!(header, None);
         assert_eq!(style, BodyStyle::Auto);
         assert!(body.starts_with("Report line 1"), "report kept: {body:?}");
@@ -8748,7 +8895,7 @@ Index: /a/one.rs
         assert!(!body.contains("</subagent>"), "wrapper stripped: {body:?}");
 
         let handle = "The subagent is working in the background (sessionID: ses_x).";
-        assert_eq!(format_tool_output("subagent", handle).2, handle);
+        assert_eq!(format_named_output("subagent", handle).2, handle);
     }
 
     /// V2's `skill` input is `{id}` where V1's was `{name}`; both render the
@@ -8791,11 +8938,12 @@ Index: /a/one.rs
         // A single-file change also names its file while folded (#902), the way
         // an `edit` panel does.
         assert_eq!(
-            title(
-                "codex/file_change",
-                json!({"changes": [{"path": "a.rs", "kind": {"type": "update"}}]})
-            ),
-            "✅ 文件修改 · 📄 a.rs"
+            panel_title(codex_file_change_panel(vec![json!({
+                "path": "a.rs",
+                "kind": {"type": "update"},
+                "diff": "@@ -1 +1 @@\n-a\n+b"
+            })])),
+            "✅ 文件修改 · ✏️ 编辑 a.rs"
         );
         assert_eq!(
             title("codex/web_search", json!({"query": "rust", "action": null})),
@@ -9438,67 +9586,61 @@ Index: /a/one.rs
         assert_eq!(format_tool_input(&silent), "", "the shape decides");
     }
 
-    /// A Codex file change names its targets in `changes[].path`, one entry per
-    /// file — not in a top-level `path`. A payload with a malformed entry is
-    /// rendered generically instead of a partial list.
+    /// A Codex file change's Input line names every touched file with its
+    /// action, from the typed `FileEdits` detail; a payload that is not the
+    /// adapter's shape stays generic.
     #[test]
     fn codex_file_change_input_lists_its_files() {
-        assert_eq!(
-            format_named_input(
-                "codex/file_change",
-                &json!({"changes": [{"path": "src/main.rs", "kind": {"type": "update"}}]})
-            ),
-            "📄 `src/main.rs`"
-        );
-        assert_eq!(
-            format_named_input(
-                "codex/file_change",
-                &json!({"changes": [
-                    {"path": "a.rs", "kind": {"type": "update"}},
-                    {"path": "b.rs", "kind": {"type": "add"}},
-                ]})
-            ),
-            "📄 `a.rs` 等 2 个文件"
-        );
-        // A rename names the file that now exists, like the title and button.
-        assert_eq!(
-            format_named_input(
-                "codex/file_change",
-                &json!({"changes": [{"path": "old.rs", "kind": {"type": "update", "movePath": "new.rs"}}]})
-            ),
-            "📄 `new.rs`"
-        );
-        let partial = format_named_input(
+        let one = codex_file_change_panel(vec![json!({
+            "path": "src/main.rs",
+            "kind": {"type": "update"},
+            "diff": "@@ -1 +1 @@\n-old\n+new",
+        })]);
+        assert_eq!(format_tool_input(&one), "✏️ 编辑 `src/main.rs`");
+
+        let two = codex_file_change_panel(vec![
+            json!({"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-a\n+b"}),
+            json!({"path": "b.rs", "kind": {"type": "add"}, "diff": "@@ -0,0 +1 @@\n+b"}),
+        ]);
+        assert_eq!(format_tool_input(&two), "✏️ 编辑 `a.rs`\n➕ 新增 `b.rs`");
+
+        // A rename names the old → new pair.
+        let rename = codex_file_change_panel(vec![json!({
+            "path": "old.rs",
+            "kind": {"type": "update", "movePath": "new.rs"},
+            "diff": "@@ -1 +1 @@\n-old\n+new",
+        })]);
+        assert_eq!(format_tool_input(&rename), "📦 重命名 `old.rs` → `new.rs`");
+
+        // A malformed entry is not the adapter's shape and stays generic.
+        let partial = format_tool_input(&ToolPanel::for_test(
             "codex/file_change",
-            &json!({"changes": [{"path": "a.rs"}, {"path": 17}]}),
-        );
+            ToolStatus::Completed,
+            Some(json!({"changes": [{"path": "a.rs"}, {"path": 17}]})),
+            None,
+        ));
         assert!(
             partial.starts_with("- changes:"),
             "a malformed entry takes the generic shape, not a partial list: {partial}"
         );
-        // The adapter always writes `kind`; a payload without it is not the
-        // adapter's shape and stays opaque (ADR-0042).
-        let no_kind = format_named_input("codex/file_change", &json!({"changes": [{"path": "a.rs"}]}));
+        let no_kind = format_tool_input(&ToolPanel::for_test(
+            "codex/file_change",
+            ToolStatus::Completed,
+            Some(json!({"changes": [{"path": "a.rs"}]})),
+            None,
+        ));
         assert!(
             no_kind.starts_with("- changes:"),
             "a missing kind takes the generic shape: {no_kind}"
         );
-        let blank = format_named_input(
-            "codex/file_change",
-            &json!({"changes": [{"path": "a.rs"}, {"path": "  "}]}),
-        );
-        assert!(
-            blank.starts_with("- changes:"),
-            "a blank path is malformed too: {blank}"
-        );
+
         // A backtick in a path cannot escape the inline span it names.
-        assert_eq!(
-            format_named_input(
-                "codex/file_change",
-                &json!({"changes": [{"path": "a`b.rs", "kind": {"type": "update"}}]})
-            ),
-            "📄 ``a`b.rs``"
-        );
+        let backtick = codex_file_change_panel(vec![json!({
+            "path": "a`b.rs",
+            "kind": {"type": "update"},
+            "diff": "@@ -1 +1 @@\n-a\n+b",
+        })]);
+        assert_eq!(format_tool_input(&backtick), "✏️ 编辑 ``a`b.rs``");
     }
 
     /// Codex's `imageView` names the file it looked at, with the same backtick
@@ -9515,23 +9657,43 @@ Index: /a/one.rs
         );
     }
 
-    /// A `websearch` input had no V1 arm either: the query leads the panel.
+    /// A web search's query leads the Input line, from the typed `Search`
+    /// shape; the vendor name is not read.
     #[test]
     fn websearch_input_shows_the_query() {
-        assert_eq!(
-            format_named_input("websearch", &json!({"query": "rust lifetimes"})),
-            "🔎 `rust lifetimes`"
+        let search = ToolPanel::for_test(
+            "websearch",
+            ToolStatus::Completed,
+            Some(json!({"query": "rust lifetimes"})),
+            None,
         );
-        assert_eq!(
-            format_named_input(
-                "codex/web_search",
-                &json!({"query": "rust lifetimes", "action": null})
-            ),
-            "🔎 `rust lifetimes`"
-        );
-        // The adapter always writes `action`; a payload without it stays
-        // opaque (ADR-0042's whole-shape gate).
-        let no_action = format_named_input("codex/web_search", &json!({"query": "rust lifetimes"}));
+        assert_eq!(format_tool_input(&search), "🔎 `rust lifetimes`");
+
+        let codex = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/web_search".into(),
+                call_id: "call_search".into(),
+            },
+            kind: ToolKind::Search,
+            detail: ToolDetail::Search {
+                query: Some("rust lifetimes".into()),
+                matches: None,
+                scope: SearchScope::Web,
+            },
+            status: ToolStatus::Completed,
+            input: Some(json!({"query": "rust lifetimes", "action": null})),
+            ..ToolCall::default()
+        });
+        assert_eq!(format_tool_input(&codex), "🔎 `rust lifetimes`");
+
+        // A payload without the adapter's shape stays opaque (ADR-0042's
+        // whole-shape gate).
+        let no_action = format_tool_input(&ToolPanel::for_test(
+            "codex/web_search",
+            ToolStatus::Completed,
+            Some(json!({"query": "rust lifetimes"})),
+            None,
+        ));
         assert!(
             no_action.starts_with("- query:"),
             "a missing action takes the generic shape: {no_action}"
@@ -9546,7 +9708,7 @@ Index: /a/one.rs
     #[test]
     fn v2_read_output_promotes_the_header_line() {
         let file = "Read file /x/y.rs, lines 1-2\n1: use std::fs;\n2: fn main() {}";
-        let (header, style, body) = format_tool_output("read", file);
+        let (header, style, body) = read_output(file);
         assert_eq!(style, BodyStyle::Code(Some("rust")), "language from .rs");
         let header = header.unwrap_or_default();
         assert!(header.contains("/x/y.rs"), "path in header: {header}");
@@ -9554,14 +9716,14 @@ Index: /a/one.rs
         assert!(body.contains("1: use std::fs;"), "code kept: {body}");
 
         let dir = "Read directory /x/src, entries 1-2\n/x/src/a.rs\n/x/src/b.rs";
-        let (header, style, body) = format_tool_output("read", dir);
+        let (header, style, body) = read_output(dir);
         let header = header.unwrap_or_default();
         assert!(header.contains("/x/src"), "dir path: {header}");
         assert_eq!(style, BodyStyle::Code(None));
         assert!(body.contains("/x/src/a.rs"), "listing kept: {body}");
 
         let empty = "Read file /x/empty.txt, 0 lines";
-        let (header, _, body) = format_tool_output("read", empty);
+        let (header, _, body) = read_output(empty);
         assert!(header.unwrap_or_default().contains("/x/empty.txt"));
         assert!(body.is_empty(), "empty file has no body: {body:?}");
 
@@ -9591,7 +9753,7 @@ excerpt one that must not appear
 ## [Second result](https://b.example/two)
 
 excerpt two";
-        let (header, style, body) = format_tool_output("websearch", raw);
+        let (header, style, body) = web_output(raw);
         assert_eq!(header.as_deref(), Some("🔎 2 条结果"));
         assert_eq!(style, BodyStyle::Markdown);
         assert!(
@@ -9603,10 +9765,7 @@ excerpt two";
             "second: {body}"
         );
         assert!(!body.contains("excerpt"), "excerpts dropped: {body}");
-        assert_eq!(
-            format_tool_output("websearch", "No search results found.").0,
-            None
-        );
+        assert_eq!(web_output("No search results found.").0, None);
     }
 
     /// A Codex `webSearch` panel: the adapter writes the opaque `results` JSON
@@ -9626,6 +9785,12 @@ excerpt two";
                 raw: (!raw.is_null()).then_some(raw),
                 blocks: Vec::new(),
                 error: None,
+            },
+            kind: ToolKind::Search,
+            detail: ToolDetail::Search {
+                query: Some("rust lifetimes".into()),
+                matches: None,
+                scope: SearchScope::Web,
             },
             ..ToolCall::default()
         })
@@ -9754,6 +9919,12 @@ excerpt two";
                 blocks: Vec::new(),
                 error: None,
             },
+            kind: ToolKind::Search,
+            detail: ToolDetail::Search {
+                query: Some("rust lifetimes".into()),
+                matches: None,
+                scope: SearchScope::Web,
+            },
             ..ToolCall::default()
         });
         let md = panel_md(tool);
@@ -9782,6 +9953,12 @@ excerpt two";
                 raw: Some(json!([{"title": "Raw", "url": "https://raw.example"}])),
                 blocks: Vec::new(),
                 error: None,
+            },
+            kind: ToolKind::Search,
+            detail: ToolDetail::Search {
+                query: Some("rust lifetimes".into()),
+                matches: None,
+                scope: SearchScope::Web,
             },
             ..ToolCall::default()
         });
@@ -10032,7 +10209,7 @@ excerpt two";
         let md = panel_md(grep);
         assert!(md.contains("**Output**\n\n2 处匹配"), "grep count: {md}");
 
-        assert_eq!(format_tool_output("glob", "a.rs\nb.rs").0, None);
+        assert_eq!(format_named_output("glob", "a.rs\nb.rs").0, None);
     }
 
     /// A Code Mode `Program` (ADR-0105, spec #1057's P2): the source renders as
@@ -10197,14 +10374,18 @@ excerpt two";
         assert_eq!(panel_output_estimate(&empty), 0);
     }
 
-    /// The input limit hint carries the tool's own unit: `read` pages lines,
-    /// `glob` counts files.
+    /// The input limit hint carries the search's own unit: a filename search
+    /// counts files, a content search and a read count lines.
     #[test]
     fn input_limit_hints_match_the_tool() {
-        assert!(
-            format_named_input("glob", &json!({"pattern": "**/*.rs", "limit": 5})).contains("最多 5 个文件")
-        );
-        assert!(format_named_input("read", &json!({"path": "a.rs", "limit": 5})).contains("最多 5 行"));
-        assert!(format_named_input("grep", &json!({"pattern": "x", "limit": 5})).contains("最多 5 行"));
+        for (name, input, unit) in [
+            ("glob", json!({"pattern": "**/*.rs", "limit": 5}), "个文件"),
+            ("read", json!({"path": "a.rs", "limit": 5}), "行"),
+            ("grep", json!({"pattern": "x", "limit": 5}), "行"),
+        ] {
+            let tool = ToolPanel::for_test(name, ToolStatus::Completed, Some(input), None);
+            let line = format_tool_input(&tool);
+            assert!(line.contains(&format!("最多 5 {unit}")), "{name}: {line}");
+        }
     }
 }

@@ -11,10 +11,11 @@
 //! (`opencode::tool_semantics::SHARED_TOOLS`), so a declared id cannot exist
 //! without an arm, and an arm cannot exist without being declared.
 //!
-//! The `*_baseline_card` tests pin byte-identical rendering: each producer's
-//! decoded wire payload is rendered through the real card builder, and the
-//! expected JSON was captured from `7c9859da`'s code before this change (a
-//! renderer that started reading `kind`/`detail` would fail here).
+//! The surviving `*_baseline_card` tests pin byte-identical rendering for the
+//! shapes P2 did not change: each producer's decoded wire payload is rendered
+//! through the real card builder, and the expected JSON was captured from
+//! `7c9859da`'s code. P3 moved the edit family onto `(kind, detail)`, so that
+//! one snapshot is now a rendered-observable test instead.
 
 use serde_json::{Value, json};
 
@@ -370,6 +371,89 @@ fn a_codex_file_change_action_is_its_wire_kind() {
     let rename = action(json!({"type": "update", "movePath": "src/b.rs"}));
     assert_eq!(rename.action, FileAction::Rename);
     assert_eq!(rename.rename_to.as_deref(), Some("src/b.rs"));
+}
+
+/// OpenCode's patch TEXT names each file's action and its hunks; a rename is
+/// the `*** Move to:` line. Both generations declare the same shape.
+#[test]
+fn opencode_patch_text_names_each_action() {
+    let patch = "\
+*** Begin Patch
+*** Add File: a.rs
++added
+*** Update File: b.rs
+@@
+-old
++new
+*** Delete File: c.rs
+*** Update File: old.rs
+*** Move to: new.rs
+@@
+-old
++new
+*** End Patch";
+    let expected = (
+        ToolKind::Edit,
+        ToolDetail::FileEdits(vec![
+            FileEdit {
+                path: "a.rs".to_string(),
+                action: FileAction::Add,
+                rename_to: None,
+                diff: Some("@@ -0,0 +1,1 @@\n+added".to_string()),
+            },
+            FileEdit {
+                path: "b.rs".to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: Some("@@\n-old\n+new".to_string()),
+            },
+            FileEdit {
+                path: "c.rs".to_string(),
+                action: FileAction::Delete,
+                rename_to: None,
+                diff: None,
+            },
+            FileEdit {
+                path: "old.rs".to_string(),
+                action: FileAction::Rename,
+                rename_to: Some("new.rs".to_string()),
+                diff: Some("@@\n-old\n+new".to_string()),
+            },
+        ]),
+    );
+    assert_eq!(
+        v2("patch", json!({"patchText": patch}), Value::Null),
+        expected,
+        "the V2 patch tool reads its patch text"
+    );
+    assert_eq!(
+        v1("apply_patch", json!({"patchText": patch}), Value::Null),
+        expected,
+        "V1's apply_patch answers the same shape"
+    );
+}
+
+/// A pure rename (no hunk) still carries its action and destination: the
+/// action is a field, never inferred from a diff.
+#[test]
+fn a_patch_text_rename_with_no_hunk_keeps_its_destination() {
+    let patch = "\
+*** Begin Patch
+*** Update File: old.rs
+*** Move to: new.rs
+*** End Patch";
+    assert_eq!(
+        v2("patch", json!({"patchText": patch}), Value::Null),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "old.rs".to_string(),
+                action: FileAction::Rename,
+                rename_to: Some("new.rs".to_string()),
+                diff: None,
+            }])
+        )
+    );
 }
 
 /// Search — each scope is one shape: `glob` filenames, `grep` contents,
@@ -858,9 +942,6 @@ fn an_unknown_id_is_opaque_on_both_generations() {
 /// same builder.
 const V1_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**Input**\n`ls -la`\n📁 `/work`\n\n**Output**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ bash","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
 
-/// Captured from `7c9859da` by the same builder, from V2's decoded edit item.
-const V2_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"tag":"button","text":{"content":"📂 打开","tag":"plain_text"},"type":"default","value":{"action":"file","path":"src/a.rs","session_id":"ses_1"}},{"content":"**Input**\n📄 `src/a.rs`\n\n**Output**\n\n+1 −1\n\n```plain_text\n@@ -1 +1 @@\n-old\n+new\n\n```","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ edit · 📄 a.rs","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
-
 /// Captured from `7c9859da` by the same builder, from Codex's decoded command item.
 const CODEX_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**Input**\n`ls -la`\n📁 `/work`\n\n**Output**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ 命令","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
 
@@ -883,15 +964,25 @@ fn a_decoded_v1_bash_renders_the_baseline_card() {
     assert_eq!(render_card(call), V1_BASELINE_CARD);
 }
 
+/// P3 moved the edit family onto `(kind, detail)`: the card's words are the
+/// action, its fence is the file's language, and the body is the same diff.
+/// Pinned as the rendered observables (the P1 byte snapshot cannot survive a
+/// renderer that now reads the detail, by design).
 #[test]
-fn a_decoded_v2_edit_renders_the_baseline_card() {
+fn a_decoded_v2_edit_renders_one_file_edits_panel() {
     let call = v2_tool(
         "edit",
         json!({"path": "src/a.rs", "oldString": "old", "newString": "new"}),
         json!({"files": [{"file": "src/a.rs", "patch": "@@ -1 +1 @@\n-old\n+new"}]}),
         Some("Edited src/a.rs"),
     );
-    assert_eq!(render_card(call), V2_BASELINE_CARD);
+    let card = render_card(call);
+    assert!(card.contains("✏️ 编辑 `src/a.rs`"), "action + path: {card}");
+    assert!(card.contains("+1 −1"), "the totals: {card}");
+    assert!(card.contains("```rust"), "the file's language: {card}");
+    assert!(card.contains("+new"), "the hunk: {card}");
+    assert!(card.contains("📂 打开"), "the way in: {card}");
+    assert!(!card.contains("Edited src/a.rs"), "the summary is noise: {card}");
 }
 
 #[test]

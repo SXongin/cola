@@ -2625,8 +2625,23 @@ fn file_edit(change: &FileUpdate) -> FileEdit {
         path: change.path.clone(),
         action,
         rename_to,
-        diff: (!change.diff.trim().is_empty()).then(|| change.diff.clone()),
+        diff: hunk_body(&change.diff),
     }
+}
+
+/// A per-file wire diff reduced to its hunk body: the [`FileEdit`] already
+/// names the path and action, so a `---`/`+++` or `Index:` header would only
+/// repeat them (and its `---`/`+++` lines would be mistaken for a deletion and
+/// an addition by the panel's totals). A value with no hunk — a binary change's
+/// message — is kept whole.
+fn hunk_body(diff: &str) -> Option<String> {
+    let lines: Vec<&str> = diff.lines().collect();
+    if let Some(start) = lines.iter().position(|line| line.starts_with("@@")) {
+        let body = lines[start..].join("\n");
+        return (!body.trim().is_empty()).then_some(body);
+    }
+    let text = diff.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// How one `collabAgentToolCall` relates to the run it names: only

@@ -222,7 +222,10 @@ fn read_detail(input: Option<&Value>, _metadata: Option<&Value>) -> ToolDetail {
 }
 
 /// A `write`'s file: the metadata's `FileDiff` list when V2 recorded one
-/// (its diff rides there), otherwise the input's structured path.
+/// (its diff rides there), otherwise a diff synthesized from the input's
+/// content. V1 records no patch, so without the synthesis the same write would
+/// render one way on V1 and another on V2; both are `Add` with the file's whole
+/// content as additions.
 ///
 /// The action stays `Add` even over a recorded status: ticket #1058's table
 /// says `write` is `FileEdits` with one `add`, and the status field is the
@@ -232,7 +235,8 @@ fn write_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
     if !recorded.is_empty() {
         return ToolDetail::FileEdits(recorded);
     }
-    ToolDetail::FileEdits(one_edit(input, FileAction::Add, metadata_diff(metadata)))
+    let diff = metadata_diff(metadata).or_else(|| input_content_diff(input));
+    ToolDetail::FileEdits(one_edit(input, FileAction::Add, diff))
 }
 
 /// An `edit`'s files. The card's `diff_from_metadata` prefers a top-level
@@ -252,23 +256,37 @@ fn edit_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
     ToolDetail::FileEdits(one_edit(input, FileAction::Update, None))
 }
 
-/// A `patch`/`apply_patch`. V2 records the touched files in
-/// `metadata.files[]` (`FileDiff.Info = {file, patch, status}`); V1 records one
-/// `{filepath, diff}` pair. Both name the change the panel renders. A diff with
-/// no name at all is not a `FileEdit` (a path-less entry would be wrong), so the
-/// patch TEXT's parse that names it stays P3's.
-fn patch_detail(_input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
+/// A `patch`/`apply_patch`. Its input is the patch TEXT, which names every
+/// touched file (`*** Add File:` / `*** Update File:` / `*** Delete File:` and
+/// an update's `*** Move to:`) and carries the hunks; that is preferred,
+/// because only the text records a rename. When the text yields no file (an
+/// older/truncated payload) the metadata's recorded files stand in: V2's
+/// `metadata.files[]` (`FileDiff.Info = {file, patch, status}`) and V1's single
+/// `{filepath, diff}` pair.
+fn patch_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
+    if let Some(edits) = input
+        .and_then(|input| input.get("patchText"))
+        .and_then(Value::as_str)
+        .map(patch_text_edits)
+        .filter(|edits| !edits.is_empty())
+    {
+        return ToolDetail::FileEdits(edits);
+    }
     let recorded = metadata_files(metadata, None);
     if !recorded.is_empty() {
         return ToolDetail::FileEdits(recorded);
     }
+    let raw = metadata_diff_raw(metadata);
+    let diff = raw.and_then(hunk_body);
     let path = metadata
         .and_then(|metadata| metadata.get("filepath"))
         .and_then(Value::as_str)
-        .filter(|path| !path.is_empty());
-    match (path, metadata_diff(metadata)) {
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .or_else(|| raw.and_then(diff_path));
+    match (path, diff) {
         (Some(path), diff) => ToolDetail::FileEdits(vec![FileEdit {
-            path: path.to_string(),
+            path,
             action: FileAction::Update,
             rename_to: None,
             diff,
@@ -322,13 +340,54 @@ fn one_edit(input: Option<&Value>, action: FileAction, diff: Option<String>) -> 
     }]
 }
 
-/// The top-level unified diff a payload records (`metadata.diff`; V1's shape).
+/// The top-level unified diff a payload records (`metadata.diff`; V1's shape),
+/// reduced to its hunk body: the card names the path and action from the
+/// [`FileEdit`], so a `---`/`+++` or `Index:` header would only repeat it.
 fn metadata_diff(metadata: Option<&Value>) -> Option<String> {
+    metadata_diff_raw(metadata).and_then(hunk_body)
+}
+
+/// The raw `metadata.diff` string, headers included — the only place a V1
+/// patch that names no `filepath` carries the target.
+fn metadata_diff_raw(metadata: Option<&Value>) -> Option<&str> {
     metadata
         .and_then(|metadata| metadata.get("diff"))
         .and_then(Value::as_str)
         .filter(|diff| !diff.is_empty())
-        .map(str::to_string)
+}
+
+/// The file a unified diff's header block names: an `Index:` line, else the
+/// `+++` side (a git `b/` prefix dropped, `/dev/null` ignored). Used only to
+/// recover a target the payload did not state separately.
+fn diff_path(diff: &str) -> Option<String> {
+    diff.lines().find_map(|line| {
+        let rest = line
+            .strip_prefix("Index: ")
+            .or_else(|| line.strip_prefix("+++ "))?;
+        let path = rest.split('\t').next().unwrap_or(rest).trim();
+        let path = path.strip_prefix("b/").unwrap_or(path);
+        (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
+    })
+}
+
+/// The additions an input's `content` represents, as a unified hunk. V1's
+/// `write` records no patch; this is the same fact V2's `FileDiff` derives from
+/// the written file, so both producers render one Add.
+fn input_content_diff(input: Option<&Value>) -> Option<String> {
+    let content = input
+        .and_then(|input| input.get("content"))
+        .and_then(Value::as_str)?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut body = format!("@@ -0,0 +1,{} @@\n", lines.len());
+    for line in lines {
+        body.push('+');
+        body.push_str(line);
+        body.push('\n');
+    }
+    Some(body.trim_end().to_string())
 }
 
 /// V2's recorded `FileDiff.Info` list (`metadata.files[]`, one `{file, patch,
@@ -353,10 +412,164 @@ fn metadata_files(metadata: Option<&Value>, action: Option<FileAction>) -> Vec<F
                 path,
                 action: action.unwrap_or_else(|| file_action(file.get("status").and_then(Value::as_str))),
                 rename_to: None,
-                diff: non_empty(file.get("patch").and_then(Value::as_str)),
+                diff: file.get("patch").and_then(Value::as_str).and_then(hunk_body),
             })
         })
         .collect()
+}
+
+/// A unified diff reduced to the lines a panel renders: everything from the
+/// first `@@` hunk header on (the `Index:`/`---`/`+++` block above it is the
+/// header, and the [`FileEdit`] already carries the path). A value with no hunk
+/// — a binary change's message — is kept whole so the panel can still show it.
+fn hunk_body(diff: &str) -> Option<String> {
+    let lines: Vec<&str> = diff.lines().collect();
+    if let Some(start) = lines.iter().position(|line| line.starts_with("@@")) {
+        let body = lines[start..].join("\n");
+        return (!body.trim().is_empty()).then_some(body);
+    }
+    let text = diff.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// The files OpenCode's patch format names, each with its action, a rename's
+/// destination and its hunk body. The format is
+/// `*** Begin Patch` / `*** Add File: <path>` / `*** Update File: <path>`(
+/// `*** Move to: <path>`) / `*** Delete File: <path>` / `*** End Patch`, and a
+/// body line is the same `+`/`-`/space hunk syntax a unified diff uses.
+///
+/// The parser is deliberately tolerant: it reads the headers and keeps the
+/// lines between them, because the adapter's job is the CANONICAL shape, not
+/// the patch tool's validation (OpenCode's own parser rejects a malformed
+/// patch before the tool ever records metadata). A body line that starts with
+/// `*** ` is a header only when it is unindented, so a quoted marker inside a
+/// hunk stays content.
+fn patch_text_edits(patch_text: &str) -> Vec<FileEdit> {
+    struct Pending {
+        path: String,
+        action: FileAction,
+        rename_to: Option<String>,
+        body: Vec<String>,
+    }
+    fn finish(pending: Pending) -> FileEdit {
+        let diff = match pending.action {
+            FileAction::Add => add_hunk(&pending.body),
+            FileAction::Delete => None,
+            FileAction::Update | FileAction::Rename => {
+                let body = pending
+                    .body
+                    .iter()
+                    .filter(|line| line.trim_end() != "*** End of File")
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let body = body.trim_end();
+                (!body.is_empty()).then(|| body.to_string())
+            }
+        };
+        FileEdit {
+            path: pending.path,
+            action: pending.action,
+            rename_to: pending.rename_to,
+            diff,
+        }
+    }
+
+    let mut edits = Vec::new();
+    let mut current: Option<Pending> = None;
+    for raw in patch_text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        // Inside a file body only an UNINDENTED marker is a boundary; at the
+        // top level the patch tool tolerates surrounding whitespace.
+        let header = if current.is_some() {
+            line.trim_end()
+        } else {
+            line.trim()
+        };
+        if header == "*** End Patch" {
+            if let Some(pending) = current.take() {
+                edits.push(finish(pending));
+            }
+            break;
+        }
+        if header == "*** Begin Patch" || header.starts_with("*** Environment ID:") {
+            continue;
+        }
+        if let Some(path) = header.strip_prefix("*** Add File: ") {
+            if let Some(pending) = current.take() {
+                edits.push(finish(pending));
+            }
+            current = Some(Pending {
+                path: path.trim().to_string(),
+                action: FileAction::Add,
+                rename_to: None,
+                body: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(path) = header.strip_prefix("*** Delete File: ") {
+            if let Some(pending) = current.take() {
+                edits.push(finish(pending));
+            }
+            current = Some(Pending {
+                path: path.trim().to_string(),
+                action: FileAction::Delete,
+                rename_to: None,
+                body: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(path) = header.strip_prefix("*** Update File: ") {
+            if let Some(pending) = current.take() {
+                edits.push(finish(pending));
+            }
+            current = Some(Pending {
+                path: path.trim().to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                body: Vec::new(),
+            });
+            continue;
+        }
+        let Some(pending) = current.as_mut() else {
+            continue;
+        };
+        if let Some(destination) = header.strip_prefix("*** Move to: ") {
+            let destination = destination.trim();
+            if !destination.is_empty() {
+                pending.action = FileAction::Rename;
+                pending.rename_to = Some(destination.to_string());
+            }
+            continue;
+        }
+        if header == "*** Move to:" || header == "*** End of File" {
+            continue;
+        }
+        pending.body.push(line.to_string());
+    }
+    if let Some(pending) = current.take() {
+        edits.push(finish(pending));
+    }
+    edits
+}
+
+/// An `Add File` body as a unified hunk: every line is an addition, numbered
+/// from the empty side. An empty add carries no hunk (the action still shows).
+fn add_hunk(body: &[String]) -> Option<String> {
+    let lines: Vec<&str> = body
+        .iter()
+        .map(|line| line.strip_prefix('+').unwrap_or(line))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut diff = format!("@@ -0,0 +1,{} @@\n", lines.len());
+    for line in lines {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    Some(diff.trim_end().to_string())
 }
 
 /// A `FileDiff.Info.status` as a file action; an unknown or absent status is an
@@ -448,10 +661,6 @@ fn text(value: Option<&Value>, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
-}
-
-fn non_empty(value: Option<&str>) -> Option<String> {
-    value.filter(|value| !value.is_empty()).map(str::to_string)
 }
 
 #[cfg(test)]
