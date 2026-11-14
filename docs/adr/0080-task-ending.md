@@ -78,9 +78,9 @@ derivation — see the 2026-10-14 amendment below.
 **One run, one record; one shown fact per ending.**
 
 - **The identity is the run, and the run's ids are aliases of one record.** A
-  new `TaskRunId`: the launch's call id when the read carries the launch, else
-  the call id of the fact that first names the run (a report before its launch),
-  else the shell/child id a Wake itself reports (never an invented one). One run's
+  new `TaskRunId`: the id **first minted** by the first fact that names the run —
+  a launch's call id, a report-before-launch call id, or the shell/job/child id a
+  Wake itself reports (never an invented one). One run's
   endings — evidence, the user's Cleanup, a Wake completion — live under that one
   id, and the record carries every id the run is known by (the launch's call id,
   its shell/child id, its tool call id, and the Wake id whose completion it
