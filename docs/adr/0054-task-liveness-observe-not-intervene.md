@@ -3,7 +3,7 @@
 > **Amended by ADR-0105/0106/0107**: the liveness line reads the **Agent Run**'s
 > `RunActivity` (ADR-0105; a Codex collaboration child has no OpenCode child
 > session), gates
-> on the Agent Client's `child_agents` capability, and its phase words are
+> on `child_agents != None` plus a run with activity, and its phase words are
 > `waiting`/`reasoning`/`responding`, not `思考中`/`推理中`/`回复中`.
 
 A `task` tool call runs a **child session** — a real session parented to the

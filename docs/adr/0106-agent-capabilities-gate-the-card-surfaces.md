@@ -32,12 +32,12 @@ The Agent Client states what it supports; nobody probes.
 
 **1. One capability read per attachment.** The **set of axes** is this ADR's;
 the struct's layout is spec #1057's. The axes are: background runs, child-agent
-mode, plan, compaction, usage, questions, modes, session/turn diffs, and MCP
-server statuses. `reports_live_runs()` is derived — the ledger lists **runs**,
+mode, **child evidence** (can a child's terminal item be read?), plan, compaction,
+usage, questions, modes, session/turn diffs, and MCP server statuses. `reports_live_runs()` is derived — the ledger lists **runs**,
 not only background work, so a turn-scoped child counts:
 
 ```text
-reports_live_runs = background_runs || child_agents != None
+reports_live_runs = background_runs || child_evidence
 ```
 
 `Backend::capabilities()` returns the struct. It is a property of the **attachment**, not
@@ -113,8 +113,9 @@ delegations, removed when no caller remains. Landing this ADR changes no renderi
   clean, diagnosable failure, not a card that silently invents one.
 - **The ledger's concept widens, and its gate says so.** Once runs are one fact
   (ADR-0105), the ledger lists **live runs**, not only "background tasks", so it
-  gates on `reports_live_runs()`. Codex and OpenCode V1 can gain the section even
-  though neither has a background concept, because their child agents are runs.
+  gates on `reports_live_runs()`. Codex can gain the section in P4 (its
+  child-thread read supplies the evidence); OpenCode V1 gains it only once its own
+  child-evidence read lands, so a row can never outlive its exit.
   Its card title and copy are UI copy, so their wording is ADR-0107's, not this
   one's.
 - **A reattach can remove a surface mid-chain.** The card already on screen is a
