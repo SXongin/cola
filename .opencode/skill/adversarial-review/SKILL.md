@@ -9,6 +9,8 @@ The binding — its pairing with `/code-review`, which review points, who runs i
 
 CI deliberately kept this pass out of `/code-review` (`ADR-0034`, 2026-10-04 amendment), which left the author-side review blind to exactly the class the gate blocks on: a negative path the new test never walks, a test that still passes with the change reverted, an unhandled error/cleanup/ordering path, a lost tail under a size split. Running it locally is the deliberate trade recorded in `ADR-0034`'s 2026-10-09 amendment — fewer review round-trips.
 
+**This is not the gate rehearsal.** The pass here is one half of the pair. `implement-spec`'s pre-push rehearsal runs the **whole** gate prompt — both axes plus this pass — with the spec and ticket bodies, in the gate's harness; a clean adversarial verdict here does not stand in for it.
+
 ## The rubric is not written here
 
 Do not invent the checks. The sub-agent lifts its `## The adversarial pass (the part an author-side review tends to miss)` and `## Rules` sections **verbatim** from `.github/codex/prompts/review.md`, so the local pass and the gate stay one rubric. The rubric is a file in this repo, so hand over its path rather than a copy — no network is involved. One clause does not carry to this host: the reference trees named in `docs/agents/references.md` exist here, so the host-tree exemption is dropped — say so in the prompt. Everything else stands, the final `CODEX_REVIEW_VERDICT` line included.
