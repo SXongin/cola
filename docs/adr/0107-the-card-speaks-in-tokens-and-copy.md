@@ -54,7 +54,7 @@ would a translator touch it?**
 | `fetch` | `webfetch` | one URL fetched |
 | `websearch` | `websearch`, Codex `web_search` | a web search |
 | `subagent` | `task`, `subagent`, Codex `collab_agent` (launch) | a delegated run |
-| `script` | Code Mode's `execute` (OpenCode V2; `codemode`/`exec`/`code_execution` elsewhere) | a program that calls tools |
+| `script` | Code Mode's `execute` (OpenCode V2; `codemode` / `exec` / `execute_tools` / `code_execution` in other harnesses) | a program that calls tools |
 | `plan` | `todowrite` | the plan surface's tool form |
 | `skill` | `skill` | a loaded skill |
 | `ask` | `question` | a question raised as a tool |
@@ -67,12 +67,44 @@ it (ADR-0105), and an unknown id keeps its name.
 `script` names the one **pattern** rather than a built-in id. Code Mode is
 general — Cloudflare named it (2025-09), Anthropic calls it programmatic tool
 calling (2025-11), OpenAI's Responses API and Pi both ship it — and the
-ecosystem spells the tool four ways (`codemode`, `exec`, `execute_tools`,
-`code_execution`). The token names the **executed unit** (a program that calls
-tools), not the artifact (`code`, which is what `edit` shows) and not the mode
-(`codemode`, which is a session setting). It parallels `shell` the way
-`subagent` parallels a single call: one command versus one program. Its
+ecosystem spells the **tool** four ways (`codemode`, `exec`, `execute_tools`,
+`code_execution`). Pi has both a `codemode` tool and a `/codemode` mode: the
+tool is what this token absorbs, while the mode is a session setting and is not
+a token. The token names the **executed unit** (a program that calls tools),
+not the artifact (`code`, which is what `edit` shows). It parallels `shell` the
+way `subagent` parallels a single call: one command versus one program. Its
 `ToolDetail::Program` carries the source and the nested calls.
+
+**Token derivation is a table, not a guess.** `tool_token(identity, kind,
+detail)` reads the detail first, then the kind, and falls back to the vendor
+name. The name is consulted in exactly one place — the `Other` + `None` arm,
+where a closed three-entry table maps `todowrite`/`skill`/`question` — and is
+otherwise only the opaque fallback. It never chooses a renderer (ADR-0105 §5);
+it names the three tools that have no shared shape because OpenCode is their
+only producer:
+
+| `(kind, detail)` | Token |
+|---|---|
+| `Execute` + `Command` | `shell` |
+| `Execute` + `Program` | `script` |
+| `Read` + `Read` | `read` |
+| `Edit` + `FileEdits`, **every** edit is `Add` | `write` |
+| `Edit` + `FileEdits`, any other list (including mixed add + update) | `edit` |
+| `Search` + `scope: FileName` | `glob` |
+| `Search` + `scope: Content` | `grep` |
+| `Search` + `scope: Web` | `websearch` |
+| `Fetch` + `None` | `fetch` |
+| `Other` + `Delegation { effect: Launch, .. }` | `subagent` |
+| `Other` + `None`, vendor `todowrite` | `plan` |
+| `Other` + `None`, vendor `skill` | `skill` |
+| `Other` + `None`, vendor `question` | `ask` |
+| anything else | the vendor name (opaque) |
+
+Two consequences worth stating because they are the ambiguous cases: a mixed
+`FileEdits` list reads `edit` (the umbrella; `write` means "this call only added
+files"), and a `Delegation` whose effect is `Address` or `Report` has **no**
+token at all — it renders as a receipt on the run, not as a panel. `FileAction`
+and `SearchScope` are ADR-0105's types.
 
 **3. The live phase slot speaks three tokens.**
 
@@ -89,13 +121,17 @@ activity line (`ChildActivity`), so a run's liveness and a card's header cannot
 use different words for the same phase.
 
 **4. A terminal header is copy, not a token.** `✅ 完成` / `❌ 出错` /
-`⏹ 已停止` close the card as a sentence; they are not a machine slot. Run
-**outcomes** are model values (`RunStatus` — `Completed`, `Failed`, `Cancelled`,
-`Lost`), and the ledger's word for one (`完成` / `失败` / `已取消` / `已失联`) is
-copy derived from it. The enum spelling is invariant because adapters and logs
-compare it; the rendered verb is translatable because it sits inside a sentence.
-*(If a later review prefers `🔔 shell completed：…` verbatim, only the copy table
-changes — the model value is already there.)*
+`⏹ 已停止` close the card as a sentence; they are not a machine slot. The ledger
+has two layers: `RunStatus` (`Running` / `Completed` / `Failed` / `Cancelled` /
+`Unknown`) is **the client's statement**, and cola's `TaskEnding` (Wake /
+RuntimeEnded / Lost / Cleaned) is how cola learned it ended — wider than
+`RunStatus`, because `结束` (a runtime-confirmed end with no Wake) and `已清理`
+(the user's dismissal) have no client-side status, and a runtime-confirmed end
+does **not** become a client `Completed`. The rendered verb — `完成` / `失败` /
+`已取消` / `结束` / `已失联` / `已清理` — is copy derived from `TaskEnding`; the
+enum spellings are invariant because adapters and logs compare them. *(If a
+later review prefers `🔔 shell completed：…` verbatim, only the copy table
+changes — the model values are already there.)*
 
 **5. Section labels are copy.** `**Input**` / `**Output**` become `**输入**` /
 `**输出**`. Units (`个文件`, `行`, `处匹配`) stay copy. Card titles (`📄 会话`,

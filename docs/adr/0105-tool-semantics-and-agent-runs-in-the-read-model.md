@@ -88,54 +88,99 @@ pub enum ToolDetail {
               timeout: bool },
     Program { source: String, language: Option<String>,
               calls: Vec<ToolCallRef> },   // Code Mode: a program that calls tools
-    FileEdits(Vec<FileEdit>),   // path, create/modify/delete/rename, unified diff
+    FileEdits(Vec<FileEdit>),   // path, action, rename target, diff
     Search { query: Option<String>, matches: Option<u64>, scope: SearchScope },
     Read { path: String, preview: Option<String>, directory: bool },
     Delegation { runs: Vec<AgentRunRef>, effect: DelegationEffect },
     Opaque,
 }
+
+pub enum FileAction { Add, Update, Delete, Rename }
+pub struct FileEdit {
+    pub path: String,
+    pub action: FileAction,
+    /// A rename's destination. `None` for every other action.
+    pub rename_to: Option<String>,
+    /// The unified diff when the producer has one (a no-hunk rename has none).
+    pub diff: Option<String>,
+}
+pub enum SearchScope { FileName, Content, Web }
 ```
 
 The rule for adding a variant is the ADR-0090 rule for DTOs: **a second
-adapter must need it.** `Command`, `Program`, `FileEdits` and `Delegation` have
-two producers today (OpenCode's built-ins and Codex's item kinds); `Search` and
-`Read` have two and are cheap; nothing else grows until a third client forces
-it. The existing `ToolCall::background_launch()` marker is unchanged — it is a
-durable launch fact, not a detail of the command.
+adapter must need it.** `Command`, `FileEdits` and `Delegation` each have two
+producers today (OpenCode's built-ins and Codex's item kinds); `Search` and
+`Read` have two and are cheap.
 
-`Program` is the **Code Mode** shape: the model writes a program that calls
-tools from inside a sandbox, and only its output returns. It is not an
-OpenCode-specific idea — Cloudflare named the pattern (Code Mode, 2025-09),
-Anthropic calls it programmatic tool calling (2025-11), OpenAI's Responses API
-and Pi both ship it, and the ecosystem already spells the tool four ways
-(`codemode`, `exec`, `execute_tools`, `code_execution`). It gets a detail now
-because its shape differs from `Command` (source + nested calls, not one command
-line) and because the current `execute` panel already has a bespoke renderer:
-mapping it to `Opaque` would keep a name arm, which is the cost this ADR
-removes. The renderer counts as the second consumer the rule asks for.
+`Program` is the one deliberate exception, and the exception is argued rather
+than hand-waved. It has **one** producer today — OpenCode V2's Code Mode — but
+three facts make the variant worth admitting now: the current `execute` panel
+already has a bespoke renderer, so leaving it `Opaque` keeps exactly the name
+arm this ADR removes; the Code Mode pattern is general (Cloudflare named it,
+Anthropic's programmatic tool calling, OpenAI's Responses API and Pi all ship
+it), so a second producer is a mapping rather than a design; and its shape
+differs from `Command` (source plus nested calls, not one command line). The
+renderer is a consumer, not a second adapter; the admission records that
+distinction rather than pretending it away. No other variant is admitted on this
+argument.
+
+The existing `ToolCall::background_launch()` marker is unchanged — it is a
+durable launch fact, not a detail of the command.
 
 **4. `AgentRun` is a neutral transcript fact.**
 
 ```rust
 pub struct AgentRun {
     pub run_id: String,            // child session/thread id when it has one
-    pub kind: AgentRunKind,        // Subagent | Collaboration | Task
     pub label: String,
     pub agent: Option<String>,     // subagent type / agent path / model
     pub started_at: Option<i64>,
-    pub status: RunStatus,         // Running | Completed | Failed | Cancelled | Lost
+    pub status: RunStatus,         // Running | Completed | Failed | Cancelled | Unknown
     pub activity: Option<RunActivity>, // newest live tool or phase (ADR-0054's fact)
     pub launched_by: Option<ToolCallRef>,
     pub addressed_by: Vec<ToolCallRef>,
+    pub reported_by: Vec<ToolCallRef>,
 }
+
+pub struct ToolCallRef { pub call_id: String }
+pub struct AgentRunRef { pub run_id: String }
+pub struct ToolLocation { pub path: String, pub line: Option<u32> }
+pub enum DelegationEffect { Launch, Address, Report }
+pub struct RunActivity {
+    pub tool: Option<ToolIdentity>, // newest live tool, when one is running
+    pub phase: Option<Phase>,       // otherwise the phase its newest part implies
+    pub since: Option<i64>,         // server time that activity started
+}
+pub enum Phase { Waiting, Reasoning, Responding }
 ```
+
+The run has no `kind`. A client's vocabulary for "what spawned it" is not a
+shared distinction — `task`, `subagent`, `spawnAgent` and a collaboration call
+all mean "a child agent this Turn set running" — and the relations, `agent` and
+`label` already carry the provenance the card needs. A later adapter that has a
+genuinely different run shape adds a field when its second producer exists, per
+the same rule as `ToolDetail`.
 
 A call relates to a run in one of three ways: it **launches** one
 (`task`/`subagent`, `spawnAgent`), **addresses** an existing one (`sendInput`,
-`wait`, `closeAgent`), or **reports** on one (`subAgentActivity`). A report
-item updates its run; it is not a panel. A call that addresses a run is a
-receipt on that run, not a timeline panel (the surface consequence is ADR-0106's;
-the timeline rule is recorded there).
+`wait`, `closeAgent`), or **reports** on one (`subAgentActivity`). All three
+relations are recorded, so a repeated report is deduped by its call id and the
+provenance of a run's last activity is explicit. A report item updates its run;
+it is not a panel. A call that addresses a run is a receipt on that run, not a
+timeline panel (the surface consequence is ADR-0106's; the timeline rule is
+recorded there).
+
+`RunStatus` is the **client's** statement about the run:
+`Running | Completed | Failed | Cancelled | Unknown`. It is deliberately narrower
+than cola's durable `TaskEnding` (Wake / RuntimeEnded / Lost / Cleaned), which
+answers how **cola** learned the run ended and owns the exactly-once rules
+(ADR-0065/0073/0080). The two are not folded into one: a runtime-confirmed end
+(`TaskEnding::RuntimeEnded`) renders `结束` even though the client's last status
+was `Running`, and a user **Cleanup** renders `已清理` with no `RunStatus` at all.
+The ledger reads `TaskEnding` first and uses `RunStatus` only for what the client
+itself reported — a Wake carrying a failure state, an explicit cancellation. A
+`RunStatus` is never inferred from a cola-side verdict, because the read model
+must not claim the client said something it did not.
 
 The run is a read-model fact. The bridge's background overlay
 (`src/bridge/tasks/*`) stays cola-side: it answers *what ended it and has the
@@ -143,8 +188,11 @@ ending been shown*, which is cola's own durable bookkeeping, not the client's
 statement.
 
 **5. The card derives what it shows from `(kind, detail)`.** `identity.name` is
-diagnostic and a fallback title, never a renderer key. A known shape renders
-through one renderer per shape; `Opaque` renders raw.
+diagnostic and a fallback title, never a renderer key. The one exception is a
+display token, not a renderer: ADR-0107's `tool_token` may read the name in the
+`Other` + `None` arm for the three name-only tokens (`plan`/`skill`/`ask`), and
+otherwise returns it only as the opaque fallback. A known shape renders through
+one renderer per shape; `Opaque` renders raw.
 
 **6. Nothing else moves.** Raw `input`/`metadata`/`output` stay; the `Part` enum
 stays; the transcript's message/turn projections stay; durable formats do not
@@ -160,8 +208,11 @@ byte-identical card.
   Host Terminal Card sharing the output block) and `Program` (Code Mode's
   source plus its nested calls). `command_input`'s vendor split and the
   `execute` name arm go.
-- **P3 — FileEdits.** One diff renderer; `edit`/`patch`/`apply_patch`/
-  `codex/file_change` collapse onto it.
+- **P3 — FileEdits.** One diff renderer; `write`/`edit`/`patch`/`apply_patch`/
+  `codex/file_change` collapse onto it. Each file carries its action — `Add` for
+  `write`, `Update` for `edit`, and the parsed action for a patch/change,
+  including a no-hunk rename with its `rename_to` — plus its diff when the
+  producer has one.
 - **P4 — AgentRun.** Codex activity reports fold into runs; the liveness line,
   the ledger and the completion entry read runs; `TASK_TOOLS` and
   `child_session_id`'s name check go.

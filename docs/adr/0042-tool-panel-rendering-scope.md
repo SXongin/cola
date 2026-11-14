@@ -1,5 +1,10 @@
 # Tool Panel rendering: tailor built-ins, treat third-party payloads as opaque
 
+> **Amended by ADR-0105**: a Tool Panel is now chosen by the call's **Tool
+> Kind** and **Tool Detail**, declared by the adapter, rather than by the
+> vendor's tool id. The id survives as identity and the opaque fallback; this
+> ADR's rule that a third-party payload is never interpreted still stands.
+
 A **Tool Panel** renders each tool call on the card, and today only `read`,
 `edit` and `todowrite` have tailored renderers: an audit of 100 sessions /
 5,685 tool parts (issue #202) found `task`/`skill` XML wrappers leaking onto the

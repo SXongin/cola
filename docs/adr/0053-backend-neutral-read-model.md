@@ -1,5 +1,11 @@
 # Backend contract owns a neutral read model; wire types stay adapter-private
 
+> **Amended by ADR-0105**: the read model now carries tool **semantics** beside
+> the vendor identity (a `ToolKind`, a `title`, `locations` and a typed
+> `ToolDetail`), and an **Agent Run** as a transcript fact. The "rejected:
+> per-built-in-tool typed payloads" option below is superseded for the shared
+> shapes; wire types still stay adapter-private.
+
 The backend seam's interface carried OpenCode's wire contract: `Backend`
 returned `SessionMessage` (from `opencode::types`, explicitly wire types) whose
 `parts` were raw `serde_json::Value`, so six production modules outside the
