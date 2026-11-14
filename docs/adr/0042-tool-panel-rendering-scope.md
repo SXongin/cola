@@ -269,7 +269,9 @@ rendering only, creates no chat mapping, and opens no write path into a child
 thread.
 
 The boundary is otherwise unchanged: a third-party tool that squats either id
-with a partial payload stays raw, and no Codex-only vocabulary is renamed.
+with a partial payload stays raw. The "no Codex-only vocabulary is renamed" half
+is superseded by ADR-0107 (the display token is `shell`/`subagent`; the id stays
+as identity).
 
 ## Amendment (2026-11-04): Codex `update_plan` feeds the Todo Panel
 
@@ -294,6 +296,6 @@ as one card-tail section (that title is the **Todo Panel's copy**; the `todowrit
 history, a freshly built projection shows no plan until the next
 `turn/plan/updated` arrives; a resync keeps the plan it already holds.
 
-The rest of this ADR is unchanged: Tool Panel rendering remains limited to the
-exact built-in or adapter-owned ids named above, together with their recorded
-shape gates.
+The rest of this ADR is unchanged **except its dispatch key**: since ADR-0105 a
+Tool Panel is chosen by the call's `ToolKind`/`ToolDetail`, not by the exact id;
+the ids named above remain identity and the opaque fallback.
