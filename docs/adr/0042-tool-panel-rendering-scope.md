@@ -18,8 +18,8 @@ A **Tool Panel** renders each tool call on the card, and today only `read`,
 card, `apply_patch` diffs dropped, and WebSearch's JSON rendered as a wall. The
 tempting fix is one renderer per tool — including the MCP servers and injected
 plugins that show up in the Shared Store. This ADR fixes the **boundary**
-instead: cola tailors Tool Panel rendering only for **OpenCode built-in tools**
-(and tools cola itself injects); every other tool's input/output is opaque and
+instead: cola tailors Tool Panel rendering only for the **shared tool kinds** the adapter
+declares (ADR-0105); every other tool's input/output is opaque and
 rendered raw. A built-in's id (`bash`, `read`, `task`, …) is a stable registry
 contract cola can follow; a third-party tool's payload shape is another
 project's implementation detail with no compatibility promise, and matching on
@@ -46,8 +46,9 @@ it would couple cola's card code to servers it does not own.
 
 ## Decision
 
-- **Tailor by exact tool id** for OpenCode built-ins — the set above as they are
-  observed — and for tools cola itself registers (none today). Each gets a
+- **Tailor by `(ToolKind, ToolDetail)`** for the shared kinds (ADR-0105); the
+  exact id is identity and the opaque fallback. (Originally "tailor by exact tool
+  id"; superseded by ADR-0105.) Each gets a
   renderer only where the shape is known and worth showing better.
 - **Everything else is opaque.** For an unrecognized tool, output passes through
   unchanged except `needs_code_block` fencing and `state.error` extraction, and
@@ -251,8 +252,8 @@ response item the item stream does not carry, so the card states what it knows
 instead of reading as a rendering gap. An unknown `tool` or
 `status` keeps its raw string on the card rather than falling back to `Other` —
 the wire enums are upstream's to extend (an unknown status rides the Input line,
-since the icon alone could not name it). The activity is a one-line panel
-naming the kind, the child thread and its `agentPath` — clipped to the folded
+since the icon alone could not name it). The activity updates its **Agent Run** (ADR-0105); it renders no panel and names
+the kind, the child thread and its `agentPath` — clipped to the folded
 header's own short-line budget by keeping the path's tail, the same rule a long
 file name takes.
 

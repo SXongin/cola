@@ -62,7 +62,7 @@ the user already looks at.
   id, its directory and the transcript just read. Its callers are Session Sync
   (placement and waiting-card admission unchanged), the Turn's drain tick and
   the follow/settle loop. Guard rails, all shared: zero requests when the read
-  lists no live Background Task; one verdict per Session per 30 s —
+  lists no live run (background or child-only); one verdict per Session per 30 s —
   process-wide, attempt-stamped (every attempt counts, success or not, so a
   failing runtime is not hammered at the poll cadence) and injectable beside
   the other timing atomics; a failed or timed-out read yields no verdict and

@@ -113,8 +113,7 @@ onto the V1-shaped one.**
   none of these types: the new fields are empty there and behavior degrades to
   today's.
 
-- **A Turn spans Executions and is not complete while Background Tasks are
-  live.** At an Execution's idle with background work still pending, the Turn's
+- **A Turn spans Executions and is not complete while live runs are live.** At an Execution's idle with background work still pending, the Turn's
   card yields with 「⏳ 等待后台任务」 — a distinct disposition, not one of the
   four terminals and never `✅`. The next Wake continues the chain on a new
   continuation card, replied to the user's message (the same Card Chain split
@@ -146,7 +145,7 @@ onto the V1-shaped one.**
 
 - **Routing key: live Execution.** A user message arriving while an Execution
   is live is a **Supplement** — submitted without starting a competing Turn,
-  the chain splitting below it. When the session is idle, including the
+  the chain splitting below it. When the session is idle (no live run, background or child-only), including the
   background-pending window, it starts a new **Turn**. The Backend's behavior
   is identical either way (every cola V2 prompt carries `delivery:"steer"`: V2
   merges it into a live execution or starts a new one), so this is cola's card
