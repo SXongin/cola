@@ -3,41 +3,58 @@
 //! One test per shared kind: the same semantic call, expressed in each
 //! producer's own wire shape, must land the same `(kind, detail)`. The suite
 //! drives the real decoders (V1's tool part, V2's tool item) and Codex's real
-//! item mapping, so an id that loses its arm falls into `Other`/`Opaque` and
-//! fails here instead of silently defaulting. A third-party id stays
-//! `Other`/`Opaque` on every producer.
+//! completion-event → `Item::parts` projection, so an id that loses its arm
+//! falls into `Other`/`Opaque` and fails here instead of silently defaulting.
+//! A third-party id stays `Other`/`Opaque` on every producer.
 //!
-//! The table is the ticket's adapter table: an id added to one adapter without
-//! an entry here is exactly what the "unmapped shared id" rows guard.
+//! `every_declared_shared_id_is_mapped` iterates the adapter's own inventory
+//! (`opencode::tool_semantics::SHARED_TOOLS`), so a declared id cannot exist
+//! without an arm, and an arm cannot exist without being declared.
+//!
+//! The `*_baseline_card` tests pin byte-identical rendering: each producer's
+//! decoded wire payload is rendered through the real card builder, and the
+//! expected JSON was captured from `7c9859da`'s code before this change (a
+//! renderer that started reading `kind`/`detail` would fail here).
 
 use serde_json::{Value, json};
 
+use super::tool_semantics::shared_tool_inventory;
 use super::v1::decode_tool_for_conformance as v1_tool;
 use super::v2::decode_tool_for_conformance as v2_tool;
 use crate::backend::{
-    DelegationEffect, FileAction, FileEdit, NestedCall, SearchScope, ToolDetail, ToolKind, ToolStatus,
+    DelegationEffect, FileAction, FileEdit, NestedCall, SearchScope, ToolCall, ToolDetail, ToolKind,
+    ToolStatus,
 };
-use crate::codex::read_model::tool_semantics_for_conformance as codex_semantics;
+use crate::codex::read_model::tool_for_conformance as codex_tool;
 
 /// One V1 tool call decoded through the legacy wire decoder.
-fn v1(name: &str, input: Value, metadata: Value) -> (ToolKind, ToolDetail) {
-    let call = v1_tool(name, input, metadata);
-    (call.kind, call.detail)
+fn v1_call(name: &str, input: Value, metadata: Value, output: Option<&str>) -> ToolCall {
+    v1_tool(name, input, metadata, output)
 }
 
 /// One V2 tool call decoded through the V2 wire decoder.
-fn v2(name: &str, input: Value, metadata: Value) -> (ToolKind, ToolDetail) {
-    let call = v2_tool(name, input, metadata);
+fn v2_call(name: &str, input: Value, metadata: Value, output: Option<&str>) -> ToolCall {
+    v2_tool(name, input, metadata, output)
+}
+
+fn v1(name: &str, input: Value, metadata: Value) -> (ToolKind, ToolDetail) {
+    let call = v1_call(name, input, metadata, None);
     (call.kind, call.detail)
 }
 
-/// One Codex item's declared semantics, through the adapter's real mapping.
+fn v2(name: &str, input: Value, metadata: Value) -> (ToolKind, ToolDetail) {
+    let call = v2_call(name, input, metadata, None);
+    (call.kind, call.detail)
+}
+
+/// One Codex item's Tool Call, through the adapter's real projection path.
 fn codex(item: Value) -> (ToolKind, ToolDetail) {
-    codex_semantics(&item)
+    let call = codex_tool(&item);
+    (call.kind, call.detail)
 }
 
 /// Execute — `bash` (V1), `shell` (V2) and `codex/command_execution` are one
-/// command command.
+/// command.
 #[test]
 fn execute_is_one_command_on_every_producer() {
     let expected = (
@@ -79,8 +96,8 @@ fn execute_is_one_command_on_every_producer() {
     );
 }
 
-/// Read — `read` and an `imageView` are one file read; an empty path is still
-/// a read with `path: None`.
+/// Read — `read` and an `imageView` are one file read; V1 names the path
+/// `filePath`, V2 `path`, and an empty path is still a read with `path: None`.
 #[test]
 fn read_is_one_file_read_on_every_producer() {
     let expected = (
@@ -92,7 +109,7 @@ fn read_is_one_file_read_on_every_producer() {
         },
     );
     assert_eq!(v1("read", json!({"filePath": "src/a.rs"}), Value::Null), expected);
-    assert_eq!(v2("read", json!({"filePath": "src/a.rs"}), Value::Null), expected);
+    assert_eq!(v2("read", json!({"path": "src/a.rs"}), Value::Null), expected);
     assert_eq!(
         codex(json!({"type": "imageView", "id": "item-image", "path": "src/a.rs"})),
         expected
@@ -118,8 +135,8 @@ fn read_is_one_file_read_on_every_producer() {
     );
 }
 
-/// Edit — `write` is one add, `edit` one update with its diff, and `patch`'s
-/// family the same shape.
+/// Edit — `write` is one add (V1 `filePath`, V2 `path`), `edit` one update
+/// with its diff, and `patch`'s family names its recorded files.
 #[test]
 fn edit_is_one_file_edit_on_every_producer() {
     let add = (
@@ -132,7 +149,7 @@ fn edit_is_one_file_edit_on_every_producer() {
         }]),
     );
     assert_eq!(v1("write", json!({"filePath": "src/a.rs"}), Value::Null), add);
-    assert_eq!(v2("write", json!({"filePath": "src/a.rs"}), Value::Null), add);
+    assert_eq!(v2("write", json!({"path": "src/a.rs"}), Value::Null), add);
 
     let diff = "@@ -1 +1 @@\n-old\n+new";
     let update = (
@@ -151,7 +168,7 @@ fn edit_is_one_file_edit_on_every_producer() {
     assert_eq!(
         v2(
             "edit",
-            json!({"filePath": "src/a.rs"}),
+            json!({"path": "src/a.rs"}),
             json!({"files": [{"file": "src/a.rs", "patch": diff}]})
         ),
         update
@@ -169,23 +186,70 @@ fn edit_is_one_file_edit_on_every_producer() {
         update
     );
 
-    let patch = (ToolKind::Edit, ToolDetail::FileEdits(Vec::new()));
+    // V2's `edit` also names its file in the input; a payload without the
+    // metadata list still declares the update rather than an empty one.
+    assert_eq!(
+        v2(
+            "edit",
+            json!({"path": "src/a.rs", "oldString": "old", "newString": "new"}),
+            Value::Null
+        ),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "src/a.rs".to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: None,
+            }])
+        )
+    );
+
+    let patch = (
+        ToolKind::Edit,
+        ToolDetail::FileEdits(vec![
+            FileEdit {
+                path: "src/a.rs".to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: Some("@@ -1 +1 @@\n-a\n+b".to_string()),
+            },
+            FileEdit {
+                path: "src/b.rs".to_string(),
+                action: FileAction::Delete,
+                rename_to: None,
+                diff: None,
+            },
+        ]),
+    );
+    let patch_metadata = json!({"files": [
+        {"file": "src/a.rs", "patch": "@@ -1 +1 @@\n-a\n+b", "status": "modified"},
+        {"file": "src/b.rs", "patch": "", "status": "deleted"}
+    ]});
     for name in ["patch", "apply_patch"] {
         assert_eq!(
-            v1(name, json!({"patchText": "*** Begin Patch"}), Value::Null),
+            v1(
+                name,
+                json!({"patchText": "*** Begin Patch"}),
+                patch_metadata.clone()
+            ),
             patch,
-            "{name} (V1) is a file edit"
+            "{name} (V1) names its recorded files"
         );
         assert_eq!(
-            v2(name, json!({"patchText": "*** Begin Patch"}), Value::Null),
+            v2(
+                name,
+                json!({"patchText": "*** Begin Patch"}),
+                patch_metadata.clone()
+            ),
             patch,
-            "{name} (V2) is a file edit"
+            "{name} (V2) names its recorded files"
         );
     }
 }
 
 /// A Codex change's action — add, delete, update, rename — comes from the wire
-/// `kind` union, not a tool name.
+/// `kind` union, not a tool name; a rename carries its destination.
 #[test]
 fn a_codex_file_change_action_is_its_wire_kind() {
     let action = |kind: Value| match codex(json!({
@@ -193,23 +257,22 @@ fn a_codex_file_change_action_is_its_wire_kind() {
         "id": "item-file",
         "changes": [{"path": "src/a.rs", "kind": kind, "diff": ""}]
     })) {
-        (ToolKind::Edit, ToolDetail::FileEdits(edits)) => edits[0].action,
+        (ToolKind::Edit, ToolDetail::FileEdits(edits)) => edits[0].clone(),
         other => panic!("a file change is an edit: {other:?}"),
     };
-    assert_eq!(action(json!({"type": "add"})), FileAction::Add);
-    assert_eq!(action(json!({"type": "delete"})), FileAction::Delete);
+    assert_eq!(action(json!({"type": "add"})).action, FileAction::Add);
+    assert_eq!(action(json!({"type": "delete"})).action, FileAction::Delete);
     assert_eq!(
-        action(json!({"type": "update", "movePath": null})),
+        action(json!({"type": "update", "movePath": null})).action,
         FileAction::Update
     );
-    assert_eq!(
-        action(json!({"type": "update", "movePath": "src/b.rs"})),
-        FileAction::Rename
-    );
+    let rename = action(json!({"type": "update", "movePath": "src/b.rs"}));
+    assert_eq!(rename.action, FileAction::Rename);
+    assert_eq!(rename.rename_to.as_deref(), Some("src/b.rs"));
 }
 
 /// Search — each scope is one shape: `glob` filenames, `grep` contents,
-/// `websearch`/`codex/web_search` the web.
+/// `websearch`/`codex/web_search` the web (with the recorded result count).
 #[test]
 fn search_is_one_shape_per_scope_on_every_producer() {
     let files = (
@@ -247,6 +310,24 @@ fn search_is_one_shape_per_scope_on_every_producer() {
     assert_eq!(
         codex(json!({"type": "webSearch", "id": "item-web", "query": "rust"})),
         web
+    );
+    // A completed Codex search reports its result rows; the count is recorded,
+    // not fabricated.
+    assert_eq!(
+        codex(json!({
+            "type": "webSearch",
+            "id": "item-web",
+            "query": "rust",
+            "results": [{"title": "a", "url": "https://a.example"}]
+        })),
+        (
+            ToolKind::Search,
+            ToolDetail::Search {
+                query: Some("rust".to_string()),
+                matches: Some(1),
+                scope: SearchScope::Web,
+            }
+        )
     );
 }
 
@@ -330,30 +411,42 @@ fn delegation_is_one_shape_per_verb() {
     );
 }
 
-/// Code Mode — `execute` carries the program's source and its nested calls,
-/// never a field called `code`.
+/// Code Mode — `execute` carries the program's source and its nested calls;
+/// the real wire shape has no language, so that field stays `None`.
 #[test]
 fn code_mode_carries_the_program_and_its_nested_calls() {
     let (kind, detail) = v2(
         "execute",
-        json!({"code": "return 1", "language": "javascript"}),
-        json!({"toolCalls": [{
-            "tool": "fetch",
-            "status": "completed",
-            "input": {"url": "https://a.example"}
-        }]}),
+        json!({"code": "return 1"}),
+        json!({"toolCalls": [
+            {"tool": "fetch", "status": "completed", "input": {"url": "https://a.example"}},
+            {"tool": "grep", "status": "error"},
+            {"tool": "read", "status": "running"}
+        ]}),
     );
     assert_eq!(kind, ToolKind::Execute);
     assert_eq!(
         detail,
         ToolDetail::Program {
             source: "return 1".to_string(),
-            language: Some("javascript".to_string()),
-            calls: vec![NestedCall {
-                name: "fetch".to_string(),
-                status: ToolStatus::Completed,
-                input: Some(json!({"url": "https://a.example"})),
-            }],
+            language: None,
+            calls: vec![
+                NestedCall {
+                    name: "fetch".to_string(),
+                    status: ToolStatus::Completed,
+                    input: Some(json!({"url": "https://a.example"})),
+                },
+                NestedCall {
+                    name: "grep".to_string(),
+                    status: ToolStatus::Error,
+                    input: None,
+                },
+                NestedCall {
+                    name: "read".to_string(),
+                    status: ToolStatus::Running,
+                    input: None,
+                },
+            ],
         }
     );
 }
@@ -422,6 +515,34 @@ fn an_image_generation_is_opaque_where_an_image_view_is_a_read() {
             }
         )
     );
+}
+
+/// Every id the adapter declares is mapped on both generations, and the
+/// inventory itself has no duplicate — an unmapped shared id fails here rather
+/// than becoming opaque.
+#[test]
+fn every_declared_shared_id_is_mapped() {
+    let inventory = shared_tool_inventory();
+    assert!(!inventory.is_empty(), "the adapter claims at least one id");
+    let mut ids: Vec<_> = inventory.iter().map(|(id, _)| *id).collect();
+    let count = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), count, "a shared id is declared twice");
+
+    for (id, declared_kind) in inventory {
+        for (generation, (kind, detail)) in [
+            ("V1", v1(id, json!({}), Value::Null)),
+            ("V2", v2(id, json!({}), Value::Null)),
+        ] {
+            assert_eq!(kind, declared_kind, "{id} ({generation}) keeps its kind");
+            assert_ne!(
+                detail,
+                ToolDetail::Opaque,
+                "{id} ({generation}) fell into the opaque default"
+            );
+        }
+    }
 }
 
 /// A tool the adapter does not know is never guessed at: both OpenCode

@@ -40,7 +40,6 @@ use crate::backend::{
     ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
     ToolStatus, TranscriptMessage, TurnDiffFile, Wake, WakeSource,
 };
-use crate::opencode::tool_semantics::tool_semantics;
 
 /// `{data: T}` — the envelope most V2 reads share (R2's "unwrap per route —
 /// there is no single rule").
@@ -1372,27 +1371,18 @@ fn decode_tool(item: &Value) -> ToolCall {
     // still arriving, so there is nothing structured to read yet).
     let input = state.and_then(|state| non_null(state.get("input"))).cloned();
     let metadata = state.and_then(|state| non_null(state.get("metadata"))).cloned();
-    // The same shared mapping V1 uses, so a shared id cannot drift between the
-    // generations (ADR-0105).
-    let (kind, detail) = tool_semantics(&identity.name, input.as_ref(), metadata.as_ref());
-    let locations = detail.locations();
-    ToolCall {
+    // V2's `ToolState` carries no human title, so the neutral title stays
+    // `None`. `ToolCall::declared` attaches the same shared semantics V1 uses,
+    // so a shared id cannot drift between the generations (ADR-0105).
+    ToolCall::declared(
         identity,
-        kind,
-        // The client's own human title for the call, when it reported one.
-        title: state
-            .and_then(|state| state.get("title"))
-            .and_then(Value::as_str)
-            .filter(|title| !title.is_empty())
-            .map(str::to_string),
-        locations,
-        status: status.clone(),
-        started_at: item.pointer("/time/created").and_then(Value::as_i64),
+        None,
+        status.clone(),
+        item.pointer("/time/created").and_then(Value::as_i64),
         input,
         metadata,
-        output: decode_tool_output(state),
-        detail,
-    }
+        decode_tool_output(state),
+    )
 }
 
 /// Decode one tool item into its neutral call — the cross-adapter conformance

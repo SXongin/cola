@@ -39,12 +39,18 @@ pub(crate) fn decode_tool_for_conformance(
     name: &str,
     input: serde_json::Value,
     metadata: serde_json::Value,
+    output: Option<&str>,
 ) -> crate::backend::ToolCall {
     wire::decode_tool_item(&serde_json::json!({
         "type": "tool",
         "id": format!("call_{name}"),
         "name": name,
-        "state": {"status": "completed", "input": input, "metadata": metadata},
+        "state": {
+            "status": "completed",
+            "input": input,
+            "metadata": metadata,
+            "content": output.map(|text| serde_json::json!([{"type": "text", "text": text}])),
+        },
         "time": {"created": 1_000},
     }))
 }

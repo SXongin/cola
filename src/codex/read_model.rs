@@ -1409,15 +1409,40 @@ impl Item {
         }
     }
 
+    /// One tool Part with the adapter's neutral semantics attached. Every tool
+    /// arm goes through here, so the kind, the derived locations and the detail
+    /// are written once rather than repeated per item kind (ADR-0105).
+    fn tool_part(
+        &self,
+        name: String,
+        status: ToolStatus,
+        input: Option<Value>,
+        metadata: Option<Value>,
+        output: ToolOutput,
+    ) -> Part {
+        let (kind, detail) = self.kind.semantics();
+        let locations = detail.locations();
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name,
+                call_id: self.id.clone(),
+            },
+            kind,
+            title: None,
+            locations,
+            status,
+            started_at: self.started_at_ms,
+            input,
+            metadata,
+            output,
+            detail,
+        })
+    }
+
     /// The neutral role and parts of this item. One item becomes one message:
     /// Codex items are already atomic (a command, a message, a reasoning
     /// block), so no part assembly beyond the item's own content is needed.
     fn parts(&self, labels: &HashMap<&str, &str>) -> (MessageRole, Vec<Part>) {
-        // The neutral semantics the adapter declares for this item (ADR-0105).
-        // Only a tool arm consumes them; the message-shaped arms ignore the
-        // opaque fallback.
-        let (tool_kind, tool_detail) = self.kind.semantics();
-        let locations = tool_detail.locations();
         match &self.kind {
             ItemKind::UserMessage { parts } => (MessageRole::User, parts.clone()),
             ItemKind::AgentMessage { text } => (
@@ -1450,25 +1475,17 @@ impl Item {
                 let output = tool_output(output, status.is_failure());
                 (
                     MessageRole::Assistant,
-                    vec![Part::Tool(ToolCall {
-                        identity: ToolIdentity {
-                            name: codex_tool_id("command_execution"),
-                            call_id: self.id.clone(),
-                        },
-                        kind: tool_kind,
-                        title: None,
-                        locations: locations.clone(),
-                        status: status.clone(),
-                        started_at: self.started_at_ms,
-                        input: Some(json!({ "command": command, "cwd": cwd })),
-                        metadata: Some(json!({
+                    vec![self.tool_part(
+                        codex_tool_id("command_execution"),
+                        status.clone(),
+                        Some(json!({ "command": command, "cwd": cwd })),
+                        Some(json!({
                             "exitCode": exit_code,
                             "cwd": cwd,
                             "status": status_label(&status),
                         })),
                         output,
-                        detail: tool_detail,
-                    })],
+                    )],
                 )
             }
             ItemKind::FileChange {
@@ -1488,17 +1505,10 @@ impl Item {
                 };
                 (
                     MessageRole::Assistant,
-                    vec![Part::Tool(ToolCall {
-                        identity: ToolIdentity {
-                            name: codex_tool_id("file_change"),
-                            call_id: self.id.clone(),
-                        },
-                        kind: tool_kind,
-                        title: None,
-                        locations: locations.clone(),
-                        status: status.clone(),
-                        started_at: self.started_at_ms,
-                        input: Some(json!({
+                    vec![self.tool_part(
+                        codex_tool_id("file_change"),
+                        status.clone(),
+                        Some(json!({
                             "changes": changes
                                 .iter()
                                 .map(|change| json!({
@@ -1507,7 +1517,7 @@ impl Item {
                                 }))
                                 .collect::<Vec<_>>(),
                         })),
-                        metadata: Some(json!({
+                        Some(json!({
                             "changes": changes
                                 .iter()
                                 .map(|change| json!({
@@ -1517,9 +1527,8 @@ impl Item {
                                 }))
                                 .collect::<Vec<_>>(),
                         })),
-                        output: tool_output(&diff, status.is_failure()),
-                        detail: tool_detail,
-                    })],
+                        tool_output(&diff, status.is_failure()),
+                    )],
                 )
             }
             ItemKind::Mcp {
@@ -1541,31 +1550,25 @@ impl Item {
                 });
                 (
                     MessageRole::Assistant,
-                    vec![Part::Tool(ToolCall {
-                        identity: ToolIdentity {
-                            name: format!("{server}/{tool}"),
-                            call_id: self.id.clone(),
-                        },
-                        kind: tool_kind,
-                        title: None,
-                        locations: locations.clone(),
-                        status: status.clone(),
-                        started_at: self.started_at_ms,
-                        input: Some(arguments.clone()),
-                        metadata: Some(json!({ "server": server, "tool": tool })),
-                        output: ToolOutput {
-                            raw: result.clone(),
-                            blocks: text
-                                .map(|text| vec![ContentBlock::Text(text)])
-                                .unwrap_or_default(),
-                            error: error
-                                .as_ref()
-                                .and_then(|error| error.get("message"))
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        },
-                        detail: tool_detail,
-                    })],
+                    vec![
+                        self.tool_part(
+                            format!("{server}/{tool}"),
+                            status.clone(),
+                            Some(arguments.clone()),
+                            Some(json!({ "server": server, "tool": tool })),
+                            ToolOutput {
+                                raw: result.clone(),
+                                blocks: text
+                                    .map(|text| vec![ContentBlock::Text(text)])
+                                    .unwrap_or_default(),
+                                error: error
+                                    .as_ref()
+                                    .and_then(|error| error.get("message"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                            },
+                        ),
+                    ],
                 )
             }
             ItemKind::WebSearch {
@@ -1574,43 +1577,27 @@ impl Item {
                 results,
             } => (
                 MessageRole::Assistant,
-                vec![Part::Tool(ToolCall {
-                    identity: ToolIdentity {
-                        name: codex_tool_id("web_search"),
-                        call_id: self.id.clone(),
-                    },
-                    kind: tool_kind,
-                    title: None,
-                    locations: locations.clone(),
-                    status: self.tool_completion_status(),
-                    started_at: self.started_at_ms,
-                    input: Some(json!({ "query": query, "action": action })),
-                    metadata: Some(json!({ "results": results })),
-                    output: ToolOutput {
+                vec![self.tool_part(
+                    codex_tool_id("web_search"),
+                    self.tool_completion_status(),
+                    Some(json!({ "query": query, "action": action })),
+                    Some(json!({ "results": results })),
+                    ToolOutput {
                         raw: results.clone(),
                         blocks: Vec::new(),
                         error: None,
                     },
-                    detail: tool_detail,
-                })],
+                )],
             ),
             ItemKind::Image { path, .. } => (
                 MessageRole::Assistant,
-                vec![Part::Tool(ToolCall {
-                    identity: ToolIdentity {
-                        name: codex_tool_id("image"),
-                        call_id: self.id.clone(),
-                    },
-                    kind: tool_kind,
-                    title: None,
-                    locations: locations.clone(),
-                    status: self.tool_completion_status(),
-                    started_at: self.started_at_ms,
-                    input: Some(json!({ "path": path })),
-                    metadata: Some(json!({ "path": path })),
-                    output: ToolOutput::default(),
-                    detail: tool_detail,
-                })],
+                vec![self.tool_part(
+                    codex_tool_id("image"),
+                    self.tool_completion_status(),
+                    Some(json!({ "path": path })),
+                    Some(json!({ "path": path })),
+                    ToolOutput::default(),
+                )],
             ),
             // One collab call becomes one card's Tool Panel: the adapter writes
             // the whole shape its renderer is gated on (ADR-0042's amendment),
@@ -1627,17 +1614,10 @@ impl Item {
                 agents,
             } => (
                 MessageRole::Assistant,
-                vec![Part::Tool(ToolCall {
-                    identity: ToolIdentity {
-                        name: codex_tool_id("collab_agent"),
-                        call_id: self.id.clone(),
-                    },
-                    kind: tool_kind,
-                    title: None,
-                    locations: locations.clone(),
-                    status: collab_status(status),
-                    started_at: self.started_at_ms,
-                    input: Some(json!({
+                vec![self.tool_part(
+                    codex_tool_id("collab_agent"),
+                    collab_status(status),
+                    Some(json!({
                         "tool": tool,
                         "status": status,
                         "senderThreadId": sender,
@@ -1655,10 +1635,9 @@ impl Item {
                             }))
                             .collect::<Vec<_>>(),
                     })),
-                    metadata: None,
-                    output: ToolOutput::default(),
-                    detail: tool_detail,
-                })],
+                    None,
+                    ToolOutput::default(),
+                )],
             ),
             // A child agent's activity is one line on the parent's card. It
             // carries no status field: like `webSearch`/`image`, it is live
@@ -1671,27 +1650,19 @@ impl Item {
                 reasoning_effort,
             } => (
                 MessageRole::Assistant,
-                vec![Part::Tool(ToolCall {
-                    identity: ToolIdentity {
-                        name: codex_tool_id("sub_agent_activity"),
-                        call_id: self.id.clone(),
-                    },
-                    kind: tool_kind,
-                    title: None,
-                    locations: locations.clone(),
-                    status: activity_status(kind, self.completed),
-                    started_at: self.started_at_ms,
-                    input: Some(json!({
+                vec![self.tool_part(
+                    codex_tool_id("sub_agent_activity"),
+                    activity_status(kind, self.completed),
+                    Some(json!({
                         "kind": kind,
                         "agentThreadId": agent_thread_id,
                         "agentPath": agent_path,
                         "model": model,
                         "reasoningEffort": reasoning_effort,
                     })),
-                    metadata: None,
-                    output: ToolOutput::default(),
-                    detail: tool_detail,
-                })],
+                    None,
+                    ToolOutput::default(),
+                )],
             ),
             ItemKind::Plan { text } => (
                 MessageRole::Assistant,
@@ -2337,11 +2308,16 @@ impl ItemKind {
             ),
             // An MCP tool is third-party: its payload is never sniffed.
             Self::Mcp { .. } => (ToolKind::Other, ToolDetail::Opaque),
-            Self::WebSearch { query, .. } => (
+            Self::WebSearch { query, results, .. } => (
                 ToolKind::Search,
                 ToolDetail::Search {
                     query: display_string(query).map(str::to_string),
-                    matches: None,
+                    // The recorded result rows are the match count the call
+                    // actually reports (a null/absent list reports none).
+                    matches: results
+                        .as_ref()
+                        .and_then(Value::as_array)
+                        .map(|rows| rows.len() as u64),
                     scope: SearchScope::Web,
                 },
             ),
@@ -2724,12 +2700,36 @@ fn codex_tool_id(kind: &str) -> String {
     format!("codex/{kind}")
 }
 
-/// A raw Codex item's declared neutral semantics — the cross-adapter
-/// conformance test's entry point, so the suite drives this adapter's real
-/// mapping rather than a second copy of it.
+/// One raw Codex item projected into its neutral Tool Call — the cross-adapter
+/// conformance test's entry point, so the suite drives the real
+/// `item/completed` → `Item::parts` path (where the semantics are attached),
+/// not a second copy of the mapping.
 #[cfg(test)]
-pub(crate) fn tool_semantics_for_conformance(item: &Value) -> (ToolKind, ToolDetail) {
-    ItemKind::from_wire(item).semantics()
+pub(crate) fn tool_for_conformance(item: &Value) -> ToolCall {
+    let mut projection = ThreadProjection::new("thread-conformance");
+    let event = json!({
+        "method": ITEM_COMPLETED,
+        "params": {
+            "threadId": "thread-conformance",
+            "turnId": "turn-1",
+            "completedAtMs": 1_000,
+            "item": item,
+        }
+    });
+    assert!(
+        projection.apply(ITEM_COMPLETED, &event["params"]),
+        "the conformance item must apply"
+    );
+    projection
+        .transcript()
+        .messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .find_map(|part| match part {
+            Part::Tool(call) => Some(call.clone()),
+            _ => None,
+        })
+        .expect("the conformance item projects a tool call")
 }
 
 fn command_status(status: &Option<String>, exit_code: Option<i64>) -> ToolStatus {
