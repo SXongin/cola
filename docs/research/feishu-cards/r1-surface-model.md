@@ -363,9 +363,10 @@ pub struct AgentCapabilities {
     pub compaction: bool,
     pub usage: UsageMode,             // None | PerTurn | Cumulative
     pub permissions: PermissionMode,  // option kinds the client can express
-    pub questions: QuestionMode,
+    pub questions: QuestionMode,      // None | Session | SessionAndLocation
     pub modes: bool,                  // agent/mode axis
     pub diffs: bool,                  // session/turn diff reads
+    pub mcp: bool,                    // MCP server statuses (the `/mcp` card)
 }
 ```
 
@@ -381,6 +382,7 @@ Surfaces gate on it instead of on per-subsystem methods:
 | Question surface | `questions != None` | no question card/block |
 | 「始终允许」 | `permissions` advertises a session scope | one-time buttons only |
 | Agent picker | `modes` | `/agent` says unsupported |
+| `/mcp` card | `mcp` | the command says unsupported |
 
 ### 4.5 Rendering: one renderer per shape, no per-name arms
 
