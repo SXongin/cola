@@ -16,7 +16,7 @@ existing ADR, **[acp]** = the Agent Client Protocol v1 documentation,
 > gate the surfaces) and **ADR-0107** (the card speaks in tokens and copy).
 > The naming question the note left open is settled there: fixed tokens are
 > English (`shell`, `script`, `waiting`, `reasoning`, `responding`), interface
-> copy stays Chinese until an i18n catalog exists. §4.3/§4.4 are kept in step
+> copy stays Chinese until an i18n catalog exists. §4.2–§4.4 are kept in step
 > with ADR-0105/0106; §7 and §8 below are the pre-decision record, and the ADRs
 > supersede them where they differ.
 
@@ -298,15 +298,18 @@ pub enum ToolKind {
 
 pub enum ToolDetail {
     None,
-    Command(CommandDetail),         // command, cwd, exit, timeout, backgrounded
-    FileEdits(Vec<FileEdit>),       // path, change kind, unified diff
-    Search { query: Option<String>, matches: Option<u64>, unit: MatchUnit },
-    Read { path: String, preview: Option<String> },
-    Delegation(AgentRunRef),        // the run this call launched/addressed
+    Command { command, cwd, exit, timeout },
     Program { source, language, calls }, // Code Mode: a program that calls tools
+    FileEdits(Vec<FileEdit>),       // path, FileAction, rename_to, diff
+    Search { query: Option<String>, matches: Option<u64>, scope: SearchScope },
+    Read { path: String, preview: Option<String>, directory: bool },
+    Delegation { runs: Vec<AgentRunRef>, effect: DelegationEffect },
     Opaque,                         // everything else — ADR-0042's rule stands
 }
 ```
+
+`FileAction`, `SearchScope`, `DelegationEffect` and the `AgentRunRef`/`ToolCallRef`
+shapes are ADR-0105's; §4.3/§4.4 below follow it.
 
 Rules that keep ADR-0042 intact:
 

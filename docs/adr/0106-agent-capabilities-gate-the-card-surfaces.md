@@ -43,6 +43,7 @@ pub struct AgentCapabilities {
     pub questions: QuestionMode,        // None | Session | SessionAndLocation
     pub modes: bool,                    // an agent/mode axis exists
     pub diffs: bool,                    // session/turn diff reads
+    pub mcp: bool,                      // MCP server statuses (the `/mcp` card)
 }
 
 impl AgentCapabilities {
@@ -74,6 +75,7 @@ new one.
 | Location Form | `questions` includes a location scope | no directory-owned form |
 | Agent picker | `modes` | `/agent` reports it as unsupported |
 | Turn-diff index | `diffs` | no index line, no button |
+| `/mcp` card | `mcp` | the command reports it as unsupported |
 
 A absent surface is **omitted**, never rendered empty and never guessed from a
 failed read. Absence is recorded once at attach (one log line naming the client
