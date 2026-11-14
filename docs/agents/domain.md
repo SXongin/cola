@@ -22,3 +22,6 @@ Both rules are `CODING_STANDARDS.md` "Code conventions" — this file adds only 
 signal it does not carry: a concept with no glossary entry yet means either you
 are inventing language the project does not use, or there is a real gap to note
 for `/domain-modeling`.
+
+**Amending an ADR** follows `CONTRIBUTING.md` "Pull request rules" 4: append,
+never rewrite. This file does not restate the rule.
