@@ -113,7 +113,7 @@ smaller surface than it looks.
 
 | Path | What the card shows | Live? | Row in ledger? | `/sub`? | Source |
 |---|---|---|---|---|---|
-| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (`shell 28s` / `reasoning 12s` / `等待你的授权`) | yes | yes (`TaskKind::Subagent`) | yes (`parentID`) | ADR-0054, `tool_render.rs:491`, `:554` |
+| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (today `bash 28s` / `推理中 12s` / `等待你的授权`; the target wording is `shell 28s` / `reasoning 12s`, ADR-0107) | yes | yes (`TaskKind::Subagent`) | yes (`parentID`) | ADR-0054, `tool_render.rs:491`, `:554` |
 | OpenCode V2 `subagent` | same, `metadata.sessionID`, `<subagent …>` envelope | yes | yes | yes | `read_model` V2, `tool_render.rs:505` |
 | Codex `collab_agent` | **one panel per call**, title from the collaboration verb (`派生子 Agent`, `发送输入`, `等待子 Agent`, …), body is the target rows / prompt / model | **no** | **no** | *(threads have `parent_thread_id` → `parent_id`, so `/sub` works)* `src/codex/threads.rs:79` | `src/codex/read_model.rs:1589`, `tool_render.rs:1029`, `:3109` |
 | Codex `sub_agent_activity` | **a tool panel of its own** (`子 Agent`, target = `agentPath`) — a lifecycle *event* rendered as a *call* | n/a | **no** | n/a | `read_model.rs:1633`, `tool_render.rs:1034` |
@@ -218,8 +218,8 @@ Two concrete gaps this exposes:
 - **The capability differs *within* one client.** Codex reports child-agent
   **activity** but no background runs. Today that means "no ledger" — and the
   activity items pile up as panels. A capability declaration with a
-  `ChildAgentMode` would let the card render the liveness line without
-  inventing a ledger.
+  `ChildAgentMode` lets the card render the liveness line **and** the live-run
+  ledger (`reports_live_runs()`), without pretending a background task exists.
 
 ### 3.1 Which surface for which event
 
@@ -231,7 +231,7 @@ This table already exists implicitly across ADR-0038, 0043, 0063, 0074, 0092,
 | A prompt starts a Turn | streaming **Turn card**, as a reply to the message | one card per request (ADR-0074) |
 | The Turn's content fills the card | **continuation card** in the same Card Chain | splitter (ADR-0043) |
 | A message arrives mid-Turn | **Supplement card** (steer), never a second live card | ADR-0043 |
-| The Turn ends with live background runs | same card yields → `Waiting` | ADR-0059 |
+| The Turn ends with live runs | same card yields → `Waiting` | ADR-0059, widened by ADR-0106 |
 | A run's completion resumes the work | same card → `Resuming` | ADR-0066 |
 | A Permission / Question on a live mapped Turn | **inline block** on the Turn card | ADR-0038 |
 | … on a session with no live card | **standalone request card**, re-adopted after restart | ADR-0038, `surfaces.rs` |
