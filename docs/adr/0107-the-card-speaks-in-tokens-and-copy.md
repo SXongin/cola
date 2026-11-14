@@ -64,7 +64,7 @@ for the first two is one question: would a translator touch it?**
 | `skill` | `skill` | a loaded skill |
 | `ask` | `question` | a question raised as a tool |
 
-Anything not in this table is **not a token**: it keeps its own vendor name
+Anything not in this table is **not a tool token**: it keeps its own vendor name
 (`codegraph_explore`, `mcp_server/tool`), exactly ADR-0042's opaque rule. The
 table is closed: a new token arrives with the `ToolDetail` variant that carries
 it (ADR-0105), and an unknown id keeps its name. The three name-only tokens
@@ -191,7 +191,7 @@ escaping and budget rules).
 - **Visible changes:** the three live phase words become `waiting` /
   `reasoning` / `responding`; `bash` → `shell`; `task`/`subagent` →
   `subagent`; `webfetch` → `fetch`; `todowrite` → `plan`; `question` → `ask`;
-  `subagent`; Codex's translated nouns disappear in favour of the same tokens;
+  Codex's translated nouns disappear in favour of the same tokens;
   `**Input**`/`**Output**` become `**输入**`/`**输出**`.
 - **Tests change with the words.** Header tests, ledger tests and tool-panel
   tests each pin a copy string; those diffs are expected and are the review's
