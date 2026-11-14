@@ -1579,9 +1579,9 @@ pub enum CompactionReason {
 /// One tool call: who it is, what it means, how it is doing, and its raw
 /// payloads. The identity, raw payloads and output belong to the vendor; the
 /// semantics ([`ToolKind`], [`ToolDetail`], the client's title and the
-/// locations it touched) are the adapter's declaration (ADR-0105). No renderer
-/// reads the semantic fields yet — the migration lands them first, so every
-/// existing card stays byte-identical.
+/// locations it touched) are the adapter's declaration (ADR-0105). The card
+/// selects a renderer from `(kind, detail)` — the Execute family does so today;
+/// the remaining name arms move one migration ticket at a time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub identity: ToolIdentity,
@@ -1670,21 +1670,35 @@ pub struct ToolLocation {
 pub enum ToolDetail {
     /// A known shared tool with nothing extra to declare.
     None,
-    /// A shell-like command: the command line, its working directory, the exit
-    /// code the client recorded, and whether it timed out.
+    /// A shell-like command: the command line, its working directory, the
+    /// client's own one-line description of it, the exit code it recorded, and
+    /// whether it timed out.
+    ///
+    /// `description` is additive to spec #1057's canonical shape: V1's `bash`
+    /// input carries one and the panel has always rendered it (`📝 …`), so the
+    /// shape keeps the fact rather than dropping a line the reader had. A
+    /// client whose wire has no such field leaves it `None`.
     Command {
         command: String,
         cwd: Option<String>,
+        description: Option<String>,
         exit: Option<i64>,
         timeout: bool,
     },
     /// A Code Mode program: its source, language, and the nested calls it made.
     /// The nested rows are the client's `toolCalls`, not transcript calls of
     /// their own.
+    ///
+    /// `error` is additive to spec #1057's canonical shape: Code Mode's own
+    /// failure (a syntax error, an empty program, a runtime diagnostic) is a
+    /// recorded fact — `metadata.error` — that no nested call has to show, so
+    /// without it a failed program with clean nested calls would render as a
+    /// success.
     Program {
         source: String,
         language: Option<String>,
         calls: Vec<NestedCall>,
+        error: bool,
     },
     /// The files a call edited, each with its action and diff.
     FileEdits(Vec<FileEdit>),

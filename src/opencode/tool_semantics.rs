@@ -201,6 +201,7 @@ fn command_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail
     ToolDetail::Command {
         command: text(input, "command").unwrap_or_default(),
         cwd: text(input, "workdir").or_else(|| text(input, "cwd")),
+        description: text(input, "description"),
         exit: metadata
             .and_then(|metadata| metadata.get("exit"))
             .and_then(Value::as_i64),
@@ -413,6 +414,10 @@ fn program_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail
         source: text(input, "code").unwrap_or_default(),
         language: None,
         calls,
+        error: metadata
+            .and_then(|metadata| metadata.get("error"))
+            .and_then(Value::as_bool)
+            == Some(true),
     }
 }
 
@@ -475,7 +480,8 @@ mod tests {
     }
 
     /// A command's timeout, exit and cwd come from the recorded state, and
-    /// `cwd` falls back to the input's `cwd`.
+    /// `cwd` falls back to the input's `cwd`. V1's `bash` also names the call
+    /// with a one-line `description`, which the shape keeps.
     #[test]
     fn a_command_reads_its_timeout_exit_and_directory() {
         assert_eq!(
@@ -486,6 +492,7 @@ mod tests {
             ToolDetail::Command {
                 command: "sleep 1".to_string(),
                 cwd: Some("/work".to_string()),
+                description: None,
                 exit: Some(2),
                 timeout: true,
             }
@@ -495,10 +502,40 @@ mod tests {
             ToolDetail::Command {
                 command: "ls".to_string(),
                 cwd: Some("/w".to_string()),
+                description: None,
                 exit: None,
                 timeout: false,
             }
         );
+        assert_eq!(
+            command_detail(
+                Some(&json!({"command": "ls", "description": "List the tree"})),
+                None
+            ),
+            ToolDetail::Command {
+                command: "ls".to_string(),
+                cwd: None,
+                description: Some("List the tree".to_string()),
+                exit: None,
+                timeout: false,
+            }
+        );
+    }
+
+    /// Code Mode's own failure is a recorded fact, not only a nested call's: a
+    /// program that errored with clean nested calls still declares `error`.
+    #[test]
+    fn a_program_reads_its_own_error_separately_from_its_nested_calls() {
+        let failed = program_detail(
+            Some(&json!({"code": "return 1"})),
+            Some(&json!({"toolCalls": [{"tool": "fetch", "status": "completed"}], "error": true})),
+        );
+        let ToolDetail::Program { calls, error, .. } = failed else {
+            panic!("a Code Mode call is a Program");
+        };
+        assert!(error, "the program's own error is a fact");
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].status.is_failure(), "no nested call failed");
     }
 
     /// A search's count is `matches` (grep) or `count` (glob); either way it is

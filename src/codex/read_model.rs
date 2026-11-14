@@ -2297,6 +2297,8 @@ impl ItemKind {
                 ToolDetail::Command {
                     command: display_string(command).unwrap_or_default().to_string(),
                     cwd: display_string(cwd).map(str::to_string),
+                    // A `commandExecution` item carries no one-line description.
+                    description: None,
                     exit: *exit_code,
                     // A `commandExecution` item records no timeout flag.
                     timeout: false,

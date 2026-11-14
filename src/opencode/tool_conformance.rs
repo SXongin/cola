@@ -99,6 +99,7 @@ fn execute_is_one_command_on_every_producer() {
         ToolDetail::Command {
             command: "ls -la".to_string(),
             cwd: Some("/work".to_string()),
+            description: None,
             exit: Some(0),
             timeout: false,
         },
@@ -483,6 +484,7 @@ fn code_mode_carries_the_program_and_its_nested_calls() {
         ToolDetail::Program {
             source: "return 1".to_string(),
             language: None,
+            error: false,
             calls: vec![
                 NestedCall {
                     name: "fetch".to_string(),
@@ -818,6 +820,10 @@ const CODEX_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_ca
 /// Byte-identity guard, one producer each: a decoded wire payload renders the
 /// exact card the pre-change code rendered. A renderer that started reading a
 /// semantic field changes one of these.
+///
+/// These still hold after P2 moved the Execute renderer onto `(kind, detail)`
+/// (#1059): the command and its cwd are the same facts the name arms read, so
+/// the card did not change — only the way the renderer found them.
 #[test]
 fn a_decoded_v1_bash_renders_the_baseline_card() {
     let call = v1_tool(
@@ -853,4 +859,57 @@ fn a_decoded_codex_command_renders_the_baseline_card() {
         "aggregatedOutput": "total 0\n"
     }));
     assert_eq!(render_card(call), CODEX_BASELINE_CARD);
+}
+
+/// The outcome a settled call records under `completed` is a failure, on every
+/// producer, straight from the wire through the real decoder and card builder
+/// (#1059): OpenCode V2 keeps the exit in `metadata` beside a `completed`
+/// status, Codex projects its `exitCode` into the call's status.
+#[test]
+fn a_settled_non_zero_exit_renders_the_failure_icon_from_the_wire() {
+    for (name, card) in [
+        (
+            "v2 shell",
+            render_card(v2_tool(
+                "shell",
+                json!({"command": "make", "cwd": "/work"}),
+                json!({"status": "completed", "exit": 1}),
+                Some("error: 3 assertions failed\n"),
+            )),
+        ),
+        (
+            "codex command",
+            render_card(codex_tool(&json!({
+                "type": "commandExecution",
+                "id": "item-command-fail",
+                "command": "make",
+                "cwd": "/work",
+                "status": "completed",
+                "exitCode": 1,
+                "aggregatedOutput": "error: 3 assertions failed\n"
+            }))),
+        ),
+    ] {
+        assert!(
+            card.contains("❌"),
+            "{name}: a settled non-zero exit is a failure: {card}"
+        );
+        assert!(
+            card.contains("error: 3 assertions failed"),
+            "{name}: the error body survives: {card}"
+        );
+    }
+
+    // A timeout is the other state `completed` hides.
+    let timed_out = render_card(v2_tool(
+        "shell",
+        json!({"command": "make", "cwd": "/work"}),
+        json!({"status": "completed", "timeout": true}),
+        Some("timed out\n"),
+    ));
+    assert!(timed_out.contains("❌"), "a timeout is a failure: {timed_out}");
+    assert!(
+        timed_out.contains("timed out"),
+        "the timeout body survives: {timed_out}"
+    );
 }
