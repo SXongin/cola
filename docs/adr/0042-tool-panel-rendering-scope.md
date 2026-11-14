@@ -289,7 +289,8 @@ Panel fallback.
 
 The Codex panel is display-only: it never drives the header's running-tool
 view, and it keeps the established `📋 todowrite` title so the two sources read
-as one card-tail section. Because the notification is not part of thread
+as one card-tail section (that title is the **Todo Panel's copy**; the `todowrite`
+*tool* tokenizes to `plan` under ADR-0107). Because the notification is not part of thread
 history, a freshly built projection shows no plan until the next
 `turn/plan/updated` arrives; a resync keeps the plan it already holds.
 

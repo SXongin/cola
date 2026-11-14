@@ -22,8 +22,8 @@ their payload shapes were a contract cola could follow. The second adapter
 inverts the economics:
 
 - **Codex's tool ids are protocol names.** `commandExecution`, `fileChange`,
-  `webSearch`, `image`, `collabAgentToolCall` and `subAgentActivity` are item
-  kinds, not display words. The adapter namespaces them `codex/*`
+  `webSearch`, `imageView`/`imageGeneration`, `collabAgentToolCall` and
+  `subAgentActivity` are item kinds, not display words. The adapter namespaces them `codex/*`
   (`src/codex/read_model.rs:2563`), and the card grows a shape-gated arm per id —
   78 mentions of six ids in `tool_render.rs` alone (68 of them quoted match
   positions).
@@ -114,7 +114,8 @@ byte-identical card.
 ### Migration
 
 P1 fields only (every existing card byte-identical) → P2 Execute → P3 FileEdits
-(which also retires the remaining name-keyed arms) → P4 AgentRun. The per-step
+(which also retires the remaining name-keyed arms) → P4 AgentRun → P5
+capabilities → vocabulary. The per-step
 field lists, adapter mappings and acceptance criteria are spec #1057's; the
 order and the P1 invariant are the decision recorded here.
 
