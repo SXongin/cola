@@ -135,7 +135,7 @@ That distinction is exactly what the four paths above collapse into.
 |---|---|---|---|
 | `bash` (OpenCode V1) | agent tool call | transcript part | `format_tool_input` `:3321`, `command_input` `:3470` |
 | `shell` (OpenCode V2) | agent tool call | transcript part + `BackgroundLaunch::Shell` | same arms; `metadata.exit/timeout` → failure icon `:437` |
-| `codex/command_execution` | agent tool call | transcript part | same arms, shape-gated `:3326` |
+| `codex/command_execution` | agent tool call | transcript part | same arms, shape-gated `:3322` |
 | **Terminal Card** (`/run`, `!cmd`) | **Host** job (ADR-0086) | cola process group, no transcript | `terminal.rs:246` |
 
 **Two of these are one concept** (an agent's execute call: command + cwd +
@@ -298,10 +298,10 @@ Rules that keep ADR-0042 intact:
 
 ### 4.3 The Agent Run: the sub-agent fact
 
-One run per child agent: a stable identity that **is** the durable Task Run Id
-(the child id when the fact creating the run names one, else the creating
-call's id; never re-keyed), the child id as a field, a label/agent/start, the
-client-declared status, the current activity (the newest call's neutral
+One run per child agent: a live identity (`run_id` — the child id when one
+exists, else the creating call's id), the durable **Task Run Id** it maps to
+(`task_run_id`, ADR-0080's key), the child id as a field, a label/agent/start,
+the client-declared status, the current activity (the newest call's neutral
 semantics plus the pending wait), and the three relations — **launched** (a set:
 a resume launches the same child again), **addressed**, and **reported** (applied
 by observation state, because the wire reuses the item id between an activity's
@@ -312,8 +312,10 @@ Read-model presence, not card presence:
 - `SessionTranscript.runs` (derived by each adapter) plus the existing
   background overlay (`src/bridge/tasks/*`) become one run view.
 - OpenCode: `task`/`subagent` calls with `metadata.sessionID` → one run.
-- Codex: `collabAgentToolCall` → a run; `subAgentActivity` → an **update to
-  that run**, not a panel; `wait`/`sendInput` → `addressed_by`.
+- Codex: a `collabAgentToolCall` that names a receiver creates a run;
+  `subAgentActivity` updates that run rather than rendering a panel; every
+  addressing verb is `addressed_by`, and `wait`/`listAgents` with no target
+  address the Turn's live runs as a set (no orphan run is minted).
 - The card uses the run for: the launching panel's liveness line, the ledger
   row, the completion entry, and `/sub`'s identity. **One fact, four surfaces,
   no vendor arms.**
@@ -412,13 +414,14 @@ and its tests.
 
 | Phase | Change | Invariant | Tests |
 |---|---|---|---|
-| **P0** | This note → GLOSSARY terms + one ADR for the model | docs only | — |
+| **P0** | This note → GLOSSARY terms + the three ADRs | docs only | — |
 | **P1** | `ToolKind`, `title`, `locations`, `ToolDetail` on `ToolCall`; adapters fill; card ignores them | every existing card byte-identical | adapter conformance + snapshot |
 | **P2** | `ToolDetail::Command`; one Execute renderer; Terminal Card reuses its output block; delete `bash`/`shell`/`codex/command_execution` arms and `command_input`'s vendor split | the three ids render the same as today | `shell.rs` header tests + `terminal.rs` |
 | **P3** | `ToolDetail::FileEdits`; collapse `edit`/`patch`/`apply_patch`/`codex/file_change` | same diffs, same open-button rule | `tool_render` diff tests |
 | **P4** | `AgentRun` + `ToolDetail::Delegation`; Codex activity items fold into runs; ledger + liveness read runs | OpenCode output unchanged; Codex gains liveness/ledger | `codex/cards.rs`, `bridge/tests/ledger.rs` |
 | **P5** | `AgentCapabilities`; surfaces gate on it | every absence is explicit and tested | per-client card tests |
-| **P6** *(optional)* | Name the tail-section list as a block model; `/model`-style surfaces stay as-is | — | — |
+| **P6** | `card/vocab.rs`, the token table, the phase renames, `输入`/`输出` | no token literal outside the module | vocab + header/ledger tests |
+| **P7** *(optional)* | Name the tail-section list as a block model; `/model`-style surfaces stay as-is | — | — |
 
 Deliberately **not** in scope:
 

@@ -143,8 +143,10 @@ RuntimeEnded / Lost / Cleaned) is how cola learned it ended — wider than
 does **not** become a client `Completed`. The rendered verb — `完成` / `失败` /
 `已取消` / `结束` / `已失联` / `已清理` — is copy derived from the **applicable**
 ending: `TaskEnding` when cola has one, else the client's `RunStatus`
-(`Completed`→`完成`, `Failed`→`失败`, `Cancelled`→`已取消`). A runtime-confirmed
-end still renders `结束` and a cleanup `已清理`. The enum spellings are invariant
+(`Completed`→`完成`, `Failed`→`失败`, `Cancelled`→`已取消`). `Unknown` is not a
+terminal word: a run reporting it with no `TaskEnding` stays live, and the row
+shows no terminal verb. A runtime-confirmed end still renders `结束` and a
+cleanup `已清理`. The enum spellings are invariant
 because adapters and logs compare them. *(If a later review prefers
 `🔔 shell completed：…` verbatim, only the copy table changes — the model values
 are already there.)*

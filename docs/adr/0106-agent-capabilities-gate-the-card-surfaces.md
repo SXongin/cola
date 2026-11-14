@@ -53,7 +53,8 @@ request method (`src/codex/approvals.rs:776`) and the neutral
 attachment-wide flag would show the button where the backend declines it or hide
 it where it is valid, so the card reads the request's own field.
 
-**2. Every optional surface gates on it.**
+**2. Every capability-gated surface gates on it.** (The permission always-scope
+is outside this table: it is per request, per the rule above.)
 
 | Surface | Gate | When absent |
 |---|---|---|
