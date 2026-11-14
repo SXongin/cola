@@ -16,9 +16,10 @@ existing ADR, **[acp]** = the Agent Client Protocol v1 documentation,
 > gate the surfaces) and **ADR-0107** (the card speaks in tokens and copy).
 > The naming question the note left open is settled there: fixed tokens are
 > English (`shell`, `script`, `waiting`, `reasoning`, `responding`), interface
-> copy stays Chinese until an i18n catalog exists. §4.2–§4.4 are kept in step
-> with ADR-0105/0106; §7 and §8 below are the pre-decision record, and the ADRs
-> supersede them where they differ.
+> copy stays Chinese until an i18n catalog exists. The state/model/migration
+> sections were removed: they now live in the ADRs and spec #1057, and keeping a
+> second copy is what drifted during review. §7/§8 remain the pre-decision
+> record.
 
 ---
 
@@ -180,176 +181,17 @@ is the template for this note:
 
 ---
 
-## 3. The state model: what is neutral, what is mixed
+## 3. State model
 
-Today's card states are a 14-variant enum (`CardState`,
-`src/feishu/card/mod.rs:39`) that mixes **three different questions**:
-
-1. **What is the run doing?** `Loading`, `Reasoning`, `Streaming`, `Done`,
-   `Error`, `Stopped`, `Waiting`.
-2. **Why did this card stop being live?** `Superseded`, `SwitchedAway`,
-   `TakenOver`, `Restarted`, `Continued`, `Retried`.
-3. **Was the message even received?** `Unreceived`.
-
-`src/bridge/turn/disposition.rs` already separates the third group as
-`Disposition` ("the one ending vocabulary"), and `CardState` is the *render*
-union. That split is right; it just is not named as the model, and the card
-header template (`header_title_and_template`, `shell.rs:495`) is the only place
-the mapping exists.
-
-**Proposed neutral levels** (each owned by a different layer, none agent-specific):
-
-| Level | States | Owner | Drives |
-|---|---|---|---|
-| **Session** | `idle` / `working` / `waiting-user` / `waiting-background` / `unknown` | backend read (`session_status`, `snapshot`) | Session Card status chip, `/switch` row |
-| **Turn** | `thinking` / `streaming` / `tool-running` / `settling` / `ended(disposition)` | bridge accumulator | header phase + timer, footer |
-| **Card** | `live` / `waiting` / `terminal(disposition)` | card chain (ADR-0071/0072) | header colour, controls, recovery |
-| **Request** | `permission(scope)` / `question(single · multi · custom)` / `location-form` | backend request DTOs | inline block or standalone card |
-| **Run** | `running` / client outcome (`completed` · `failed` · `cancelled` · `unknown`) / cola ending (`TaskEnding`) | read model (`AgentRun`) plus the bridge overlay for the durable ending (ADR-0105/0080) | ledger row, completion entry |
-
-Two concrete gaps this exposes:
-
-- **Capability gaps are invisible.** `background_tasks_supported()` returns
-  `false` for both Codex clients and for OpenCode V1
-  (`src/codex/backend.rs:3191`, `src/opencode/strategy.rs:260` **[code]**), and
-  the ledger simply never appears. That is fine — but it is expressed as a
-  method per subsystem, not as one declaration the card can consult, so every
-  new surface re-invents "does this client support X?".
-- **The capability differs *within* one client.** Codex reports child-agent
-  **activity** but no background runs. Today that means "no ledger" — and the
-  activity items pile up as panels. A capability declaration with a
-  `ChildAgentMode` lets the card render the liveness line **and** the live-run
-  ledger (`reports_live_runs()`), without pretending a background task exists.
-
-### 3.1 Which surface for which event
-
-This table already exists implicitly across ADR-0038, 0043, 0063, 0074, 0092,
-0100; naming it is the "when does which card show" half of the model.
-
-| Event | Surface | Owner decision |
-|---|---|---|
-| A prompt starts a Turn | streaming **Turn card**, as a reply to the message | one card per request (ADR-0074) |
-| The Turn's content fills the card | **continuation card** in the same Card Chain | splitter (ADR-0043) |
-| A message arrives mid-Turn | **Supplement card** (steer), never a second live card | ADR-0043 |
-| The Turn ends with live runs | same card yields → `Waiting` | ADR-0059, widened by ADR-0106 |
-| A run's completion resumes the work | same card → `Resuming` | ADR-0066 |
-| A Permission / Question on a live mapped Turn | **inline block** on the Turn card | ADR-0038 |
-| … on a session with no live card | **standalone request card**, re-adopted after restart | ADR-0038, `surfaces.rs` |
-| … from a child session | re-homed to the **parent's** card | pitfall `child-session-permissions` |
-| … already resolved in another client | `build_resolved_elsewhere_card` | `notify.rs:31` |
-| A read of a Session nobody renders (`/card`) | **Session Card**, one-shot, no controls | ADR-0100 |
-| Another client posted a user message | **notify card** | `notify.rs:13` |
-| A Host command (`/run`, `!cmd`) | **Terminal Card**, outside every Chain | ADR-0086 |
-| A Host file (`/cat`) or dir (`/dir`) | **Viewer / browse card**, outside every Chain | ADR-0083, 0078 |
-| A compaction | **row on the Turn card** at its server position | ADR-0082 |
-| A restart finds a live card | `Restarted` stamp, **not** a new card | ADR-0063 |
-
-The gaps are all of one kind: the table is not derived from a declaration, so
-a client that cannot raise a Question or cannot background a run simply leaves
-its row unreachable instead of the surface degrading explicitly.
-
----
+Superseded: the state levels, the capability axes and the event→surface matrix
+now live in **ADR-0105/0106** and **spec #1057** (`Surface gates and selection`).
+This note keeps only the evidence for why they were needed.
 
 ## 4. The proposed model
 
-### 4.1 One sentence
-
-> **The read model says what happened in neutral terms; the Agent Client
-> declares what it can produce; the card decides what to draw and owns every
-> word of it.**
-
-That is ADR-0053 (read model) + ADR-0092 (capability/surface) applied to the
-tool surface.
-
-### 4.2 The read model addition: tool *semantics*, not tool *payloads*
-
-ADR-0053 deliberately kept tool payloads raw:
-
-> "Per-built-in-tool typed payloads inside the read model. Rejected: tool
-> payload interpretation is the Platform's deliberate specialization
-> (ADR-0042)." — ADR-0053, "Considered Options"
-
-That was correct while one adapter existed and the built-ins were one
-vendor's. It is now the thing forcing every card arm: the *shape gates*
-(`command_execution_shape`, `file_change_shape`, …) exist because the card
-cannot trust a name, and there is no neutral type to trust instead.
-
-**Proposal: four additive facts, all adapter-supplied, with `Other` staying
-opaque.** A `ToolCall` gains a `ToolKind` (ACP's ten), a human `title`, the
-`locations` it touches and a typed `detail`; the raw payloads, status and output
-are unchanged. The shapes themselves are decided in ADR-0105 and laid out once in
-spec #1057 — this note keeps the reasoning, not a second copy.
-
-Rules that keep ADR-0042 intact:
-
-1. **`kind` is declared by the adapter, never sniffed from a third-party
-   payload.** A tool the adapter does not recognise is `ToolKind::Other` and
-   `ToolDetail::Opaque`, exactly today's raw path.
-2. **A vendor name remains.** `identity.name` still says `codex/file_change`
-   or `bash`; it becomes diagnostic and the fallback title, not the dispatch
-   key.
-3. **`detail` is filled only where the semantics are shared.** ACP's
-   `diff`/`terminal`/`content` content blocks and OpenCode's `edit`/`patch`
-   metadata both produce `FileEdits`/`Command`; a `websearch` produces
-   `Search`; nothing else grows a variant until a second adapter needs it — except `Program`, the exception ADR-0105 argues (one producer, an existing renderer, a general pattern).
-4. **Presentation copy stays in the card.** The adapter supplies *facts and
-   titles*; the token and the icon remain the card's (ADR-0107: `shell`, `edit`,
-   `subagent`, …), never the Agent Client's.
-
-### 4.3 The Agent Run: the sub-agent fact
-
-One run per child agent, with a stable identity, its three relations and a status
-distinct from cola's durable ending. ADR-0105 states the rules; spec #1057 owns
-the shape and every edge case (key selection, multiplicity, dedupe, retirement).
-
-Read-model presence, not card presence:
-
-- `SessionTranscript.runs` (derived by each adapter) plus the existing
-  background overlay (`src/bridge/tasks/*`) become one run view.
-- OpenCode: `task`/`subagent` calls with `metadata.sessionID` → one run.
-- Codex: only `spawnAgent` launches a run; `subAgentActivity` updates that run
-  rather than rendering a panel; every other collaboration verb addresses, and
-  `wait`/`listAgents` with no target address the Turn's live runs as a set (no
-  orphan run is minted).
-- The card uses the run for: the launching panel's liveness line, the ledger
-  row, the completion entry, and `/sub`'s identity. **One fact, four surfaces,
-  no vendor arms.**
-
-### 4.4 Capabilities: one declaration per Agent Client
-
-The axes are background runs, child-agent mode, plan, compaction, usage,
-questions, modes, diffs and MCP server statuses, with `reports_live_runs()`
-derived from the first two. The permission always-scope is **not** an axis: it
-is per request (ADR-0018), carried by `PermissionRequest::always_supported`.
-ADR-0106 states the set and the gates; spec #1057 owns the struct.
-
-The gate matrix and the event→surface table live in spec #1057; ADR-0106 states
-the principle (omitted, never empty) and the axes.
-
-### 4.5 Rendering: one renderer per shape, no per-name arms
-
-Do **not** start by inventing a general block tree. The staged version:
-
-1. **One renderer per `ToolDetail` shape**, not per name. `Execute` has one
-   builder reused by the tool panel *and* the Terminal Card's output section.
-   `FileEdits` has one diff builder. `Delegation` has one run block.
-2. **Key the panel title on `kind` + `detail`**, with `title` as the
-   adapter's refinement: `Execute` → `shell`, `Edit` → `edit` (or `write` for an
-   all-Add list, ADR-0107), `Read` →
-   `read`, `Delegation` → `subagent` (the token table is ADR-0107's).
-3. **A `ToolDetail::Opaque` path identical to today's** — raw input as a
-   key-value list, raw output with the markdown-safety fence.
-4. Only after those three exist, decide whether the card needs a block model.
-   The likely answer is a small one: the *tail* already is a list of typed
-   sections (todo, ledger, live tools, compaction, footer) in `CardBuilder`;
-   naming that list is the block model, and it costs one enum.
-
-The card-size estimate mirror (`panel_estimate`, `bridge/turn/state.rs:591`)
-is the early warning for this: it is a second implementation of the renderer's
-byte cost, kept in lockstep by hand. A per-shape renderer that returns its own
-estimate keeps the pair together; the current per-name arithmetic cannot.
-
----
+Superseded: the shapes are **spec #1057's `Canonical shapes`**, and the rules are
+implied by **ADR-0105/0106/0107**. This note does not restate them — that
+duplication is what drifted three times during review.
 
 ## 5. ACP as a reference (and where it does not reach)
 
@@ -391,30 +233,11 @@ refactor.
 
 ---
 
-## 6. Migration plan (each step independently shippable)
+## 6. Migration
 
-Ordered by (evidence strength × risk⁻¹). Every step keeps a single invariant
-and its tests.
-
-| Phase | Change | Invariant | Tests |
-|---|---|---|---|
-| **P0** | This note → GLOSSARY terms + the three ADRs | docs only | — |
-| **P1** | `ToolKind`, `title`, `locations`, `ToolDetail` on `ToolCall`; adapters fill; card ignores them | every existing card byte-identical | adapter conformance + snapshot |
-| **P2** | `ToolDetail::Command`; one Execute renderer; Terminal Card reuses its output block; delete `bash`/`shell`/`codex/command_execution` arms and `command_input`'s vendor split | the three ids render the same as today | `shell.rs` header tests + `terminal.rs` |
-| **P3** | `ToolDetail::FileEdits`; collapse `write`/`edit`/`patch`/`apply_patch`/`codex/file_change`, plus the remaining `read`/`glob`/`grep`/`webfetch` arms | same diffs, same open-button rule; no name-keyed arm left | `tool_render` diff tests |
-| **P4** | `AgentRun` + `ToolDetail::Delegation`; Codex activity items fold into runs; ledger + liveness read runs | OpenCode output unchanged; Codex gains liveness/ledger | `codex/cards.rs`, `bridge/tests/ledger.rs` |
-| **P5** | `AgentCapabilities`; surfaces gate on it | every absence is explicit and tested | per-client card tests |
-| **P6** | `card/vocab.rs`, the token table, the phase renames, `输入`/`输出` | no token literal outside the module | vocab + header/ledger tests |
-| **P7** *(optional)* | Name the tail-section list as a block model; `/model`-style surfaces stay as-is | — | — |
-
-Deliberately **not** in scope:
-
-- Merging the Terminal Card's lifecycle with an agent shell (different owners).
-- Moving card copy into adapters — the card owns the words.
-- Sniffing third-party payloads. `Other` stays opaque (ADR-0042).
-- Per-chat multi-client routing (ADR-0090 defers it; it needs its own ADR).
-
----
+Superseded: the phases and their invariants are **spec #1057's ticket cut**
+(P1 fields → P2 Execute → P3 FileEdits → P4 AgentRun → P5 capabilities →
+vocabulary). The note does not keep a second copy.
 
 ## 7. Decisions this note asks for
 
