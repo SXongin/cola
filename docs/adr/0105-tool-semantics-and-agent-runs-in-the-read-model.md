@@ -46,7 +46,8 @@ inverts the economics:
 - **The repo already proves the pattern twice.** The plan/todo surface is one
   neutral `TodoList` fed by `todowrite` and by `turn/plan/updated`
   (`src/backend/transcript.rs:94`); `/model` is one client-declared
-  `ModelSurface` the card only renders (ADR-0092). Neither has vendor arms.
+  `ModelSurface` the card only renders (ADR-0092). Neither needs per-adapter
+  arms beyond a mapping (the Todo surface's remaining name checks are P6's).
 
 ## Decision
 
@@ -80,8 +81,9 @@ shape is `Opaque`.
 child agent — OpenCode's `task`/`subagent`, a Codex collaboration child — is one
 run with its own identity, label, agent, start, status, current activity, and
 the calls that **launched**, **addressed** or **reported** on it. A report
-updates its run; an addressing call is a receipt on it; only a launch keeps a
-Tool Panel. A run's identity is minted once and is never re-keyed by a later
+updates its run; an addressing call is a receipt on it (one that names no
+target, like `wait`, addresses the Turn's live runs as a set); only a launch
+keeps a Tool Panel. A run's identity is minted once and is never re-keyed by a later
 sighting.
 
 `RunStatus` is the **client's** statement about the run. Cola's durable ending is
