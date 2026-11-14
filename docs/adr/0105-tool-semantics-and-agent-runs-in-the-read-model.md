@@ -79,10 +79,10 @@ shape is `Opaque`.
 **4. `AgentRun` is a neutral transcript fact — one run per child agent.** The
 run's shape is #1057's; these are the rules it must satisfy:
 
-- **One key space with the Task Run Id.** `run_id` **is** ADR-0080's Task Run
-  Id — there is no alias and no second string. It is the child id when the fact
-  that creates the run names one, otherwise the creating call's id (with `#<i>`
-  for an id-less receiver among several). A run whose creating fact named no
+- **One key space with the Task Run Id, by alias.** `run_id` **is** ADR-0080's
+  Task Run Id, selected the same way (the child id when the creating fact names
+  one, else the creating call's id) and resolved by any id the run holds — the
+  record's alias rule, not a second string. A run whose creating fact named no
   child keeps that id and fills `child_id` when it learns one. **A launch that
   names no receiver creates no run**: a completion naming N children creates N
   runs, each keyed by its child id. Once created, a run keeps its key forever.
