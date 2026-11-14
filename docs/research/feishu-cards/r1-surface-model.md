@@ -164,7 +164,7 @@ Already unified, and worth copying:
 - The card renders **one** plan section (`todo_panel_element`), with no
   vendor arms.
 
-But the *tool-panel* side still name-checks `todowrite` in five places
+But the *tool-panel* side still name-checks `todowrite` in six places
 (`tool_render.rs:228`, `:1902`, `:2600`, `bridge/turn/state.rs:316`, `:1881`, `:4248`)
 — that is a leftover, not a design.
 

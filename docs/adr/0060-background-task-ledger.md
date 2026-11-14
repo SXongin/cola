@@ -199,7 +199,7 @@ review round as the amendment above):
 
 ## Amendment (2026-10-02): the type words are the tools' own names
 
-The ledger's type words are the tool's own name everywhere it names one (#502,
+The ledger's type words are the run's tool token (`shell`/`subagent`) everywhere it names one, not the vendor id (#502, ADR-0107;
 spec #501): the ledger and the Tool Panel call one task the same thing.
 
 - The live row reads `· shell：**npm run build** · 14:02 · 3m12s` /
