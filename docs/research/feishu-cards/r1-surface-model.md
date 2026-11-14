@@ -11,6 +11,14 @@ Evidence tags: **[code]** = read from `src/` at the cited line, **[adr]** = an
 existing ADR, **[acp]** = the Agent Client Protocol v1 documentation,
 **[measured]** = counted in this tree on the research date.
 
+> **Decided (2026-11-14).** This note's recommendations became **ADR-0105**
+> (tool semantics and agent runs in the read model), **ADR-0106** (capabilities
+> gate the surfaces) and **ADR-0107** (the card speaks in tokens and copy).
+> The naming question the note left open is settled there: fixed tokens are
+> English (`shell`, `waiting`, `reasoning`, `responding`), interface copy stays
+> Chinese until an i18n catalog exists. §7 and §8 below are the pre-decision
+> record; the ADRs supersede them where they differ.
+
 ---
 
 ## Verdict
@@ -377,8 +385,8 @@ Do **not** start by inventing a general block tree. The staged version:
    builder reused by the tool panel *and* the Terminal Card's output section.
    `FileEdits` has one diff builder. `Delegation` has one run block.
 2. **Key the panel title on `kind` + `detail`**, with `title` as the
-   adapter's refinement: `Execute` → 「命令」, `Edit` → 「文件修改」, `Read` →
-   「读取」, `Delegation` → the collaboration verb the adapter supplies.
+   adapter's refinement: `Execute` → `shell`, `Edit` → `edit`, `Read` →
+   `read`, `Delegation` → `subagent` (the token table is ADR-0107's).
 3. **A `ToolDetail::Opaque` path identical to today's** — raw input as a
    key-value list, raw output with the markdown-safety fence.
 4. Only after those three exist, decide whether the card needs a block model.
@@ -478,14 +486,13 @@ Each is phrased as an ADR candidate.
 
 ## 8. Open questions
 
-1. **`ToolKind` spelling.** Use ACP's ten kinds verbatim (cheap for the third
-   adapter) or a cola enum mapped to ACP? *Recommendation: ACP's ten, plus
-   cola-only `ToolDetail` variants — the kind is a category, the detail carries
-   the distinction ACP does not express.*
-2. **Codex `sendInput`/`wait`/`closeAgent`.** Are they tool panels at all, or
-   should they be run-addressed receipts (one line on the run's card)? They are
-   not new work; rendering them as panels inflates the timeline. *Recommendation:
-   receipts on the run, with the raw call kept in the transcript.*
+1. **`ToolKind` spelling.** *(Settled by ADR-0105/0107.)* `ToolKind` is
+   ACP's ten, because that is the coarsest category every adapter can fill; the
+   card's display word is a separate **token** refined through `ToolDetail`
+   (`glob`/`grep` → `Search`, `write`/`edit` → `Edit`), so the two axes cannot
+   collapse into one enum.
+2. **Codex `sendInput`/`wait`/`closeAgent`.** *(Settled by ADR-0106.)* Receipts
+   on the run, with the raw call kept in the transcript.
 3. **Codex ledger.** Codex has child threads and no background launches. Do we
    want a ledger for *live child agents* even when no "background" concept
    exists? *Recommendation: yes, but call it what it is — the ledger is "live
