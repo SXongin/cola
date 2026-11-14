@@ -1,7 +1,8 @@
 # Task liveness is observed on the running panel; child sessions get no second write path
 
-> **Amended by ADR-0106/0107**: the liveness line reads the **Agent Run**'s
-> `RunActivity` (a Codex collaboration child has no OpenCode child session), gates
+> **Amended by ADR-0105/0106/0107**: the liveness line reads the **Agent Run**'s
+> `RunActivity` (ADR-0105; a Codex collaboration child has no OpenCode child
+> session), gates
 > on the Agent Client's `child_agents` capability, and its phase words are
 > `waiting`/`reasoning`/`responding`, not `思考中`/`推理中`/`回复中`.
 

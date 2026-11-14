@@ -40,7 +40,7 @@ not only background work, so a turn-scoped child counts:
 reports_live_runs = background_runs || child_agents != None
 ```
 
-`Backend::capabilities()` returns it. It is a property of the **attachment**, not
+`Backend::capabilities()` returns the struct. It is a property of the **attachment**, not
 of a Session: a reattach (a Codex daemon restart, an OpenCode generation switch)
 may change it, and a value read from a stale connection is not used to render a
 new one.
