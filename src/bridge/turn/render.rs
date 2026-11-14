@@ -4843,15 +4843,15 @@ Index: /x/src/main.rs
         let parts = vec![Part::Tool(call)];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
-        let out = acc.tools()["call_patch"].output().unwrap();
-        assert!(out.contains("+let b = 3;"), "hunk shown: {out}");
+        let card = acc.build_card().to_string();
+        assert!(card.contains("+let b = 3;"), "hunk shown: {card}");
         assert!(
-            out.contains("LSP errors detected in src/main.rs"),
-            "LSP tail kept: {out}"
+            card.contains("LSP errors detected in src/main.rs"),
+            "LSP tail kept: {card}"
         );
         assert!(
-            !out.contains("Success. Updated"),
-            "success summary dropped: {out}"
+            !card.contains("Success. Updated"),
+            "success summary dropped: {card}"
         );
     }
 
@@ -8950,12 +8950,11 @@ Index: /x/src/main.rs
                 None
             ))
         ));
-        let out = acc.tools()["call_edit"].output().unwrap_or_default();
-        assert!(out.contains("@@ -1 +1 @@"), "diff must be shown: {}", out);
+        let card = acc.build_card().to_string();
+        assert!(card.contains("@@ -1 +1 @@"), "diff must be shown: {card}");
         assert!(
-            !out.contains("Edit applied successfully."),
-            "noise dropped: {}",
-            out
+            !card.contains("Edit applied successfully."),
+            "noise dropped: {card}"
         );
 
         // Re-rendering the same completed part is deduped (output unchanged).
