@@ -62,7 +62,10 @@ would a translator touch it?**
 Anything not in this table is **not a token**: it keeps its own vendor name
 (`codegraph_explore`, `mcp_server/tool`), exactly ADR-0042's opaque rule. The
 table is closed: a new token arrives with the `ToolDetail` variant that carries
-it (ADR-0105), and an unknown id keeps its name.
+it (ADR-0105), and an unknown id keeps its name. The three name-only tokens
+(`plan`, `skill`, `ask`) are the recorded exception: they have no detail because
+OpenCode is their only producer, and the closure rule admits them by the closed
+name table rather than by a variant.
 
 `script` names the one **pattern** rather than a built-in id. Code Mode is
 general — Cloudflare named it (2025-09), Anthropic calls it programmatic tool
@@ -140,7 +143,7 @@ changes — the model values are already there.)*
 **6. The split is enforced by one module: `src/feishu/card/vocab.rs`.**
 
 - It owns every token constant and the functions that derive a token from the
-  read model (`tool_token(kind, detail)`, `phase_token(state)`).
+  read model (`tool_token(identity, kind, detail)`, `phase_token(state)`).
 - It owns the copy constants a second module would otherwise duplicate; copy that
   is purely local to one card may stay beside that card.
 - No renderer writes a token as a string literal. A rename edits `vocab.rs` and
