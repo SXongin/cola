@@ -109,9 +109,9 @@ the record of the request, but renders 🌙 in its status slot instead of ✅ �
 rest of the title is a normal panel's (`🌙 shell · <label>`); the ledger, not
 the panel, owns the run's liveness.
 
-V1 carries none of the background facts, so nothing but a live **Agent Run**
-appears there: a `task` child is a run, and the section lists it under
-`reports_live_runs()` (ADR-0106). With no run either, behavior is today's (the
+V1 carries none of the background facts; a `task` child is a run, but V1's
+child-evidence read does not exist yet, so `reports_live_runs()` is false and the
+section stays empty until that read lands (ADR-0106). Behavior is today's (the
 ADR-0059 degradation).
 
 ## Considered options

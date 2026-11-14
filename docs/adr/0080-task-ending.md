@@ -2,7 +2,9 @@
 
 > **Amended by ADR-0105**: the same ending classes cover a child-only **Agent
 > Run** (no Background Task); its child transcript's terminal item is the
-> evidence, and every rule below applies to it unchanged.
+> evidence, and every rule below applies to it unchanged. A run first named by a
+> non-launch fact (a report before its launch) is keyed by that call's id; a later
+> launch is an alias.
 
 > **Ratified (2026-10-14, spec #699)**: three points where the landed
 > implementation diverges from this ADR's literal wording — the **Wake** path
@@ -77,7 +79,8 @@ derivation — see the 2026-10-14 amendment below.
 
 - **The identity is the run, and the run's ids are aliases of one record.** A
   new `TaskRunId`: the launch's call id when the read carries the launch, else
-  the shell/child id a Wake itself reports (never an invented one). One run's
+  the call id of the fact that first names the run (a report before its launch),
+  else the shell/child id a Wake itself reports (never an invented one). One run's
   endings — evidence, the user's Cleanup, a Wake completion — live under that one
   id, and the record carries every id the run is known by (the launch's call id,
   its shell/child id, its tool call id, and the Wake id whose completion it

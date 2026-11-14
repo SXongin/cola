@@ -165,7 +165,7 @@ Already unified, and worth copying:
   vendor arms.
 
 But the *tool-panel* side still name-checks `todowrite` in five places
-(`tool_render.rs:228`, `:1902`, `bridge/turn/state.rs:316`, `:1881`, `:4248`)
+(`tool_render.rs:228`, `:1902`, `:2600`, `bridge/turn/state.rs:316`, `:1881`, `:4248`)
 — that is a leftover, not a design.
 
 ### 2.4 Model picker: the second positive precedent

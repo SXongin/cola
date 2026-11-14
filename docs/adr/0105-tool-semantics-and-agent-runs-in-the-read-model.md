@@ -64,7 +64,8 @@ declaration.
 **2. `ToolKind` is ACP's ten, declared by the adapter.** `Read`, `Edit`,
 `Delete`, `Move`, `Search`, `Execute`, `Think`, `Fetch`, `SwitchMode`, `Other`.
 `Other` is the default **for a third-party id**; an unmapped shared id fails the
-conformance test rather than silently becoming opaque. A tool the adapter does
+conformance test rather than silently becoming opaque, because that test
+enumerates every shared id the adapter claims to support. A tool the adapter does
 not recognise is `Other` + opaque detail and renders raw (ADR-0042). A kind is never inferred from
 a third-party payload — the adapter owns its Agent Client's contract and is the only
 writer.
