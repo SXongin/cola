@@ -435,6 +435,13 @@ fn decode_tool(part: &Value) -> ToolCall {
     }
 }
 
+/// Decode one tool part into its neutral call — the cross-adapter conformance
+/// test's entry point, so the suite drives this generation's real decoder.
+#[cfg(test)]
+pub(crate) fn decode_tool_part(part: &Value) -> ToolCall {
+    decode_tool(part)
+}
+
 /// Decode a tool state's output side. Text sources follow the precedence the
 /// presentation has always rendered: a string `output` is authoritative (the
 /// other sources are never appended to it); otherwise the shared

@@ -1395,6 +1395,13 @@ fn decode_tool(item: &Value) -> ToolCall {
     }
 }
 
+/// Decode one tool item into its neutral call — the cross-adapter conformance
+/// test's entry point, so the suite drives this generation's real decoder.
+#[cfg(test)]
+pub(crate) fn decode_tool_item(item: &Value) -> ToolCall {
+    decode_tool(item)
+}
+
 /// A tool's identity: its built-in name — the historical `"tool"` fallback
 /// when the payload lost it — and the call's id, falling back to the name so a
 /// call without one still folds onto a single panel.
