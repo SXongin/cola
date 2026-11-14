@@ -62,7 +62,7 @@ declaration.
 `Delete`, `Move`, `Search`, `Execute`, `Think`, `Fetch`, `SwitchMode`, `Other`.
 `Other` is the default and the fallback; a tool the adapter does not recognise is
 `Other` + opaque detail and renders raw (ADR-0042). A kind is never inferred from
-a third-party payload — the adapter owns its client's contract and is the only
+a third-party payload — the adapter owns its Agent Client's contract and is the only
 writer.
 
 **3. `ToolDetail` is typed only where the semantics are shared.** The variants
@@ -150,8 +150,8 @@ the decision recorded here.
   card cannot trust a name; the fix is something it *can* trust.
 - **Put the whole presentation in the adapter** (a `tool_view` like
   `model_surface`). Rejected for layout and copy: the card owns the words, the
-  budget and the fold, and a client should not ship Feishu JSON. Accepted for
-  the factual `title` and `locations`, which are the client's knowledge.
+  budget and the fold, and an Agent Client should not ship Feishu JSON. Accepted
+  for the factual `title` and `locations`, which are the client's knowledge.
 - **A typed payload per built-in id.** Rejected: a vendor id is not a
   cross-adapter contract, and it would grow a variant per client.
 - **A generic "valid JSON → pretty-print" fallback.** Rejected again, for
