@@ -46,7 +46,7 @@ for the first two is one question: would a translator touch it?**
   `title` or `AgentRun.label`. It is never classified as a token, never
   translated, and never re-worded.
 
-**2. The tool tokens are one per concept, and a token is never a vendor id.**
+**2. The tool tokens are one per concept; a token is not a vendor id.** It may coincide with one vendor's id (`shell`), but it names a concept that another adapter reaches through a different id (`command_execution`).
 
 | Token | Absorbs | Note |
 |---|---|---|
