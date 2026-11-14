@@ -220,7 +220,7 @@ spec #501): the ledger and the Tool Panel call one task the same thing.
 A background `subagent`'s live row carries the same child-session liveness the
 live task panel shows (spec #501, ticket #503): appended after the row's start
 clock — `· subagent：**review the diff** · 14:04 · shell 5s`, or
-`· reasoning 30s · 等待你的授权` for a phase and its wait — through the front's own
+`· waiting 30s · 等待你的授权` for a phase and its wait — through the front's own
 fragment vocabulary, so one child state reads the same wherever cola renders
 it. The fragment sits after the start clock and before `· ⚠️ 状态待确认`; a row
 the runtime reconciliation could not confirm renders no activity, and a `shell`

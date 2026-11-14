@@ -1,5 +1,10 @@
 # Runtime reconciliation for background-task liveness
 
+> **Amended by ADR-0106**: the reconciliation's early return gates on
+> `reports_live_runs()`, not `background_tasks_supported()`, so a child-only
+> Agent Run is reconciled too.
+
+
 > **Reopened by ADR-0080**: the process-local overlay and the "a retirement is
 > observed only while a waiting card can receive it" gate give way to the
 > durable **Task Ending** — the reconcile derives the ending once and it

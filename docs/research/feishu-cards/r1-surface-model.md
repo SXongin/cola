@@ -248,7 +248,7 @@ Each is phrased as an ADR candidate.
   `kind` adapter-declared and never inferred. *(One-way door: it fixes the
   vocabulary every later adapter answers.)*
 - **D2 — Agent Run as a neutral fact.** One run model for OpenCode
-  `task`/`subagent` and Codex `collabAgent`/`subAgentActivity`, with
+  `task`/`subagent` and Codex `collabAgentToolCall`/`subAgentActivity`, with
   launch/address/report relations. *(One-way door for the task surface.)*
 - **D3 — Capabilities as one declaration.** Backends answer
   `AgentCapabilities`; surfaces gate on it. *(Two-way.)*
