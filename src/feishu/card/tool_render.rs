@@ -735,6 +735,7 @@ impl ToolPanel {
                     .unwrap_or_default(),
                 error: None,
             },
+            ..ToolCall::default()
         })
     }
 
@@ -3786,6 +3787,7 @@ mod tests {
                 blocks: vec![ContentBlock::File(content)],
                 error: None,
             },
+            ..ToolCall::default()
         };
         let mut panel = ToolPanel::new(call);
         panel.set_file_delivery(0, delivery);
@@ -3932,6 +3934,7 @@ mod tests {
                 blocks,
                 error: None,
             },
+            ..ToolCall::default()
         };
         let mut panel = ToolPanel::new(call);
         for i in 0..total {
@@ -4737,6 +4740,7 @@ mod tests {
                 blocks: Vec::new(),
                 error: Some("permission denied".into()),
             },
+            ..ToolCall::default()
         });
         let md = panel_md_with_session(error_only, "ses_1");
         assert!(
@@ -5637,6 +5641,7 @@ mod tests {
                         input: None,
                         metadata,
                         output: ToolOutput::default(),
+                        ..ToolCall::default()
                     }),
                     Some(at),
                     None,
@@ -5843,6 +5848,7 @@ mod tests {
             input: None,
             metadata: Some(json!({"sessionId": "ses_child", "parentSessionId": "ses_parent"})),
             output: ToolOutput::default(),
+            ..ToolCall::default()
         });
         assert_eq!(with_metadata.child_session_id(), Some("ses_child"));
 
@@ -5856,6 +5862,7 @@ mod tests {
             input: None,
             metadata: Some(json!({"sessionID": "ses_v2_child", "status": "running"})),
             output: ToolOutput::default(),
+            ..ToolCall::default()
         });
         assert_eq!(subagent.child_session_id(), Some("ses_v2_child"));
 
@@ -6214,6 +6221,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         assert_eq!(
             diff_truncation_note(&tool),
@@ -6273,6 +6281,7 @@ Index: src/main.rs
                 },
                 error: None,
             },
+            ..ToolCall::default()
         })
     }
 
@@ -6541,6 +6550,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text(diff.into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let md = panel_md(tool.clone());
         assert!(!md.contains("+1 −1"), "not a diff panel: {md}");
@@ -6629,6 +6639,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit failed.".into())],
                 error: Some("x".repeat(2 * TOOL_OUTPUT_MAX_CHARS)),
             },
+            ..ToolCall::default()
         });
         assert_eq!(
             diff_truncation_note(&failed),
@@ -6837,6 +6848,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            ..ToolCall::default()
         })
     }
 
@@ -6869,6 +6881,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            ..ToolCall::default()
         })
     }
 
@@ -6923,6 +6936,7 @@ Index: .config/opencode/AGENTS.md
                 )],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let card = CardBuilder::new()
             .with_state(CardState::Done)
@@ -6983,6 +6997,7 @@ Index: .config/opencode/AGENTS.md
                 blocks: vec![ContentBlock::Text("Edited 2 files".into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let title = panel_title(tool.clone());
         assert!(
@@ -7032,6 +7047,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text(text_output.into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let card = CardBuilder::new()
             .with_state(CardState::Done)
@@ -7087,6 +7103,7 @@ Index: /x/one.rs
                 blocks: vec![ContentBlock::Text(text_output.into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let card = CardBuilder::new()
             .with_state(CardState::Done)
@@ -7898,6 +7915,7 @@ LSP errors detected in a.rs, please fix:
                 blocks: vec![ContentBlock::Text("first block\nsecond block".into())],
                 error: None,
             },
+            ..ToolCall::default()
         };
         assert_eq!(
             ToolPanel::new(completed.clone()).output().as_deref(),
@@ -8359,6 +8377,7 @@ LSP errors detected in a.rs, please fix:
                     .unwrap_or_default(),
                 error: None,
             },
+            ..ToolCall::default()
         })
     }
 
@@ -9322,6 +9341,7 @@ excerpt two";
                 blocks: Vec::new(),
                 error: None,
             },
+            ..ToolCall::default()
         })
     }
 
@@ -9399,6 +9419,7 @@ excerpt two";
                 blocks: vec![ContentBlock::Text("opaque search output".into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let md = panel_md(tool);
         assert!(md.contains("opaque search output"), "its own text: {md}");
@@ -9447,6 +9468,7 @@ excerpt two";
                 blocks: Vec::new(),
                 error: None,
             },
+            ..ToolCall::default()
         });
         let md = panel_md(tool);
         assert!(
@@ -9475,6 +9497,7 @@ excerpt two";
                 blocks: Vec::new(),
                 error: None,
             },
+            ..ToolCall::default()
         });
         let md = panel_md(tool);
         assert!(md.contains("[Meta](https://meta.example)"), "metadata wins: {md}");

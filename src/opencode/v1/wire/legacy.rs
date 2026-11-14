@@ -24,6 +24,7 @@ use crate::backend::{
     StepStart, TokenUsage, ToolCall, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::error::Result;
+use crate::opencode::tool_semantics::tool_semantics;
 
 use super::{
     assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_identity,
@@ -409,13 +410,28 @@ fn decode_tool(part: &Value) -> ToolCall {
     let identity = decode_tool_identity(part.get("tool"), part.get("callID"));
     let state = part.get("state");
     let status = decode_tool_status(state.and_then(|state| state.get("status")));
+    let input = state.and_then(|state| state.get("input")).cloned();
+    let metadata = state.and_then(|state| state.get("metadata")).cloned();
+    // The neutral semantics this generation declares for its own ids
+    // (ADR-0105); a third-party id stays opaque.
+    let (kind, detail) = tool_semantics(&identity.name, input.as_ref(), metadata.as_ref());
+    let locations = detail.locations();
     ToolCall {
         identity,
+        kind,
+        // The client's own human title for the call, when it reported one.
+        title: state
+            .and_then(|state| state.get("title"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string),
+        locations,
         status: status.clone(),
         started_at: state.and_then(|state| started_at(state, "/time/start")),
-        input: state.and_then(|state| state.get("input")).cloned(),
-        metadata: state.and_then(|state| state.get("metadata")).cloned(),
+        input,
+        metadata,
         output: decode_tool_output(state, &status),
+        detail,
     }
 }
 

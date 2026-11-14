@@ -128,6 +128,7 @@ fn background_shell_launch(created: i64, call_id: &str, shell_id: &str, command:
                 blocks: vec![ContentBlock::Text("moved to background".into())],
                 error: None,
             },
+            ..ToolCall::default()
         })],
     )
 }
@@ -158,6 +159,7 @@ fn background_subagent_launch(
                 blocks: vec![ContentBlock::Text("moved to background".into())],
                 error: None,
             },
+            ..ToolCall::default()
         })],
     )
 }
@@ -290,6 +292,7 @@ fn resumed_work(created: i64) -> TranscriptMessage {
                     blocks: vec![ContentBlock::Text("workflow run 123 成功".into())],
                     error: None,
                 },
+                ..ToolCall::default()
             }),
             Part::Text(TextPart {
                 text: "CI 通过了。".into(),

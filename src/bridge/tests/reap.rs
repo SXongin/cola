@@ -1641,6 +1641,7 @@ fn in_flight_shell(
                 },
                 error: None,
             },
+            ..ToolCall::default()
         })],
     }
 }

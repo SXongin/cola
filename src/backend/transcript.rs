@@ -1413,6 +1413,11 @@ pub struct TailMarker {
 
 /// A message part, typed. Unknown kinds decode into [`Part::Other`] with their
 /// raw payload, so a newer backend never breaks the read.
+///
+/// A tool call stays inline: ADR-0105's semantic fields make it the largest
+/// variant, and boxing it would put a deref in front of every consumer of a
+/// transient, per-read value for no measured win.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Part {
     Text(TextPart),
@@ -1569,10 +1574,21 @@ pub enum CompactionReason {
     Manual,
 }
 
-/// One tool call: who it is, how it is doing, and its raw payloads.
+/// One tool call: who it is, what it means, how it is doing, and its raw
+/// payloads. The identity, raw payloads and output belong to the vendor; the
+/// semantics ([`ToolKind`], [`ToolDetail`], the client's title and the
+/// locations it touched) are the adapter's declaration (ADR-0105). No renderer
+/// reads the semantic fields yet — the migration lands them first, so every
+/// existing card stays byte-identical.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub identity: ToolIdentity,
+    /// The coarse kind of work the call does, in ACP's vocabulary.
+    pub kind: ToolKind,
+    /// The client's own human title for the call, when it reported one.
+    pub title: Option<String>,
+    /// The files (or paths) the call touched, when the adapter can name them.
+    pub locations: Vec<ToolLocation>,
     pub status: ToolStatus,
     /// Server time the call started, when reported.
     pub started_at: Option<i64>,
@@ -1581,6 +1597,190 @@ pub struct ToolCall {
     /// The raw metadata, verbatim — an edit's unified diff lives here.
     pub metadata: Option<Value>,
     pub output: ToolOutput,
+    /// The shared shape the call carries, when the adapter recognises one.
+    pub detail: ToolDetail,
+}
+
+impl Default for ToolCall {
+    /// The neutral starting point a caller that decoded no semantics uses: no
+    /// identity, `Other`/`Opaque`, no title or locations. Every adapter sets
+    /// all four explicitly; test fixtures that only exercise the raw payloads
+    /// complete their literal with `..ToolCall::default()`.
+    fn default() -> Self {
+        Self {
+            identity: ToolIdentity {
+                name: String::new(),
+                call_id: String::new(),
+            },
+            kind: ToolKind::Other,
+            title: None,
+            locations: Vec::new(),
+            status: ToolStatus::Unknown,
+            started_at: None,
+            input: None,
+            metadata: None,
+            output: ToolOutput::default(),
+            detail: ToolDetail::Opaque,
+        }
+    }
+}
+
+/// A tool call's coarse category — ACP's `ToolKind` exactly, declared by the
+/// adapter rather than sniffed from the payload (ADR-0105). [`Other`] is the
+/// default only for an id the adapter does not recognise; a shared id without
+/// a mapping fails the adapter's conformance test.
+///
+/// [`Other`]: ToolKind::Other
+// ACP's complete vocabulary: the variants no adapter produces yet (a delete,
+// a move, a reasoning tool, a mode switch) are still declared, so a third
+// adapter answers the same enum instead of extending it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolKind {
+    Read,
+    Edit,
+    Delete,
+    Move,
+    Search,
+    Execute,
+    Think,
+    Fetch,
+    SwitchMode,
+    Other,
+}
+
+/// One location a tool call touched: a path and, when reported, a line in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolLocation {
+    pub path: String,
+    pub line: Option<u32>,
+}
+
+/// The shared shape a tool call carries. Typed only where two adapters agree
+/// on the semantics; a vendor tool with no shared shape is [`Opaque`] and one
+/// with nothing extra to say is [`None`] (ADR-0105).
+///
+/// [`None`]: ToolDetail::None
+/// [`Opaque`]: ToolDetail::Opaque
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolDetail {
+    /// A known shared tool with nothing extra to declare.
+    None,
+    /// A shell-like command: the command line, its working directory, the exit
+    /// code the client recorded, and whether it timed out.
+    Command {
+        command: String,
+        cwd: Option<String>,
+        exit: Option<i64>,
+        timeout: bool,
+    },
+    /// A Code Mode program: its source, language, and the nested calls it made.
+    /// The nested rows are the client's `toolCalls`, not transcript calls of
+    /// their own.
+    Program {
+        source: String,
+        language: Option<String>,
+        calls: Vec<NestedCall>,
+    },
+    /// The files a call edited, each with its action and diff.
+    FileEdits(Vec<FileEdit>),
+    /// A search: its query, its match count when reported, and its scope.
+    Search {
+        query: Option<String>,
+        matches: Option<u64>,
+        scope: SearchScope,
+    },
+    /// A file (or directory) read. An empty path in a read is
+    /// `Read { path: None }` — it is still a read.
+    Read {
+        path: Option<String>,
+        preview: Option<String>,
+        directory: bool,
+    },
+    /// A call that launches, addresses or reports on an agent run. The `runs`
+    /// are filled by the AgentRun ticket; P1 only lands the variant.
+    Delegation {
+        runs: Vec<AgentRunRef>,
+        effect: DelegationEffect,
+    },
+    /// A vendor tool with no shared shape: render raw (ADR-0042).
+    Opaque,
+}
+
+impl ToolDetail {
+    /// The paths this detail names, in the order it lists them: a read's file,
+    /// or every edited file. The adapter writes the same list into
+    /// [`ToolCall::locations`], so the two cannot disagree.
+    pub fn locations(&self) -> Vec<ToolLocation> {
+        match self {
+            Self::Read { path: Some(path), .. } if !path.is_empty() => vec![ToolLocation {
+                path: path.clone(),
+                line: None,
+            }],
+            Self::FileEdits(edits) => edits
+                .iter()
+                .filter(|edit| !edit.path.is_empty())
+                .map(|edit| ToolLocation {
+                    path: edit.path.clone(),
+                    line: None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// One file a [`ToolDetail::FileEdits`] recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdit {
+    pub path: String,
+    pub action: FileAction,
+    /// A rename's destination.
+    pub rename_to: Option<String>,
+    /// The unified diff, none for a no-hunk rename.
+    pub diff: Option<String>,
+}
+
+/// What happened to a file in a [`FileEdit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FileAction {
+    Add,
+    Update,
+    Delete,
+    Rename,
+}
+
+/// A Code Mode program's nested tool call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NestedCall {
+    pub name: String,
+    pub status: ToolStatus,
+    pub input: Option<Value>,
+}
+
+/// The scope a [`ToolDetail::Search`] covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchScope {
+    /// Filenames: `glob`.
+    FileName,
+    /// File contents: `grep`.
+    Content,
+    /// The web: `websearch`.
+    Web,
+}
+
+/// How a delegation call relates to the run it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DelegationEffect {
+    Launch,
+    Address,
+    Report,
+}
+
+/// A reference to an agent run, keyed by the run's stable identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRunRef {
+    pub run_id: String,
 }
 
 /// A run a settled tool call moved to the background: which tool launched it
@@ -1721,6 +1921,7 @@ mod tests {
             input: None,
             metadata: None,
             output: ToolOutput::default(),
+            ..ToolCall::default()
         })
     }
 
@@ -2700,6 +2901,7 @@ mod tests {
                     input: None,
                     metadata: None,
                     output: ToolOutput::default(),
+                    ..ToolCall::default()
                 }),
                 // A tool whose payload reported no status at all.
                 Part::Tool(ToolCall {
@@ -2712,6 +2914,7 @@ mod tests {
                     input: None,
                     metadata: None,
                     output: ToolOutput::default(),
+                    ..ToolCall::default()
                 }),
             ],
         );
@@ -3182,6 +3385,7 @@ mod tests {
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            ..ToolCall::default()
         };
         assert!(!call.status.is_live());
         assert_eq!(

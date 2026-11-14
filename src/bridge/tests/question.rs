@@ -1296,6 +1296,7 @@ async fn a_surfaced_question_drains_the_explanation_before_it() {
                         input: Some(serde_json::json!({ "questions": [] })),
                         metadata: None,
                         output: Default::default(),
+                        ..crate::backend::ToolCall::default()
                     }),
                 ],
             ),
@@ -1388,6 +1389,7 @@ async fn a_surfaced_question_drains_the_explanation_before_it() {
                     input: Some(serde_json::json!({ "questions": [] })),
                     metadata: None,
                     output: Default::default(),
+                    ..crate::backend::ToolCall::default()
                 }),
             ],
         ),

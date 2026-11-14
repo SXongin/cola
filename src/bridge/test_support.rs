@@ -115,6 +115,7 @@ pub(crate) fn tool_part(
             blocks: vec![ContentBlock::Text(output.to_string())],
             error: None,
         },
+        ..ToolCall::default()
     })
 }
 

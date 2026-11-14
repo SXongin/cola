@@ -59,6 +59,7 @@ fn running_tool_reply(created: i64, output: &str) -> TranscriptMessage {
                 blocks: vec![ContentBlock::Text(output.into())],
                 error: None,
             },
+            ..ToolCall::default()
         })],
     )
 }
@@ -98,6 +99,7 @@ fn subagent_reply(created: i64, child: &str, status: ToolStatus) -> TranscriptMe
                 blocks: vec![],
                 error: None,
             },
+            ..ToolCall::default()
         })],
     )
 }

@@ -3977,6 +3977,7 @@ mod tests {
                         input: None,
                         metadata: None,
                         output: Default::default(),
+                        ..ToolCall::default()
                     }),
                 ],
             ),
@@ -4007,6 +4008,7 @@ mod tests {
                         input: None,
                         metadata: None,
                         output: Default::default(),
+                        ..ToolCall::default()
                     }),
                     Part::Tool(ToolCall {
                         identity: ToolIdentity {
@@ -4018,6 +4020,7 @@ mod tests {
                         input: None,
                         metadata: None,
                         output: Default::default(),
+                        ..ToolCall::default()
                     }),
                 ],
             ),
@@ -4045,6 +4048,7 @@ mod tests {
                     input: None,
                     metadata: None,
                     output: Default::default(),
+                    ..ToolCall::default()
                 }),
             ],
         )]);

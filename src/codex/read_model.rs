@@ -33,10 +33,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::{
-    Compaction, CompactionReason, CompactionStatus, ContentBlock, FileContent, FinishReason, MessageId,
-    MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish,
-    TextPart, TodoList, TodoStatus, TodoStep, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
-    TranscriptMessage, TurnDiff, TurnDiffFile,
+    Compaction, CompactionReason, CompactionStatus, ContentBlock, DelegationEffect, FileAction, FileContent,
+    FileEdit, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part,
+    ReasoningPart, SearchScope, SessionTranscript, StepFinish, TextPart, TodoList, TodoStatus, TodoStep,
+    TokenUsage, ToolCall, ToolDetail, ToolIdentity, ToolKind, ToolOutput, ToolStatus, TranscriptMessage,
+    TurnDiff, TurnDiffFile,
 };
 
 /// `item/started`: the server's opening payload for one item.
@@ -1412,6 +1413,11 @@ impl Item {
     /// Codex items are already atomic (a command, a message, a reasoning
     /// block), so no part assembly beyond the item's own content is needed.
     fn parts(&self, labels: &HashMap<&str, &str>) -> (MessageRole, Vec<Part>) {
+        // The neutral semantics the adapter declares for this item (ADR-0105).
+        // Only a tool arm consumes them; the message-shaped arms ignore the
+        // opaque fallback.
+        let (tool_kind, tool_detail) = self.kind.semantics();
+        let locations = tool_detail.locations();
         match &self.kind {
             ItemKind::UserMessage { parts } => (MessageRole::User, parts.clone()),
             ItemKind::AgentMessage { text } => (
@@ -1449,6 +1455,9 @@ impl Item {
                             name: codex_tool_id("command_execution"),
                             call_id: self.id.clone(),
                         },
+                        kind: tool_kind,
+                        title: None,
+                        locations: locations.clone(),
                         status: status.clone(),
                         started_at: self.started_at_ms,
                         input: Some(json!({ "command": command, "cwd": cwd })),
@@ -1458,6 +1467,7 @@ impl Item {
                             "status": status_label(&status),
                         })),
                         output,
+                        detail: tool_detail,
                     })],
                 )
             }
@@ -1483,6 +1493,9 @@ impl Item {
                             name: codex_tool_id("file_change"),
                             call_id: self.id.clone(),
                         },
+                        kind: tool_kind,
+                        title: None,
+                        locations: locations.clone(),
                         status: status.clone(),
                         started_at: self.started_at_ms,
                         input: Some(json!({
@@ -1505,6 +1518,7 @@ impl Item {
                                 .collect::<Vec<_>>(),
                         })),
                         output: tool_output(&diff, status.is_failure()),
+                        detail: tool_detail,
                     })],
                 )
             }
@@ -1532,6 +1546,9 @@ impl Item {
                             name: format!("{server}/{tool}"),
                             call_id: self.id.clone(),
                         },
+                        kind: tool_kind,
+                        title: None,
+                        locations: locations.clone(),
                         status: status.clone(),
                         started_at: self.started_at_ms,
                         input: Some(arguments.clone()),
@@ -1547,6 +1564,7 @@ impl Item {
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
                         },
+                        detail: tool_detail,
                     })],
                 )
             }
@@ -1561,6 +1579,9 @@ impl Item {
                         name: codex_tool_id("web_search"),
                         call_id: self.id.clone(),
                     },
+                    kind: tool_kind,
+                    title: None,
+                    locations: locations.clone(),
                     status: self.tool_completion_status(),
                     started_at: self.started_at_ms,
                     input: Some(json!({ "query": query, "action": action })),
@@ -1570,6 +1591,7 @@ impl Item {
                         blocks: Vec::new(),
                         error: None,
                     },
+                    detail: tool_detail,
                 })],
             ),
             ItemKind::Image { path, .. } => (
@@ -1579,11 +1601,15 @@ impl Item {
                         name: codex_tool_id("image"),
                         call_id: self.id.clone(),
                     },
+                    kind: tool_kind,
+                    title: None,
+                    locations: locations.clone(),
                     status: self.tool_completion_status(),
                     started_at: self.started_at_ms,
                     input: Some(json!({ "path": path })),
                     metadata: Some(json!({ "path": path })),
                     output: ToolOutput::default(),
+                    detail: tool_detail,
                 })],
             ),
             // One collab call becomes one card's Tool Panel: the adapter writes
@@ -1606,6 +1632,9 @@ impl Item {
                         name: codex_tool_id("collab_agent"),
                         call_id: self.id.clone(),
                     },
+                    kind: tool_kind,
+                    title: None,
+                    locations: locations.clone(),
                     status: collab_status(status),
                     started_at: self.started_at_ms,
                     input: Some(json!({
@@ -1628,6 +1657,7 @@ impl Item {
                     })),
                     metadata: None,
                     output: ToolOutput::default(),
+                    detail: tool_detail,
                 })],
             ),
             // A child agent's activity is one line on the parent's card. It
@@ -1646,6 +1676,9 @@ impl Item {
                         name: codex_tool_id("sub_agent_activity"),
                         call_id: self.id.clone(),
                     },
+                    kind: tool_kind,
+                    title: None,
+                    locations: locations.clone(),
                     status: activity_status(kind, self.completed),
                     started_at: self.started_at_ms,
                     input: Some(json!({
@@ -1657,6 +1690,7 @@ impl Item {
                     })),
                     metadata: None,
                     output: ToolOutput::default(),
+                    detail: tool_detail,
                 })],
             ),
             ItemKind::Plan { text } => (
@@ -1777,7 +1811,7 @@ impl ItemKind {
                     *action = Some(value.clone());
                 }
             }
-            ItemKind::Image { path } => {
+            ItemKind::Image { path, .. } => {
                 if path.is_none()
                     && let Some(value) = item
                         .get("path")
@@ -1953,7 +1987,7 @@ impl ItemKind {
                     *results = Some(value.clone());
                 }
             }
-            ItemKind::Image { path } => {
+            ItemKind::Image { path, .. } => {
                 if let Some(value) = item
                     .get("path")
                     .or_else(|| item.get("savedPath"))
@@ -2081,8 +2115,13 @@ enum ItemKind {
         action: Option<Value>,
         results: Option<Value>,
     },
+    /// `imageView` and `imageGeneration` both project into one `codex/image`
+    /// item kind, so the source item type is kept here: an image view is a
+    /// `Read`, an image generation is an opaque image-creating tool (spec
+    /// #1057's Codex table).
     Image {
         path: Option<String>,
+        generated: bool,
     },
     /// One `collabAgentToolCall` (issue #962): a V2 collaboration tool call —
     /// `spawnAgent`, `sendInput`, `wait`, `closeAgent`, … — as the parent
@@ -2205,9 +2244,11 @@ impl ItemKind {
             },
             Some("imageView") => Self::Image {
                 path: item.get("path").and_then(Value::as_str).map(str::to_string),
+                generated: false,
             },
             Some("imageGeneration") => Self::Image {
                 path: item.get("savedPath").and_then(Value::as_str).map(str::to_string),
+                generated: true,
             },
             Some("collabAgentToolCall") => Self::Collab {
                 tool: item
@@ -2262,6 +2303,85 @@ impl ItemKind {
                 kind: String::new(),
                 raw: item.clone(),
             },
+        }
+    }
+
+    /// The neutral kind and shared detail this item declares (ADR-0105, spec
+    /// #1057's Codex table). Only the tool item kinds reach this method; the
+    /// message-shaped arms return the opaque fallback because they never
+    /// become a [`ToolCall`].
+    ///
+    /// `imageView` and `imageGeneration` share the `codex/image` item kind, so
+    /// the source type kept on [`ItemKind::Image`] decides here: a view reads a
+    /// file, a generation creates one and stays opaque.
+    fn semantics(&self) -> (ToolKind, ToolDetail) {
+        match self {
+            Self::Command {
+                command,
+                cwd,
+                exit_code,
+                ..
+            } => (
+                ToolKind::Execute,
+                ToolDetail::Command {
+                    command: display_string(command).unwrap_or_default().to_string(),
+                    cwd: display_string(cwd).map(str::to_string),
+                    exit: *exit_code,
+                    // A `commandExecution` item records no timeout flag.
+                    timeout: false,
+                },
+            ),
+            Self::FileChange { changes, .. } => (
+                ToolKind::Edit,
+                ToolDetail::FileEdits(changes.iter().map(file_edit).collect()),
+            ),
+            // An MCP tool is third-party: its payload is never sniffed.
+            Self::Mcp { .. } => (ToolKind::Other, ToolDetail::Opaque),
+            Self::WebSearch { query, .. } => (
+                ToolKind::Search,
+                ToolDetail::Search {
+                    query: display_string(query).map(str::to_string),
+                    matches: None,
+                    scope: SearchScope::Web,
+                },
+            ),
+            Self::Image {
+                path,
+                generated: false,
+            } => (
+                ToolKind::Read,
+                ToolDetail::Read {
+                    path: path.clone().filter(|path| !path.is_empty()),
+                    preview: None,
+                    directory: false,
+                },
+            ),
+            Self::Image { generated: true, .. } => (ToolKind::Other, ToolDetail::Opaque),
+            Self::Collab { tool, .. } => (
+                ToolKind::Other,
+                ToolDetail::Delegation {
+                    // The run facts land with the AgentRun ticket; P1 only
+                    // declares which verb this call is.
+                    runs: Vec::new(),
+                    effect: collab_effect(tool),
+                },
+            ),
+            // A child's lifecycle observation is a report on its run.
+            Self::SubAgentActivity { .. } => (
+                ToolKind::Other,
+                ToolDetail::Delegation {
+                    runs: Vec::new(),
+                    effect: DelegationEffect::Report,
+                },
+            ),
+            // Not a tool call: the message, reasoning, plan and compaction
+            // arms reach no ToolCall.
+            Self::UserMessage { .. }
+            | Self::AgentMessage { .. }
+            | Self::Reasoning { .. }
+            | Self::Plan { .. }
+            | Self::Compaction
+            | Self::Other { .. } => (ToolKind::Other, ToolDetail::Opaque),
         }
     }
 
@@ -2498,6 +2618,47 @@ fn collab_agents(item: &Value) -> Vec<AgentState> {
     }
     rows.extend(states);
     rows
+}
+
+/// A wire string as a display fact: empty reads as absent.
+fn display_string(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+/// One `fileChange` entry as the neutral file edit. The action comes from the
+/// wire's `kind` union; an update that names a destination is a rename (its
+/// `movePath` names the file that now exists).
+fn file_edit(change: &FileUpdate) -> FileEdit {
+    let (action, rename_to) = match change.kind.get("type").and_then(Value::as_str) {
+        Some("add") => (FileAction::Add, None),
+        Some("delete") => (FileAction::Delete, None),
+        Some("update") => match change
+            .kind
+            .get("movePath")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        {
+            Some(destination) => (FileAction::Rename, Some(destination.to_string())),
+            None => (FileAction::Update, None),
+        },
+        _ => (FileAction::Update, None),
+    };
+    FileEdit {
+        path: change.path.clone(),
+        action,
+        rename_to,
+        diff: (!change.diff.trim().is_empty()).then(|| change.diff.clone()),
+    }
+}
+
+/// How one `collabAgentToolCall` relates to the run it names: only
+/// `spawnAgent` launches; every other verb (including one upstream adds) is a
+/// receipt on an existing run (ADR-0106).
+fn collab_effect(tool: &str) -> DelegationEffect {
+    match tool {
+        "spawnAgent" => DelegationEffect::Launch,
+        _ => DelegationEffect::Address,
+    }
 }
 
 fn combine_reasoning(summary: &str, text: &str) -> Option<String> {
@@ -3774,6 +3935,62 @@ mod tests {
         );
         let call = projected_tool(&interrupted, "item-activity-interrupted");
         assert_eq!(call.status, ToolStatus::Error);
+    }
+
+    /// Spec #1057 P1: `imageView` and `imageGeneration` both project into the
+    /// one `codex/image` item kind, so the adapter keeps the source type on the
+    /// item: a view is a `Read`, a generation stays opaque.
+    #[test]
+    fn an_image_view_reads_and_an_image_generation_stays_opaque() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_100i64,
+                        "item": {"type": "imageView", "id": "item-view", "path": "/work/in.png"}
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_100i64,
+                        "item": {"type": "imageGeneration", "id": "item-gen", "savedPath": "/work/out.png"}
+                    }
+                }),
+            ],
+        );
+
+        let view = projected_tool(&projection, "item-view");
+        assert_eq!(view.identity.name, "codex/image");
+        assert_eq!(view.kind, ToolKind::Read);
+        assert_eq!(
+            view.detail,
+            ToolDetail::Read {
+                path: Some("/work/in.png".to_string()),
+                preview: None,
+                directory: false,
+            }
+        );
+        assert_eq!(
+            view.locations,
+            vec![crate::backend::ToolLocation {
+                path: "/work/in.png".to_string(),
+                line: None,
+            }]
+        );
+
+        let generation = projected_tool(&projection, "item-gen");
+        assert_eq!(generation.identity.name, "codex/image");
+        assert_eq!(generation.kind, ToolKind::Other);
+        assert_eq!(generation.detail, ToolDetail::Opaque);
+        assert!(generation.locations.is_empty());
     }
 
     /// The one Tool Panel a given item id projects, through the neutral read.

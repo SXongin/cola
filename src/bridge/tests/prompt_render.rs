@@ -108,6 +108,7 @@ fn orphaned_in_flight_message(
                 blocks: Vec::new(),
                 error: None,
             },
+            ..ToolCall::default()
         })],
     }
 }
