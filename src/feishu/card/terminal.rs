@@ -14,9 +14,11 @@
 //! flag, so the loop can end on it and the buttons can follow it.
 //!
 //! Every fenced element — cwd, command and output alike — is clipped through the
-//! shared [`clip_fenced_body`] walk, so a long backtick run can never make the
+//! **Command output block** the Tool Panel's `Command` shape renders its body
+//! with ([`command_output_block`]), so a long backtick run can never make the
 //! fence (which grows with the run) push the element past
-//! [`MAX_ELEMENT_TEXT_CHARS`].
+//! [`MAX_ELEMENT_TEXT_CHARS`](super::MAX_ELEMENT_TEXT_CHARS), and a clip rule
+//! fixed on one surface is the other's too.
 //!
 //! The display tail is line-oriented and bounded twice (ADR-0086 §"The
 //! no-terminal constraint" and decision 4): each line is capped at
@@ -33,8 +35,7 @@ use serde_json::json;
 
 use super::sanitize::CardMarkdown;
 use super::shell::{card_shell, fmt_elapsed};
-use super::tool_render::{clip_fenced_body, clip_fenced_tail};
-use super::{MAX_ELEMENT_TEXT_CHARS, fenced_code};
+use super::tool_render::{OutputClip, command_output_block};
 
 /// The newest characters of a **Terminal Log** a card shows: the live tail and
 /// the settled tail share this one budget (ADR-0086 §4).
@@ -569,22 +570,27 @@ fn button_column(label: &str, kind: &str, value: serde_json::Value) -> serde_jso
     })
 }
 
-/// One fenced element under the per-element budget. The clip charges the body's
-/// JSON-escaped bytes PLUS the dynamic fence `fenced_code` will add, so the
-/// whole element (prefix, fence and body) stays inside
-/// [`MAX_ELEMENT_TEXT_CHARS`]; the returned flag says whether the body had to be
-/// cut. The prefix itself is charged at its byte length, which is never smaller
-/// than its character count (the conservative side). `keep_tail` clips from the
-/// end, so the output's newest line — its diagnostic — survives.
+/// One fenced element under the per-element budget, through the **Command
+/// output block** the Tool Panel's `Command` shape renders its body with
+/// (`command_output_block`, ADR-0086: a render block, never a lifecycle) — one
+/// code path, so a clip or fence rule fixed on the panel cannot be wrong here.
+/// The block charges the body's JSON-escaped bytes PLUS the dynamic fence
+/// `fenced_code` will add, so the whole element (prefix, fence and body) stays
+/// inside [`MAX_ELEMENT_TEXT_CHARS`](super::MAX_ELEMENT_TEXT_CHARS); the returned
+/// flag says whether the body had to be cut. `keep_tail` clips from the end, so
+/// the output's newest line — its diagnostic — survives.
 fn fenced_element(
     prefix: &str,
     body: &str,
     keep_tail: bool,
     markdown: &mut CardMarkdown,
 ) -> (serde_json::Value, bool) {
-    let clipped = displayed_text(prefix, body, keep_tail);
-    let was_clipped = clipped != body;
-    let block = fenced_code(&clipped, None);
+    let (block, was_clipped) = command_output_block(
+        body,
+        OutputClip::element(prefix, keep_tail),
+        // A Terminal Log and a command line are machine output: always fenced.
+        true,
+    );
     let element = json!({
         "tag": "markdown",
         "content": markdown.clean(&format!("{prefix}\n{block}")),
@@ -593,16 +599,12 @@ fn fenced_element(
 }
 
 /// The body a fenced element under `prefix` actually shows: clipped to the
-/// per-element budget, from the head or (the output's newest line) the tail.
-/// The button payload uses this too, so what it carries is exactly what the
-/// card renders — never the raw input.
+/// per-element budget, from the head or (the output's newest line) the tail —
+/// the same clip [`fenced_element`] renders through. The button payload uses
+/// this too, so what it carries is exactly what the card renders — never the raw
+/// input.
 fn displayed_text(prefix: &str, body: &str, keep_tail: bool) -> String {
-    let budget = MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1);
-    if keep_tail {
-        clip_fenced_tail(body, None, budget)
-    } else {
-        clip_fenced_body(body, None, budget)
-    }
+    OutputClip::element(prefix, keep_tail).clipped(body)
 }
 
 /// Render the newest output for display: split on `\n`, treat a `\r` inside a
@@ -879,6 +881,7 @@ pub(crate) fn full_output_notice(outcome: FullOutputOutcome<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feishu::card::MAX_ELEMENT_TEXT_CHARS;
 
     fn settled(stopped: bool, survivors: bool) -> serde_json::Value {
         build_terminal_card(TerminalCard {
@@ -1135,6 +1138,44 @@ mod tests {
             "the placeholder claims nothing about the run: {text}"
         );
         assert_eq!(card.to_string().matches("\"tag\":\"button\"").count(), 0);
+    }
+
+    /// ADR-0086's shared render block, from the Terminal Card's side: its output
+    /// section IS the **Command output block** a `Command` Tool Panel renders its
+    /// body through — the same clip and fence, with no lifecycle, Chain or record
+    /// riding along (the states around it are unchanged).
+    #[test]
+    fn the_terminal_cards_output_is_the_command_output_block() {
+        let body = format!("building\n{}\ndone", "x".repeat(140));
+        let card = build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: "make",
+            output: &body,
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: None,
+            notice: None,
+            state: TerminalState::Live {
+                past_cap: false,
+                survivors: false,
+            },
+            run_id: "run-shared",
+            chat_id: "chat_1",
+            thread_id: "chat_1",
+        });
+        let (block, cut) = command_output_block(&body, OutputClip::element("**输出**", true), true);
+        assert!(!cut, "a body inside the per-element budget is not cut");
+        assert!(block.starts_with("```\n"), "machine output is fenced: {block}");
+        let texts = crate::bridge::test_support::card_texts(&card);
+        let output = texts
+            .iter()
+            .find(|content| content.starts_with("**输出**"))
+            .expect("the card carries an output element");
+        assert_eq!(
+            output,
+            &format!("**输出**\n{block}"),
+            "the output element is the shared block"
+        );
     }
 
     /// A card a bare `/run` superseded says where the run went and offers no
