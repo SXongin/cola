@@ -77,7 +77,7 @@ new one.
 | Turn-diff index | `diffs` | no index line, no button |
 | `/mcp` card | `mcp` | the command reports it as unsupported |
 
-A absent surface is **omitted**, never rendered empty and never guessed from a
+An absent surface is **omitted**, never rendered empty and never guessed from a
 failed read. Absence is recorded once at attach (one log line naming the client
 and the missing surfaces), and each client has a test that asserts each absent
 surface stays absent.
@@ -117,7 +117,7 @@ this ADR changes no rendering by itself.
 
 ## Why
 
-- **One question instead of nine.** A new surface asks `capabilities()`; a new
+- **One question instead of ten.** A new surface asks `capabilities()`; a new
   client answers one struct.
 - **Degradation becomes testable.** "This client has no ledger" is now an
   assertion, not a consequence observed in production.

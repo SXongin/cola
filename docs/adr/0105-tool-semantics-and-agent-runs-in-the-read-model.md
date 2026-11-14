@@ -161,6 +161,11 @@ all mean "a child agent this Turn set running" — and the relations, `agent` an
 genuinely different run shape adds a field when its second producer exists, per
 the same rule as `ToolDetail`.
 
+`run_id` is the run's stable identity: the child session/thread id when the
+client reports one, otherwise the **launching call's id**. It is never empty, so
+a run without a child id is still addressable and `AgentRunRef` never aliases two
+runs with the empty string.
+
 A call relates to a run in one of three ways: it **launches** one
 (`task`/`subagent`, `spawnAgent`), **addresses** an existing one (`sendInput`,
 `wait`, `closeAgent`), or **reports** on one (`subAgentActivity`). All three
