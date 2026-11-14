@@ -2,6 +2,8 @@
 
 > **Amended by ADR-0107**: the header's live phase tokens are `waiting`,
 > `reasoning` and `responding` (they replace 思考中/推理中/回复中).
+> The body below is the historical record and is not rewritten; this banner is
+> authoritative (convention: #1065).
 
 > **Amended by the 2026-11-04 update below**: the decision stands. Two parts of
 > the framing were too broad: element-level increments buy more than a
@@ -109,5 +111,5 @@ waiting on that tool. The phase and the header label therefore read the running
 call first: a Reasoning state with a running tool reports the Tool phase and the
 tool's own label, and no reasoning length rides along. The STATE keeps its
 ordinary meaning (`mark_reasoning` is still a plain write), so when the call
-settles and nothing else has streamed the header falls back to 「💭 reasoning」
+settles and nothing else has streamed the header falls back to 「💭 推理中」
 rather than claiming a reply nobody wrote.

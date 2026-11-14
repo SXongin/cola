@@ -7,6 +7,8 @@
 >
 > **Amended by ADR-0107**: the liveness vocabulary is `waiting`/`reasoning`/
 > `responding`, and the tool token is `shell` (not `bash`).
+> The body below is the historical record and is not rewritten; this banner is
+> authoritative (convention: #1065).
 
 > **Amended by ADR-0066**: the freeze's carve-out widens — a yielded card also
 > receives its Wake's resumed content (ADR-0066 resumes shell/subagent
@@ -109,10 +111,8 @@ the record of the request, but renders 🌙 in its status slot instead of ✅ �
 rest of the title is a normal panel's (`🌙 shell · <label>`); the ledger, not
 the panel, owns the run's liveness.
 
-V1 carries none of the background facts; a `task` child is a run, but V1's
-child-evidence read does not exist yet, so `reports_live_runs()` is false and the
-section stays empty until that read lands (ADR-0106). Behavior is today's (the
-ADR-0059 degradation).
+V1 carries none of these facts: there the section is empty and behavior is
+today's (the ADR-0059 degradation).
 
 ## Considered options
 
@@ -199,7 +199,7 @@ review round as the amendment above):
 
 ## Amendment (2026-10-02): the type words are the tools' own names
 
-The ledger's type words are the run's tool token (`shell`/`subagent`) everywhere it names one, not the vendor id (#502, ADR-0107;
+The ledger's type words are the tool's own name everywhere it names one (#502,
 spec #501): the ledger and the Tool Panel call one task the same thing.
 
 - The live row reads `· shell：**npm run build** · 14:02 · 3m12s` /
@@ -219,8 +219,8 @@ spec #501): the ledger and the Tool Panel call one task the same thing.
 
 A background `subagent`'s live row carries the same child-session liveness the
 live task panel shows (spec #501, ticket #503): appended after the row's start
-clock — `· subagent：**review the diff** · 14:04 · shell 5s`, or
-`· waiting 30s · 等待你的授权` for a phase and its wait — through the front's own
+clock — `· subagent：**review the diff** · 14:04 · bash 5s`, or
+`· 思考中 30s · 等待你的授权` for a phase and its wait — through the front's own
 fragment vocabulary, so one child state reads the same wherever cola renders
 it. The fragment sits after the start clock and before `· ⚠️ 状态待确认`; a row
 the runtime reconciliation could not confirm renders no activity, and a `shell`

@@ -11,6 +11,8 @@
 > verbs only. The Codex arm's verbs (`派生子 Agent`, `等待子 Agent`) are tokenized by
 > ADR-0107 (`subagent`; the surrounding words stay Copy), and a `wait`/`sendInput`
 > is an addressing call, not a panel (ADR-0106).
+> The body below is the historical record and is not rewritten; this banner is
+> authoritative (convention: #1065).
 
 A **Tool Panel** renders each tool call on the card, and today only `read`,
 `edit` and `todowrite` have tailored renderers: an audit of 100 sessions /
@@ -18,8 +20,8 @@ A **Tool Panel** renders each tool call on the card, and today only `read`,
 card, `apply_patch` diffs dropped, and WebSearch's JSON rendered as a wall. The
 tempting fix is one renderer per tool — including the MCP servers and injected
 plugins that show up in the Shared Store. This ADR fixes the **boundary**
-instead: cola tailors Tool Panel rendering only for the **shared tool kinds** the adapter
-declares (ADR-0105); every other tool's input/output is opaque and
+instead: cola tailors Tool Panel rendering only for **OpenCode built-in tools**
+(and tools cola itself injects); every other tool's input/output is opaque and
 rendered raw. A built-in's id (`bash`, `read`, `task`, …) is a stable registry
 contract cola can follow; a third-party tool's payload shape is another
 project's implementation detail with no compatibility promise, and matching on
@@ -46,9 +48,8 @@ it would couple cola's card code to servers it does not own.
 
 ## Decision
 
-- **Tailor by `(ToolKind, ToolDetail)`** for the shared kinds (ADR-0105); the
-  exact id is identity and the opaque fallback. (Originally "tailor by exact tool
-  id"; superseded by ADR-0105.) Each gets a
+- **Tailor by exact tool id** for OpenCode built-ins — the set above as they are
+  observed — and for tools cola itself registers (none today). Each gets a
   renderer only where the shape is known and worth showing better.
 - **Everything else is opaque.** For an unrecognized tool, output passes through
   unchanged except `needs_code_block` fencing and `state.error` extraction, and
@@ -252,8 +253,8 @@ response item the item stream does not carry, so the card states what it knows
 instead of reading as a rendering gap. An unknown `tool` or
 `status` keeps its raw string on the card rather than falling back to `Other` —
 the wire enums are upstream's to extend (an unknown status rides the Input line,
-since the icon alone could not name it). The activity updates its **Agent Run** (ADR-0105); it renders no panel and names
-the kind, the child thread and its `agentPath` — clipped to the folded
+since the icon alone could not name it). The activity is a one-line panel
+naming the kind, the child thread and its `agentPath` — clipped to the folded
 header's own short-line budget by keeping the path's tail, the same rule a long
 file name takes.
 
@@ -270,9 +271,7 @@ rendering only, creates no chat mapping, and opens no write path into a child
 thread.
 
 The boundary is otherwise unchanged: a third-party tool that squats either id
-with a partial payload stays raw. The "no Codex-only vocabulary is renamed" half
-is superseded by ADR-0107 (the display token is `shell`/`subagent`; the id stays
-as identity).
+with a partial payload stays raw, and no Codex-only vocabulary is renamed.
 
 ## Amendment (2026-11-04): Codex `update_plan` feeds the Todo Panel
 
@@ -292,11 +291,10 @@ Panel fallback.
 
 The Codex panel is display-only: it never drives the header's running-tool
 view, and it keeps the established `📋 todowrite` title so the two sources read
-as one card-tail section (that title is the **Todo Panel's copy**; the `todowrite`
-*tool* tokenizes to `plan` under ADR-0107). Because the notification is not part of thread
+as one card-tail section. Because the notification is not part of thread
 history, a freshly built projection shows no plan until the next
 `turn/plan/updated` arrives; a resync keeps the plan it already holds.
 
-The rest of this ADR is unchanged **except its dispatch key**: since ADR-0105 a
-Tool Panel is chosen by the call's `ToolKind`/`ToolDetail`, not by the exact id;
-the ids named above remain identity and the opaque fallback.
+The rest of this ADR is unchanged: Tool Panel rendering remains limited to the
+exact built-in or adapter-owned ids named above, together with their recorded
+shape gates.

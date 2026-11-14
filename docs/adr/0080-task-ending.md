@@ -5,6 +5,8 @@
 > evidence, and every rule below applies to it unchanged. A run first named by a
 > non-launch fact (a report before its launch) is keyed by that call's id; a later
 > launch is an alias.
+> The body below is the historical record and is not rewritten; this banner is
+> authoritative (convention: #1065).
 
 > **Ratified (2026-10-14, spec #699)**: three points where the landed
 > implementation diverges from this ADR's literal wording — the **Wake** path
@@ -78,9 +80,8 @@ derivation — see the 2026-10-14 amendment below.
 **One run, one record; one shown fact per ending.**
 
 - **The identity is the run, and the run's ids are aliases of one record.** A
-  new `TaskRunId`: the id **first minted** by the first fact that names the run —
-  a launch's call id, a report-before-launch call id, or the shell/job/child id a
-  Wake itself reports (never an invented one). One run's
+  new `TaskRunId`: the launch's call id when the read carries the launch, else
+  the shell/child id a Wake itself reports (never an invented one). One run's
   endings — evidence, the user's Cleanup, a Wake completion — live under that one
   id, and the record carries every id the run is known by (the launch's call id,
   its shell/child id, its tool call id, and the Wake id whose completion it
@@ -101,9 +102,8 @@ derivation — see the 2026-10-14 amendment below.
   record no longer keys on — would each mint a record, and the duplicate #659 is
   about would come straight back. So **every writer resolves before it mints**,
   and it resolves by every id it holds, strongest identity first:
-  1. an exact **`TaskRunId`** — the id **first minted** for the run (a launch's
-     call id, a report-before-launch call id, or a Wake's shell/job/child id); a
-     retirement always holds it, so evidence and cleanup endings are exact;
+  1. an exact **`TaskRunId`** — the launch's call id; a retirement always holds
+     it, so evidence and cleanup endings are exact;
   2. an exact **Wake id** already on a record — a Wake's own id is unique, so a
      re-encounter is exact;
   3. else the **newest** record naming any other id the writer holds (the
