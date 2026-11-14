@@ -1414,9 +1414,11 @@ pub struct TailMarker {
 /// A message part, typed. Unknown kinds decode into [`Part::Other`] with their
 /// raw payload, so a newer backend never breaks the read.
 ///
-/// A tool call stays inline: ADR-0105's semantic fields make it the largest
-/// variant, and boxing it would put a deref in front of every consumer of a
-/// transient, per-read value for no measured win.
+/// A tool call stays inline. ADR-0105's semantic fields make `ToolCall` the
+/// largest variant and trip `large_enum_variant`; boxing it (`Part::Tool(Box<
+/// ToolCall>)`) would add a deref to every renderer, adapter and bridge site
+/// that reads a call — a hot, transient per-read value — for no measured win,
+/// so the variant stays inline deliberately.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Part {
@@ -1601,11 +1603,13 @@ pub struct ToolCall {
     pub detail: ToolDetail,
 }
 
+/// Test-only: every adapter sets all four semantic fields explicitly through
+/// `ToolCall::declared`; this is for fixtures that exercise only the raw
+/// payloads and complete their literal with `..ToolCall::default()`.
+#[cfg(test)]
 impl Default for ToolCall {
-    /// The neutral starting point a caller that decoded no semantics uses: no
-    /// identity, `Other`/`Opaque`, no title or locations. Every adapter sets
-    /// all four explicitly; test fixtures that only exercise the raw payloads
-    /// complete their literal with `..ToolCall::default()`.
+    /// A neutral, semantics-free starting point: no identity, `Other`/`Opaque`,
+    /// no title or locations.
     fn default() -> Self {
         Self {
             identity: ToolIdentity {

@@ -16,19 +16,27 @@ mod wire;
 
 /// Decode one V1 tool call for the cross-adapter conformance suite (spec
 /// #1057 P1): the caller names the tool and its raw state, and this strategy
-/// builds the V1 wire envelope, so no V1 field name leaves the strategy (the
-/// generation guard's rule) and the suite still drives the real decoder.
+/// builds the V1 *envelope* (`type`/`tool`/`callID`/`state`), so that half of
+/// the wire shape stays inside the strategy; the shared semantic reads
+/// (`workdir`, `metadata.diff`, …) live in `tool_semantics` beside the two
+/// decoders.
 #[cfg(test)]
 pub(crate) fn decode_tool_for_conformance(
     name: &str,
     input: serde_json::Value,
     metadata: serde_json::Value,
+    output: Option<&str>,
 ) -> crate::backend::ToolCall {
     wire::legacy::decode_tool_part(&serde_json::json!({
         "type": "tool",
         "tool": name,
         "callID": format!("call_{name}"),
-        "state": {"status": "completed", "input": input, "metadata": metadata},
+        "state": {
+            "status": "completed",
+            "input": input,
+            "metadata": metadata,
+            "output": output,
+        },
     }))
 }
 
