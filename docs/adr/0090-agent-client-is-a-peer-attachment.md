@@ -1,5 +1,9 @@
 # An agent client is a peer attachment; Codex's is app-server
 
+> **Amended by ADR-0105**: its second-adapter rule for neutral DTOs is refined —
+> `ToolDetail::Program` is admitted with one producer, with the exception argued
+> in that ADR.
+
 ## Context
 
 cola's whole value proposition rests on one architectural accident: OpenCode's
