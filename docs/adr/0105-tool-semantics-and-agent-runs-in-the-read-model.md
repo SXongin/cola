@@ -31,8 +31,8 @@ inverts the economics:
   the Permission card (`describe_permission`, `src/bridge/request/kind.rs:2999`)
   and the Background Task Ledger (`task_kind`/`task_label`,
   `src/bridge/tasks/model.rs:358`) each keep their own name→meaning table. The
-  same Codex command is 「命令」 on its panel, 「执行 Shell 命令」 on a permission
-  card, and a `shell` row in the ledger.
+  same Codex command is 「命令」 on its panel and 「执行 Shell 命令」 on a
+  permission; where an OpenCode ledger row exists, the same thing is `shell`.
 - **Sub-agents are four display paths for one concept.** OpenCode's
   `task`/`subagent` carries a child session, a liveness line and a ledger row;
   Codex's `collabAgentToolCall` is a panel per call with no liveness and no
