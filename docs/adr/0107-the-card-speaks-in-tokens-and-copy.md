@@ -135,21 +135,15 @@ use different words for the same phase.
 
 **4. A terminal header is copy, not a token.** `✅ 完成` / `❌ 出错` /
 `⏹ 已停止` close the card as a sentence; they are not a machine slot. The ledger
-has two layers: `RunStatus` (`Running` / `Completed` / `Failed` / `Cancelled` /
-`Unknown`) is **the client's statement**, and cola's `TaskEnding` (Wake /
-RuntimeEnded / Lost / Cleaned) is how cola learned it ended — wider than
-`RunStatus`, because `结束` (a runtime-confirmed end with no Wake) and `已清理`
-(the user's dismissal) have no client-side status, and a runtime-confirmed end
-does **not** become a client `Completed`. The rendered verb — `完成` / `失败` /
-`已取消` / `结束` / `已失联` / `已清理` — is copy derived from the **applicable**
-ending: `TaskEnding` when cola has one, else the client's `RunStatus`
-(`Completed`→`完成`, `Failed`→`失败`, `Cancelled`→`已取消`). `Unknown` is not a
-terminal word: a run reporting it with no `TaskEnding` stays live, and the row
-shows no terminal verb. A runtime-confirmed end still renders `结束` and a
-cleanup `已清理`. The enum spellings are invariant
-because adapters and logs compare them. *(If a later review prefers
-`🔔 shell completed：…` verbatim, only the copy table changes — the model values
-are already there.)*
+has three layers: `RunStatus` (`Running` / `Completed` / `Failed` / `Cancelled` /
+`Unknown`) is **the client's statement**; ADR-0080's **durable**
+`TaskEndingClass` (`Evidence` / `Cleanup` / `Wake`, with its evidence) is what
+cola records; and the **render** enum `bridge::tasks::TaskEnding` (`Wake` /
+`RuntimeEnded` / `Lost` / `Cleaned`) names the card's word. The rendered verb —
+`完成` / `失败` / `已取消` / `结束` / `已失联` / `已清理` — is copy derived from the
+render ending, or from `RunStatus` when only the client reported the end. A
+runtime-confirmed end renders `结束` (a durable `Evidence`), a cleanup renders
+`已清理` (a durable `Cleanup`), and neither is folded into `RunStatus`.
 
 **5. Section labels are copy.** `**Input**` / `**Output**` become `**输入**` /
 `**输出**`. Units (`个文件`, `行`, `处匹配`) stay copy. Card titles (`📄 会话`,
@@ -218,8 +212,10 @@ escaping and budget rules).
   were never in the token table.
 - **The token table and ADR-0105's `ToolKind` are different axes.** Several
   tokens may share one kind (`glob`/`grep` → `Search`, `write`/`edit` → `Edit`),
-  and the token refines the kind through `ToolDetail`. An Agent Client that can
-  only fill the coarse kind still renders correctly.
+  and the token refines the kind through `ToolDetail`. An Agent Client that
+  fills the detail renders correctly; one that cannot must either map its tool
+  to the detail or accept the opaque fallback (`Edit + None` and `Search + None`
+  keep the vendor name).
 
 ## Open
 
