@@ -2700,12 +2700,49 @@ fn codex_tool_id(kind: &str) -> String {
     format!("codex/{kind}")
 }
 
-/// One raw Codex item projected into its neutral Tool Call — the cross-adapter
-/// conformance test's entry point, so the suite drives the real
-/// `item/completed` → `Item::parts` path (where the semantics are attached),
-/// not a second copy of the mapping.
+/// The shared shape a recognized Codex item declares, for the conformance
+/// inventory (`NoTool`: the item is a message or a session fact, not a call).
 #[cfg(test)]
-pub(crate) fn tool_for_conformance(item: &Value) -> ToolCall {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ItemShape {
+    NoTool,
+    Command,
+    FileEdits,
+    Search,
+    Read,
+    Delegation,
+    Opaque,
+}
+
+/// Every wire item type `ItemKind::from_wire` recognizes, with the Tool kind
+/// and shared shape it declares. The cross-adapter conformance suite iterates
+/// this table, so a recognized type with no expected shape fails there; keep it
+/// in step with `from_wire`.
+#[cfg(test)]
+pub(crate) const RECOGNIZED_ITEM_TYPES: &[(&str, Option<ToolKind>, ItemShape)] = &[
+    ("userMessage", None, ItemShape::NoTool),
+    ("agentMessage", None, ItemShape::NoTool),
+    ("reasoning", None, ItemShape::NoTool),
+    ("commandExecution", Some(ToolKind::Execute), ItemShape::Command),
+    ("fileChange", Some(ToolKind::Edit), ItemShape::FileEdits),
+    ("mcpToolCall", Some(ToolKind::Other), ItemShape::Opaque),
+    ("webSearch", Some(ToolKind::Search), ItemShape::Search),
+    ("imageView", Some(ToolKind::Read), ItemShape::Read),
+    ("imageGeneration", Some(ToolKind::Other), ItemShape::Opaque),
+    (
+        "collabAgentToolCall",
+        Some(ToolKind::Other),
+        ItemShape::Delegation,
+    ),
+    ("subAgentActivity", Some(ToolKind::Other), ItemShape::Delegation),
+    ("plan", None, ItemShape::NoTool),
+    ("contextCompaction", None, ItemShape::NoTool),
+];
+
+/// One raw Codex item projected through the real completion-event →
+/// `Item::parts` path. `None` for an item that projects no Tool Call.
+#[cfg(test)]
+pub(crate) fn projected_item_for_conformance(item: &Value) -> Option<ToolCall> {
     let mut projection = ThreadProjection::new("thread-conformance");
     let event = json!({
         "method": ITEM_COMPLETED,
@@ -2729,7 +2766,14 @@ pub(crate) fn tool_for_conformance(item: &Value) -> ToolCall {
             Part::Tool(call) => Some(call.clone()),
             _ => None,
         })
-        .expect("the conformance item projects a tool call")
+}
+
+/// One raw Codex item projected into its neutral Tool Call — the cross-adapter
+/// conformance test's entry point, so the suite drives the real projection
+/// path (where the semantics are attached), not a second copy of the mapping.
+#[cfg(test)]
+pub(crate) fn tool_for_conformance(item: &Value) -> ToolCall {
+    projected_item_for_conformance(item).expect("the conformance item projects a tool call")
 }
 
 fn command_status(status: &Option<String>, exit_code: Option<i64>) -> ToolStatus {

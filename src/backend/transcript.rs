@@ -1689,6 +1689,11 @@ pub enum ToolDetail {
     /// The files a call edited, each with its action and diff.
     FileEdits(Vec<FileEdit>),
     /// A search: its query, its match count when reported, and its scope.
+    ///
+    /// `matches` is the count the client recorded: a real match count where its
+    /// wire reports one (`grep`'s `matches`, `glob`'s `count`), else the number
+    /// of result rows Codex's `webSearch` records — that wire carries no count
+    /// field, so its rows are the only count available.
     Search {
         query: Option<String>,
         matches: Option<u64>,

@@ -25,32 +25,56 @@ use crate::backend::{
     DelegationEffect, FileAction, FileEdit, NestedCall, SearchScope, ToolCall, ToolDetail, ToolKind,
     ToolStatus,
 };
-use crate::codex::read_model::tool_for_conformance as codex_tool;
+use crate::codex::read_model::{
+    ItemShape, RECOGNIZED_ITEM_TYPES, projected_item_for_conformance as codex_project,
+    tool_for_conformance as codex_tool,
+};
 
-/// One V1 tool call decoded through the legacy wire decoder.
-fn v1_call(name: &str, input: Value, metadata: Value, output: Option<&str>) -> ToolCall {
-    v1_tool(name, input, metadata, output)
-}
-
-/// One V2 tool call decoded through the V2 wire decoder.
-fn v2_call(name: &str, input: Value, metadata: Value, output: Option<&str>) -> ToolCall {
-    v2_tool(name, input, metadata, output)
-}
-
+/// One V1 tool's `(kind, detail)`, decoded through the legacy wire decoder.
 fn v1(name: &str, input: Value, metadata: Value) -> (ToolKind, ToolDetail) {
-    let call = v1_call(name, input, metadata, None);
+    let call = v1_tool(name, input, metadata, None, None);
     (call.kind, call.detail)
 }
 
+/// One V2 tool's `(kind, detail)`, decoded through the V2 wire decoder.
 fn v2(name: &str, input: Value, metadata: Value) -> (ToolKind, ToolDetail) {
-    let call = v2_call(name, input, metadata, None);
+    let call = v2_tool(name, input, metadata, None);
     (call.kind, call.detail)
 }
 
-/// One Codex item's Tool Call, through the adapter's real projection path.
+/// One Codex item's `(kind, detail)`, through the adapter's real projection
+/// path (not a second copy of its mapping).
 fn codex(item: Value) -> (ToolKind, ToolDetail) {
     let call = codex_tool(&item);
     (call.kind, call.detail)
+}
+
+/// The neutral concept a detail declares, with its payload values erased. The
+/// cross-producer comparisons use it so two ids cannot pass by carrying the
+/// same values under different shapes (or by both matching a tautology).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailShape {
+    None,
+    Command,
+    Program,
+    FileEdits,
+    Search,
+    Read,
+    Delegation,
+    Opaque,
+}
+
+fn detail_shape(detail: &ToolDetail) -> DetailShape {
+    match detail {
+        ToolDetail::None => DetailShape::None,
+        ToolDetail::Command { .. } => DetailShape::Command,
+        ToolDetail::Program { .. } => DetailShape::Program,
+        ToolDetail::FileEdits(_) => DetailShape::FileEdits,
+        ToolDetail::Search { .. } => DetailShape::Search,
+        ToolDetail::Read { .. } => DetailShape::Read,
+        ToolDetail::Delegation { .. } => DetailShape::Delegation,
+        ToolDetail::Opaque => DetailShape::Opaque,
+    }
 }
 
 /// Render one decoded call through the real Tool Panel card builder. The
@@ -218,47 +242,63 @@ fn edit_is_one_file_edit_on_every_producer() {
         )
     );
 
-    let patch = (
-        ToolKind::Edit,
-        ToolDetail::FileEdits(vec![
-            FileEdit {
+    // V1's real `apply_patch` metadata is one `{filepath, diff}` pair (the
+    // permission card reads the same shape); it names the file and carries the
+    // panel's diff.
+    assert_eq!(
+        v1(
+            "apply_patch",
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"filepath": "src/a.rs", "diff": "@@ -1 +1 @@\n-a\n+b"})
+        ),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
                 path: "src/a.rs".to_string(),
                 action: FileAction::Update,
                 rename_to: None,
                 diff: Some("@@ -1 +1 @@\n-a\n+b".to_string()),
-            },
-            FileEdit {
-                path: "src/b.rs".to_string(),
-                action: FileAction::Delete,
-                rename_to: None,
-                diff: None,
-            },
-        ]),
+            }])
+        )
     );
-    let patch_metadata = json!({"files": [
-        {"file": "src/a.rs", "patch": "@@ -1 +1 @@\n-a\n+b", "status": "modified"},
-        {"file": "src/b.rs", "patch": "", "status": "deleted"}
-    ]});
-    for name in ["patch", "apply_patch"] {
-        assert_eq!(
-            v1(
-                name,
-                json!({"patchText": "*** Begin Patch"}),
-                patch_metadata.clone()
-            ),
-            patch,
-            "{name} (V1) names its recorded files"
-        );
-        assert_eq!(
-            v2(
-                name,
-                json!({"patchText": "*** Begin Patch"}),
-                patch_metadata.clone()
-            ),
-            patch,
-            "{name} (V2) names its recorded files"
-        );
-    }
+    // V2's real `patch` metadata is its `FileDiff.Info` list.
+    assert_eq!(
+        v2(
+            "patch",
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"files": [
+                {"file": "src/a.rs", "patch": "@@ -1 +1 @@\n-a\n+b", "status": "modified"},
+                {"file": "src/b.rs", "patch": "", "status": "deleted"}
+            ]})
+        ),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![
+                FileEdit {
+                    path: "src/a.rs".to_string(),
+                    action: FileAction::Update,
+                    rename_to: None,
+                    diff: Some("@@ -1 +1 @@\n-a\n+b".to_string()),
+                },
+                FileEdit {
+                    path: "src/b.rs".to_string(),
+                    action: FileAction::Delete,
+                    rename_to: None,
+                    diff: None,
+                },
+            ])
+        )
+    );
+    // A V1 patch with only a diff names no file, and a path-less entry is not
+    // a FileEdit: that stays P3's patch-text parse.
+    assert_eq!(
+        v1(
+            "apply_patch",
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"diff": "@@ -1 +1 @@\n-a\n+b"})
+        ),
+        (ToolKind::Edit, ToolDetail::FileEdits(Vec::new()))
+    );
 }
 
 /// A Codex change's action — add, delete, update, rename — comes from the wire
@@ -530,6 +570,155 @@ fn an_image_generation_is_opaque_where_an_image_view_is_a_read() {
     );
 }
 
+/// The client's title is the adapter's fact: V1's `state.title` reaches the
+/// call (an empty one is no title) and V2, which reports none, stays `None`.
+#[test]
+fn a_v1_title_reaches_the_call_and_a_v2_call_reports_none() {
+    let titled = v1_tool(
+        "bash",
+        json!({"command": "ls"}),
+        Value::Null,
+        Some("List files"),
+        None,
+    );
+    assert_eq!(titled.title.as_deref(), Some("List files"));
+
+    let untitled = v1_tool("bash", json!({"command": "ls"}), Value::Null, Some(""), None);
+    assert_eq!(untitled.title, None, "an empty title is no title");
+
+    let v2_call = v2_tool("shell", json!({"command": "ls"}), Value::Null, None);
+    assert_eq!(v2_call.title, None, "V2's ToolState reports no title");
+}
+
+/// Every file-bearing detail names the same paths in `ToolCall::locations`,
+/// on all three producers.
+#[test]
+fn file_bearing_calls_carry_their_detail_locations() {
+    let calls = [
+        v1_tool("read", json!({"filePath": "src/a.rs"}), Value::Null, None, None),
+        v2_tool("read", json!({"path": "src/a.rs"}), Value::Null, None),
+        v1_tool("write", json!({"filePath": "src/a.rs"}), Value::Null, None, None),
+        v2_tool("write", json!({"path": "src/a.rs"}), Value::Null, None),
+        v1_tool(
+            "apply_patch",
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"filepath": "src/a.rs", "diff": "@@ -1 +1 @@"}),
+            None,
+            None,
+        ),
+        v2_tool(
+            "patch",
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"files": [{"file": "src/a.rs", "patch": "@@ -1 +1 @@"}]}),
+            None,
+        ),
+        codex_tool(&json!({"type": "imageView", "id": "item-view", "path": "src/a.rs"})),
+        codex_tool(&json!({
+            "type": "fileChange",
+            "id": "item-file",
+            "changes": [{"path": "src/a.rs", "kind": {"type": "update"}, "diff": ""}]
+        })),
+    ];
+    for call in calls {
+        assert_eq!(
+            call.locations,
+            call.detail.locations(),
+            "locations must mirror the detail"
+        );
+        assert_eq!(call.locations.len(), 1, "one named file: {call:#?}");
+        assert_eq!(call.locations[0].path, "src/a.rs");
+        assert_eq!(call.locations[0].line, None);
+    }
+}
+
+/// Codex's own inventory: every wire item type its decoder recognizes has a
+/// declared Tool kind and shared shape (`NoTool` for the message/session
+/// facts), so a recognized type with no expectation fails here.
+#[test]
+fn every_recognized_codex_item_type_has_its_declared_shape() {
+    assert_eq!(
+        RECOGNIZED_ITEM_TYPES
+            .iter()
+            .map(|(wire, _, _)| *wire)
+            .collect::<Vec<_>>(),
+        [
+            "userMessage",
+            "agentMessage",
+            "reasoning",
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "webSearch",
+            "imageView",
+            "imageGeneration",
+            "collabAgentToolCall",
+            "subAgentActivity",
+            "plan",
+            "contextCompaction",
+        ],
+        "the declared inventory is the decoder's complete recognized-item set"
+    );
+
+    for &(wire, expected_kind, shape) in RECOGNIZED_ITEM_TYPES {
+        let item = json!({"type": wire, "id": format!("item-{wire}")});
+        let call = codex_project(&item);
+        match (call, expected_kind, shape) {
+            (None, None, ItemShape::NoTool) => {}
+            (Some(call), Some(expected_kind), shape) => {
+                assert_eq!(call.kind, expected_kind, "{wire} keeps its declared kind");
+                let expected = match shape {
+                    ItemShape::NoTool => panic!("{wire} declares no tool but a shape"),
+                    ItemShape::Command => DetailShape::Command,
+                    ItemShape::FileEdits => DetailShape::FileEdits,
+                    ItemShape::Search => DetailShape::Search,
+                    ItemShape::Read => DetailShape::Read,
+                    ItemShape::Delegation => DetailShape::Delegation,
+                    ItemShape::Opaque => DetailShape::Opaque,
+                };
+                assert_eq!(
+                    detail_shape(&call.detail),
+                    expected,
+                    "{wire} keeps its declared detail shape"
+                );
+            }
+            (call, kind, _) => panic!(
+                "{wire}: a tool call and its kind must agree (tool={:?}, kind={kind:?})",
+                call.is_some()
+            ),
+        }
+    }
+}
+
+/// The Codex inventory is the decoder's real match set: a new `from_wire` arm
+/// that is not declared here fails, not just a declaration that diverges.
+#[test]
+fn the_codex_item_inventory_covers_every_recognized_wire_type() {
+    let source = include_str!("../codex/read_model.rs");
+    let start = source
+        .find("fn from_wire(item: &Value) -> Self {")
+        .expect("the decoder's item match exists");
+    let tail = &source[start..];
+    let end = tail
+        .find("fn from_completed")
+        .expect("the decoder's match has an end");
+    let mut decoded: Vec<&str> = tail[..end]
+        .match_indices("Some(\"")
+        .map(|(index, _)| {
+            let rest = &tail[..end][index + "Some(\"".len()..];
+            &rest[..rest.find('"').expect("a closed wire-type literal")]
+        })
+        .collect();
+    decoded.sort_unstable();
+    decoded.dedup();
+
+    let mut declared: Vec<&str> = RECOGNIZED_ITEM_TYPES.iter().map(|(wire, _, _)| *wire).collect();
+    declared.sort_unstable();
+    assert_eq!(
+        decoded, declared,
+        "the declared inventory must be the decoder's recognized wire types"
+    );
+}
+
 /// Every id the adapter declares is mapped on both generations, and the
 /// inventory itself has no duplicate — an unmapped shared id fails here rather
 /// than becoming opaque.
@@ -542,18 +731,65 @@ fn every_declared_shared_id_is_mapped() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), count, "a shared id is declared twice");
+    assert_eq!(
+        ids,
+        [
+            "apply_patch",
+            "bash",
+            "edit",
+            "execute",
+            "glob",
+            "grep",
+            "patch",
+            "question",
+            "read",
+            "shell",
+            "skill",
+            "subagent",
+            "task",
+            "todowrite",
+            "webfetch",
+            "websearch",
+            "write",
+        ],
+        "the declared inventory is the adapter's complete shared-id set"
+    );
 
-    for (id, declared_kind) in inventory {
-        for (generation, (kind, detail)) in [
+    for id in inventory.iter().map(|(id, _)| *id) {
+        for (generation, (_, detail)) in [
             ("V1", v1(id, json!({}), Value::Null)),
             ("V2", v2(id, json!({}), Value::Null)),
         ] {
-            assert_eq!(kind, declared_kind, "{id} ({generation}) keeps its kind");
             assert_ne!(
-                detail,
-                ToolDetail::Opaque,
+                detail_shape(&detail),
+                DetailShape::Opaque,
                 "{id} ({generation}) fell into the opaque default"
             );
+        }
+    }
+
+    // One neutral concept, several ids: a divergent arm fails here (the table
+    // lookup alone cannot compare two ids to each other).
+    for group in [
+        &["bash", "shell"][..],
+        &["patch", "apply_patch"],
+        &["task", "subagent"],
+        &["todowrite", "skill", "question"],
+    ] {
+        let first = group[0];
+        let (expected_kind, expected_detail) = v1(first, json!({}), Value::Null);
+        let expected_shape = detail_shape(&expected_detail);
+        for id in &group[1..] {
+            for (generation, (kind, detail)) in [
+                ("V1", v1(id, json!({}), Value::Null)),
+                ("V2", v2(id, json!({}), Value::Null)),
+            ] {
+                assert_eq!(
+                    (kind, detail_shape(&detail)),
+                    (expected_kind, expected_shape),
+                    "{id} ({generation}) must declare the same concept as {first}"
+                );
+            }
         }
     }
 }
@@ -573,10 +809,10 @@ fn an_unknown_id_is_opaque_on_both_generations() {
 /// same builder.
 const V1_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**Input**\n`ls -la`\n📁 `/work`\n\n**Output**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ bash","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
 
-/// Captured from `7c9859da` (see [`V1_BASELINE_CARD`]).
+/// Captured from `7c9859da` by the same builder, from V2's decoded edit item.
 const V2_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"tag":"button","text":{"content":"📂 打开","tag":"plain_text"},"type":"default","value":{"action":"file","path":"src/a.rs","session_id":"ses_1"}},{"content":"**Input**\n📄 `src/a.rs`\n\n**Output**\n\n+1 −1\n\n```plain_text\n@@ -1 +1 @@\n-old\n+new\n\n```","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ edit · 📄 a.rs","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
 
-/// Captured from `7c9859da` (see [`V1_BASELINE_CARD`]).
+/// Captured from `7c9859da` by the same builder, from Codex's decoded command item.
 const CODEX_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**Input**\n`ls -la`\n📁 `/work`\n\n**Output**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ 命令","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
 
 /// Byte-identity guard, one producer each: a decoded wire payload renders the
@@ -584,10 +820,11 @@ const CODEX_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_ca
 /// semantic field changes one of these.
 #[test]
 fn a_decoded_v1_bash_renders_the_baseline_card() {
-    let call = v1_call(
+    let call = v1_tool(
         "bash",
         json!({"command": "ls -la", "workdir": "/work"}),
         json!({"exit": 0}),
+        None,
         Some("total 0\n"),
     );
     assert_eq!(render_card(call), V1_BASELINE_CARD);
@@ -595,7 +832,7 @@ fn a_decoded_v1_bash_renders_the_baseline_card() {
 
 #[test]
 fn a_decoded_v2_edit_renders_the_baseline_card() {
-    let call = v2_call(
+    let call = v2_tool(
         "edit",
         json!({"path": "src/a.rs", "oldString": "old", "newString": "new"}),
         json!({"files": [{"file": "src/a.rs", "patch": "@@ -1 +1 @@\n-old\n+new"}]}),

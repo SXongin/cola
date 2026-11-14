@@ -25,6 +25,7 @@ pub(crate) fn decode_tool_for_conformance(
     name: &str,
     input: serde_json::Value,
     metadata: serde_json::Value,
+    title: Option<&str>,
     output: Option<&str>,
 ) -> crate::backend::ToolCall {
     wire::legacy::decode_tool_part(&serde_json::json!({
@@ -35,6 +36,7 @@ pub(crate) fn decode_tool_for_conformance(
             "status": "completed",
             "input": input,
             "metadata": metadata,
+            "title": title,
             "output": output,
         },
     }))
