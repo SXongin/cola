@@ -40,6 +40,7 @@ use crate::backend::{
     ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
     ToolStatus, TranscriptMessage, TurnDiffFile, Wake, WakeSource,
 };
+use crate::opencode::tool_semantics::ToolPayloads;
 
 /// `{data: T}` — the envelope most V2 reads share (R2's "unwrap per route —
 /// there is no single rule").
@@ -1379,8 +1380,7 @@ fn decode_tool(item: &Value) -> ToolCall {
         None,
         status.clone(),
         item.pointer("/time/created").and_then(Value::as_i64),
-        input,
-        metadata,
+        ToolPayloads::new(input, metadata),
         decode_tool_output(state),
     )
 }

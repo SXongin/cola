@@ -148,20 +148,36 @@ pub(crate) fn shared_tool_inventory() -> Vec<(&'static str, ToolKind)> {
     SHARED_TOOLS.iter().map(|tool| (tool.id, tool.kind)).collect()
 }
 
+/// The two raw payloads a decode site read: the call's structured input and its
+/// recorded metadata. Bundled so a call's construction does not grow one
+/// positional argument per payload (and so a future payload is one field, not a
+/// new parameter at every call site).
+pub(crate) struct ToolPayloads {
+    pub(crate) input: Option<Value>,
+    pub(crate) metadata: Option<Value>,
+}
+
+impl ToolPayloads {
+    pub(crate) fn new(input: Option<Value>, metadata: Option<Value>) -> Self {
+        Self { input, metadata }
+    }
+}
+
 impl ToolCall {
-    /// One decoded call with its semantics attached. The adapters call this so
-    /// the kind, the derived locations and the detail are written in one place
-    /// rather than repeated per decode site.
-    #[allow(clippy::too_many_arguments)]
+    /// One decoded call with its semantics attached. The two OpenCode decoders
+    /// call this so the kind, the derived locations and the detail are written
+    /// in one place rather than repeated per decode site. Codex derives the
+    /// same fields in `Item::tool_part`, where its typed item replaces the raw
+    /// payloads.
     pub(crate) fn declared(
         identity: ToolIdentity,
         title: Option<String>,
         status: ToolStatus,
         started_at: Option<i64>,
-        input: Option<Value>,
-        metadata: Option<Value>,
+        payloads: ToolPayloads,
         output: ToolOutput,
     ) -> Self {
+        let ToolPayloads { input, metadata } = payloads;
         let (kind, detail) = tool_semantics(&identity.name, input.as_ref(), metadata.as_ref());
         let locations = detail.locations();
         Self {
@@ -206,6 +222,10 @@ fn read_detail(input: Option<&Value>, _metadata: Option<&Value>) -> ToolDetail {
 
 /// A `write`'s file: the metadata's `FileDiff` list when V2 recorded one
 /// (its diff rides there), otherwise the input's structured path.
+///
+/// The action stays `Add` even over a recorded status: ticket #1058's table
+/// says `write` is `FileEdits` with one `add`, and the status field is the
+/// diff entry's own label rather than the tool's semantic action.
 fn write_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
     let recorded = metadata_files(metadata, Some(FileAction::Add));
     if !recorded.is_empty() {
@@ -231,12 +251,29 @@ fn edit_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
     ToolDetail::FileEdits(one_edit(input, FileAction::Update, None))
 }
 
-/// A `patch`/`apply_patch`: V2 records the touched files in `metadata.files[]`
-/// (`FileDiff.Info = {file, patch, status}`), so the adapter names them. A
-/// payload without the list yields an empty list — the parse of the patch TEXT
-/// is P3's.
+/// A `patch`/`apply_patch`. V2 records the touched files in
+/// `metadata.files[]` (`FileDiff.Info = {file, patch, status}`); V1 records one
+/// `{filepath, diff}` pair. Both name the change the panel renders. A diff with
+/// no name at all is not a `FileEdit` (a path-less entry would be wrong), so the
+/// patch TEXT's parse that names it stays P3's.
 fn patch_detail(_input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
-    ToolDetail::FileEdits(metadata_files(metadata, None))
+    let recorded = metadata_files(metadata, None);
+    if !recorded.is_empty() {
+        return ToolDetail::FileEdits(recorded);
+    }
+    let path = metadata
+        .and_then(|metadata| metadata.get("filepath"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty());
+    match (path, metadata_diff(metadata)) {
+        (Some(path), diff) => ToolDetail::FileEdits(vec![FileEdit {
+            path: path.to_string(),
+            action: FileAction::Update,
+            rename_to: None,
+            diff,
+        }]),
+        _ => ToolDetail::FileEdits(Vec::new()),
+    }
 }
 
 fn glob_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
@@ -567,6 +604,66 @@ mod tests {
         assert_eq!(
             patch_detail(Some(&json!({"patchText": "*** Begin Patch"})), None),
             ToolDetail::FileEdits(Vec::new())
+        );
+    }
+
+    /// V1 records one `{filepath, diff}` pair; either half alone is not a file
+    /// edit (the patch text's parse that names a path-less diff is P3's).
+    #[test]
+    fn a_v1_patch_reads_its_filepath_and_diff() {
+        assert_eq!(
+            patch_detail(
+                Some(&json!({"patchText": "*** Begin Patch"})),
+                Some(&json!({"filepath": "src/a.rs", "diff": "@@ -1 +1 @@\n-a\n+b"}))
+            ),
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "src/a.rs".to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: Some("@@ -1 +1 @@\n-a\n+b".to_string()),
+            }])
+        );
+        assert_eq!(
+            patch_detail(None, Some(&json!({"filepath": "src/a.rs"}))),
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "src/a.rs".to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: None,
+            }])
+        );
+        assert_eq!(
+            patch_detail(None, Some(&json!({"diff": "@@ -1 +1 @@\n-a\n+b"}))),
+            ToolDetail::FileEdits(Vec::new()),
+            "a path-less diff waits for P3's patch-text parse"
+        );
+    }
+
+    /// A recorded `FileDiff.Info.status` names the action, and an empty path is
+    /// skipped rather than emitted as a nameless edit.
+    #[test]
+    fn a_recorded_status_names_the_action_and_empty_paths_are_skipped() {
+        assert_eq!(file_action(Some("added")), FileAction::Add);
+        assert_eq!(file_action(Some("deleted")), FileAction::Delete);
+        assert_eq!(file_action(Some("modified")), FileAction::Update);
+        assert_eq!(file_action(Some("renamed")), FileAction::Update);
+        assert_eq!(file_action(None), FileAction::Update);
+
+        let edits = metadata_files(
+            Some(&json!({"files": [
+                {"file": "", "patch": "ignored"},
+                {"file": "src/a.rs", "patch": "@@ -1 +1 @@", "status": "added"}
+            ]})),
+            None,
+        );
+        assert_eq!(
+            edits,
+            vec![FileEdit {
+                path: "src/a.rs".to_string(),
+                action: FileAction::Add,
+                rename_to: None,
+                diff: Some("@@ -1 +1 @@".to_string()),
+            }]
         );
     }
 

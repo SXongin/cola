@@ -24,6 +24,7 @@ use crate::backend::{
     StepStart, TokenUsage, ToolCall, ToolOutput, ToolStatus, TranscriptMessage,
 };
 use crate::error::Result;
+use crate::opencode::tool_semantics::ToolPayloads;
 
 use super::{
     assemble_tool_output, decode_error, decode_finish_reason, decode_text_part, decode_tool_identity,
@@ -424,8 +425,7 @@ fn decode_tool(part: &Value) -> ToolCall {
         title,
         status.clone(),
         state.and_then(|state| started_at(state, "/time/start")),
-        input,
-        metadata,
+        ToolPayloads::new(input, metadata),
         decode_tool_output(state, &status),
     )
 }
