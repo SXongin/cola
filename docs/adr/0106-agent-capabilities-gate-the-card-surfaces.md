@@ -72,8 +72,10 @@ and the exact row are spec #1057's.
 
 **5. Existing per-subsystem methods fold into the read.**
 `background_tasks_supported` and its siblings are not a second source of truth.
-They become capability reads (thin delegations during the migration, removed
-when no caller remains). Landing this ADR changes no rendering by itself.
+`background_tasks_supported` delegates to `background_runs`; the live-run ledger
+and the **runtime reconciliation's early return** gate on `reports_live_runs()`,
+so a child-only Agent Client still gets its verdict. The rest are thin
+delegations, removed when no caller remains. Landing this ADR changes no rendering by itself.
 
 ## Why
 
@@ -83,9 +85,10 @@ when no caller remains). Landing this ADR changes no rendering by itself.
   assertion, not a consequence observed in production.
 - **It keeps the card free of Agent Client identity.** The card never asks "is
   this Codex?"; it asks whether a surface exists.
-- **It matches what an Agent Client already is.** Codex's own `initialize`
-  result advertises its capabilities; cola's adapter translates that into this
-  struct instead of re-deriving it per subsystem.
+- **It matches what an Agent Client already is.** The adapter derives the
+  struct from the surface it pinned (ADR-0090's probe) and the protocol it was
+  written against — Codex's `initialize` carries identity only, so its
+  capabilities come from the pinned app-server schema, not a capability field.
 
 ## Considered options
 
