@@ -275,7 +275,7 @@ impl ToolPanel {
     }
 
     /// The tool's built-in id (`bash`, `read`, …). It is the display word and
-    /// the key the not-yet-migrated name arms use; the Execute family selects
+    /// the key the not-yet-migrated name arms use; the `Execute` family selects
     /// its renderer by `(kind, detail)` instead (ADR-0105).
     pub fn name(&self) -> &str {
         &self.call.identity.name
@@ -499,7 +499,7 @@ enum ExecuteShape<'a> {
 }
 
 impl<'a> ExecuteShape<'a> {
-    /// The Execute shape `tool` carries, when its adapter declared one. A
+    /// The `Execute` family's shape `tool` carries, when its adapter declared one. A
     /// detail on a kind that is not `Execute` is not an Execute call (a lying
     /// detail gets the opaque path, ADR-0105's consequence).
     fn of(tool: &'a ToolPanel) -> Option<Self> {
@@ -539,12 +539,12 @@ impl<'a> ExecuteShape<'a> {
     }
 }
 
-/// Whether the call is the Execute family's `Command` shape.
+/// Whether the call is the `Execute` family's `Command` shape.
 fn is_command(tool: &ToolPanel) -> bool {
     matches!(ExecuteShape::of(tool), Some(ExecuteShape::Command { .. }))
 }
 
-/// Whether the call is the Execute family's `Program` shape: the panel that
+/// Whether the call is the `Execute` family's `Program` shape: the panel that
 /// spends the output budget on its input and puts its call count in the folded
 /// title.
 fn is_program(tool: &ToolPanel) -> bool {
@@ -1364,15 +1364,20 @@ pub(crate) enum OutputClip {
 }
 
 impl OutputClip {
-    /// The clip one fenced element under `prefix` uses: the element's whole
-    /// budget is [`MAX_ELEMENT_TEXT_CHARS`], so the prefix and its newline come
-    /// out of the body's. `keep_tail` keeps the newest bytes.
-    pub(crate) fn element(prefix: &str, keep_tail: bool) -> Self {
-        let budget = MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1);
-        if keep_tail {
-            Self::BytesTail { max_bytes: budget }
-        } else {
-            Self::Bytes { max_bytes: budget }
+    /// The clip one fenced element's body takes under `prefix`, keeping its
+    /// head: the element's whole budget is [`MAX_ELEMENT_TEXT_CHARS`], so the
+    /// prefix and its newline come out of the body's.
+    pub(crate) fn under_element(prefix: &str) -> Self {
+        Self::Bytes {
+            max_bytes: element_body_budget(prefix),
+        }
+    }
+
+    /// [`Self::under_element`] from the END: the newest bytes survive, because a
+    /// command's last line is its diagnostic.
+    pub(crate) fn tail_under_element(prefix: &str) -> Self {
+        Self::BytesTail {
+            max_bytes: element_body_budget(prefix),
         }
     }
 
@@ -1387,7 +1392,13 @@ impl OutputClip {
     }
 }
 
-/// The **Command output block** — one code path for a `Command` Tool Panel
+/// The bytes one fenced element's body may spend under `prefix`: the element's
+/// whole budget ([`MAX_ELEMENT_TEXT_CHARS`]) less the prefix and its newline.
+fn element_body_budget(prefix: &str) -> usize {
+    MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1)
+}
+
+/// The `Command` output block — one code path for a `Command` Tool Panel
 /// (ADR-0105) and the Host **Terminal Card** (ADR-0086: the two share a render
 /// block, never a lifecycle, a Chain or a record).
 ///
@@ -1904,8 +1915,8 @@ pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
 /// [`TOOL_OUTPUT_MAX_CHARS`] and charged in the form the renderer writes it —
 /// a generated list goes through the sanitizer (which expands `<`), a fenced
 /// body carries its dynamic fence and language tag. Shared by the Codex search
-/// results and a collaboration call's target rows, so neither can drift from
-/// what it renders.
+/// results, a collaboration call's target rows and a Code Mode program's
+/// nested-call body, so none of them can drift from what it renders.
 fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, body: &str) -> usize {
     let header = header
         .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
@@ -1920,17 +1931,21 @@ fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, body: &str) -
 }
 
 /// The serialized byte length the Output body a panel renders contributes to
-/// its card size (#788): a file-editing panel's PARSED diff ([`diff_output`],
-/// clipped at [`DIFF_MAX_ESCAPED_BYTES`] as the render writes it, #792); a
-/// `write` call's own `content` ([`write_body`], which the output text does not
-/// carry) together with the `📄 <path>` header that body renders; else the
-/// tool's output text. Every body is measured JSON-ESCAPED (the form it takes
-/// inside the card's `content` string, each newline and quote costing its extra
-/// byte) and with the dynamic fence [`fenced_overhead`] charges for a body full
-/// of backticks. Kept beside the render so the estimate cannot charge a body
-/// the panel never writes, nor miss the file a `write` just produced — and a
-/// diff is charged under the SAME cap it renders under, never the old
-/// 3,000-character preview (#792).
+/// its card size (#788). The branches walk the bodies in the same order
+/// [`panel_output`] does, so the first body the renderer reaches is the one
+/// charged: a `Program`'s assembled nested-call body; a `write` call's own
+/// `content` ([`write_body`], which the output text does not carry) together
+/// with the `📄 <path>` header that body renders; a file-editing panel's PARSED
+/// diff ([`diff_output`], clipped at [`DIFF_MAX_ESCAPED_BYTES`] as the render
+/// writes it, #792); a Codex search's or collaboration call's assembled body;
+/// else the call's output text (a `Command`'s included, through the same shared
+/// block). Every body is measured JSON-ESCAPED (the form it takes inside the
+/// card's `content` string, each newline and quote costing its extra byte) and
+/// with the dynamic fence [`fenced_overhead`] charges for a body full of
+/// backticks. Kept beside the render so the estimate cannot charge a body the
+/// panel never writes, nor miss the file a `write` just produced — and a diff is
+/// charged under the SAME cap it renders under, never the old 3,000-character
+/// preview (#792).
 ///
 /// The boundary #792's acceptance line names: a diff that already fit the old
 /// 3,000-character preview renders exactly as it did before and is charged at
@@ -1940,6 +1955,29 @@ fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, body: &str) -
 /// because the card now carries those bytes. Ordinary `read`/`write` panels
 /// keep their 3,000-character budget and their old charge untouched.
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
+    // A Code Mode program's nested-call rows and result are assembled from the
+    // shape, not from the call's text output: charge the body the panel writes.
+    // Its progress header is the folded title's (`title_details`), not part of
+    // this body charge.
+    if is_program(tool) {
+        return program_output(tool)
+            .map(|(_, style, body)| assembled_body_estimate(None, style, &body))
+            .unwrap_or(0);
+    }
+    let write = write_body(tool);
+    if let Some((header, _, body)) = &write {
+        // The header rides the body's markdown OUTSIDE any fence, so it is
+        // charged through the card's own sanitizer — a path that closes its
+        // inline code span (`a\`<<<<.rs`) has its `<`-es expanded there, and
+        // the raw length would under-count them. The content itself is a
+        // fenced `Code` body clipped at the preview cap.
+        let header = header
+            .as_deref()
+            .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
+            .unwrap_or(0);
+        let body = truncate_md(body, TOOL_OUTPUT_MAX_CHARS);
+        return header + json_escaped_len(&body) + fenced_overhead(&body);
+    }
     // A diff renders its parsed hunks clipped at the byte budget, not the raw
     // recorded diff at the preview cap: charge exactly that body, the count
     // header above it and the WHOLE fence around it, language tag included.
@@ -1954,41 +1992,21 @@ pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
         let body = clip_fenced_body(&body, lang, DIFF_MAX_ESCAPED_BYTES);
         return header + json_escaped_len(&body) + fenced_block_overhead(&body) + fence_lang_bytes(lang);
     }
-    // A Codex search's body is assembled from metadata, not from the call's
-    // (empty) text output, so it is charged from the same derivation the panel
-    // renders — header included, and the raw fallback's `json` fence tag, which
-    // the generic branch's constant does not carry.
+    // A Codex search's or collaboration call's body is assembled from metadata,
+    // not from the call's (empty) text output, so it is charged from the same
+    // derivation the panel renders — header included, and the raw fallback's
+    // `json` fence tag, which the generic branch's constant does not carry.
     if let Some((header, style, body)) = codex_web_search_output(tool).or_else(|| codex_collab_output(tool)) {
         return assembled_body_estimate(header.as_deref(), style, &body);
     }
-    // A Code Mode program's nested-call rows and result are assembled from the
-    // shape, not from the call's text output: charge the body the panel writes.
-    // Its count header is the folded title's (`title_details`), not part of this
-    // body charge.
-    if is_program(tool) {
-        return program_output(tool)
-            .map(|(_, style, body)| assembled_body_estimate(None, style, &body))
-            .unwrap_or(0);
-    }
-    let write = write_body(tool);
-    // The header rides the body's markdown OUTSIDE any fence, so it is charged
-    // through the card's own sanitizer — a path that closes its inline code span
-    // (`a\`<<<<.rs`) has its `<`-es expanded there, and the raw length would
-    // under-count them.
-    let header = write
-        .as_ref()
-        .and_then(|(header, _, _)| header.as_deref())
-        .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
-        .unwrap_or(0);
-    let body = write
-        .map(|(_, _, body)| body)
-        .or_else(|| tool.output())
+    // Everything else — a `Command` included — is its output text, clipped at
+    // the preview cap exactly as the render clips it.
+    tool.output()
         .map(|body| {
             let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
             json_escaped_len(&body) + fenced_overhead(&body)
         })
-        .unwrap_or(0);
-    header + body
+        .unwrap_or(0)
 }
 
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
@@ -2015,7 +2033,7 @@ pub(super) fn tool_panel_element(
 ) -> serde_json::Value {
     // One name read for the panel's name-keyed decisions: the todo section's
     // detection, the input formatter's fallback table, and the header's display
-    // name. The Execute family is selected by its shape instead.
+    // name. The `Execute` family is selected by its shape instead.
     let name = tool.name();
     // A `Program` assembles its body from its nested-call list, and a `write`
     // renders its own `content` input, so those have their own builders; every
@@ -2841,14 +2859,15 @@ fn search_count_header(name: &str, metadata: Option<&serde_json::Value>) -> Opti
     })
 }
 
-/// The `Program` panel's output (the Execute family's Code Mode shape): one
+/// The `Program` panel's output (the execute family's Code Mode shape): one
 /// status row per nested tool call the program made — the shape records them
 /// live, in start order, while the program runs — followed by the formatted
-/// result. The header is the call count (plus failures), which the panel
-/// promotes to its folded title (`title_details`). `None` when there is neither
-/// a nested call nor a result, so the panel falls back to its input alone.
+/// result. The header is the pinned title's progress line — the call count, the
+/// nested failures and the program's OWN failure — which the panel promotes to
+/// its folded title (`title_details`). `None` when there is neither a nested
+/// call nor a result, so the panel falls back to its input alone.
 fn program_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    let Some(ExecuteShape::Program { calls, .. }) = ExecuteShape::of(tool) else {
+    let Some(ExecuteShape::Program { calls, error, .. }) = ExecuteShape::of(tool) else {
         return None;
     };
     let result = tool.output();
@@ -2856,10 +2875,20 @@ fn program_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String
         return None;
     }
     let failures = calls.iter().filter(|call| call.status.is_failure()).count();
-    let header = (!calls.is_empty()).then(|| match failures {
-        0 => format!("{} 个工具调用", calls.len()),
-        n => format!("{} 个工具调用 · {} 失败", calls.len(), n),
-    });
+    // Every fact the ❌ icon stands on is named beside it: a clean call count
+    // under a failed program would read as a contradiction. The program's own
+    // error is not a nested call's failure, so it gets its own segment.
+    let mut segments = Vec::new();
+    if !calls.is_empty() {
+        segments.push(format!("{} 个工具调用", calls.len()));
+        if failures > 0 {
+            segments.push(format!("{failures} 失败"));
+        }
+    }
+    if error {
+        segments.push("程序出错".to_string());
+    }
+    let header = (!segments.is_empty()).then(|| segments.join(" · "));
     let mut body = calls
         .iter()
         .map(|call| format!("- {} `{}`", nested_status_icon(&call.status), call.name))
@@ -3211,7 +3240,7 @@ fn input_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> 
 /// each mapping is gated on the input shape cola's own Codex adapter writes, so
 /// a foreign tool that merely shares the id still renders as itself.
 ///
-/// This is a display word, not a renderer key: the Execute family already
+/// This is a display word, not a renderer key: the `Execute` family already
 /// selects its renderer by `(kind, detail)` (ADR-0105), and the remaining name
 /// arms are the migration tickets' to move. The token rename is the vocabulary
 /// ticket's.
@@ -3444,44 +3473,31 @@ fn inline_code(text: &str) -> String {
 /// renderer per shape covers `bash`, `shell`, `codex/command_execution` and Code
 /// Mode's `execute` alike (ADR-0105, spec #1057's P2). Every other built-in still
 /// has its own name arm until its migration ticket moves it (P3).
+///
+/// A declared shape owns its Input line, the empty one included: an empty line
+/// renders no section, and it never falls through to the raw payload's key table
+/// (which would print `- command:` for a call the adapter already described).
 fn format_tool_input(tool: &ToolPanel) -> String {
-    if let Some(shape) = ExecuteShape::of(tool) {
-        match shape {
-            ExecuteShape::Command {
-                command,
-                cwd,
-                description,
-                ..
-            } => {
-                let line = command_input(command, cwd, description);
-                if !line.is_empty() {
-                    return line;
-                }
-            }
-            // A Code Mode program is the panel's input, fenced with the OUTPUT
-            // budget (`tool_panel_element` widens the input clamp for this
-            // shape); the pre-clamp keeps the closing fence inside the panel's
-            // budget.
-            ExecuteShape::Program { source, language, .. } if !source.is_empty() => {
-                // Code Mode's runtime is JavaScript and its wire declares no
-                // language, so that stays the default; a client that declares
-                // one names the fence.
-                let lang = language.filter(|lang| !lang.is_empty()).unwrap_or("javascript");
-                return fenced_code(&truncate_md(source, TOOL_OUTPUT_MAX_CHARS - 64), Some(lang));
-            }
-            ExecuteShape::Program { .. } => {}
-        }
+    match ExecuteShape::of(tool) {
+        Some(ExecuteShape::Command {
+            command,
+            cwd,
+            description,
+            ..
+        }) => command_input(command, cwd, description),
+        Some(ExecuteShape::Program { source, language, .. }) => program_input(source, language),
+        None => tool
+            .input()
+            .map(|input| format_named_input(tool.name(), input))
+            .unwrap_or_default(),
     }
-    tool.input()
-        .map(|input| format_named_input(tool.name(), input))
-        .unwrap_or_default()
 }
 
 /// The Input line a `Command` renders: the command, its working directory and
 /// the client's one-line description. Every producer has already resolved its
 /// own key into the shape (V1's `workdir` and Codex's `cwd` are one `cwd`
 /// there), so there is no vendor split left to take. Empty when the shape names
-/// nothing, so the caller can fall back to the raw payload.
+/// nothing — the shape is the whole input, so there is nothing else to show.
 fn command_input(command: &str, cwd: Option<&str>, description: Option<&str>) -> String {
     let mut line = String::new();
     if !command.is_empty() {
@@ -3496,10 +3512,24 @@ fn command_input(command: &str, cwd: Option<&str>, description: Option<&str>) ->
     line
 }
 
+/// The Input line a Code Mode `Program` renders: its source, fenced with the
+/// OUTPUT budget (`tool_panel_element` widens the input clamp for this shape),
+/// the pre-clamp keeping the closing fence inside the panel's budget. Code
+/// Mode's runtime is JavaScript and its wire declares no language, so that stays
+/// the default; a client that declares one names the fence. Empty when the shape
+/// carries no source, for the same reason as [`command_input`].
+fn program_input(source: &str, language: Option<&str>) -> String {
+    if source.is_empty() {
+        return String::new();
+    }
+    let lang = language.filter(|lang| !lang.is_empty()).unwrap_or("javascript");
+    fenced_code(&truncate_md(source, TOOL_OUTPUT_MAX_CHARS - 64), Some(lang))
+}
+
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
 /// name. Recognized tools get tailored one-liners (read → the file path, edit →
 /// the file; the edit's actual change comes from its diff output); anything else
-/// falls back to a generic key-value list. The Execute family is selected by its
+/// falls back to a generic key-value list. The `Execute` family is selected by its
 /// shape ([`format_tool_input`]), not here.
 fn format_named_input(name: &str, input: &serde_json::Value) -> String {
     // Non-object inputs (a bare path string, a number) just display as-is.
@@ -8226,31 +8256,6 @@ LSP errors detected in a.rs, please fix:
         }
     }
 
-    /// V1's `bash` reaches the same `Command` renderer as `shell`: the shape's
-    /// `cwd` (resolved from `workdir` by the adapter) is what the panel shows,
-    /// and no raw payload key leaks onto the card.
-    #[test]
-    fn tool_input_bash_shows_command_and_workdir() {
-        let tool = command_panel(
-            "bash",
-            ToolStatus::Completed,
-            "cargo test --all",
-            Some("/proj"),
-            None,
-            false,
-            None,
-        );
-        let card = CardBuilder::new()
-            .with_state(CardState::Done)
-            .with_tool(tool)
-            .build();
-        let text = card.to_string();
-        assert!(text.contains("cargo test --all"), "command missing: {}", text);
-        assert!(text.contains("/proj"), "cwd missing: {}", text);
-        assert!(!text.contains("workdir"), "raw key leaked: {}", text);
-        assert!(!text.contains("command"), "raw key leaked: {}", text);
-    }
-
     #[test]
     fn tool_input_edit_shows_only_the_file() {
         // The oldString/newString preview (the first line of each, both marked
@@ -8588,7 +8593,7 @@ LSP errors detected in a.rs, please fix:
             .to_string()
     }
 
-    /// A shell-like call as the adapters declare it: the Execute family's
+    /// A shell-like call as the adapters declare it: the `Execute` family's
     /// `Command` shape is what the renderer reads (ADR-0105), so a shell fixture
     /// must carry it — a name alone selects nothing.
     fn command_panel(
@@ -9342,7 +9347,7 @@ Index: /a/one.rs
         );
     }
 
-    /// The Execute family's `Command` shape renders one Input line on every
+    /// The `Execute` family's `Command` shape renders one Input line on every
     /// producer: `bash` (V1), `shell` (V2) and `codex/command_execution` each
     /// reach it through `(kind, detail)`, never through a name (ADR-0105,
     /// spec #1057's P2). The adapter has already resolved `workdir`/`cwd` into
@@ -9394,6 +9399,43 @@ Index: /a/one.rs
             format_tool_input(&foreign).starts_with("- command:"),
             "no shape, no tailored render"
         );
+    }
+
+    /// A declared shape owns its line, the empty one included: an empty Input
+    /// line renders NO section and never falls through to the raw payload's key
+    /// table, so no `command`/`workdir` key leaks onto the card.
+    #[test]
+    fn an_empty_declared_shape_renders_no_input_section() {
+        let command = command_panel("shell", ToolStatus::Completed, "", None, None, false, Some("out"));
+        assert_eq!(format_tool_input(&command), "", "an empty command is no line");
+        let program = program_panel(
+            "execute",
+            ToolStatus::Completed,
+            "",
+            vec![nested("fetch", ToolStatus::Completed)],
+            false,
+            Some("out"),
+        );
+        assert_eq!(format_tool_input(&program), "", "an empty source is no line");
+
+        for tool in [command, program] {
+            let card = CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_tool(tool)
+                .build();
+            let text = card.to_string();
+            assert!(!text.contains("**Input**"), "no empty section: {text}");
+            assert!(
+                !text.contains("- command:") && !text.contains("- workdir:") && !text.contains("- code:"),
+                "no raw payload key leaks: {text}"
+            );
+        }
+
+        // The raw payload may still carry a command the shape does not: the
+        // shape is the whole Input line, so it stays silent.
+        let mut silent = command_panel("shell", ToolStatus::Completed, "", None, None, false, None);
+        silent.call.input = Some(json!({"command": "ls -la", "workdir": "/w"}));
+        assert_eq!(format_tool_input(&silent), "", "the shape decides");
     }
 
     /// A Codex file change names its targets in `changes[].path`, one entry per
@@ -10032,7 +10074,8 @@ excerpt two";
         assert_eq!(panel_title(ok), "✅ execute · 1 个工具调用");
 
         // The program's OWN error is a fact of its own: a clean nested list does
-        // not make a failed program a success (no failure count to show).
+        // not make a failed program a success, and the header names the failure
+        // the ❌ icon stands on instead of showing a clean count beside it.
         let own_error = program_panel(
             "execute",
             ToolStatus::Completed,
@@ -10042,10 +10085,26 @@ excerpt two";
             Some("nope"),
         );
         assert_eq!(
-            panel_title(own_error),
-            "❌ execute · 1 个工具调用",
+            panel_title(own_error.clone()),
+            "❌ execute · 1 个工具调用 · 程序出错",
             "the program's own error cannot be inferred from the nested rows"
         );
+        assert!(
+            panel_md(own_error).contains("- ✅ `fetch`"),
+            "the clean nested row stays"
+        );
+
+        // A program whose own error sits beside a failed nested call names both,
+        // in the card's `·`-segment style.
+        let both = program_panel(
+            "execute",
+            ToolStatus::Completed,
+            "throw new Error('nope')",
+            vec![nested("fetch", ToolStatus::Error)],
+            true,
+            Some("nope"),
+        );
+        assert_eq!(panel_title(both), "❌ execute · 1 个工具调用 · 1 失败 · 程序出错");
 
         // A live program with no output yet still lists its calls.
         let live = program_panel(
@@ -10095,6 +10154,47 @@ excerpt two";
             format_tool_input(&declared).starts_with("```lua"),
             "the declared language names the fence"
         );
+    }
+
+    /// The size estimate charges a `Program`'s assembled body. The nested-call
+    /// rows ARE the body — a program that wrote no output text still renders
+    /// them — so an estimate that only read the text output charged zero for the
+    /// panel it writes.
+    #[test]
+    fn a_program_body_is_charged_to_the_estimate() {
+        let tool = program_panel(
+            "execute",
+            ToolStatus::Completed,
+            "return 1",
+            vec![
+                nested("fetch", ToolStatus::Completed),
+                nested("read", ToolStatus::Completed),
+            ],
+            false,
+            // No output text at all: the rows are the whole body.
+            None,
+        );
+        let md = panel_md(tool.clone());
+        assert!(md.contains("- ✅ `fetch`"), "the rows are the body: {md}");
+        assert!(md.contains("- ✅ `read`"), "both rows: {md}");
+        let estimate = panel_output_estimate(&tool);
+        assert!(estimate > 0, "the rows are charged, not zero: {estimate}");
+        assert!(
+            estimate >= serialized_len("- ✅ `fetch`\n- ✅ `read`"),
+            "it covers the rows it writes: {estimate}"
+        );
+
+        // A program with neither calls nor output renders no Output section, so
+        // it charges nothing — the same walk the render takes.
+        let empty = program_panel(
+            "execute",
+            ToolStatus::Completed,
+            "return 1",
+            Vec::new(),
+            false,
+            None,
+        );
+        assert_eq!(panel_output_estimate(&empty), 0);
     }
 
     /// The input limit hint carries the tool's own unit: `read` pages lines,

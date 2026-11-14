@@ -14,7 +14,7 @@
 //! flag, so the loop can end on it and the buttons can follow it.
 //!
 //! Every fenced element — cwd, command and output alike — is clipped through the
-//! **Command output block** the Tool Panel's `Command` shape renders its body
+//! `Command` output block the Tool Panel's `Command` shape renders its body
 //! with ([`command_output_block`]), so a long backtick run can never make the
 //! fence (which grows with the run) push the element past
 //! [`MAX_ELEMENT_TEXT_CHARS`](super::MAX_ELEMENT_TEXT_CHARS), and a clip rule
@@ -416,11 +416,13 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
         // The payload carries the text the elements SHOW, not the raw input: a
         // multi-kilobyte command must not be duplicated into the card's JSON.
         // Clipping twice is idempotent, so the rebuilt card renders the same.
-        let cwd = displayed_text("**目录**", view.cwd, false);
-        let command = displayed_text("**命令**", view.command, false);
+        // The body each element actually shows, from the same clips it renders
+        // through, so the payload cannot disagree with the card.
+        let cwd = OutputClip::under_element("**目录**").clipped(view.cwd);
+        let command = OutputClip::under_element("**命令**").clipped(view.command);
         // The 「问 AI」 window is exactly the fenced element's body, so the
         // submission quotes what the reader sees (ADR-0086 decision 9).
-        let window = displayed_text("**输出**", &output, true);
+        let window = OutputClip::tail_under_element("**输出**").clipped(&output);
         elements.push(settled_buttons_row(
             full_output,
             &cwd,
@@ -585,26 +587,18 @@ fn fenced_element(
     keep_tail: bool,
     markdown: &mut CardMarkdown,
 ) -> (serde_json::Value, bool) {
-    let (block, was_clipped) = command_output_block(
-        body,
-        OutputClip::element(prefix, keep_tail),
-        // A Terminal Log and a command line are machine output: always fenced.
-        true,
-    );
+    let clip = if keep_tail {
+        OutputClip::tail_under_element(prefix)
+    } else {
+        OutputClip::under_element(prefix)
+    };
+    // A Terminal Log and a command line are machine output: always fenced.
+    let (block, was_clipped) = command_output_block(body, clip, true);
     let element = json!({
         "tag": "markdown",
         "content": markdown.clean(&format!("{prefix}\n{block}")),
     });
     (element, was_clipped)
-}
-
-/// The body a fenced element under `prefix` actually shows: clipped to the
-/// per-element budget, from the head or (the output's newest line) the tail —
-/// the same clip [`fenced_element`] renders through. The button payload uses
-/// this too, so what it carries is exactly what the card renders — never the raw
-/// input.
-fn displayed_text(prefix: &str, body: &str, keep_tail: bool) -> String {
-    OutputClip::element(prefix, keep_tail).clipped(body)
 }
 
 /// Render the newest output for display: split on `\n`, treat a `\r` inside a
@@ -1141,7 +1135,7 @@ mod tests {
     }
 
     /// ADR-0086's shared render block, from the Terminal Card's side: its output
-    /// section IS the **Command output block** a `Command` Tool Panel renders its
+    /// section IS the `Command` output block a `Command` Tool Panel renders its
     /// body through — the same clip and fence, with no lifecycle, Chain or record
     /// riding along (the states around it are unchanged).
     #[test]
@@ -1163,7 +1157,7 @@ mod tests {
             chat_id: "chat_1",
             thread_id: "chat_1",
         });
-        let (block, cut) = command_output_block(&body, OutputClip::element("**输出**", true), true);
+        let (block, cut) = command_output_block(&body, OutputClip::tail_under_element("**输出**"), true);
         assert!(!cut, "a body inside the per-element budget is not cut");
         assert!(block.starts_with("```\n"), "machine output is fenced: {block}");
         let texts = crate::bridge::test_support::card_texts(&card);
