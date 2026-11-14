@@ -1,8 +1,9 @@
 # Task liveness is observed on the running panel; child sessions get no second write path
 
-> **Amended by ADR-0106/0107**: the liveness line gates on the Agent Client's
-> `child_agents` capability (a Codex collaboration launch has it too), and its
-> phase words are `waiting`/`reasoning`/`responding`, not `思考中`/`推理中`/`回复中`.
+> **Amended by ADR-0106/0107**: the liveness line reads the **Agent Run**'s
+> `RunActivity` (a Codex collaboration child has no OpenCode child session), gates
+> on the Agent Client's `child_agents` capability, and its phase words are
+> `waiting`/`reasoning`/`responding`, not `思考中`/`推理中`/`回复中`.
 
 A `task` tool call runs a **child session** — a real session parented to the
 calling one, whose id sits in the call's metadata (`state.metadata.sessionId`).
@@ -49,9 +50,10 @@ adoption, not a message injection.
   (`reasoning 12s`). A pending Permission/Question appends the header's wait
   vocabulary (等待你的授权 / 等待你的回答 / 等待你的授权/回答), and a live tool
   with no server clock yet shows its name alone.
-- **Live only, direct child only.** The line renders only while the panel is
-  live; a settled panel keeps its ordinary final form. It reads only the
-  panel's direct child session, never nested descendants (subagents cannot
+- **Live only, direct run only.** The line renders only while the panel is
+  live; a settled panel keeps its ordinary final form. It reads the `AgentRun`
+  the call launched (its `RunActivity`), which for an OpenCode call is its direct
+  child session, never nested descendants (subagents cannot
   dispatch `task` under their derived permissions, so nesting is rare).
 
 ## Considered Options
