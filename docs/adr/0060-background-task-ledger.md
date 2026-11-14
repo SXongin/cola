@@ -1,5 +1,10 @@
 # The background-task ledger: one live list on the newest card, entries where they lived
 
+> **Amended by ADR-0106**: the ledger lists a Session's **live runs** — a
+> Background Task or a Turn-scoped child agent — gates on
+> `reports_live_runs()`, and each row's type word is the run's tool token
+> (`shell`/`subagent`), not the vendor id.
+
 > **Amended by ADR-0066**: the freeze's carve-out widens — a yielded card also
 > receives its Wake's resumed content (ADR-0066 resumes shell/subagent
 > completion Wakes in place), so the live list and the completion entries stay

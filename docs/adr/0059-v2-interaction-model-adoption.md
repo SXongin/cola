@@ -1,5 +1,9 @@
 # Adopt the V2 interaction model: idle-bounded Executions, synthesized Wakes, and the waiting card
 
+> **Amended by ADR-0106**: a Turn also yields while **live runs** are live, not
+> only Background Tasks — a child-only Agent Client (Codex) has runs without
+> background launches, and the ledger lists them.
+
 > **Amended by ADR-0060**: the waiting card is no longer strictly frozen — the
 > **Background Task Ledger** updates it in place, and a last task retiring with
 > nothing to render settles it ✅ there (the "the card stops updating" half of

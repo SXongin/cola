@@ -25,7 +25,8 @@ inverts the economics:
   `webSearch`, `image`, `collabAgentToolCall` and `subAgentActivity` are item
   kinds, not display words. The adapter namespaces them `codex/*`
   (`src/codex/read_model.rs:2563`), and the card grows a shape-gated arm per id —
-  68 occurrences of six ids in `tool_render.rs` alone.
+  78 mentions of six ids in `tool_render.rs` alone (68 of them quoted match
+  positions).
 - **Three consumers interpret the same call, and they disagree.** The Tool Panel,
   the Permission card (`describe_permission`, `src/bridge/request/kind.rs:2999`)
   and the Background Task Ledger (`task_kind`/`task_label`,
@@ -78,17 +79,24 @@ shape is `Opaque`.
 **4. `AgentRun` is a neutral transcript fact — one run per child agent.** The
 run's shape is #1057's; these are the rules it must satisfy:
 
-- **Identity is minted once and never re-keyed.** A run gets its id when it is
-  first observed; a child id that arrives later is a field on the run, not its
-  key. A multi-receiver launch with no ids mints one run per receiver.
+- **One key space with the Task Run Id.** `run_id` **is** ADR-0080's Task Run
+  Id — there is no alias and no second string. It is the child id when the fact
+  that creates the run names one, otherwise the creating call's id (with `#<i>`
+  for an id-less receiver among several). A run whose creating fact named no
+  child keeps that id and fills `child_id` when it learns one. **A launch that
+  names no receiver creates no run**: a completion naming N children creates N
+  runs, each keyed by its child id. Once created, a run keeps its key forever.
 - **A child may be launched more than once.** A resumed `task` passes the prior
   child id, so the launch relation is a set, not one call.
-- **Three relations, recorded.** A call **launches** a run (`task`/`subagent`,
-  `spawnAgent`), **addresses** an existing one (`sendInput`, `wait`,
-  `closeAgent`) or **reports** on one (`subAgentActivity`). A report is an
-  *observation*: it is applied when its state is newer, and identical
-  observations collapse — never deduped by the call id alone, because the wire
-  reuses the item id between an activity's start and its completion.
+- **Three relations, compactly enumerated.** A call **launches** a run
+  (`task`/`subagent`, `spawnAgent`), **addresses** an existing one (`sendInput`,
+  `sendMessage`, `followupTask`, `resumeAgent`, `wait`, `closeAgent`,
+  `interruptAgent`, `listAgents`) or **reports** on one (`subAgentActivity`).
+  `resumeAgent` resumes a child and is an address, not a launch; `wait` and
+  `listAgents` may name no target and then address the Turn's live runs as a
+  set. A report is an *observation*: it is applied when its state is newer, and
+  identical observations collapse — never deduped by the call id alone, because
+  the wire reuses the item id between an activity's start and its completion.
 - **Addressing may name no target.** Codex's `wait` writes empty receiver lists;
   such a call addresses the Turn's live runs as a set and renders a turn-level
   receipt, never a guess at one run.
