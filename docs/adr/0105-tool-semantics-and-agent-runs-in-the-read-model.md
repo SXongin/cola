@@ -81,11 +81,11 @@ run's shape is #1057's; these are the rules it must satisfy:
 
 - **The durable key is a field.** `run_id` is the live run's identity — the
   child id when one exists, else the creating call's id — and `task_run_id` is
-  ADR-0080's durable key for the same run (the launch call id when the read
-  carries the launch, else the child id). The ledger reads and writes
-  `TaskEnding` by `task_run_id`, never by `run_id`; the run carries the mapping,
-  so neither side resolves the other by guessing. ADR-0080's own key selection
-  and alias rule are unchanged.
+  ADR-0080's durable key for the same run: the **newest** launch's call id (a
+  resumed child's later launch supersedes the earlier one, ADR-0080), else the
+  child id. A multi-receiver launch keys each run by its own child id, so two
+  runs never share one call key. The ledger reads and writes endings by
+  `task_run_id`, never by `run_id`; the run carries the mapping.
 - **Multiplicity.** A launch that names no receiver creates no run; a completion
   naming N children creates N runs. A non-launch fact with no child id (an
   activity report) creates a call-keyed run and fills `child_id` when it learns
@@ -107,17 +107,21 @@ run's shape is #1057's; these are the rules it must satisfy:
 - **No vendor `kind`.** `task`/`subagent`/`spawnAgent`/a collaboration call all
   mean "a child agent this Turn set running"; the relations, `agent` and `label`
   carry the provenance.
-- **Liveness carries neutral semantics and its clock.** The activity line's
-  newest call carries its `ToolKind`, `ToolDetail`, identity and **server start
-  time** (so `shell 28s` counts from the call's own start, not from the last
-  activity), plus the child's pending wait.
+- **Liveness carries neutral semantics, its clock and both waits.** The
+  activity line's newest call carries its `ToolKind`, `ToolDetail`, identity and
+  **server start time** (so `shell 28s` counts from the call's own start), and
+  the child's pending requests are a **set** (permission and question may both be
+  live, rendering `等待你的授权/回答`).
 - **`RunStatus` is the client's statement, not cola's ending.** `Running`,
-  `Completed`, `Failed`, `Cancelled`, `Unknown`. Cola's durable `TaskEnding`
-  (Wake / RuntimeEnded / Lost / Cleaned) answers how **cola** learned it ended and
-  owns the exactly-once rules (ADR-0065/0073/0080). They are never folded: a
-  runtime-confirmed end renders `结束` while the client still says `Running`, and
-  a **Cleanup** renders `已清理` with no `RunStatus`. The ledger reads
-  `TaskEnding` first and `RunStatus` only for an end the client itself reported.
+  `Completed`, `Failed`, `Cancelled`, `Unknown`. Cola has two ending types and
+  neither is `RunStatus`: the **durable** `TaskEndingClass`
+  (`Evidence`/`Cleanup`/`Wake`, with its `TaskEndingEvidence`) that ADR-0080
+  keys and owns the exactly-once rules for, and the **render** enum
+  `bridge::tasks::TaskEnding` (`Wake`/`RuntimeEnded`/`Lost`/`Cleaned`) that names
+  the card's word. A runtime-confirmed end renders `结束` while the client still
+  says `Running`; a **Cleanup** renders `已清理` with no `RunStatus`; and a
+  child-only run retires on its child transcript's terminal evidence or a
+  cleanup, never on a `RunStatus` alone.
 
 The run is a read-model fact. The bridge's background overlay
 (`src/bridge/tasks/*`) stays cola-side: it answers *what ended it and has the
@@ -125,7 +129,9 @@ ending been shown*, which is cola's own durable bookkeeping, not the client's
 statement.
 
 **5. The card derives what it shows from `(kind, detail)`.** `identity.name` is
-diagnostic and a fallback title, never a renderer key. The one exception is a
+diagnostic and a fallback title, never a renderer key. The migration is complete
+only when no name-keyed arm remains — `Read`, `Search` and `Fetch` move with the
+same pass, not just the Execute/FileEdits/Delegation families. The one exception is a
 display token, not a renderer: ADR-0107's `tool_token` may read the name in the
 `Other` + `None` arm for the three name-only tokens (`plan`/`skill`/`ask`), and
 otherwise returns it only as the opaque fallback. A known shape renders through

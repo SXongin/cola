@@ -13,8 +13,8 @@ per-subsystem methods and implicit defaults:
 - `session_diff` returns `Option`; compaction, questions, models, agents and
   MCP each have their own shape of "may be absent".
 - The capability differs *within* one Agent Client: Codex reports child-agent
-  **activity** but has no background launches, so its runs cannot appear in a
-  ledger and its activity items become standalone panels.
+  **activity** but has no background launches, so today its runs cannot appear
+  in a ledger and its activity items become standalone panels.
 
 The absence is usually treated correctly and always accidentally. The card's
 "when does which surface show" rules exist, but spread over ADR-0038 (inline vs
@@ -61,7 +61,7 @@ is outside this table: it is per request, per the rule above.)
 | Live-run ledger | `reports_live_runs()` | no section |
 | Panel liveness line | `child_agents != None` **and** a run with activity | plain panel |
 | Plan section | `plan != None` | no section |
-| Compaction row | `compaction` | the part is not a row |
+| Compaction row / `/compact` | `compaction` | no row; the command reports it as unsupported |
 | Turn footer usage | `usage != None` | no footer figure |
 | 「始终允许」 on a permission | the **request's** `always_supported` (ADR-0018) | one-time options only |
 | Question card / inline block | `questions != None` | no question surface |
