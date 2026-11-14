@@ -1,5 +1,10 @@
 # Task liveness is observed on the running panel; child sessions get no second write path
 
+> **Amended by ADR-0106/0107**: the liveness line reads the **Agent Run**'s
+> `RunActivity` (a Codex collaboration child has no OpenCode child session), gates
+> on the Agent Client's `child_agents` capability, and its phase words are
+> `waiting`/`reasoning`/`responding`, not `思考中`/`推理中`/`回复中`.
+
 A `task` tool call runs a **child session** — a real session parented to the
 calling one, whose id sits in the call's metadata (`state.metadata.sessionId`).
 While it runs, cola's card shows only the **Tool Panel** (description,
@@ -40,14 +45,15 @@ adoption, not a message injection.
   mapped alongside it.
 - **One liveness line on the running panel.** While a task Tool Panel is live
   it carries what the child is doing and for how long, in the header's own
-  shape: its newest running tool and that call's elapsed time (`bash 28s`), or
+  shape: its newest running tool and that call's elapsed time (`shell 28s`), or
   — when no tool is live — its phase and the time since its newest activity
-  (`推理中 12s`). A pending Permission/Question appends the header's wait
+  (`reasoning 12s`). A pending Permission/Question appends the header's wait
   vocabulary (等待你的授权 / 等待你的回答 / 等待你的授权/回答), and a live tool
   with no server clock yet shows its name alone.
-- **Live only, direct child only.** The line renders only while the panel is
-  live; a settled panel keeps its ordinary final form. It reads only the
-  panel's direct child session, never nested descendants (subagents cannot
+- **Live only, direct run only.** The line renders only while the panel is
+  live; a settled panel keeps its ordinary final form. It reads the `AgentRun`
+  the call launched (its `RunActivity`), which for an OpenCode call is its direct
+  child session, never nested descendants (subagents cannot
   dispatch `task` under their derived permissions, so nesting is rare).
 
 ## Considered Options

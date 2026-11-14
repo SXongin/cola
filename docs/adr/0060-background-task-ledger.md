@@ -1,5 +1,13 @@
 # The background-task ledger: one live list on the newest card, entries where they lived
 
+> **Amended by ADR-0106**: the ledger lists a Session's **live runs** — a
+> Background Task or a Turn-scoped child agent — gates on
+> `reports_live_runs()`, and each row's type word is the run's tool token
+> (`shell`/`subagent`), not the vendor id.
+>
+> **Amended by ADR-0107**: the liveness vocabulary is `waiting`/`reasoning`/
+> `responding`, and the tool token is `shell` (not `bash`).
+
 > **Amended by ADR-0066**: the freeze's carve-out widens — a yielded card also
 > receives its Wake's resumed content (ADR-0066 resumes shell/subagent
 > completion Wakes in place), so the live list and the completion entries stay
@@ -101,8 +109,10 @@ the record of the request, but renders 🌙 in its status slot instead of ✅ �
 rest of the title is a normal panel's (`🌙 shell · <label>`); the ledger, not
 the panel, owns the run's liveness.
 
-V1 carries none of these facts: there the section is empty and behavior is
-today's (the ADR-0059 degradation).
+V1 carries none of the background facts, so nothing but a live **Agent Run**
+appears there: a `task` child is a run, and the section lists it under
+`reports_live_runs()` (ADR-0106). With no run either, behavior is today's (the
+ADR-0059 degradation).
 
 ## Considered options
 
@@ -209,8 +219,8 @@ spec #501): the ledger and the Tool Panel call one task the same thing.
 
 A background `subagent`'s live row carries the same child-session liveness the
 live task panel shows (spec #501, ticket #503): appended after the row's start
-clock — `· subagent：**review the diff** · 14:04 · bash 5s`, or
-`· 思考中 30s · 等待你的授权` for a phase and its wait — through the front's own
+clock — `· subagent：**review the diff** · 14:04 · shell 5s`, or
+`· reasoning 30s · 等待你的授权` for a phase and its wait — through the front's own
 fragment vocabulary, so one child state reads the same wherever cola renders
 it. The fragment sits after the start clock and before `· ⚠️ 状态待确认`; a row
 the runtime reconciliation could not confirm renders no activity, and a `shell`
