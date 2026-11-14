@@ -112,7 +112,7 @@ smaller surface than it looks.
 
 | Path | What the card shows | Live? | Row in ledger? | `/sub`? | Source |
 |---|---|---|---|---|---|
-| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (`bash 28s` / `推理中 12s` / `等待你的授权`) | yes | yes (`TaskKind::Subagent`) | yes (`parentID`) | ADR-0054, `tool_render.rs:3433`, `:491` |
+| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (`bash 28s` / `reasoning 12s` / `等待你的授权`) | yes | yes (`TaskKind::Subagent`) | yes (`parentID`) | ADR-0054, `tool_render.rs:491`, `:554` |
 | OpenCode V2 `subagent` | same, `metadata.sessionID`, `<subagent …>` envelope | yes | yes | yes | `read_model` V2, `tool_render.rs:505` |
 | Codex `collab_agent` | **one panel per call**, title from the collaboration verb (`派生子 Agent`, `发送输入`, `等待子 Agent`, …), body is the target rows / prompt / model | **no** | **no** | *(threads have `parent_thread_id` → `parent_id`, so `/sub` works)* `src/codex/threads.rs:79` | `src/codex/read_model.rs:1589`, `tool_render.rs:1029`, `:3109` |
 | Codex `sub_agent_activity` | **a tool panel of its own** (`子 Agent`, target = `agentPath`) — a lifecycle *event* rendered as a *call* | n/a | **no** | n/a | `read_model.rs:1633`, `tool_render.rs:1034` |
@@ -204,7 +204,7 @@ the mapping exists.
 | **Turn** | `thinking` / `streaming` / `tool-running` / `settling` / `ended(disposition)` | bridge accumulator | header phase + timer, footer |
 | **Card** | `live` / `waiting` / `terminal(disposition)` | card chain (ADR-0071/0072) | header colour, controls, recovery |
 | **Request** | `permission(scope)` / `question(single · multi · custom)` / `location-form` | backend request DTOs | inline block or standalone card |
-| **Run** | `running` / `ended(completed · failed · cancelled · lost · cleaned)` | bridge task overlay (ADR-0065/0080) | ledger row, completion entry |
+| **Run** | `running` / client outcome (`completed` · `failed` · `cancelled` · `unknown`) / cola ending (`TaskEnding`) | read model (`AgentRun`) plus the bridge overlay for the durable ending (ADR-0105/0080) | ledger row, completion entry |
 
 Two concrete gaps this exposes:
 
@@ -297,8 +297,9 @@ Rules that keep ADR-0042 intact:
 
 ### 4.3 The Agent Run: the sub-agent fact
 
-One run per child agent: a stable identity minted once when the run is first
-observed, the child id as a field (never the key), a label/agent/start, the
+One run per child agent: a stable identity that **is** the durable Task Run Id
+(the child id when the fact creating the run names one, else the creating
+call's id; never re-keyed), the child id as a field, a label/agent/start, the
 client-declared status, the current activity (the newest call's neutral
 semantics plus the pending wait), and the three relations — **launched** (a set:
 a resume launches the same child again), **addressed**, and **reported** (applied
@@ -331,7 +332,7 @@ Surfaces gate on it instead of on per-subsystem methods:
 | Ledger section | `reports_live_runs()` (`background_runs \|\| child_agents != None`) | no section |
 | Panel liveness line | `child_agents != None` + a run with activity | plain panel |
 | Plan section | `plan != None` | no section |
-| Compaction row | `compaction` | part renders as `Other`/omitted |
+| Compaction row | `compaction` | no row (the part is not a compaction row) |
 | Footer usage | `usage != None` | no footer figure |
 | Question surface | `questions != None` | no question card/block |
 | 「始终允许」 | the **request's** `always_supported` (ADR-0018) | one-time buttons only |

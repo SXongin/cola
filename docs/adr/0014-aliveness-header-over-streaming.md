@@ -1,5 +1,8 @@
 # Reject Feishu streaming cards; honest progress header instead
 
+> **Amended by ADR-0107**: the header's live phase tokens are `waiting`,
+> `reasoning` and `responding` (they replace 思考中/推理中/回复中).
+
 > **Amended by the 2026-11-04 update below**: the decision stands. Two parts of
 > the framing were too broad: element-level increments buy more than a
 > typewriter, and the interactive-callback restriction is narrower than stated —

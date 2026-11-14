@@ -31,8 +31,8 @@ The distinction that actually matters is not Chinese versus English. It is
 
 ## Decision
 
-**1. Every user-visible string is a Token or Copy. The test is one question:
-would a translator touch it?**
+**1. Every card-authored string is a Token or Copy; data is Verbatim. The test
+for the first two is one question: would a translator touch it?**
 
 - **No → Token.** Domain vocabulary: tool nouns, live phase words, protocol
   names, identifiers. Tokens are invariant: they stay English when a locale
@@ -40,6 +40,10 @@ would a translator touch it?**
 - **Yes → Copy.** Interface text: card titles, sentences, buttons, empty states,
   hints, units, section labels. Copy is authored in Chinese today and becomes a
   `zh-CN` catalog when i18n lands.
+- **Neither → Verbatim.** Data the card renders as-is: session/model/agent ids,
+  paths, command lines, model output, user input, and an adapter-supplied
+  `title` or `AgentRun.label`. It is never classified as a token, never
+  translated, and never re-worded.
 
 **2. The tool tokens are one per concept, and a token is never a vendor id.**
 
@@ -107,9 +111,9 @@ Three consequences worth stating because they are the ambiguous cases: a mixed
 `FileEdits` list reads `edit` (the umbrella; `write` means "a non-empty list
 whose every entry adds"), an **empty** `FileEdits` also reads `edit` (Codex's
 `fileChange` starts empty and gains entries, so `write` would flip back), and a
-`Delegation` whose effect is `Address` or `Report` has **no** token at all — it
-renders as a receipt on the run, not as a panel. `AgentRun`'s types, `FileAction`
-and `SearchScope` live in spec #1057.
+`Delegation` whose effect is `Address` renders a receipt on the run while
+`Report` updates the run with **no** surface of its own. `AgentRun`'s types,
+`FileAction` and `SearchScope` live in spec #1057.
 
 **3. The live phase slot speaks three tokens.**
 

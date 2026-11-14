@@ -1,5 +1,9 @@
 # Task liveness is observed on the running panel; child sessions get no second write path
 
+> **Amended by ADR-0106/0107**: the liveness line gates on the Agent Client's
+> `child_agents` capability (a Codex collaboration launch has it too), and its
+> phase words are `waiting`/`reasoning`/`responding`, not `思考中`/`推理中`/`回复中`.
+
 A `task` tool call runs a **child session** — a real session parented to the
 calling one, whose id sits in the call's metadata (`state.metadata.sessionId`).
 While it runs, cola's card shows only the **Tool Panel** (description,
