@@ -97,6 +97,7 @@ fn background_launch(created: i64, name: &str, call_id: &str, input: serde_json:
                     blocks: vec![ContentBlock::Text("moved to background".into())],
                     error: None,
                 },
+                ..ToolCall::default()
             }),
             Part::StepFinish(StepFinish {
                 reason: FinishReason::ToolCalls,
@@ -127,6 +128,7 @@ fn foreground_shell(created: i64, call_id: &str) -> TranscriptMessage {
                     blocks: vec![ContentBlock::Text("test result: ok".into())],
                     error: None,
                 },
+                ..ToolCall::default()
             }),
             Part::StepFinish(StepFinish {
                 reason: FinishReason::ToolCalls,
@@ -158,6 +160,7 @@ fn todowrite(created: i64, call_id: &str) -> TranscriptMessage {
                     blocks: vec![ContentBlock::Text(todos.to_string())],
                     error: None,
                 },
+                ..ToolCall::default()
             }),
             Part::StepFinish(StepFinish {
                 reason: FinishReason::ToolCalls,
@@ -973,6 +976,7 @@ fn subagent_launch(created: i64, call_id: &str, child_id: &str) -> TranscriptMes
                 input: Some(serde_json::json!({ "description": "review the diff", "background": true })),
                 metadata: Some(serde_json::json!({ "status": "running", "sessionID": child_id })),
                 output: ToolOutput::default(),
+                ..ToolCall::default()
             }),
             Part::StepFinish(StepFinish {
                 reason: FinishReason::ToolCalls,
@@ -5187,6 +5191,7 @@ fn child_running_tool(started_at: i64, name: &str) -> SessionTranscript {
             input: Some(serde_json::json!({ "command": "cargo test" })),
             metadata: None,
             output: ToolOutput::default(),
+            ..ToolCall::default()
         })],
     )])
 }
@@ -6414,6 +6419,7 @@ async fn a_v1_read_spends_no_output_window_request() {
                     blocks: vec![ContentBlock::Text("moved to background".into())],
                     error: None,
                 },
+                ..ToolCall::default()
             })],
         ),
     ]);

@@ -6529,6 +6529,7 @@ mod tests {
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let estimate = panel_estimate(&panel, Some("ses_1"));
         assert!(
@@ -6593,6 +6594,7 @@ mod tests {
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
+            ..ToolCall::default()
         });
         let estimate = panel_estimate(&panel, Some("ses_1"));
         assert!(

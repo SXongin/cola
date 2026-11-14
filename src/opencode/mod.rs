@@ -28,6 +28,7 @@ mod live;
 pub(crate) mod strategy;
 #[cfg(test)]
 mod tests;
+pub(crate) mod tool_semantics;
 pub(crate) mod transport;
 pub(crate) mod v1;
 pub(crate) mod v2;

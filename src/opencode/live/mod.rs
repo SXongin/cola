@@ -2523,6 +2523,7 @@ mod poll_tests {
                     input: None,
                     metadata: None,
                     output: crate::backend::ToolOutput::default(),
+                    ..crate::backend::ToolCall::default()
                 })],
             )])
         };

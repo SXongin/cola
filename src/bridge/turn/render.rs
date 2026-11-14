@@ -4236,6 +4236,7 @@ mod tests {
             input: Some(serde_json::json!({ "description": "review the diff" })),
             metadata: Some(serde_json::json!({ "status": "running", "sessionID": child_id })),
             output: ToolOutput::default(),
+            ..ToolCall::default()
         })
     }
 
@@ -4466,6 +4467,7 @@ mod tests {
                 blocks: output,
                 error: None,
             },
+            ..ToolCall::default()
         }
     }
 
@@ -4507,6 +4509,7 @@ mod tests {
                 blocks: vec![crate::backend::ContentBlock::Text(todos.to_string())],
                 error: None,
             },
+            ..ToolCall::default()
         })
     }
 
@@ -6401,6 +6404,7 @@ Index: /x/src/main.rs
                 input: Some(serde_json::json!({"todos": []})),
                 metadata: None,
                 output: ToolOutput::default(),
+                ..ToolCall::default()
             })],
         )]);
 
@@ -11595,6 +11599,7 @@ Index: /x/src/main.rs
                     input: Some(serde_json::json!({ "description": "review the shared child" })),
                     metadata: Some(serde_json::json!({ "sessionID": "ses_shared" })),
                     output: ToolOutput::default(),
+                    ..ToolCall::default()
                 }),
             );
         }
@@ -11757,6 +11762,7 @@ Index: /x/src/main.rs
             input: Some(serde_json::json!({"description": "review"})),
             metadata: Some(serde_json::json!({"sessionId": child, "parentSessionId": "ses_parent"})),
             output: ToolOutput::default(),
+            ..ToolCall::default()
         })
     }
 
@@ -11773,6 +11779,7 @@ Index: /x/src/main.rs
             input: Some(serde_json::json!({"agent": "general", "description": "review"})),
             metadata: Some(serde_json::json!({"sessionID": child, "status": "running"})),
             output: ToolOutput::default(),
+            ..ToolCall::default()
         })
     }
 
@@ -12702,6 +12709,7 @@ Index: /x/src/main.rs
             input: None,
             metadata: Some(serde_json::json!({ "diff": patch })),
             output: ToolOutput::default(),
+            ..ToolCall::default()
         })
     }
 

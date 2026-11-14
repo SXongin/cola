@@ -382,6 +382,7 @@ mod tests {
                     input: Some(serde_json::json!({ "command": "ls" })),
                     metadata: None,
                     output: ToolOutput::default(),
+                    ..ToolCall::default()
                 }),
                 Part::StepFinish(StepFinish {
                     reason: FinishReason::ToolCalls,
