@@ -30,6 +30,25 @@
 mod progress;
 mod wire;
 
+/// Decode one V2 tool call for the cross-adapter conformance suite (spec
+/// #1057 P1): the caller names the tool and its raw state, and this strategy
+/// builds the V2 wire item, so the suite drives the real decoder without
+/// spelling a V2 envelope of its own.
+#[cfg(test)]
+pub(crate) fn decode_tool_for_conformance(
+    name: &str,
+    input: serde_json::Value,
+    metadata: serde_json::Value,
+) -> crate::backend::ToolCall {
+    wire::decode_tool_item(&serde_json::json!({
+        "type": "tool",
+        "id": format!("call_{name}"),
+        "name": name,
+        "state": {"status": "completed", "input": input, "metadata": metadata},
+        "time": {"created": 1_000},
+    }))
+}
+
 #[cfg(test)]
 pub(crate) mod conformance;
 #[cfg(test)]

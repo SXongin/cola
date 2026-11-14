@@ -28,6 +28,8 @@ mod live;
 pub(crate) mod strategy;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_conformance;
 pub(crate) mod tool_semantics;
 pub(crate) mod transport;
 pub(crate) mod v1;

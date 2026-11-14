@@ -2724,6 +2724,14 @@ fn codex_tool_id(kind: &str) -> String {
     format!("codex/{kind}")
 }
 
+/// A raw Codex item's declared neutral semantics — the cross-adapter
+/// conformance test's entry point, so the suite drives this adapter's real
+/// mapping rather than a second copy of it.
+#[cfg(test)]
+pub(crate) fn tool_semantics_for_conformance(item: &Value) -> (ToolKind, ToolDetail) {
+    ItemKind::from_wire(item).semantics()
+}
+
 fn command_status(status: &Option<String>, exit_code: Option<i64>) -> ToolStatus {
     match status.as_deref() {
         Some("inProgress") => ToolStatus::Running,
