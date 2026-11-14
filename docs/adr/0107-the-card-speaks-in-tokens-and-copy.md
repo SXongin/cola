@@ -54,14 +54,25 @@ would a translator touch it?**
 | `fetch` | `webfetch` | one URL fetched |
 | `websearch` | `websearch`, Codex `web_search` | a web search |
 | `subagent` | `task`, `subagent`, Codex `collab_agent` (launch) | a delegated run |
+| `script` | Code Mode's `execute` (OpenCode V2; `codemode`/`exec`/`code_execution` elsewhere) | a program that calls tools |
 | `plan` | `todowrite` | the plan surface's tool form |
 | `skill` | `skill` | a loaded skill |
 | `ask` | `question` | a question raised as a tool |
 
 Anything not in this table is **not a token**: it keeps its own vendor name
 (`codegraph_explore`, `mcp_server/tool`), exactly ADR-0042's opaque rule. The
-table is closed for the shared kinds; a new shared kind is added with the
-`ToolKind`/`ToolDetail` variant that carries it (ADR-0105).
+table is closed: a new token arrives with the `ToolDetail` variant that carries
+it (ADR-0105), and an unknown id keeps its name.
+
+`script` names the one **pattern** rather than a built-in id. Code Mode is
+general — Cloudflare named it (2025-09), Anthropic calls it programmatic tool
+calling (2025-11), OpenAI's Responses API and Pi both ship it — and the
+ecosystem spells the tool four ways (`codemode`, `exec`, `execute_tools`,
+`code_execution`). The token names the **executed unit** (a program that calls
+tools), not the artifact (`code`, which is what `edit` shows) and not the mode
+(`codemode`, which is a session setting). It parallels `shell` the way
+`subagent` parallels a single call: one command versus one program. Its
+`ToolDetail::Program` carries the source and the nested calls.
 
 **3. The live phase slot speaks three tokens.**
 
@@ -156,10 +167,6 @@ escaping and budget rules).
 
 ## Open
 
-- **Code Mode's `execute`.** V2's Code Mode runs a JavaScript program, not a
-  shell command; it is neither `shell` nor a vendor tool. Recommended token:
-  `code`. Recorded here rather than added to the table because no approved token
-  covers it and the surface is V2-only today.
 - **`plan_exit`, `lsp`, `invalid`.** Built-ins outside the shared kinds; they
   stay opaque (vendor name) until a second adapter makes one shared.
 - **Where the copy catalog lives** if a second locale ever lands (`vocab.rs`

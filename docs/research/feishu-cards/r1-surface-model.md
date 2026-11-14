@@ -302,7 +302,7 @@ pub enum ToolDetail {
     Search { query: Option<String>, matches: Option<u64>, unit: MatchUnit },
     Read { path: String, preview: Option<String> },
     Delegation(AgentRunRef),        // the run this call launched/addressed
-    Plan(TodoList),                 // when a client states a plan AS a tool
+    Program { source, language, calls }, // Code Mode: a program that calls tools
     Opaque,                         // everything else — ADR-0042's rule stands
 }
 ```
