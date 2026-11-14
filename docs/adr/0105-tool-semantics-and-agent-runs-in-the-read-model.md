@@ -79,13 +79,16 @@ shape is `Opaque`.
 **4. `AgentRun` is a neutral transcript fact — one run per child agent.** The
 run's shape is #1057's; these are the rules it must satisfy:
 
-- **The durable key is a field.** `run_id` is the live run's identity — the
-  child id when one exists, else the creating call's id — and `task_run_id` is
-  ADR-0080's durable key for the same run: the **newest** launch's call id (a
-  resumed child's later launch supersedes the earlier one, ADR-0080), else the
-  child id. A multi-receiver launch keys each run by its own child id, so two
-  runs never share one call key. The ledger reads and writes endings by
-  `task_run_id`, never by `run_id`; the run carries the mapping.
+- **The durable key is a field, and ADR-0080 owns its selection.** `run_id` is
+  the live run's identity — the child id when one exists, else the creating
+  call's id — and `task_run_id` is ADR-0080's durable key: the **first** launch's
+  call id when the read carried one, else the child id, and `None` until either
+  exists (an empty id is no id). It never re-mints on a resume; a later launch
+  resolves to the existing record through ADR-0080's alias rule instead. A
+  multi-receiver launch keys each run by its own child id, so two runs never
+  share one call key. The ledger reads and writes endings by `task_run_id`,
+  never by `run_id`, and a run with no `task_run_id` is live and renders no
+  completion entry.
 - **Multiplicity.** A launch that names no receiver creates no run; a completion
   naming N children creates N runs. A non-launch fact with no child id (an
   activity report) creates a call-keyed run and fills `child_id` when it learns
@@ -120,8 +123,9 @@ run's shape is #1057's; these are the rules it must satisfy:
   `bridge::tasks::TaskEnding` (`Wake`/`RuntimeEnded`/`Lost`/`Cleaned`) that names
   the card's word. A runtime-confirmed end renders `结束` while the client still
   says `Running`; a **Cleanup** renders `已清理` with no `RunStatus`; and a
-  child-only run retires on its child transcript's terminal evidence or a
-  cleanup, never on a `RunStatus` alone.
+  child-only run retires on its child transcript's terminal **evidence** (Class
+  `Evidence`, so its adapter must read the child's terminal item) or a cleanup,
+  never on a `RunStatus` alone.
 
 The run is a read-model fact. The bridge's background overlay
 (`src/bridge/tasks/*`) stays cola-side: it answers *what ended it and has the
@@ -130,8 +134,9 @@ statement.
 
 **5. The card derives what it shows from `(kind, detail)`.** `identity.name` is
 diagnostic and a fallback title, never a renderer key. The migration is complete
-only when no name-keyed arm remains — `Read`, `Search` and `Fetch` move with the
-same pass, not just the Execute/FileEdits/Delegation families. The one exception is a
+only when no name-keyed arm remains — `Read`, `Search` and `Fetch` move in the
+FileEdits ticket's pass (spec #1057's P3), not just the
+Execute/FileEdits/Delegation families. The one exception is a
 display token, not a renderer: ADR-0107's `tool_token` may read the name in the
 `Other` + `None` arm for the three name-only tokens (`plan`/`skill`/`ask`), and
 otherwise returns it only as the opaque fallback. A known shape renders through
@@ -199,7 +204,7 @@ the decision recorded here.
 
 ## Not decided here
 
-- Whether the *card* needs a general block model. The five detail shapes and one
+- Whether the *card* needs a general block model. The six detail shapes and one
   opaque path are sufficient; a block tree remains optional (research note §4.5).
 - How Codex's addressed calls render on the timeline. ADR-0106 records the
   receipt rule; the exact row is P4's UI work.
