@@ -279,6 +279,36 @@ the marker after the process exits.
    list after a single keyword (`Closes #10, #11`).
 4. Record architectural decisions as ADRs in `docs/adr/` when the change is
    hard to reverse.
+
+   **An accepted ADR's body is append-only: existing text is never altered or
+   deleted; additions are allowed.** A later decision is appended as a top
+   banner naming the ADR **and stating in one line what changed** — for example
+   `> **Amended by ADR-NNNN**: …`, `> **Superseded by ADR-NNNN**: …`,
+   `> **Retired by ADR-NNNN**: …`, `> **Reopened by ADR-NNNN**: …`, or
+   `> **Ratified by ADR-NNNN**: …`. A dated `Amended (date)` banner is
+   historical. Each banner states its own scope (the whole ADR or named claims);
+   a later banner overrides an earlier one where their scopes overlap, and the
+   file's existing order is kept.
+
+   Additions: that banner; an inline `**(superseded by ADR-NNNN: …)**` marker at
+   a sentence that would mislead; a trailing `## Amendment` / `## Update` section
+   (which may accompany the banner, never replace it); and a `Status:` line
+   immediately after the title, used only when the whole ADR is superseded (a
+   scoped supersession is stated in the banner). The heading-only amendments
+   already in the tree — ADR-0034/0056/0076/0103 among them — are grandfathered.
+
+   Allowed body edits: a **factual** typo, link or number fix, and that `Status:`
+   line. Nothing that changes the decision; a number the decision rests on is not
+   a typo — amend it or write a new ADR.
+
+   A change that needs the decision restated is a **new ADR**: the old one gains
+   `> **Superseded by ADR-NNNN**: …` and `Status: superseded by ADR-NNNN`, and
+   the new one opens with `> **Supersedes ADR-XXXX**: …` (a forward rule;
+   existing edges stated in prose are historical).
+
+   There is no central index: every forward banner names its ADR, and a new ADR
+   names what it supersedes.
+
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is
    green. Agent-authored PRs additionally wait for the user's own verification
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
