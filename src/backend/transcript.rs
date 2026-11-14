@@ -1580,7 +1580,7 @@ pub enum CompactionReason {
 /// payloads. The identity, raw payloads and output belong to the vendor; the
 /// semantics ([`ToolKind`], [`ToolDetail`], the client's title and the
 /// locations it touched) are the adapter's declaration (ADR-0105). The card
-/// selects a renderer from `(kind, detail)` — the Execute family does so today;
+/// selects a renderer from `(kind, detail)` — the `Execute` family does so today;
 /// the remaining name arms move one migration ticket at a time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -1691,9 +1691,17 @@ pub enum ToolDetail {
     ///
     /// `error` is additive to spec #1057's canonical shape: Code Mode's own
     /// failure (a syntax error, an empty program, a runtime diagnostic) is a
-    /// recorded fact — `metadata.error` — that no nested call has to show, so
-    /// without it a failed program with clean nested calls would render as a
-    /// success.
+    /// recorded fact — the wire's `metadata.error` — that no nested call has to
+    /// show, so without it a failed program with clean nested calls would render
+    /// as a success.
+    ///
+    /// It is a FLAG, not a message: the wire writes the key only on a failure
+    /// and always as `true` (upstream's `ExecuteOutput` spreads
+    /// `...(result.ok ? {} : { error: true })`), and the official client tests
+    /// `metadata.error === true` for exactly that reason. A non-boolean value is
+    /// therefore not a failure this build can name, and the API takes no message
+    /// it would have to invent one for; the program's diagnostic reaches the
+    /// reader through its output text.
     Program {
         source: String,
         language: Option<String>,

@@ -132,6 +132,53 @@ fn execute_is_one_command_on_every_producer() {
         })),
         expected
     );
+
+    // The one-line description is V1 `bash`'s own input field; the shape keeps
+    // it and the other two producers declare none (neither wire carries one),
+    // so the field is the same fact wherever a client has it.
+    assert_eq!(
+        v1(
+            "bash",
+            json!({"command": "ls -la", "workdir": "/work", "description": "List files"}),
+            json!({"exit": 0})
+        ),
+        (
+            ToolKind::Execute,
+            ToolDetail::Command {
+                command: "ls -la".to_string(),
+                cwd: Some("/work".to_string()),
+                description: Some("List files".to_string()),
+                exit: Some(0),
+                timeout: false,
+            }
+        )
+    );
+    for (name, detail) in [
+        (
+            "shell",
+            v2(
+                "shell",
+                json!({"command": "ls -la", "cwd": "/work"}),
+                json!({"exit": 0}),
+            ),
+        ),
+        (
+            "codex/command_execution",
+            codex(json!({
+                "type": "commandExecution",
+                "id": "item-command",
+                "command": "ls -la",
+                "cwd": "/work",
+                "exitCode": 0,
+                "status": "completed"
+            })),
+        ),
+    ] {
+        let ToolDetail::Command { description, .. } = detail.1 else {
+            panic!("{name} is a command");
+        };
+        assert_eq!(description, None, "{name} declares no description");
+    }
 }
 
 /// Read — `read` and an `imageView` are one file read; V1 names the path
@@ -863,11 +910,27 @@ fn a_decoded_codex_command_renders_the_baseline_card() {
 
 /// The outcome a settled call records under `completed` is a failure, on every
 /// producer, straight from the wire through the real decoder and card builder
-/// (#1059): OpenCode V2 keeps the exit in `metadata` beside a `completed`
-/// status, Codex projects its `exitCode` into the call's status.
+/// (#1059).
+///
+/// This is the ticket's one user-visible verdict change: V1's `bash` records its
+/// exit in `metadata` beside a `completed` status exactly as V2 does, and before
+/// this ticket the card only read that record for the id `shell` — so a failed
+/// V1 command rendered ✅. V2 and Codex already rendered ❌ from the same facts,
+/// which is why each producer is pinned here: the rows differ in what makes the
+/// case non-trivial (V1's verdict is new; V2's and Codex's must not regress).
 #[test]
 fn a_settled_non_zero_exit_renders_the_failure_icon_from_the_wire() {
     for (name, card) in [
+        (
+            "v1 bash",
+            render_card(v1_tool(
+                "bash",
+                json!({"command": "make", "workdir": "/work"}),
+                json!({"exit": 1}),
+                None,
+                Some("error: 3 assertions failed\n"),
+            )),
+        ),
         (
             "v2 shell",
             render_card(v2_tool(
@@ -901,15 +964,42 @@ fn a_settled_non_zero_exit_renders_the_failure_icon_from_the_wire() {
     }
 
     // A timeout is the other state `completed` hides.
-    let timed_out = render_card(v2_tool(
-        "shell",
-        json!({"command": "make", "cwd": "/work"}),
-        json!({"status": "completed", "timeout": true}),
-        Some("timed out\n"),
+    for (name, card) in [
+        (
+            "v1 bash",
+            render_card(v1_tool(
+                "bash",
+                json!({"command": "make", "workdir": "/work"}),
+                json!({"timeout": true}),
+                None,
+                Some("timed out\n"),
+            )),
+        ),
+        (
+            "v2 shell",
+            render_card(v2_tool(
+                "shell",
+                json!({"command": "make", "cwd": "/work"}),
+                json!({"status": "completed", "timeout": true}),
+                Some("timed out\n"),
+            )),
+        ),
+    ] {
+        assert!(card.contains("❌"), "{name}: a timeout is a failure: {card}");
+        assert!(
+            card.contains("timed out"),
+            "{name}: the timeout body survives: {card}"
+        );
+    }
+
+    // Control: a settled success stays ✅ on V1 too (the new verdict reads the
+    // recorded outcome, not the producer).
+    let ok = render_card(v1_tool(
+        "bash",
+        json!({"command": "make", "workdir": "/work"}),
+        json!({"exit": 0}),
+        None,
+        Some("ok\n"),
     ));
-    assert!(timed_out.contains("❌"), "a timeout is a failure: {timed_out}");
-    assert!(
-        timed_out.contains("timed out"),
-        "the timeout body survives: {timed_out}"
-    );
+    assert!(!ok.contains("❌"), "an exit 0 is not a failure: {ok}");
 }

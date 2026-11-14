@@ -391,6 +391,13 @@ fn search_detail(input: Option<&Value>, metadata: Option<&Value>, scope: SearchS
 /// Code Mode's program: its source and the nested calls the client recorded in
 /// the metadata. The real `CodeMode.Input` carries no language, so the field
 /// stays `None` until an adapter's wire shape declares one.
+///
+/// `error` is the wire's `metadata.error`, which upstream writes only on a failed
+/// program and always as the boolean `true` — the official client's own test is
+/// `metadata.error === true`. It is read as exactly that flag: a `true` is a
+/// failure, and a message-shaped or otherwise non-boolean value is not one this
+/// build can name (the program's diagnostic reaches the card through its output
+/// text, so nothing is silently dropped from what the reader can see).
 fn program_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
     let calls = metadata
         .and_then(|metadata| metadata.get("toolCalls"))
@@ -523,19 +530,37 @@ mod tests {
     }
 
     /// Code Mode's own failure is a recorded fact, not only a nested call's: a
-    /// program that errored with clean nested calls still declares `error`.
+    /// program that errored with clean nested calls still declares `error`. The
+    /// wire writes it as the boolean `true` and the official client tests
+    /// `=== true`, so a message-shaped value is NOT a failure this build names
+    /// (its diagnostic still reaches the card as the program's output text).
     #[test]
     fn a_program_reads_its_own_error_separately_from_its_nested_calls() {
-        let failed = program_detail(
-            Some(&json!({"code": "return 1"})),
-            Some(&json!({"toolCalls": [{"tool": "fetch", "status": "completed"}], "error": true})),
-        );
-        let ToolDetail::Program { calls, error, .. } = failed else {
-            panic!("a Code Mode call is a Program");
+        let with = |metadata: Value| {
+            let detail = program_detail(Some(&json!({"code": "return 1"})), Some(&metadata));
+            let ToolDetail::Program { calls, error, .. } = detail else {
+                panic!("a Code Mode call is a Program");
+            };
+            (calls, error)
         };
+
+        let (calls, error) = with(json!({
+            "toolCalls": [{"tool": "fetch", "status": "completed"}],
+            "error": true
+        }));
         assert!(error, "the program's own error is a fact");
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].status.is_failure(), "no nested call failed");
+
+        let (_, error) = with(json!({"toolCalls": [], "error": false}));
+        assert!(!error, "an explicit false is not a failure");
+        let (_, error) = with(json!({"toolCalls": [], "error": "boom"}));
+        assert!(!error, "a non-boolean value is not the flag upstream writes");
+        let (_, error) = with(json!({"toolCalls": [], "error": {"message": "boom"}}));
+        assert!(
+            !error,
+            "a message-shaped error is not the boolean the official client checks"
+        );
     }
 
     /// A search's count is `matches` (grep) or `count` (glob); either way it is
