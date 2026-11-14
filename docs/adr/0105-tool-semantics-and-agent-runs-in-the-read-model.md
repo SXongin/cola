@@ -47,7 +47,8 @@ inverts the economics:
   neutral `TodoList` fed by `todowrite` and by `turn/plan/updated`
   (`src/backend/transcript.rs:94`); `/model` is one client-declared
   `ModelSurface` the card only renders (ADR-0092). Neither needs per-adapter
-  arms beyond a mapping (the Todo surface's remaining name checks are P6's).
+  arms beyond a mapping (the Todo surface's remaining name checks belong to the
+  vocabulary ticket).
 
 ## Decision
 
@@ -121,8 +122,8 @@ order and the P1 invariant are the decision recorded here.
 - **One vocabulary instead of N adapters × M consumers.** A third adapter
   answers a mapping table; it edits no card.
 - **The three tables become one fact.** A call's kind is written once, where the
-  client's contract is understood.
-- **Sub-agents stop being a special case per client.** One run fact serves four
+  Agent Client's contract is understood.
+- **Sub-agents stop being a special case per Agent Client.** One run fact serves four
   surfaces.
 - **It is the ADR-0090 decision-7 generalisation, now earned.** The read model
   was generalised after the second generation existed (ADR-0053); the tool
@@ -137,9 +138,9 @@ order and the P1 invariant are the decision recorded here.
 - **Put the whole presentation in the adapter** (a `tool_view` like
   `model_surface`). Rejected for layout and copy: the card owns the words, the
   budget and the fold, and an Agent Client should not ship Feishu JSON. Accepted
-  for the factual `title` and `locations`, which are the client's knowledge.
+  for the factual `title` and `locations`, which are the Agent Client's knowledge.
 - **A typed payload per built-in id.** Rejected: a vendor id is not a
-  cross-adapter contract, and it would grow a variant per client.
+  cross-adapter contract, and it would grow a variant per Agent Client.
 - **A generic "valid JSON → pretty-print" fallback.** Rejected again, for
   ADR-0042's reason: it makes a third-party shape a presentation contract.
 - **Make `kind` a field of `ToolOutput` or a card-side enum.** Rejected: it is

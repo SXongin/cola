@@ -143,8 +143,8 @@ status renders which verb, and what `Unknown` does, is spec #1057's.
   read model (`tool_token`, `phase_token`). Their signatures are spec #1057's.
 - `imageGeneration` is not a `read`: it creates an image and has no file the card
   viewed, so it stays `Other`/`Opaque` until a second adapter gives it a shape.
-- It owns the copy constants a second module would otherwise duplicate; copy that
-  is purely local to one card may stay beside that card.
+- It owns the copy constants a second module would otherwise duplicate, including
+  the run-outcome words and the ledger's; a card keeps no private copy of one.
 - No renderer writes a token as a string literal. A rename edits `vocab.rs` and
   its tests; the compiler finds the callers.
 - `vocab.rs` is the future `zh-CN` catalog's seed: copy functions become lookups,
@@ -189,6 +189,7 @@ escaping and budget rules).
 
 - **Visible changes:** the three live phase words become `waiting` /
   `reasoning` / `responding`; `bash` → `shell`; `task`/`subagent` →
+  `subagent`; `webfetch` → `fetch`; `todowrite` → `plan`; `question` → `ask`;
   `subagent`; Codex's translated nouns disappear in favour of the same tokens;
   `**Input**`/`**Output**` become `**输入**`/`**输出**`.
 - **Tests change with the words.** Header tests, ledger tests and tool-panel
@@ -201,9 +202,9 @@ escaping and budget rules).
 - **The token table and ADR-0105's `ToolKind` are different axes.** Several
   tokens may share one kind (`glob`/`grep` → `Search`, `write`/`edit` → `Edit`),
   and the token refines the kind through `ToolDetail`. An Agent Client that
-  fills the detail renders correctly; one that cannot must either map its tool
-  to the detail or accept the opaque fallback (`Edit + None` and `Search + None`
-  keep the vendor name).
+  fills the detail renders correctly; a **shared built-in** must fill it (the
+  conformance test fails an unmapped shared id), and only a third-party id may
+  be opaque.
 
 ## Open
 

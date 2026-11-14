@@ -2,7 +2,8 @@
 
 > **Amended by ADR-0106**: a Turn also yields while **live runs** are live, not
 > only Background Tasks — a child-only Agent Client (Codex) has runs without
-> background launches, and the ledger lists them.
+> background launches, and the ledger lists them. The Chinese nouns this ADR's
+> examples use (`子代理完成`) are copy superseded by ADR-0107's tokens.
 
 > **Amended by ADR-0060**: the waiting card is no longer strictly frozen — the
 > **Background Task Ledger** updates it in place, and a last task retiring with
