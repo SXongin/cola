@@ -9,7 +9,8 @@
 > only **addresses** an existing run renders as a receipt on that run, not as a
 > panel (ADR-0106), which narrows this ADR's "one call, one panel" for addressing
 > verbs only. The Codex arm's Chinese nouns (`派生子 Agent`, `等待子 Agent`) are
-> **copy superseded by ADR-0107's tokens** (`subagent`, `wait`).
+> **copy superseded by ADR-0107's token** (`subagent`); a `wait`/`sendInput` is
+> an addressing call, not a panel (ADR-0106).
 
 A **Tool Panel** renders each tool call on the card, and today only `read`,
 `edit` and `todowrite` have tailored renderers: an audit of 100 sessions /

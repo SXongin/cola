@@ -1,5 +1,9 @@
 # A Background Task's ending is one durable fact, shown once by the Rendered Cursor's confirmation
 
+> **Amended by ADR-0105**: the same ending classes cover a child-only **Agent
+> Run** (no Background Task); its child transcript's terminal item is the
+> evidence, and every rule below applies to it unchanged.
+
 > **Ratified (2026-10-14, spec #699)**: three points where the landed
 > implementation diverges from this ADR's literal wording — the **Wake** path
 > records its ending with its completion entry's commit, not at derivation; the

@@ -124,7 +124,8 @@ the contract. `AgentRun`'s types, `FileAction` and `SearchScope` live there too.
 `thinking` versus `reasoning` has the same synonym problem in English that
 `思考` versus `推理` has in Chinese. The same three words serve the child-agent
 activity line (`ChildActivity`), so a run's liveness and a card's header cannot
-use different words for the same phase.
+use different words for the same phase. The source is the run's `RunActivity`
+and its `CallView`/`Phase`, not the old `ChildActivity`.
 
 **4. A terminal header is copy, not a token.** `✅ 完成` / `❌ 出错` /
 `⏹ 已停止` close the card as a sentence. The rendered verb comes from the
