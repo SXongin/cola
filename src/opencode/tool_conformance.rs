@@ -53,6 +53,19 @@ fn codex(item: Value) -> (ToolKind, ToolDetail) {
     (call.kind, call.detail)
 }
 
+/// Render one decoded call through the real Tool Panel card builder. The
+/// baseline strings below were produced by this exact function on `7c9859da`.
+fn render_card(call: ToolCall) -> String {
+    use crate::feishu::card::CardState;
+    use crate::feishu::card::shell::CardBuilder;
+    use crate::feishu::card::tool_render::ToolPanel;
+    let card = CardBuilder::new()
+        .with_state(CardState::Done)
+        .with_tool_at(ToolPanel::new(call), None, Some("tool_call"), Some("ses_1"))
+        .build();
+    serde_json::to_string(&card).expect("a card serializes")
+}
+
 /// Execute — `bash` (V1), `shell` (V2) and `codex/command_execution` are one
 /// command.
 #[test]
@@ -554,4 +567,53 @@ fn an_unknown_id_is_opaque_on_both_generations() {
         assert_eq!(v1(name, json!({"path": "x"}), Value::Null), expected);
         assert_eq!(v2(name, json!({"path": "x"}), Value::Null), expected);
     }
+}
+
+/// Captured from `7c9859da` by rendering the same decoded payload through this
+/// same builder.
+const V1_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**Input**\n`ls -la`\n📁 `/work`\n\n**Output**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ bash","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
+
+/// Captured from `7c9859da` (see [`V1_BASELINE_CARD`]).
+const V2_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"tag":"button","text":{"content":"📂 打开","tag":"plain_text"},"type":"default","value":{"action":"file","path":"src/a.rs","session_id":"ses_1"}},{"content":"**Input**\n📄 `src/a.rs`\n\n**Output**\n\n+1 −1\n\n```plain_text\n@@ -1 +1 @@\n-old\n+new\n\n```","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ edit · 📄 a.rs","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
+
+/// Captured from `7c9859da` (see [`V1_BASELINE_CARD`]).
+const CODEX_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**Input**\n`ls -la`\n📁 `/work`\n\n**Output**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ 命令","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
+
+/// Byte-identity guard, one producer each: a decoded wire payload renders the
+/// exact card the pre-change code rendered. A renderer that started reading a
+/// semantic field changes one of these.
+#[test]
+fn a_decoded_v1_bash_renders_the_baseline_card() {
+    let call = v1_call(
+        "bash",
+        json!({"command": "ls -la", "workdir": "/work"}),
+        json!({"exit": 0}),
+        Some("total 0\n"),
+    );
+    assert_eq!(render_card(call), V1_BASELINE_CARD);
+}
+
+#[test]
+fn a_decoded_v2_edit_renders_the_baseline_card() {
+    let call = v2_call(
+        "edit",
+        json!({"path": "src/a.rs", "oldString": "old", "newString": "new"}),
+        json!({"files": [{"file": "src/a.rs", "patch": "@@ -1 +1 @@\n-old\n+new"}]}),
+        Some("Edited src/a.rs"),
+    );
+    assert_eq!(render_card(call), V2_BASELINE_CARD);
+}
+
+#[test]
+fn a_decoded_codex_command_renders_the_baseline_card() {
+    let call = codex_tool(&json!({
+        "type": "commandExecution",
+        "id": "item-command",
+        "command": "ls -la",
+        "cwd": "/work",
+        "status": "completed",
+        "exitCode": 0,
+        "aggregatedOutput": "total 0\n"
+    }));
+    assert_eq!(render_card(call), CODEX_BASELINE_CARD);
 }
