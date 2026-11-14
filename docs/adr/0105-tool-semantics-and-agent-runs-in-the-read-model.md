@@ -76,61 +76,21 @@ one producer today, but the Code Mode pattern is general, its shape differs from
 change removes. No variant carries a vendor id, and a vendor tool with no shared
 shape is `Opaque`.
 
-**4. `AgentRun` is a neutral transcript fact — one run per child agent.** The
-run's shape is #1057's; these are the rules it must satisfy:
+**4. `AgentRun` is a neutral transcript fact — one run per child agent.** A
+child agent — OpenCode's `task`/`subagent`, a Codex collaboration child — is one
+run with its own identity, label, agent, start, status, current activity, and
+the calls that **launched**, **addressed** or **reported** on it. A report
+updates its run; an addressing call is a receipt on it; only a launch keeps a
+Tool Panel. A run's identity is minted once and is never re-keyed by a later
+sighting.
 
-- **The durable key is a field, and ADR-0080 owns its selection.** `run_id` is
-  the live run's identity — the child id when one exists, else the creating
-  call's id — and `task_run_id` is ADR-0080's durable key: the **first** launch's
-  call id when the read carried one, else the child id, and `None` until either
-  exists (an empty id is no id). It never re-mints on a resume; a later launch
-  resolves to the existing record through ADR-0080's alias rule instead. A
-  multi-receiver launch keys each run by its own child id, so two runs never
-  share one call key. The ledger reads and writes endings by `task_run_id`,
-  never by `run_id`, and a run with no `task_run_id` is live and renders no
-  completion entry.
-- **Multiplicity.** A launch that names no receiver creates no run; a completion
-  naming N children creates N runs. A non-launch fact with no child id (an
-  activity report) creates a call-keyed run and fills `child_id` when it learns
-  one. Once created, a run's `run_id` never moves.
-- **A child may be launched more than once.** A resumed `task` passes the prior
-  child id, so the launch relation is a set, not one call.
-- **Three relations, compactly enumerated.** A call **launches** a run
-  (`task`/`subagent`, `spawnAgent`), **addresses** an existing one (`sendInput`,
-  `sendMessage`, `followupTask`, `resumeAgent`, `wait`, `closeAgent`,
-  `interruptAgent`, `listAgents`) or **reports** on one (`subAgentActivity`).
-  `resumeAgent` resumes a child and is an address, not a launch; `wait` and
-  `listAgents` may name no target and then address the Turn's live runs as a
-  set. A report is an *observation*: it is applied when its state is newer, and
-  identical observations collapse — never deduped by the call id alone, because
-  the wire reuses the item id between an activity's start and its completion.
-- **Addressing may name no target.** Codex's `wait` writes empty receiver lists;
-  such a call addresses the Turn's live runs as a set and renders a turn-level
-  receipt, never a guess at one run.
-- **No vendor `kind`.** `task`/`subagent`/`spawnAgent`/a collaboration call all
-  mean "a child agent this Turn set running"; the relations, `agent` and `label`
-  carry the provenance.
-- **Liveness carries neutral semantics, its clock and both waits.** The
-  activity line's newest call carries its `ToolKind`, `ToolDetail`, identity and
-  **server start time** (so `shell 28s` counts from the call's own start), and
-  the child's pending requests are a **set** (permission and question may both be
-  live, rendering `等待你的授权/回答`).
-- **`RunStatus` is the client's statement, not cola's ending.** `Running`,
-  `Completed`, `Failed`, `Cancelled`, `Unknown`. Cola has two ending types and
-  neither is `RunStatus`: the **durable** `TaskEndingClass`
-  (`Evidence`/`Cleanup`/`Wake`, with its `TaskEndingEvidence`) that ADR-0080
-  keys and owns the exactly-once rules for, and the **render** enum
-  `bridge::tasks::TaskEnding` (`Wake`/`RuntimeEnded`/`Lost`/`Cleaned`) that names
-  the card's word. A runtime-confirmed end renders `结束` while the client still
-  says `Running`; a **Cleanup** renders `已清理` with no `RunStatus`; and a
-  child-only run retires on its child transcript's terminal **evidence** (Class
-  `Evidence`, so its adapter must read the child's terminal item) or a cleanup,
-  never on a `RunStatus` alone.
+`RunStatus` is the **client's** statement about the run. Cola's durable ending is
+a separate layer — ADR-0080's `TaskEndingClass` and its evidence, plus the render
+enum that names the card's word — and the two are never folded: a runtime end or
+a cleanup never becomes a client status.
 
-The run is a read-model fact. The bridge's background overlay
-(`src/bridge/tasks/*`) stays cola-side: it answers *what ended it and has the
-ending been shown*, which is cola's own durable bookkeeping, not the client's
-statement.
+**The implementation contract — key selection, multiplicity, observation dedupe,
+the wait set, the retirement path — is spec #1057's**, not this ADR's.
 
 **5. The card derives what it shows from `(kind, detail)`.** `identity.name` is
 diagnostic and a fallback title, never a renderer key. The migration is complete
@@ -150,9 +110,9 @@ byte-identical card.
 ### Migration
 
 P1 fields only (every existing card byte-identical) → P2 Execute → P3 FileEdits
-→ P4 AgentRun. **The per-step field lists, adapter mappings and acceptance
-criteria are spec #1057's**, not this ADR's; the order and the P1 invariant are
-the decision recorded here.
+(which also retires the remaining name-keyed arms) → P4 AgentRun. The per-step
+field lists, adapter mappings and acceptance criteria are spec #1057's; the
+order and the P1 invariant are the decision recorded here.
 
 ## Why
 

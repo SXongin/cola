@@ -108,16 +108,9 @@ only producer:
 | `Other` + `None`, vendor `question` | `ask` |
 | anything else | the vendor name (opaque) |
 
-Four consequences worth stating because they are the ambiguous cases: a mixed
-`FileEdits` list reads `edit` (the umbrella; `write` means "a non-empty list
-whose every entry adds"), an **empty** `FileEdits` also reads `edit` (Codex's
-`fileChange` starts empty and gains entries, so `write` would flip back), a
-`Delegation` whose effect is `Address` renders a receipt on the run while
-`Report` updates the run with **no** surface of its own, and `read` absorbs only
-`imageView` — the adapter must carry the source item type, because Codex
-projects `imageView` and `imageGeneration` into one item kind and a generated
-image is `Other`/`Opaque` (P1's conformance test covers both).
-`AgentRun`'s types, `FileAction` and `SearchScope` live in spec #1057.
+The derived edge cases — a mixed or empty `FileEdits` list, `read` versus a
+generated image, an address versus a report — are spec #1057's; the table above is
+the contract. `AgentRun`'s types, `FileAction` and `SearchScope` live there too.
 
 **3. The live phase slot speaks three tokens.**
 
@@ -134,16 +127,11 @@ activity line (`ChildActivity`), so a run's liveness and a card's header cannot
 use different words for the same phase.
 
 **4. A terminal header is copy, not a token.** `✅ 完成` / `❌ 出错` /
-`⏹ 已停止` close the card as a sentence; they are not a machine slot. The ledger
-has three layers: `RunStatus` (`Running` / `Completed` / `Failed` / `Cancelled` /
-`Unknown`) is **the client's statement**; ADR-0080's **durable**
-`TaskEndingClass` (`Evidence` / `Cleanup` / `Wake`, with its evidence) is what
-cola records; and the **render** enum `bridge::tasks::TaskEnding` (`Wake` /
-`RuntimeEnded` / `Lost` / `Cleaned`) names the card's word. The rendered verb —
-`完成` / `失败` / `已取消` / `结束` / `已失联` / `已清理` — is copy derived from the
-render ending, or from `RunStatus` when only the client reported the end. A
-runtime-confirmed end renders `结束` (a durable `Evidence`), a cleanup renders
-`已清理` (a durable `Cleanup`), and neither is folded into `RunStatus`.
+`⏹ 已停止` close the card as a sentence. The rendered verb comes from the
+**ending layer** — ADR-0080's `TaskEndingClass` and its evidence, or the render
+enum that names the word — never from `RunStatus` alone, because `RunStatus` is
+the client's statement and is never folded into cola's ending. Which evidence or
+status renders which verb, and what `Unknown` does, is spec #1057's.
 
 **5. Section labels are copy.** `**Input**` / `**Output**` become `**输入**` /
 `**输出**`. Units (`个文件`, `行`, `处匹配`) stay copy. Card titles (`📄 会话`,

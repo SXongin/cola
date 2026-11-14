@@ -53,58 +53,22 @@ request method (`src/codex/approvals.rs:776`) and the neutral
 attachment-wide flag would show the button where the backend declines it or hide
 it where it is valid, so the card reads the request's own field.
 
-**2. Every capability-gated surface gates on it.** (The permission always-scope
-is outside this table: it is per request, per the rule above.)
+**2. Every capability-gated surface is omitted when absent, never rendered
+empty and never guessed.** The gate matrix — which surface needs which axis, and
+what its absence looks like — is spec #1057's. The permission always-scope is
+outside it, per the rule above. Absence is recorded once at attach, and each
+Agent Client has a test that asserts each absent surface stays absent.
 
-| Surface | Gate | When absent |
-|---|---|---|
-| Live-run ledger | `reports_live_runs()` | no section |
-| Panel liveness line | `child_agents != None` **and** a run with activity | plain panel |
-| Plan section | `plan != None` | no section |
-| Compaction row / `/compact` | `compaction` | no row; the command reports it as unsupported |
-| Turn footer usage | `usage != None` | no footer figure |
-| 「始终允许」 on a permission | the **request's** `always_supported` (ADR-0018) | one-time options only |
-| Question card / inline block | `questions != None` | no question surface |
-| Location Form | `questions` includes a location scope | no directory-owned form |
-| Agent picker | `modes` | `/agent` reports it as unsupported |
-| Turn-diff index | `diffs` | no index line, no button |
-| `/mcp` card | `mcp` | the command reports it as unsupported |
+**3. The event→surface selection is the same model.** Which card an event opens
+— the Turn card, a continuation, a Supplement, an inline block, a standalone
+request card, the Session Card, the Terminal/Viewer cards, a compaction row, a
+restart stamp — is spec #1057's surface table. The ADR fixes the principle: one
+surface per event, chosen by capability, never duplicated.
 
-An absent surface is **omitted**, never rendered empty and never guessed from a
-failed read. Absence is recorded once at attach (one log line naming the Agent
-Client and the missing surfaces), and each Agent Client has a test that asserts
-each absent surface stays absent.
-
-**3. The event→surface table is part of this decision.** It is the reference a
-new surface is checked against:
-
-| Event | Surface |
-|---|---|
-| A prompt starts a Turn | streaming Turn card, a reply to the message |
-| Content fills the card | continuation card in the same Card Chain |
-| A message arrives mid-Turn | Supplement card (steer) |
-| The Turn ends with live runs | the same card yields (`Waiting`) |
-| A run's completion resumes work | the same card (`Resuming`) |
-| A Permission/Question on a live mapped Turn | inline block |
-| … with no live card | standalone request card, re-adoptable |
-| … from a child session | re-homed to the parent's card |
-| … already resolved elsewhere | resolved-elsewhere card |
-| `/card` on a Session nobody renders | one-shot Session Card, no controls |
-| Another Agent Client's user message | notify card |
-| A Host command | Terminal Card, outside every Chain |
-| A Host file/directory | Viewer/browse card, outside every Chain |
-| A compaction | row on the Turn card at its server position |
-| A restart finds a live card | `Restarted` stamp, not a new card |
-
-**4. A call that addresses an existing run is a receipt, not a panel.** Codex's
-addressing verbs (`sendInput`, `sendMessage`, `followupTask`, `resumeAgent`,
-`wait`, `closeAgent`, `interruptAgent`, `listAgents`) carry no new work: they
-belong to an existing `AgentRun` (ADR-0105) and render as a run receipt. A `wait`
-that names no target addresses the Turn's live runs as a set, so its receipt is
-turn-level (ADR-0105's addressing rule). A call that **launches** a run keeps its
-panel as the record of the request. The raw call stays in the transcript either
-way. This is a surface rule, not a read-model one: the call is still a
-`ToolCall`, and `kind`/`detail` still describe it.
+**4. A call that only addresses an existing run is a receipt, not a panel.** A
+launch keeps its Tool Panel as the record of the request; an addressing call
+belongs to the run it addresses (ADR-0105). The verb list, the turn-level case
+and the exact row are spec #1057's.
 
 **5. Existing per-subsystem methods fold into the read.**
 `background_tasks_supported` and its siblings are not a second source of truth.

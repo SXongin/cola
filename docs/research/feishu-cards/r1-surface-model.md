@@ -298,24 +298,19 @@ Rules that keep ADR-0042 intact:
 
 ### 4.3 The Agent Run: the sub-agent fact
 
-One run per child agent: a live identity (`run_id` — the child id when one
-exists, else the creating call's id), the durable **Task Run Id** it maps to
-(`task_run_id`, ADR-0080's key), the child id as a field, a label/agent/start,
-the client-declared status, the current activity (the newest call's neutral
-semantics plus the pending wait), and the three relations — **launched** (a set:
-a resume launches the same child again), **addressed**, and **reported** (applied
-by observation state, because the wire reuses the item id between an activity's
-start and completion). ADR-0105 states the rules; spec #1057 owns the shape.
+One run per child agent, with a stable identity, its three relations and a status
+distinct from cola's durable ending. ADR-0105 states the rules; spec #1057 owns
+the shape and every edge case (key selection, multiplicity, dedupe, retirement).
 
 Read-model presence, not card presence:
 
 - `SessionTranscript.runs` (derived by each adapter) plus the existing
   background overlay (`src/bridge/tasks/*`) become one run view.
 - OpenCode: `task`/`subagent` calls with `metadata.sessionID` → one run.
-- Codex: a `collabAgentToolCall` that names a receiver creates a run;
-  `subAgentActivity` updates that run rather than rendering a panel; every
-  addressing verb is `addressed_by`, and `wait`/`listAgents` with no target
-  address the Turn's live runs as a set (no orphan run is minted).
+- Codex: only `spawnAgent` launches a run; `subAgentActivity` updates that run
+  rather than rendering a panel; every other collaboration verb addresses, and
+  `wait`/`listAgents` with no target address the Turn's live runs as a set (no
+  orphan run is minted).
 - The card uses the run for: the launching panel's liveness line, the ledger
   row, the completion entry, and `/sub`'s identity. **One fact, four surfaces,
   no vendor arms.**
@@ -328,20 +323,8 @@ derived from the first two. The permission always-scope is **not** an axis: it
 is per request (ADR-0018), carried by `PermissionRequest::always_supported`.
 ADR-0106 states the set and the gates; spec #1057 owns the struct.
 
-Surfaces gate on it instead of on per-subsystem methods:
-
-| Surface | Requires | When absent |
-|---|---|---|
-| Ledger section | `reports_live_runs()` (`background_runs \|\| child_agents != None`) | no section |
-| Panel liveness line | `child_agents != None` + a run with activity | plain panel |
-| Plan section | `plan != None` | no section |
-| Compaction row | `compaction` | no row (the part is not a compaction row) |
-| Footer usage | `usage != None` | no footer figure |
-| Question surface | `questions != None` | no question card/block |
-| 「始终允许」 | the **request's** `always_supported` (ADR-0018) | one-time buttons only |
-| Agent picker | `modes` | `/agent` says unsupported |
-| Turn-diff index | `diffs` | no index line, no button |
-| `/mcp` card | `mcp` | the command says unsupported |
+The gate matrix and the event→surface table live in spec #1057; ADR-0106 states
+the principle (omitted, never empty) and the axes.
 
 ### 4.5 Rendering: one renderer per shape, no per-name arms
 
