@@ -86,6 +86,8 @@ pub enum ToolDetail {
     None,
     Command { command: String, cwd: Option<String>, exit: Option<i64>,
               timeout: bool },
+    Program { source: String, language: Option<String>,
+              calls: Vec<ToolCallRef> },   // Code Mode: a program that calls tools
     FileEdits(Vec<FileEdit>),   // path, create/modify/delete/rename, unified diff
     Search { query: Option<String>, matches: Option<u64>, scope: SearchScope },
     Read { path: String, preview: Option<String>, directory: bool },
@@ -95,11 +97,22 @@ pub enum ToolDetail {
 ```
 
 The rule for adding a variant is the ADR-0090 rule for DTOs: **a second
-adapter must need it.** `Command`, `FileEdits` and `Delegation` have two
-producers today (OpenCode's built-ins and Codex's item kinds); `Search` and
+adapter must need it.** `Command`, `Program`, `FileEdits` and `Delegation` have
+two producers today (OpenCode's built-ins and Codex's item kinds); `Search` and
 `Read` have two and are cheap; nothing else grows until a third client forces
 it. The existing `ToolCall::background_launch()` marker is unchanged — it is a
 durable launch fact, not a detail of the command.
+
+`Program` is the **Code Mode** shape: the model writes a program that calls
+tools from inside a sandbox, and only its output returns. It is not an
+OpenCode-specific idea — Cloudflare named the pattern (Code Mode, 2025-09),
+Anthropic calls it programmatic tool calling (2025-11), OpenAI's Responses API
+and Pi both ship it, and the ecosystem already spells the tool four ways
+(`codemode`, `exec`, `execute_tools`, `code_execution`). It gets a detail now
+because its shape differs from `Command` (source + nested calls, not one command
+line) and because the current `execute` panel already has a bespoke renderer:
+mapping it to `Opaque` would keep a name arm, which is the cost this ADR
+removes. The renderer counts as the second consumer the rule asks for.
 
 **4. `AgentRun` is a neutral transcript fact.**
 
@@ -143,8 +156,10 @@ byte-identical card.
 - **P1 — fields only.** Add `kind`/`title`/`locations`/`detail`; every adapter
   fills them; the card ignores them. The invariant is that every existing card
   is byte-identical.
-- **P2 — Execute.** One `Command` renderer; the three shell ids and the Host
-  Terminal Card's output block share it. `command_input`'s vendor split goes.
+- **P2 — Execute.** One Execute family: `Command` (the three shell ids, with the
+  Host Terminal Card sharing the output block) and `Program` (Code Mode's
+  source plus its nested calls). `command_input`'s vendor split and the
+  `execute` name arm go.
 - **P3 — FileEdits.** One diff renderer; `edit`/`patch`/`apply_patch`/
   `codex/file_change` collapse onto it.
 - **P4 — AgentRun.** Codex activity reports fold into runs; the liveness line,
