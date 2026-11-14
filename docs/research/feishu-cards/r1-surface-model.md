@@ -417,7 +417,7 @@ and its tests.
 | **P0** | This note → GLOSSARY terms + the three ADRs | docs only | — |
 | **P1** | `ToolKind`, `title`, `locations`, `ToolDetail` on `ToolCall`; adapters fill; card ignores them | every existing card byte-identical | adapter conformance + snapshot |
 | **P2** | `ToolDetail::Command`; one Execute renderer; Terminal Card reuses its output block; delete `bash`/`shell`/`codex/command_execution` arms and `command_input`'s vendor split | the three ids render the same as today | `shell.rs` header tests + `terminal.rs` |
-| **P3** | `ToolDetail::FileEdits`; collapse `write`/`edit`/`patch`/`apply_patch`/`codex/file_change` | same diffs, same open-button rule | `tool_render` diff tests |
+| **P3** | `ToolDetail::FileEdits`; collapse `write`/`edit`/`patch`/`apply_patch`/`codex/file_change`, plus the remaining `read`/`glob`/`grep`/`webfetch` arms | same diffs, same open-button rule; no name-keyed arm left | `tool_render` diff tests |
 | **P4** | `AgentRun` + `ToolDetail::Delegation`; Codex activity items fold into runs; ledger + liveness read runs | OpenCode output unchanged; Codex gains liveness/ledger | `codex/cards.rs`, `bridge/tests/ledger.rs` |
 | **P5** | `AgentCapabilities`; surfaces gate on it | every absence is explicit and tested | per-client card tests |
 | **P6** | `card/vocab.rs`, the token table, the phase renames, `输入`/`输出` | no token literal outside the module | vocab + header/ledger tests |
