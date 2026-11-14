@@ -4,6 +4,9 @@
 > Background Task or a Turn-scoped child agent — gates on
 > `reports_live_runs()`, and each row's type word is the run's tool token
 > (`shell`/`subagent`), not the vendor id.
+>
+> **Amended by ADR-0107**: the liveness vocabulary is `waiting`/`reasoning`/
+> `responding`, and the tool token is `shell` (not `bash`).
 
 > **Amended by ADR-0066**: the freeze's carve-out widens — a yielded card also
 > receives its Wake's resumed content (ADR-0066 resumes shell/subagent
@@ -214,8 +217,8 @@ spec #501): the ledger and the Tool Panel call one task the same thing.
 
 A background `subagent`'s live row carries the same child-session liveness the
 live task panel shows (spec #501, ticket #503): appended after the row's start
-clock — `· subagent：**review the diff** · 14:04 · bash 5s`, or
-`· 思考中 30s · 等待你的授权` for a phase and its wait — through the front's own
+clock — `· subagent：**review the diff** · 14:04 · shell 5s`, or
+`· reasoning 30s · 等待你的授权` for a phase and its wait — through the front's own
 fragment vocabulary, so one child state reads the same wherever cola renders
 it. The fragment sits after the start clock and before `· ⚠️ 状态待确认`; a row
 the runtime reconciliation could not confirm renders no activity, and a `shell`

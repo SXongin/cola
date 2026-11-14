@@ -96,13 +96,14 @@ new surface is checked against:
 | A restart finds a live card | `Restarted` stamp, not a new card |
 
 **4. A call that addresses an existing run is a receipt, not a panel.** Codex's
-`sendInput`/`wait`/`closeAgent` carry no new work: they belong to an existing
-`AgentRun` (ADR-0105) and render as a run receipt. A `wait` that names no target
-addresses the Turn's live runs as a set, so its receipt is turn-level
-(ADR-0105's addressing rule). A call that **launches** a run keeps its panel as
-the record of the request. The raw call stays in the transcript either way. This
-is a surface rule, not a read-model one: the call is still a `ToolCall`, and
-`kind`/`detail` still describe it.
+addressing verbs (`sendInput`, `sendMessage`, `followupTask`, `resumeAgent`,
+`wait`, `closeAgent`, `interruptAgent`, `listAgents`) carry no new work: they
+belong to an existing `AgentRun` (ADR-0105) and render as a run receipt. A `wait`
+that names no target addresses the Turn's live runs as a set, so its receipt is
+turn-level (ADR-0105's addressing rule). A call that **launches** a run keeps its
+panel as the record of the request. The raw call stays in the transcript either
+way. This is a surface rule, not a read-model one: the call is still a
+`ToolCall`, and `kind`/`detail` still describe it.
 
 **5. Existing per-subsystem methods fold into the read.**
 `background_tasks_supported` and its siblings are not a second source of truth.

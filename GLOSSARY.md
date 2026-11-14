@@ -187,7 +187,7 @@ One **Background Task** run's endings as durable facts on the **Chain Record**, 
 _Avoid_: Task status (that is liveness, not an ending), completion record (that is the **Wake**), rendered mark (the pre-ADR-0080 parallel key set)
 
 **Task Run Id** (运行身份):
-The stable identity of one **Background Task** run, and the key its **Task Ending**s are recorded under: the launching tool call's id when the read carries the launch, else the shell/child id the **Wake** itself reports — never an invented one. The record carries every id the run is known by, and every writer resolves before it mints — by an exact run id, else an exact **Wake** id already on a record, else the **newest** record naming any other id it holds (a resumed child's later launch supersedes the earlier one) — so the order the two sides arrive in cannot matter: one run keeps one record, however the run is named.
+The stable identity of one **Background Task** run, and the key its **Task Ending**s are recorded under: the child id when the fact creating the run names one, else the launching call's id — never an invented one. The record carries every id the run is known by, and every writer resolves before it mints — by an exact run id, else an exact **Wake** id already on a record, else the **newest** record naming any other id it holds (a resumed child's later launch supersedes the earlier one) — so the order the two sides arrive in cannot matter: one run keeps one record, however the run is named.
 _Avoid_: Call id (the launch's own id, one spelling), shell id / child id (the run's other names)
 
 **Runtime Reconciliation**:

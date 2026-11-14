@@ -35,8 +35,9 @@ The distinction that actually matters is not Chinese versus English. It is
 for the first two is one question: would a translator touch it?**
 
 - **No → Token.** Domain vocabulary: tool nouns, live phase words, protocol
-  names, identifiers. Tokens are invariant: they stay English when a locale
-  arrives, and they never enter a translation catalog.
+  constants (`mcp`, `subagent`). Tokens are invariant: they stay English when a
+  locale arrives, and they never enter a translation catalog. A data id is
+  **Verbatim**, never a token.
 - **Yes → Copy.** Interface text: card titles, sentences, buttons, empty states,
   hints, units, section labels. Copy is authored in Chinese today and becomes a
   `zh-CN` catalog when i18n lands.

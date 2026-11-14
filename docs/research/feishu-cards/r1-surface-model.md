@@ -46,7 +46,8 @@ three parallel name→meaning tables:
 `tool_render.rs` alone is **9,725 lines** of a **33,645-line** card layer
 **[measured]**, and the six adapter-namespaced ids (`command_execution`,
 `file_change`, `web_search`, `image`, `collab_agent`, `sub_agent_activity`)
-appear **68 times** in it, tests included **[measured]**. Every one of those
+appear **78 times** in it (68 quoted match positions), tests included
+**[measured]**. Every one of those
 arms is a *presentation consequence of a semantics gap*: the card cannot ask
 "is this an edit?", only "is this `patch`, `apply_patch`, `edit`, or
 `codex/file_change`?".
@@ -112,7 +113,7 @@ smaller surface than it looks.
 
 | Path | What the card shows | Live? | Row in ledger? | `/sub`? | Source |
 |---|---|---|---|---|---|
-| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (`bash 28s` / `reasoning 12s` / `等待你的授权`) | yes | yes (`TaskKind::Subagent`) | yes (`parentID`) | ADR-0054, `tool_render.rs:491`, `:554` |
+| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (`shell 28s` / `reasoning 12s` / `等待你的授权`) | yes | yes (`TaskKind::Subagent`) | yes (`parentID`) | ADR-0054, `tool_render.rs:491`, `:554` |
 | OpenCode V2 `subagent` | same, `metadata.sessionID`, `<subagent …>` envelope | yes | yes | yes | `read_model` V2, `tool_render.rs:505` |
 | Codex `collab_agent` | **one panel per call**, title from the collaboration verb (`派生子 Agent`, `发送输入`, `等待子 Agent`, …), body is the target rows / prompt / model | **no** | **no** | *(threads have `parent_thread_id` → `parent_id`, so `/sub` works)* `src/codex/threads.rs:79` | `src/codex/read_model.rs:1589`, `tool_render.rs:1029`, `:3109` |
 | Codex `sub_agent_activity` | **a tool panel of its own** (`子 Agent`, target = `agentPath`) — a lifecycle *event* rendered as a *call* | n/a | **no** | n/a | `read_model.rs:1633`, `tool_render.rs:1034` |
