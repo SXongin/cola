@@ -46,8 +46,8 @@ would a translator touch it?**
 | Token | Absorbs | Note |
 |---|---|---|
 | `shell` | `bash`, `shell`, `command_execution` | command + cwd + exit + background |
-| `read` | `read`, Codex `image` | a file or image viewed |
-| `write` | `write` | a new file |
+| `read` | `read`, Codex `imageView` (`codex/image`) | a file or image viewed |
+| `write` | `write` | a new file (every file in the edits is an add) |
 | `edit` | `edit`, `patch`, `apply_patch`, Codex `file_change` | a diff |
 | `glob` | `glob` | file-name search |
 | `grep` | `grep` | content search |
@@ -91,8 +91,8 @@ only producer:
 | `Execute` + `Command` | `shell` |
 | `Execute` + `Program` | `script` |
 | `Read` + `Read` | `read` |
-| `Edit` + `FileEdits`, **every** edit is `Add` | `write` |
-| `Edit` + `FileEdits`, any other list (including mixed add + update) | `edit` |
+| `Edit` + `FileEdits` with a **non-empty** list, every edit `Add` | `write` |
+| `Edit` + `FileEdits` otherwise (empty, mixed, or any non-add) | `edit` |
 | `Search` + `scope: FileName` | `glob` |
 | `Search` + `scope: Content` | `grep` |
 | `Search` + `scope: Web` | `websearch` |
@@ -103,11 +103,13 @@ only producer:
 | `Other` + `None`, vendor `question` | `ask` |
 | anything else | the vendor name (opaque) |
 
-Two consequences worth stating because they are the ambiguous cases: a mixed
-`FileEdits` list reads `edit` (the umbrella; `write` means "this call only added
-files"), and a `Delegation` whose effect is `Address` or `Report` has **no**
-token at all — it renders as a receipt on the run, not as a panel. `FileAction`
-and `SearchScope` are ADR-0105's types.
+Three consequences worth stating because they are the ambiguous cases: a mixed
+`FileEdits` list reads `edit` (the umbrella; `write` means "a non-empty list
+whose every entry adds"), an **empty** `FileEdits` also reads `edit` (Codex's
+`fileChange` starts empty and gains entries, so `write` would flip back), and a
+`Delegation` whose effect is `Address` or `Report` has **no** token at all — it
+renders as a receipt on the run, not as a panel. `AgentRun`'s types, `FileAction`
+and `SearchScope` live in spec #1057.
 
 **3. The live phase slot speaks three tokens.**
 
@@ -143,7 +145,9 @@ changes — the model values are already there.)*
 **6. The split is enforced by one module: `src/feishu/card/vocab.rs`.**
 
 - It owns every token constant and the functions that derive a token from the
-  read model (`tool_token(identity, kind, detail)`, `phase_token(state)`).
+  read model (`tool_token`, `phase_token`). Their signatures are spec #1057's.
+- `imageGeneration` is not a `read`: it creates an image and has no file the card
+  viewed, so it stays `Other`/`Opaque` until a second adapter gives it a shape.
 - It owns the copy constants a second module would otherwise duplicate; copy that
   is purely local to one card may stay beside that card.
 - No renderer writes a token as a string literal. A rename edits `vocab.rs` and

@@ -273,43 +273,11 @@ vendor's. It is now the thing forcing every card arm: the *shape gates*
 (`command_execution_shape`, `file_change_shape`, …) exist because the card
 cannot trust a name, and there is no neutral type to trust instead.
 
-**Proposal: four additive fields, all adapter-supplied, with `Other` staying
-opaque.**
-
-```rust
-// src/backend/transcript.rs
-pub struct ToolCall {
-    pub identity: ToolIdentity,     // vendor name + call id — unchanged
-    pub kind: ToolKind,             // NEW: coarse, adapter-declared
-    pub title: Option<String>,      // NEW: the adapter's human title (ACP `title`)
-    pub locations: Vec<ToolLocation>, // NEW: files this call touches (ACP `locations`)
-    pub status: ToolStatus,
-    pub started_at: Option<i64>,
-    pub input: Option<Value>,       // unchanged, stays raw
-    pub metadata: Option<Value>,    // unchanged
-    pub output: ToolOutput,
-    pub detail: ToolDetail,         // NEW: typed only for the shared shapes
-}
-
-/// ACP's ToolKind, which is exactly the coarse taxonomy the card needs.
-pub enum ToolKind {
-    Read, Edit, Delete, Move, Search, Execute, Think, Fetch, SwitchMode, Other,
-}
-
-pub enum ToolDetail {
-    None,
-    Command { command, cwd, exit, timeout },
-    Program { source, language, calls }, // Code Mode: a program that calls tools
-    FileEdits(Vec<FileEdit>),       // path, FileAction, rename_to, diff
-    Search { query: Option<String>, matches: Option<u64>, scope: SearchScope },
-    Read { path: String, preview: Option<String>, directory: bool },
-    Delegation { runs: Vec<AgentRunRef>, effect: DelegationEffect },
-    Opaque,                         // everything else — ADR-0042's rule stands
-}
-```
-
-`FileAction`, `SearchScope`, `DelegationEffect` and the `AgentRunRef`/`ToolCallRef`
-shapes are ADR-0105's; §4.3/§4.4 below follow it.
+**Proposal: four additive facts, all adapter-supplied, with `Other` staying
+opaque.** A `ToolCall` gains a `ToolKind` (ACP's ten), a human `title`, the
+`locations` it touches and a typed `detail`; the raw payloads, status and output
+are unchanged. The shapes themselves are decided in ADR-0105 and laid out once in
+spec #1057 — this note keeps the reasoning, not a second copy.
 
 Rules that keep ADR-0042 intact:
 
@@ -324,23 +292,18 @@ Rules that keep ADR-0042 intact:
    metadata both produce `FileEdits`/`Command`; a `websearch` produces
    `Search`; nothing else grows a variant until a second adapter needs it.
 4. **Presentation copy stays in the card.** The adapter supplies *facts and
-   titles*; 「文件修改」/「命令」/「子 Agent」 and the icon remain the card's.
+   titles*; the token and the icon remain the card's (ADR-0107: `shell`, `edit`,
+   `subagent`, …), never the client's.
 
 ### 4.3 The Agent Run: the sub-agent fact
 
-```rust
-pub struct AgentRun {
-    pub run_id: String,             // child session/thread id when it has one
-    pub label: String,              // description / prompt / agent name
-    pub agent: Option<String>,      // subagent_type / agentPath / model
-    pub started_at: Option<i64>,
-    pub status: RunStatus,          // Running | Completed | Failed | Cancelled | Unknown
-    pub activity: Option<RunActivity>, // newest live tool or phase (ADR-0054's fact)
-    pub launched_by: Option<ToolCallRef>,
-    pub addressed_by: Vec<ToolCallRef>, // sendInput/wait/closeAgent
-    pub reported_by: Vec<ToolCallRef>,  // subAgentActivity
-}
-```
+One run per child agent: a stable identity minted once when the run is first
+observed, the child id as a field (never the key), a label/agent/start, the
+client-declared status, the current activity (the newest call's neutral
+semantics plus the pending wait), and the three relations — **launched** (a set:
+a resume launches the same child again), **addressed**, and **reported** (applied
+by observation state, because the wire reuses the item id between an activity's
+start and completion). ADR-0105 states the rules; spec #1057 owns the shape.
 
 Read-model presence, not card presence:
 
@@ -355,20 +318,11 @@ Read-model presence, not card presence:
 
 ### 4.4 Capabilities: one declaration per Agent Client
 
-```rust
-pub struct AgentCapabilities {
-    pub background_runs: bool,        // a call can outlive its Turn
-    pub child_agents: ChildAgentMode, // None | ChildSessions | ActivityReports
-    pub plan: PlanMode,               // None | TodoTool | TurnPlan
-    pub compaction: bool,
-    pub usage: UsageMode,             // None | PerTurn | Cumulative
-    pub permissions: PermissionMode,  // option kinds the client can express
-    pub questions: QuestionMode,      // None | Session | SessionAndLocation
-    pub modes: bool,                  // agent/mode axis
-    pub diffs: bool,                  // session/turn diff reads
-    pub mcp: bool,                    // MCP server statuses (the `/mcp` card)
-}
-```
+The axes are background runs, child-agent mode, plan, compaction, usage,
+questions, modes, diffs and MCP server statuses, with `reports_live_runs()`
+derived from the first two. The permission always-scope is **not** an axis: it
+is per request (ADR-0018), carried by `PermissionRequest::always_supported`.
+ADR-0106 states the set and the gates; spec #1057 owns the struct.
 
 Surfaces gate on it instead of on per-subsystem methods:
 
@@ -382,6 +336,7 @@ Surfaces gate on it instead of on per-subsystem methods:
 | Question surface | `questions != None` | no question card/block |
 | 「始终允许」 | `permissions` advertises a session scope | one-time buttons only |
 | Agent picker | `modes` | `/agent` says unsupported |
+| Turn-diff index | `diffs` | no index line, no button |
 | `/mcp` card | `mcp` | the command says unsupported |
 
 ### 4.5 Rendering: one renderer per shape, no per-name arms
@@ -456,7 +411,7 @@ and its tests.
 | Phase | Change | Invariant | Tests |
 |---|---|---|---|
 | **P0** | This note → GLOSSARY terms + one ADR for the model | docs only | — |
-| **P1** | `ToolKind`, `title`, `locations` on `ToolCall`; adapters fill; card ignores them | every existing card byte-identical | adapter conformance + snapshot |
+| **P1** | `ToolKind`, `title`, `locations`, `ToolDetail` on `ToolCall`; adapters fill; card ignores them | every existing card byte-identical | adapter conformance + snapshot |
 | **P2** | `ToolDetail::Command`; one Execute renderer; Terminal Card reuses its output block; delete `bash`/`shell`/`codex/command_execution` arms and `command_input`'s vendor split | the three ids render the same as today | `shell.rs` header tests + `terminal.rs` |
 | **P3** | `ToolDetail::FileEdits`; collapse `edit`/`patch`/`apply_patch`/`codex/file_change` | same diffs, same open-button rule | `tool_render` diff tests |
 | **P4** | `AgentRun` + `ToolDetail::Delegation`; Codex activity items fold into runs; ledger + liveness read runs | OpenCode output unchanged; Codex gains liveness/ledger | `codex/cards.rs`, `bridge/tests/ledger.rs` |
