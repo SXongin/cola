@@ -3,6 +3,8 @@
 > **Amended by ADR-0106**: the reconciliation's early return gates on
 > `reports_live_runs()`, not `background_tasks_supported()`, so a child-only
 > Agent Run is reconciled too.
+> The body below is the historical record and is not rewritten; this banner is
+> authoritative (convention: #1065).
 
 
 > **Reopened by ADR-0080**: the process-local overlay and the "a retirement is

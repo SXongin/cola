@@ -3,6 +3,8 @@
 > **Amended by ADR-0105**: its second-adapter rule for neutral DTOs is refined —
 > `ToolDetail::Program` is admitted with one producer, with the exception argued
 > in that ADR.
+> The body below is the historical record and is not rewritten; this banner is
+> authoritative (convention: #1065).
 
 ## Context
 
