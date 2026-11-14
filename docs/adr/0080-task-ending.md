@@ -1,10 +1,5 @@
 # A Background Task's ending is one durable fact, shown once by the Rendered Cursor's confirmation
 
-> **Amended by ADR-0105**: the canonical `TaskRunId` is the **child id when the
-> creating fact names one**, else the launch's call id. The alias rule below is
-> unchanged — the record still carries every id the run is known by, so either
-> spelling resolves to the same run.
-
 > **Ratified (2026-10-14, spec #699)**: three points where the landed
 > implementation diverges from this ADR's literal wording — the **Wake** path
 > records its ending with its completion entry's commit, not at derivation; the
@@ -77,8 +72,8 @@ derivation — see the 2026-10-14 amendment below.
 **One run, one record; one shown fact per ending.**
 
 - **The identity is the run, and the run's ids are aliases of one record.** A
-  new `TaskRunId`: the child id when the creating fact names one, else the
-  launch's call id (never an invented one). One run's
+  new `TaskRunId`: the launch's call id when the read carries the launch, else
+  the shell/child id a Wake itself reports (never an invented one). One run's
   endings — evidence, the user's Cleanup, a Wake completion — live under that one
   id, and the record carries every id the run is known by (the launch's call id,
   its shell/child id, its tool call id, and the Wake id whose completion it

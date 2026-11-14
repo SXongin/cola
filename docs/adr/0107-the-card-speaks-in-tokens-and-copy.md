@@ -108,13 +108,16 @@ only producer:
 | `Other` + `None`, vendor `question` | `ask` |
 | anything else | the vendor name (opaque) |
 
-Three consequences worth stating because they are the ambiguous cases: a mixed
+Four consequences worth stating because they are the ambiguous cases: a mixed
 `FileEdits` list reads `edit` (the umbrella; `write` means "a non-empty list
 whose every entry adds"), an **empty** `FileEdits` also reads `edit` (Codex's
-`fileChange` starts empty and gains entries, so `write` would flip back), and a
+`fileChange` starts empty and gains entries, so `write` would flip back), a
 `Delegation` whose effect is `Address` renders a receipt on the run while
-`Report` updates the run with **no** surface of its own. `AgentRun`'s types,
-`FileAction` and `SearchScope` live in spec #1057.
+`Report` updates the run with **no** surface of its own, and `read` absorbs only
+`imageView` — the adapter must carry the source item type, because Codex
+projects `imageView` and `imageGeneration` into one item kind and a generated
+image is `Other`/`Opaque` (P1's conformance test covers both).
+`AgentRun`'s types, `FileAction` and `SearchScope` live in spec #1057.
 
 **3. The live phase slot speaks three tokens.**
 
@@ -138,10 +141,13 @@ RuntimeEnded / Lost / Cleaned) is how cola learned it ended — wider than
 `RunStatus`, because `结束` (a runtime-confirmed end with no Wake) and `已清理`
 (the user's dismissal) have no client-side status, and a runtime-confirmed end
 does **not** become a client `Completed`. The rendered verb — `完成` / `失败` /
-`已取消` / `结束` / `已失联` / `已清理` — is copy derived from `TaskEnding`; the
-enum spellings are invariant because adapters and logs compare them. *(If a
-later review prefers `🔔 shell completed：…` verbatim, only the copy table
-changes — the model values are already there.)*
+`已取消` / `结束` / `已失联` / `已清理` — is copy derived from the **applicable**
+ending: `TaskEnding` when cola has one, else the client's `RunStatus`
+(`Completed`→`完成`, `Failed`→`失败`, `Cancelled`→`已取消`). A runtime-confirmed
+end still renders `结束` and a cleanup `已清理`. The enum spellings are invariant
+because adapters and logs compare them. *(If a later review prefers
+`🔔 shell completed：…` verbatim, only the copy table changes — the model values
+are already there.)*
 
 **5. Section labels are copy.** `**Input**` / `**Output**` become `**输入**` /
 `**输出**`. Units (`个文件`, `行`, `处匹配`) stay copy. Card titles (`📄 会话`,

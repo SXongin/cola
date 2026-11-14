@@ -25,7 +25,7 @@ The one declaration an **Agent Client** makes about what its attachment can prod
 _Avoid_: feature flags (they describe cola's build, not the attached client), client profile
 
 **Agent Run** (子 Agent 运行):
-One child agent/thread a **Turn** set running — OpenCode's `task`/`subagent` child session, or Codex's collaboration agent — as one neutral fact: a stable identity that **is** the durable **Task Run Id** (the child id when the fact creating the run names one, otherwise the creating call's id; never re-keyed), a label, the child's activity, a status, and the calls that **launched**, **addressed** or **reported** on it. A report (Codex's `subAgentActivity`) updates the run rather than rendering as a **Tool Panel**; a call that addresses an existing run (`sendInput`/`wait`/`closeAgent`) is a receipt on it. It is a read-model fact, so the panel's liveness line, the **Background Task Ledger** row, the completion entry and `/sub` read the same run (ADR-0105). Distinct from a **Background Task**: a run is live work whether or not it outlived its Turn.
+One child agent/thread a **Turn** set running — OpenCode's `task`/`subagent` child session, or Codex's collaboration agent — as one neutral fact: a live identity (`run_id`: the child id when one exists, else the creating call's id), the durable **Task Run Id** it maps to (`task_run_id`, ADR-0080's key), a label, the child's activity, a status, and the calls that **launched**, **addressed** or **reported** on it. A report (Codex's `subAgentActivity`) updates the run rather than rendering as a **Tool Panel**; a call that addresses an existing run (`sendInput`/`wait`/`closeAgent`) is a receipt on it. It is a read-model fact, so the panel's liveness line, the **Background Task Ledger** row, the completion entry and `/sub` read the same run (ADR-0105). Distinct from a **Background Task**: a run is live work whether or not it outlived its Turn.
 _Avoid_: subagent call (that is the launching **Tool Call**), task (the OpenCode tool id), child session (the Backend's identity, not the run)
 
 **Peer Attachment**:
@@ -187,7 +187,7 @@ One **Background Task** run's endings as durable facts on the **Chain Record**, 
 _Avoid_: Task status (that is liveness, not an ending), completion record (that is the **Wake**), rendered mark (the pre-ADR-0080 parallel key set)
 
 **Task Run Id** (运行身份):
-The stable identity of one **Background Task** run, and the key its **Task Ending**s are recorded under: the child id when the fact creating the run names one, else the launching call's id — never an invented one. The record carries every id the run is known by, and every writer resolves before it mints — by an exact run id, else an exact **Wake** id already on a record, else the **newest** record naming any other id it holds (a resumed child's later launch supersedes the earlier one) — so the order the two sides arrive in cannot matter: one run keeps one record, however the run is named.
+The stable identity of one run, and the key its **Task Ending**s are recorded under: the launching tool call's id when the read carries the launch, else the shell/child id the **Wake** itself reports — never an invented one. It identifies a **Background Task** when the run has one and an **Agent Run** when it does not (ADR-0080, ADR-0105). The record carries every id the run is known by, and every writer resolves before it mints — by an exact run id, else an exact **Wake** id already on a record, else the **newest** record naming any other id it holds (a resumed child's later launch supersedes the earlier one) — so the order the two sides arrive in cannot matter: one run keeps one record, however the run is named.
 _Avoid_: Call id (the launch's own id, one spelling), shell id / child id (the run's other names)
 
 **Runtime Reconciliation**:
@@ -471,7 +471,7 @@ A Feishu interactive message card. It evolves through live states (loading → r
 _Avoid_: Widget, component, bubble
 
 **Token** (词汇):
-A **card-authored** string that is domain vocabulary and is never translated — a tool noun (`shell`, `read`, `edit`), a live phase word (`waiting`, `reasoning`, `responding`), a protocol name or an identifier. A token stays English when a locale arrives and never enters a translation catalog; the three live phase tokens replace the synonym pair 思考中/推理中. Distinct from **Copy**, the interface text a translator would touch, and from **Verbatim**, the data the card renders as-is (ADR-0107).
+A **card-authored** string that is domain vocabulary and is never translated — a tool noun (`shell`, `read`, `edit`), a live phase word (`waiting`, `reasoning`, `responding`), or a protocol constant (`mcp`, `subagent`). A token stays English when a locale arrives and never enters a translation catalog; the three live phase tokens replace the synonym pair 思考中/推理中. A data id is **Verbatim**, never a token. Distinct from **Copy**, the interface text a translator would touch, and from **Verbatim**, the data the card renders as-is (ADR-0107).
 _Avoid_: keyword, label (a label is a **Copy** section heading)
 
 **Copy** (界面文案):

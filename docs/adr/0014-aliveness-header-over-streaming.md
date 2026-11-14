@@ -109,5 +109,5 @@ waiting on that tool. The phase and the header label therefore read the running
 call first: a Reasoning state with a running tool reports the Tool phase and the
 tool's own label, and no reasoning length rides along. The STATE keeps its
 ordinary meaning (`mark_reasoning` is still a plain write), so when the call
-settles and nothing else has streamed the header falls back to 「💭 推理中」
+settles and nothing else has streamed the header falls back to 「💭 reasoning」
 rather than claiming a reply nobody wrote.

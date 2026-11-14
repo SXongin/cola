@@ -46,7 +46,7 @@ adoption, not a message injection.
   it carries what the child is doing and for how long, in the header's own
   shape: its newest running tool and that call's elapsed time (`shell 28s`), or
   — when no tool is live — its phase and the time since its newest activity
-  (`推理中 12s`). A pending Permission/Question appends the header's wait
+  (`reasoning 12s`). A pending Permission/Question appends the header's wait
   vocabulary (等待你的授权 / 等待你的回答 / 等待你的授权/回答), and a live tool
   with no server clock yet shows its name alone.
 - **Live only, direct child only.** The line renders only while the panel is
