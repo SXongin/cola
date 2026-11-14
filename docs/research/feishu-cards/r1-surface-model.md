@@ -113,7 +113,7 @@ smaller surface than it looks.
 
 | Path | What the card shows | Live? | Row in ledger? | `/sub`? | Source |
 |---|---|---|---|---|---|
-| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (today `bash 28s` / `推理中 12s` / `等待你的授权`; the target wording is `shell 28s` / `reasoning 12s`, ADR-0107) | yes | yes (`TaskKind::Subagent`) | yes (`parentID`) | ADR-0054, `tool_render.rs:491`, `:554` |
+| OpenCode V1 `task` | panel: `🔀 <description>` + `🤖 <subagent_type>`, plus a **liveness line** while running (today `bash 28s` / `推理中 12s` / `等待你的授权`; the target wording is `shell 28s` / `reasoning 12s`, ADR-0107) | yes | no (V1 has no background fact) | yes (`parentID`) | ADR-0054, `tool_render.rs:491`, `:554` |
 | OpenCode V2 `subagent` | same, `metadata.sessionID`, `<subagent …>` envelope | yes | yes | yes | `read_model` V2, `tool_render.rs:505` |
 | Codex `collab_agent` | **one panel per call**, title from the collaboration verb (`派生子 Agent`, `发送输入`, `等待子 Agent`, …), body is the target rows / prompt / model | **no** | **no** | *(threads have `parent_thread_id` → `parent_id`, so `/sub` works)* `src/codex/threads.rs:79` | `src/codex/read_model.rs:1589`, `tool_render.rs:1029`, `:3109` |
 | Codex `sub_agent_activity` | **a tool panel of its own** (`子 Agent`, target = `agentPath`) — a lifecycle *event* rendered as a *call* | n/a | **no** | n/a | `read_model.rs:1633`, `tool_render.rs:1034` |
@@ -291,7 +291,7 @@ Rules that keep ADR-0042 intact:
 3. **`detail` is filled only where the semantics are shared.** ACP's
    `diff`/`terminal`/`content` content blocks and OpenCode's `edit`/`patch`
    metadata both produce `FileEdits`/`Command`; a `websearch` produces
-   `Search`; nothing else grows a variant until a second adapter needs it.
+   `Search`; nothing else grows a variant until a second adapter needs it — except `Program`, the exception ADR-0105 argues (one producer, an existing renderer, a general pattern).
 4. **Presentation copy stays in the card.** The adapter supplies *facts and
    titles*; the token and the icon remain the card's (ADR-0107: `shell`, `edit`,
    `subagent`, …), never the Agent Client's.
@@ -334,7 +334,8 @@ Do **not** start by inventing a general block tree. The staged version:
    builder reused by the tool panel *and* the Terminal Card's output section.
    `FileEdits` has one diff builder. `Delegation` has one run block.
 2. **Key the panel title on `kind` + `detail`**, with `title` as the
-   adapter's refinement: `Execute` → `shell`, `Edit` → `edit`, `Read` →
+   adapter's refinement: `Execute` → `shell`, `Edit` → `edit` (or `write` for an
+   all-Add list, ADR-0107), `Read` →
    `read`, `Delegation` → `subagent` (the token table is ADR-0107's).
 3. **A `ToolDetail::Opaque` path identical to today's** — raw input as a
    key-value list, raw output with the markdown-safety fence.
