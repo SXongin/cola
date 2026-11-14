@@ -15,9 +15,10 @@ existing ADR, **[acp]** = the Agent Client Protocol v1 documentation,
 > (tool semantics and agent runs in the read model), **ADR-0106** (capabilities
 > gate the surfaces) and **ADR-0107** (the card speaks in tokens and copy).
 > The naming question the note left open is settled there: fixed tokens are
-> English (`shell`, `waiting`, `reasoning`, `responding`), interface copy stays
-> Chinese until an i18n catalog exists. §7 and §8 below are the pre-decision
-> record; the ADRs supersede them where they differ.
+> English (`shell`, `script`, `waiting`, `reasoning`, `responding`), interface
+> copy stays Chinese until an i18n catalog exists. §4.3/§4.4 are kept in step
+> with ADR-0105/0106; §7 and §8 below are the pre-decision record, and the ADRs
+> supersede them where they differ.
 
 ---
 
@@ -327,14 +328,14 @@ Rules that keep ADR-0042 intact:
 ```rust
 pub struct AgentRun {
     pub run_id: String,             // child session/thread id when it has one
-    pub kind: AgentRunKind,         // Subagent | Collaboration | Task
     pub label: String,              // description / prompt / agent name
     pub agent: Option<String>,      // subagent_type / agentPath / model
     pub started_at: Option<i64>,
-    pub status: RunStatus,          // Running | Completed | Failed | Cancelled | Lost
+    pub status: RunStatus,          // Running | Completed | Failed | Cancelled | Unknown
     pub activity: Option<RunActivity>, // newest live tool or phase (ADR-0054's fact)
     pub launched_by: Option<ToolCallRef>,
     pub addressed_by: Vec<ToolCallRef>, // sendInput/wait/closeAgent
+    pub reported_by: Vec<ToolCallRef>,  // subAgentActivity
 }
 ```
 
@@ -369,11 +370,12 @@ Surfaces gate on it instead of on per-subsystem methods:
 
 | Surface | Requires | When absent |
 |---|---|---|
-| Ledger section | `background_runs` | no section (today: correct by accident) |
+| Ledger section | `reports_live_runs()` (`background_runs \|\| child_agents != None`) | no section |
 | Panel liveness line | `child_agents != None` + a run with activity | plain panel |
 | Plan section | `plan != None` | no section |
 | Compaction row | `compaction` | part renders as `Other`/omitted |
 | Footer usage | `usage != None` | no footer figure |
+| Question surface | `questions != None` | no question card/block |
 | 「始终允许」 | `permissions` advertises a session scope | one-time buttons only |
 | Agent picker | `modes` | `/agent` says unsupported |
 

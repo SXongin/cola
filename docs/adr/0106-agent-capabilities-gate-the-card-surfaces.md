@@ -40,9 +40,18 @@ pub struct AgentCapabilities {
     pub compaction: bool,
     pub usage: UsageMode,               // None | PerTurn | Cumulative
     pub permissions: PermissionMode,    // the option kinds the client can express
-    pub questions: QuestionMode,
+    pub questions: QuestionMode,        // None | Session | SessionAndLocation
     pub modes: bool,                    // an agent/mode axis exists
     pub diffs: bool,                    // session/turn diff reads
+}
+
+impl AgentCapabilities {
+    /// The live-run ledger lists **runs**, not only background work: a
+    /// turn-scoped child is a run too, so a client with either surface can have
+    /// rows. Codex is exactly this case — child agents, no background launches.
+    pub fn reports_live_runs(&self) -> bool {
+        self.background_runs || self.child_agents != ChildAgentMode::None
+    }
 }
 ```
 
@@ -55,12 +64,14 @@ new one.
 
 | Surface | Gate | When absent |
 |---|---|---|
-| Background run ledger | `background_runs` | no section |
+| Live-run ledger | `reports_live_runs()` (`background_runs \|\| child_agents != None`) | no section |
 | Panel liveness line | `child_agents != None` **and** a run with activity | plain panel |
 | Plan section | `plan != None` | no section |
 | Compaction row | `compaction` | the part is not a row |
 | Turn footer usage | `usage != None` | no footer figure |
 | 「始终允许」 on a permission | `permissions` advertises a session scope | one-time options only |
+| Question card / inline block | `questions != None` | no question surface (the client never asks) |
+| Location Form | `questions` includes a location scope | no directory-owned form |
 | Agent picker | `modes` | `/agent` reports it as unsupported |
 | Turn-diff index | `diffs` | no index line, no button |
 
@@ -131,10 +142,12 @@ this ADR changes no rendering by itself.
 - **A capability lie is visible.** A client that claims `background_runs` but
   never reports a launch renders no ledger rows; that is a clean, diagnosable
   failure, not a card that silently invents one.
-- **The ledger's concept widens.** Once runs are one fact (ADR-0105), the ledger
-  lists **live runs**, not only "background tasks". Codex can gain the section in
-  P4 even though it has no background concept. Its card title and copy are UI
-  copy, so their wording is ADR-0107's problem, not this one.
+- **The ledger's concept widens, and its gate says so.** Once runs are one fact
+  (ADR-0105), the ledger lists **live runs**, not only "background tasks", so it
+  gates on `reports_live_runs()` rather than `background_runs`. Codex and
+  OpenCode V1 can gain the section even though neither has a background concept,
+  because their child agents are runs. Its card title and copy are UI copy, so
+  their wording is ADR-0107's problem, not this one.
 - **A reattach can remove a surface mid-chain.** The card already on screen is a
   snapshot and is not rewritten; the next render under the new attachment simply
   omits the section.
