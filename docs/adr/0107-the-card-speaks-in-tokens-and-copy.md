@@ -53,7 +53,7 @@ for the first two is one question: would a translator touch it?**
 | `shell` | `bash`, `shell`, `command_execution` | command + cwd + exit + background |
 | `read` | `read`, Codex `imageView` (`codex/image`) | a file or image viewed |
 | `write` | `write` | a new file (every file in the edits is an add) |
-| `edit` | `edit`, `patch`, `apply_patch`, Codex `file_change` | a diff |
+| `edit` | `edit`, `patch`, `apply_patch`, Codex `file_change` | a diff; the derivation below picks `write` for an all-Add list |
 | `glob` | `glob` | file-name search |
 | `grep` | `grep` | content search |
 | `fetch` | `webfetch` | one URL fetched |
