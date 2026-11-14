@@ -79,13 +79,17 @@ shape is `Opaque`.
 **4. `AgentRun` is a neutral transcript fact — one run per child agent.** The
 run's shape is #1057's; these are the rules it must satisfy:
 
-- **One key space with the Task Run Id, by alias.** `run_id` **is** ADR-0080's
-  Task Run Id, selected the same way (the child id when the creating fact names
-  one, else the creating call's id) and resolved by any id the run holds — the
-  record's alias rule, not a second string. A run whose creating fact named no
-  child keeps that id and fills `child_id` when it learns one. **A launch that
-  names no receiver creates no run**: a completion naming N children creates N
-  runs, each keyed by its child id. Once created, a run keeps its key forever.
+- **The durable key is a field.** `run_id` is the live run's identity — the
+  child id when one exists, else the creating call's id — and `task_run_id` is
+  ADR-0080's durable key for the same run (the launch call id when the read
+  carries the launch, else the child id). The ledger reads and writes
+  `TaskEnding` by `task_run_id`, never by `run_id`; the run carries the mapping,
+  so neither side resolves the other by guessing. ADR-0080's own key selection
+  and alias rule are unchanged.
+- **Multiplicity.** A launch that names no receiver creates no run; a completion
+  naming N children creates N runs. A non-launch fact with no child id (an
+  activity report) creates a call-keyed run and fills `child_id` when it learns
+  one. Once created, a run's `run_id` never moves.
 - **A child may be launched more than once.** A resumed `task` passes the prior
   child id, so the launch relation is a set, not one call.
 - **Three relations, compactly enumerated.** A call **launches** a run
@@ -103,9 +107,10 @@ run's shape is #1057's; these are the rules it must satisfy:
 - **No vendor `kind`.** `task`/`subagent`/`spawnAgent`/a collaboration call all
   mean "a child agent this Turn set running"; the relations, `agent` and `label`
   carry the provenance.
-- **Liveness carries neutral semantics.** The activity line's newest call carries
-  its `ToolKind`, `ToolDetail` and identity (so it can render a tool token) plus
-  the child's pending wait; a bare vendor name is not enough.
+- **Liveness carries neutral semantics and its clock.** The activity line's
+  newest call carries its `ToolKind`, `ToolDetail`, identity and **server start
+  time** (so `shell 28s` counts from the call's own start, not from the last
+  activity), plus the child's pending wait.
 - **`RunStatus` is the client's statement, not cola's ending.** `Running`,
   `Completed`, `Failed`, `Cancelled`, `Unknown`. Cola's durable `TaskEnding`
   (Wake / RuntimeEnded / Lost / Cleaned) answers how **cola** learned it ended and
