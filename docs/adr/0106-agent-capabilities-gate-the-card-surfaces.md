@@ -111,7 +111,7 @@ when no caller remains). Landing this ADR changes no rendering by itself.
 
 ## Why
 
-- **One question instead of ten.** A new surface asks `capabilities()`; a new
+- **One question instead of nine.** A new surface asks `capabilities()`; a new
   Agent Client answers one struct.
 - **Degradation becomes testable.** "This Agent Client has no ledger" is now an
   assertion, not a consequence observed in production.

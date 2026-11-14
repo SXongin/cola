@@ -293,7 +293,7 @@ Rules that keep ADR-0042 intact:
    `Search`; nothing else grows a variant until a second adapter needs it.
 4. **Presentation copy stays in the card.** The adapter supplies *facts and
    titles*; the token and the icon remain the card's (ADR-0107: `shell`, `edit`,
-   `subagent`, …), never the client's.
+   `subagent`, …), never the Agent Client's.
 
 ### 4.3 The Agent Run: the sub-agent fact
 
@@ -334,7 +334,7 @@ Surfaces gate on it instead of on per-subsystem methods:
 | Compaction row | `compaction` | part renders as `Other`/omitted |
 | Footer usage | `usage != None` | no footer figure |
 | Question surface | `questions != None` | no question card/block |
-| 「始终允许」 | `permissions` advertises a session scope | one-time buttons only |
+| 「始终允许」 | the **request's** `always_supported` (ADR-0018) | one-time buttons only |
 | Agent picker | `modes` | `/agent` says unsupported |
 | Turn-diff index | `diffs` | no index line, no button |
 | `/mcp` card | `mcp` | the command says unsupported |

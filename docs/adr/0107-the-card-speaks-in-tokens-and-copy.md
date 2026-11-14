@@ -205,8 +205,8 @@ escaping and budget rules).
   were never in the token table.
 - **The token table and ADR-0105's `ToolKind` are different axes.** Several
   tokens may share one kind (`glob`/`grep` → `Search`, `write`/`edit` → `Edit`),
-  and the token refines the kind through `ToolDetail`. A client that can only
-  fill the coarse kind still renders correctly.
+  and the token refines the kind through `ToolDetail`. An Agent Client that can
+  only fill the coarse kind still renders correctly.
 
 ## Open
 
