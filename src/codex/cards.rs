@@ -1363,6 +1363,54 @@ async fn a_child_threads_terminal_turn_is_its_evidence() {
     );
 }
 
+/// `thread/read` carries only a bounded page of turns. A long-lived child whose
+/// newest terminal turn lies outside that page must still yield evidence
+/// through the full `thread/turns/list` read.
+#[tokio::test]
+async fn a_truncated_thread_read_still_finds_the_newest_turn() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "the parent",
+    ));
+    let mut child = ScriptedThread::adopted("thread-child-paged", "session-root", WORK, "worker");
+    child.parent_thread_id = Some(THREAD.into());
+    child.turns = vec![
+        json!({
+            "id": "turn-live",
+            "status": "inProgress",
+            "startedAt": 1_000,
+            "items": []
+        }),
+        json!({
+            "id": "turn-done",
+            "status": "completed",
+            "startedAt": 1_500,
+            "completedAt": 2_000,
+            "items": []
+        }),
+    ];
+    // The read page keeps only the first (non-terminal) turn; the terminal one
+    // is reachable only through `thread/turns/list`.
+    child.read_turn_limit = Some(1);
+    server.seed_thread(child);
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (_app, _platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    assert_eq!(
+        Backend::child_evidence(&client, "thread-child-paged")
+            .await
+            .expect("the paged child thread read"),
+        crate::backend::ChildEvidence::Terminal {
+            completed_at: 2_000_000
+        },
+        "the full turns list finds the terminal turn outside the read page"
+    );
+}
+
 /// Ticket #881 acceptance 3 through the bridge: a second message while cola owns
 /// the live run is a Supplement → `turn/steer`, never a second `turn/start`, and
 /// its text renders once on the split continuation.
