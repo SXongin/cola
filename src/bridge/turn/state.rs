@@ -2531,9 +2531,28 @@ impl StreamAccumulator {
 
     /// Install the attachment's declaration for this render. Cheap and
     /// idempotent: the render loop re-reads it each pass, so a reattach that
-    /// changes the surface is reflected by the next pass.
+    /// changes the surface is reflected by the next pass. A declaration change
+    /// also drops the stored state whose axis disappeared (ADR-0106): a plan
+    /// panel, the settled change index and the usage figure cannot keep
+    /// rendering for a client that no longer declares them. A stored question
+    /// block is skipped at its render site; the ledger is cleared by the
+    /// ledger's own capability gate (which owes its removal PATCH).
     pub(super) fn set_capabilities(&mut self, capabilities: AgentCapabilities) {
+        let changed = self.capabilities != Some(capabilities);
         self.capabilities = Some(capabilities);
+        if !changed {
+            return;
+        }
+        if capabilities.plan.is_absent() {
+            self.todo_panel = None;
+            self.todo_shown_at = None;
+        }
+        if !capabilities.diffs {
+            self.turn_diff_stats = TurnDiffStats::default();
+        }
+        if capabilities.usage == crate::backend::UsageMode::None {
+            self.context_tokens = 0;
+        }
     }
 
     /// Record the context tokens a completed assistant message consumed
@@ -5329,6 +5348,13 @@ impl StreamAccumulator {
                         }
                     }
                     InteractionBlock::Question(q) => {
+                        // A client that no longer declares a question surface
+                        // must not render a stored block (ADR-0106): the
+                        // reattach removed it, and the card would otherwise
+                        // keep a form it cannot answer.
+                        if self.capabilities().questions.is_absent() {
+                            continue;
+                        }
                         for el in crate::feishu::card::question::question_elements(
                             &q.title,
                             q.uncollectable,
@@ -8843,5 +8869,70 @@ mod tests {
         assert!(hr < footer, "hr precedes the footer line");
         assert!(footer < retry, "recovery buttons stay after the footer");
         assert_eq!(elements.len(), footer + 2, "footer and retry end the card");
+    }
+
+    /// ADR-0106: a reattach can remove a surface mid-chain. The declaration
+    /// change drops the stored state each lost axis owned, and a stored
+    /// question block is omitted by the render (the ledger has its own test).
+    #[test]
+    fn a_capability_loss_clears_the_gated_stored_surfaces() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_todo_panel(
+            crate::feishu::card::tool_render::ToolPanel::for_test(
+                "todowrite",
+                crate::backend::ToolStatus::Completed,
+                None,
+                None,
+            ),
+            Some(1_000),
+        );
+        acc.set_turn_diff_stats(TurnDiffStats {
+            files: 2,
+            additions: 3,
+            deletions: 1,
+        });
+        acc.set_context_tokens(84_200);
+        assert!(acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q".into(),
+            session_id: "s".into(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "UNIQUE_QUESTION_TEXT".into(),
+                header: "h".into(),
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: "/w".into(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+            asked_at: None,
+        })));
+        assert!(acc.todo_panel.is_some());
+        assert_eq!(acc.turn_diff_stats.files, 2);
+        assert_eq!(acc.context_tokens, 84_200);
+
+        let without = AgentCapabilities {
+            plan: crate::backend::PlanMode::None,
+            diffs: false,
+            usage: crate::backend::UsageMode::None,
+            questions: crate::backend::QuestionMode::None,
+            ..AgentCapabilities::full()
+        };
+        acc.set_capabilities(without);
+
+        assert!(acc.todo_panel.is_none(), "the plan surface is gone");
+        assert_eq!(
+            acc.turn_diff_stats,
+            TurnDiffStats::default(),
+            "the change index is gone"
+        );
+        assert_eq!(acc.context_tokens, 0, "the usage figure is gone");
+        let text = acc.build_card().to_string();
+        assert!(
+            !text.contains("UNIQUE_QUESTION_TEXT"),
+            "a stored question block is omitted when its surface is absent: {text}"
+        );
     }
 }
