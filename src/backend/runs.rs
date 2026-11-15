@@ -1018,6 +1018,35 @@ mod tests {
         assert_eq!(read.task_retirements[0].finished_at, Some(1_700_000_002_000));
     }
 
+    /// Codex's seconds-granular `completedAt` is normalized to the END of its
+    /// second, so a completion inside the second a run started (start 1_500 ms,
+    /// completion second 1 → 1_999) is accepted; a genuinely earlier second is
+    /// still rejected.
+    #[test]
+    fn a_same_second_completion_is_not_stale() {
+        let mut read = transcript(vec![call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["ses_child"],
+            ToolStatus::Running,
+            Some(1_500),
+        )]);
+        assert!(read.apply_run_child_evidence("ses_child", ChildEvidence::Terminal { completed_at: 1_999 }));
+        assert!(read.runs.is_empty(), "the same-second completion retires the run");
+
+        let mut read = transcript(vec![call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["ses_child"],
+            ToolStatus::Running,
+            Some(1_500),
+        )]);
+        assert!(
+            !read.apply_run_child_evidence("ses_child", ChildEvidence::Terminal { completed_at: 999 }),
+            "a genuinely previous second is still stale"
+        );
+    }
+
     /// A client's terminal statement is mapped honestly: a reason this build
     /// cannot name is `Unknown` — not `Cancelled`, which would put words in
     /// the client's mouth and let the run look concluded. `Unknown` is not
