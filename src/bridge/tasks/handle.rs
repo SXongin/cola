@@ -498,12 +498,41 @@ impl TasksHandle {
                 !run.ids().any(|id| ids.contains(id))
             });
         }
+        // The child-only runs obey the same rule (spec #1057's P4): a run with
+        // a durable ending has ended, and the process-local cache matches it by
+        // any id it is known by. The run carries the durable key as
+        // `task_run_id`, so the record a launchless writer minted resolves
+        // here too.
+        transcript.runs.retain(|run| {
+            let identity = TaskRunId {
+                key: run.ending_key().to_string(),
+                call_id: run.task_run_id.clone(),
+                shell_id: None,
+                child_id: run.child_id.clone(),
+                job_id: None,
+                wake_id: None,
+            };
+            let ended = match &chains {
+                Some(chains) => chains.observe_run(session_id, &identity),
+                None => false,
+            };
+            let retired = state
+                .retired
+                .get(session_id)
+                .is_some_and(|ids| identity.ids().any(|id| ids.contains(id)));
+            !ended && !retired
+        });
         let Some(ids) = state.unconfirmed.get(session_id) else {
             return;
         };
         for task in &transcript.background_tasks {
             if ids.contains(task.tool.call_id.as_str()) {
                 transcript.unconfirmed_tasks.insert(task.tool.call_id.clone());
+            }
+        }
+        for run in &transcript.runs {
+            if run.ids().any(|id| ids.contains(id)) {
+                transcript.unconfirmed_tasks.insert(run.ending_key().to_string());
             }
         }
     }

@@ -146,12 +146,14 @@ pub(crate) async fn gather_snapshot(
                 && transcript.settle(Some(anchor)) == crate::backend::TurnSettle::Waiting
         })
             // An UNTIMED newest user message has no anchor to settle, but an
-            // Idle read with live Background Tasks is the same Waiting fact:
-            // the run may wake by itself, so the status must not say 空闲
-            // (#999 US2). This is a status fact only; the follow still needs
-            // an anchor and stays static (the #1005 carve-out above).
+            // Idle read with live Background Tasks (or live runs — a child-only
+            // client such as Codex) is the same Waiting fact: the run may wake
+            // by itself, so the status must not say 空闲 (#999 US2). This is a
+            // status fact only; the follow still needs an anchor and stays
+            // static (the #1005 carve-out above).
             || (newest_user.is_some_and(|message| message.time.is_none())
-                && !transcript.background_tasks.is_empty()));
+                && (!transcript.background_tasks.is_empty()
+                    || transcript.runs.iter().any(crate::backend::AgentRun::is_live))));
 
     SnapshotData {
         session_id: session_id.to_string(),

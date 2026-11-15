@@ -29,8 +29,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::drain::{
-    assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn,
-    user, wait_for_card_text,
+    assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_prepared, scripted_app_with,
+    spawn_sync, spawn_turn, user, wait_for_card_text,
 };
 use crate::backend::types::SessionStatus;
 use crate::backend::{
@@ -2324,6 +2324,156 @@ async fn a_terminal_child_settles_the_waiting_card() {
         later.background_tasks.is_empty(),
         "the retirement overlay filters every later read"
     );
+}
+
+/// Spec #1057's P4: a **child-only** run (Codex's collaboration child) has no
+/// Background Task to name it, so its row and its ending come from the run
+/// fact. The runtime verdict registry answers nothing; the child thread's own
+/// terminal item is the evidence, and a run that ends with no Wake still
+/// retires its row and settles the yielded Turn (ADR-0080's ending rules
+/// unchanged: the retirement is a `ChildEnded` evidence ending keyed by the
+/// run's durable id).
+#[tokio::test]
+async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let launch = TranscriptMessage {
+        id: MessageId::new("msg_launch_call_spawn"),
+        role: MessageRole::Assistant,
+        time: Some(crate::backend::MessageTime {
+            created: 2_000,
+            completed: Some(2_000),
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: "call_spawn".into(),
+            },
+            // The launch call is a handle: it settles while the child runs.
+            status: ToolStatus::Completed,
+            started_at: Some(2_000),
+            input: Some(serde_json::json!({
+                "tool": "spawnAgent",
+                "receiverThreadIds": ["thread_child"],
+                "prompt": "review the diff"
+            })),
+            output: ToolOutput::default(),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        })],
+    };
+    let activity = TranscriptMessage {
+        id: MessageId::new("msg_activity_call_activity"),
+        role: MessageRole::Assistant,
+        time: Some(crate::backend::MessageTime {
+            created: 2_100,
+            completed: Some(2_100),
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: "call_activity".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(2_100),
+            input: Some(serde_json::json!({
+                "kind": "started",
+                "agentThreadId": "thread_child",
+                "agentPath": "/root/worker"
+            })),
+            output: ToolOutput::default(),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                }],
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..ToolCall::default()
+        })],
+    };
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "审阅这次的改动"),
+        assistant(1_500, "交给子 Agent 了。"),
+        launch,
+        activity,
+    ])
+    .with_executions(vec![execution(2_500)]);
+    assert_eq!(waiting.runs.len(), 1, "one child is one run");
+    assert!(
+        waiting.runs[0].is_live(),
+        "the report's start keeps the run live: {:?}",
+        waiting.runs[0].status
+    );
+    let (_dir, app, backend, platform) = scripted_app_prepared(
+        vec![waiting],
+        Some(SessionStatus::Idle),
+        |_| {},
+        |backend| {
+            // A client with no Background Task surface that still reports live
+            // runs (Codex's shape): the ledger gates on `reports_live_runs`.
+            backend.with_child_only_runs();
+        },
+    )
+    .await;
+    // While the child runs its read is Unfinished (the scripted default), so
+    // the Turn ends with a live run and yields; the child finishes only after.
+    Turn::run(&app.turn_handles(), ctx("ses_test", "审阅这次的改动"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "a Turn that ends with a live run yields"
+    );
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&yielded).contains("⏳ 后台任务（1）") && card_text(&yielded).contains("subagent"),
+        "the child-only run has its own ledger row: {yielded}"
+    );
+
+    // The child thread's own last turn is terminal now: the evidence a missing
+    // Wake leaves as the only way out.
+    backend
+        .with_child_evidence(
+            "thread_child",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅") && card_text(card).contains("🔔 subagent 结束")
+    })
+    .await;
+
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the child's terminal evidence is the Turn's true end"
+    );
+    let evidence_reads = backend.child_evidence_calls.lock().await.clone();
+    assert!(
+        !evidence_reads.is_empty() && evidence_reads.iter().all(|child| child == "thread_child"),
+        "every evidence read is spent on the run's own child: {evidence_reads:?}"
+    );
+    // The ending is durable under ADR-0080's key, so no later read resurrects
+    // the row.
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert!(later.runs.is_empty(), "the retirement overlay prunes the run");
 }
 
 /// Spec #588 / #591: a child session the server no longer knows (404) is

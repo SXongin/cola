@@ -1100,13 +1100,14 @@ async fn a_feishu_prompt_becomes_a_user_message_and_completes() {
     assert_eq!(user[0].text(), "please help");
 }
 
-/// Issue #962: a V2 collaboration call reaches the card as one folded panel —
-/// its title names the call and its target thread, its body the prompt, the
-/// model/effort and the target's own state — and the child's
-/// `subAgentActivity` is a row beside it. Both items ride the PARENT thread's
-/// stream; no child-thread subscription is involved.
+/// Issue #962 / spec #1057's P4: a V2 collaboration LAUNCH reaches the card as
+/// one folded panel — its title names the call and its target thread, its body
+/// the prompt, the model/effort and the target's own state — while the child's
+/// `subAgentActivity` is a one-line RECEIPT on the run, never a second panel.
+/// Both items ride the PARENT thread's stream; no child-thread subscription is
+/// involved, and the raw calls stay in the transcript.
 #[tokio::test]
-async fn a_collab_call_and_a_child_activity_render_on_the_card() {
+async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
     let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(ScriptedThread::adopted(
         THREAD,
@@ -1191,8 +1192,11 @@ async fn a_collab_call_and_a_child_activity_render_on_the_card() {
         card_text(card).contains("派生子 Agent")
     })
     .await;
-    wait_for_card_update(&platform, "the settled turn", CardUpdates::Any, |card| {
-        card_header(card).contains("完成")
+    // The Turn ends while the child is still live, so it YIELDS (ADR-0059's
+    // Policy W): one run is owed an exit, and the child's own thread supplies
+    // it later. The activity is already a receipt on the card.
+    wait_for_card_update(&platform, "the yielded turn", CardUpdates::Latest, |card| {
+        card_text(card).contains("↪ started · 0192f0aa-0000-7000-8000-000000000001")
     })
     .await;
     wait_for_handler(handler, "the collab turn", SETTLE_DEADLINE).await;
@@ -1202,7 +1206,12 @@ async fn a_collab_call_and_a_child_activity_render_on_the_card() {
         .await
         .last()
         .cloned()
-        .expect("the settled card");
+        .expect("the yielded card");
+    assert!(
+        card_header(&card).contains("⏳"),
+        "the Turn yields on its live run: {}",
+        card_header(&card)
+    );
     let text = card_text(&card);
     assert!(text.contains("派生子 Agent"), "the call's title: {text}");
     assert!(text.contains("🧵 /root/worker"), "the target thread: {text}");
@@ -1219,10 +1228,76 @@ async fn a_collab_call_and_a_child_activity_render_on_the_card() {
         "the target's own state: {text}"
     );
     assert!(
-        text.contains("子 Agent · ") && text.contains("🧵 /root/worker"),
-        "the child activity row names its path: {text}"
+        text.contains("↪ started · 0192f0aa-0000-7000-8000-000000000001"),
+        "the activity is a one-line receipt on its run: {text}"
     );
-    assert!(text.contains("🌱 启动"), "the activity kind: {text}");
+    assert!(
+        !text.contains("✅ 子 Agent ·") && !text.contains("⏳ 子 Agent ·"),
+        "the activity is not a Tool Panel of its own (the launch panel's own title is 派生子 Agent): {text}"
+    );
+    assert!(
+        !text.contains("🌱 启动"),
+        "the removed activity-panel row no longer renders: {text}"
+    );
+}
+
+/// Spec #1057's P4 / ADR-0080: a child thread's own terminal turn is the
+/// evidence a run with **no Wake** retires on. The read is `thread/read`; a
+/// turn still in progress is no evidence (never guessed dead), and a thread the
+/// server does not know is `Gone` (the run cannot be hosted there).
+#[tokio::test]
+async fn a_child_threads_terminal_turn_is_its_evidence() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "the parent",
+    ));
+    let mut finished = ScriptedThread::adopted("thread-child-done", "session-root", WORK, "worker");
+    finished.parent_thread_id = Some(THREAD.into());
+    finished.turns = vec![json!({
+        "id": "turn-child",
+        "status": "completed",
+        "startedAt": 1_000,
+        "completedAt": 2_000,
+        "items": []
+    })];
+    server.seed_thread(finished);
+    let mut running = ScriptedThread::adopted("thread-child-running", "session-root", WORK, "worker");
+    running.parent_thread_id = Some(THREAD.into());
+    running.turns = vec![json!({
+        "id": "turn-live",
+        "status": "inProgress",
+        "startedAt": 1_000,
+        "items": []
+    })];
+    server.seed_thread(running);
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (_app, _platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    assert_eq!(
+        Backend::child_evidence(&client, "thread-child-done")
+            .await
+            .expect("the child thread read"),
+        crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+        "a terminal turn carries the run's completion clock"
+    );
+    assert_eq!(
+        Backend::child_evidence(&client, "thread-child-running")
+            .await
+            .expect("the live child thread read"),
+        crate::backend::ChildEvidence::Unfinished,
+        "a running child is no terminal evidence"
+    );
+    assert_eq!(
+        Backend::child_evidence(&client, "thread-child-unknown")
+            .await
+            .expect("a missing thread is evidence, not a read failure"),
+        crate::backend::ChildEvidence::Gone,
+        "a child the server no longer knows cannot be hosted there"
+    );
 }
 
 /// Ticket #881 acceptance 3 through the bridge: a second message while cola owns
