@@ -4373,3 +4373,87 @@ async fn a_deferred_notice_is_suppressed_when_a_new_turn_replaced_the_card() {
         "the original request's card is gone, so the notice is suppressed: {notices:?}"
     );
 }
+
+/// A Turn whose only work is a child-run launch that the server never settles:
+/// the turn anchor, the launch part, and an idle Execution boundary.
+fn wedged_launch_transcript() -> SessionTranscript {
+    SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下子任务"),
+        typed_message(
+            "msg_launch",
+            MessageRole::Assistant,
+            Some(2_000),
+            vec![Part::Tool(crate::backend::ToolCall {
+                identity: ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_task".into(),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(2_000),
+                input: Some(serde_json::json!({ "description": "review the diff" })),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "ses_child".into(),
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..crate::backend::ToolCall::default()
+            })],
+        ),
+    ])
+    .with_executions(vec![execution(2_500)])
+}
+
+/// Review finding 4: a client that CANNOT retire a run (V1: no reconcile, no
+/// child evidence) must not let a wedged launch panel yield forever. The
+/// launch-live exemption is gated on `reports_live_runs`, so the stuck-panel
+/// grace still owns it and ends Error with the #386 copy.
+#[tokio::test]
+async fn a_wedged_v1_launch_panel_still_takes_the_stuck_panel_grace() {
+    let _wd = test_work_dir();
+    let (_dir, app, _backend, platform) = scripted_app_prepared(
+        vec![wedged_launch_transcript()],
+        Some(SessionStatus::Idle),
+        |_| {},
+        |backend| {
+            backend.without_task_surface();
+        },
+    )
+    .await;
+    app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
+    let handler = spawn_turn(&app, ctx("ses_test", "跑一下子任务"));
+    wait_for_card_update(&platform, "the stuck launch panel", CardUpdates::Latest, |card| {
+        card_header(card).contains("出错")
+    })
+    .await;
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains("未收尾"),
+        "the wedged launch takes the grace's copy: {last}"
+    );
+    let _ = handler.await;
+}
+
+/// Review finding 4, the other half: a client that CAN retire a run (Codex:
+/// `reports_live_runs`) yields on the same live launch panel instead — the run
+/// owns the exit, and the card waits for the child's evidence.
+#[tokio::test]
+async fn a_retirable_launch_panel_yields_instead_of_grace() {
+    let _wd = test_work_dir();
+    let (_dir, app, _backend, platform) =
+        scripted_app(vec![wedged_launch_transcript()], Some(SessionStatus::Idle)).await;
+    app.turn_follow_grace_ms.store(30, Ordering::Relaxed);
+    let outcome = Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下子任务"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the run owns the exit, so the Turn yields: {outcome:?}"
+    );
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        !card_header(&last).contains("出错") && !card_text(&last).contains("未收尾"),
+        "no stuck-panel ending for a retirable run: {last}"
+    );
+}

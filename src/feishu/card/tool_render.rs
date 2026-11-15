@@ -525,7 +525,7 @@ pub(crate) fn receipt_line(call: &ToolCall) -> String {
         _ => None,
     };
     let verb = match effect {
-        Some(DelegationEffect::Report) => report_word(&call.status).to_string(),
+        Some(DelegationEffect::Report) => ReceiptState::of(&call.status).word().to_string(),
         Some(DelegationEffect::Address) => call
             .input
             .as_ref()
@@ -548,18 +548,6 @@ pub(crate) fn receipt_line(call: &ToolCall) -> String {
     }
 }
 
-/// The word a report's declared state reads. The adapter maps the wire activity
-/// kind onto [`ToolStatus`], so this never parses a vendor payload.
-fn report_word(status: &ToolStatus) -> &str {
-    match status {
-        ToolStatus::Pending | ToolStatus::Running => "started",
-        ToolStatus::Completed => "completed",
-        ToolStatus::Error => "failed",
-        ToolStatus::Other(reason) => reason,
-        ToolStatus::Unknown => "unknown",
-    }
-}
-
 /// A receipt's dedupe identity: the call, plus the OBSERVED state for a
 /// report. Dedupe is never by call id alone (spec #1057) — the wire reuses an
 /// activity's item id between its start and completion, so a state move is a
@@ -572,7 +560,9 @@ pub(crate) struct ReceiptKey {
 }
 
 /// The reported state a receipt's identity carries. Typed on purpose: an
-/// identity must never be a `Debug` rendering of a vendor string.
+/// identity must never be a `Debug` rendering of a vendor string. It is also
+/// the ONE `ToolStatus` mapping the receipt path uses — the verb and the
+/// identity read the same value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ReceiptState {
     Live,
@@ -583,18 +573,36 @@ enum ReceiptState {
     Other(String),
 }
 
+impl ReceiptState {
+    fn of(status: &ToolStatus) -> Self {
+        match status {
+            ToolStatus::Pending | ToolStatus::Running => Self::Live,
+            ToolStatus::Completed => Self::Completed,
+            ToolStatus::Error => Self::Failed,
+            ToolStatus::Unknown => Self::Unknown,
+            ToolStatus::Other(reason) => Self::Other(reason.clone()),
+        }
+    }
+
+    /// The word a report at this state reads on its receipt. A report's state
+    /// is the adapter's declaration, so this never parses a vendor payload.
+    fn word(&self) -> &str {
+        match self {
+            Self::Live => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::Other(reason) => reason,
+        }
+    }
+}
+
 pub(crate) fn receipt_key(call: &ToolCall) -> ReceiptKey {
     let state = match &call.detail {
         ToolDetail::Delegation {
             effect: DelegationEffect::Report,
             ..
-        } => match &call.status {
-            ToolStatus::Pending | ToolStatus::Running => ReceiptState::Live,
-            ToolStatus::Completed => ReceiptState::Completed,
-            ToolStatus::Error => ReceiptState::Failed,
-            ToolStatus::Unknown => ReceiptState::Unknown,
-            ToolStatus::Other(reason) => ReceiptState::Other(reason.clone()),
-        },
+        } => ReceiptState::of(&call.status),
         _ => ReceiptState::Live,
     };
     ReceiptKey {
@@ -6354,6 +6362,45 @@ mod tests {
             since: Some(990_000),
         });
         assert_eq!(timed.title_fragment(1_000_000), "推理中 10s");
+    }
+
+    /// Review finding 7: a report's unknown and vendor-specific states are
+    /// their own receipt identity and their own word — no `Debug` text, no
+    /// silent collapse into `completed`.
+    #[test]
+    fn a_reports_unknown_and_vendor_states_are_their_own_identity() {
+        let report = |status: ToolStatus| ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: "call_activity".into(),
+            },
+            status,
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_1".into(),
+                }],
+                effect: DelegationEffect::Report,
+            },
+            ..ToolCall::default()
+        };
+        let unknown = report(ToolStatus::Unknown);
+        assert_eq!(receipt_line(&unknown), "↪ unknown · thread_1");
+        let paused = report(ToolStatus::Other("paused".into()));
+        assert_eq!(receipt_line(&paused), "↪ paused · thread_1");
+        assert_ne!(
+            receipt_key(&unknown),
+            receipt_key(&paused),
+            "each state is its own observation"
+        );
+        assert_eq!(
+            receipt_key(&report(ToolStatus::Running)),
+            receipt_key(&report(ToolStatus::Pending)),
+            "the live states share one identity"
+        );
+        assert_ne!(
+            receipt_key(&report(ToolStatus::Running)),
+            receipt_key(&report(ToolStatus::Completed))
+        );
     }
 
     /// ADR-0107's token table, row by row, and the full-vendor opaque

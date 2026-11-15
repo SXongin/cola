@@ -256,11 +256,15 @@ pub(super) async fn run(
         // orphaned work still takes the grace.
         let disposition = Disposition::from(transcript.settle(anchor.as_ref()));
         // A `⏳` panel must not be stamped over: a crash-orphaned call gets the
-        // grace to settle, then ends Error rather than a false `✅`. A
-        // Waiting decision whose only live panel is a launch yields instead.
-        if (disposition != Disposition::Waiting || Turn::has_live_orphan_tools(&flow.cards, session_id).await)
-            && Turn::has_live_tools(&flow.cards, session_id).await
-        {
+        // grace to settle, then ends Error rather than a false `✅`. A Waiting
+        // decision yields instead only when its live panel is a launch THIS
+        // client can retire (see `Turn::waiting_panels_are_stuck`).
+        let stuck = if disposition == Disposition::Waiting {
+            Turn::waiting_panels_are_stuck(&flow.cards, session_id, flow.backend.reports_live_runs()).await
+        } else {
+            Turn::has_live_tools(&flow.cards, session_id).await
+        };
+        if stuck {
             let since = *stuck_since.get_or_insert_with(tokio::time::Instant::now);
             if since.elapsed() >= grace {
                 return finish(Disposition::StuckPanel, session_id, label);
