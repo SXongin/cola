@@ -135,6 +135,27 @@ pub(crate) async fn send_switch_card(
     Ok(())
 }
 
+/// One `/sub` row for an `AgentRun` the client's session list does not carry
+/// (spec #1057's P4; Codex filters sub-agent threads out of `thread/list`).
+/// The row's identity is the run's `run_id` (its child id), its title is the
+/// run's label, and its child id is the attach target the card's takeover
+/// resolves. A run with no start clock renders no relative-time segment.
+fn run_child_row(run: &crate::backend::AgentRun, parent_id: &str) -> crate::backend::types::SessionListInfo {
+    crate::backend::types::SessionListInfo {
+        id: run.run_id.clone(),
+        title: run.label.clone(),
+        directory: String::new(),
+        parent_id: Some(parent_id.to_string()),
+        agent: run.agent.clone(),
+        model: None,
+        time: run.started_at.map(|at| crate::backend::types::SessionTime {
+            created: at,
+            updated: at,
+            archived: None,
+        }),
+    }
+}
+
 /// Fetch + shape the data the `/sub` child-session card renders (spec #344):
 /// the Active Session's DIRECT children (`parentID` equal to its id), keyword-
 /// filtered and sorted by last activity newest-first, plus the live run state
@@ -145,6 +166,12 @@ pub(crate) async fn send_switch_card(
 /// Archived children are excluded, like every other session surface. The
 /// status map's `None` (a failed or unrecognised read) omits the row's label
 /// rather than guessing (ADR-0028).
+///
+/// The current session's `AgentRun`s are unioned in (spec #1057's P4): a
+/// Codex collaboration child has no session-list row, so its run's `run_id`
+/// is its `/sub` identity and its live/terminal state decides the row's
+/// status without a session read. A run whose id already names a session row
+/// is that row, unchanged.
 pub(crate) async fn child_card_data(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -172,6 +199,37 @@ pub(crate) async fn child_card_data(
                 && (lower.is_empty() || matches_keyword(s, &lower))
         })
         .collect();
+    // The run rows: a Codex collaboration child is not in the session list, so
+    // without this union `/sub` would not know it exists. De-dupe by id, so an
+    // OpenCode `task` child keeps its session-list row exactly as before.
+    let mut seen: std::collections::HashSet<String> = children.iter().map(|child| child.id.clone()).collect();
+    let mut run_statuses: std::collections::HashMap<String, crate::backend::types::SessionStatus> =
+        std::collections::HashMap::new();
+    let runs = handles
+        .flow
+        .backend
+        .transcript(active_id.as_str())
+        .await
+        .map(|transcript| transcript.runs)
+        .unwrap_or_default();
+    for run in &runs {
+        if !seen.insert(run.run_id.clone()) {
+            continue;
+        }
+        let row = run_child_row(run, active_id.as_str());
+        if !lower.is_empty() && !matches_keyword(&row, &lower) {
+            continue;
+        }
+        run_statuses.insert(
+            run.run_id.clone(),
+            if run.is_live() {
+                crate::backend::types::SessionStatus::Busy
+            } else {
+                crate::backend::types::SessionStatus::Idle
+            },
+        );
+        children.push(row);
+    }
     children.sort_by(|a, b| {
         let ub = b.time.as_ref().map(|t| t.updated).unwrap_or(0);
         let ua = a.time.as_ref().map(|t| t.updated).unwrap_or(0);
@@ -180,16 +238,21 @@ pub(crate) async fn child_card_data(
 
     // One status read per row actually rendered: the window is clamped here the
     // same way the builder clamps it, so pages do not read their siblings' rows.
+    // A run row's own live/terminal state is already the status; it never
+    // spends a session read.
     let window = super::session::page_window(children.len(), page);
     let mut statuses = std::collections::HashMap::new();
     for child in &children[window.start..window.end] {
-        let status = handles
-            .flow
-            .backend
-            .session_status(&child.id, Some(&child.directory))
-            .await
-            .ok()
-            .flatten();
+        let status = match run_statuses.get(&child.id) {
+            Some(status) => Some(*status),
+            None => handles
+                .flow
+                .backend
+                .session_status(&child.id, Some(&child.directory))
+                .await
+                .ok()
+                .flatten(),
+        };
         statuses.insert(child.id.clone(), status);
     }
     (children, statuses)
@@ -981,6 +1044,54 @@ mod tests {
 
     fn key() -> crate::config::ThreadKey {
         crate::config::ThreadKey::new("chat_1".into(), "chat_1".into())
+    }
+
+    /// A Codex collaboration child has no session-list entry. Its `AgentRun`
+    /// still appears in `/sub` with the run's `run_id`, label and live state.
+    #[tokio::test]
+    async fn child_card_data_includes_child_only_agent_runs() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.given_sessions(Vec::new());
+        let transcript = crate::backend::SessionTranscript::new(vec![typed_message(
+            "msg_spawn",
+            crate::backend::MessageRole::Assistant,
+            Some(1_000),
+            vec![crate::backend::Part::Tool(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "codex/collab_agent".into(),
+                    call_id: "call_spawn".into(),
+                },
+                status: crate::backend::ToolStatus::Running,
+                started_at: Some(1_000),
+                input: Some(serde_json::json!({"description": "review the diff"})),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "thread_child".into(),
+                        status: None,
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..crate::backend::ToolCall::default()
+            })],
+        )]);
+        backend
+            .given_transcript_after_build("ses_root", vec![transcript])
+            .await;
+        let (app, _platform) = build_app(cfg, backend).await;
+        seed_session(&app, "ses_root", "/work").await;
+
+        let (children, statuses) = child_card_data(&app.command_handles(), &key(), "", 1).await;
+        assert_eq!(children.len(), 1, "the child-only run is a /sub row");
+        assert_eq!(children[0].id, "thread_child", "the row's identity is run_id");
+        assert_eq!(children[0].title, "review the diff");
+        assert_eq!(
+            statuses.get("thread_child"),
+            Some(&Some(crate::backend::types::SessionStatus::Busy)),
+            "the live run's state, no session read needed"
+        );
     }
 
     /// `dir_card_data` derives Recent Directories from the shared store:
