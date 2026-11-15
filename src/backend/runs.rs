@@ -327,7 +327,11 @@ pub fn child_run_status(transcript: &SessionTranscript) -> Option<RunStatus> {
             super::FinishReason::Stop | super::FinishReason::Length | super::FinishReason::ContentFilter => {
                 Some(RunStatus::Completed)
             }
-            super::FinishReason::Other(_) => Some(RunStatus::Cancelled),
+            // A reason this build cannot name is not a client statement that
+            // the run was cancelled: it still owes an exit (its evidence or a
+            // cleanup), the same honesty `ToolStatus::Other` gets in
+            // `status_of`.
+            super::FinishReason::Other(_) => Some(RunStatus::Unknown),
             super::FinishReason::ToolCalls | super::FinishReason::Unknown => None,
         },
         _ => None,
@@ -337,7 +341,9 @@ pub fn child_run_status(transcript: &SessionTranscript) -> Option<RunStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{AgentRunRef, ChildEvidence, MessageId, MessageTime, ToolIdentity};
+    use crate::backend::{
+        AgentRunRef, ChildEvidence, FinishReason, MessageId, MessageTime, StepFinish, ToolIdentity,
+    };
 
     fn call(
         call_id: &str,
@@ -775,6 +781,50 @@ mod tests {
         assert_eq!(
             retirement.task.tool.name, "subagent",
             "the ledger's row stays subagent"
+        );
+    }
+
+    /// A client's terminal statement is mapped honestly: a reason this build
+    /// cannot name is `Unknown` — not `Cancelled`, which would put words in
+    /// the client's mouth and let the run look concluded. `Unknown` is not
+    /// terminal, so the run still owes its exit (its evidence or a cleanup),
+    /// exactly as [`RunStatus::is_terminal`] documents.
+    #[test]
+    fn an_unknown_finish_reason_is_unknown_and_still_owes_an_exit() {
+        let finished = |reason: FinishReason| {
+            SessionTranscript::new(vec![TranscriptMessage {
+                id: MessageId::new("msg_finish"),
+                role: super::super::MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: 1,
+                    completed: Some(2),
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::StepFinish(StepFinish { reason })],
+            }])
+        };
+
+        let unknown = child_run_status(&finished(FinishReason::Other("vendor-x".into())));
+        assert_eq!(
+            unknown,
+            Some(RunStatus::Unknown),
+            "an unnameable finish reason is an unknown statement, not a cancellation"
+        );
+        assert!(
+            !unknown.expect("a statement").is_terminal(),
+            "an unknown statement still owes an exit"
+        );
+        assert_eq!(child_run_status(&finished(FinishReason::Unknown)), None);
+        assert_eq!(child_run_status(&finished(FinishReason::ToolCalls)), None);
+        assert_eq!(
+            child_run_status(&finished(FinishReason::Error)),
+            Some(RunStatus::Failed)
+        );
+        assert_eq!(
+            child_run_status(&finished(FinishReason::Stop)),
+            Some(RunStatus::Completed)
         );
     }
 }
