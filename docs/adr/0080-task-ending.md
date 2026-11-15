@@ -8,6 +8,16 @@
 > The body below is the historical record and is not rewritten; this banner is
 > authoritative (convention: #1065).
 
+> **Amended by #1061 (Agent Run)**: an **Agent Run**'s durable key
+> (`task_run_id`) is its **child id** whenever a naming fact carries one, not
+> the launch's call id. A call id cannot identify the runs one multi-child fact
+> names, and it made the key depend on where a read window began (a window
+> starting at a `wait` minted a different key from one including the launch), so
+> two reads of one run could record two endings. The ADR-0105 banner's
+> call-keyed non-launch rule is superseded for runs. Scope: a run's durable key
+> only — a Background Task's `TaskRunId` selection below is unchanged. The body
+> and the banners above are the historical record; this one is authoritative.
+
 > **Ratified (2026-10-14, spec #699)**: three points where the landed
 > implementation diverges from this ADR's literal wording — the **Wake** path
 > records its ending with its completion entry's commit, not at derivation; the

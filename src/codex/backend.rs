@@ -3240,22 +3240,20 @@ impl Backend for CodexClient {
     /// evidence. `thread/read` carries the turns; the newest one is the
     /// verdict.
     ///
-    /// "No rollout found" is `Unfinished`, not `Gone`: a freshly spawned child
-    /// is a thread in its first turn, and calling it lost would retire every
-    /// healthy new child. `Gone` needs a definitive absence, so a read failure
-    /// is followed by one probe over the server's **child-agent** threads
-    /// (`thread/list` with the `subAgent*` source kinds, which the interactive
-    /// session list deliberately excludes). Absent there → `Gone`; present (or
-    /// the probe itself failed) → the original read stays a failed read.
+    /// "No rollout found" alone is not absence: a freshly spawned child is a
+    /// thread in its first turn. But a DELETED child can answer the same way,
+    /// so the verdict needs the server's thread list either way: absent →
+    /// `Gone`, listed + no-rollout → `Unfinished` (a healthy first-turn
+    /// child), listed + some other read failure → the read stays failed. A
+    /// failed probe is never an absence.
     async fn child_evidence(&self, child_id: &str) -> Result<ChildEvidence> {
         let thread = match self.threads().read(child_id, true).await {
             Ok(thread) => thread,
-            Err(error) if thread_has_no_history(&error, child_id) => {
-                return Ok(ChildEvidence::Unfinished);
-            }
             Err(error) => {
+                let no_history = thread_has_no_history(&error, child_id);
                 return match self.threads().child_exists(child_id).await {
                     Ok(false) => Ok(ChildEvidence::Gone),
+                    Ok(true) if no_history => Ok(ChildEvidence::Unfinished),
                     Ok(true) | Err(_) => Err(client_error(error)),
                 };
             }

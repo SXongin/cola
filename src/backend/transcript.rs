@@ -2137,28 +2137,28 @@ pub struct ToolCallRef {
 /// addresses the run is a receipt on it; a report updates the run and is never
 /// a panel.
 ///
-/// The two identities are deliberately separate:
-///
-/// - [`Self::run_id`] is the live run's identity — the child id when one
-///   exists, else the creating call's id — and never moves once minted.
-/// - [`Self::task_run_id`] is ADR-0080's durable key, first minted by any
-///   id-bearing fact naming the run (a launch's call id, else another call's
-///   id); the ledger reads and writes a **Task Ending** by it. It is `None`
-///   only in the instant before such a fact exists.
+/// The reached shape is one identity: every derived run has
+/// `run_id == child_id == task_run_id`, because a fact names a child to create
+/// a run and both producers drop the ids they cannot name. The three fields
+/// stay for their ROLES, not for three values: `run_id` is the live identity a
+/// relation/`AgentRunRef` keys on, `child_id` is the client's session/thread
+/// the liveness gather reads, and `task_run_id` is ADR-0080's durable key the
+/// ledger writes an ending under. A future call-only producer would fill
+/// `child_id` later without moving `run_id`; no such producer exists today.
 ///
 /// [`Self::status`] is the client's statement about the run; cola's
 /// `TaskEnding` is a separate, durable fact and is never folded into it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentRun {
-    /// The live run's identity: the child id when one exists, else the creating
-    /// call's id. Never re-keyed by a later sighting.
+    /// The live run's identity — the child id. Never re-keyed by a later
+    /// sighting.
     pub run_id: String,
-    /// ADR-0080's durable key: the run's **child id**, the one id every fact
-    /// and every read window names the run by. Never re-minted; later ids are
-    /// aliases.
+    /// ADR-0080's durable key (amended for runs by #1061): the run's **child
+    /// id**, the one id every fact and every read window names the run by.
+    /// Never re-minted; later ids are aliases.
     pub task_run_id: Option<String>,
-    /// The client's child session/thread id, when reported. Usually equals
-    /// `run_id`; a run created from a call-only fact fills it later.
+    /// The client's child session/thread id — the identity the liveness gather
+    /// reads. Equal to `run_id` for every derived run.
     pub child_id: Option<String>,
     /// The label the client gave the child (a description, a prompt, an agent
     /// path), or the run id when it named none.
@@ -2188,11 +2188,16 @@ impl AgentRun {
     }
 
     /// Every id the run is known by, the live identity first — what a durable
-    /// ending or a liveness-tier record matches against.
+    /// ending, a liveness-tier record or an unconfirmed marker matches
+    /// against. The `launched_by` call ids are part of that set: the runtime's
+    /// `⚠️ 状态待确认` marker is keyed by the LAUNCH call id even though the
+    /// run's durable key is the child id, so a row that asked only the latter
+    /// lost the marker (and with it #590's only cleanup exit).
     pub fn ids(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.run_id.as_str())
             .chain(self.task_run_id.as_deref())
             .chain(self.child_id.as_deref())
+            .chain(self.launched_by.iter().map(|call| call.call_id.as_str()))
     }
 
     /// The `Task Ending` key this run's durable records use (ADR-0080): the

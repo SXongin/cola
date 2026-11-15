@@ -57,6 +57,13 @@ const EVENT_CAPACITY: usize = 1024;
 /// alone.
 const NO_ROLLOUT: &str = "no rollout found for thread id ";
 
+/// The most `thread/list` pages the child-absence probe will scan. The probe
+/// runs only after a failed child read (not on every reconcile), stops at the
+/// first page that holds the child, and a scan that never ends is a failed
+/// probe — never an inferred absence. Bounding it keeps one wedged child from
+/// spending an unbounded number of requests per cycle.
+const ABSENCE_PROBE_MAX_PAGES: usize = 16;
+
 /// One app-server thread, as `thread/list`, `thread/read` and `thread/resume`
 /// return it. Only the fields cola reads today are decoded; turns and status
 /// are the read model's (#879).
@@ -488,7 +495,7 @@ impl Threads {
     pub(crate) async fn child_exists(&self, thread_id: &str) -> Result<bool> {
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
-        loop {
+        for _ in 0..ABSENCE_PROBE_MAX_PAGES {
             let page = self.list_page_for(None, None, cursor.as_deref(), None).await?;
             if page.sessions.iter().any(|session| session.id == thread_id) {
                 return Ok(true);
@@ -506,6 +513,10 @@ impl Threads {
                 }
             }
         }
+        Err(CodexError::Protocol {
+            method: "thread/list".to_string(),
+            detail: format!("child-absence probe did not finish within {ABSENCE_PROBE_MAX_PAGES} pages"),
+        })
     }
 
     async fn list_all_page(&self, cwd: Option<&str>) -> Result<Vec<SessionListInfo>> {

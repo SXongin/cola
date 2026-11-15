@@ -2863,12 +2863,17 @@ fn collab_status(
         if let Some(status) = launch {
             return status;
         }
-        if !receivers.is_empty() {
-            // ANY live target keeps the run live; a receiver with no state row
-            // yet (the start payload) counts as live, never as ended.
+        // The named targets are exactly the ones `collab_runs` mints runs for:
+        // the receiver list PLUS any target the state map names. Inspecting
+        // only the receiver list would let a state-only launch read `Completed`
+        // and be born terminal (the run exists but the call says it ended).
+        let names = collab_runs(receivers, agents);
+        if !names.is_empty() {
+            // ANY live target keeps the run live; a named target with no state
+            // row yet (the start payload) counts as live, never as ended.
             let mut rows = agents
                 .iter()
-                .filter(|agent| receivers.contains(&agent.thread_id))
+                .filter(|agent| names.iter().any(|run| run.run_id == agent.thread_id))
                 .peekable();
             let any_live =
                 rows.peek().is_none() || rows.any(|agent| !agent_status_is_terminal(&agent.status));
@@ -3940,6 +3945,37 @@ mod tests {
             projected_tool(&done, "item-done").status,
             ToolStatus::Completed,
             "every target terminal is a completed run"
+        );
+
+        // The state map may name the child before the receiver list does: the
+        // run exists, so the call must read the target's live state.
+        let mut state_only = ThreadProjection::new("thread-1");
+        replay(
+            &mut state_only,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-state-only",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": "thread-1",
+                        "receiverThreadIds": [],
+                        "agentsStates": {
+                            "thread-a": { "status": "running", "message": null }
+                        }
+                    }
+                }
+            })],
+        );
+        assert_eq!(
+            projected_tool(&state_only, "item-state-only").status,
+            ToolStatus::Running,
+            "a state-map-only launch is live"
         );
     }
 
