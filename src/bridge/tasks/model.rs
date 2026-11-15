@@ -362,11 +362,12 @@ pub(crate) fn identity_task(identity: &TaskRunIdentity, fallback_key: &str) -> B
     }
 }
 
-/// The ledger kind of a Background Task's tool. It keys on the **neutral
-/// launch noun** the decoder admits from the V2 tool shape — `shell` or
-/// `subagent` — never a vendor id (ADR-0105's table was removed):
-/// `background_launch` returns `None` for every other name, so only those two
-/// ever background. A matching pair, matched once, here.
+/// The ledger kind of a Background Task's tool: it keys on the **neutral
+/// launch noun** the V2 decoder writes for a background run — `shell` or
+/// `subagent` — not a vendor id, and it is not the per-adapter semantics table
+/// (`SHARED_TOOLS`, which still exists). `background_launch` returns `None`
+/// for every other name, so only those two ever background. A matching pair,
+/// matched once, here.
 pub(crate) fn task_kind(tool: &str) -> TaskKind {
     match tool {
         "subagent" => TaskKind::Subagent,
