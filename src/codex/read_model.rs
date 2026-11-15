@@ -2931,13 +2931,15 @@ fn agent_status_is_terminal(status: &str) -> bool {
 /// state. The item's own start/completion events are transport (every activity
 /// arrives as both), so they never settle the run — `started`/`interacted`/
 /// `resumed` (and an upstream kind this build does not know) stay `Running`,
-/// `completed` is `Completed`, and `interrupted` is the failure mark. This is
-/// the declaration the neutral AgentRun fold reads (spec #1057's P4), which is
-/// why it must not conflate "the item was delivered" with "the run ended".
+/// `completed` is `Completed`, and `interrupted` carries the same neutral
+/// `Other("interrupted")` the `agentsStates` status uses, which
+/// [`status_of`] maps to `Cancelled` — never `Failed`. This is the declaration
+/// the neutral AgentRun fold reads (spec #1057's P4), which is why it must not
+/// conflate "the item was delivered" with "the run ended".
 fn activity_status(kind: &str) -> ToolStatus {
     match kind {
         "completed" => ToolStatus::Completed,
-        "interrupted" => ToolStatus::Error,
+        "interrupted" => ToolStatus::Other("interrupted".to_string()),
         _ => ToolStatus::Running,
     }
 }
@@ -4285,7 +4287,8 @@ mod tests {
     /// Issue #962 / spec #1057's P4: a `subAgentActivity` is a REPORT carrying
     /// the child's path and the model it was started with — its kind is the
     /// run's state (a `started` activity is live), and an interrupted activity
-    /// is the failure mark. It is never a Tool Panel of its own.
+    /// is a cancellation, the same state `agentsStates` declares. It is never a
+    /// Tool Panel of its own.
     #[test]
     fn a_sub_agent_activity_is_a_report_with_its_path() {
         let projection = projected();
@@ -4328,7 +4331,16 @@ mod tests {
             })],
         );
         let call = projected_tool(&interrupted, "item-activity-interrupted");
-        assert_eq!(call.status, ToolStatus::Error);
+        assert_eq!(
+            call.status,
+            ToolStatus::Other("interrupted".into()),
+            "the activity's interrupted state shares the agentsStates vocabulary"
+        );
+        assert_eq!(
+            interrupted.transcript().runs[0].status,
+            RunStatus::Cancelled,
+            "and the run reads Cancelled, not Failed"
+        );
     }
 
     /// Spec #1057 P1: `imageView` and `imageGeneration` both project into the
