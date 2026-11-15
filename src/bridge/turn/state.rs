@@ -4389,7 +4389,12 @@ impl StreamAccumulator {
                 } else if crate::feishu::card::tool_render::is_receipt_call(call) {
                     self.mark_receipt_delivered(crate::feishu::card::tool_render::receipt_key(call));
                 } else if is_plan_call(call) {
-                    self.record_todo_call(call);
+                    // A client with no plan surface records no delivered list
+                    // (ADR-0106): the part stays in the transcript, but no
+                    // successor can reintroduce a plan panel.
+                    if !self.capabilities().plan.is_absent() {
+                        self.record_todo_call(call);
+                    }
                 } else {
                     self.tools
                         .insert(call.identity.call_id.clone(), ToolPanel::new(call.clone()));
@@ -5005,7 +5010,9 @@ impl StreamAccumulator {
             // renderer owns, exactly as `build_card_inner` omits it
             // ([`Self::omitted_live_seeded`]): the reserve must not charge for
             // what the build will not render.
-            if let Some(todo) = &self.todo_panel {
+            if !self.capabilities().plan.is_absent()
+                && let Some(todo) = &self.todo_panel
+            {
                 let session = self.session_id.as_deref();
                 comps += match todo {
                     TodoPanel::List { .. } => 1,
@@ -5292,7 +5299,9 @@ impl StreamAccumulator {
             // list always lands on the LIVE card (a timeline row would freeze
             // on a finalized one). The block spans below are recorded from
             // `builder.body_len()`, so they stay correct with it in front.
-            if let Some(todo) = &self.todo_panel {
+            if !self.capabilities().plan.is_absent()
+                && let Some(todo) = &self.todo_panel
+            {
                 builder = builder.with_todo_at(
                     todo.clone(),
                     self.todo_shown_at,
@@ -8860,6 +8869,37 @@ mod tests {
         assert!(hr < footer, "hr precedes the footer line");
         assert!(footer < retry, "recovery buttons stay after the footer");
         assert_eq!(elements.len(), footer + 2, "footer and retry end the card");
+    }
+
+    /// A projected successor's delivered `todowrite` must not reintroduce a
+    /// plan panel for a client that declares no plan surface.
+    #[test]
+    fn a_delivered_plan_part_is_ignored_when_plan_is_absent() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_capabilities(AgentCapabilities {
+            plan: crate::backend::PlanMode::None,
+            ..AgentCapabilities::full()
+        });
+        let call = ToolCall {
+            identity: crate::backend::ToolIdentity {
+                name: "todowrite".into(),
+                call_id: "call_plan".into(),
+            },
+            kind: crate::backend::ToolKind::Other,
+            detail: crate::backend::ToolDetail::None,
+            status: crate::backend::ToolStatus::Completed,
+            input: Some(serde_json::json!({"todos": [{"content": "task", "status": "pending"}]})),
+            ..ToolCall::default()
+        };
+        acc.mark_delivered_part(&MessageId::new("msg_plan"), &Part::Tool(call));
+        assert!(
+            acc.todo_panel.is_none(),
+            "no plan surface, no delivered plan panel"
+        );
+        assert!(
+            !acc.build_card().to_string().contains("📋"),
+            "the card renders no plan section"
+        );
     }
 
     /// ADR-0106: a reattach can remove a surface mid-chain. The declaration
