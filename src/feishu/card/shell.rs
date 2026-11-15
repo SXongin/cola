@@ -991,15 +991,15 @@ mod tests {
             wait: None,
         };
         assert_eq!(
-            activity(ChildActivity::Waiting).title_fragment(1_000),
+            activity(ChildActivity::Phase(Phase::Waiting)).title_fragment(1_000),
             phase_token(Phase::Waiting)
         );
         assert_eq!(
-            activity(ChildActivity::Reasoning).title_fragment(1_000),
+            activity(ChildActivity::Phase(Phase::Reasoning)).title_fragment(1_000),
             phase_token(Phase::Reasoning)
         );
         assert_eq!(
-            activity(ChildActivity::Responding).title_fragment(1_000),
+            activity(ChildActivity::Phase(Phase::Responding)).title_fragment(1_000),
             phase_token(Phase::Responding)
         );
     }

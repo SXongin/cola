@@ -39,6 +39,26 @@ pub(crate) const TOOL_PLAN: &str = "plan";
 pub(crate) const TOOL_SKILL: &str = "skill";
 pub(crate) const TOOL_ASK: &str = "ask";
 
+/// Every tool token, for the source guard and the uniqueness test. A new token
+/// constant joins this list; the guard cannot see a constant it was not told
+/// about, so keeping the list beside the declarations is the reminder.
+#[cfg(test)]
+pub(crate) const ALL_TOKENS: &[&str] = &[
+    TOOL_SHELL,
+    TOOL_READ,
+    TOOL_WRITE,
+    TOOL_EDIT,
+    TOOL_GLOB,
+    TOOL_GREP,
+    TOOL_FETCH,
+    TOOL_WEBSEARCH,
+    TOOL_SUBAGENT,
+    TOOL_SCRIPT,
+    TOOL_PLAN,
+    TOOL_SKILL,
+    TOOL_ASK,
+];
+
 /// The live phase slot's three tokens (ADR-0107 §3). They serve the card
 /// header and the child-agent activity line, so one run cannot read as two
 /// different phases on two surfaces.
@@ -58,6 +78,18 @@ pub(crate) const AWAITING_PERMISSION: &str = "等待你的授权";
 pub(crate) const AWAITING_QUESTION: &str = "等待你的回答";
 pub(crate) const AWAITING_BOTH: &str = "等待你的授权/回答";
 
+/// The header's rendered form of the same waits: the words above behind the
+/// header's ⏳. They live beside the labels so a rename edits one module and
+/// the header cannot drift from the liveness line (a test pins the shape).
+pub(crate) const AWAITING_PERMISSION_TITLE: &str = "⏳ 等待你的授权";
+pub(crate) const AWAITING_QUESTION_TITLE: &str = "⏳ 等待你的回答";
+pub(crate) const AWAITING_BOTH_TITLE: &str = "⏳ 等待你的授权/回答";
+
+/// The turn-level target a receiverless addressing receipt names (ADR-0106:
+/// a `wait` with no receiver addresses the Turn's live runs as a set). Copy,
+/// because a translator would touch it.
+pub(crate) const RECEIPT_TURN_RUNS: &str = "本回合的运行";
+
 /// A run's ending word (ADR-0107 §4): copy, never a token, because a
 /// translator would touch it. `TaskEnding` is wider than the client's
 /// `RunStatus` — a runtime-confirmed end and a user cleanup have no client
@@ -73,11 +105,34 @@ pub(crate) const RUN_CLEANED: &str = "已清理";
 /// ("live runs") keeps `后台任务` as its heading for now (spec #1057's P4).
 pub(crate) const LEDGER_TITLE: &str = "后台任务";
 
+/// The closed name-only token arm — the one place a vendor name may become a
+/// token. It matches **only** `Other` + `None`, because `todowrite`, `skill`
+/// and `question` are the three tools OpenCode alone produces and they have no
+/// shared shape (ADR-0107's recorded exception). `None` means "no token from
+/// the name": the name is opaque data, even when it happens to spell a token
+/// (`{name: "plan", detail: Opaque}` keeps its vendor name and is **not** the
+/// plan surface).
+pub(crate) fn name_only_token(
+    identity: &ToolIdentity,
+    kind: ToolKind,
+    detail: &ToolDetail,
+) -> Option<&'static str> {
+    match (kind, detail) {
+        (ToolKind::Other, ToolDetail::None) => match identity.name.as_str() {
+            "todowrite" => Some(TOOL_PLAN),
+            "skill" => Some(TOOL_SKILL),
+            "question" => Some(TOOL_ASK),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// The tool token for one call: ADR-0107's closed table, derived from
 /// `(kind, detail)` first and the vendor name last.
 ///
-/// The name is read in exactly one place — the `Other` + `None` arm, where a
-/// closed three-entry table maps `todowrite`/`skill`/`question` to
+/// The name is read in exactly one place — [`name_only_token`], where a closed
+/// three-entry table maps `todowrite`/`skill`/`question` to
 /// `plan`/`skill`/`ask` (OpenCode is their only producer, so they have no
 /// shared shape). Everywhere else the name is only the opaque fallback: a
 /// vendor tool keeps its **full** vendor name, namespace included (ADR-0042).
@@ -118,15 +173,9 @@ pub(crate) fn tool_token<'a>(identity: &'a ToolIdentity, kind: ToolKind, detail:
                 ..
             },
         ) => TOOL_SUBAGENT,
-        // The closed name-only token set (ADR-0107's one exception).
-        (ToolKind::Other, ToolDetail::None) => match identity.name.as_str() {
-            "todowrite" => TOOL_PLAN,
-            "skill" => TOOL_SKILL,
-            "question" => TOOL_ASK,
-            _ => identity.name.as_str(),
-        },
-        // A shape on the wrong kind, or a vendor tool: opaque.
-        _ => identity.name.as_str(),
+        // The closed name-only token set (ADR-0107's one exception); every
+        // other name is the opaque fallback.
+        _ => name_only_token(identity, kind, detail).unwrap_or(identity.name.as_str()),
     }
 }
 
@@ -343,6 +392,29 @@ mod tests {
         }
     }
 
+    /// The opaque fallback may spell a token; it is still not that token's
+    /// closed arm. An MCP/plugin tool literally named `plan` must not be
+    /// classified as the plan surface.
+    #[test]
+    fn an_opaque_name_that_spells_a_token_is_not_its_closed_arm() {
+        let identity = identity("plan");
+        assert_eq!(
+            tool_token(&identity, ToolKind::Other, &ToolDetail::Opaque),
+            "plan",
+            "the opaque fallback keeps the vendor name"
+        );
+        assert_eq!(
+            name_only_token(&identity, ToolKind::Other, &ToolDetail::Opaque),
+            None,
+            "an opaque vendor name is not a token table entry"
+        );
+        assert_eq!(
+            name_only_token(&identity, ToolKind::Other, &ToolDetail::None),
+            None,
+            "a vendor name outside the closed three is not a token either"
+        );
+    }
+
     /// The three name-only tokens are the closed exception; the name is read
     /// nowhere else.
     #[test]
@@ -417,6 +489,16 @@ mod tests {
         assert_eq!(words.len(), 6, "the six endings are six distinct words");
     }
 
+    /// The guard's list is built from the module's constants, so a rename
+    /// cannot leave it scanning for an old word; this checks the list stayed
+    /// distinct while a token was added beside its neighbours.
+    #[test]
+    fn the_token_list_is_distinct() {
+        let set: std::collections::BTreeSet<&str> = ALL_TOKENS.iter().copied().collect();
+        assert_eq!(set.len(), ALL_TOKENS.len(), "a token is listed twice");
+        assert_eq!(ALL_TOKENS.len(), 13, "the closed table has thirteen tokens");
+    }
+
     /// ADR-0107 §6: a renderer writes no token as a string literal. The scan
     /// strips the test module and comments, then looks for a token in a
     /// display position — a match arm's result, a `Some`, a binding, a
@@ -431,24 +513,11 @@ mod tests {
     /// argument.
     #[test]
     fn no_renderer_writes_a_token_literal() {
-        const TOKENS: &[&str] = &[
-            TOOL_SHELL,
-            TOOL_READ,
-            TOOL_WRITE,
-            TOOL_EDIT,
-            TOOL_GLOB,
-            TOOL_GREP,
-            TOOL_FETCH,
-            TOOL_WEBSEARCH,
-            TOOL_SUBAGENT,
-            TOOL_SCRIPT,
-            TOOL_PLAN,
-            TOOL_SKILL,
-            TOOL_ASK,
-            PHASE_WAITING,
-            PHASE_REASONING,
-            PHASE_RESPONDING,
-        ];
+        let tokens: Vec<&str> = ALL_TOKENS
+            .iter()
+            .copied()
+            .chain([PHASE_WAITING, PHASE_REASONING, PHASE_RESPONDING])
+            .collect();
         const EXEMPT: &[&str] = &["vocab.rs", "lang.rs", "picker.rs"];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/feishu/card");
         let mut checked = 0;
@@ -475,7 +544,7 @@ mod tests {
                 if trimmed.starts_with("//") {
                     continue;
                 }
-                for token in TOKENS {
+                for token in &tokens {
                     let quoted = format!("\"{token}\"");
                     let displays = [
                         format!("=> {quoted}"),

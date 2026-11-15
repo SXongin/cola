@@ -36,6 +36,7 @@ use serde_json::json;
 use super::sanitize::CardMarkdown;
 use super::shell::{card_shell, fmt_elapsed};
 use super::tool_render::{OutputClip, command_output_block};
+use super::vocab::OUTPUT_LABEL;
 
 /// The newest characters of a **Terminal Log** a card shows: the live tail and
 /// the settled tail share this one budget (ADR-0086 §4).
@@ -359,7 +360,8 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     } else {
         tail
     };
-    let (output_element, fence_clipped) = fenced_element("**输出**", &output, true, &mut markdown);
+    let (output_element, fence_clipped) =
+        fenced_element(&format!("**{OUTPUT_LABEL}**"), &output, true, &mut markdown);
 
     let mut elements = vec![cwd_element, command_element];
     if cwd_clipped || command_clipped {
@@ -422,7 +424,7 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
         let command = OutputClip::under_element("**命令**").clipped(view.command);
         // The 「问 AI」 window is exactly the fenced element's body, so the
         // submission quotes what the reader sees (ADR-0086 decision 9).
-        let window = OutputClip::tail_under_element("**输出**").clipped(&output);
+        let window = OutputClip::tail_under_element(&format!("**{OUTPUT_LABEL}**")).clipped(&output);
         elements.push(settled_buttons_row(
             full_output,
             &cwd,
@@ -1157,17 +1159,21 @@ mod tests {
             chat_id: "chat_1",
             thread_id: "chat_1",
         });
-        let (block, cut) = command_output_block(&body, OutputClip::tail_under_element("**输出**"), true);
+        let (block, cut) = command_output_block(
+            &body,
+            OutputClip::tail_under_element(&format!("**{OUTPUT_LABEL}**")),
+            true,
+        );
         assert!(!cut, "a body inside the per-element budget is not cut");
         assert!(block.starts_with("```\n"), "machine output is fenced: {block}");
         let texts = crate::bridge::test_support::card_texts(&card);
         let output = texts
             .iter()
-            .find(|content| content.starts_with("**输出**"))
+            .find(|content| content.starts_with(&format!("**{OUTPUT_LABEL}**")))
             .expect("the card carries an output element");
         assert_eq!(
             output,
-            &format!("**输出**\n{block}"),
+            &format!("**{OUTPUT_LABEL}**\n{block}"),
             "the output element is the shared block"
         );
     }

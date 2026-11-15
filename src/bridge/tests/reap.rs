@@ -6650,7 +6650,7 @@ async fn a_restart_mid_run_follows_the_live_run_onto_a_successor() {
     // The successor is a live continuation — a working card, not a stamped
     // orphan — and the delivered prefix is never repeated.
     assert!(
-        card_header(&successor).contains("responding"),
+        card_header(&successor).contains(crate::feishu::card::vocab::PHASE_RESPONDING),
         "the successor is a working card: {successor}"
     );
     assert!(
@@ -6902,7 +6902,7 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
-        card_header(&successor).contains("responding"),
+        card_header(&successor).contains(crate::feishu::card::vocab::PHASE_RESPONDING),
         "the adoption follows the live run: {successor}"
     );
     assert!(successor_text.contains("CI 通过了。"), "{successor}");
@@ -6949,7 +6949,7 @@ async fn an_idle_read_does_not_block_the_reaps_live_adoption() {
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
-        card_header(&successor).contains("responding"),
+        card_header(&successor).contains(crate::feishu::card::vocab::PHASE_RESPONDING),
         "the adoption follows the live run: {successor}"
     );
     assert!(
@@ -7555,7 +7555,7 @@ async fn a_live_adoption_is_generation_neutral() {
         spawn_sync(&app);
         let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
         assert!(
-            card_header(&successor).contains("responding"),
+            card_header(&successor).contains(crate::feishu::card::vocab::PHASE_RESPONDING),
             "a working successor on the {generation} mock: {successor}"
         );
         assert_successor_header(&successor, "项目乙", 1_000);

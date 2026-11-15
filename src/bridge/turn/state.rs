@@ -7444,7 +7444,7 @@ mod tests {
             }]
         };
         let thinking = |last_activity_ms: i64| TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Waiting,
+            activity: crate::feishu::card::tool_render::ChildActivity::Phase(crate::backend::Phase::Waiting),
             last_activity_ms: Some(last_activity_ms),
             wait: None,
         };
@@ -7464,7 +7464,9 @@ mod tests {
         assert!(acc.set_ledger(row(thinking(start + 400)), start + 1_400, LedgerCadence::Second));
         // A shape change at the same instant owes too: the phase word...
         let replying = |at: i64| TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Responding,
+            activity: crate::feishu::card::tool_render::ChildActivity::Phase(
+                crate::backend::Phase::Responding,
+            ),
             last_activity_ms: Some(at),
             wait: None,
         };
@@ -7602,7 +7604,9 @@ mod tests {
         );
         // The gather heals to a new typed activity: that change owes at once.
         let replying = TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Responding,
+            activity: crate::feishu::card::tool_render::ChildActivity::Phase(
+                crate::backend::Phase::Responding,
+            ),
             last_activity_ms: Some(start + 31_000),
             wait: None,
         };
@@ -7726,7 +7730,9 @@ mod tests {
                 started_at: Some(started_at),
                 unconfirmed: false,
                 activity: Some(TaskLiveness {
-                    activity: crate::feishu::card::tool_render::ChildActivity::Waiting,
+                    activity: crate::feishu::card::tool_render::ChildActivity::Phase(
+                        crate::backend::Phase::Waiting,
+                    ),
                     last_activity_ms: Some(activity_at),
                     wait: None,
                 }),
@@ -8231,7 +8237,8 @@ mod tests {
         acc.card_state = CardState::Reasoning;
         acc.refresh_phase();
         assert!(
-            acc.header_sig().contains("reasoning"),
+            acc.header_sig()
+                .contains(crate::feishu::card::vocab::PHASE_REASONING),
             "reasoning phase in sig: {}",
             acc.header_sig()
         );
@@ -8297,7 +8304,8 @@ mod tests {
         assert!(acc.dismiss_interaction("q"));
         assert_eq!(acc.awaiting_action(), AwaitingAction::None);
         assert!(
-            acc.header_sig().contains("reasoning"),
+            acc.header_sig()
+                .contains(crate::feishu::card::vocab::PHASE_REASONING),
             "awaiting title must lift back to the phase label: {}",
             acc.header_sig()
         );

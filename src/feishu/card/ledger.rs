@@ -635,6 +635,7 @@ fn secs_since(at_ms: i64, now_ms: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::Phase;
     use crate::feishu::card::tool_render::ChildActivity;
 
     /// A shell row's output window (spec #588, #592) renders under the row as
@@ -981,7 +982,7 @@ mod tests {
         );
 
         let thinking = TaskLiveness {
-            activity: ChildActivity::Waiting,
+            activity: ChildActivity::Phase(Phase::Waiting),
             last_activity_ms: Some(now - 30_000),
             wait: Some(crate::feishu::card::AwaitingAction::Permission),
         };
@@ -1617,7 +1618,7 @@ mod tests {
             started_at: None,
             unconfirmed: false,
             activity: Some(TaskLiveness {
-                activity: ChildActivity::Waiting,
+                activity: ChildActivity::Phase(Phase::Waiting),
                 last_activity_ms: Some(0),
                 wait,
             }),
@@ -1685,17 +1686,17 @@ mod tests {
                 wait: Some(crate::feishu::card::AwaitingAction::Permission),
             },
             TaskLiveness {
-                activity: ChildActivity::Waiting,
+                activity: ChildActivity::Phase(Phase::Waiting),
                 last_activity_ms: Some(0),
                 wait: None,
             },
             TaskLiveness {
-                activity: ChildActivity::Reasoning,
+                activity: ChildActivity::Phase(Phase::Reasoning),
                 last_activity_ms: Some(0),
                 wait: Some(crate::feishu::card::AwaitingAction::Both),
             },
             TaskLiveness {
-                activity: ChildActivity::Responding,
+                activity: ChildActivity::Phase(Phase::Responding),
                 last_activity_ms: Some(0),
                 wait: None,
             },

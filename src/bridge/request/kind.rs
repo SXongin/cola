@@ -21,6 +21,7 @@ use crate::feishu::card::question::FallbackLoss;
 use crate::feishu::card::tool_render::{
     DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_from_metadata, parse_edit_diff,
 };
+use crate::feishu::card::vocab::INPUT_LABEL;
 
 use super::companion::{
     companion_target_digest, describe_permission_for, describe_permission_target_summary,
@@ -2963,6 +2964,12 @@ async fn reply_question_scoped(
 /// `subagent`, and the V2 tools whose permission assert names them directly
 /// (`question`, `grep`, `glob`, `skill`, `websearch`). An action with no arm
 /// still renders — as the generic `🔐 执行操作`.
+///
+/// Scope note (#1063): these are **copy sentences**, not tool-token slots, and
+/// the ticket's visible set does not rename them. ADR-0107's Context names the
+/// permission description as the third name→meaning table; folding it into the
+/// token vocabulary would change human sentences (`执行 Shell 命令`,
+/// `调用子代理`) and belongs to its own copy pass, not this rename.
 pub(crate) fn describe_action(action: &str) -> (&'static str, &'static str) {
     match action {
         "bash" | "shell" | "command" => ("⚡", "执行 Shell 命令"),
@@ -3097,7 +3104,7 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
             ("command", "命令"),
             ("cwd", "目录"),
             ("description", "说明"),
-            ("input", "输入"),
+            ("input", INPUT_LABEL),
             ("path", "路径"),
         ] {
             if let Some(v) = meta.get(key) {

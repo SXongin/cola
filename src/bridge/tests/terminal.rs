@@ -16,6 +16,7 @@ use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 #[cfg(unix)]
 use crate::feishu::card::terminal::TERMINAL_TAIL_CHARS;
+use crate::feishu::card::vocab::OUTPUT_LABEL;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -103,10 +104,10 @@ async fn settled_card(platform: &RecordingPlatform) -> serde_json::Value {
 fn output_body(card: &serde_json::Value) -> String {
     let content = card_texts(card)
         .into_iter()
-        .find(|content| content.starts_with("**输出**"))
+        .find(|content| content.starts_with(&format!("**{OUTPUT_LABEL}**")))
         .expect("the card carries an output element");
     let fenced = content
-        .strip_prefix("**输出**\n")
+        .strip_prefix(&format!("**{OUTPUT_LABEL}**\n"))
         .expect("the output element starts with its label");
     let body = fenced.split_once('\n').expect("the fence has a body line").1;
     body.rsplit_once('\n').expect("the fence closes").0.to_string()
@@ -499,7 +500,7 @@ async fn a_backtick_heavy_output_keeps_the_newest_line_within_the_budget() {
     let joined = texts.join("\n");
     let output = texts
         .iter()
-        .find(|text| text.starts_with("**输出**"))
+        .find(|text| text.starts_with(&format!("**{OUTPUT_LABEL}**")))
         .expect("the card carries an output element");
     assert!(
         output.contains("ERROR: boom"),

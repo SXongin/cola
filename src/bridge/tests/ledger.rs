@@ -397,7 +397,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         text.contains("⏳ 后台任务（2）")
             && text.contains("· shell：**npm run build**")
             && text.contains("· subagent：**review the diff**")
-            && text.contains("📋 plan")
+            && text.contains(&format!("📋 {}", crate::feishu::card::vocab::TOOL_PLAN))
     })
     .await;
 
@@ -417,7 +417,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         "rows keep transcript order (shell before subagent): {text}"
     );
     assert!(
-        text.contains("📋 plan"),
+        text.contains(&format!("📋 {}", crate::feishu::card::vocab::TOOL_PLAN)),
         "the Todo Panel coexists with the ledger: {text}"
     );
     assert!(
@@ -2507,7 +2507,8 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
     );
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&yielded).contains("⏳ 后台任务（1）") && card_text(&yielded).contains("subagent"),
+        card_text(&yielded).contains("⏳ 后台任务（1）")
+            && card_text(&yielded).contains(crate::feishu::card::vocab::TOOL_SUBAGENT),
         "the child-only run has its own ledger row: {yielded}"
     );
 

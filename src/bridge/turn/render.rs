@@ -7955,7 +7955,7 @@ Index: /x/src/main.rs
             "the header still names the running call: {title}"
         );
         assert!(
-            !title.contains("reasoning") && !title.contains('字'),
+            !title.contains(crate::feishu::card::vocab::PHASE_REASONING) && !title.contains('字'),
             "no reasoning label or count while the tool runs: {title}"
         );
 
@@ -7967,7 +7967,9 @@ Index: /x/src/main.rs
         ));
         assert_eq!(acc.current_phase(), Some(&HeaderPhase::Reasoning));
         assert!(
-            acc.header_title_and_template().0.contains("reasoning"),
+            acc.header_title_and_template()
+                .0
+                .contains(crate::feishu::card::vocab::PHASE_REASONING),
             "a settled tool restores the reasoning header: {}",
             acc.header_title_and_template().0
         );
@@ -9126,7 +9128,11 @@ Index: /x/src/main.rs
             "a header change alone must re-flush the card: {updates:?}"
         );
         assert!(
-            updates.last().unwrap().to_string().contains("reasoning"),
+            updates
+                .last()
+                .unwrap()
+                .to_string()
+                .contains(crate::feishu::card::vocab::PHASE_REASONING),
             "the re-flush carries the new header: {}",
             updates.last().unwrap()
         );
@@ -11778,7 +11784,7 @@ Index: /x/src/main.rs
         assert_eq!(
             child_liveness(&transcript),
             Some(TaskLiveness {
-                activity: ChildActivity::Reasoning,
+                activity: ChildActivity::Phase(crate::backend::Phase::Reasoning),
                 last_activity_ms: Some(8_000),
                 wait: None,
             })
@@ -11794,7 +11800,7 @@ Index: /x/src/main.rs
         assert_eq!(
             child_liveness(&replying),
             Some(TaskLiveness {
-                activity: ChildActivity::Responding,
+                activity: ChildActivity::Phase(crate::backend::Phase::Responding),
                 last_activity_ms: Some(5_000),
                 wait: None,
             })
@@ -11808,7 +11814,7 @@ Index: /x/src/main.rs
         assert_eq!(
             child_liveness(&thinking),
             Some(TaskLiveness {
-                activity: ChildActivity::Waiting,
+                activity: ChildActivity::Phase(crate::backend::Phase::Waiting),
                 last_activity_ms: Some(6_000),
                 wait: None,
             })

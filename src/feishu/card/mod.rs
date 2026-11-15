@@ -381,11 +381,10 @@ pub struct CardActionButton {
     pub value: serde_json::Value,
 }
 
-/// The header titles while a request blocks the turn (ADR-0014). Tests assert
-/// these constants so the copy lives in one place.
-pub(crate) const AWAITING_PERMISSION_TITLE: &str = "⏳ 等待你的授权";
-pub(crate) const AWAITING_QUESTION_TITLE: &str = "⏳ 等待你的回答";
-pub(crate) const AWAITING_BOTH_TITLE: &str = "⏳ 等待你的授权/回答";
+/// The header titles while a request blocks the turn (ADR-0014). They live in
+/// [`vocab`] beside the wait words they render, and are re-exported here so
+/// every existing import path keeps resolving.
+pub(crate) use vocab::{AWAITING_BOTH_TITLE, AWAITING_PERMISSION_TITLE, AWAITING_QUESTION_TITLE};
 
 /// Wrap `text` in a fenced code block so long lines render without wrapping.
 /// The fence is sized longer than any backtick run in the content, so an
