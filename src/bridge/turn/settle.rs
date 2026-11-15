@@ -254,7 +254,8 @@ pub(super) async fn run(
         // decision legitimately carries a live panel when that panel is a
         // child run's launch (the run owns the wait), while the turn's own
         // orphaned work still takes the grace.
-        let disposition = Disposition::from(transcript.settle(anchor.as_ref()));
+        let disposition =
+            Disposition::from(transcript.settle_with(anchor.as_ref(), flow.backend.reports_live_runs()));
         // A `⏳` panel must not be stamped over: a crash-orphaned call gets the
         // grace to settle, then ends Error rather than a false `✅`. A Waiting
         // decision yields instead only when its live panel is a launch THIS

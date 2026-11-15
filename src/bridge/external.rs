@@ -1775,7 +1775,7 @@ async fn external_render_loop(
         let settle = transcript
             .turn_for_user(&anchor)
             .complete
-            .then(|| transcript.settle(Some(&anchor)));
+            .then(|| transcript.settle_with(Some(&anchor), handles.backend.reports_live_runs()));
         undecided = matches!(settle, Some(TurnSettle::Running));
         // The accumulator was replaced (cola's own `run_prompt` inserted a fresh
         // one, or a newer external message's renderer took over): exit so this

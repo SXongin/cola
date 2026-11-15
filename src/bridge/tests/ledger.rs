@@ -604,6 +604,62 @@ async fn a_task_appears_and_retires_on_the_live_card_in_cadence() {
     );
 }
 
+/// Spec #1057's P4: a completed V1 `task` with a `sessionId` derives a terminal
+/// child-id run, but V1 has no child-evidence read and no live-run surface. It
+/// must settle the Turn as before, not wait forever on an ending no surface can
+/// produce.
+#[tokio::test]
+async fn a_completed_v1_task_does_not_hold_the_turn() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下"),
+        typed_message(
+            "msg_v1_task",
+            MessageRole::Assistant,
+            Some(2_000),
+            vec![Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_v1".into(),
+                },
+                status: ToolStatus::Completed,
+                started_at: Some(2_000),
+                input: Some(serde_json::json!({"description": "review the diff"})),
+                metadata: Some(serde_json::json!({"sessionId": "ses_child"})),
+                output: ToolOutput::default(),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "ses_child".into(),
+                        status: None,
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..ToolCall::default()
+            })],
+        ),
+        assistant(2_500, "完成了。"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, _backend, _platform) = scripted_app_prepared(
+        vec![transcript],
+        Some(SessionStatus::Idle),
+        |_| {},
+        |backend| {
+            backend.without_task_surface();
+        },
+    )
+    .await;
+
+    let outcome = Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下"))
+        .await
+        .expect("the V1 turn runs");
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "a terminal V1 run with no retirable surface settles: {outcome:?}"
+    );
+}
+
 /// Acceptance 5 (#589 keeps it under the shared step): V1 carries no
 /// Background Task facts — a V1 `task` call that looks backgrounded renders
 /// its panel and never a ledger section, and the empty list short-circuits the

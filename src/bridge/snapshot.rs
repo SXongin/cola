@@ -162,7 +162,8 @@ pub(crate) async fn gather_snapshot(
     let waiting = status == Some(crate::backend::types::SessionStatus::Idle)
         && (newest_user_anchor.as_ref().is_some_and(|anchor| {
             transcript.turn_for_user(anchor).complete
-                && transcript.settle(Some(anchor)) == crate::backend::TurnSettle::Waiting
+                && transcript.settle_with(Some(anchor), backend.reports_live_runs())
+                    == crate::backend::TurnSettle::Waiting
         })
             // An UNTIMED newest user message has no anchor to settle, but an
             // Idle read with live Background Tasks (or live runs — a child-only
