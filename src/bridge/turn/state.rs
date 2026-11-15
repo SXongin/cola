@@ -17,8 +17,8 @@ use super::timeline::{
 #[cfg(test)]
 use crate::backend::TranscriptMessage;
 use crate::backend::{
-    Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor,
-    TurnDiffStats,
+    AgentCapabilities, Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall,
+    TurnAnchor, TurnDiffStats,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
 use crate::bridge::handles::CardsHandle;
@@ -1326,6 +1326,12 @@ pub(super) struct StreamAccumulator {
     /// [`Self::set_todo_panel`]; read through [`Self::tool_panel_current`] and
     /// the card tail render.
     todo_shown_at: Option<i64>,
+    /// The attachment's capability declaration (ADR-0106, spec #1057 P5),
+    /// installed by the render pass from the backend. `None` means no pass has
+    /// installed one yet (a bare fixture/card), which reads as the neutral full
+    /// surface ([`Self::capabilities`]). Every gated surface consults it: plan,
+    /// compaction, footer usage, panel liveness, ledger and the change index.
+    capabilities: Option<AgentCapabilities>,
     /// The Background Task Ledger (ADR-0060): the Session's live Background
     /// Tasks, rebuilt from each transcript read ([`Self::set_ledger_from_read`])
     /// and rendered as a card-TAIL section, so the list rides the newest (live)
@@ -2487,11 +2493,29 @@ impl StreamAccumulator {
         self.context_tokens
     }
 
+    /// The attachment's capability declaration (ADR-0106). `None` until a render
+    /// pass installs it; the read then answers the neutral full surface, which
+    /// is what a bare fixture card means. A real card carries the backend's
+    /// declaration, so an absent plan/compaction/usage surface is omitted.
+    pub(super) fn capabilities(&self) -> AgentCapabilities {
+        self.capabilities.unwrap_or_else(AgentCapabilities::full)
+    }
+
+    /// Install the attachment's declaration for this render. Cheap and
+    /// idempotent: the render loop re-reads it each pass, so a reattach that
+    /// changes the surface is reflected by the next pass.
+    pub(super) fn set_capabilities(&mut self, capabilities: AgentCapabilities) {
+        self.capabilities = Some(capabilities);
+    }
+
     /// Record the context tokens a completed assistant message consumed
     /// (ADR-0044). The caller guards against an all-zero in-flight usage before
-    /// calling.
+    /// calling. A client with no usage surface records nothing, so the footer
+    /// renders no figure.
     pub(super) fn set_context_tokens(&mut self, tokens: i64) {
-        self.context_tokens = tokens;
+        if self.capabilities().usage != crate::backend::UsageMode::None {
+            self.context_tokens = tokens;
+        }
     }
 
     /// The monotonic progress mark (#457). Private to this module: advanced by
@@ -3713,6 +3737,11 @@ impl StreamAccumulator {
     /// used tokens alone when the server reports no window. `None` until the
     /// first usage lands — a step that has not finished has no token data.
     pub(super) fn context_segment(&self) -> Option<String> {
+        // A client with no usage axis renders no footer figure at all (ADR-0106):
+        // absent means omitted, never a guessed or zero value.
+        if self.capabilities().usage == crate::backend::UsageMode::None {
+            return None;
+        }
         let (used, window) = self.context_sig();
         if used <= 0 {
             return None;

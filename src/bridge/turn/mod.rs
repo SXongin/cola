@@ -148,6 +148,11 @@ pub(super) async fn terminal_change_index(
     disposition: &Disposition,
     anchor: Option<&TurnAnchor>,
 ) -> Option<TurnDiffStats> {
+    // The change index and its button are a diff surface (ADR-0106): a client
+    // with no turn-diff read renders neither, and spends no read.
+    if !backend.capabilities().diffs {
+        return None;
+    }
     if !disposition.card_state().is_some_and(|state| state.is_terminal()) {
         return None;
     }
@@ -528,6 +533,7 @@ impl Turn {
         // on a missing id, and the first flush after the id lands serves it.
         let started_at = std::time::Instant::now();
         let mut acc = StreamAccumulator::new(&subtitle);
+        acc.set_capabilities(handles.backend.capabilities());
         // The durable announcement seed is NOT read here: it happens inside the
         // install below, in one cards-map critical section with the insert
         // (issue #671, ticket #672). See `install_fresh_session`.

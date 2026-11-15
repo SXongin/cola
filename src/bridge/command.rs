@@ -278,6 +278,16 @@ pub(crate) const STOPPED_WAITING: &str = "⏹ 已停止等待；后台任务结�
 /// (ADR-0082), so the ack says where to look instead of promising a chat reply.
 const COMPACTING: &str = "已提交压缩，完成后会显示在卡片上。";
 
+/// `/agent` on a client with no agent-selection surface (ADR-0106): the
+/// command reports the capability as unsupported instead of posting an empty
+/// picker. `/compact` has its own sentence at its arm.
+fn agent_unavailable(handles: &CommandHandles) -> String {
+    format!(
+        "当前 Agent Client（{}）不提供 Agent 选择，`/agent` 不可用。",
+        handles.flow.backend.client_name()
+    )
+}
+
 /// What `/switch` should do (ADR-0012). The text-direct forms all share the
 /// session store; the no-arg form pops the interactive card.
 #[derive(Debug, Clone, PartialEq)]
@@ -2088,6 +2098,20 @@ pub(crate) async fn handle_command(
             }
         }
         Command::Compact => {
+            if !handles.flow.backend.capabilities().compaction {
+                handles
+                    .flow
+                    .platform
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "当前 Agent Client（{}）不提供上下文压缩，`/compact` 不可用。",
+                            handles.flow.backend.client_name()
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            }
             if let Some(id) = handles.flow.sessions.get_session_id(&thread_key).await {
                 handles.flow.backend.compact(&id).await?;
                 handles.flow.platform.reply_text(message_id, COMPACTING).await?;
@@ -2162,9 +2186,25 @@ pub(crate) async fn handle_command(
             post_idle_card(handles, &session_id, message_id, !is_child).await?;
         }
         Command::AgentCard => {
+            if !handles.flow.backend.capabilities().modes {
+                handles
+                    .flow
+                    .platform
+                    .reply_text(message_id, &agent_unavailable(handles))
+                    .await?;
+                return Ok(());
+            }
             crate::feishu::card::command::send_agent_card(handles, &thread_key, message_id).await?;
         }
         Command::Agent(name) => {
+            if !handles.flow.backend.capabilities().modes {
+                handles
+                    .flow
+                    .platform
+                    .reply_text(message_id, &agent_unavailable(handles))
+                    .await?;
+                return Ok(());
+            }
             // `/agent` records the per-session override and — on a generation
             // whose selection is durable (V2) — switches the session's agent,
             // so the next turn uses it with nothing re-sent (the server honors
