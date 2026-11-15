@@ -2052,6 +2052,7 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
         "/tmp/ext",
         None,
         Some(ExternalCardLead::UserMessage("👤 新消息")),
+        crate::backend::AgentCapabilities::full(),
     )
     .await;
     {
@@ -3537,6 +3538,7 @@ async fn external_adopted_follow_yields_and_observes_until_the_true_end() {
         "/tmp/ext",
         None,
         None,
+        crate::backend::AgentCapabilities::full(),
     )
     .await;
     app.external
@@ -3784,6 +3786,7 @@ async fn external_undecided_settlement_survives_the_idle_bound() {
         "/tmp/ext",
         None,
         None,
+        crate::backend::AgentCapabilities::full(),
     )
     .await;
     app.external
@@ -3852,6 +3855,7 @@ async fn external_undecided_settlement_survives_failed_reads() {
         "/tmp/ext",
         None,
         None,
+        crate::backend::AgentCapabilities::full(),
     )
     .await;
     app.external
@@ -3929,6 +3933,7 @@ async fn external_undecided_settlement_survives_timed_out_reads() {
         "/tmp/ext",
         None,
         None,
+        crate::backend::AgentCapabilities::full(),
     )
     .await;
     app.external

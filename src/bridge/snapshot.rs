@@ -723,6 +723,32 @@ mod tests {
         assert_eq!(line, "已接管「标题」", "a timed-out gather omits the status");
     }
 
+    /// ADR-0106: a `questions: None` client's Session Card carries no pending
+    /// question even when the session-backed request would pass the card's
+    /// `session_id` filter — the capability short-circuit is the gate.
+    #[tokio::test]
+    async fn a_question_none_client_gets_no_pending_question_on_the_session_card() {
+        let mut backend = typed_backend(vec![
+            user("msg_u1", 1_000, &["看一下"]),
+            assistant("msg_a1", 2_000, &["好"]),
+        ]);
+        backend.capabilities.questions = crate::backend::QuestionMode::None;
+        backend.ask_question(crate::backend::types::QuestionRequest {
+            id: "q_none".into(),
+            session_id: "ses_adopted".into(),
+            ..Default::default()
+        });
+        let data = gather_from_typed_backend(backend).await;
+        assert!(
+            data.pending.iter().all(|request| request.id() != "q_none"),
+            "a client with no question axis embeds no pending question: {:?}",
+            data.pending
+                .iter()
+                .map(|request| request.id())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// ADR-0106: a client with no compaction axis gets no Compaction marker on
     /// its Session Card either — the live card and `/card` read one fact.
     #[tokio::test]

@@ -463,9 +463,18 @@ impl Turn {
         session_dir: &str,
         variant: Option<String>,
         lead: Option<ExternalCardLead<'_>>,
+        capabilities: crate::backend::AgentCapabilities,
     ) {
-        let prepared =
-            Self::prepare_external_render(session_id, anchor, subtitle, session_dir, variant, lead).await;
+        let prepared = Self::prepare_external_render(
+            session_id,
+            anchor,
+            subtitle,
+            session_dir,
+            variant,
+            lead,
+            capabilities,
+        )
+        .await;
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         Self::commit_external_render_locked(cards, session_id, card_id, prepared, false).await;
@@ -484,8 +493,13 @@ impl Turn {
         session_dir: &str,
         variant: Option<String>,
         lead: Option<ExternalCardLead<'_>>,
+        capabilities: crate::backend::AgentCapabilities,
     ) -> PreparedExternalRender {
         let mut acc = state::StreamAccumulator::new(subtitle);
+        // The attachment's declaration must be on the accumulator BEFORE the
+        // first card is built: this render can post its initial card before any
+        // render pass installs one (the busy-follow's external accumulator).
+        acc.set_capabilities(capabilities);
         // The external message's anchor — identity plus server time — is the
         // turn's anchor: header date, turn filter and renderer replacement
         // guard all read it, and cola's clock is never part of the card
@@ -863,6 +877,7 @@ impl Turn {
         session_id: &str,
         anchor: &TurnAnchor,
         facts: ContinuationFacts<'_>,
+        capabilities: crate::backend::AgentCapabilities,
     ) -> Option<serde_json::Value> {
         let work_context = StreamAccumulator::capture_work_context(facts.directory).await;
         let mut live = cards.cards.lock().await;
@@ -895,6 +910,10 @@ impl Turn {
             return None;
         }
         let mut acc = StreamAccumulator::new(facts.subtitle);
+        // Seed BEFORE the initial send: this probe builds the card that is
+        // posted right after the insert, and no render pass has run yet to
+        // install the declaration.
+        acc.set_capabilities(capabilities);
         // The durable seed and the insert below share this one cards-map
         // critical section already: no await separates them (issue #671,
         // ticket #672).

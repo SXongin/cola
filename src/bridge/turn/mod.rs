@@ -5016,6 +5016,22 @@ impl Turn {
             .map(|c| c.acc.card_state().clone())
     }
 
+    /// The stored card's installed capability declaration (ADR-0106): a test
+    /// seam proving an arming path seeded the attachment before building its
+    /// first card, so no surface is briefly rendered on a guess.
+    #[cfg(test)]
+    pub(crate) async fn card_capabilities(
+        cards: &CardsHandle,
+        session_id: &str,
+    ) -> Option<crate::backend::AgentCapabilities> {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .map(|card| card.acc.capabilities())
+    }
+
     /// Whether the card's fallback reached the suspended state (the fenced
     /// retry was refused too): the flush's terminal mark, so a test can pin
     /// that a refused write leaves the card exactly as the suspension rules

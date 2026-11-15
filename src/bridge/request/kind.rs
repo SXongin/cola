@@ -1893,8 +1893,9 @@ impl RequestKind for QuestionKind {
         // The question surface is a capability (ADR-0106): a client with no
         // question axis lists nothing (no card, no inline block), and a client
         // with session-only questions drops directory-owned Location Forms
-        // before they can surface. One `QuestionMode::accepts` rule serves this
-        // listing and the Session Card.
+        // before they can surface. `QuestionMode::accepts` is the one rule this
+        // poll listing and `/mcp`'s form rows share; the Session Card relies on
+        // its own `session_id` filter instead.
         let mode = backend.capabilities().questions;
         if mode.is_absent() {
             return Ok(Vec::new());

@@ -658,6 +658,7 @@ impl ExternalFlow {
             &session_dir,
             variant,
             lead,
+            handles.backend.capabilities(),
         )
         .await;
         tracing::info!("external reply render armed for session {}", session_id);
@@ -800,8 +801,16 @@ impl ExternalFlow {
         // Build the accumulator OFF the card map (ADR-0100): the work-context
         // read happens here, before any write lock. The static lead joins it
         // later, under the lock, once the seed count is final.
-        let prepared =
-            Turn::prepare_external_render(&data.session_id, &anchor, "", &session_dir, variant, None).await;
+        let prepared = Turn::prepare_external_render(
+            &data.session_id,
+            &anchor,
+            "",
+            &session_dir,
+            variant,
+            None,
+            handles.backend.capabilities(),
+        )
+        .await;
         // One bounded read for the surfaces' receipt anchor (issue #1023) —
         // only when this follow will actually seed a request block; the follow
         // streams parts later, but the block's cut must be captured now.
@@ -1247,6 +1256,7 @@ impl ExternalFlow {
                         directory,
                         variant,
                     },
+                    handles.backend.capabilities(),
                 )
                 .await
                 else {
