@@ -2969,11 +2969,17 @@ async fn live_turn_tool_panel_open_keeps_the_viewer_after_the_turn_flushes() {
         &cards,
         "ses_seed",
         "call_write",
-        crate::feishu::card::tool_render::ToolPanel::for_test(
+        crate::feishu::card::tool_render::ToolPanel::for_test_file_edits(
             "write",
             crate::backend::ToolStatus::Running,
             Some(serde_json::json!({"filePath": "report.md", "content": "written"})),
             Some("written"),
+            vec![crate::backend::FileEdit {
+                path: "report.md".into(),
+                action: crate::backend::FileAction::Add,
+                rename_to: None,
+                diff: None,
+            }],
         ),
     )
     .await;

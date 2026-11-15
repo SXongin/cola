@@ -1094,3 +1094,162 @@ fn a_settled_non_zero_exit_renders_the_failure_icon_from_the_wire() {
     ));
     assert!(!ok.contains("❌"), "an exit 0 is not a failure: {ok}");
 }
+
+/// P3 regression: a decoded V2 `websearch` carries its result envelope as text
+/// blocks (its `output.raw` is the content array). It must render through the
+/// neutral Search renderer — count, Markdown list, excerpts dropped — not as
+/// opaque pretty-printed JSON.
+#[test]
+fn a_decoded_v2_websearch_renders_its_markdown_results() {
+    let results = json!({
+        "search_id": "search_1",
+        "results": [{
+            "url": "https://a.example/one",
+            "title": "First result",
+            "publish_date": "2026-01-02",
+            "excerpts": ["an excerpt that must not appear"],
+        }],
+    })
+    .to_string();
+    let call = v2_tool(
+        "websearch",
+        json!({"query": "rust lifetimes"}),
+        Value::Null,
+        Some(&results),
+    );
+    let card = render_card(call);
+    assert!(card.contains("🔎 1 条结果"), "the result count: {card}");
+    assert!(
+        card.contains("[First result](https://a.example/one)"),
+        "the Markdown list: {card}"
+    );
+    assert!(!card.contains("```json"), "not opaque JSON: {card}");
+    assert!(!card.contains("excerpt"), "excerpts dropped: {card}");
+}
+
+/// V1's `write` records no patch: the adapter synthesizes the Add hunk from the
+/// input's content, so both generations render one `➕ 新增` panel.
+#[test]
+fn a_v1_write_synthesizes_its_add_hunk() {
+    let call = v1_tool(
+        "write",
+        json!({"filePath": "src/a.rs", "content": "one\ntwo"}),
+        Value::Null,
+        None,
+        Some("Wrote file successfully."),
+    );
+    assert_eq!(
+        call.detail,
+        ToolDetail::FileEdits(vec![FileEdit {
+            path: "src/a.rs".to_string(),
+            action: FileAction::Add,
+            rename_to: None,
+            diff: Some("@@ -0,0 +1,2 @@\n+one\n+two".to_string()),
+        }])
+    );
+    let card = render_card(call);
+    assert!(card.contains("➕ 新增 `src/a.rs`"), "the action: {card}");
+    assert!(card.contains("+2 −0"), "the totals: {card}");
+    assert!(card.contains("+one"), "the synthesized hunk: {card}");
+}
+
+/// A path-less V1 patch still names its file, action and hunks from the raw
+/// diff's headers: `/dev/null` is an add/delete side, two names a rename.
+#[test]
+fn a_v1_patch_metadata_recovers_its_action_from_the_diff_headers() {
+    let cases = [
+        (
+            "--- /dev/null\n+++ b/a.rs\n@@ -0,0 +1 @@\n+new",
+            FileAction::Add,
+            "a.rs",
+            None,
+        ),
+        (
+            "--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone",
+            FileAction::Delete,
+            "old.rs",
+            None,
+        ),
+        (
+            "--- a/old.rs\n+++ b/new.rs\n@@ -1 +1 @@\n-old\n+new",
+            FileAction::Rename,
+            "old.rs",
+            Some("new.rs"),
+        ),
+    ];
+    for (diff, action, path, rename_to) in cases {
+        assert_eq!(
+            v1(
+                "apply_patch",
+                json!({"patchText": "*** Begin Patch"}),
+                json!({"diff": diff})
+            ),
+            (
+                ToolKind::Edit,
+                ToolDetail::FileEdits(vec![FileEdit {
+                    path: path.to_string(),
+                    action,
+                    rename_to: rename_to.map(str::to_string),
+                    diff: crate::backend::file_edit_hunks(diff),
+                }])
+            ),
+            "{diff}"
+        );
+    }
+}
+
+/// A patch text with headers but no hunks does not suppress the metadata's
+/// applied diff; its action/rename still wins.
+#[test]
+fn patch_text_actions_merge_with_metadata_hunks() {
+    let metadata = json!({"files": [{
+        "file": "/a/one.rs",
+        "patch": "@@ -1 +1 @@\n-old\n+new",
+        "status": "modified"
+    }]});
+    assert_eq!(
+        v2(
+            "patch",
+            json!({"patchText": "*** Begin Patch\n*** Update File: /a/one.rs\n*** Move to: /a/two.rs\n*** End Patch"}),
+            metadata.clone()
+        ),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "/a/one.rs".to_string(),
+                action: FileAction::Rename,
+                rename_to: Some("/a/two.rs".to_string()),
+                diff: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+            }])
+        )
+    );
+}
+
+/// A patch that updates one file twice is one edit: the hunks merge in order,
+/// so the card's count, totals and open button see one file (#793).
+#[test]
+fn a_repeated_patch_header_merges_into_one_file() {
+    let patch = "\
+*** Begin Patch
+*** Update File: a.rs
+@@
+-a
++b
+*** Update File: a.rs
+@@
+-c
++d
+*** End Patch";
+    assert_eq!(
+        v2("patch", json!({"patchText": patch}), Value::Null),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "a.rs".to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: Some("@@\n-a\n+b\n@@\n-c\n+d".to_string()),
+            }])
+        )
+    );
+}
