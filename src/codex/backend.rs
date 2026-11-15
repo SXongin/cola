@@ -2318,7 +2318,14 @@ fn thread_evidence(thread: &Thread) -> ChildEvidence {
     let Some(completed_at) = turn.get("completedAt").and_then(Value::as_i64) else {
         return ChildEvidence::Unfinished;
     };
-    ChildEvidence::Terminal { completed_at }
+    // Codex's persisted `turn` wire times are epoch SECONDS (`startedAt` /
+    // `completedAt`; `ThreadProjection::seed_turn` converts them the same way),
+    // while the neutral run and item clocks are epoch milliseconds. Convert at
+    // this boundary: a raw seconds value would look like a previous turn and
+    // the stale-evidence guard would refuse to retire the run.
+    ChildEvidence::Terminal {
+        completed_at: completed_at.saturating_mul(1000),
+    }
 }
 
 fn not_attached() -> BridgeError {
