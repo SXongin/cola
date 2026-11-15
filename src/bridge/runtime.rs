@@ -373,24 +373,18 @@ pub(crate) async fn reconcile_now(
                     None => {}
                 }
             }
-            // The child-only runs (spec #1057's P4): a client with no runtime
-            // verdict registry (Codex) still reports a child thread, and its
-            // terminal item is the evidence — so a child that ends with no
-            // Wake retires its row and settles the yielded Turn. A run already
-            // represented by a Background Task was handled above and is not
-            // read twice.
+            // The runs (spec #1057's P4): a child thread's own terminal item is
+            // the evidence, so a child that ends with no Wake retires its row
+            // and settles the yielded Turn. A run already represented by a
+            // Background Task was handled above and is not read twice.
             //
-            // Only a client WITHOUT the runtime's child verdicts takes this
-            // path. Where the registry answers, a foreground run's child is
-            // read by the evidence path above only after the runtime reports
-            // it inactive; reading every live run here would pre-empt that
-            // verdict and could retire a child on a previous turn's terminal
-            // item.
-            for (run_id, child_id) in transcript
-                .run_evidence_suspects()
-                .into_iter()
-                .filter(|_| !backend.background_tasks_supported())
-            {
+            // The gate is the ADR-0106 live-runs predicate this whole pass
+            // already checked (`reports_live_runs = background_runs ||
+            // child_evidence`), not a second, narrower capability: a client
+            // that claims background runs but has no runtime child verdicts
+            // still reads its children here, and the pass itself is the only
+            // thing that can decide whether reading them is meaningful.
+            for (run_id, child_id) in transcript.run_evidence_suspects() {
                 match budget
                     .read("run child evidence read", backend.child_evidence(&child_id))
                     .await
@@ -640,6 +634,68 @@ mod tests {
         );
 
         let _ = handle.await;
+    }
+
+    /// Review finding 5: the run-evidence step gates on the ADR-0106 live-runs
+    /// predicate (already checked by the pass), not on the narrower Background
+    /// Task surface — a client that reports background runs AND has no runtime
+    /// child verdicts still reads its runs' children.
+    #[tokio::test]
+    async fn a_background_client_still_reads_its_run_children() {
+        let mock = MockBackend::new(Vec::new());
+        // Deliberately the default: `background_tasks_supported()` is true.
+        mock.with_child_evidence(
+            "thread_child",
+            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+        )
+        .await;
+        let mock = Arc::new(mock);
+        let reads = Arc::clone(&mock.child_evidence_calls);
+        let backend: Arc<dyn Backend> = mock;
+
+        let launch = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "task".into(),
+                call_id: "call_task".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_1"),
+            role: crate::backend::MessageRole::Assistant,
+            time: None,
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(launch)],
+        }]);
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+        )
+        .await;
+        assert!(pass.is_some(), "the pass applied a verdict");
+        assert_eq!(
+            reads.lock().await.as_slice(),
+            ["thread_child".to_string()],
+            "the run's child is read even though the runtime registry exists"
+        );
+        assert!(transcript.runs.is_empty());
+        assert_eq!(
+            transcript.task_retirements[0].ending,
+            crate::backend::TaskRetirementEnding::ChildEnded
+        );
     }
 
     /// Spec #860, ticket #880: a client that declares no Background Task

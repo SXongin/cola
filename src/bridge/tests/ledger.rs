@@ -2385,7 +2385,7 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
                 name: "codex/sub_agent_activity".into(),
                 call_id: "call_activity".into(),
             },
-            status: ToolStatus::Completed,
+            status: ToolStatus::Running,
             started_at: Some(2_100),
             input: Some(serde_json::json!({
                 "kind": "started",
@@ -2474,6 +2474,185 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
         .await
         .unwrap();
     assert!(later.runs.is_empty(), "the retirement overlay prunes the run");
+}
+
+/// Spec #1057's P4, review finding 1: ONE launch naming two children mints a
+/// distinct durable key per run, so A's ending is A's: one record and one
+/// completion entry, B stays live and keeps the Turn yielding, and A's
+/// retirement never prunes B. Review finding 10 rides along — the entry names
+/// the run's own label, not a re-join through the launch payload.
+#[tokio::test]
+async fn a_multi_launch_retires_each_child_on_its_own_ending() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let launch = || {
+        let mut spawn = ToolCall {
+            identity: ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: "call_spawn".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(2_000),
+            input: Some(serde_json::json!({
+                "tool": "spawnAgent",
+                "receiverThreadIds": ["thread_a", "thread_b"],
+                "label": "review the two halves"
+            })),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: ["thread_a", "thread_b"]
+                    .iter()
+                    .map(|id| crate::backend::AgentRunRef { run_id: (*id).into() })
+                    .collect(),
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        };
+        spawn.output = ToolOutput::default();
+        spawn
+    };
+    let report = |call_id: &str, child: &str| TranscriptMessage {
+        id: MessageId::new(format!("msg_activity_{call_id}")),
+        role: MessageRole::Assistant,
+        time: Some(crate::backend::MessageTime {
+            created: 2_100,
+            completed: Some(2_100),
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(2_100),
+            input: Some(serde_json::json!({
+                "kind": "started",
+                "agentThreadId": child
+            })),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..ToolCall::default()
+        })],
+    };
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "审阅这两半"),
+        assistant(1_500, "交给两个子 Agent 了。"),
+        TranscriptMessage {
+            id: MessageId::new("msg_launch"),
+            role: MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: 2_000,
+                completed: Some(2_000),
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Tool(launch())],
+        },
+        report("call_a", "thread_a"),
+        report("call_b", "thread_b"),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    assert_eq!(waiting.runs.len(), 2);
+    assert_ne!(
+        waiting.runs[0].ending_key(),
+        waiting.runs[1].ending_key(),
+        "two children never share one durable key"
+    );
+
+    let (_dir, app, backend, platform) = scripted_app_prepared(
+        vec![waiting],
+        Some(SessionStatus::Idle),
+        |_| {},
+        |backend| {
+            backend.with_child_only_runs();
+        },
+    )
+    .await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "审阅这两半"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting)
+    );
+    let yielded = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&yielded).contains("⏳ 后台任务（2）"),
+        "both children are live runs: {yielded}"
+    );
+
+    // A's child thread ended; B's is still in progress.
+    backend
+        .with_child_evidence(
+            "thread_a",
+            ChildEvidence::Terminal {
+                completed_at: now - 1_000,
+            },
+        )
+        .await;
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "A's entry with B still live",
+        CardUpdates::Latest,
+        |card| {
+            card_header(card).contains("⏳")
+                && card_text(card).contains("🔔 subagent 结束：review the two halves")
+        },
+    )
+    .await;
+
+    let mid = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&mid).contains("⏳ 后台任务（1）"),
+        "B keeps its row while A's entry renders: {mid}"
+    );
+    assert_eq!(
+        card_text(&mid).matches("🔔 subagent 结束").count(),
+        1,
+        "exactly one completion entry for two children: {mid}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "B is still live, so the Turn keeps yielding"
+    );
+    let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .runs
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<Vec<_>>(),
+        ["thread_b"],
+        "A's ending prunes A, never B"
+    );
+
+    // B's own terminal item settles the Turn.
+    backend
+        .with_child_evidence(
+            "thread_b",
+            ChildEvidence::Terminal {
+                completed_at: now - 500,
+            },
+        )
+        .await;
+    wait_for_card_update(&platform, "the settled card", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+    })
+    .await;
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done)
+    );
 }
 
 /// Spec #588 / #591: a child session the server no longer knows (404) is
