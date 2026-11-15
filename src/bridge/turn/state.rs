@@ -501,6 +501,8 @@ fn hash_slice_content(
                 TaskEnding::RuntimeEnded => 1u8.hash(hasher),
                 TaskEnding::Lost => 2u8.hash(hasher),
                 TaskEnding::Cleaned => 3u8.hash(hasher),
+                TaskEnding::ClientFailed => 4u8.hash(hasher),
+                TaskEnding::ClientCancelled => 5u8.hash(hasher),
             }
             ending.is_some().hash(hasher);
         }

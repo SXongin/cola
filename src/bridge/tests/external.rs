@@ -70,16 +70,6 @@ fn live_subagent_reply(created: i64, child: &str) -> TranscriptMessage {
     subagent_reply(created, child, ToolStatus::Running)
 }
 
-/// [`live_subagent_reply`]'s settled shape — the panel the turn ends with.
-fn settled_subagent_reply(created: i64, child: &str, text: &str) -> TranscriptMessage {
-    let mut message = subagent_reply(created, child, ToolStatus::Completed);
-    message.parts.push(text_part(text));
-    message.parts.push(Part::StepFinish(StepFinish {
-        reason: FinishReason::Stop,
-    }));
-    message
-}
-
 fn subagent_reply(created: i64, child: &str, status: ToolStatus) -> TranscriptMessage {
     typed_message(
         "msg_ext_assist",
@@ -1817,7 +1807,12 @@ async fn external_reply_render_renews_on_child_liveness() {
     let mut parents: Vec<SessionTranscript> = (0..100).map(|_| live_parent()).collect();
     parents.push(SessionTranscript::new(vec![
         user("msg_ext_user", 2_000_000, "OpenChamber 里发的消息"),
-        settled_subagent_reply(2_050_000, "ses_child", "父回合的最后输出。"),
+        typed_message(
+            "msg_ext_assist",
+            MessageRole::Assistant,
+            Some(2_050_000),
+            vec![text_part("父回合的最后输出。")],
+        ),
     ]));
     mock.given_transcript("ses_ext", parents);
     // The child's transcript advances on every liveness read.

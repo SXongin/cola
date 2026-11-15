@@ -418,6 +418,7 @@ impl SessionTranscript {
         else {
             return false;
         };
+        let client_status = self.runs[index].status;
         let (ending, finished_at) = match evidence {
             ChildEvidence::Terminal { completed_at } => {
                 if self.runs[index]
@@ -435,7 +436,12 @@ impl SessionTranscript {
                     );
                     return false;
                 }
-                (TaskRetirementEnding::ChildEnded, Some(completed_at))
+                let ending = match client_status {
+                    RunStatus::Failed => TaskRetirementEnding::ClientFailed,
+                    RunStatus::Cancelled => TaskRetirementEnding::ClientCancelled,
+                    _ => TaskRetirementEnding::ChildEnded,
+                };
+                (ending, Some(completed_at))
             }
             ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
             // No evidence: the run stays exactly as the client stated it.
@@ -717,13 +723,23 @@ impl SessionTranscript {
         // run with no child id still counts — it is a run with an exit owed,
         // not an empty identity.
         //
+        // A CLIENT-TERMINAL run is not the true end either: its own status is
+        // not the durable ending. The child evidence read (or a Cleanup) still
+        // owes the entry, so a run that names a child keeps the Turn waiting
+        // even after the client reports Failed/Cancelled. A terminal run with no
+        // child id has no read left and cannot block.
+        //
         // A live LAUNCH does not exempt it: a Codex `spawnAgent` call stays
         // `Running` while its child runs (the adapter states the targets'
         // states), and the whole point is that the Turn yields instead of
         // stamping ✅ over a live child. The card's live tool panel is not a
         // stuck panel in that case — the drain yields on the waiting decision
         // (see the two settle loops).
-        if self.runs.iter().any(AgentRun::is_live) {
+        if self
+            .runs
+            .iter()
+            .any(|run| run.is_live() || run.child_id.is_some())
+        {
             return TurnSettle::Waiting;
         }
         TurnSettle::Complete
@@ -1516,6 +1532,13 @@ pub enum TaskRetirementEnding {
     /// stamp) ends the task without a Wake. Only a subagent carries it; the
     /// ledger renders it as the runtime's own 结束 ending.
     ChildEnded,
+    /// The child session's terminal evidence ended a run the client itself
+    /// had already reported `Failed`: the entry keeps the client's own 失败
+    /// word rather than the runtime's generic 结束.
+    ClientFailed,
+    /// The child session's terminal evidence ended a run the client itself
+    /// had already reported `Cancelled`: the entry keeps 已取消.
+    ClientCancelled,
     /// The user's cleanup click retired the task (spec #588, ticket #590):
     /// never produced by a read, only by
     /// [`SessionTranscript::apply_cleanup`], and recorded in the process-local
@@ -2910,6 +2933,74 @@ mod tests {
 
         let v1 = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)]);
         assert_eq!(v1.settle(Some(&anchor)), TurnSettle::Complete);
+    }
+
+    /// A client-terminal run is not the true end: the child evidence (or a
+    /// Cleanup) still owes its entry, so the Turn keeps waiting until the read
+    /// concludes. The ending then carries the client's own word.
+    #[test]
+    fn a_client_terminal_run_waits_for_its_child_evidence() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let run = |status| AgentRun {
+            run_id: "thread_child".into(),
+            task_run_id: Some("thread_child".into()),
+            child_id: Some("thread_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(1_000),
+            status,
+            activity: None,
+            observed_at: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        };
+        let mut failed = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)]);
+        failed.runs = vec![run(RunStatus::Failed)];
+        assert_eq!(
+            failed.settle(Some(&anchor)),
+            TurnSettle::Waiting,
+            "a client-terminal run still owes its evidence"
+        );
+        assert!(!failed.apply_run_child_evidence("thread_child", ChildEvidence::Unfinished));
+        assert_eq!(
+            failed.settle(Some(&anchor)),
+            TurnSettle::Waiting,
+            "Unfinished evidence is no exit"
+        );
+        assert!(
+            failed.apply_run_child_evidence("thread_child", ChildEvidence::Terminal { completed_at: 1_500 })
+        );
+        assert_eq!(
+            failed.task_retirements[0].ending,
+            TaskRetirementEnding::ClientFailed
+        );
+        assert_eq!(failed.settle(Some(&anchor)), TurnSettle::Complete);
+
+        let mut cancelled = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)]);
+        cancelled.runs = vec![run(RunStatus::Cancelled)];
+        assert!(
+            cancelled
+                .apply_run_child_evidence("thread_child", ChildEvidence::Terminal { completed_at: 1_500 })
+        );
+        assert_eq!(
+            cancelled.task_retirements[0].ending,
+            TaskRetirementEnding::ClientCancelled
+        );
+
+        let mut runtime_end = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)]);
+        runtime_end.runs = vec![run(RunStatus::Running)];
+        assert!(
+            runtime_end
+                .apply_run_child_evidence("thread_child", ChildEvidence::Terminal { completed_at: 1_500 })
+        );
+        assert_eq!(
+            runtime_end.task_retirements[0].ending,
+            TaskRetirementEnding::ChildEnded
+        );
     }
 
     /// A live Background Task turns the idle ending into Waiting; a settled
