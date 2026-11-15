@@ -4472,7 +4472,10 @@ async fn a_retired_launch_panel_does_not_stuck_panel_the_settle() {
     let mut read = wedged_launch_transcript();
     assert!(read.apply_run_child_evidence(
         "ses_child",
-        crate::backend::ChildEvidence::Terminal { completed_at: 3_000 }
+        crate::backend::ChildEvidence::Terminal {
+            completed_at: 3_000,
+            started_at: None
+        }
     ));
     assert!(read.runs.is_empty(), "the child evidence retires the run");
 

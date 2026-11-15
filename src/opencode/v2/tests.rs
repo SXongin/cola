@@ -1143,7 +1143,10 @@ async fn child_evidence_reads_one_page_newest_assistant_first() {
     let evidence = client.child_evidence("ses_child").await.unwrap();
     assert_eq!(
         evidence,
-        ChildEvidence::Terminal { completed_at: 2_500 },
+        ChildEvidence::Terminal {
+            completed_at: 2_500,
+            started_at: None
+        },
         "a terminal finish with its completion stamp is the evidence"
     );
 

@@ -312,13 +312,6 @@ impl SessionTranscript {
         // touched, and no other arm can turn it into an ending. A single
         // `Unfinished => Lost` catch-all (or a guard whose arm disagrees with
         // it) is how a healthy, unread child would be recorded lost.
-        let (ending, finished_at) = match evidence {
-            ChildEvidence::Terminal { completed_at } => {
-                (TaskRetirementEnding::ChildEnded, Some(completed_at))
-            }
-            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
-            ChildEvidence::Unfinished => return,
-        };
         let Some(index) = self
             .background_tasks
             .iter()
@@ -326,7 +319,30 @@ impl SessionTranscript {
         else {
             return;
         };
+        let started_at = self.background_tasks[index].started_at;
+        let (ending, finished_at) = match evidence {
+            ChildEvidence::Terminal {
+                completed_at,
+                started_at: turn_started_at,
+            } => {
+                let turn_start = turn_started_at.unwrap_or(completed_at);
+                if started_at.is_some_and(|started| turn_start < started) {
+                    // A previous turn's terminal item: the task stays live.
+                    return;
+                }
+                (TaskRetirementEnding::ChildEnded, Some(completed_at))
+            }
+            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
+            ChildEvidence::Unfinished => return,
+        };
         let task = self.background_tasks.remove(index);
+        // One run, one ending: the run this task represents leaves with it, so
+        // the run-evidence loop cannot read the same child again and append a
+        // second retirement under its own key.
+        if let Some(child) = task.child_id.as_deref() {
+            self.runs
+                .retain(|run| run.run_id != child && run.child_id.as_deref() != Some(child));
+        }
         self.unconfirmed_tasks.remove(call_id);
         self.task_retirements.push(TaskRetirement {
             task,
@@ -418,12 +434,24 @@ impl SessionTranscript {
         else {
             return false;
         };
+        // A task path may already have retired this child this pass: never mint
+        // a second ending for one run.
+        if self.task_retirements.iter().any(|retirement| {
+            retirement.task.child_id.is_some() && retirement.task.child_id == self.runs[index].child_id
+        }) {
+            self.runs.remove(index);
+            return false;
+        }
         let client_status = self.runs[index].status;
         let (ending, finished_at) = match evidence {
-            ChildEvidence::Terminal { completed_at } => {
+            ChildEvidence::Terminal {
+                completed_at,
+                started_at,
+            } => {
+                let turn_start = started_at.unwrap_or(completed_at);
                 if self.runs[index]
                     .started_at
-                    .is_some_and(|started| completed_at < started)
+                    .is_some_and(|started| turn_start < started)
                 {
                     // A previous turn's terminal item, not this run's. Record
                     // the rejection so a persistently stale suspect is
@@ -431,6 +459,7 @@ impl SessionTranscript {
                     tracing::debug!(
                         run = %self.runs[index].run_id,
                         completed_at,
+                        turn_start,
                         started_at = self.runs[index].started_at,
                         "child evidence predates the run's start; keeping the run live"
                     );
@@ -1489,8 +1518,15 @@ impl TaskRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildEvidence {
     /// The newest assistant message finished its run with a terminal step
-    /// finish and the server's completion stamp: the retirement's clock.
-    Terminal { completed_at: i64 },
+    /// finish and the server's completion stamp. `started_at` is the turn's own
+    /// start when the producer reports one (Codex's persisted turn does): the
+    /// stale guard uses it to tell this run's turn from a previous turn that
+    /// merely completed after the run's start. `None` falls back to
+    /// `completed_at`.
+    Terminal {
+        completed_at: i64,
+        started_at: Option<i64>,
+    },
     /// The child session does not exist at the attached server (a 404 read):
     /// the run cannot still be hosted there. The retirement is identity-only,
     /// like a shell the runtime has no record of.
@@ -2969,9 +3005,13 @@ mod tests {
             TurnSettle::Waiting,
             "Unfinished evidence is no exit"
         );
-        assert!(
-            failed.apply_run_child_evidence("thread_child", ChildEvidence::Terminal { completed_at: 1_500 })
-        );
+        assert!(failed.apply_run_child_evidence(
+            "thread_child",
+            ChildEvidence::Terminal {
+                completed_at: 1_500,
+                started_at: None
+            }
+        ));
         assert_eq!(
             failed.task_retirements[0].ending,
             TaskRetirementEnding::ClientFailed
@@ -2981,10 +3021,13 @@ mod tests {
         let mut cancelled = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)]);
         cancelled.runs = vec![run(RunStatus::Cancelled)];
-        assert!(
-            cancelled
-                .apply_run_child_evidence("thread_child", ChildEvidence::Terminal { completed_at: 1_500 })
-        );
+        assert!(cancelled.apply_run_child_evidence(
+            "thread_child",
+            ChildEvidence::Terminal {
+                completed_at: 1_500,
+                started_at: None
+            }
+        ));
         assert_eq!(
             cancelled.task_retirements[0].ending,
             TaskRetirementEnding::ClientCancelled
@@ -2993,10 +3036,13 @@ mod tests {
         let mut runtime_end = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)]);
         runtime_end.runs = vec![run(RunStatus::Running)];
-        assert!(
-            runtime_end
-                .apply_run_child_evidence("thread_child", ChildEvidence::Terminal { completed_at: 1_500 })
-        );
+        assert!(runtime_end.apply_run_child_evidence(
+            "thread_child",
+            ChildEvidence::Terminal {
+                completed_at: 1_500,
+                started_at: None
+            }
+        ));
         assert_eq!(
             runtime_end.task_retirements[0].ending,
             TaskRetirementEnding::ChildEnded
@@ -3232,7 +3278,13 @@ mod tests {
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![child_task("call_sub", "ses_child")]);
         terminal.unconfirmed_tasks.insert("call_sub".into());
-        terminal.apply_child_evidence("call_sub", ChildEvidence::Terminal { completed_at: 2_000 });
+        terminal.apply_child_evidence(
+            "call_sub",
+            ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None,
+            },
+        );
         assert!(
             terminal.background_tasks.is_empty(),
             "a terminal child leaves the live list"
@@ -3291,7 +3343,13 @@ mod tests {
         assert_eq!(unfinished.settle(Some(&anchor)), TurnSettle::Waiting);
 
         // An id with no live task invents no retirement.
-        unfinished.apply_child_evidence("call_absent", ChildEvidence::Terminal { completed_at: 3_000 });
+        unfinished.apply_child_evidence(
+            "call_absent",
+            ChildEvidence::Terminal {
+                completed_at: 3_000,
+                started_at: None,
+            },
+        );
         assert_eq!(unfinished.background_tasks.len(), 1);
         assert!(unfinished.task_retirements.is_empty());
     }
