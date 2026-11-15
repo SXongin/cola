@@ -10,7 +10,7 @@ use super::sanitize::CardMarkdown;
 use super::tool_render::{
     TodoPanel, ToolPanel, file_image_elements, todo_panel_element, tool_display_name, tool_panel_element,
 };
-use super::vocab::phase_token;
+use super::vocab::{self, phase_token};
 use super::{
     CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
 };
@@ -530,7 +530,7 @@ pub(crate) fn header_title_and_template(
         // The Turn's Execution ended but its Background Tasks are still live
         // (ADR-0059): the card yields, grey like the other non-working ends —
         // it is not ✅ and not a terminal. The next Wake continues the chain.
-        CardState::Waiting => ("⏳ 等待后台任务".to_string(), "grey"),
+        CardState::Waiting => (vocab::WAITING_BACKGROUND_CHIP.to_string(), "grey"),
         // A yielded card resumed IN PLACE by a shell/subagent completion Wake
         // (ADR-0066): the resumed run works on, so the card says so — blue like
         // the other working states — and keeps the live phase timer (below),
@@ -1525,7 +1525,7 @@ mod tests {
             (CardState::Error, "❌ 出错"),
             (CardState::Done, "✅ 完成"),
             (CardState::Stopped, "⏹ 已停止"),
-            (CardState::Waiting, "⏳ 等待后台任务"),
+            (CardState::Waiting, vocab::WAITING_BACKGROUND_CHIP),
             (CardState::Unreceived, "⚠️ 这条消息未被接收"),
             (CardState::Superseded, "⏳ 部分完成 · 已由新消息接管"),
             (CardState::SwitchedAway, "⏳ 已切换会话 · 后台任务仍在运行"),

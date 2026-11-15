@@ -8646,20 +8646,20 @@ Index: /x/src/main.rs
         acc.set_card_state(CardState::Done);
         // A near-maximal todo panel: one item whose CJK content fills the
         // reserve's 3000-char output window (~9KB).
-        let output = serde_json::json!([{
+        let todos = serde_json::json!([{
             "content": "很长的任务描述".repeat(500),
             "status": "pending",
-        }])
-        .to_string();
-        acc.set_todo_panel(
-            crate::feishu::card::tool_render::ToolPanel::for_test(
-                "todowrite",
-                ToolStatus::Completed,
-                None,
-                Some(&output),
-            ),
-            None,
+        }]);
+        // The adapter's real plan shape: `Other` + `None` + `todowrite`, which
+        // is what makes this the plan reserve rather than an ordinary panel.
+        let Part::Tool(call) = todowrite("call_todo", 0, todos) else {
+            unreachable!("the helper builds a tool part")
+        };
+        assert!(
+            crate::feishu::card::tool_render::is_plan_call(&call),
+            "the fixture must exercise the plan surface"
         );
+        acc.set_todo_panel(crate::feishu::card::tool_render::ToolPanel::new(call), None);
         // Two max-size CJK text chunks (~18KB each): the first alone plus the
         // reserve is over the budget, so only the progress guarantee keeps the
         // chain moving.
@@ -8672,7 +8672,8 @@ Index: /x/src/main.rs
             let (card, full) = acc.build_card_with_split();
             let text = card.to_string();
             assert!(
-                text.contains("回答。") || text.contains("todowrite"),
+                text.contains("回答。")
+                    || text.contains(&format!("📋 {}", crate::feishu::card::vocab::TOOL_PLAN)),
                 "an empty card was built at render_from={before}: {text}"
             );
             cards += 1;
@@ -8684,8 +8685,9 @@ Index: /x/src/main.rs
         }
         let last = acc.build_card();
         assert!(
-            last.to_string().contains("todowrite"),
-            "the panel must ride the final card: {last}"
+            last.to_string()
+                .contains(&format!("📋 {}", crate::feishu::card::vocab::TOOL_PLAN)),
+            "the plan panel must ride the final card: {last}"
         );
     }
 
