@@ -4160,6 +4160,82 @@ mod tests {
         assert_eq!(runs[0].status, Some(RunStatus::Cancelled));
     }
 
+    /// A named receiver with no state row is not terminal: a launch stays live
+    /// until every named target reports a terminal state.
+    #[test]
+    fn a_named_receiver_with_no_state_row_keeps_the_launch_live() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-collab-missing",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": "thread-1",
+                        "receiverThreadIds": ["thread-a", "thread-b"],
+                        "prompt": null,
+                        "model": null,
+                        "reasoningEffort": null,
+                        "agentsStates": {"thread-a": {"status": "completed"}}
+                    }
+                }
+            })],
+        );
+        let call = projected_tool(&projection, "item-collab-missing");
+        assert_eq!(
+            call.status,
+            ToolStatus::Running,
+            "thread-b has no row yet, so the launch is still live"
+        );
+        let ToolDetail::Delegation { runs, .. } = &call.detail else {
+            panic!("a collaboration call is a delegation");
+        };
+        assert_eq!(runs[0].status, Some(RunStatus::Completed));
+        assert_eq!(runs[1].status, None, "the missing row has no per-run status");
+
+        // Once every named target is terminal, the launch completes.
+        let mut projection = ThreadProjection::new("thread-2");
+        replay(
+            &mut projection,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-2",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-collab-done",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": "thread-2",
+                        "receiverThreadIds": ["thread-a", "thread-b"],
+                        "prompt": null,
+                        "model": null,
+                        "reasoningEffort": null,
+                        "agentsStates": {
+                            "thread-a": {"status": "completed"},
+                            "thread-b": {"status": "shutdown"}
+                        }
+                    }
+                }
+            })],
+        );
+        let call = projected_tool(&projection, "item-collab-done");
+        assert_eq!(
+            call.status,
+            ToolStatus::Completed,
+            "every named target is terminal"
+        );
+    }
+
     /// The row order is the wire's receiver order first, then any extra state,
     /// sorted by id — never a hash order, so replaying the same item yields an
     /// identical `ToolCall` and the card is not repainted for nothing.
