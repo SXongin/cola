@@ -322,12 +322,13 @@ impl SessionTranscript {
             .collect()
     }
 
-    /// The runs a child-evidence read must cover: a live run, or a run a
-    /// `subAgentActivity` report already declared terminal. The report is the
-    /// client's statement, never the durable ending: its live ROW leaves the
-    /// ledger immediately (the client says it ended), and the child read still
-    /// has to supply the `结束` entry and the ADR-0080 record — otherwise the
-    /// row would disappear with neither.
+    /// The runs that still owe a child-evidence read, in read order: every run
+    /// still in this read with a child id, unless a Background Task already
+    /// represents it (the task's own runtime `child_evidence` path owns that
+    /// row). The status is deliberately not a filter: a run the client declared
+    /// terminal through a launch/ref status, or through a report, still has no
+    /// durable ending until its child's own item is read — skipping it would
+    /// drop the row with no entry and no ADR-0080 record.
     ///
     /// Each entry is `(ending key, child id)`: the ending key is the run's
     /// `task_run_id` when minted (ADR-0080), which is what a recorded ending
@@ -337,7 +338,6 @@ impl SessionTranscript {
     pub fn run_evidence_suspects(&self) -> Vec<(String, String)> {
         self.runs
             .iter()
-            .filter(|run| run.is_live() || !run.reported_by.is_empty())
             .filter_map(|run| {
                 let child = run.child_id.as_deref()?;
                 let task = self
