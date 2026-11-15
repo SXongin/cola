@@ -369,6 +369,16 @@ async fn panel_liveness_follows_the_child_agent_axis() {
             .any(|id| id == "ses_call_sub"),
         "no child-agent axis means no child read"
     );
+    // The launch's ledger row is still there — only its liveness fragment is
+    // gated, not the run's existence.
+    assert!(
+        card_text(&card).contains("后台任务（1）"),
+        "the ledger row still renders under the plain panel: {card}"
+    );
+    assert!(
+        card_text(&card).contains("subagent"),
+        "the row names its run kind: {card}"
+    );
     // The ledger row still renders (the client reports live runs through child
     // evidence), but carries no activity fragment: the child's running `bash`
     // never reaches the card.
@@ -441,8 +451,46 @@ async fn ledger_follows_reports_live_runs() {
     );
 }
 
+/// The Session Card (`/card`) reads the same two axes: a `Session`-only
+/// client's static read carries no Location Form, and a client without
+/// compaction carries no Compaction marker.
+#[tokio::test]
+async fn the_session_card_omits_location_forms_and_compaction_when_absent() {
+    let transcript = crate::backend::SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "做点活"),
+        compaction_message("msg_cmp", 1_500, "压缩摘要"),
+        assistant(2_000, "答案。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app_prepared(
+        vec![transcript],
+        Some(SessionStatus::Idle),
+        |_| {},
+        |backend| {
+            backend.capabilities.questions = crate::backend::QuestionMode::Session;
+            backend.capabilities.compaction = false;
+            backend.ask_question(location_question("frm_card"));
+        },
+    )
+    .await;
+    send_command(&app, "/card", "msg_card").await;
+    let cards = posted_cards(&platform).await;
+    let card = cards.last().expect("the Session Card is posted");
+    let text = card_text(card);
+    assert!(
+        !text.contains("选个目录"),
+        "a session-only client's /card carries no Location Form: {text}"
+    );
+    assert!(
+        !text.contains("压缩摘要"),
+        "a client without compaction's /card carries no marker: {text}"
+    );
+}
+
 /// A client that claims `background_runs` but reports no launch renders no
-/// ledger rows — the honest empty answer, never an invented task.
+/// ledger rows — the honest empty answer, never an invented task — and logs the
+/// unsubstantiated claim once (ADR-0106's diagnosable failure). The empty read
+/// is the only reachable shape of that claim: the transcript carries neither a
+/// Background Task nor a run, so there is no launch fact to draw from.
 #[tokio::test]
 async fn a_claimed_background_surface_without_launches_renders_no_ledger_rows() {
     let transcript = crate::backend::SessionTranscript::new(vec![
@@ -461,9 +509,25 @@ async fn a_claimed_background_surface_without_launches_renders_no_ledger_rows() 
         },
     )
     .await;
-    Turn::run(&app.turn_handles(), ctx("ses_test", "做点活"))
-        .await
-        .unwrap();
+    // The claim's only reachable shape is an empty read: the transcript names
+    // no Background Task and no run, so there is no launch to render. Pin the
+    // one-shot diagnostic the gate now emits (pre-change there was none) and
+    // the honest empty card.
+    let ((), logs) = capture_logs(async {
+        Turn::run(&app.turn_handles(), ctx("ses_test", "做点活"))
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(
+        level_count(
+            &logs,
+            "claims background runs but this read names no launch",
+            "DEBUG"
+        ),
+        1,
+        "the unsubstantiated claim is logged exactly once, not per render:\n{logs}"
+    );
     let card = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
         !card_text(&card).contains("后台任务"),

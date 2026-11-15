@@ -1327,10 +1327,13 @@ pub(super) struct StreamAccumulator {
     /// the card tail render.
     todo_shown_at: Option<i64>,
     /// The attachment's capability declaration (ADR-0106, spec #1057 P5),
-    /// installed by the render pass from the backend. `None` means no pass has
-    /// installed one yet (a bare fixture/card), which reads as the neutral full
-    /// surface ([`Self::capabilities`]). Every gated surface consults it: plan,
-    /// compaction, footer usage, panel liveness, ledger and the change index.
+    /// installed by the render pass from the backend. `None` means no render
+    /// path has installed one yet — a bare `Default` fixture only; `new` seeds
+    /// the neutral full surface and every production path overrides it with the
+    /// backend's declaration. A `None` read logs the miss once rather than
+    /// silently rendering every surface (the opposite of "absent means
+    /// omitted"). Every gated surface consults it: plan, compaction, footer
+    /// usage, panel liveness, ledger and the change index.
     capabilities: Option<AgentCapabilities>,
     /// The Background Task Ledger (ADR-0060): the Session's live Background
     /// Tasks, rebuilt from each transcript read ([`Self::set_ledger_from_read`])
@@ -1356,6 +1359,11 @@ pub(super) struct StreamAccumulator {
     /// current, and a failure never renders a placeholder. Pruned to the live
     /// shells on every read, like [`Self::ledger_activity`].
     ledger_outputs: HashMap<String, crate::backend::ShellOutputWindow>,
+    /// Whether the one diagnostic for a `background_runs` claim that this read
+    /// cannot substantiate has been logged (ADR-0106). The gate is `true`, but
+    /// the read names no task and no run, so the ledger has nothing to show;
+    /// the line is emitted once per card, never per render.
+    ledger_claim_logged: bool,
     /// The addressing/reporting calls already rendered as one-line receipts
     /// (ADR-0106 §4, spec #1057's P4), keyed by call id. A receipt stands in
     /// for a Tool Panel, so it needs a panel's dedupe: the same call seen
@@ -1791,6 +1799,10 @@ impl StreamAccumulator {
             // timer counts from here (ADR-0014).
             current_phase: Some(HeaderPhase::Loading),
             phase_started_at: Some(std::time::Instant::now()),
+            // A fixture/the pre-attachment card renders the neutral full
+            // surface; every production path replaces this with the backend's
+            // declaration before it renders.
+            capabilities: Some(AgentCapabilities::full()),
             ..Default::default()
         }
     }
@@ -2493,12 +2505,25 @@ impl StreamAccumulator {
         self.context_tokens
     }
 
-    /// The attachment's capability declaration (ADR-0106). `None` until a render
-    /// pass installs it; the read then answers the neutral full surface, which
-    /// is what a bare fixture card means. A real card carries the backend's
-    /// declaration, so an absent plan/compaction/usage surface is omitted.
+    /// The attachment's capability declaration (ADR-0106). Invariant: every
+    /// production card is seeded before any render — `Turn::start`, the Wake's
+    /// projected card and each render loop install the backend's value, and
+    /// [`Self::new`] seeds the neutral full surface for fixtures. A `None` here
+    /// is a programming miss (a `Default` accumulator), so it is logged once
+    /// rather than silently rendering every surface.
     pub(super) fn capabilities(&self) -> AgentCapabilities {
-        self.capabilities.unwrap_or_else(AgentCapabilities::full)
+        match self.capabilities {
+            Some(capabilities) => capabilities,
+            None => {
+                static MISS_LOGGED: std::sync::Once = std::sync::Once::new();
+                MISS_LOGGED.call_once(|| {
+                    tracing::warn!(
+                        "card accumulator has no capability declaration; rendering the neutral full surface"
+                    );
+                });
+                AgentCapabilities::full()
+            }
+        }
     }
 
     /// Install the attachment's declaration for this render. Cheap and
@@ -4414,8 +4439,29 @@ impl StreamAccumulator {
         now_ms: i64,
         cadence: LedgerCadence,
     ) -> LedgerChange {
+        self.note_empty_ledger_claim(transcript);
         let rows = self.ledger_rows(transcript, activities);
         self.set_ledger_change(rows, now_ms, cadence)
+    }
+
+    /// One diagnostic for a capability claim the read cannot substantiate
+    /// (ADR-0106's Consequences): the client declares `background_runs`, but
+    /// this read carries no Background Task and no run, so the ledger renders
+    /// no rows. That is a clean, diagnosable failure — logged once per card,
+    /// never per render and never turned into an invented row.
+    fn note_empty_ledger_claim(&mut self, transcript: &SessionTranscript) {
+        if self.ledger_claim_logged || !self.capabilities().background_runs {
+            return;
+        }
+        if !transcript.background_tasks.is_empty() || !transcript.runs.is_empty() {
+            return;
+        }
+        self.ledger_claim_logged = true;
+        tracing::debug!(
+            background_tasks = transcript.background_tasks.len(),
+            runs = transcript.runs.len(),
+            "ledger: client claims background runs but this read names no launch; rendering no rows"
+        );
     }
 
     /// Replace the live Background Task ledger from an already-derived read

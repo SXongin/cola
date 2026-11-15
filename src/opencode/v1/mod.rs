@@ -109,7 +109,10 @@ impl GenerationStrategy for V1Strategy {
     ///   the child as its own session, whose transcript the panel can read.
     /// - `child_evidence = false`: V1 has no child-evidence read (`Unfinished`
     ///   without a request), so a run could outlive its exit — `reports_live_runs`
-    ///   stays false and the ledger never opens.
+    ///   stays false and the ledger never opens. **V1's ledger waits for this
+    ///   read**: ADR-0106's Consequences and spec #1057's P4 defer it, even
+    ///   though ticket #1062's acceptance listing names V1 beside Codex; there
+    ///   is no live-run surface to show until the evidence read lands.
     /// - `plan = TodoTool`: `todowrite` replaces the card-tail list.
     /// - `compaction = true`: a `compaction` part plus its paired summary
     ///   message (ADR-0082).

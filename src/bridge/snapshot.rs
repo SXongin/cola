@@ -84,20 +84,19 @@ pub(crate) async fn gather_snapshot(
         }
     };
     let question_mode = backend.capabilities().questions;
-    let questions: Vec<_> = match question_mode {
-        crate::backend::QuestionMode::None => Vec::new(),
-        mode => match backend.list_questions(Some(directory)).await {
+    let questions: Vec<_> = if question_mode.is_absent() {
+        Vec::new()
+    } else {
+        match backend.list_questions(Some(directory)).await {
             Ok(questions) => questions
                 .into_iter()
-                .filter(|question| {
-                    mode == crate::backend::QuestionMode::SessionAndLocation || !question.is_location()
-                })
+                .filter(|question| question_mode.accepts(question))
                 .collect(),
             Err(e) => {
                 tracing::warn!("snapshot: list questions for {} failed: {}", session_id, e);
                 Vec::new()
             }
-        },
+        }
     };
     // Only the adopted session's own requests belong on the snapshot — never a
     // sibling session's in the same directory, and never a sub-task child's
@@ -263,8 +262,8 @@ mod tests {
         TailMessage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
     };
     use crate::bridge::test_support::{
-        MockBackend, background_shell, execution, list_session, realistic_parts, test_config, test_work_dir,
-        text_part, typed_message,
+        MockBackend, background_shell, compaction_message, execution, list_session, realistic_parts,
+        test_config, test_work_dir, text_part, typed_message,
     };
 
     fn user(id: &str, created: i64, texts: &[&str]) -> TranscriptMessage {
@@ -720,5 +719,75 @@ mod tests {
 
         let line = adoption_line(&handles, "接管", &list_session("ses_test", "标题", "/work", 1)).await;
         assert_eq!(line, "已接管「标题」", "a timed-out gather omits the status");
+    }
+
+    /// ADR-0106: a `Session`-only client's `/card` read drops the
+    /// directory-owned Location Form at the same `QuestionMode::accepts` rule
+    /// the poll listing uses — no Location Form surface survives on either
+    /// path.
+    #[tokio::test]
+    async fn a_session_only_client_drops_location_forms_from_the_read() {
+        let mut backend = typed_backend(vec![
+            user("msg_u1", 1_000, &["看一下"]),
+            assistant("msg_a1", 2_000, &["好"]),
+        ]);
+        backend.capabilities.questions = crate::backend::QuestionMode::Session;
+        backend.ask_questions(vec![
+            crate::backend::types::QuestionRequest {
+                id: "q_session".into(),
+                session_id: "ses_adopted".into(),
+                ..Default::default()
+            },
+            crate::backend::types::QuestionRequest::location(
+                "frm_location",
+                "目录".into(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            ),
+        ]);
+        let data = gather_from_typed_backend(backend).await;
+        let ids: Vec<&str> = data.pending.iter().map(|request| request.id()).collect();
+        assert!(
+            ids.contains(&"q_session"),
+            "the session-backed question rides the card: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"frm_location"),
+            "a session-only client never embeds a Location Form: {ids:?}"
+        );
+    }
+
+    /// ADR-0106: a client with no compaction axis gets no Compaction marker on
+    /// its Session Card either — the live card and `/card` read one fact.
+    #[tokio::test]
+    async fn a_client_without_compaction_gets_no_session_card_marker() {
+        fn tail_messages() -> Vec<TranscriptMessage> {
+            vec![
+                user("msg_u1", 1_000, &["做点活"]),
+                compaction_message("msg_cmp", 1_500, "压缩摘要"),
+                assistant("msg_a1", 2_000, &["答案"]),
+            ]
+        }
+        fn has_compaction(data: &SnapshotData) -> bool {
+            data.tail
+                .iter()
+                .any(|entry| matches!(entry, crate::backend::TailEntry::Compaction(_)))
+        }
+
+        let full = gather_from_typed_backend(typed_backend(tail_messages())).await;
+        assert!(
+            has_compaction(&full),
+            "the full-capability control keeps its Session Card marker"
+        );
+
+        let mut backend = typed_backend(tail_messages());
+        backend.capabilities.compaction = false;
+        let absent = gather_from_typed_backend(backend).await;
+        assert!(
+            !has_compaction(&absent),
+            "a client without compaction renders no Session Card marker"
+        );
     }
 }
