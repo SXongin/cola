@@ -4208,6 +4208,53 @@ async fn the_wake_initial_send_carries_the_attachments_capability_declaration() 
     );
 }
 
+/// The Wake's render probe judges "is there anything new" through the
+/// attachment's axes (ADR-0106): a Compaction row is not new content for a
+/// client that declares compaction absent, so it must not arm a Fresh card that
+/// then renders nothing. The full-capability control proves the fixture really
+/// carries that one row.
+#[tokio::test]
+async fn the_wake_render_probe_consults_the_attachment_axes() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let cards = app.cards_handle();
+    // The compaction sits BEFORE the Wake's anchor, so it can only reach the
+    // probe through the session-scoped compaction walk — the path the
+    // declaration gates.
+    let transcript = SessionTranscript::new(vec![
+        compaction_message("msg_cmp", 1_000, "压缩摘要"),
+        user("msg_u", 2_000, "做点活"),
+    ])
+    .with_wakes(vec![shell_wake(3_000)]);
+    let anchor = turn_anchor(2_000);
+
+    let full = Turn::wake_continuation(
+        &cards,
+        "ses_test",
+        &transcript,
+        &anchor,
+        crate::backend::AgentCapabilities::full(),
+    )
+    .await;
+    assert!(
+        matches!(full, Some(crate::bridge::turn::WakeContinuation::Fresh { .. })),
+        "the full-capability control sees the compaction as new content"
+    );
+
+    let without_compaction = crate::backend::AgentCapabilities {
+        compaction: false,
+        ..crate::backend::AgentCapabilities::full()
+    };
+    assert!(
+        Turn::wake_continuation(&cards, "ses_test", &transcript, &anchor, without_compaction)
+            .await
+            .is_none(),
+        "a client with no compaction surface has no new content, so no Wake card arms"
+    );
+}
+
 /// A Wake's Fresh arm must not replace a terminal card that still carries a
 /// live Permission/Question: the takeover would collect the old card and strip
 /// the only answerable controls (ADR-0100).
