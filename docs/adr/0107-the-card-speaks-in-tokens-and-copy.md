@@ -1,5 +1,11 @@
 # The card speaks in tokens and copy
 
+> **Amended (#1057)**: §2's derivation table names only `Edit` + `FileEdits`,
+> but the implementation gives a `Delete` or `Move` kind carrying `FileEdits`
+> the same `write`/`edit` word, because ACP's kinds are the adapter's
+> declaration and the FileEdits renderer admits those shapes. The table below
+> is unchanged.
+
 > **Evidence**: `docs/research/feishu-cards/r1-surface-model.md` §2.1, §2.2.
 > **Relates to**: ADR-0105 (the semantic fields these words name) and ADR-0106
 > (which surfaces appear at all).
