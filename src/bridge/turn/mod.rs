@@ -3934,10 +3934,12 @@ impl Turn {
         session_id: &str,
         card_message_id: &str,
         reply_to: &str,
+        capabilities: crate::backend::AgentCapabilities,
     ) -> bool {
         let mut acc = state::StreamAccumulator::new("");
         acc.set_session(session_id);
         acc.set_reply_target(Some(reply_to.to_string()));
+        acc.set_capabilities(capabilities);
         acc.mark_idle_read();
         let session = state::CardSession::new(acc, Some(card_message_id.to_string()));
         let mut live = cards.cards.lock().await;

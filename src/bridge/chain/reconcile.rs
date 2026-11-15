@@ -2582,7 +2582,14 @@ mod tests {
         // compare-and-swap and is covered by `card_pull`'s race test.
         Turn::set_card_state(&handles.cards, "ses_test", CardState::Done).await;
         assert!(
-            Turn::record_idle_card(&handles.cards, "ses_test", "om_idle", "msg_card").await,
+            Turn::record_idle_card(
+                &handles.cards,
+                "ses_test",
+                "om_idle",
+                "msg_card",
+                handles.backend.capabilities()
+            )
+            .await,
             "the terminal chain card is replaced by the read"
         );
         // The record's card still owes its terminal PATCH: stage one in the

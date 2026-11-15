@@ -1531,7 +1531,14 @@ async fn post_idle_card(
     // `record_idle_card` refuses a running card, and the read then stays a
     // plain message marked superseded — never the Session's card, never a host
     // for a later flush.
-    let recorded = crate::bridge::turn::Turn::record_idle_card(cards, session_id, &sent, message_id).await;
+    let recorded = crate::bridge::turn::Turn::record_idle_card(
+        cards,
+        session_id,
+        &sent,
+        message_id,
+        handles.flow.backend.capabilities(),
+    )
+    .await;
     drop(guard);
     if recorded {
         untracked.disarm();

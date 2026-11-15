@@ -185,7 +185,7 @@ async fn subtask_permission_whose_host_goes_idle_before_insert_surfaces_standalo
     // holds the resolved host. The next sweep decision must see the dead card.
     Turn::set_card_state(&cards, &parent, crate::feishu::card::CardState::Done).await;
     assert!(
-        Turn::record_idle_card(&cards, &parent, "om_idle", "msg_1").await,
+        Turn::record_idle_card(&cards, &parent, "om_idle", "msg_1", app.client.capabilities(),).await,
         "the finished card is replaced by the Idle read"
     );
     drop(host_guard);
