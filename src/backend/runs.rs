@@ -60,20 +60,32 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
                     let run = resolve_or_create(&mut runs, run_id, call, receiver_status);
                     push_relation(&mut run.launched_by, call);
                     // A resumed task names the same child: the run it resolves
-                    // gains a launch, never a second record.
+                    // gains a launch, never a second record. The resume also
+                    // moves the run's start when its clock is newer, so a
+                    // pre-resume completion is stale evidence (the stale guard
+                    // compares against this start).
                     if run.child_id.is_none() {
                         run.child_id = Some(run_id.to_string());
                     }
+                    if let Some(at) = call.started_at
+                        && run.started_at.is_none_or(|start| at > start)
+                    {
+                        run.started_at = Some(at);
+                    }
                     // The launch call is the client's statement about the run
-                    // it created or resumed: a foreground `task` settles only
-                    // when its child ends, so its own status is the child's.
-                    // A multi-child launch may state each receiver's state
-                    // separately; that declaration wins. A client whose launch
-                    // is only a handle states the child's later state through a
-                    // report, and a report is the newer statement — it is never
-                    // overridden here.
-                    if run.reported_by.is_empty() {
+                    // it created or resumed: a resume is the newest statement
+                    // when its clock is at or after the newest observation, so
+                    // it makes the run live again. A multi-child launch may
+                    // state each receiver's state separately; that declaration
+                    // wins. A report newer than the launch is not overridden.
+                    let launch_is_newest = call
+                        .started_at
+                        .is_none_or(|at| run.observed_at.is_none_or(|seen| at >= seen));
+                    if launch_is_newest {
                         run.status = receiver_status.unwrap_or_else(|| status_of(call));
+                        if let Some(at) = call.started_at {
+                            run.observed_at = Some(at);
+                        }
                     }
                 }
             }
@@ -764,6 +776,46 @@ mod tests {
             Some("ses_child"),
             "the key is minted once"
         );
+    }
+
+    /// A resume is the newest client statement: it moves the run's start and
+    /// makes it live again, so a completion before the resume is stale evidence
+    /// and cannot retire the freshly resumed run.
+    #[test]
+    fn a_resumed_launch_refreshes_the_run_and_rejects_pre_resume_evidence() {
+        let mut completed = report("call_activity", "ses_child", "completed");
+        completed.started_at = Some(4);
+        let mut read = transcript(vec![
+            call(
+                "call_1",
+                DelegationEffect::Launch,
+                &["ses_child"],
+                ToolStatus::Running,
+                Some(1),
+            ),
+            completed,
+            call(
+                "call_2",
+                DelegationEffect::Launch,
+                &["ses_child"],
+                ToolStatus::Running,
+                Some(5),
+            ),
+        ]);
+        let run = &read.runs[0];
+        assert_eq!(run.started_at, Some(5), "the resume moves the run's start");
+        assert_eq!(
+            run.status,
+            RunStatus::Running,
+            "the resume is the newest client statement"
+        );
+        assert!(run.is_live());
+
+        assert!(
+            !read.apply_run_child_evidence("ses_child", ChildEvidence::Terminal { completed_at: 4 }),
+            "a pre-resume completion is older than the resumed start"
+        );
+        assert_eq!(read.runs.len(), 1, "the resumed run stays live");
     }
 
     /// A report is an observation applied by its state: the same call's start
