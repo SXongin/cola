@@ -215,8 +215,11 @@ async fn a_turn_started_on_another_connection_renders_on_the_feishu_card() {
         card_text(card).contains("The fix")
     })
     .await;
-    wait_for_card_update(&platform, "the settled turn", CardUpdates::Latest, |card| {
-        card_header(card).contains("完成")
+    // The recorded turn ends with a live collaboration run (a `started`
+    // activity and no terminal child), so the card YIELDS rather than
+    // completing: one run still owes an exit (spec #1057's P4).
+    wait_for_card_update(&platform, "the yielded turn", CardUpdates::Latest, |card| {
+        card_header(card).contains("⏳") && card_text(card).contains("The fix")
     })
     .await;
 
@@ -225,7 +228,7 @@ async fn a_turn_started_on_another_connection_renders_on_the_feishu_card() {
         .await
         .last()
         .cloned()
-        .expect("the notification card's settled update");
+        .expect("the notification card's yielded update");
     let text = card_text(&card);
     assert!(
         text.contains("Fix the build"),
@@ -1291,12 +1294,24 @@ async fn a_child_threads_terminal_turn_is_its_evidence() {
         crate::backend::ChildEvidence::Unfinished,
         "a running child is no terminal evidence"
     );
+    // The protocol's own answer for a child thread the server no longer
+    // holds: `-32600 no rollout found for thread id <id>` — matched on code
+    // and message form, never a phrase.
+    server.answer_next_thread_read_no_rollout("thread-child-unknown");
     assert_eq!(
         Backend::child_evidence(&client, "thread-child-unknown")
             .await
-            .expect("a missing thread is evidence, not a read failure"),
+            .expect("the recorded no-rollout answer is evidence, not a read failure"),
         crate::backend::ChildEvidence::Gone,
-        "a child the server no longer knows cannot be hosted there"
+        "a child the server no longer holds cannot be running there"
+    );
+    // A generic server error is a FAILED read, never an ending: the row must
+    // survive it.
+    assert!(
+        Backend::child_evidence(&client, "thread-child-unknown")
+            .await
+            .is_err(),
+        "a mismatched reply is no evidence"
     );
 }
 
