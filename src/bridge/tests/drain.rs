@@ -115,10 +115,28 @@ pub(crate) async fn scripted_app_with(
     Arc<MockBackend>,
     Arc<RecordingPlatform>,
 ) {
+    scripted_app_prepared(scripts, status, configure, |_| {}).await
+}
+
+/// [`scripted_app_with`] whose Backend is adjusted before the App is built —
+/// the capability flags are construction facts, so a test that scripts a
+/// child-only client (spec #1057's P4) must flip them here.
+pub(crate) async fn scripted_app_prepared(
+    scripts: Vec<SessionTranscript>,
+    status: Option<SessionStatus>,
+    configure: impl FnOnce(&mut crate::config::Config),
+    prepare_backend: impl FnOnce(&mut MockBackend),
+) -> (
+    tempfile::TempDir,
+    Arc<App>,
+    Arc<MockBackend>,
+    Arc<RecordingPlatform>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     configure(&mut cfg);
     let mut backend = MockBackend::new(realistic_parts());
+    prepare_backend(&mut backend);
     backend.given_transcript("ses_test", scripts);
     if let Some(status) = status {
         backend.with_session_status("ses_test", Some(status));

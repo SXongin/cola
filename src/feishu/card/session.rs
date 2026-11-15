@@ -610,7 +610,10 @@ fn strip_task_agent_suffix(title: &str, agent: &str) -> Option<String> {
 /// toggle and no ＋新建 footer. `children` is the caller's filtered,
 /// last-activity-sorted list; `statuses` holds the run state read for the rows
 /// on `page` only (one read per rendered row, bounded by the page size), so a
-/// missing or `None` entry omits the label. The card reuses the switch card's
+/// missing or `None` entry omits the label. The row's identity is the child
+/// session/thread id — the **run's `run_id`** (spec #1057's P4: a run's live
+/// identity is its child id when one exists), so this card and the ledger name
+/// one run by one id. The card reuses the switch card's
 /// search box and pager with the same round-trip state (ADR-0052): `keyword`
 /// and the clamped `page` ride every button. `now_ms` is the build-time clock
 /// the relative last-activity stamps count from.

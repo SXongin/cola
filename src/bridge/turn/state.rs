@@ -28,7 +28,7 @@ use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::{CardBuilder, RunningToolView};
 use crate::feishu::card::tool_render::{
-    FileDelivery, TaskLiveness, TodoPanel, ToolPanel, is_task_tool, todo_panel_estimate, tool_display_name,
+    FileDelivery, TaskLiveness, TodoPanel, ToolPanel, todo_panel_estimate, tool_display_name,
 };
 use crate::feishu::card::{AwaitingAction, CardState, format_tokens};
 use indexmap::IndexMap;
@@ -1350,6 +1350,15 @@ pub(super) struct StreamAccumulator {
     /// current, and a failure never renders a placeholder. Pruned to the live
     /// shells on every read, like [`Self::ledger_activity`].
     ledger_outputs: HashMap<String, crate::backend::ShellOutputWindow>,
+    /// The addressing/reporting calls already rendered as one-line receipts
+    /// (ADR-0106 §4, spec #1057's P4), keyed by call id. A receipt stands in
+    /// for a Tool Panel, so it needs a panel's dedupe: the same call seen
+    /// again on a later poll must not append a second line, and a report whose
+    /// state moved is still one call (the run carries the new state). Seeded
+    /// deliveries insert here so a takeover's re-render skips them. Private to
+    /// this module: written by [`Self::push_delegation_receipt`] and
+    /// [`Self::mark_delivered_part`]; read through [`Self::receipt_rendered`].
+    receipt_calls: std::collections::HashSet<String>,
     /// The ledger's render clock ([`Self::set_ledger`]): each row's rendered
     /// numbers — a shell row's elapsed, and any row's activity fragment age, in
     /// whole seconds as of the read that last moved the section (ADR-0060, spec
@@ -3065,6 +3074,36 @@ impl StreamAccumulator {
             .expect("a receipt always owns one entry")
     }
 
+    /// Whether a call already rendered as its one-line receipt. A receipt
+    /// replaces a Tool Panel for an addressing/reporting call (ADR-0106 §4), so
+    /// it needs the panel's dedupe: one call, one line, however many polls
+    /// see it; a report whose state moved is still the one call.
+    pub(super) fn receipt_rendered(&self, call_id: &str) -> bool {
+        self.receipt_calls.contains(call_id)
+    }
+
+    /// Mark one call as delivered without rendering it — the seed path's
+    /// counterpart to [`Self::push_delegation_receipt`], so a takeover does not
+    /// replay a receipt that already sits on the previous card.
+    pub(super) fn mark_receipt_delivered(&mut self, call_id: &str) {
+        self.receipt_calls.insert(call_id.to_string());
+    }
+
+    /// Render an addressing/reporting call as its one-line receipt instead of
+    /// a timeline panel (ADR-0106 §4, spec #1057's P4). The raw call stays in
+    /// the transcript; only its display collapses. Returns whether it rendered
+    /// (false for a call already shown).
+    pub(super) fn push_delegation_receipt(&mut self, call: &crate::backend::ToolCall) -> bool {
+        if !self.receipt_calls.insert(call.identity.call_id.clone()) {
+            return false;
+        }
+        self.push_receipt_at(
+            call.started_at,
+            &crate::feishu::card::tool_render::receipt_line(call),
+        );
+        true
+    }
+
     /// Place the External Message's own text (ADR-0028) on the timeline at
     /// `at_ms` — normally just before the Turn's anchor, so it heads the card.
     /// An empty message renders nothing. A distinct kind, so the reply's text
@@ -4244,7 +4283,9 @@ impl StreamAccumulator {
                 ));
             }
             Part::Tool(call) => {
-                if call.identity.name == "todowrite" {
+                if crate::feishu::card::tool_render::is_receipt_call(call) {
+                    self.mark_receipt_delivered(&call.identity.call_id);
+                } else if call.identity.name == "todowrite" {
                     self.record_todo_call(call);
                 } else {
                     self.tools
@@ -4277,13 +4318,15 @@ impl StreamAccumulator {
         }
     }
 
-    /// The live `task`/`subagent` panels' (call id, child Session id) pairs
-    /// (ADR-0054): the render path reads each child's liveness for them. A
-    /// child-spawning call with no recorded child id contributes nothing.
+    /// The live run panels' (call id, child Session id) pairs (ADR-0054): the
+    /// render path reads each child's liveness for them. The launch relation —
+    /// the call's `Delegation { effect: Launch }` and the child it names —
+    /// replaces the old tool-name check; a panel with no launched child
+    /// contributes nothing.
     pub(super) fn live_task_children(&self) -> Vec<(String, String)> {
         self.tools
             .iter()
-            .filter(|(_, panel)| panel.is_live() && is_task_tool(panel.name()))
+            .filter(|(_, panel)| panel.is_live())
             .filter_map(|(call_id, panel)| {
                 panel
                     .child_session_id()
@@ -4421,77 +4464,99 @@ impl StreamAccumulator {
         transcript: &SessionTranscript,
         activities: &HashMap<String, TaskLiveness>,
     ) -> Vec<TaskLedgerRow> {
-        // The common case (V1, or a session with no live task) does no scan: an
-        // empty read clears an empty ledger — and every cached fragment and
-        // window with it, so a retired task's facts cannot outlive its row.
-        if transcript.background_tasks.is_empty() {
+        // The common case (V1, or a session with no live task or run) does no
+        // scan: an empty read clears an empty ledger — and every cached
+        // fragment and window with it, so a retired task's facts cannot outlive
+        // its row.
+        if transcript.background_tasks.is_empty() && transcript.runs.is_empty() {
             self.ledger_activity.clear();
             self.ledger_outputs.clear();
             return Vec::new();
         }
-        let rows: Vec<TaskLedgerRow> = transcript
-            .background_tasks
-            .iter()
-            .map(|task| {
-                // The kind is derived ONCE per task: the row's type noun, the
-                // label arm and the activity arm below read the same value, so
-                // they cannot disagree.
-                let kind = task_kind(&task.tool.name);
-                let call_id = task.tool.call_id.as_str();
-                let activity = (kind == TaskKind::Subagent)
-                    .then(|| {
-                        activities
-                            .get(call_id)
-                            .or_else(|| self.ledger_activity.get(call_id))
-                            .cloned()
-                    })
-                    .flatten();
-                // The shell's output window (spec #592): the read's own outcome
-                // when it spent one, the last established window when the
-                // shared cycle's throttle spent nothing. An empty capture is a
-                // success the row still omits (spec #588, review) — only the
-                // entry's own read tells it apart from 「输出已不可用」.
-                let output = if kind == TaskKind::Shell {
-                    task.shell_id.as_deref().and_then(|shell_id| {
-                        match transcript.shell_outputs.get(shell_id) {
-                            // The read spent a tail read and found nothing
-                            // renderable: an empty capture or an unavailable
-                            // record. The window is omitted, and any stored one
-                            // leaves with it — never a stale window posing as
-                            // current, never a placeholder.
-                            Some(read) => read.window().cloned(),
-                            // No tail read this cycle (the shared throttle):
-                            // the last established window stands, exactly like
-                            // a subagent's stored activity fragment.
-                            None => self.ledger_outputs.get(shell_id).cloned(),
-                        }
-                    })
-                } else {
-                    None
-                };
-                TaskLedgerRow {
-                    kind,
-                    label: task_label(kind, transcript.tool_input(call_id)),
-                    started_at: task.started_at,
-                    // A task the runtime could not confirm (issue #454): the row
-                    // renders its own facts plus the unconfirmed marker, and stays
-                    // live until its Wake or a positive terminal verdict retires it.
-                    unconfirmed: transcript.unconfirmed_tasks.contains(call_id),
-                    activity,
-                    output,
-                }
-            })
-            .collect();
-        // Keep the cache to the live subagents (a retired task's fragment
-        // leaves with its row) and fold in this read's fresh successes — a
-        // failed child read contributed no entry, so its call keeps its last
-        // successful fragment above.
-        let live_subagents: std::collections::HashSet<&str> = transcript
+        // One run per child is the ledger's subagent row (spec #1057's P4): the
+        // row reads the run's label, start and `activity`, so the liveness line
+        // and the completion entry name the same run. A shell Background Task
+        // is not a child agent and keeps its own row; a subagent Background Task
+        // that has a run is rendered FROM the run, at the task's own position,
+        // so transcript order does not move.
+        let mut rows: Vec<TaskLedgerRow> = Vec::new();
+        let mut activity_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for task in &transcript.background_tasks {
+            let kind = task_kind(&task.tool.name);
+            let call_id = task.tool.call_id.as_str();
+            if kind == TaskKind::Subagent
+                && let Some(run) = transcript.runs.iter().find(|run| {
+                    run.ending_key() == call_id || (task.child_id.is_some() && run.child_id == task.child_id)
+                })
+            {
+                rows.push(self.run_row(transcript, activities, run, &mut activity_keys));
+                continue;
+            }
+            let activity = (kind == TaskKind::Subagent)
+                .then(|| {
+                    activities
+                        .get(call_id)
+                        .or_else(|| self.ledger_activity.get(call_id))
+                        .cloned()
+                })
+                .flatten();
+            // The shell's output window (spec #592): the read's own outcome
+            // when it spent one, the last established window when the
+            // shared cycle's throttle spent nothing. An empty capture is a
+            // success the row still omits (spec #588, review) — only the
+            // entry's own read tells it apart from 「输出已不可用」.
+            let output = if kind == TaskKind::Shell {
+                task.shell_id.as_deref().and_then(|shell_id| {
+                    match transcript.shell_outputs.get(shell_id) {
+                        // The read spent a tail read and found nothing
+                        // renderable: an empty capture or an unavailable
+                        // record. The window is omitted, and any stored one
+                        // leaves with it — never a stale window posing as
+                        // current, never a placeholder.
+                        Some(read) => read.window().cloned(),
+                        // No tail read this cycle (the shared throttle):
+                        // the last established window stands, exactly like
+                        // a subagent's stored activity fragment.
+                        None => self.ledger_outputs.get(shell_id).cloned(),
+                    }
+                })
+            } else {
+                None
+            };
+            if kind == TaskKind::Subagent {
+                activity_keys.insert(call_id.to_string());
+            }
+            rows.push(TaskLedgerRow {
+                kind,
+                label: task_label(kind, transcript.tool_input(call_id)),
+                started_at: task.started_at,
+                // A task the runtime could not confirm (issue #454): the row
+                // renders its own facts plus the unconfirmed marker, and stays
+                // live until its Wake or a positive terminal verdict retires it.
+                unconfirmed: transcript.unconfirmed_tasks.contains(call_id),
+                activity,
+                output,
+            });
+        }
+        // A child-only run has no Background Task to name it (Codex): its own
+        // row follows the Background Tasks, in run order.
+        let represented: Vec<&str> = transcript
             .background_tasks
             .iter()
             .filter(|task| task_kind(&task.tool.name) == TaskKind::Subagent)
-            .map(|task| task.tool.call_id.as_str())
+            .flat_map(|task| std::iter::once(task.tool.call_id.as_str()).chain(task.child_id.as_deref()))
             .collect();
+        for run in transcript.live_runs() {
+            if represented.iter().any(|id| run.ids().any(|own| own == *id)) {
+                continue;
+            }
+            rows.push(self.run_row(transcript, activities, run, &mut activity_keys));
+        }
+        // Keep the cache to the live runs (a retired run's fragment leaves with
+        // its row) and fold in this read's fresh successes — a failed child
+        // read contributed no entry, so its key keeps its last successful
+        // fragment above.
+        let live_subagents = activity_keys;
         self.ledger_activity
             .retain(|call_id, _| live_subagents.contains(call_id.as_str()));
         for (call_id, liveness) in activities {
@@ -4531,6 +4596,39 @@ impl StreamAccumulator {
             }
         }
         rows
+    }
+
+    /// One live run's ledger row (spec #1057's P4): the run's own label, start
+    /// and `activity`. The activity comes from this read's shared gather (keyed
+    /// by the run's id or the launch call id) when it established one, else
+    /// from the last successful gather, else from the activity the run itself
+    /// carries. The row's type word stays `subagent` whatever producer named
+    /// it.
+    fn run_row(
+        &self,
+        transcript: &SessionTranscript,
+        activities: &HashMap<String, TaskLiveness>,
+        run: &crate::backend::AgentRun,
+        activity_keys: &mut std::collections::HashSet<String>,
+    ) -> TaskLedgerRow {
+        let launch = run.launched_by.first().map(|call| call.call_id.as_str());
+        let key = run.run_id.as_str();
+        activity_keys.insert(key.to_string());
+        let activity = activities
+            .get(key)
+            .or_else(|| launch.and_then(|call| activities.get(call)))
+            .or_else(|| self.ledger_activity.get(key))
+            .or_else(|| launch.and_then(|call| self.ledger_activity.get(call)))
+            .cloned()
+            .or_else(|| run.activity.as_ref().map(TaskLiveness::from_run));
+        TaskLedgerRow {
+            kind: TaskKind::Subagent,
+            label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
+            started_at: run.started_at,
+            unconfirmed: run.ids().any(|id| transcript.unconfirmed_tasks.contains(id)),
+            activity,
+            output: None,
+        }
     }
 
     /// Build the whole card (tests + simple callers). Assembles the full

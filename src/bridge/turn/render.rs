@@ -32,7 +32,7 @@ use crate::bridge::turn::timeline::{
 use crate::config::ThreadKey;
 use crate::feishu::card::compaction::same_row;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
-use crate::feishu::card::tool_render::{ChildActivity, FileDelivery, TaskLiveness};
+use crate::feishu::card::tool_render::{FileDelivery, TaskLiveness};
 
 use super::Turn;
 use super::flush::FlushOutcome;
@@ -164,6 +164,12 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
                 && !acc.has_rendered_part(&RenderedPart::Reasoning(reasoning.text.clone()))
         }
         Part::Tool(call) => {
+            // An addressing/reporting call is a one-line receipt on its run,
+            // never a panel (ADR-0106 §4): its dedupe is the receipt set, not
+            // the panel map.
+            if crate::feishu::card::tool_render::is_receipt_call(call) {
+                return !acc.receipt_rendered(&call.identity.call_id);
+            }
             // The current panel IS the call's rendered revision: an update
             // (running → completed, a late output, or a todowrite list
             // rewritten with same-length items) differs from it and
@@ -260,7 +266,9 @@ fn render_part(
             acc.mark_reasoning();
         }
         Part::Tool(call) => {
-            if call.identity.name == "todowrite" {
+            if crate::feishu::card::tool_render::is_receipt_call(call) {
+                acc.push_delegation_receipt(call);
+            } else if call.identity.name == "todowrite" {
                 // A live status section, not a transcript row: the latest call
                 // replaces the panel the card tail renders (on the live card,
                 // so a split can't strand an outdated list). The clock is
@@ -375,7 +383,9 @@ fn render_part_scoped(
             acc.mark_reasoning();
         }
         Part::Tool(call) => {
-            if call.identity.name == "todowrite" {
+            if crate::feishu::card::tool_render::is_receipt_call(call) {
+                acc.push_delegation_receipt(call);
+            } else if call.identity.name == "todowrite" {
                 acc.record_todo_call(call);
             } else {
                 let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
@@ -1673,12 +1683,15 @@ pub(super) fn apply_ledger_read(
     cadence: LedgerCadence,
     endings: Endings<'_>,
     plans: Vec<PlannedEntry>,
-    task_surface: bool,
+    live_runs: bool,
 ) -> LedgerChange {
-    if !task_surface {
-        // No Background Task surface: no ledger rows, no completion entries and
-        // no `⚠️ 状态待确认` marker — the client declared the surface absent, so
-        // the card renders no section rather than an empty one.
+    if !live_runs {
+        // No live-run surface (`reports_live_runs`, ADR-0106): no ledger rows,
+        // no completion entries and no `⚠️ 状态待确认` marker — the client
+        // declared the surface absent, so the card renders no section rather
+        // than an empty one. A child-only client such as Codex answers true
+        // here without a Background Task surface, and its runs get the same
+        // ledger.
         return LedgerChange::default();
     }
     let mut change = acc.set_ledger_from_read(transcript, activities, now_ms, cadence);
@@ -1747,13 +1760,11 @@ pub(super) fn render_new_turn_parts_committing(
     bound: Option<usize>,
     endings: Endings<'_>,
     plans: Vec<PlannedEntry>,
-    task_surface: bool,
+    live_runs: bool,
 ) -> bool {
     let rendered = render_turn_parts(acc, transcript, bound);
     let entries = commit_planned_entries(acc, plans, endings);
-    rendered
-        | refresh_ledger(acc, transcript, &std::collections::HashMap::new(), task_surface).owes()
-        | entries
+    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new(), live_runs).owes() | entries
 }
 
 /// The read's message positions, keyed by message id (spec #1040): the
@@ -2563,7 +2574,10 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                 // receipt, and the call's read position orders it, exactly
                 // like the window walk (issue #1022).
                 if !acc.part_seeded_delivered(source.message_id(), &part) && renders_part(acc, &part) {
-                    if call.identity.name == "todowrite" {
+                    if crate::feishu::card::tool_render::is_receipt_call(call) {
+                        acc.push_delegation_receipt(call);
+                        acc.refresh_phase();
+                    } else if call.identity.name == "todowrite" {
                         acc.record_todo_call(call);
                         acc.refresh_phase();
                     } else {
@@ -2627,11 +2641,11 @@ fn refresh_ledger(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
-    task_surface: bool,
+    live_runs: bool,
 ) -> super::state::LedgerChange {
-    if !task_surface {
-        // The client publishes no Background Task surface: the card carries no
-        // ledger at all (never an empty `⏳ 后台任务（0）`, never a status row).
+    if !live_runs {
+        // The client reports no live runs: the card carries no ledger at all
+        // (never an empty `⏳ 后台任务（0）`, never a status row).
         return super::state::LedgerChange::default();
     }
     if !acc.has_turn_anchor() {
@@ -3058,12 +3072,8 @@ async fn render_and_flush_inner(
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) => {
-                    let ledger = refresh_ledger(
-                        &mut card.acc,
-                        transcript,
-                        &liveness,
-                        backend.background_tasks_supported(),
-                    );
+                    let ledger =
+                        refresh_ledger(&mut card.acc, transcript, &liveness, backend.reports_live_runs());
                     let liveness_changed = apply_task_liveness(&mut card.acc, &panel_children, &liveness);
                     // Only the ROW half is progress: a rendered elapsed/age
                     // crossing its cadence (the clock half) must not renew the
@@ -3110,71 +3120,43 @@ async fn render_and_flush_inner(
     })
 }
 
-/// A child session's liveness as its transcript reports it (ADR-0054): the
-/// timestamp of its newest activity and its newest still-running tool. `None`
-/// when the transcript carries no timestamp at all (a child that just started,
-/// or a payload without times) — no line is better than a made-up age.
+/// A child session's liveness as its transcript reports it (ADR-0054), read
+/// through the run fact (ADR-0105, spec #1057's P4): the neutral
+/// [`crate::backend::RunActivity`] is the one source, and the card's
+/// [`TaskLiveness`] is its view. `None` when the transcript carries no
+/// timestamp at all (a child that just started, or a payload without times) —
+/// no line is better than a made-up age. Test-only: the shared gather reads
+/// the neutral activity directly (so it can attach the waits as a set).
+#[cfg(test)]
 fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
-    let mut newest_ms: Option<i64> = None;
-    let mut observe = |at: Option<i64>| {
-        if let Some(at) = at {
-            newest_ms = Some(newest_ms.map_or(at, |current: i64| current.max(at)));
-        }
-    };
-    // The newest live tool by server start time (an untimed call only wins
-    // when nothing timed is running), and the newest part for the phase when
-    // nothing is live.
-    let mut current: Option<(i64, String, Option<i64>)> = None;
-    let mut newest_part: Option<&Part> = None;
-    for message in &transcript.messages {
-        if let Some(time) = &message.time {
-            observe(Some(time.completed.unwrap_or(time.created)));
-        }
-        for part in &message.parts {
-            newest_part = Some(part);
-            match part {
-                Part::Tool(call) => {
-                    observe(call.started_at);
-                    if call.status.is_live() {
-                        let at = call.started_at.unwrap_or(i64::MIN);
-                        if current.as_ref().is_none_or(|(best, _, _)| at >= *best) {
-                            current = Some((at, call.identity.name.clone(), call.started_at));
-                        }
-                    }
-                }
-                Part::Text(_) | Part::Reasoning(_) => observe(part.started_at()),
-                Part::StepStart(_)
-                | Part::StepFinish(_)
-                | Part::Patch(_)
-                | Part::File(_)
-                | Part::Compaction(_)
-                | Part::Other(_) => {}
-            }
-        }
+    // A child whose own transcript reports a terminal run is not live: its
+    // panel shows the settled result, its ledger row retires on the evidence,
+    // and a liveness line would claim progress that ended.
+    if crate::backend::runs::child_run_status(transcript).is_some_and(|status| {
+        !matches!(
+            status,
+            crate::backend::RunStatus::Running | crate::backend::RunStatus::Unknown
+        )
+    }) {
+        return None;
     }
-    let activity = match current {
-        Some((_, name, started_at)) => ChildActivity::Tool { name, started_at },
-        None => match newest_part {
-            Some(Part::Reasoning(_)) => ChildActivity::Reasoning,
-            Some(Part::Text(_)) => ChildActivity::Replying,
-            _ => ChildActivity::Thinking,
-        },
-    };
-    Some(TaskLiveness {
-        activity,
-        last_activity_ms: newest_ms?,
-        wait: None,
-    })
+    let activity = crate::backend::runs::child_run_activity(transcript)?;
+    Some(TaskLiveness::from_run(&activity))
 }
 
 /// One batched gather of child-session liveness (ADR-0054, spec #501): every
 /// distinct child in `children` costs exactly ONE transcript light read and,
-/// on a successful read, one pending-wait query; every `(call_id, child)` pair
-/// names its child's liveness in the returned map under its own call id (one
-/// child can be driven by several calls, and each renders the same state). A
-/// child whose read fails — or whose transcript carries no timestamp — is
-/// absent from the map, so its caller keeps whatever fragment it last rendered
-/// instead of inventing one; a child named by several pairs is still read once.
+/// on a successful read, one pending-wait query; every `(key, child)` pair
+/// names its child's liveness in the returned map under its own key (one child
+/// can be driven by several calls, and each renders the same state). A child
+/// whose read fails — or whose transcript carries no timestamp — is absent
+/// from the map, so its caller keeps whatever fragment it last rendered
+/// instead of inventing one; a child named by several pairs is still read
+/// once.
+///
+/// The read produces the neutral [`crate::backend::RunActivity`] (the run
+/// fact, spec #1057's P4), with **both** waits as a set; the card's
+/// [`TaskLiveness`] is its view, so the panel and the ledger read one value.
 pub(super) async fn gather_child_liveness(
     backend: &Arc<dyn crate::backend::Backend>,
     requests: &RequestsHandle,
@@ -3183,27 +3165,61 @@ pub(super) async fn gather_child_liveness(
     let mut by_child: std::collections::HashMap<&str, Option<TaskLiveness>> =
         std::collections::HashMap::new();
     let mut gathered = std::collections::HashMap::new();
-    for (call_id, child) in children {
+    for (key, child) in children {
         // The distinct-child cache holds failures too (`None`), so a child
-        // whose read already failed is not read again for another call.
+        // whose read already failed is not read again for another key.
         if !by_child.contains_key(child.as_str()) {
             let liveness = match backend.transcript(child).await {
-                Ok(transcript) => match child_liveness(&transcript) {
-                    Some(mut liveness) => {
-                        liveness.wait = requests.wait_for(child).await;
-                        Some(liveness)
+                Ok(transcript) => {
+                    // A child whose own read reports a terminal run is not
+                    // live: its panel shows the settled result, its ledger row
+                    // retires on the evidence, and a liveness line would claim
+                    // progress that ended.
+                    let terminal =
+                        crate::backend::runs::child_run_status(&transcript).is_some_and(|status| {
+                            !matches!(
+                                status,
+                                crate::backend::RunStatus::Running | crate::backend::RunStatus::Unknown
+                            )
+                        });
+                    match crate::backend::runs::child_run_activity(&transcript) {
+                        Some(mut activity) if !terminal => {
+                            activity.awaiting = run_waits(requests.wait_for(child).await);
+                            Some(TaskLiveness::from_run(&activity))
+                        }
+                        Some(_) | None => None,
                     }
-                    None => None,
-                },
+                }
                 Err(_) => None,
             };
             by_child.insert(child.as_str(), liveness);
         }
         if let Some(liveness) = by_child.get(child.as_str()).and_then(Option::as_ref) {
-            gathered.insert(call_id.clone(), liveness.clone());
+            gathered.insert(key.clone(), liveness.clone());
         }
     }
     gathered
+}
+
+/// The header's wait words as the run's own set: both may be live at once
+/// (spec #1057's `RunWaits`).
+fn run_waits(action: Option<crate::feishu::card::AwaitingAction>) -> Option<crate::backend::RunWaits> {
+    use crate::feishu::card::AwaitingAction;
+    match action {
+        Some(AwaitingAction::Permission) => Some(crate::backend::RunWaits {
+            permission: true,
+            question: false,
+        }),
+        Some(AwaitingAction::Question) => Some(crate::backend::RunWaits {
+            permission: false,
+            question: true,
+        }),
+        Some(AwaitingAction::Both) => Some(crate::backend::RunWaits {
+            permission: true,
+            question: true,
+        }),
+        Some(AwaitingAction::None) | None => None,
+    }
 }
 
 /// The live background subagents a transcript read names, as the
@@ -3238,15 +3254,22 @@ async fn live_panel_children(cards: &CardsHandle, session_id: &str) -> Vec<(Stri
     }
 }
 
-/// The child liveness one live render needs, gathered ONCE for both surfaces
-/// that show it (spec #501, ticket #504): the union of the card's live task
-/// panels' children ([`live_panel_children`]) and the read's live background
-/// subagents ([`background_subagent_children`]). One transcript light read and
-/// one pending-wait query per distinct child, so a child named by both a panel
-/// and a ledger row is read once; a render that names no child at all (V1, or
-/// a session with no live task) spends no request. Returns the panel pairs the
-/// caller attaches the result to, alongside the map keyed by every pair's call
-/// id.
+/// The child liveness one live render needs, gathered ONCE for every surface
+/// that shows it (spec #501, ticket #504; spec #1057's P4): the union of the
+/// card's live run panels' children ([`live_panel_children`]), the read's live
+/// background subagents ([`background_subagent_children`]) and the read's
+/// child-only runs ([`SessionTranscript::run_children`]). One transcript light
+/// read and one pending-wait query per distinct child, so a child named by a
+/// panel, a ledger row and a run is read once; a render that names no child at
+/// all spends no request. The map is keyed by every pair's own key — a panel's
+/// call id, a Background Task's call id, a run's `run_id` — so each surface
+/// reads the one gather. Returns the panel pairs the caller attaches the result
+/// to.
+///
+/// The gate is [`crate::backend::Backend::reports_live_runs`] (`background_runs
+/// || child_evidence`, ADR-0106), not `background_tasks_supported`: a
+/// child-only client such as Codex has no background concept but does report
+/// live runs, so its liveness line renders.
 async fn gather_render_liveness(
     cards: &CardsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
@@ -3258,13 +3281,18 @@ async fn gather_render_liveness(
     std::collections::HashMap<String, TaskLiveness>,
 ) {
     let panels = live_panel_children(cards, session_id).await;
-    let mut children = panels.clone();
-    if !backend.background_tasks_supported() {
-        // No Background Task surface: a live `task` panel still renders, but
-        // there is no child-session liveness registry to read for it.
+    if !backend.reports_live_runs() {
+        // No live-run surface: a live panel still renders, but there is no
+        // child liveness read to spend for it.
         return (panels, std::collections::HashMap::new());
     }
+    let mut children = panels.clone();
     children.extend(background_subagent_children(transcript));
+    for pair in transcript.run_children() {
+        if !children.contains(&pair) {
+            children.push(pair);
+        }
+    }
     if children.is_empty() {
         return (panels, std::collections::HashMap::new());
     }
@@ -3438,6 +3466,7 @@ mod tests {
         );
     }
 
+    use crate::backend::ToolDetail;
     use crate::backend::{
         BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, MessageRole,
         MessageTime, ReasoningPart, StepFinish, StepStart, TodoList, TodoStatus, TodoStep, ToolCall,
@@ -3458,7 +3487,7 @@ mod tests {
     };
     use crate::bridge::turn::timeline::TimelineKind;
     use crate::feishu::card::CardState;
-    use crate::feishu::card::tool_render::ToolPanel;
+    use crate::feishu::card::tool_render::{ChildActivity, ToolPanel};
 
     /// The run one test's entry names (ADR-0080): the launch's call id, with the
     /// child session's own id riding along as the alias a Wake names it by.
@@ -11606,6 +11635,12 @@ Index: /x/src/main.rs
                     input: Some(serde_json::json!({ "description": "review the shared child" })),
                     metadata: Some(serde_json::json!({ "sessionID": "ses_shared" })),
                     output: ToolOutput::default(),
+                    detail: ToolDetail::Delegation {
+                        runs: vec![crate::backend::AgentRunRef {
+                            run_id: "ses_shared".into(),
+                        }],
+                        effect: crate::backend::DelegationEffect::Launch,
+                    },
                     ..ToolCall::default()
                 }),
             );
@@ -11769,6 +11804,10 @@ Index: /x/src/main.rs
             input: Some(serde_json::json!({"description": "review"})),
             metadata: Some(serde_json::json!({"sessionId": child, "parentSessionId": "ses_parent"})),
             output: ToolOutput::default(),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
             ..ToolCall::default()
         })
     }
@@ -11786,6 +11825,10 @@ Index: /x/src/main.rs
             input: Some(serde_json::json!({"agent": "general", "description": "review"})),
             metadata: Some(serde_json::json!({"sessionID": child, "status": "running"})),
             output: ToolOutput::default(),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
             ..ToolCall::default()
         })
     }
@@ -11915,6 +11958,120 @@ Index: /x/src/main.rs
         assert!(
             card.contains("review"),
             "the subagent panel keeps its own input line: {card}"
+        );
+    }
+
+    /// A Codex collaboration call, as the adapter declares it: the verb is its
+    /// `tool`, the receivers the runs it names, and `effect` says whether it is
+    /// a launch or a receipt.
+    fn collab_part(
+        call_id: &str,
+        started_at: i64,
+        tool: &str,
+        receivers: &[&str],
+        effect: crate::backend::DelegationEffect,
+    ) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(started_at),
+            input: Some(serde_json::json!({ "tool": tool, "receiverThreadIds": receivers })),
+            output: ToolOutput::default(),
+            detail: ToolDetail::Delegation {
+                runs: receivers
+                    .iter()
+                    .map(|id| crate::backend::AgentRunRef {
+                        run_id: id.to_string(),
+                    })
+                    .collect(),
+                effect,
+            },
+            ..ToolCall::default()
+        })
+    }
+
+    /// Spec #1057's P4 / ADR-0106 §4: an addressing call is a one-line receipt
+    /// on its run, never a timeline panel. A `wait` that names no receiver
+    /// addresses the Turn's runs as a set and renders a TURN-LEVEL receipt; the
+    /// raw call stays in the transcript. The receipt dedupes by call, so a
+    /// second poll of the same call does not append another line.
+    #[tokio::test]
+    async fn an_addressing_call_renders_a_receipt_and_never_a_panel() {
+        use crate::backend::DelegationEffect;
+
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let now = chrono::Utc::now().timestamp_millis();
+        let backend = MockBackend::new(realistic_parts());
+        let parent = SessionTranscript::new(vec![message(
+            "a1",
+            now - 10_000,
+            vec![
+                collab_part(
+                    "call_input",
+                    now - 6_000,
+                    "sendInput",
+                    &["thread_1"],
+                    DelegationEffect::Address,
+                ),
+                collab_part("call_wait", now - 5_000, "wait", &[], DelegationEffect::Address),
+                collab_part(
+                    "call_launch",
+                    now - 7_000,
+                    "spawnAgent",
+                    &["thread_1"],
+                    DelegationEffect::Launch,
+                ),
+            ],
+        )]);
+        let (app, platform) = build_app(cfg, backend).await;
+        let cards = app.cards_handle();
+        let sid = "ses_parent";
+        Turn::seed_card(&cards, sid, Some("om_parent")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(now - 11_000)).await;
+
+        for _ in 0..2 {
+            let _ = render_and_flush(
+                &cards,
+                &app.sessions_handle(),
+                &app.client,
+                &app.requests_handle(),
+                sid,
+                &parent,
+            )
+            .await;
+        }
+
+        let card = platform.updated_cards().await.last().cloned().expect("a flush");
+        let text = card_text(&card);
+        assert!(
+            text.contains("↪ sendInput · thread_1"),
+            "an addressed call is a receipt on its run: {text}"
+        );
+        assert!(
+            text.contains("↪ wait · 本回合的运行"),
+            "a receiverless wait is a turn-level receipt: {text}"
+        );
+        assert_eq!(
+            text.matches("↪ wait").count(),
+            1,
+            "the same call renders one receipt however many polls see it: {text}"
+        );
+        assert!(
+            !text.contains("发送输入") && !text.contains("等待子 Agent"),
+            "no addressing call becomes a timeline panel: {text}"
+        );
+        assert!(
+            text.contains("codex/collab_agent") && !text.contains("↪ spawnAgent"),
+            "the launch keeps its panel (the record of the request): {text}"
+        );
+        assert!(
+            parent.tool_call("call_wait").is_some() && parent.tool_call("call_input").is_some(),
+            "the raw calls stay in the transcript"
         );
     }
 

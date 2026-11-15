@@ -2097,6 +2097,11 @@ pub struct MockBackend {
     /// test that scripts a no-surface client flips it through
     /// [`Self::without_task_surface`].
     pub task_surface: bool,
+    /// Whether this client reports live runs WITHOUT a Background Task surface
+    /// — the child-only shape (Codex, spec #1057's P4). It makes
+    /// [`Backend::reports_live_runs`] true while `task_surface` stays false, so
+    /// a test can prove the run ledger renders from child evidence alone.
+    pub live_runs_only: bool,
     /// Message ids the client answers as cola-authored through the authorship
     /// seam (ADR-0090): a client that assigns its own ids answers from its own
     /// record, never from the `msg_cola_` prefix. Empty by default, so the mock
@@ -2351,6 +2356,7 @@ impl MockBackend {
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             task_runtime: Arc::new(std::sync::Mutex::new(crate::backend::TaskRuntime::default())),
             task_surface: true,
+            live_runs_only: false,
             authored_message_ids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_task_runtime_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3016,6 +3022,16 @@ impl MockBackend {
     /// when a scripted transcript carries task facts.
     pub(crate) fn without_task_surface(&mut self) -> &mut Self {
         self.task_surface = false;
+        self
+    }
+
+    /// Scenario: a **child-only** client (Codex, spec #1057's P4) — no
+    /// Background Task surface, but live runs reported through child threads.
+    /// The ledger and the runtime reconciliation gate on `reports_live_runs`,
+    /// so they still run.
+    pub(crate) fn with_child_only_runs(&mut self) -> &mut Self {
+        self.task_surface = false;
+        self.live_runs_only = true;
         self
     }
 
@@ -4399,6 +4415,10 @@ impl crate::backend::Backend for MockBackend {
     /// #880): the scripted `task_surface` flag.
     fn background_tasks_supported(&self) -> bool {
         self.task_surface
+    }
+
+    fn reports_live_runs(&self) -> bool {
+        self.task_surface || self.live_runs_only
     }
 
     /// The scripted runtime verdict (issue #454). Empty by default, so a test
