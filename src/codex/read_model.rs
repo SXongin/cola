@@ -35,9 +35,9 @@ use serde_json::{Value, json};
 use crate::backend::{
     AgentRunRef, Compaction, CompactionReason, CompactionStatus, ContentBlock, DelegationEffect, FileAction,
     FileContent, FileEdit, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part,
-    ReasoningPart, SearchScope, SessionTranscript, StepFinish, TextPart, TodoList, TodoStatus, TodoStep,
-    TokenUsage, ToolCall, ToolDetail, ToolIdentity, ToolKind, ToolOutput, ToolStatus, TranscriptMessage,
-    TurnDiff, TurnDiffFile,
+    ReasoningPart, RunStatus, SearchScope, SessionTranscript, StepFinish, TextPart, TodoList, TodoStatus,
+    TodoStep, TokenUsage, ToolCall, ToolDetail, ToolIdentity, ToolKind, ToolOutput, ToolStatus,
+    TranscriptMessage, TurnDiff, TurnDiffFile,
 };
 
 /// `item/started`: the server's opening payload for one item.
@@ -2356,6 +2356,7 @@ impl ItemKind {
                     } else {
                         vec![AgentRunRef {
                             run_id: agent_thread_id.clone(),
+                            status: None,
                         }]
                     },
                     effect: DelegationEffect::Report,
@@ -2661,9 +2662,34 @@ fn collab_runs(receivers: &[String], agents: &[AgentState]) -> Vec<AgentRunRef> 
         if id.is_empty() || runs.iter().any(|run| &run.run_id == id) {
             continue;
         }
-        runs.push(AgentRunRef { run_id: id.clone() });
+        // The adapter's per-receiver statement: a multi-child launch can name
+        // one completed and one running child in the same call. A row with no
+        // state leaves `None`, so the call's status applies to that run.
+        let status = agents
+            .iter()
+            .find(|agent| &agent.thread_id == id)
+            .and_then(|agent| agent_run_status(&agent.status));
+        runs.push(AgentRunRef {
+            run_id: id.clone(),
+            status,
+        });
     }
     runs
+}
+
+/// One target agent's own state as a neutral [`RunStatus`]. `None` when the
+/// row reported no state (the call's status then applies). Unknown states stay
+/// live: [`RunStatus::Unknown`] is non-terminal, exactly like
+/// [`agent_status_is_terminal`]'s unknown-is-live rule.
+fn agent_run_status(status: &str) -> Option<RunStatus> {
+    match status {
+        "" => None,
+        "pendingInit" | "running" => Some(RunStatus::Running),
+        "completed" => Some(RunStatus::Completed),
+        "errored" | "failed" => Some(RunStatus::Failed),
+        "interrupted" | "cancelled" | "closed" | "shutdown" => Some(RunStatus::Cancelled),
+        _ => Some(RunStatus::Unknown),
+    }
 }
 
 fn combine_reasoning(summary: &str, text: &str) -> Option<String> {

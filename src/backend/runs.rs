@@ -46,16 +46,18 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
         // A reference naming no id is not a run: an addressing call with no
         // target addresses the Turn's live runs as a SET and mints nothing
         // (spec #1057), and a producer strips the empty ids it cannot name. So
-        // every ref this fold acts on names exactly one child.
-        let names: Vec<&str> = refs
+        // every ref this fold acts on names exactly one child. Its status is
+        // the adapter's per-receiver declaration when it made one, else the
+        // call's status (a one-run launch's own statement).
+        let names: Vec<(&str, Option<RunStatus>)> = refs
             .iter()
-            .map(|reference| reference.run_id.as_str())
-            .filter(|id| !id.is_empty())
+            .filter(|reference| !reference.run_id.is_empty())
+            .map(|reference| (reference.run_id.as_str(), reference.status))
             .collect();
         match effect {
             DelegationEffect::Launch => {
-                for run_id in names {
-                    let run = resolve_or_create(&mut runs, run_id, call);
+                for (run_id, receiver_status) in names {
+                    let run = resolve_or_create(&mut runs, run_id, call, receiver_status);
                     push_relation(&mut run.launched_by, call);
                     // A resumed task names the same child: the run it resolves
                     // gains a launch, never a second record.
@@ -65,23 +67,25 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
                     // The launch call is the client's statement about the run
                     // it created or resumed: a foreground `task` settles only
                     // when its child ends, so its own status is the child's.
-                    // A client whose launch is only a handle states the
-                    // child's later state through a report, and a report is
-                    // the newer statement — it is never overridden here.
+                    // A multi-child launch may state each receiver's state
+                    // separately; that declaration wins. A client whose launch
+                    // is only a handle states the child's later state through a
+                    // report, and a report is the newer statement — it is never
+                    // overridden here.
                     if run.reported_by.is_empty() {
-                        run.status = status_of(call);
+                        run.status = receiver_status.unwrap_or_else(|| status_of(call));
                     }
                 }
             }
             DelegationEffect::Address => {
-                for run_id in names {
-                    let run = resolve_or_create(&mut runs, run_id, call);
+                for (run_id, receiver_status) in names {
+                    let run = resolve_or_create(&mut runs, run_id, call, receiver_status);
                     push_relation(&mut run.addressed_by, call);
                 }
             }
             DelegationEffect::Report => {
-                for run_id in names {
-                    let run = resolve_or_create(&mut runs, run_id, call);
+                for (run_id, receiver_status) in names {
+                    let run = resolve_or_create(&mut runs, run_id, call, receiver_status);
                     // Dedupe by the CALL, never by call id alone: an activity
                     // whose state moved is the same call, so the relation is
                     // one entry and the state is applied below.
@@ -106,7 +110,12 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
 /// by which call the window happens to begin at (and could not identify two
 /// runs named by one multi-child fact). No fact names a run without an id —
 /// both producers drop empty ids — so no call-keyed arm exists.
-fn resolve_or_create<'a>(runs: &'a mut Vec<AgentRun>, run_id: &str, call: &ToolCall) -> &'a mut AgentRun {
+fn resolve_or_create<'a>(
+    runs: &'a mut Vec<AgentRun>,
+    run_id: &str,
+    call: &ToolCall,
+    receiver_status: Option<RunStatus>,
+) -> &'a mut AgentRun {
     if let Some(index) = runs
         .iter()
         .position(|run| run.run_id == run_id || run.child_id.as_deref() == Some(run_id))
@@ -120,7 +129,7 @@ fn resolve_or_create<'a>(runs: &'a mut Vec<AgentRun>, run_id: &str, call: &ToolC
         label: label_of(call).unwrap_or_else(|| run_id.to_string()),
         agent: agent_of(call),
         started_at: call.started_at,
-        status: status_of(call),
+        status: receiver_status.unwrap_or_else(|| status_of(call)),
         activity: None,
         launched_by: Vec::new(),
         addressed_by: Vec::new(),
@@ -389,6 +398,7 @@ mod tests {
                     .iter()
                     .map(|id| AgentRunRef {
                         run_id: id.to_string(),
+                        status: None,
                     })
                     .collect(),
                 effect,
@@ -579,6 +589,49 @@ mod tests {
                 .all(|run| run.task_run_id.as_deref() == run.child_id.as_deref()),
             "a multi-receiver fact keys each run by its own child id"
         );
+    }
+
+    /// A multi-child launch may state each receiver's own status. The per-ref
+    /// declaration wins over the call's single status: one completed child must
+    /// not read live because a sibling is still running (spec #1057's
+    /// `agentsStates`).
+    #[test]
+    fn a_multi_child_launch_keeps_each_receivers_own_status() {
+        let mut spawn = call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &[],
+            ToolStatus::Running,
+            Some(10),
+        );
+        spawn.detail = ToolDetail::Delegation {
+            runs: vec![
+                AgentRunRef {
+                    run_id: "thread_a".into(),
+                    status: Some(RunStatus::Completed),
+                },
+                AgentRunRef {
+                    run_id: "thread_b".into(),
+                    status: Some(RunStatus::Running),
+                },
+            ],
+            effect: DelegationEffect::Launch,
+        };
+        let read = transcript(vec![spawn]);
+        let a = read
+            .runs
+            .iter()
+            .find(|run| run.run_id == "thread_a")
+            .expect("run A");
+        let b = read
+            .runs
+            .iter()
+            .find(|run| run.run_id == "thread_b")
+            .expect("run B");
+        assert_eq!(a.status, RunStatus::Completed);
+        assert_eq!(b.status, RunStatus::Running);
+        assert!(!a.is_live(), "the completed child is not live");
+        assert!(b.is_live(), "the running child stays live");
     }
 
     /// A report's state is the adapter's declaration: a completed observation

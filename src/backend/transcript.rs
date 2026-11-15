@@ -2119,6 +2119,11 @@ pub enum DelegationEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRunRef {
     pub run_id: String,
+    /// The adapter's declaration for THIS receiver, when one call names several
+    /// runs that do not share a state (Codex's `agentsStates`). `None` means
+    /// the call's own status applies to this run (spec #1057's multi-child
+    /// launch).
+    pub status: Option<RunStatus>,
 }
 
 /// A reference to one tool call, used by an [`AgentRun`]'s relations.

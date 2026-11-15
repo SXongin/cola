@@ -104,6 +104,7 @@ fn subagent_reply(created: i64, child: &str, status: ToolStatus) -> TranscriptMe
             detail: crate::backend::ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: child.to_string(),
+                    status: None,
                 }],
                 effect: crate::backend::DelegationEffect::Launch,
             },
