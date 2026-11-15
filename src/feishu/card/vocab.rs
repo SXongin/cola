@@ -150,7 +150,12 @@ pub(crate) fn tool_token<'a>(identity: &'a ToolIdentity, kind: ToolKind, detail:
     match (kind, detail) {
         (ToolKind::Execute, ToolDetail::Command { .. }) => TOOL_SHELL,
         (ToolKind::Execute, ToolDetail::Program { .. }) => TOOL_SCRIPT,
-        (ToolKind::Edit, ToolDetail::FileEdits(edits)) => {
+        // FileEdits: the same three kinds the FileEdits renderer admits
+        // (`Edit | Delete | Move`, `tool_render::file_edits`), so a Delete or
+        // Move call that carries file edits reads the write/edit word rather
+        // than falling back to its vendor id. An all-Add list is `write`; an
+        // empty or mixed list is `edit`.
+        (ToolKind::Edit | ToolKind::Delete | ToolKind::Move, ToolDetail::FileEdits(edits)) => {
             // `write` needs a non-empty list whose every entry is an add: an
             // empty list is not "nothing changed", it is an edit with no
             // recorded files.
@@ -338,6 +343,25 @@ mod tests {
         assert_eq!(
             token("edit", ToolKind::Edit, edits(&[FileAction::Delete])),
             TOOL_EDIT
+        );
+
+        // The FileEdits renderer admits `Delete` and `Move` kinds too
+        // (`tool_render::file_edits`), so the token follows the same three
+        // kinds: a file-edit body never hides behind a vendor title because
+        // its kind is not `Edit`.
+        assert_eq!(
+            token(
+                "codex/file_change",
+                ToolKind::Delete,
+                edits(&[FileAction::Delete])
+            ),
+            TOOL_EDIT,
+            "a Delete kind carrying FileEdits is the edit word, not a vendor id"
+        );
+        assert_eq!(
+            token("codex/file_change", ToolKind::Move, edits(&[FileAction::Rename])),
+            TOOL_EDIT,
+            "a Move kind carrying FileEdits is the edit word, not a vendor id"
         );
 
         // Search: the scope decides the token.
