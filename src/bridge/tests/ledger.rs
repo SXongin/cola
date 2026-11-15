@@ -2345,6 +2345,7 @@ async fn a_terminal_child_settles_the_waiting_card() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: finished,
+                started_at: None,
             },
         )
         .await;
@@ -2525,6 +2526,7 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
             "thread_child",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -2842,6 +2844,7 @@ async fn a_multi_launch_retires_each_child_on_its_own_ending() {
             "thread_a",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -2891,6 +2894,7 @@ async fn a_multi_launch_retires_each_child_on_its_own_ending() {
             "thread_b",
             ChildEvidence::Terminal {
                 completed_at: now - 500,
+                started_at: None,
             },
         )
         .await;
@@ -3003,6 +3007,7 @@ async fn a_terminal_child_ends_the_turn_directly() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -3068,6 +3073,7 @@ async fn one_evidence_read_is_spent_per_suspected_child_per_cycle() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -4592,6 +4598,7 @@ async fn a_late_wake_never_doubles_a_child_evidences_completion_entry() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -4660,6 +4667,7 @@ async fn a_late_wake_after_a_restart_joins_the_retirements_shown_bit() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -7550,6 +7558,7 @@ async fn a_subagent_entry_spends_no_output_read() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -7651,6 +7660,7 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;
@@ -7695,6 +7705,7 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
             "ses_call_sub",
             ChildEvidence::Terminal {
                 completed_at: now - 1_000,
+                started_at: None,
             },
         )
         .await;

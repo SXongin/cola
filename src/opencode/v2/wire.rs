@@ -833,7 +833,10 @@ impl MessagesPage {
             terminal,
             message.pointer("/time/completed").and_then(Value::as_i64),
         ) {
-            (true, Some(completed_at)) => ChildEvidence::Terminal { completed_at },
+            (true, Some(completed_at)) => ChildEvidence::Terminal {
+                completed_at,
+                started_at: None,
+            },
             _ => ChildEvidence::Unfinished,
         }
     }

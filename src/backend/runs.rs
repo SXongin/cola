@@ -810,7 +810,13 @@ mod tests {
         assert!(run.is_live());
 
         assert!(
-            !read.apply_run_child_evidence("ses_child", ChildEvidence::Terminal { completed_at: 4 }),
+            !read.apply_run_child_evidence(
+                "ses_child",
+                ChildEvidence::Terminal {
+                    completed_at: 4,
+                    started_at: None
+                }
+            ),
             "a pre-resume completion is older than the resumed start"
         );
         assert_eq!(read.runs.len(), 1, "the resumed run stays live");
@@ -935,7 +941,13 @@ mod tests {
         );
 
         let mut read = read;
-        assert!(read.apply_run_child_evidence("thread_1", ChildEvidence::Terminal { completed_at: 3 }));
+        assert!(read.apply_run_child_evidence(
+            "thread_1",
+            ChildEvidence::Terminal {
+                completed_at: 3,
+                started_at: None
+            }
+        ));
         assert_eq!(read.task_retirements.len(), 1);
         assert_eq!(
             read.task_retirements[0].label.as_deref(),
@@ -979,7 +991,13 @@ mod tests {
             ToolStatus::Running,
             Some(1),
         )]);
-        assert!(read.apply_run_child_evidence("ses_child", ChildEvidence::Terminal { completed_at: 9 }));
+        assert!(read.apply_run_child_evidence(
+            "ses_child",
+            ChildEvidence::Terminal {
+                completed_at: 9,
+                started_at: None
+            }
+        ));
         assert!(read.runs.is_empty(), "the run leaves the live list");
         assert_eq!(read.task_retirements.len(), 1);
         let retirement = &read.task_retirements[0];
@@ -1011,19 +1029,20 @@ mod tests {
         assert!(read.apply_run_child_evidence(
             "ses_child",
             ChildEvidence::Terminal {
-                completed_at: 1_700_000_002_000
+                completed_at: 1_700_000_002_000,
+                started_at: None
             }
         ));
         assert!(read.runs.is_empty(), "the run retires on its child's evidence");
         assert_eq!(read.task_retirements[0].finished_at, Some(1_700_000_002_000));
     }
 
-    /// Codex's seconds-granular `completedAt` is normalized to the END of its
-    /// second, so a completion inside the second a run started (start 1_500 ms,
-    /// completion second 1 → 1_999) is accepted; a genuinely earlier second is
-    /// still rejected.
+    /// Codex's turn start is the ordering fact: a turn that began after the run
+    /// (even if it completes in the same second) is this run's, while a previous
+    /// turn whose completion merely rounds into the new run's window is stale.
+    /// With no turn start reported, the completion clock is the fallback.
     #[test]
-    fn a_same_second_completion_is_not_stale() {
+    fn a_turn_start_orders_the_child_evidence() {
         let mut read = transcript(vec![call(
             "call_spawn",
             DelegationEffect::Launch,
@@ -1031,8 +1050,35 @@ mod tests {
             ToolStatus::Running,
             Some(1_500),
         )]);
-        assert!(read.apply_run_child_evidence("ses_child", ChildEvidence::Terminal { completed_at: 1_999 }));
-        assert!(read.runs.is_empty(), "the same-second completion retires the run");
+        assert!(read.apply_run_child_evidence(
+            "ses_child",
+            ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: Some(2_000)
+            }
+        ));
+        assert!(
+            read.runs.is_empty(),
+            "a same-second completion of a turn that began after the run is accepted"
+        );
+
+        let mut read = transcript(vec![call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["ses_child"],
+            ToolStatus::Running,
+            Some(5_000),
+        )]);
+        assert!(
+            !read.apply_run_child_evidence(
+                "ses_child",
+                ChildEvidence::Terminal {
+                    completed_at: 6_000,
+                    started_at: Some(4_000)
+                }
+            ),
+            "a previous turn is stale even when its completion lands after the resume"
+        );
 
         let mut read = transcript(vec![call(
             "call_spawn",
@@ -1042,8 +1088,14 @@ mod tests {
             Some(1_500),
         )]);
         assert!(
-            !read.apply_run_child_evidence("ses_child", ChildEvidence::Terminal { completed_at: 999 }),
-            "a genuinely previous second is still stale"
+            !read.apply_run_child_evidence(
+                "ses_child",
+                ChildEvidence::Terminal {
+                    completed_at: 1_499,
+                    started_at: None
+                }
+            ),
+            "no turn start falls back to the completion clock"
         );
     }
 

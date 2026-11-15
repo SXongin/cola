@@ -2323,13 +2323,16 @@ fn thread_evidence(turns: &[Value]) -> ChildEvidence {
     };
     // Codex's persisted `turn` wire times are epoch SECONDS (`startedAt` /
     // `completedAt`; `ThreadProjection::seed_turn` converts them the same way),
-    // while the neutral run and item clocks are epoch milliseconds. Convert at
-    // this boundary to the END of the completion second: a `completedAt` second
-    // can be earlier than a run that started inside the same second (start
-    // 1_500 ms, completion second 1), and a bare `*1000` would make that
-    // completion look like a previous turn forever.
+    // while the neutral run and item clocks are epoch milliseconds. Convert
+    // both at this boundary; the stale guard compares the turn's OWN start to
+    // the run's start, so rounding the completion cannot make a previous turn
+    // look new.
     ChildEvidence::Terminal {
-        completed_at: completed_at.saturating_mul(1000).saturating_add(999),
+        completed_at: completed_at.saturating_mul(1000),
+        started_at: turn
+            .get("startedAt")
+            .and_then(Value::as_i64)
+            .map(|seconds| seconds.saturating_mul(1000)),
     }
 }
 

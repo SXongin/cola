@@ -1306,7 +1306,8 @@ async fn a_child_threads_terminal_turn_is_its_evidence() {
             .await
             .expect("the child thread read"),
         crate::backend::ChildEvidence::Terminal {
-            completed_at: 2_000_999
+            completed_at: 2_000_000,
+            started_at: Some(1_000_000)
         },
         "a terminal turn's seconds land as a millisecond run clock"
     );
@@ -1409,7 +1410,8 @@ async fn a_truncated_thread_read_still_finds_the_newest_turn() {
             .await
             .expect("the paged child thread read"),
         crate::backend::ChildEvidence::Terminal {
-            completed_at: 2_000_999
+            completed_at: 2_000_000,
+            started_at: Some(1_500_000)
         },
         "the full turns list finds the terminal turn outside the read page"
     );

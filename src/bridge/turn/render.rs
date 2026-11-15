@@ -4464,7 +4464,10 @@ mod tests {
             SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
         transcript.apply_child_evidence(
             "call_sub",
-            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+            crate::backend::ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None,
+            },
         );
         let facts = facts_with("call_sub", TaskEndingClass::Legacy, TaskEndingState::Shown);
 

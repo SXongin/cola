@@ -716,7 +716,10 @@ mod tests {
         // Deliberately the default: `capabilities().background_runs` is true.
         mock.with_child_evidence(
             "thread_child",
-            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+            crate::backend::ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None,
+            },
         )
         .await;
         let mock = Arc::new(mock);
@@ -837,6 +840,83 @@ mod tests {
         assert_eq!(transcript.runs.len(), 1, "the run keeps its row");
         assert_eq!(transcript.background_tasks.len(), 1, "the task keeps its row");
     }
+    /// A V2 background subagent is both a Background Task and a derived run.
+    /// Retiring the task on its child evidence must remove the matching run in
+    /// the same step, so the run loop does not read the child again and append a
+    /// second retirement for one child.
+    #[tokio::test]
+    async fn a_task_retirement_removes_its_matching_run_once() {
+        let mock = MockBackend::new(Vec::new());
+        mock.with_child_evidence(
+            "ses_child",
+            crate::backend::ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None,
+            },
+        )
+        .await;
+        let mock = Arc::new(mock);
+        let reads = Arc::clone(&mock.child_evidence_calls);
+        let backend: Arc<dyn Backend> = mock;
+
+        let launch = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_spawn".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "ses_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_launch"),
+            role: crate::backend::MessageRole::Assistant,
+            time: None,
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(launch)],
+        }])
+        .with_background_tasks(vec![crate::backend::BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_spawn".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            started_at: Some(1_000),
+        }]);
+        transcript.unconfirmed_tasks.insert("call_spawn".into());
+
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+        )
+        .await;
+        assert!(pass.is_some_and(|pass| pass.changed()));
+        assert_eq!(
+            reads.lock().await.as_slice(),
+            ["ses_child".to_string()],
+            "one child, one evidence read"
+        );
+        assert_eq!(transcript.task_retirements.len(), 1, "one run, one retirement");
+        assert!(transcript.background_tasks.is_empty());
+        assert!(
+            transcript.runs.is_empty(),
+            "the matching run leaves with its task, without a second ending"
+        );
+    }
+
     /// Review finding 1: a freshly spawned child answers "no rollout found"
     /// until it has run a turn. That is `Unfinished`, so the reconcile leaves
     /// the run live with no Lost ending — never a permanent 「已失联」 for a
@@ -909,7 +989,10 @@ mod tests {
         let mock = MockBackend::new(Vec::new());
         mock.with_child_evidence(
             "thread_child",
-            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+            crate::backend::ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None,
+            },
         )
         .await;
         let mock = Arc::new(mock);
@@ -977,7 +1060,10 @@ mod tests {
         let mock = MockBackend::new(Vec::new());
         mock.with_child_evidence(
             "thread_done",
-            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+            crate::backend::ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None,
+            },
         )
         .await;
         let mock = Arc::new(mock);
