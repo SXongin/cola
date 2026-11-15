@@ -733,9 +733,12 @@ struct State {
     /// one, modelling a response that names another thread.
     read_returns: std::sync::Mutex<Option<String>>,
     /// One-shot: answer the next `thread/read` for this thread id with the
-    /// recorded no-rollout error — the shape a server gives a child thread it
-    /// no longer holds (`-32600 no rollout found for thread id <id>`).
+    /// recorded no-rollout error — the shape a server gives a thread that has
+    /// not run a turn yet (`-32600 no rollout found for thread id <id>`).
     read_no_rollout: std::sync::Mutex<Option<String>>,
+    /// One-shot: answer the next `thread/read` with a generic server error (a
+    /// transient failed read, not an absence).
+    reject_thread_read: std::sync::atomic::AtomicBool,
     /// `model/list` calls received, so a paged catalog is proved by its pages.
     model_list_calls: AtomicUsize,
     /// One-shot: leave the next `model/list` unanswered (a stalled catalog).
@@ -821,6 +824,7 @@ impl Default for State {
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             read_returns: std::sync::Mutex::new(None),
             read_no_rollout: std::sync::Mutex::new(None),
+            reject_thread_read: std::sync::atomic::AtomicBool::new(false),
             model_list_calls: AtomicUsize::new(0),
             silent_model_list: std::sync::atomic::AtomicBool::new(false),
             model_list_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
@@ -1526,9 +1530,15 @@ impl FakeServer {
 
     /// Answer the next `thread/read` for `thread_id` with the recorded
     /// no-rollout error (`-32600 no rollout found for thread id <id>`) — the
-    /// protocol's own answer for a child thread the server no longer holds.
+    /// protocol's own answer for a thread that has not run a turn yet.
     pub(crate) fn answer_next_thread_read_no_rollout(&self, thread_id: &str) {
         *self.state.read_no_rollout.lock().expect("read no rollout") = Some(thread_id.to_string());
+    }
+
+    /// Fail the next `thread/read` with a generic server error: a transient
+    /// read failure, which is no evidence either way.
+    pub(crate) fn reject_next_thread_read(&self) {
+        self.state.reject_thread_read.store(true, Ordering::SeqCst);
     }
 
     /// Hide a thread's in-progress turns from the next `reads` `thread/read`
@@ -1761,6 +1771,9 @@ where
         Some("thread/read") => {
             if state.silent_thread_read.swap(false, Ordering::SeqCst) {
                 return true;
+            }
+            if state.reject_thread_read.swap(false, Ordering::SeqCst) {
+                return reply_error(sink, id, -32000, "the thread store is unavailable").await;
             }
             let requested = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             let substituted = state.read_returns.lock().expect("read returns").take();

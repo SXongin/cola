@@ -429,9 +429,24 @@ impl Threads {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<ThreadPage> {
-        let mut params = json!({
-            "sourceKinds": INTERACTIVE_SOURCE_KINDS,
-        });
+        self.list_page_for(Some(INTERACTIVE_SOURCE_KINDS), cwd, cursor, limit)
+            .await
+    }
+
+    /// [`Self::list_page`] for an explicit source-kind set (`None` lists every
+    /// kind): the child-absence probe must see a child thread the interactive
+    /// session list deliberately filters out.
+    async fn list_page_for(
+        &self,
+        sources: Option<&[&str]>,
+        cwd: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<ThreadPage> {
+        let mut params = json!({});
+        if let Some(sources) = sources {
+            params["sourceKinds"] = json!(sources);
+        }
         if let Some(cwd) = cwd {
             params["cwd"] = json!(cwd);
         }
@@ -463,6 +478,34 @@ impl Threads {
     /// carries its cwd on the row for the caller to filter.
     pub(crate) async fn list_all_any(&self) -> Result<Vec<SessionListInfo>> {
         self.list_all_page(None).await
+    }
+
+    /// Whether the server still holds `thread_id` at all — any source kind.
+    /// This is the definitive absence [`crate::backend::ChildEvidence::Gone`]
+    /// needs: a child thread is excluded from the interactive session list, so
+    /// the probe must ask for every kind before a miss can mean "gone". A read
+    /// failure with no answer is not an absence — `Err` stays a failed read.
+    pub(crate) async fn child_exists(&self, thread_id: &str) -> Result<bool> {
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let page = self.list_page_for(None, None, cursor.as_deref(), None).await?;
+            if page.sessions.iter().any(|session| session.id == thread_id) {
+                return Ok(true);
+            }
+            match page.next_cursor {
+                None => return Ok(false),
+                Some(next) => {
+                    if !seen.insert(next.clone()) {
+                        return Err(CodexError::Protocol {
+                            method: "thread/list".to_string(),
+                            detail: format!("the server repeated pagination cursor `{next}`"),
+                        });
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
     }
 
     async fn list_all_page(&self, cwd: Option<&str>) -> Result<Vec<SessionListInfo>> {

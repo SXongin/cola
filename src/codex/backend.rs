@@ -2289,16 +2289,15 @@ fn client_error(error: CodexError) -> BridgeError {
     }
 }
 
-/// Whether a `thread/read` failure means the child thread is not hosted at the
-/// attached server — the `Gone` evidence (a run cannot still be running there).
+/// Whether a `thread/read` failure is the recorded **no-rollout** answer for
+/// this child: code `-32600` and `no rollout found for thread id <id>`
+/// (`threads::is_no_rollout`, shared with `thread/resume`'s no-history state).
 ///
-/// The match is the **recorded protocol answer**, exactly: code `-32600` and
-/// the message form `no rollout found for thread id <id>` for THIS child
-/// (shared with `thread/resume`'s no-history state, `threads::is_no_rollout`).
-/// A transport failure, another code, or a phrase that merely appears in some
-/// other message is a failed read, not an ending — message-only matching would
-/// be guessing (ADR-0080's evidence rule).
-fn thread_is_gone(error: &CodexError, child_id: &str) -> bool {
+/// This is NOT absence: a thread created by `thread/start` answers it until it
+/// has run a turn, and a child `spawnAgent` just created is exactly such a
+/// thread. It is `Unfinished` — a healthy child with no turn yet — never
+/// `Gone`.
+fn thread_has_no_history(error: &CodexError, child_id: &str) -> bool {
     matches!(
         error,
         CodexError::Rpc { code, detail, .. } if crate::codex::threads::is_no_rollout(*code, child_id, detail)
@@ -3239,13 +3238,27 @@ impl Backend for CodexClient {
     /// agent that ends with no Wake still has to retire its run and settle the
     /// yielded Turn, and the child thread's last persisted turn is the
     /// evidence. `thread/read` carries the turns; the newest one is the
-    /// verdict. A thread the server no longer knows is `Gone`; anything the
-    /// read cannot conclude is `Unfinished`, never guessed.
+    /// verdict.
+    ///
+    /// "No rollout found" is `Unfinished`, not `Gone`: a freshly spawned child
+    /// is a thread in its first turn, and calling it lost would retire every
+    /// healthy new child. `Gone` needs a definitive absence, so a read failure
+    /// is followed by one probe over the server's **child-agent** threads
+    /// (`thread/list` with the `subAgent*` source kinds, which the interactive
+    /// session list deliberately excludes). Absent there → `Gone`; present (or
+    /// the probe itself failed) → the original read stays a failed read.
     async fn child_evidence(&self, child_id: &str) -> Result<ChildEvidence> {
         let thread = match self.threads().read(child_id, true).await {
             Ok(thread) => thread,
-            Err(error) if thread_is_gone(&error, child_id) => return Ok(ChildEvidence::Gone),
-            Err(error) => return Err(client_error(error)),
+            Err(error) if thread_has_no_history(&error, child_id) => {
+                return Ok(ChildEvidence::Unfinished);
+            }
+            Err(error) => {
+                return match self.threads().child_exists(child_id).await {
+                    Ok(false) => Ok(ChildEvidence::Gone),
+                    Ok(true) | Err(_) => Err(client_error(error)),
+                };
+            }
         };
         Ok(thread_evidence(&thread))
     }

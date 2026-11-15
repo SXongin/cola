@@ -156,7 +156,11 @@ impl RuntimeReconcile {
             return None;
         }
         let (shells, children) = live_task_ids(transcript);
-        if shells.is_empty() && children.is_empty() {
+        // A report-terminal run has no live child id (`run_children` lists live
+        // runs only), but it still owes a child-evidence read: the client says
+        // it ended, and the child read supplies the durable `结束` ending. The
+        // work gate must see it, or the row would disappear with no entry.
+        if shells.is_empty() && children.is_empty() && transcript.run_evidence_suspects().is_empty() {
             return None;
         }
         if !self.begin(session_id) {
@@ -312,7 +316,9 @@ pub(crate) async fn reconcile_now(
         return None;
     }
     let (shells, children) = live_task_ids(transcript);
-    if shells.is_empty() && children.is_empty() {
+    // Same gate as [`RuntimeReconcile::observe`]: a run whose report already
+    // ended it has no live child id but still owes the evidence read.
+    if shells.is_empty() && children.is_empty() && transcript.run_evidence_suspects().is_empty() {
         return None;
     }
     match budget
@@ -696,6 +702,130 @@ mod tests {
             transcript.task_retirements[0].ending,
             crate::backend::TaskRetirementEnding::ChildEnded
         );
+    }
+
+    /// Review finding 1: a freshly spawned child answers "no rollout found"
+    /// until it has run a turn. That is `Unfinished`, so the reconcile leaves
+    /// the run live with no Lost ending — never a permanent 「已失联」 for a
+    /// healthy first-turn child.
+    #[tokio::test]
+    async fn a_fresh_childs_no_history_keeps_its_run_live() {
+        let mock = MockBackend::new(Vec::new());
+        // The scripted default for an unscripted child is `Unfinished`: the
+        // same verdict the Codex adapter derives from the recorded no-rollout
+        // answer.
+        let mock = Arc::new(mock);
+        let reads = Arc::clone(&mock.child_evidence_calls);
+        let backend: Arc<dyn Backend> = mock;
+
+        let launch = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "task".into(),
+                call_id: "call_task".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_fresh".into(),
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_launch"),
+            role: crate::backend::MessageRole::Assistant,
+            time: None,
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(launch)],
+        }]);
+
+        let _ = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+        )
+        .await;
+        assert_eq!(reads.lock().await.as_slice(), ["thread_fresh".to_string()]);
+        assert_eq!(transcript.runs.len(), 1, "the run stays live");
+        assert!(transcript.runs[0].is_live());
+        assert!(
+            transcript.task_retirements.is_empty(),
+            "no Lost ending for a child with no history yet"
+        );
+        assert_eq!(transcript.settle(None), crate::backend::TurnSettle::Unreceived);
+    }
+
+    /// Review finding 2: a report-terminal run is the ONLY work, so no live
+    /// child id exists and the old gate skipped the pass entirely. The run's
+    /// child read must still run through the reconcile to produce the entry
+    /// and the durable ending.
+    #[tokio::test]
+    async fn a_report_terminal_run_alone_still_gets_its_ending() {
+        let mock = MockBackend::new(Vec::new());
+        mock.with_child_evidence(
+            "thread_child",
+            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+        )
+        .await;
+        let mock = Arc::new(mock);
+        let reads = Arc::clone(&mock.child_evidence_calls);
+        let backend: Arc<dyn Backend> = mock;
+
+        let report = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: "call_activity".into(),
+            },
+            status: crate::backend::ToolStatus::Completed,
+            started_at: Some(1_000),
+            input: Some(serde_json::json!({
+                "kind": "completed",
+                "agentThreadId": "thread_child"
+            })),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                }],
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_activity"),
+            role: crate::backend::MessageRole::Assistant,
+            time: None,
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(report)],
+        }]);
+        assert!(!transcript.runs[0].is_live(), "the client ended it");
+        assert!(transcript.run_children().is_empty(), "no live child id");
+
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+        )
+        .await;
+        assert!(
+            pass.is_some_and(|pass| pass.changed()),
+            "the pass applied an ending"
+        );
+        assert_eq!(reads.lock().await.as_slice(), ["thread_child".to_string()]);
+        assert_eq!(
+            transcript.task_retirements[0].ending,
+            crate::backend::TaskRetirementEnding::ChildEnded
+        );
+        assert!(transcript.runs.is_empty());
     }
 
     /// Spec #860, ticket #880: a client that declares no Background Task
