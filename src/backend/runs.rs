@@ -355,6 +355,9 @@ pub fn child_run_status(transcript: &SessionTranscript) -> Option<RunStatus> {
 /// live-looking `waiting <age>` line while the run awaits its evidence, so
 /// liveness asks this, not the status name.
 pub fn child_run_finished(transcript: &SessionTranscript) -> bool {
+    // Either statement ends the liveness line: the status a terminal finish
+    // maps to, and the terminal finish itself (which `Other` keeps out of the
+    // status so the client's statement stays honest).
     child_run_status(transcript).is_some_and(|status| status.is_terminal())
         || newest_step_finish(transcript).is_some_and(super::FinishReason::is_terminal)
 }
