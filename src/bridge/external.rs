@@ -1105,7 +1105,14 @@ impl ExternalFlow {
         {
             return false;
         }
-        let Some(continuation) = Turn::wake_continuation(&handles.cards, sid, transcript, turn_anchor).await
+        let Some(continuation) = Turn::wake_continuation(
+            &handles.cards,
+            sid,
+            transcript,
+            turn_anchor,
+            handles.backend.capabilities(),
+        )
+        .await
         else {
             return false;
         };

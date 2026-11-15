@@ -642,6 +642,7 @@ impl Turn {
         session_id: &str,
         transcript: &SessionTranscript,
         turn_anchor: &TurnAnchor,
+        capabilities: crate::backend::AgentCapabilities,
     ) -> Option<WakeContinuation> {
         let newest_wake = transcript
             .wakes
@@ -826,7 +827,12 @@ impl Turn {
         // full transcript scan, so it runs only when the plan warrants it — an
         // already-announced or stale Wake owes nothing regardless.
         if reads.needs_render_probe() {
-            let probe = StreamAccumulator::new("");
+            let mut probe = StreamAccumulator::new("");
+            // The probe answers what THIS attachment would render: a Compaction
+            // row or a `todowrite` part is not new content for a client that
+            // declares the surface absent, so it must not arm a Wake that then
+            // renders nothing (ADR-0106).
+            probe.set_capabilities(capabilities);
             let bound = render::rendered_bound(cards, session_id, transcript);
             reads.renders = reads
                 .wake
