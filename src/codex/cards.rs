@@ -1113,11 +1113,11 @@ async fn a_feishu_prompt_becomes_a_user_message_and_completes() {
 /// Issue #962 / spec #1057's P4: a V2 collaboration LAUNCH reaches the card as
 /// one folded panel — its title names the call and its target thread, its body
 /// the prompt, the model/effort and the target's own state — while the child's
-/// `subAgentActivity` is a one-line RECEIPT on the run, never a second panel.
+/// `subAgentActivity` updates its run, never a second panel or a timeline line.
 /// Both items ride the PARENT thread's stream; no child-thread subscription is
 /// involved, and the raw calls stay in the transcript.
 #[tokio::test]
-async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
+async fn a_collab_launch_keeps_its_panel_and_a_child_activity_updates_its_run() {
     let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(ScriptedThread::adopted(
         THREAD,
@@ -1204,9 +1204,9 @@ async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
     .await;
     // The Turn ends while the child is still live, so it YIELDS (ADR-0059's
     // Policy W): one run is owed an exit, and the child's own thread supplies
-    // it later. The activity is already a receipt on the card.
+    // it later. The activity updates the run; it leaves no timeline line.
     wait_for_card_update(&platform, "the yielded turn", CardUpdates::Latest, |card| {
-        card_text(card).contains("↪ started · 0192f0aa-0000-7000-8000-000000000001")
+        card_header(card).contains("等待后台任务")
     })
     .await;
     wait_for_handler(handler, "the collab turn", SETTLE_DEADLINE).await;
@@ -1245,8 +1245,12 @@ async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
         "the target's own state: {text}"
     );
     assert!(
-        text.contains("↪ started · 0192f0aa-0000-7000-8000-000000000001"),
-        "the activity is a one-line receipt on its run: {text}"
+        !text.contains("↪ started · 0192f0aa-0000-7000-8000-000000000001"),
+        "the activity updates its run and renders no receipt line: {text}"
+    );
+    assert!(
+        !text.contains("↪ completed · 0192f0aa-0000-7000-8000-000000000001"),
+        "no report renders a timeline line: {text}"
     );
     assert!(
         !text.contains("✅ codex/sub_agent_activity ·") && !text.contains("⏳ codex/sub_agent_activity ·"),

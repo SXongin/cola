@@ -487,24 +487,36 @@ impl ToolPanel {
     }
 }
 
-/// Whether a call only addresses or reports on a run — it renders as a one-line
-/// receipt, never a Tool Panel (ADR-0106 §4, spec #1057's P4). Only a launch
-/// keeps its panel: the record of the request.
+/// Whether a call only addresses a run — it renders as a one-line receipt,
+/// never a Tool Panel (ADR-0106 §4, spec #1057's P4). Only an `Address` is a
+/// receipt: a `Report` updates its run and leaves no timeline row, and a launch
+/// keeps its panel as the record of the request.
 pub(crate) fn is_receipt_call(call: &ToolCall) -> bool {
     matches!(
         &call.detail,
         ToolDetail::Delegation {
-            effect: DelegationEffect::Address | DelegationEffect::Report,
+            effect: DelegationEffect::Address,
             ..
         }
     )
 }
 
-/// The one-line receipt an addressing or reporting call leaves on its run. The
-/// target names the runs it addressed — or says it addressed the Turn's runs as
-/// a set when it named none. The turn-level words are [`vocab::RECEIPT_TURN_RUNS`];
-/// a report's verb comes from the call's declared status (a report is an
-/// observation, so its state IS the verb).
+/// Whether a call is a report on an existing run. It updates the run
+/// ([`crate::backend::AgentRun`]); it is neither a Tool Panel nor a receipt on
+/// the card.
+pub(crate) fn is_report_call(call: &ToolCall) -> bool {
+    matches!(
+        &call.detail,
+        ToolDetail::Delegation {
+            effect: DelegationEffect::Report,
+            ..
+        }
+    )
+}
+
+/// The one-line receipt an addressing call leaves on its run. The target names
+/// the runs it addressed — or says it addressed the Turn's runs as a set when
+/// it named none. The turn-level words are [`vocab::RECEIPT_TURN_RUNS`].
 ///
 /// An addressing verb has no neutral field yet: `ToolDetail` declares only
 /// `{runs, effect}`, so the adapter's own `input.tool` (`wait`, `sendInput`,
@@ -517,7 +529,6 @@ pub(crate) fn receipt_line(call: &ToolCall) -> String {
         _ => None,
     };
     let verb = match effect {
-        Some(DelegationEffect::Report) => ReceiptState::of(&call.status).word().to_string(),
         Some(DelegationEffect::Address) => call
             .input
             .as_ref()
@@ -540,66 +551,18 @@ pub(crate) fn receipt_line(call: &ToolCall) -> String {
     }
 }
 
-/// A receipt's dedupe identity: the call, plus the OBSERVED state for a
-/// report. Dedupe is never by call id alone (spec #1057) — the wire reuses an
-/// activity's item id between its start and completion, so a state move is a
-/// new observation and renders its own one-line receipt. An addressing call's
-/// verb does not move with its status, so it stays one line per call.
+/// A receipt's dedupe identity: the call. An addressing call's verb does not
+/// move with its status, so it stays one line per call. Reports are not
+/// receipts (they update their run and render no timeline row), so no state
+/// belongs in this key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReceiptKey {
     call_id: String,
-    state: ReceiptState,
-}
-
-/// The reported state a receipt's identity carries. Typed on purpose: an
-/// identity must never be a `Debug` rendering of a vendor string. It is also
-/// the ONE `ToolStatus` mapping the receipt path uses — the verb and the
-/// identity read the same value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ReceiptState {
-    Live,
-    Completed,
-    Failed,
-    Unknown,
-    /// A status this build does not know, kept verbatim as its own state.
-    Other(String),
-}
-
-impl ReceiptState {
-    fn of(status: &ToolStatus) -> Self {
-        match status {
-            ToolStatus::Pending | ToolStatus::Running => Self::Live,
-            ToolStatus::Completed => Self::Completed,
-            ToolStatus::Error => Self::Failed,
-            ToolStatus::Unknown => Self::Unknown,
-            ToolStatus::Other(reason) => Self::Other(reason.clone()),
-        }
-    }
-
-    /// The word a report at this state reads on its receipt. A report's state
-    /// is the adapter's declaration, so this never parses a vendor payload.
-    fn word(&self) -> &str {
-        match self {
-            Self::Live => "started",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Unknown => "unknown",
-            Self::Other(reason) => reason,
-        }
-    }
 }
 
 pub(crate) fn receipt_key(call: &ToolCall) -> ReceiptKey {
-    let state = match &call.detail {
-        ToolDetail::Delegation {
-            effect: DelegationEffect::Report,
-            ..
-        } => ReceiptState::of(&call.status),
-        _ => ReceiptState::Live,
-    };
     ReceiptKey {
         call_id: call.identity.call_id.clone(),
-        state,
     }
 }
 
@@ -6317,17 +6280,16 @@ mod tests {
         );
     }
 
-    /// Review finding 7: a report's unknown and vendor-specific states are
-    /// their own receipt identity and their own word — no `Debug` text, no
-    /// silent collapse into `completed`.
+    /// A report updates its run; it is not a receipt and not a panel. Only an
+    /// addressing call renders a receipt.
     #[test]
-    fn a_reports_unknown_and_vendor_states_are_their_own_identity() {
-        let report = |status: ToolStatus| ToolCall {
+    fn a_report_is_not_a_receipt() {
+        let report = ToolCall {
             identity: ToolIdentity {
                 name: "codex/sub_agent_activity".into(),
                 call_id: "call_activity".into(),
             },
-            status,
+            status: ToolStatus::Completed,
             detail: ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_1".into(),
@@ -6337,24 +6299,30 @@ mod tests {
             },
             ..ToolCall::default()
         };
-        let unknown = report(ToolStatus::Unknown);
-        assert_eq!(receipt_line(&unknown), "↪ unknown · thread_1");
-        let paused = report(ToolStatus::Other("paused".into()));
-        assert_eq!(receipt_line(&paused), "↪ paused · thread_1");
-        assert_ne!(
-            receipt_key(&unknown),
-            receipt_key(&paused),
-            "each state is its own observation"
+        assert!(is_report_call(&report));
+        assert!(
+            !is_receipt_call(&report),
+            "a report is not a receipt: it updates its run only"
         );
-        assert_eq!(
-            receipt_key(&report(ToolStatus::Running)),
-            receipt_key(&report(ToolStatus::Pending)),
-            "the live states share one identity"
-        );
-        assert_ne!(
-            receipt_key(&report(ToolStatus::Running)),
-            receipt_key(&report(ToolStatus::Completed))
-        );
+
+        let address = ToolCall {
+            identity: ToolIdentity {
+                name: "wait".into(),
+                call_id: "call_wait".into(),
+            },
+            input: Some(serde_json::json!({"tool": "wait"})),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_1".into(),
+                    status: None,
+                }],
+                effect: DelegationEffect::Address,
+            },
+            ..ToolCall::default()
+        };
+        assert!(is_receipt_call(&address));
+        assert!(!is_report_call(&address));
+        assert_eq!(receipt_line(&address), "↪ wait · thread_1");
     }
 
     /// The child session id is the LAUNCH relation's, not a tool name's (spec
