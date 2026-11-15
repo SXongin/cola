@@ -221,6 +221,68 @@ fn read_is_one_file_read_on_every_producer() {
     );
 }
 
+/// Ticket #1058: a read's directory verdict is the OUTPUT envelope's fact, not
+/// a card-only parse. V1's `<type>directory</type>` and V2's `Read directory`
+/// header both land `Read { directory: true }`; each generation's file
+/// envelope stays false.
+#[test]
+fn a_directory_read_sets_the_neutral_fact_on_every_producer() {
+    let v1_directory =
+        "<path>/tmp/notes</path>\n<type>directory</type>\n<content>\n/tmp/notes/a.rs\n</content>";
+    let v2_directory = "Read directory /tmp/notes, entries 1-2\n/tmp/notes/a.rs\n/tmp/notes/b.rs";
+    let v1_file = "<path>/tmp/a.rs</path>\n<type>file</type>\n<content>\n1: fn main() {}\n</content>";
+    let v2_file = "Read file /tmp/a.rs, lines 1-1\n1: fn main() {}";
+
+    let directory = |call: ToolCall| matches!(call.detail, ToolDetail::Read { directory: true, .. });
+    let file = |call: ToolCall| matches!(call.detail, ToolDetail::Read { directory: false, .. });
+
+    assert!(
+        directory(v1_tool(
+            "read",
+            json!({"filePath": "/tmp/notes"}),
+            Value::Null,
+            None,
+            Some(v1_directory),
+        )),
+        "V1's directory envelope is the neutral directory fact"
+    );
+    assert!(
+        directory(v2_tool(
+            "read",
+            json!({"path": "/tmp/notes"}),
+            Value::Null,
+            Some(v2_directory),
+        )),
+        "V2's directory envelope is the neutral directory fact"
+    );
+    assert!(
+        file(v1_tool(
+            "read",
+            json!({"filePath": "/tmp/a.rs"}),
+            Value::Null,
+            None,
+            Some(v1_file),
+        )),
+        "V1's file envelope stays a file"
+    );
+    assert!(
+        file(v2_tool(
+            "read",
+            json!({"path": "/tmp/a.rs"}),
+            Value::Null,
+            Some(v2_file),
+        )),
+        "V2's file envelope stays a file"
+    );
+    // No output proves no directory: the fact is never guessed.
+    assert!(file(v2_tool(
+        "read",
+        json!({"path": "/tmp/a.rs"}),
+        Value::Null,
+        None
+    )));
+}
+
 /// Edit — `write` is one add (V1 `filePath`, V2 `path`), `edit` one update
 /// with its diff, and `patch`'s family names its recorded files.
 #[test]
