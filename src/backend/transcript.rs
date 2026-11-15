@@ -2370,6 +2370,54 @@ pub struct ToolOutput {
     pub error: Option<String>,
 }
 
+impl ToolOutput {
+    /// The plain text this output carries, concatenated in block order — the
+    /// same view the card renders. `None` when it carries no text block.
+    pub fn text(&self) -> Option<String> {
+        let mut out = String::new();
+        let mut has_text = false;
+        for block in &self.blocks {
+            if let ContentBlock::Text(text) = block {
+                has_text = true;
+                out.push_str(text);
+            }
+        }
+        has_text.then_some(out)
+    }
+}
+
+/// V1's `read` output marks a DIRECTORY listing with this tag line in its XML
+/// envelope, where a file's carries `<type>file</type>`.
+pub const V1_DIRECTORY_TYPE_TAG: &str = "<type>directory</type>";
+
+/// V2's `read` output opens a DIRECTORY listing's header line with this prefix,
+/// where a file's opens `Read file `.
+pub const V2_DIRECTORY_HEADER_PREFIX: &str = "Read directory ";
+
+/// Whether a read call's raw output is a DIRECTORY listing, by output shape
+/// (ADR-0083 §8 amendment, #770): V1's XML envelope marks it
+/// [`V1_DIRECTORY_TYPE_TAG`] where a file's marks `<type>file</type>`, and V2's
+/// header line opens [`V2_DIRECTORY_HEADER_PREFIX`] where a file's opens
+/// `Read file `. The adapters derive a read's `directory` fact with this same
+/// rule, and the card's parsers read the markers from here, so the verdict and
+/// the envelope parsers cannot drift.
+///
+/// Each generation is read in its own envelope: the V1 tag only counts ABOVE
+/// `<content>`, so a file whose own text spells the tag is still a file, and
+/// the V2 prefix only on the first line, where its header lives.
+pub fn read_output_is_directory(output: &str) -> bool {
+    if output.contains("<path>") {
+        return output
+            .lines()
+            .take_while(|line| line.trim() != "<content>")
+            .any(|line| line.trim() == V1_DIRECTORY_TYPE_TAG);
+    }
+    output
+        .lines()
+        .next()
+        .is_some_and(|first| first.starts_with(V2_DIRECTORY_HEADER_PREFIX))
+}
+
 /// One output content block. Text blocks carry their text; a `file` block that
 /// inlines its payload is decoded into the typed [`FileContent`] view; any
 /// other kind stays raw.

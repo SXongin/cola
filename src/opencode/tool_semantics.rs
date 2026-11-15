@@ -178,7 +178,16 @@ impl ToolCall {
         output: ToolOutput,
     ) -> Self {
         let ToolPayloads { input, metadata } = payloads;
-        let (kind, detail) = tool_semantics(&identity.name, input.as_ref(), metadata.as_ref());
+        let (kind, mut detail) = tool_semantics(&identity.name, input.as_ref(), metadata.as_ref());
+        // A read's `directory` is an output-shape fact (ticket #1058): the
+        // client's envelope says whether the path is a directory listing. Both
+        // generations derive it here, after their decoder built the output, with
+        // the one helper the card's read parsers share.
+        if let ToolDetail::Read { directory, .. } = &mut detail {
+            *directory = output
+                .text()
+                .is_some_and(|text| crate::backend::read_output_is_directory(&text));
+        }
         let locations = detail.locations();
         Self {
             identity,
