@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::backend::{
     ContentBlock, FileAction, FileContent, FileEdit, NestedCall, SearchScope, TodoList, TodoStatus, TodoStep,
     ToolCall, ToolDetail, ToolKind, ToolStatus,
@@ -365,7 +367,7 @@ impl ToolPanel {
     /// read.
     pub(crate) fn file_open_path(&self) -> Option<String> {
         if let Some(edits) = file_edits(self) {
-            let [only] = edits.as_slice() else {
+            let [only] = edits.as_ref() else {
                 return None;
             };
             if only.action == FileAction::Delete {
@@ -564,7 +566,7 @@ fn has_file_edits(tool: &ToolPanel) -> bool {
 /// The kind must agree with the detail: a `FileEdits` on an unrelated kind is
 /// not this family (a lying detail gets the opaque path, ADR-0105's
 /// consequence).
-fn file_edits(tool: &ToolPanel) -> Option<Vec<FileEdit>> {
+fn file_edits(tool: &ToolPanel) -> Option<Cow<'_, [FileEdit]>> {
     match (tool.call().kind, &tool.call().detail) {
         (ToolKind::Edit | ToolKind::Delete | ToolKind::Move, ToolDetail::FileEdits(edits))
             if !edits.is_empty() =>
@@ -572,10 +574,28 @@ fn file_edits(tool: &ToolPanel) -> Option<Vec<FileEdit>> {
             // A Move kind is admitted because ACP declares it; `FileAction`
             // has no Move, so the detail's own action (Rename for a move,
             // Update for an in-place edit) is the word shown.
-            Some(crate::backend::merge_file_edits(edits.iter().cloned()))
+            //
+            // The adapters already merge duplicate paths; a third adapter may
+            // not, so the card re-merges only when it actually sees a repeat
+            // and otherwise borrows the detail (the common path costs no
+            // clone).
+            if has_duplicate_paths(edits) {
+                Some(Cow::Owned(crate::backend::merge_file_edits(
+                    edits.iter().cloned(),
+                )))
+            } else {
+                Some(Cow::Borrowed(edits.as_slice()))
+            }
         }
         _ => None,
     }
+}
+
+fn has_duplicate_paths(edits: &[FileEdit]) -> bool {
+    edits
+        .iter()
+        .enumerate()
+        .any(|(index, edit)| edits[..index].iter().any(|earlier| earlier.path == edit.path))
 }
 
 /// The `#947` action word for one file: add/update/delete/rename, never
@@ -709,14 +729,20 @@ fn file_edits_totals(edits: &[FileEdit]) -> (usize, usize) {
     (additions, deletions)
 }
 
-/// The pieces a FileEdits panel composes: the action lines OUTSIDE the fence
-/// (markdown, so a path's inline code renders), the hunks the fence wraps, and
-/// the two trailing notes the TICKET keeps apart — a `write`'s LSP note rides
-/// after the fence (pre-P3 #788), an edit/patch note stays inside it.
+/// One file's section in a FileEdits panel: its action line (markdown, outside
+/// any fence) and its own hunks, so a multi-file body keeps every action next
+/// to the change it names.
+struct FileEditSection {
+    action: Option<String>,
+    hunks: String,
+}
+
+/// The pieces a FileEdits panel composes: per-file sections (action + hunks)
+/// and the two trailing notes the ticket keeps apart — a `write`'s LSP note
+/// rides after the fence (pre-P3 #788), an edit/patch note stays inside it.
 struct FileEditsBody {
     header: Option<String>,
-    actions: String,
-    hunks: String,
+    sections: Vec<FileEditSection>,
     lang: &'static str,
     outside_tail: Option<String>,
     inside_tail: Option<String>,
@@ -730,30 +756,24 @@ fn file_edits_body(tool: &ToolPanel) -> Option<FileEditsBody> {
     }
     let edits = file_edits(tool)?;
     let multi = edits.len() > 1;
-    let mut actions = String::new();
-    let mut hunks = String::new();
-    for edit in &edits {
-        // Preserve a hunk's trailing spaces: only its line terminator is
-        // framing the card supplies.
-        let diff = edit.diff.as_deref().filter(|diff| !diff.trim().is_empty());
-        if multi || diff.is_none() {
-            if !actions.is_empty() {
-                actions.push('\n');
-            }
-            actions.push_str(&file_edit_action_line(edit));
-        }
-        if let Some(diff) = diff {
-            if !hunks.is_empty() {
-                hunks.push('\n');
-            }
-            hunks.push_str(diff);
+    let mut sections: Vec<FileEditSection> = Vec::new();
+    for edit in edits.iter() {
+        let hunks = edit
+            .diff
+            .as_deref()
+            .filter(|diff| !diff.trim().is_empty())
+            .unwrap_or_default()
+            .to_string();
+        let action = (multi || hunks.is_empty()).then(|| file_edit_action_line(edit));
+        if action.is_some() || !hunks.is_empty() {
+            sections.push(FileEditSection { action, hunks });
         }
     }
-    if actions.trim().is_empty() && hunks.trim().is_empty() {
+    if sections.is_empty() {
         return None;
     }
     let lang = diff_language_for(edits.iter().map(file_edit_display_path));
-    let header = match edits.as_slice() {
+    let header = match edits.as_ref() {
         [only] => only.diff.as_deref().map(|_| {
             let (additions, deletions) = file_edits_totals(std::slice::from_ref(only));
             format!("+{additions} −{deletions}")
@@ -761,19 +781,19 @@ fn file_edits_body(tool: &ToolPanel) -> Option<FileEditsBody> {
         _ => None,
     };
     let tail = file_edits_tail(tool);
-    // A `write` is an Add; its note belonged outside the fence before P3
-    // (#788), under its own 500-char bound. An edit/patch note stays inside,
-    // under the same diff budget.
-    let (outside_tail, inside_tail) = match edits.as_slice() {
-        [only] if only.action == FileAction::Add => {
+    // A `write`'s note (its own success summary precedes it) belonged outside
+    // the fence before P3 (#788), under its own 500-char bound. Any other
+    // producer's note stays inside, under the diff budget; an Add alone is not
+    // enough — an `apply_patch` Add keeps its note inside.
+    let (outside_tail, inside_tail) =
+        if edits.len() == 1 && edits[0].action == FileAction::Add && is_write_output(tool) {
             (tail.map(|tail| truncate_md(&tail, WRITE_TAIL_MAX_CHARS)), None)
-        }
-        _ => (None, tail),
-    };
+        } else {
+            (None, tail)
+        };
     Some(FileEditsBody {
         header,
-        actions,
-        hunks,
+        sections,
         lang,
         outside_tail,
         inside_tail,
@@ -781,49 +801,100 @@ fn file_edits_body(tool: &ToolPanel) -> Option<FileEditsBody> {
 }
 
 impl FileEditsBody {
-    /// The markdown body the panel writes: action lines first, then one fenced
-    /// block for every file's hunks (inside-tail included) and a `write`'s note
-    /// after the fence. The hunks clip BARE under the diff byte budget, the
-    /// note below the fence is the reader's only signal (#788/#792).
-    fn render(&self) -> String {
-        let mut hunks = self.hunks.clone();
-        if let Some(tail) = &self.inside_tail {
-            if !hunks.is_empty() {
-                hunks.push('\n');
+    /// The markdown body the panel writes, with every file's action line
+    /// immediately before its own fence. Each hunk block and the action list
+    /// share [`DIFF_MAX_ESCAPED_BYTES`]: the action list stops growing when
+    /// the budget is spent, a hunk block clips to the remainder, and the
+    /// returned flag tells the caller its truncation note is owed.
+    fn render(&self) -> (String, bool) {
+        let mut body = String::new();
+        let mut clipped = false;
+        let mut inside_tail = self.inside_tail.as_deref();
+        let last_hunk = self
+            .sections
+            .iter()
+            .rposition(|section| !section.hunks.is_empty());
+        for (index, section) in self.sections.iter().enumerate() {
+            let action = section.action.as_deref();
+            if let Some(action) = action {
+                let separator = if body.is_empty() { 0 } else { 2 };
+                if json_escaped_len(&body) + separator + json_escaped_len(action) > DIFF_MAX_ESCAPED_BYTES {
+                    clipped = true;
+                    break;
+                }
+                if !body.is_empty() {
+                    body.push_str("\n\n");
+                }
+                body.push_str(action);
             }
-            hunks.push_str(tail);
-        }
-        let clipped = if hunks.is_empty() {
-            String::new()
-        } else {
-            clip_fenced_body(&hunks, Some(self.lang), DIFF_MAX_ESCAPED_BYTES)
-        };
-        let mut body = self.actions.clone();
-        if !clipped.is_empty() {
+            let mut hunks = section.hunks.clone();
+            if Some(index) == last_hunk
+                && let Some(tail) = inside_tail.take()
+            {
+                if !hunks.is_empty() {
+                    hunks.push('\n');
+                }
+                hunks.push_str(tail);
+            }
+            if hunks.is_empty() {
+                continue;
+            }
+            let separator = if body.is_empty() { 0 } else { 2 };
+            let remaining = DIFF_MAX_ESCAPED_BYTES.saturating_sub(json_escaped_len(&body) + separator);
+            let clipped_hunks = clip_fenced_body(&hunks, Some(self.lang), remaining);
+            if clipped_hunks.is_empty() {
+                clipped = true;
+                break;
+            }
+            if clipped_hunks != hunks {
+                clipped = true;
+            }
             if !body.is_empty() {
                 body.push_str("\n\n");
             }
-            body.push_str(&fenced_code(&clipped, Some(self.lang)));
+            body.push_str(&fenced_code(&clipped_hunks, Some(self.lang)));
         }
         if let Some(tail) = &self.outside_tail {
-            if !body.is_empty() {
-                body.push_str("\n\n");
+            let separator = if body.is_empty() { 0 } else { 2 };
+            let remaining = DIFF_MAX_ESCAPED_BYTES.saturating_sub(json_escaped_len(&body) + separator);
+            if remaining > 0 {
+                let original = tail.chars().count();
+                let tail = truncate_md(tail, remaining);
+                if tail.chars().count() < original {
+                    clipped = true;
+                }
+                if !body.is_empty() {
+                    body.push_str("\n\n");
+                }
+                body.push_str(&tail);
+            } else {
+                clipped = true;
             }
-            body.push_str(tail);
         }
-        body
+        (body, clipped)
     }
 
     fn clipped(&self) -> bool {
-        let mut hunks = self.hunks.clone();
-        if let Some(tail) = &self.inside_tail {
-            if !hunks.is_empty() {
-                hunks.push('\n');
-            }
-            hunks.push_str(tail);
-        }
-        !hunks.is_empty() && !fenced_body_fits(&hunks, Some(self.lang), DIFF_MAX_ESCAPED_BYTES)
+        self.render().1
     }
+}
+
+/// Whether the call's output carries a `write` tool's success summary (V1's
+/// `Wrote file successfully.`, V2's `Wrote/Created file successfully: …`).
+/// This is the producer's OUTPUT shape, not its id: an `apply_patch` Add must
+/// keep its LSP note inside the diff fence.
+fn is_write_output(tool: &ToolPanel) -> bool {
+    let Some(text) = tool.output() else {
+        return false;
+    };
+    let first = text.lines().next().unwrap_or("").trim_start();
+    [
+        "Wrote file successfully",
+        "Created file successfully",
+        "Successfully wrote",
+    ]
+    .iter()
+    .any(|prefix| first.starts_with(prefix))
 }
 
 /// The FileEdits panel's Output: markdown action lines outside the fence, the
@@ -832,7 +903,7 @@ impl FileEditsBody {
 /// wrap the action lines in a second fence.
 fn file_edits_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
     let body = file_edits_body(tool)?;
-    let text = body.render();
+    let (text, _) = body.render();
     if text.trim().is_empty() {
         return None;
     }
@@ -1039,8 +1110,11 @@ pub(crate) fn diff_from_metadata(metadata: Option<&serde_json::Value>) -> Option
 
 /// A Tool Panel for tests, built from the typed pieces a formatter reads: the
 /// tool name, typed status, raw input, and one text output block (the shape
-/// most fixtures need). Production code always wraps a decoded [`ToolCall`];
-/// fixtures that exercise metadata build the call directly.
+/// most fixtures need). It does NOT infer a [`ToolDetail`] from the id: a
+/// fixture that needs a shape uses [`Self::for_test_file_edits`]/
+/// [`Self::for_test_read`] or builds the [`ToolCall`] with its detail, so a
+/// bare `bash`/`task` id here exercises the opaque path on purpose. Production
+/// code always wraps a decoded [`ToolCall`] whose adapter declared the detail.
 #[cfg(test)]
 impl ToolPanel {
     pub(crate) fn for_test(
@@ -1851,15 +1925,6 @@ fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option
     preview_body_clipped(tool).then_some(PREVIEW_TRUNCATION_NOTE)
 }
 
-/// Whether a panel is Codex's `webSearch` as cola's own adapter writes it:
-/// the namespaced id plus `{query, action}` (ADR-0042's amendment). Its
-/// `results` field is opaque vendor JSON, not a shared `ToolDetail`, so this
-/// one renderer still reads the adapter's id and shape; a V2 `websearch` has
-/// the neutral `Search` detail and goes through [`web_output`] instead.
-fn is_codex_web_search(tool: &ToolPanel) -> bool {
-    tool.name() == "codex/web_search" && web_search_shape(tool.input())
-}
-
 /// The Output triple a Codex `webSearch` panel renders. The app-server schema
 /// calls `results` opaque JSON, so only one shape is read as a result list —
 /// an array whose every entry has a non-empty `url` (a `title` is optional) —
@@ -1890,22 +1955,48 @@ fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyl
     ))
 }
 
-/// The opaque `results` a shape-gated Codex search carries: its metadata first,
-/// then the raw output (the adapter writes both; the fallback covers a call from
-/// before the field existed). `None` while the search has no results yet, and
-/// for every non-Codex search — a V2 `websearch`'s text blocks are rendered by
-/// [`web_output`], never as this opaque JSON.
+/// The opaque `results` a web-search payload carries: its metadata first, then
+/// the raw output (the adapter writes both; the fallback covers a call from
+/// before the field existed). The gate is the PAYLOAD SHAPE, not the id: a V2
+/// `websearch`'s raw output is its content-block envelope
+/// (`[{type: "text", …}]`) and falls through to [`web_output`], never to this
+/// opaque JSON. `None` while the search has no results yet.
 fn codex_search_results(tool: &ToolPanel) -> Option<&serde_json::Value> {
-    if !is_codex_web_search(tool) {
+    if search_detail(tool)?.scope != SearchScope::Web {
         return None;
     }
-    let results = tool
+    if let Some(results) = tool
         .metadata()
         .and_then(|metadata| metadata.get("results"))
         .filter(|value| !value.is_null())
-        .or_else(|| tool.call().output.raw.as_ref().filter(|value| !value.is_null()))?;
-    // A provider's empty message is no result, not an empty Output.
-    (!results.as_str().is_some_and(|text| text.trim().is_empty())).then_some(results)
+    {
+        // A provider's empty message is no result, not an empty Output.
+        return (!results.as_str().is_some_and(|text| text.trim().is_empty())).then_some(results);
+    }
+    let raw = tool.call().output.raw.as_ref().filter(|value| !value.is_null())?;
+    if is_content_block_envelope(raw) {
+        return None;
+    }
+    // A text raw value may be OpenCode's own result envelope (V1's JSON or
+    // V2's markdown): the neutral parser claims it. A raw string that parser
+    // cannot read is a provider's message — Codex's opaque fallback.
+    if let Some(text) = raw.as_str()
+        && parse_websearch_results(text).is_some()
+    {
+        return None;
+    }
+    Some(raw)
+}
+
+/// Whether a value is a tool output's `content` block envelope (V2's
+/// `[{type: "text", …}]`), as opposed to a vendor's opaque `results` payload.
+fn is_content_block_envelope(value: &serde_json::Value) -> bool {
+    value.as_array().is_some_and(|items| {
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|item| item.get("type").and_then(serde_json::Value::as_str).is_some())
+    })
 }
 
 /// The raw-JSON body for a `results` value the card cannot confirm: a JSON
@@ -2076,7 +2167,7 @@ pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
             .as_deref()
             .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
             .unwrap_or(0);
-        return header + serialized_len(&body.render());
+        return header + serialized_len(&body.render().0);
     }
     // A Codex search's or collaboration call's body is assembled from metadata,
     // not from the call's (empty) text output, so it is charged from the same
@@ -2411,7 +2502,7 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
             // A unified hunk cannot hold a truly empty line: a blank source
             // line is the context line `" "`. So a real empty line is the
             // note's boundary — unless it separates two files of a joined
-            // patch (`recorded_diff` joins per-file strings that end in `\n`
+            // patch (`diff_from_metadata` joins per-file strings that end in `\n`
             // with `\n`), where the next line opens the next file.
             in_tail = true;
             continue;
@@ -2506,7 +2597,7 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
 }
 
 /// Whether the next non-empty line at or after `from` opens another file's
-/// header block in a concatenated patch. [`recorded_diff`] joins per-file
+/// header block in a concatenated patch. [`diff_from_metadata`] joins per-file
 /// patch strings — each ending in `\n` — with `\n`, so a joined multi-file
 /// patch carries a real blank line between files. That line is a file
 /// boundary, not the trailing note's start; reading it as one would swallow
@@ -3950,6 +4041,12 @@ mod tests {
                 name: "read".into(),
                 call_id: "call_read".into(),
             },
+            kind: ToolKind::Read,
+            detail: ToolDetail::Read {
+                path: Some(name.to_string()),
+                preview: None,
+                directory: false,
+            },
             status: ToolStatus::Completed,
             started_at: None,
             input: None,
@@ -4606,6 +4703,12 @@ mod tests {
     fn a_read_with_a_file_content_carries_no_open_button() {
         let mut panel = ToolPanel::for_test_with_files("read", &[("shot.png", b"ABC")]);
         panel.call.input = Some(json!({"filePath": "/x/shot.png"}));
+        panel.call.kind = ToolKind::Read;
+        panel.call.detail = ToolDetail::Read {
+            path: Some("/x/shot.png".into()),
+            preview: None,
+            directory: false,
+        };
         assert_eq!(
             panel.file_open_path(),
             None,
@@ -4882,7 +4985,8 @@ mod tests {
         let content = "`".repeat(TOOL_OUTPUT_MAX_CHARS);
         let panel = write_panel("notes.md", &content, ToolStatus::Completed, None);
         let body = file_edits_body(&panel).expect("the Add body");
-        let clipped = clip_fenced_body(&body.hunks, Some(body.lang), DIFF_MAX_ESCAPED_BYTES);
+        let hunks = &body.sections[0].hunks;
+        let clipped = clip_fenced_body(hunks, Some(body.lang), DIFF_MAX_ESCAPED_BYTES);
         assert!(
             fenced_block_overhead(&clipped) > TOOL_OUTPUT_MAX_CHARS,
             "the fence dwarfs the body it wraps"
@@ -4894,7 +4998,7 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(
             panel_output_estimate(&panel),
-            header + serialized_len(&body.render()),
+            header + serialized_len(&body.render().0),
             "the fence beyond the minimum is charged"
         );
     }
@@ -4962,6 +5066,46 @@ mod tests {
         assert!(md.contains("+2 −2"), "both hunks' totals: {md}");
     }
 
+    /// The action list is clipped under the same body budget as the hunks: a
+    /// many-file patch cannot exceed the card's diff allowance through its
+    /// action lines alone.
+    #[test]
+    fn the_action_list_is_clipped_under_the_body_budget() {
+        let edits = (0..1_000)
+            .map(|i| FileEdit {
+                path: format!("src/file_{i}.rs"),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: None,
+            })
+            .collect();
+        let tool = panel_with_edits(
+            "patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            edits,
+            None,
+        );
+        let body = file_edits_body(&tool).expect("the action list body");
+        let (text, clipped) = body.render();
+        assert!(clipped, "the action list is over budget");
+        assert!(
+            json_escaped_len(&text) <= DIFF_MAX_ESCAPED_BYTES,
+            "the body stays inside the diff budget: {}",
+            json_escaped_len(&text)
+        );
+        assert!(text.contains("src/file_0.rs"), "early actions kept: {text}");
+        assert!(
+            !text.contains("src/file_999.rs"),
+            "over-budget actions stopped: {text}"
+        );
+        assert_eq!(
+            preview_truncation_note_estimate(&tool, None),
+            DIFF_TRUNCATION_NOTE.len(),
+            "the clip note is charged"
+        );
+    }
+
     /// A multi-file body keeps the action lines OUTSIDE the fence (markdown,
     /// so the paths' inline code renders) and preserves a hunk's trailing
     /// spaces.
@@ -4989,8 +5133,12 @@ mod tests {
         );
         let md = panel_md(tool);
         assert!(
-            md.contains("✏️ 编辑 `a.rs`\n➕ 新增 `b.rs`\n\n```rust"),
-            "action lines precede the fence as markdown: {md}"
+            md.contains("✏️ 编辑 `a.rs`\n\n```rust\n@@ -1 +1 @@"),
+            "the first file's action precedes its own hunks: {md}"
+        );
+        assert!(
+            md.contains("➕ 新增 `b.rs`\n\n```rust\n@@ -0,0 +1 @@"),
+            "the second file's action precedes its own hunks: {md}"
         );
         assert!(
             !md.contains("```rust\n✏️ 编辑"),
@@ -5015,6 +5163,26 @@ mod tests {
             "the note follows the closed fence: {md}"
         );
         assert!(!md.contains("LSP errors detected\n```"), "not inside: {md}");
+
+        // An Add is not enough: an `apply_patch` Add keeps its note INSIDE the
+        // fence, because its output is not a write summary.
+        let patch = panel_with_edits(
+            "apply_patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            vec![FileEdit {
+                path: "a.rs".into(),
+                action: FileAction::Add,
+                rename_to: None,
+                diff: Some("@@ -0,0 +1 @@\n+new".into()),
+            }],
+            Some("Success. Updated the following files:\nA a.rs\n\nLSP errors detected"),
+        );
+        let md = panel_md(patch);
+        assert!(
+            md.contains("LSP errors detected\n```"),
+            "a patch Add's note stays inside: {md}"
+        );
     }
 
     /// A call whose path is absent or unusable carries no button rather than a
@@ -6659,7 +6827,7 @@ Index: src/main.rs
             (FileAction::Delete, "c.rs", None, "🗑 删除"),
             (FileAction::Rename, "old.rs", Some("new.rs"), "📦 重命名"),
         ];
-        for producer in ["codex/file_change", "patch"] {
+        for producer in ["write", "edit", "apply_patch", "patch", "codex/file_change"] {
             for (action, path, rename_to, word) in cases {
                 let edit = FileEdit {
                     path: path.to_string(),
@@ -7055,7 +7223,7 @@ Index: src/main.rs
         let rendered = file_edits_body(&panel).expect("the diff body");
         assert_eq!(
             estimate,
-            json_escaped_len(&CardMarkdown::new().element(&header)) + serialized_len(&rendered.render()),
+            json_escaped_len(&CardMarkdown::new().element(&header)) + serialized_len(&rendered.render().0),
             "the charge is the rendered body, fence, tag and header"
         );
         assert!(
@@ -7277,7 +7445,7 @@ Index: .config/opencode/AGENTS.md
         assert!(!md.contains("(1 replacement)"), "generated summary dropped: {md}");
     }
 
-    /// #793: V2's `edit` records `metadata.files[]`, and `recorded_diff` joins
+    /// #793: V2's `edit` records `metadata.files[]`, and `diff_from_metadata` joins
     /// the per-file patches. Two entries are two files, so the folded header
     /// says `📄 2 files`; the totals stay the joined patch's own counts, and the
     /// body keeps both hunks untouched.
@@ -7552,7 +7720,7 @@ Index: /a/b.rs
         assert!(!d.body.contains("LSP"), "note not in hunks: {:?}", d.body);
     }
 
-    /// `recorded_diff` joins per-file patch strings — each ending in `\n` —
+    /// `diff_from_metadata` joins per-file patch strings — each ending in `\n` —
     /// with `\n`, so a joined multi-file patch carries a real blank line
     /// between files. That line is a boundary, not the note's start: reading it
     /// as one would swallow every file after the first into `tail`.
@@ -7797,12 +7965,12 @@ Index: /a/lua.lua
         );
         let body = panel_md(tool);
         assert!(
-            body.contains("✏️ 编辑 `/a/one.rs`"),
-            "first file named with its action: {body}"
+            body.contains("✏️ 编辑 `/a/one.rs`\n\n```rust\n@@ -1,3 +1,3 @@"),
+            "the first file's action and hunk stay together: {body}"
         );
         assert!(
-            body.contains("✏️ 编辑 `/a/two.rs`"),
-            "second file named with its action: {body}"
+            body.contains("✏️ 编辑 `/a/two.rs`\n\n```rust\n@@ -1 +1 @@"),
+            "the second file's action and hunk stay together: {body}"
         );
         assert!(body.contains("+let b = 3;"), "hunk kept: {body}");
         assert!(body.contains("+y"), "second hunk kept: {body}");

@@ -1797,7 +1797,30 @@ pub fn file_edit_hunks(diff: &str) -> Option<String> {
         return (!body.trim().is_empty()).then_some(body);
     }
     let text = diff.trim();
+    // A header block with no hunk (a pure rename, a delete, a mode-only
+    // change) is not a diff body: the FileEdit's action and rename_to already
+    // say what happened. A binary change's message is not a header block and
+    // is kept.
+    if text.lines().any(is_diff_framing_line) {
+        return None;
+    }
     (!text.is_empty()).then(|| text.to_string())
+}
+
+/// One line of a unified diff's framing (`Index:`, `---`, `+++`, git's
+/// `diff --git`/`rename`/mode lines): present only before the first hunk.
+fn is_diff_framing_line(line: &str) -> bool {
+    line.starts_with("Index: ")
+        || line.starts_with("diff --git ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("new file mode ")
+        || line.starts_with("deleted file mode ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
 }
 
 /// One [`FileEdit`] recovered from a unified diff whose payload does not state
@@ -1806,7 +1829,7 @@ pub fn file_edit_hunks(diff: &str) -> Option<String> {
 /// is an Add, on the new side a Delete, two different names a Rename; anything
 /// else is an Update on `path_hint`, the index line, or the new side.
 pub fn file_edit_from_diff(path_hint: Option<&str>, diff: &str) -> Option<FileEdit> {
-    let hunks = file_edit_hunks(diff)?;
+    let hunks = file_edit_hunks(diff);
     let mut index = None;
     let mut old = DiffSide::default();
     let mut new = DiffSide::default();
@@ -1860,7 +1883,7 @@ pub fn file_edit_from_diff(path_hint: Option<&str>, diff: &str) -> Option<FileEd
         path: path?,
         action,
         rename_to,
-        diff: Some(hunks),
+        diff: hunks,
     })
 }
 
