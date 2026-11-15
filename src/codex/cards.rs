@@ -1301,8 +1301,10 @@ async fn a_child_threads_terminal_turn_is_its_evidence() {
         Backend::child_evidence(&client, "thread-child-done")
             .await
             .expect("the child thread read"),
-        crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
-        "a terminal turn carries the run's completion clock"
+        crate::backend::ChildEvidence::Terminal {
+            completed_at: 2_000_000
+        },
+        "a terminal turn's seconds land as a millisecond run clock"
     );
     assert_eq!(
         Backend::child_evidence(&client, "thread-child-running")

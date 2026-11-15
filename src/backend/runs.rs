@@ -898,6 +898,29 @@ mod tests {
         );
     }
 
+    /// Codex's `completedAt` is epoch seconds on the wire and milliseconds at
+    /// the adapter boundary. A millisecond completion after the run's start
+    /// retires it; a raw seconds value would look older than the start and be
+    /// rejected as a previous turn's evidence.
+    #[test]
+    fn a_millisecond_completion_after_the_run_start_retires_it() {
+        let mut read = transcript(vec![call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["ses_child"],
+            ToolStatus::Running,
+            Some(1_700_000_000_000),
+        )]);
+        assert!(read.apply_run_child_evidence(
+            "ses_child",
+            ChildEvidence::Terminal {
+                completed_at: 1_700_000_002_000
+            }
+        ));
+        assert!(read.runs.is_empty(), "the run retires on its child's evidence");
+        assert_eq!(read.task_retirements[0].finished_at, Some(1_700_000_002_000));
+    }
+
     /// A client's terminal statement is mapped honestly: a reason this build
     /// cannot name is `Unknown` — not `Cancelled`, which would put words in
     /// the client's mouth and let the run look concluded. `Unknown` is not
