@@ -2917,8 +2917,10 @@ async fn render_and_flush_inner(
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         // The attachment's surface declaration, re-read each pass so a
-        // reattach's new value governs the next render (ADR-0106).
-        card.acc.set_capabilities(backend.capabilities());
+        // reattach's new value governs the next render (ADR-0106). A change is
+        // content the body owes (a stored plan/diff/usage/compaction surface
+        // may disappear), even when no new part arrived.
+        let capabilities_changed = card.acc.set_capabilities(backend.capabilities());
         let before = card.acc.rendered_part_count();
         // The anchor this read establishes (or already carries) is the scope
         // both the parts and the completion entries place against: capture it
@@ -2954,7 +2956,7 @@ async fn render_and_flush_inner(
         // passed, so a row an earlier card surfaced is never replayed onto this
         // one.
         let bound = rendered_bound(cards, session_id, transcript);
-        let changed = render_turn_parts(&mut card.acc, transcript, bound);
+        let changed = render_turn_parts(&mut card.acc, transcript, bound) || capabilities_changed;
         if changed {
             // Mark the progress NOW: a later stage of this pass may be
             // abandoned by the caller's timeout (#457), and the external
