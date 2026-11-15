@@ -3674,8 +3674,14 @@ fn format_tool_input(tool: &ToolPanel) -> String {
     if is_launch_call(tool) {
         return tool.input().map(delegation_input).unwrap_or_default();
     }
+    let call = tool.call();
+    let token = vocab::name_only_token(&call.identity, call.kind, &call.detail);
     tool.input()
-        .map(|input| format_named_input(tool.name(), input))
+        .map(|input| match token {
+            Some(vocab::TOOL_SKILL) => skill_input(input),
+            Some(vocab::TOOL_ASK) => question_input(input),
+            _ => format_generic_input(input),
+        })
         .unwrap_or_default()
 }
 
@@ -3720,10 +3726,7 @@ fn read_input(tool: &ToolPanel, read: ReadShape<'_>) -> String {
     let Some(path) = read.path.filter(|path| !path.trim().is_empty()) else {
         // A path-less read keeps its raw payload (a bare string, an unknown
         // shape) rather than rendering an empty line.
-        return tool
-            .input()
-            .map(|input| format_named_input(tool.name(), input))
-            .unwrap_or_default();
+        return tool.input().map(format_generic_input).unwrap_or_default();
     };
     let mut line = format!("📖 {}", inline_code(path));
     if let Some(obj) = tool.input().and_then(serde_json::Value::as_object) {
@@ -3798,35 +3801,47 @@ fn fetch_input(input: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// Render a tool's input JSON as human-readable markdown, for the ids whose
-/// ENVELOPE is vendor-specific and has no shared shape. Anything else falls
-/// back to a generic key-value list. The migrated families (Execute,
-/// FileEdits, Read, Search, Fetch) are selected by their shape
-/// ([`format_tool_input`]), not here.
-fn format_named_input(name: &str, input: &serde_json::Value) -> String {
-    // Non-object inputs (a bare path string, a number) just display as-is.
+/// A vendor-free input fallback: one `- key: value` line per scalar field,
+/// nested values compacted and clipped, or a non-object input as-is. A
+/// third-party tool whose name happens to spell a closed token reaches this
+/// path, never the built-in's presentation.
+fn format_generic_input(input: &serde_json::Value) -> String {
     let obj = match input.as_object() {
         Some(o) => o,
         None => return input.as_str().map(|s| s.to_string()).unwrap_or_default(),
     };
-    let get = |k: &str| obj.get(k).and_then(|v| v.as_str());
-    match name {
-        "skill" => match get("name").or_else(|| get("id")) {
-            Some(name) => format!("🧩 {}", name),
-            None => input.to_string(),
-        },
-        "question" => match obj.get("questions").and_then(|v| v.as_array()) {
-            Some(questions) if !questions.is_empty() => {
-                let first = questions[0]
-                    .get("question")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let first = first_chunk(first, 120);
-                format!("❓ {} 个问题 · {}", questions.len(), first)
-            }
-            _ => input.to_string(),
-        },
-        _ => generic_tool_input(obj),
+    generic_tool_input(obj)
+}
+
+/// A `skill` call's Input line (the closed `name_only_token` arm).
+fn skill_input(input: &serde_json::Value) -> String {
+    let obj = match input.as_object() {
+        Some(o) => o,
+        None => return input.as_str().map(|s| s.to_string()).unwrap_or_default(),
+    };
+    obj.get("name")
+        .or_else(|| obj.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|name| format!("🧩 {}", name))
+        .unwrap_or_else(|| input.to_string())
+}
+
+/// A `question` call's Input line (the closed `name_only_token` arm).
+fn question_input(input: &serde_json::Value) -> String {
+    let obj = match input.as_object() {
+        Some(o) => o,
+        None => return input.as_str().map(|s| s.to_string()).unwrap_or_default(),
+    };
+    match obj.get("questions").and_then(serde_json::Value::as_array) {
+        Some(questions) if !questions.is_empty() => {
+            let first = questions[0]
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let first = first_chunk(first, 120);
+            format!("❓ {} 个问题 · {}", questions.len(), first)
+        }
+        _ => input.to_string(),
     }
 }
 
@@ -8974,12 +8989,17 @@ LSP errors detected in a.rs, please fix:
     /// instead of the generic `- name: …` key-value line.
     #[test]
     fn tool_input_skill_shows_its_name() {
-        let tool = ToolPanel::for_test(
-            "skill",
-            ToolStatus::Completed,
-            Some(json!({"name": "implement"})),
-            None,
-        );
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "skill".into(),
+                call_id: "call_skill".into(),
+            },
+            kind: ToolKind::Other,
+            detail: ToolDetail::None,
+            status: ToolStatus::Completed,
+            input: Some(json!({"name": "implement"})),
+            ..ToolCall::default()
+        });
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -9000,7 +9020,17 @@ LSP errors detected in a.rs, please fix:
                          {"label": "直接实现改进", "description": "…"}]},
             {"question": "第二个问题", "header": "其他", "options": []},
         ]});
-        let tool = ToolPanel::for_test("question", ToolStatus::Running, Some(input.clone()), None);
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "question".into(),
+                call_id: "call_question".into(),
+            },
+            kind: ToolKind::Other,
+            detail: ToolDetail::None,
+            status: ToolStatus::Running,
+            input: Some(input.clone()),
+            ..ToolCall::default()
+        });
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
@@ -9015,11 +9045,8 @@ LSP errors detected in a.rs, please fix:
 
         // The count reads the same for one question or many.
         let single = json!({"questions": [{"question": "继续?", "header": "确认", "options": []}]});
-        assert_eq!(format_named_input("question", &single), "❓ 1 个问题 · 继续?");
-        assert_eq!(
-            format_named_input("question", &input),
-            "❓ 2 个问题 · issue 202 你想让我做什么？"
-        );
+        assert_eq!(question_input(&single), "❓ 1 个问题 · 继续?");
+        assert_eq!(question_input(&input), "❓ 2 个问题 · issue 202 你想让我做什么？");
     }
 
     /// Regression: a tool whose input renders as markdown LIST lines (the
@@ -9578,13 +9605,36 @@ Report
     /// and already handled.
     #[test]
     fn skill_input_reads_v2_id_and_v1_name() {
-        assert_eq!(
-            format_named_input("skill", &json!({"id": "implement"})),
-            "🧩 implement"
+        assert_eq!(skill_input(&json!({"id": "implement"})), "🧩 implement");
+        assert_eq!(skill_input(&json!({"name": "caveman"})), "🧩 caveman");
+    }
+
+    /// An opaque third-party tool named `skill` or `question` is not the
+    /// built-in: only the closed `name_only_token` arm (`Other + None`) gets
+    /// the tailored Input line.
+    #[test]
+    fn an_opaque_tool_named_skill_or_question_stays_generic() {
+        let skill = ToolPanel::for_test(
+            "skill",
+            ToolStatus::Completed,
+            Some(json!({"id": "implement"})),
+            None,
         );
-        assert_eq!(
-            format_named_input("skill", &json!({"name": "caveman"})),
-            "🧩 caveman"
+        let input = format_tool_input(&skill);
+        assert!(
+            input.starts_with("- id:"),
+            "an opaque skill-named tool is not the closed arm: {input}"
+        );
+        let question = ToolPanel::for_test(
+            "question",
+            ToolStatus::Completed,
+            Some(json!({"questions": []})),
+            None,
+        );
+        let input = format_tool_input(&question);
+        assert!(
+            input.starts_with("- questions:"),
+            "an opaque question-named tool is not the closed arm: {input}"
         );
     }
 
