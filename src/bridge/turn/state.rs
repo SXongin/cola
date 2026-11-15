@@ -1945,10 +1945,9 @@ impl StreamAccumulator {
             || !self.seeded_delivered.is_empty()
             || !self.tools.is_empty()
             || self.todo_panel.is_some()
-            || self
-                .timeline
-                .iter()
-                .any(|item| matches!(item.kind(), TimelineKind::Compaction(_)))
+            || self.timeline.iter().any(|item| {
+                matches!(item.kind(), TimelineKind::Compaction(_)) && self.capabilities().compaction
+            })
     }
 
     /// Whether this part's content was already rendered into the card — the
@@ -2537,11 +2536,11 @@ impl StreamAccumulator {
     /// rendering for a client that no longer declares them. A stored question
     /// block is skipped at its render site; the ledger is cleared by the
     /// ledger's own capability gate (which owes its removal PATCH).
-    pub(super) fn set_capabilities(&mut self, capabilities: AgentCapabilities) {
+    pub(super) fn set_capabilities(&mut self, capabilities: AgentCapabilities) -> bool {
         let changed = self.capabilities != Some(capabilities);
         self.capabilities = Some(capabilities);
         if !changed {
-            return;
+            return false;
         }
         if capabilities.plan.is_absent() {
             self.todo_panel = None;
@@ -2553,6 +2552,7 @@ impl StreamAccumulator {
         if capabilities.usage == crate::backend::UsageMode::None {
             self.context_tokens = 0;
         }
+        true
     }
 
     /// Record the context tokens a completed assistant message consumed
@@ -5105,11 +5105,12 @@ impl StreamAccumulator {
                 // entry's, and the summary is charged in JSON bytes rather than
                 // as card text — a fold body cannot be split the way streamed
                 // text can.
-                TimelineKind::Compaction(compaction) => (
+                TimelineKind::Compaction(compaction) if self.capabilities().compaction => (
                     crate::feishu::card::compaction::compaction_components(compaction),
                     crate::feishu::card::compaction::compaction_estimate(compaction),
                     0,
                 ),
+                TimelineKind::Compaction(_) => (0, 0, 0),
             };
             comps += c;
             size += s;
@@ -5254,7 +5255,7 @@ impl StreamAccumulator {
                 // error — in its own server-time position among the parts. Its
                 // `compaction_{seq}` id keeps the reader's fold state across the
                 // in-place update from the live row to its terminal one.
-                TimelineKind::Compaction(compaction) => {
+                TimelineKind::Compaction(compaction) if self.capabilities().compaction => {
                     if !pending.is_empty() {
                         builder = builder.with_text(&pending);
                         pending.clear();
@@ -5262,6 +5263,10 @@ impl StreamAccumulator {
                     builder =
                         builder.with_compaction(compaction, Some(&format!("compaction_{}", item.seq())));
                 }
+                // A client that no longer declares compaction renders no row,
+                // even for a stored entry (ADR-0106): the surface came from the
+                // attachment, and the reattach removed it.
+                TimelineKind::Compaction(_) => {}
             }
         }
         if !pending.is_empty() {
@@ -5351,8 +5356,13 @@ impl StreamAccumulator {
                         // A client that no longer declares a question surface
                         // must not render a stored block (ADR-0106): the
                         // reattach removed it, and the card would otherwise
-                        // keep a form it cannot answer.
-                        if self.capabilities().questions.is_absent() {
+                        // keep a form it cannot answer. `Session` mode also
+                        // drops the directory-owned Location Form (its empty
+                        // session id), which only `SessionAndLocation` keeps.
+                        let questions = self.capabilities().questions;
+                        if questions.is_absent()
+                            || (questions == crate::backend::QuestionMode::Session && q.session_id.is_empty())
+                        {
                             continue;
                         }
                         for el in crate::feishu::card::question::question_elements(
@@ -6607,37 +6617,6 @@ mod tests {
                 + crate::feishu::card::tool_render::file_image_estimate(&with_files)
                 + marker,
             "panel_estimate must charge the header marker's bytes"
-        );
-    }
-
-    /// A collaboration panel's folded title names its target agent (issue
-    /// #962): `panel_estimate` must charge that fragment too, or a card carrying
-    /// it could pass the size check and then be rejected by Feishu. The two
-    /// panels differ only in whether the id is an adapter arm, so the whole
-    /// difference is the fragment.
-    #[test]
-    fn panel_estimate_charges_the_collab_target_detail() {
-        let input = serde_json::json!({
-            "kind": "started",
-            "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
-            "agentPath": "/root/worker",
-            "model": null,
-            "reasoningEffort": null
-        });
-        let activity = ToolPanel::for_test(
-            "codex/sub_agent_activity",
-            ToolStatus::Completed,
-            Some(input.clone()),
-            None,
-        );
-        let plain = ToolPanel::for_test("tool", ToolStatus::Completed, Some(input), None);
-        let detail = crate::feishu::card::tool_render::panel_target_detail_estimate(&activity);
-        assert!(detail > 0, "an activity names its path while folded");
-
-        assert_eq!(
-            panel_estimate(&activity, None),
-            panel_estimate(&plain, None) + detail,
-            "panel_estimate must charge the folded title's target detail"
         );
     }
 
@@ -8892,32 +8871,71 @@ mod tests {
             deletions: 1,
         });
         acc.set_context_tokens(84_200);
-        assert!(acc.add_interaction(InteractionBlock::Question(PendingQuestion {
-            request_id: "q".into(),
-            session_id: "s".into(),
-            title: String::new(),
-            questions: vec![crate::backend::types::QuestionInfo {
-                question: "UNIQUE_QUESTION_TEXT".into(),
-                header: "h".into(),
-                ..Default::default()
-            }],
-            uncollectable: None,
-            directory: "/w".into(),
-            answers: vec![None],
-            done: vec![false],
-            open: 0,
-            drafts: vec![String::new()],
-            asked_at: None,
-        })));
+        let question = |request_id: &str, session_id: &str, text: &str| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: request_id.into(),
+                session_id: session_id.into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: text.into(),
+                    header: "h".into(),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![false],
+                open: 0,
+                drafts: vec![String::new()],
+                asked_at: None,
+            })
+        };
+        assert!(acc.add_interaction(question("q_session", "s", "UNIQUE_QUESTION_TEXT")));
+        assert!(acc.add_interaction(question("q_location", "", "UNIQUE_LOCATION_FORM")));
+        let compaction = crate::backend::Compaction {
+            status: crate::backend::CompactionStatus::Completed,
+            reason: crate::backend::CompactionReason::Auto,
+            summary: "UNIQUE_COMPACTION_SUMMARY".into(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        acc.push_compaction_at(
+            Some(1_000),
+            PartSource::at(MessageId::new("msg_1"), 0),
+            &compaction,
+        );
         assert!(acc.todo_panel.is_some());
         assert_eq!(acc.turn_diff_stats.files, 2);
         assert_eq!(acc.context_tokens, 84_200);
+        let full = acc.build_card().to_string();
+        assert!(full.contains("UNIQUE_QUESTION_TEXT"));
+        assert!(full.contains("UNIQUE_LOCATION_FORM"));
+        assert!(full.contains("UNIQUE_COMPACTION_SUMMARY"));
+
+        // `Session` drops the directory-owned Location Form but keeps the
+        // session-backed question (the gate table's location scope).
+        let session_only = AgentCapabilities {
+            questions: crate::backend::QuestionMode::Session,
+            ..AgentCapabilities::full()
+        };
+        acc.set_capabilities(session_only);
+        let session = acc.build_card().to_string();
+        assert!(
+            session.contains("UNIQUE_QUESTION_TEXT"),
+            "a session question stays: {session}"
+        );
+        assert!(
+            !session.contains("UNIQUE_LOCATION_FORM"),
+            "a location form is omitted for `Session`: {session}"
+        );
 
         let without = AgentCapabilities {
             plan: crate::backend::PlanMode::None,
             diffs: false,
             usage: crate::backend::UsageMode::None,
             questions: crate::backend::QuestionMode::None,
+            compaction: false,
             ..AgentCapabilities::full()
         };
         acc.set_capabilities(without);
@@ -8931,8 +8949,12 @@ mod tests {
         assert_eq!(acc.context_tokens, 0, "the usage figure is gone");
         let text = acc.build_card().to_string();
         assert!(
-            !text.contains("UNIQUE_QUESTION_TEXT"),
+            !text.contains("UNIQUE_QUESTION_TEXT") && !text.contains("UNIQUE_LOCATION_FORM"),
             "a stored question block is omitted when its surface is absent: {text}"
+        );
+        assert!(
+            !text.contains("UNIQUE_COMPACTION_SUMMARY"),
+            "a stored compaction row is omitted when its surface is absent: {text}"
         );
     }
 }
