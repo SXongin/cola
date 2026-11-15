@@ -3288,10 +3288,13 @@ async fn live_panel_children(cards: &CardsHandle, session_id: &str) -> Vec<(Stri
 /// reads the one gather. Returns the panel pairs the caller attaches the result
 /// to.
 ///
-/// The gate is [`crate::backend::Backend::reports_live_runs`] (`background_runs
-/// || child_evidence`, ADR-0106): a
-/// child-only client such as Codex has no background concept but does report
-/// live runs, so its liveness line renders.
+/// The gate is the `child_agents` axis (ADR-0106): the liveness line belongs to
+/// the child-agent surface, so an Agent Client that declares
+/// [`crate::backend::ChildAgentMode::None`] spends no child read. The ledger
+/// and the reconciliation's early return are the `reports_live_runs()` consumers
+/// — a child-only client such as Codex has no background concept but does report
+/// live runs, and OpenCode V1 has child sessions and no child-evidence read, so
+/// its readable child transcripts still supply the panel's liveness.
 async fn gather_render_liveness(
     cards: &CardsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
@@ -3303,8 +3306,8 @@ async fn gather_render_liveness(
     std::collections::HashMap<String, TaskLiveness>,
 ) {
     let panels = live_panel_children(cards, session_id).await;
-    if !backend.reports_live_runs() {
-        // No live-run surface: a live panel still renders, but there is no
+    if backend.capabilities().child_agents == crate::backend::ChildAgentMode::None {
+        // No child-agent surface: a live panel still renders, but there is no
         // child liveness read to spend for it.
         return (panels, std::collections::HashMap::new());
     }
@@ -11735,6 +11738,114 @@ Index: /x/src/main.rs
             text.lines()
                 .any(|line| line.contains("⏳ subagent") && line.contains("bash ")),
             "the live panel carries the same fragment: {text}"
+        );
+    }
+
+    /// ADR-0106: the panel liveness gather gates on `child_agents`, not on the
+    /// live-run predicate. OpenCode V1 declares child sessions but no
+    /// child-evidence read, so `reports_live_runs()` is false; its readable
+    /// child transcript must still supply the panel's liveness line.
+    #[tokio::test]
+    async fn a_child_session_client_without_live_runs_still_reads_panel_liveness() {
+        let _wd = test_work_dir();
+        let now = chrono::Utc::now().timestamp_millis();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.capabilities = crate::backend::AgentCapabilities {
+            background_runs: false,
+            child_agents: crate::backend::ChildAgentMode::ChildSessions,
+            child_evidence: false,
+            ..crate::backend::AgentCapabilities::full()
+        };
+        assert!(
+            !backend.capabilities.reports_live_runs(),
+            "V1 is the child-session-without-evidence shape"
+        );
+        let backend = Arc::new(backend);
+        let child = SessionTranscript::new(vec![message(
+            "a_child",
+            now - 5_000,
+            vec![Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "codex/command_execution".into(),
+                    call_id: "call_child".into(),
+                },
+                kind: ToolKind::Execute,
+                detail: ToolDetail::Command {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    description: None,
+                    exit: None,
+                    timeout: false,
+                },
+                status: ToolStatus::Running,
+                started_at: Some(now - 5_000),
+                output: ToolOutput::default(),
+                ..ToolCall::default()
+            })],
+        )]);
+        backend
+            .given_transcript_after_build("ses_v1_child", vec![child])
+            .await;
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_panel_liveness";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_panel_liveness")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        Turn::clear_phase(&cards, sid).await;
+        {
+            let mut live = cards.cards.lock().await;
+            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            acc.push_tool_at(
+                Some(now - 5_000),
+                "call_panel",
+                ToolPanel::new(ToolCall {
+                    identity: ToolIdentity {
+                        name: "task".into(),
+                        call_id: "call_panel".into(),
+                    },
+                    status: ToolStatus::Running,
+                    started_at: Some(now - 5_000),
+                    input: Some(serde_json::json!({"description": "review the diff"})),
+                    output: ToolOutput::default(),
+                    detail: ToolDetail::Delegation {
+                        runs: vec![crate::backend::AgentRunRef {
+                            run_id: "ses_v1_child".into(),
+                            status: None,
+                        }],
+                        effect: crate::backend::DelegationEffect::Launch,
+                    },
+                    ..ToolCall::default()
+                }),
+            );
+        }
+
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &SessionTranscript::default(),
+        )
+        .await;
+
+        let reads = backend
+            .transcript_calls
+            .lock()
+            .await
+            .iter()
+            .filter(|id| id.as_str() == "ses_v1_child")
+            .count();
+        assert_eq!(reads, 1, "the child session is read for its panel's liveness");
+        let card = platform.updated_cards().await.last().cloned().unwrap();
+        let text = card_text(&card);
+        assert!(
+            text.lines()
+                .any(|line| line.contains("⏳ subagent") && line.contains("shell ")),
+            "the panel carries the child's liveness line: {text}"
         );
     }
 
