@@ -34,9 +34,9 @@ use super::drain::{
 };
 use crate::backend::types::SessionStatus;
 use crate::backend::{
-    BackgroundTask, ChildEvidence, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, Part,
-    SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolDetail, ToolIdentity, ToolKind,
-    ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
+    BackgroundTask, ChildEvidence, ChildRuntime, ContentBlock, FileAction, FileEdit, FinishReason, MessageId,
+    MessageRole, Part, SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolDetail,
+    ToolIdentity, ToolKind, ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
 use crate::bridge::chain::{ChainRecords, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
 use crate::bridge::tasks::TaskRunId;
@@ -5577,23 +5577,54 @@ async fn a_future_start_time_renders_zero_elapsed() {
 // ---------------------------------------------------------------------------
 
 /// A child-session transcript whose newest part is a running tool started at
-/// `started_at` — the activity the yielded ledger row shows as `<name> <age>`.
-fn child_running_tool(started_at: i64, name: &str) -> SessionTranscript {
+/// `started_at` — the activity a ledger row renders as `<token> <age>`. Each
+/// shape selects a real neutral shape, never `ToolCall::default()`'s
+/// `Other`/`Opaque`, so the line exercises the `(kind, detail)` token
+/// derivation (spec #1057's P4) rather than the opaque fallback: a command is
+/// Codex's `codex/command_execution` (`Execute` + `Command`) and reads
+/// `shell`, while an edit carries `FileEdits` and reads `edit`.
+fn child_running_tool(started_at: i64, shape: &str) -> SessionTranscript {
+    let (identity, kind, detail) = match shape {
+        "edit" => (
+            "codex/file_change",
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "src/main.rs".into(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: None,
+            }]),
+        ),
+        _ => (
+            "codex/command_execution",
+            ToolKind::Execute,
+            ToolDetail::Command {
+                command: "cargo test".to_string(),
+                cwd: None,
+                description: None,
+                exit: None,
+                timeout: false,
+            },
+        ),
+    };
     SessionTranscript::new(vec![typed_message(
         "a_child",
         MessageRole::Assistant,
         Some(started_at),
         vec![Part::Tool(ToolCall {
             identity: ToolIdentity {
-                name: name.into(),
+                name: identity.into(),
                 call_id: "call_child".into(),
             },
+            kind,
+            detail,
             status: ToolStatus::Running,
             started_at: Some(started_at),
             input: Some(serde_json::json!({ "command": "cargo test" })),
             metadata: None,
             output: ToolOutput::default(),
-            ..ToolCall::default()
+            title: None,
+            locations: Vec::new(),
         })],
     )])
 }
@@ -5611,7 +5642,7 @@ fn child_replying(at: i64) -> SessionTranscript {
 }
 
 /// The row starting with `prefix`'s activity fragment — everything it renders
-/// after its start clock (`bash 5s`, `waiting 30s · 等待你的授权`), or `None` when
+/// after its start clock (`shell 5s`, `waiting 30s · 等待你的授权`), or `None` when
 /// the row carries none (a shell row, an unconfirmed row, a subagent row with
 /// no stored fragment). A subagent row renders no total elapsed, so the
 /// fragment follows the `HH:MM` clock directly; a row with no clock has the
@@ -5642,7 +5673,7 @@ fn parsed_task_elapsed(seg: &str) -> Option<u64> {
     }
 }
 
-/// The seconds a fragment's age names — `bash 5s`, `waiting 1m30s`.
+/// The seconds a fragment's age names — `shell 5s`, `waiting 1m30s`.
 fn activity_age_secs(activity: &str) -> u64 {
     let age = activity
         .split(' ')
@@ -5665,7 +5696,7 @@ async fn a_yielded_subagents_row_shows_its_childs_liveness() {
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     let tool_started = now - 5_000;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(tool_started, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(tool_started, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
     // The yield's own rendering no longer establishes the fragment on its own —
@@ -5684,13 +5715,17 @@ async fn a_yielded_subagents_row_shows_its_childs_liveness() {
     let card = platform.updated_cards().await.last().cloned().unwrap();
     let activity = ledger_activity(&card, "· subagent：**review the diff**")
         .unwrap_or_else(|| panic!("the subagent row carries its child's activity: {card}"));
-    let (name, age) = activity
+    let (name, _age) = activity
         .split_once(' ')
         .unwrap_or_else(|| panic!("activity names the tool before its age: {activity:?}"));
-    assert_eq!(name, "bash", "the running tool's own name: {activity:?}");
+    assert_eq!(
+        name, "shell",
+        "the neutral token, never the vendor id: {activity:?}"
+    );
     assert!(
-        age.ends_with('s'),
-        "the age is second-granular at the yield: {activity:?}"
+        activity_age_secs(&activity) >= 5,
+        "the age counts from the call's own start ({} ms ago): {activity:?}",
+        now - tool_started
     );
     // The row reads type, bold label, start clock, then the fragment directly:
     // a subagent row renders no total elapsed.
@@ -5794,7 +5829,7 @@ async fn one_pass_reads_each_distinct_child_once() {
     ]);
     let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
     backend
-        .given_transcript_after_build("ses_shared", vec![child_running_tool(now - 5_000, "bash")])
+        .given_transcript_after_build("ses_shared", vec![child_running_tool(now - 5_000, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
 
@@ -5861,7 +5896,7 @@ async fn a_failed_child_read_keeps_the_last_fragment_and_grows_its_age() {
     let live = waiting_shell_and_subagent(now - 120_000, now - 90_000);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 80_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 80_000, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
 
@@ -5901,8 +5936,8 @@ async fn a_failed_child_read_keeps_the_last_fragment_and_grows_its_age() {
         .unwrap_or_else(|| panic!("the failed read keeps the last fragment: {card}"));
     assert_eq!(
         later.split_once(' ').unwrap().0,
-        "bash",
-        "the fragment keeps the tool the last successful read named: {later:?}"
+        "shell",
+        "the fragment keeps the token the last successful read named: {later:?}"
     );
     assert!(
         activity_age_secs(&later) > first_age,
@@ -5961,7 +5996,7 @@ async fn an_unconfirmed_row_renders_no_activity_and_recovers_it() {
     let live = waiting_shell_and_subagent(now - 60_000, now - 30_000);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 10_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 10_000, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
 
@@ -5984,7 +6019,7 @@ async fn an_unconfirmed_row_renders_no_activity_and_recovers_it() {
         .unwrap_or_else(|| panic!("the subagent row: {marked}"))
         .to_string();
     assert!(
-        row.ends_with("⚠️ 状态待确认") && !row.contains("bash"),
+        row.ends_with("⚠️ 状态待确认") && !row.contains("shell"),
         "an unconfirmed row carries the marker and no activity: {row:?}"
     );
 
@@ -5998,7 +6033,7 @@ async fn an_unconfirmed_row_renders_no_activity_and_recovers_it() {
     let restored = platform.updated_cards().await.last().cloned().unwrap();
     let activity = ledger_activity(&restored, "· subagent：**review the diff**").unwrap();
     assert!(
-        activity.starts_with("bash ") && activity_age_secs(&activity) >= 10,
+        activity.starts_with("shell ") && activity_age_secs(&activity) >= 10,
         "the fragment returns with its age still counting from the stored start: {activity:?}"
     );
 }
@@ -6032,7 +6067,7 @@ async fn a_typed_answer_freezes_the_live_task_panel_activity() {
     ]);
     let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "command")])
         .await;
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建并审阅"));
     wait_for_card_update(
@@ -6041,7 +6076,7 @@ async fn a_typed_answer_freezes_the_live_task_panel_activity() {
         CardUpdates::Latest,
         |card| {
             ledger_activity(card, "· subagent：**review the diff**")
-                .is_some_and(|activity| activity.starts_with("bash "))
+                .is_some_and(|activity| activity.starts_with("shell "))
         },
     )
     .await;
@@ -6091,7 +6126,7 @@ async fn a_retired_subagents_activity_leaves_with_its_row() {
     let live = waiting_shell_and_subagent(now - 60_000, now - 30_000);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 20_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 20_000, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
     spawn_sync(&app);
@@ -6126,7 +6161,7 @@ async fn a_retired_subagents_activity_leaves_with_its_row() {
         "the retired row is gone: {card}"
     );
     assert!(
-        !text.contains("bash 2") && !text.contains("· bash"),
+        !text.contains("· shell ") && !text.contains("shell 2"),
         "the activity fragment left with its row: {card}"
     );
     assert!(
@@ -6152,7 +6187,7 @@ async fn a_yielded_rows_activity_age_advances_on_the_rendered_second() {
     let live = waiting_shell_and_subagent(frozen_start(now), now - 30_000);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
 
@@ -6253,7 +6288,7 @@ async fn a_typed_answer_freezes_the_yielded_ledger() {
     let live = waiting_shell_and_subagent(frozen_start(now), now - 30_000);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
 
@@ -6388,7 +6423,7 @@ async fn a_click_only_question_leaves_the_yielded_ledger_clock_running() {
     let live = waiting_shell_and_subagent(frozen_start(now), now - 30_000);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "command")])
         .await;
     yield_waiting_card(&app, &platform, 2).await;
 
@@ -6450,7 +6485,7 @@ async fn a_live_subagents_row_shows_its_childs_liveness() {
     ]);
     let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "command")])
         .await;
 
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建并审阅"));
@@ -6460,7 +6495,7 @@ async fn a_live_subagents_row_shows_its_childs_liveness() {
         CardUpdates::Latest,
         |card| {
             ledger_activity(card, "· subagent：**review the diff**")
-                .is_some_and(|activity| activity.starts_with("bash "))
+                .is_some_and(|activity| activity.starts_with("shell "))
         },
     )
     .await;
@@ -6471,7 +6506,7 @@ async fn a_live_subagents_row_shows_its_childs_liveness() {
     let (name, age) = activity
         .split_once(' ')
         .unwrap_or_else(|| panic!("activity names the tool before its age: {activity:?}"));
-    assert_eq!(name, "bash", "the running tool's own name: {activity:?}");
+    assert_eq!(name, "shell", "the running tool's own name: {activity:?}");
     assert!(
         age.ends_with('s') && activity_age_secs(&activity) >= 5,
         "the live fragment's age is second-granular and true: {activity:?}"
@@ -6541,7 +6576,7 @@ async fn a_live_subagents_row_refreshes_to_the_childs_new_activity() {
 
     // The child starts a tool: the next renders carry the typed change.
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 1_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 1_000, "command")])
         .await;
     wait_for_card_update(
         &platform,
@@ -6549,7 +6584,7 @@ async fn a_live_subagents_row_refreshes_to_the_childs_new_activity() {
         CardUpdates::Latest,
         |card| {
             ledger_activity(card, "· subagent：**review the diff**")
-                .is_some_and(|activity| activity.starts_with("bash "))
+                .is_some_and(|activity| activity.starts_with("shell "))
         },
     )
     .await;
@@ -6580,7 +6615,7 @@ async fn a_live_subagents_activity_age_advances_with_the_render_clock() {
     .with_background_tasks(vec![live_subagent(now - 30_000, "call_sub")]);
     let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
     backend
-        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "bash")])
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "command")])
         .await;
 
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下审阅"));
