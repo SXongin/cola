@@ -1888,22 +1888,9 @@ impl StreamAccumulator {
             };
             current && self.todo_shown_at == call.started_at
         } else {
-            #[cfg(test)]
-            {
-                // A fixture may hand-build the raw call without the adapter's
-                // semantic fields; both sides normalize so an unchanged poll
-                // still dedupes.
-                let call = ToolPanel::normalized_call(call.clone());
-                self.tools
-                    .get(&call.identity.call_id)
-                    .is_some_and(|panel| panel.call() == &call)
-            }
-            #[cfg(not(test))]
-            {
-                self.tools
-                    .get(&call.identity.call_id)
-                    .is_some_and(|panel| panel.call() == call)
-            }
+            self.tools
+                .get(&call.identity.call_id)
+                .is_some_and(|panel| panel.call() == call)
         }
     }
 
@@ -5821,7 +5808,47 @@ pub(super) use crate::bridge::tasks::{task_kind, task_label};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{BackgroundTask, ToolIdentity, ToolStatus};
+    use crate::backend::{BackgroundTask, FileAction, FileEdit, ToolIdentity, ToolStatus};
+
+    fn write_panel(path: &str, content: &str, output: Option<&str>) -> ToolPanel {
+        let lines: Vec<&str> = content.lines().collect();
+        let diff = (!lines.is_empty()).then(|| {
+            let mut diff = format!("@@ -0,0 +1,{} @@\n", lines.len());
+            for line in lines {
+                diff.push('+');
+                diff.push_str(line);
+                diff.push('\n');
+            }
+            diff.trim_end_matches(['\r', '\n']).to_string()
+        });
+        ToolPanel::for_test_file_edits(
+            "write",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"filePath": path, "content": content})),
+            output,
+            vec![FileEdit {
+                path: path.to_string(),
+                action: FileAction::Add,
+                rename_to: None,
+                diff,
+            }],
+        )
+    }
+
+    fn edit_panel(path: &str, diff: &str) -> ToolPanel {
+        ToolPanel::for_test_file_edits(
+            "edit",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"filePath": path})),
+            Some("Edit applied successfully."),
+            vec![FileEdit {
+                path: path.to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: crate::backend::file_edit_hunks(diff),
+            }],
+        )
+    }
 
     /// The slice fingerprint hashes VALUES, not lengths (issue #886 review): a
     /// compaction summary rewritten to a same-length sentence changes the
@@ -6375,12 +6402,7 @@ mod tests {
     /// and charges nothing.
     #[test]
     fn panel_estimate_charges_the_open_button() {
-        let written = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(serde_json::json!({"filePath": "report.md", "content": "hi"})),
-            Some("written"),
-        );
+        let written = write_panel("report.md", "hi", Some("written"));
         let button = crate::feishu::card::tool_render::tool_open_button_estimate(&written, Some("ses_1"));
         assert!(button > 0, "a written file's button has a byte cost");
         // The same panel with and without a Session differs by exactly the
@@ -6390,7 +6412,8 @@ mod tests {
             panel_estimate(&written, None) + button,
             "panel_estimate must charge the button's bytes"
         );
-        let pathless = ToolPanel::for_test("write", ToolStatus::Completed, None, Some("written"));
+        let pathless =
+            ToolPanel::for_test_file_edits("write", ToolStatus::Completed, None, Some("written"), Vec::new());
         assert_eq!(
             crate::feishu::card::tool_render::tool_open_button_estimate(&pathless, Some("ses_1")),
             0,
@@ -6417,10 +6440,9 @@ mod tests {
     fn panel_estimate_charges_a_read_panels_button_and_note() {
         // A body well past the panel's own budget: the panel clips it, so the
         // note renders beside the button.
-        let clipped = ToolPanel::for_test(
-            "read",
+        let clipped = ToolPanel::for_test_read(
             ToolStatus::Completed,
-            Some(serde_json::json!({"path": "/x/big.rs"})),
+            Some("/x/big.rs"),
             Some(&format!("Read file /x/big.rs, lines 1-1\n{}", "x".repeat(4_000))),
         );
         let button = crate::feishu::card::tool_render::tool_open_button_estimate(&clipped, Some("ses_1"));
@@ -6435,10 +6457,9 @@ mod tests {
         );
 
         // A body that fits carries no note: only the button is charged.
-        let small = ToolPanel::for_test(
-            "read",
+        let small = ToolPanel::for_test_read(
             ToolStatus::Completed,
-            Some(serde_json::json!({"path": "/x/small.rs"})),
+            Some("/x/small.rs"),
             Some("Read file /x/small.rs, lines 1-1\n1: fn main() {}"),
         );
         let button = crate::feishu::card::tool_render::tool_open_button_estimate(&small, Some("ses_1"));
@@ -6461,14 +6482,7 @@ mod tests {
     /// instead of splitting.
     #[test]
     fn panel_estimate_charges_a_write_panels_content_body() {
-        let write = |content: &str| {
-            ToolPanel::for_test(
-                "write",
-                ToolStatus::Completed,
-                Some(serde_json::json!({"filePath": "big.rs", "content": content})),
-                Some("Wrote file successfully."),
-            )
-        };
+        let write = |content: &str| write_panel("big.rs", content, Some("Wrote file successfully."));
         let max = crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS;
         let long = write(&"x".repeat(max));
         let short = write("x");
@@ -6523,26 +6537,8 @@ mod tests {
     /// diff, and the bytes the clip note adds are charged beside the button.
     #[test]
     fn a_diff_panels_body_and_note_stay_under_the_card_budget() {
-        use crate::backend::{ContentBlock, ToolOutput};
         let widest = "\u{1}".repeat(9_000);
-        let panel = ToolPanel::new(ToolCall {
-            identity: ToolIdentity {
-                name: "edit".into(),
-                call_id: "call_edit".into(),
-            },
-            status: ToolStatus::Completed,
-            started_at: None,
-            input: Some(serde_json::json!({"filePath": "big.rs"})),
-            metadata: Some(serde_json::json!({
-                "diff": format!("@@ -1,1 +1,1 @@\n+{widest}\n"),
-            })),
-            output: ToolOutput {
-                raw: Some(serde_json::json!("Edit applied successfully.")),
-                blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
-                error: None,
-            },
-            ..ToolCall::default()
-        });
+        let panel = edit_panel("big.rs", &format!("@@ -1,1 +1,1 @@\n+{widest}\n"));
         let estimate = panel_estimate(&panel, Some("ses_1"));
         assert!(
             estimate < crate::feishu::card::MAX_CARD_JSON_CHARS,
@@ -6587,27 +6583,11 @@ mod tests {
     /// and a panel cannot split away from itself.
     #[test]
     fn a_backtick_diff_body_and_its_fence_stay_under_the_card_budget() {
-        use crate::backend::{ContentBlock, ToolOutput};
         let diff = format!(
             "Index: src/main.rs\n--- src/main.rs\n+++ src/main.rs\n@@ -1,1 +1,1 @@\n+{}\n",
             "`".repeat(25_000)
         );
-        let panel = ToolPanel::new(ToolCall {
-            identity: ToolIdentity {
-                name: "edit".into(),
-                call_id: "call_edit".into(),
-            },
-            status: ToolStatus::Completed,
-            started_at: None,
-            input: Some(serde_json::json!({"filePath": "src/main.rs"})),
-            metadata: Some(serde_json::json!({ "diff": diff })),
-            output: ToolOutput {
-                raw: Some(serde_json::json!("Edit applied successfully.")),
-                blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
-                error: None,
-            },
-            ..ToolCall::default()
-        });
+        let panel = edit_panel("src/main.rs", &diff);
         let estimate = panel_estimate(&panel, Some("ses_1"));
         assert!(
             estimate < crate::feishu::card::MAX_CARD_JSON_CHARS,
@@ -6633,12 +6613,7 @@ mod tests {
     /// detail's charge.
     #[test]
     fn panel_estimate_charges_the_header_file_detail() {
-        let named = ToolPanel::for_test(
-            "write",
-            ToolStatus::Completed,
-            Some(serde_json::json!({"filePath": "a \"quoted\".md"})),
-            Some("ok"),
-        );
+        let named = write_panel("a \"quoted\".md", "", Some("ok"));
         let anonymous = ToolPanel::for_test(
             "bash",
             ToolStatus::Completed,
@@ -6652,9 +6627,25 @@ mod tests {
             0,
             "a tool that names no file charges no detail"
         );
-        assert!(
-            panel_estimate(&named, None) >= detail,
-            "panel_estimate includes the header detail's bytes"
+        let input = named
+            .input()
+            .map(|input| input.to_string())
+            .map(|input| first_n_chars_bytes(&input, 400))
+            .unwrap_or(0);
+        let expected = 400
+            + input
+            + crate::feishu::card::tool_render::panel_output_estimate(&named)
+            + crate::feishu::card::tool_render::file_tracking_estimate(&named)
+            + crate::feishu::card::tool_render::file_image_estimate(&named)
+            + crate::feishu::card::tool_render::file_header_marker_estimate(&named)
+            + detail
+            + crate::feishu::card::tool_render::panel_target_detail_estimate(&named)
+            + crate::feishu::card::tool_render::tool_open_button_estimate(&named, None)
+            + crate::feishu::card::tool_render::preview_truncation_note_estimate(&named, None);
+        assert_eq!(
+            panel_estimate(&named, None),
+            expected,
+            "panel_estimate includes the header detail's bytes exactly"
         );
     }
 
@@ -6674,12 +6665,7 @@ mod tests {
             for i in 0..35 {
                 acc.push_tool(
                     &format!("call_{i}"),
-                    ToolPanel::for_test(
-                        "write",
-                        ToolStatus::Completed,
-                        Some(serde_json::json!({"filePath": format!("r{i}.md")})),
-                        Some("ok"),
-                    ),
+                    write_panel(&format!("r{i}.md"), "", Some("ok")),
                 );
             }
             acc

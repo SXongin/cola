@@ -4840,6 +4840,10 @@ Index: /x/src/main.rs
             vec![crate::backend::ContentBlock::Text(output.to_string())],
         );
         call.metadata = Some(serde_json::json!({"diff": diff}));
+        call.kind = crate::backend::ToolKind::Edit;
+        call.detail = crate::backend::ToolDetail::FileEdits(vec![
+            crate::backend::file_edit_from_diff(Some("src/main.rs"), diff).expect("a unified diff"),
+        ]);
         let parts = vec![Part::Tool(call)];
         let mut acc = StreamAccumulator::new("test");
         render_parts(&mut acc, &parts);
@@ -8935,6 +8939,10 @@ Index: /x/src/main.rs
                     "diff": diff,
                     "filediff": { "file": "src/main.rs", "additions": 1, "deletions": 1 }
                 }));
+                call.kind = crate::backend::ToolKind::Edit;
+                call.detail = crate::backend::ToolDetail::FileEdits(vec![
+                    crate::backend::file_edit_from_diff(Some("src/main.rs"), diff).expect("a unified diff"),
+                ]);
             }
             Part::Tool(call)
         };
