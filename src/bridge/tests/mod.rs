@@ -5,6 +5,7 @@
 
 pub(crate) mod access;
 pub(crate) mod autoaccept_default;
+pub(crate) mod capabilities;
 pub(crate) mod card_handles;
 pub(crate) mod card_pull;
 pub(crate) mod child;

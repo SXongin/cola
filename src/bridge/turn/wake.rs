@@ -320,6 +320,7 @@ impl Turn {
         // completion entries it owes are planned on it and their output tails
         // read before the lock is taken (spec #593; the reads are network).
         let mut acc = StreamAccumulator::new(title);
+        acc.set_capabilities(backend.capabilities());
         acc.adopt_turn_anchor(anchor);
         acc.set_session(session_id);
         // The chain's reply target (issue #580) is the target the successor's

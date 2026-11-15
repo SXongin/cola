@@ -83,12 +83,21 @@ pub(crate) async fn gather_snapshot(
             Vec::new()
         }
     };
-    let questions = match backend.list_questions(Some(directory)).await {
-        Ok(questions) => questions,
-        Err(e) => {
-            tracing::warn!("snapshot: list questions for {} failed: {}", session_id, e);
-            Vec::new()
-        }
+    let question_mode = backend.capabilities().questions;
+    let questions: Vec<_> = match question_mode {
+        crate::backend::QuestionMode::None => Vec::new(),
+        mode => match backend.list_questions(Some(directory)).await {
+            Ok(questions) => questions
+                .into_iter()
+                .filter(|question| {
+                    mode == crate::backend::QuestionMode::SessionAndLocation || !question.is_location()
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!("snapshot: list questions for {} failed: {}", session_id, e);
+                Vec::new()
+            }
+        },
     };
     // Only the adopted session's own requests belong on the snapshot — never a
     // sibling session's in the same directory, and never a sub-task child's
@@ -133,7 +142,16 @@ pub(crate) async fn gather_snapshot(
         Some(message) => backend.is_cola_authored(message.id.as_str()).await,
         None => false,
     };
-    let tail = transcript.transcript_tail();
+    let tail = {
+        let mut tail = transcript.transcript_tail();
+        // A Session Card renders the same Compaction rows as the live card
+        // (ADR-0082), so the capability gate applies here too (ADR-0106): a
+        // client with no compaction surface gets no marker.
+        if !backend.capabilities().compaction {
+            tail.retain(|entry| !matches!(entry, crate::backend::TailEntry::Compaction(_)));
+        }
+        tail
+    };
     // The ADR-0059 Waiting fact (#586): the newest user message's Turn is
     // complete (an assistant step finished it) while live Background Tasks
     // remain, and the server reads idle — exactly the read the follow's own

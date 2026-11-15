@@ -1890,10 +1890,19 @@ impl RequestKind for QuestionKind {
         &self,
         backend: &Arc<dyn crate::backend::DirectoryBackend>,
     ) -> crate::error::Result<Vec<PendingRequest>> {
-        backend
-            .list_questions()
-            .await
-            .map(|v| v.into_iter().map(PendingRequest::Question).collect())
+        // The question surface is a capability (ADR-0106): a client with no
+        // question axis lists nothing (no card, no inline block), and a client
+        // with session-only questions drops directory-owned Location Forms
+        // before they can surface.
+        let mode = backend.capabilities().questions;
+        if mode == crate::backend::QuestionMode::None {
+            return Ok(Vec::new());
+        }
+        let mut questions = backend.list_questions().await?;
+        if mode == crate::backend::QuestionMode::Session {
+            questions.retain(|question| !question.is_location());
+        }
+        Ok(questions.into_iter().map(PendingRequest::Question).collect())
     }
 
     async fn reject(

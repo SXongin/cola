@@ -58,6 +58,17 @@ pub(crate) async fn run(
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> crate::error::Result<()> {
+    // `/mcp` is a capability gate (ADR-0106): a client that publishes no MCP
+    // status surface reports the command as unsupported instead of rendering an
+    // empty card.
+    if !handles.flow.backend.capabilities().mcp {
+        handles
+            .flow
+            .platform
+            .reply_text(message_id, &unavailable_text(handles.flow.backend.client_name()))
+            .await?;
+        return Ok(());
+    }
     let directory = handles.current_project_directory(thread_key).await;
     let timeout_ms = handles.question.list_timeout_ms.load(Ordering::Relaxed);
     let Some(statuses) = crate::bridge::bounded_call(
@@ -158,6 +169,11 @@ pub(crate) async fn handle_action(
 ) -> Option<CardActionResult> {
     if value.get("op").and_then(Value::as_str) != Some("reopen") {
         return None;
+    }
+    if !handles.flow.backend.capabilities().mcp {
+        return Some(toast(
+            "当前 Agent Client 不提供 MCP 状态 + Location Form 读取接口。",
+        ));
     }
     let request_id = value.get("request_id").and_then(Value::as_str).unwrap_or("");
     let directory = value.get("directory").and_then(Value::as_str).unwrap_or("");
