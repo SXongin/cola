@@ -3107,13 +3107,19 @@ async fn render_and_flush_inner(
         // `subagent` rows and every live task panel (ADR-0060/0054). A change on
         // either must flush even when no part, header second or context figure
         // moved — the line is the only thing that changed.
-        Some((panel_children, liveness)) => {
+        Some(liveness) => {
+            let RenderLiveness {
+                panels: panel_children,
+                gathered: liveness,
+                clear_missing,
+            } = liveness;
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) => {
                     let ledger =
                         refresh_ledger(&mut card.acc, transcript, &liveness, backend.reports_live_runs());
-                    let liveness_changed = apply_task_liveness(&mut card.acc, &panel_children, &liveness);
+                    let liveness_changed =
+                        apply_task_liveness(&mut card.acc, &panel_children, &liveness, clear_missing);
                     // Only the ROW half is progress: a rendered elapsed/age
                     // crossing its cadence (the clock half) must not renew the
                     // external renderer's idle bound, or a silent task's
@@ -3284,6 +3290,17 @@ async fn live_panel_children(cards: &CardsHandle, session_id: &str) -> Vec<(Stri
     }
 }
 
+/// The liveness one render gathered for every surface that shows it, plus the
+/// panel pairs it attaches to. `clear_missing` distinguishes the modes whose
+/// map is authoritative for the line: an `ActivityReports` client (Codex) has
+/// no child transcript to fall back on, so a missing run means the line is
+/// gone, not stale.
+struct RenderLiveness {
+    panels: Vec<(String, String)>,
+    gathered: std::collections::HashMap<String, TaskLiveness>,
+    clear_missing: bool,
+}
+
 /// The child liveness one live render needs, gathered ONCE for every surface
 /// that shows it (spec #501, ticket #504; spec #1057's P4): the union of the
 /// card's live run panels' children ([`live_panel_children`]), the read's live
@@ -3293,58 +3310,91 @@ async fn live_panel_children(cards: &CardsHandle, session_id: &str) -> Vec<(Stri
 /// panel, a ledger row and a run is read once; a render that names no child at
 /// all spends no request. The map is keyed by every pair's own key — a panel's
 /// call id, a Background Task's call id, a run's `run_id` — so each surface
-/// reads the one gather. Returns the panel pairs the caller attaches the result
-/// to.
+/// reads the one gather.
 ///
-/// The gate is the `child_agents` axis (ADR-0106): the liveness line belongs to
-/// the child-agent surface, so an Agent Client that declares
-/// [`crate::backend::ChildAgentMode::None`] spends no child read. The ledger
-/// and the reconciliation's early return are the `reports_live_runs()` consumers
-/// — a child-only client such as Codex has no background concept but does report
-/// live runs, and OpenCode V1 has child sessions and no child-evidence read, so
-/// its readable child transcripts still supply the panel's liveness.
+/// The gate is the `child_agents` axis (ADR-0106). A child-session client
+/// (OpenCode) reads the child transcript; an `ActivityReports` client (Codex)
+/// states the run's activity on the parent transcript, so its panel liveness
+/// comes from the run's [`crate::backend::RunActivity`] with no child read, and
+/// a run that is no longer live clears the line ([`RenderLiveness::clear_missing`]).
 async fn gather_render_liveness(
     cards: &CardsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
     requests: &RequestsHandle,
     session_id: &str,
     transcript: &SessionTranscript,
-) -> (
-    Vec<(String, String)>,
-    std::collections::HashMap<String, TaskLiveness>,
-) {
+) -> RenderLiveness {
     let panels = live_panel_children(cards, session_id).await;
-    if backend.capabilities().child_agents == crate::backend::ChildAgentMode::None {
-        // No child-agent surface: a live panel still renders, but there is no
-        // child liveness read to spend for it.
-        return (panels, std::collections::HashMap::new());
-    }
-    let mut children = panels.clone();
-    children.extend(background_subagent_children(transcript));
-    for pair in transcript.run_children() {
-        if !children.contains(&pair) {
-            children.push(pair);
+    match backend.capabilities().child_agents {
+        crate::backend::ChildAgentMode::None => RenderLiveness {
+            panels,
+            gathered: std::collections::HashMap::new(),
+            clear_missing: true,
+        },
+        crate::backend::ChildAgentMode::ActivityReports => {
+            // The report is the activity: build the line from the run the
+            // launch panel names, keyed by both the run and its launch call.
+            let mut gathered = std::collections::HashMap::new();
+            for run in &transcript.runs {
+                if !run.is_live() {
+                    continue;
+                }
+                let Some(activity) = &run.activity else {
+                    continue;
+                };
+                let liveness = TaskLiveness::from_run(activity);
+                gathered.insert(run.run_id.clone(), liveness.clone());
+                for launch in &run.launched_by {
+                    gathered.insert(launch.call_id.clone(), liveness.clone());
+                }
+            }
+            RenderLiveness {
+                panels,
+                gathered,
+                clear_missing: true,
+            }
+        }
+        crate::backend::ChildAgentMode::ChildSessions => {
+            let mut children = panels.clone();
+            children.extend(background_subagent_children(transcript));
+            for pair in transcript.run_children() {
+                if !children.contains(&pair) {
+                    children.push(pair);
+                }
+            }
+            if children.is_empty() {
+                return RenderLiveness {
+                    panels,
+                    gathered: std::collections::HashMap::new(),
+                    clear_missing: false,
+                };
+            }
+            RenderLiveness {
+                panels,
+                gathered: gather_child_liveness(backend, requests, &children).await,
+                clear_missing: false,
+            }
         }
     }
-    if children.is_empty() {
-        return (panels, std::collections::HashMap::new());
-    }
-    (panels, gather_child_liveness(backend, requests, &children).await)
 }
 
-/// Attach the render's shared gather to every live `task` panel in `acc`
-/// (ADR-0054). Returns true when a panel changed. A panel the gather could not
-/// establish keeps its previous line (its stored activity time keeps the age
-/// growing truthfully) instead of clearing it or inventing one.
+/// Attach the render's gather to every live `task` panel in `acc` (ADR-0054).
+/// Returns true when a panel changed. A child-session panel the gather could
+/// not establish keeps its previous line (its stored activity time keeps the
+/// age growing truthfully); an `ActivityReports` panel has no fallback read, so
+/// a missing run clears the line instead of leaving it stale.
 fn apply_task_liveness(
     acc: &mut StreamAccumulator,
     panels: &[(String, String)],
     gathered: &std::collections::HashMap<String, TaskLiveness>,
+    clear_missing: bool,
 ) -> bool {
     let mut changed = false;
     for (call_id, _) in panels {
-        if let Some(liveness) = gathered.get(call_id).cloned() {
-            changed |= acc.set_tool_liveness(call_id, Some(liveness));
+        match gathered.get(call_id).cloned() {
+            Some(liveness) => changed |= acc.set_tool_liveness(call_id, Some(liveness)),
+            None if clear_missing => changed |= acc.set_tool_liveness(call_id, None),
+            None => {}
         }
     }
     changed
@@ -11870,6 +11920,188 @@ Index: /x/src/main.rs
             text.lines()
                 .any(|line| line.contains("⏳ subagent") && line.contains("shell ")),
             "the panel carries the child's liveness line: {text}"
+        );
+    }
+
+    /// A lost child-agent surface clears the panel's stored liveness line: the
+    /// gather has no fallback read in that mode, so the line must not stay
+    /// stale (ADR-0106).
+    #[test]
+    fn a_lost_child_agent_surface_clears_a_panels_liveness() {
+        let mut acc = StreamAccumulator::new("test");
+        let panel = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "task".into(),
+                call_id: "call_panel".into(),
+            },
+            kind: ToolKind::Other,
+            status: ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        });
+        acc.push_tool("call_panel", panel);
+        acc.set_tool_liveness(
+            "call_panel",
+            Some(TaskLiveness {
+                activity: ChildActivity::Tool {
+                    name: "shell".into(),
+                    started_at: Some(1_000),
+                },
+                last_activity_ms: Some(1_000),
+                wait: None,
+            }),
+        );
+        assert!(acc.tools()["call_panel"].liveness().is_some());
+        let panels = [("call_panel".to_string(), "thread_child".to_string())];
+        assert!(apply_task_liveness(
+            &mut acc,
+            &panels,
+            &std::collections::HashMap::new(),
+            true
+        ));
+        assert!(
+            acc.tools()["call_panel"].liveness().is_none(),
+            "the lost surface clears the line instead of keeping it"
+        );
+    }
+
+    /// An `ActivityReports` client (Codex) has no child transcript: the launch
+    /// panel's liveness comes from the run's reported activity, with no child
+    /// read, and a terminal report clears the line rather than leaving the last
+    /// one stale.
+    #[tokio::test]
+    async fn an_activity_report_client_renders_panel_liveness_from_the_run() {
+        let _wd = test_work_dir();
+        let now = chrono::Utc::now().timestamp_millis();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.capabilities = crate::backend::AgentCapabilities {
+            background_runs: false,
+            child_agents: crate::backend::ChildAgentMode::ActivityReports,
+            child_evidence: true,
+            ..crate::backend::AgentCapabilities::full()
+        };
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_activity_panel";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_activity_panel")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        Turn::clear_phase(&cards, sid).await;
+
+        let launch = || crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: "call_launch".into(),
+            },
+            kind: ToolKind::Other,
+            status: ToolStatus::Running,
+            started_at: Some(now - 10_000),
+            input: Some(serde_json::json!({
+                "tool": "spawnAgent",
+                "status": "completed",
+                "senderThreadId": "thread-root",
+                "receiverThreadIds": ["thread_child"],
+                "prompt": null,
+                "model": null,
+                "reasoningEffort": null,
+                "agents": [{"threadId": "thread_child", "status": "running", "message": null}]
+            })),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let report = |status: ToolStatus, at: i64| crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: "call_activity".into(),
+            },
+            kind: ToolKind::Other,
+            status,
+            started_at: Some(at),
+            input: Some(serde_json::json!({"kind": "started", "agentThreadId": "thread_child"})),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let transcript = |status: ToolStatus| {
+            SessionTranscript::new(vec![message(
+                "a1",
+                now - 10_000,
+                vec![Part::Tool(launch()), Part::Tool(report(status, now - 5_000))],
+            )])
+        };
+        {
+            let mut live = cards.cards.lock().await;
+            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            acc.push_tool_at(Some(now - 10_000), "call_launch", ToolPanel::new(launch()));
+        }
+
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &transcript(ToolStatus::Running),
+        )
+        .await;
+
+        assert!(
+            !backend
+                .transcript_calls
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == "thread_child"),
+            "an activity-report client spends no child transcript read"
+        );
+        let card = platform.updated_cards().await.last().cloned().unwrap();
+        let text = card_text(&card);
+        assert!(
+            text.lines()
+                .any(|line| line.contains("⏳ subagent") && line.contains("waiting ")),
+            "the launch panel carries the reported activity: {text}"
+        );
+
+        // A terminal report ends the run: the line leaves with it.
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &transcript(ToolStatus::Completed),
+        )
+        .await;
+        let card = platform.updated_cards().await.last().cloned().unwrap();
+        let text = card_text(&card);
+        let panel = text
+            .lines()
+            .find(|line| line.contains("⏳ subagent"))
+            .expect("the launch panel");
+        assert!(
+            !panel.contains("waiting "),
+            "a terminal report clears the liveness line: {panel:?}"
         );
     }
 
