@@ -2175,9 +2175,10 @@ pub struct AgentRun {
     pub status: RunStatus,
     /// What the run is doing now, when the read established it (ADR-0054).
     pub activity: Option<RunActivity>,
-    /// The newest report observation's clock, when the client gave one. It
-    /// orders replayed observations: an older non-terminal report must not
-    /// revive a run a later report already ended.
+    /// The newest client observation's clock — a launch or a report — when one
+    /// was given. It orders observations: an older report must not revive a run
+    /// a later report ended, and a resume whose clock is at or after the
+    /// newest observation becomes the current statement.
     pub observed_at: Option<i64>,
     /// Every call that launched or resumed this run — a set, because a resumed
     /// `task` launches the same child again.
