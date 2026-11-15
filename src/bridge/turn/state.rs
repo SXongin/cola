@@ -2552,6 +2552,18 @@ impl StreamAccumulator {
         if capabilities.usage == crate::backend::UsageMode::None {
             self.context_tokens = 0;
         }
+        // A lost question surface must drop the stored blocks too: leaving an
+        // unanswered typed answer in place makes `awaits_typed_answer` freeze
+        // every render, so no PATCH could ever remove an unanswerable form. A
+        // `Session` declaration keeps session-backed questions but drops the
+        // directory-owned Location Form (empty session id).
+        let questions = capabilities.questions;
+        if questions.is_absent() || questions == crate::backend::QuestionMode::Session {
+            self.interactions.retain(|block| match block {
+                InteractionBlock::Question(q) => !questions.is_absent() && !q.session_id.is_empty(),
+                InteractionBlock::Permission(_) | InteractionBlock::Receipt(_) => true,
+            });
+        }
         true
     }
 
@@ -8879,6 +8891,7 @@ mod tests {
                 questions: vec![crate::backend::types::QuestionInfo {
                     question: text.into(),
                     header: "h".into(),
+                    custom: Some(true),
                     ..Default::default()
                 }],
                 uncollectable: None,
@@ -8908,6 +8921,10 @@ mod tests {
         assert!(acc.todo_panel.is_some());
         assert_eq!(acc.turn_diff_stats.files, 2);
         assert_eq!(acc.context_tokens, 84_200);
+        assert!(
+            acc.awaits_typed_answer(),
+            "the unanswered custom-answer field freezes renders"
+        );
         let full = acc.build_card().to_string();
         assert!(full.contains("UNIQUE_QUESTION_TEXT"));
         assert!(full.contains("UNIQUE_LOCATION_FORM"));
@@ -8955,6 +8972,16 @@ mod tests {
         assert!(
             !text.contains("UNIQUE_COMPACTION_SUMMARY"),
             "a stored compaction row is omitted when its surface is absent: {text}"
+        );
+        assert!(
+            !acc.awaits_typed_answer(),
+            "the lost question surface also clears the typed-answer freeze"
+        );
+        assert!(
+            acc.interactions
+                .iter()
+                .all(|block| !matches!(block, InteractionBlock::Question(_))),
+            "the unanswerable question blocks are dropped"
         );
     }
 }

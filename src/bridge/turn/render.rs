@@ -3316,9 +3316,10 @@ struct RenderLiveness {
 ///
 /// The gate is the `child_agents` axis (ADR-0106). A child-session client
 /// (OpenCode) reads the child transcript; an `ActivityReports` client (Codex)
-/// states the run's activity on the parent transcript, so its panel liveness
-/// comes from the run's [`crate::backend::RunActivity`] with no child read, and
-/// a run that is no longer live clears the line ([`RenderLiveness::clear_missing`]).
+/// merges the run's reported activity with the child transcript's live
+/// `CallView` and pending wait, so the panel can read `shell 5s · 等待你的授权`.
+/// A run that is no longer live clears the line
+/// ([`RenderLiveness::clear_missing`]).
 async fn gather_render_liveness(
     cards: &CardsHandle,
     backend: &Arc<dyn crate::backend::Backend>,
@@ -3334,17 +3335,46 @@ async fn gather_render_liveness(
             clear_missing: true,
         },
         crate::backend::ChildAgentMode::ActivityReports => {
-            // The report is the activity: build the line from the run the
-            // launch panel names, keyed by both the run and its launch call.
+            // The report states the activity, but the child transcript still
+            // carries the live `CallView` (its tool token and start clock) and
+            // the pending wait. Read each named child once and merge those two
+            // facts; a run with no report yet uses the child's own read.
+            let mut children = panels.clone();
+            for pair in transcript.run_children() {
+                if !children.contains(&pair) {
+                    children.push(pair);
+                }
+            }
+            let child_liveness = if children.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                gather_child_liveness(backend, requests, &children).await
+            };
             let mut gathered = std::collections::HashMap::new();
             for run in &transcript.runs {
                 if !run.is_live() {
                     continue;
                 }
-                let Some(activity) = &run.activity else {
-                    continue;
+                let child = child_liveness.get(&run.run_id).cloned();
+                let mut liveness = match run.activity.as_ref().map(TaskLiveness::from_run) {
+                    Some(reported) => reported,
+                    None => match child.clone() {
+                        Some(child) => child,
+                        None => continue,
+                    },
                 };
-                let liveness = TaskLiveness::from_run(activity);
+                if let Some(child) = child {
+                    if matches!(
+                        child.activity,
+                        crate::feishu::card::tool_render::ChildActivity::Tool { .. }
+                    ) {
+                        liveness.activity = child.activity;
+                    }
+                    liveness.wait = child.wait;
+                    if liveness.last_activity_ms.is_none() {
+                        liveness.last_activity_ms = child.last_activity_ms;
+                    }
+                }
                 gathered.insert(run.run_id.clone(), liveness.clone());
                 for launch in &run.launched_by {
                     gathered.insert(launch.call_id.clone(), liveness.clone());
@@ -3564,8 +3594,8 @@ mod tests {
     };
     use crate::bridge::test_support::{
         HostCardAction, MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card,
-        realistic_parts, seed_cover_title, seed_entry, send_command_in, test_config, test_work_dir,
-        text_part, turn_anchor, typed_message,
+        perm_request, realistic_parts, seed_cover_title, seed_entry, seed_session, send_command_in,
+        test_config, test_work_dir, text_part, turn_anchor, typed_message,
     };
     use crate::bridge::turn::state::{
         CursorSeed, InteractionBlock, PendingQuestion, StreamAccumulator, file_content_hash,
@@ -11974,7 +12004,80 @@ Index: /x/src/main.rs
         );
     }
 
-    /// An `ActivityReports` client (Codex) has no child transcript: the launch
+    /// A lost question surface must drop an unanswered typed-answer block
+    /// before the render's freeze check, or the form would keep the card
+    /// unwritable forever. The next pass writes a card without it.
+    #[tokio::test]
+    async fn a_lost_question_surface_drops_an_unanswered_form_and_writes() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.capabilities = crate::backend::AgentCapabilities {
+            questions: crate::backend::QuestionMode::None,
+            ..crate::backend::AgentCapabilities::full()
+        };
+        let backend = Arc::new(backend);
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+        let sid = "ses_lost_form";
+        let cards = app.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_lost_form")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        {
+            let mut live = cards.cards.lock().await;
+            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            assert!(acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+                request_id: "q_form".into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "UNIQUE_LOST_FORM_TEXT".into(),
+                    header: "h".into(),
+                    custom: Some(true),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![false],
+                open: 0,
+                drafts: vec![String::new()],
+                asked_at: None,
+            })));
+            assert!(acc.awaits_typed_answer(), "the form would freeze the render");
+        }
+        let transcript = SessionTranscript::new(vec![typed_message(
+            "msg_user",
+            MessageRole::User,
+            Some(1_000),
+            vec![text_part("hello")],
+        )]);
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+        )
+        .await;
+
+        let card = platform
+            .updated_cards()
+            .await
+            .last()
+            .cloned()
+            .expect("the capability loss writes a card");
+        assert!(
+            !card_text(&card).contains("UNIQUE_LOST_FORM_TEXT"),
+            "the unanswerable form is gone: {card}"
+        );
+    }
+
+    /// An `ActivityReports` client (Codex) merges the run's reported activity
+    /// with the child transcript; with an empty child read the report's
+    /// `waiting` phase still renders, and a terminal report clears the line.
     /// panel's liveness comes from the run's reported activity, with no child
     /// read, and a terminal report clears the line rather than leaving the last
     /// one stale.
@@ -11992,6 +12095,9 @@ Index: /x/src/main.rs
             ..crate::backend::AgentCapabilities::full()
         };
         let backend = Arc::new(backend);
+        backend
+            .given_transcript_after_build("thread_child", vec![SessionTranscript::new(vec![])])
+            .await;
         let platform = Arc::new(RecordingPlatform::new());
         let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
         let sid = "ses_activity_panel";
@@ -12068,14 +12174,16 @@ Index: /x/src/main.rs
         )
         .await;
 
-        assert!(
-            !backend
-                .transcript_calls
-                .lock()
-                .await
-                .iter()
-                .any(|id| id == "thread_child"),
-            "an activity-report client spends no child transcript read"
+        let reads = backend
+            .transcript_calls
+            .lock()
+            .await
+            .iter()
+            .filter(|id| id.as_str() == "thread_child")
+            .count();
+        assert_eq!(
+            reads, 1,
+            "the child is read for its live CallView and pending wait"
         );
         let card = platform.updated_cards().await.last().cloned().unwrap();
         let text = card_text(&card);
@@ -12104,6 +12212,151 @@ Index: /x/src/main.rs
         assert!(
             !panel.contains("waiting "),
             "a terminal report clears the liveness line: {panel:?}"
+        );
+    }
+
+    /// The `ActivityReports` merge: the child transcript supplies the live
+    /// `CallView` (a Codex `commandExecution` reads `shell`) and the pending
+    /// wait, while the run report supplies the phase; the child is read.
+    #[tokio::test]
+    async fn an_activity_report_panel_merges_the_child_call_and_wait() {
+        let _wd = test_work_dir();
+        let now = chrono::Utc::now().timestamp_millis();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.capabilities = crate::backend::AgentCapabilities {
+            background_runs: false,
+            child_agents: crate::backend::ChildAgentMode::ActivityReports,
+            child_evidence: true,
+            ..crate::backend::AgentCapabilities::full()
+        };
+        backend.ask_permission(perm_request("per_1", "ses_child", "rm -rf /"));
+        let backend = Arc::new(backend);
+        backend
+            .given_transcript_after_build(
+                "ses_child",
+                vec![SessionTranscript::new(vec![message(
+                    "a_child",
+                    now - 5_000,
+                    vec![Part::Tool(ToolCall {
+                        identity: ToolIdentity {
+                            name: "codex/command_execution".into(),
+                            call_id: "call_child".into(),
+                        },
+                        kind: ToolKind::Execute,
+                        detail: ToolDetail::Command {
+                            command: "cargo test".into(),
+                            cwd: None,
+                            description: None,
+                            exit: None,
+                            timeout: false,
+                        },
+                        status: ToolStatus::Running,
+                        started_at: Some(now - 5_000),
+                        output: ToolOutput::default(),
+                        ..ToolCall::default()
+                    })],
+                )])],
+            )
+            .await;
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        seed_session(&app, "ses_1", "/work").await;
+        let mut seen = std::collections::HashSet::new();
+        app.permission.sweep(&app.flow_handles(), &mut seen).await;
+        assert_eq!(
+            app.requests_handle().wait_for("ses_child").await,
+            Some(crate::feishu::card::AwaitingAction::Permission),
+            "the child's pending permission is recorded"
+        );
+
+        let sid = "ses_activity_merge";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_activity_merge")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        Turn::clear_phase(&cards, sid).await;
+        let launch = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: "call_launch".into(),
+            },
+            kind: ToolKind::Other,
+            status: ToolStatus::Running,
+            started_at: Some(now - 10_000),
+            input: Some(serde_json::json!({
+                "tool": "spawnAgent",
+                "status": "completed",
+                "senderThreadId": "thread-root",
+                "receiverThreadIds": ["ses_child"],
+                "prompt": null,
+                "model": null,
+                "reasoningEffort": null,
+                "agents": [{"threadId": "ses_child", "status": "running", "message": null}]
+            })),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "ses_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let report = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: "call_activity".into(),
+            },
+            kind: ToolKind::Other,
+            status: ToolStatus::Running,
+            started_at: Some(now - 6_000),
+            input: Some(serde_json::json!({"kind": "started", "agentThreadId": "ses_child"})),
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "ses_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        {
+            let mut live = cards.cards.lock().await;
+            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            acc.push_tool_at(Some(now - 10_000), "call_launch", ToolPanel::new(launch.clone()));
+        }
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            now - 10_000,
+            vec![Part::Tool(launch), Part::Tool(report)],
+        )]);
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+        )
+        .await;
+
+        assert!(
+            backend
+                .transcript_calls
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == "ses_child"),
+            "the child is read for its CallView and wait"
+        );
+        let card = platform.updated_cards().await.last().cloned().unwrap();
+        let text = card_text(&card);
+        assert!(
+            text.lines().any(|line| {
+                line.contains("⏳ subagent") && line.contains("shell ") && line.contains("等待你的授权")
+            }),
+            "the panel reads the child's tool and its pending wait: {text}"
         );
     }
 
