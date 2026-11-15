@@ -4114,6 +4114,30 @@ impl Turn {
         !retires_runs || Self::has_live_orphan_tools(cards, session_id).await
     }
 
+    /// Whether a decided settle's card still carries live work that must take
+    /// the stuck-panel grace. A `Waiting` decision uses the wait's own rule
+    /// ([`Self::waiting_panels_are_stuck`]). Any other decision after a run
+    /// retired must not be blocked by the launch panel that still reads
+    /// `Running`: a client that can retire runs (`reports_live_runs`) ignores
+    /// them (the run already owns/received its exit), while a client that
+    /// cannot (OpenCode V1) keeps every live panel as its own work and #386's
+    /// grace.
+    pub(crate) async fn settle_is_stuck(
+        cards: &CardsHandle,
+        session_id: &str,
+        waiting: bool,
+        retires_runs: bool,
+    ) -> bool {
+        if waiting {
+            return Self::waiting_panels_are_stuck(cards, session_id, retires_runs).await;
+        }
+        if retires_runs {
+            Self::has_live_orphan_tools(cards, session_id).await
+        } else {
+            Self::has_live_tools(cards, session_id).await
+        }
+    }
+
     /// Refresh the live card's work context at turn end (ADR-0019): re-read the
     /// session directory's git state so the final card shows where the turn
     /// landed.

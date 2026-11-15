@@ -4458,3 +4458,64 @@ async fn a_retirable_launch_panel_yields_instead_of_grace() {
         "no stuck-panel ending for a retirable run: {last}"
     );
 }
+
+/// Review finding 2: after the child's evidence retires the run, the Codex
+/// launch panel still reads `Running` (the call's own status). The settle must
+/// not treat that panel as live work and stamp `StuckPanel`; a client that
+/// cannot retire runs (V1) keeps it as its own work and keeps the grace.
+#[tokio::test]
+async fn a_retired_launch_panel_does_not_stuck_panel_the_settle() {
+    let _wd = test_work_dir();
+    let (_dir, app, _backend, _platform) = scripted_app(vec![], Some(SessionStatus::Idle)).await;
+    let cards = app.cards_handle();
+
+    let mut read = wedged_launch_transcript();
+    assert!(read.apply_run_child_evidence(
+        "ses_child",
+        crate::backend::ChildEvidence::Terminal { completed_at: 3_000 }
+    ));
+    assert!(read.runs.is_empty(), "the child evidence retires the run");
+
+    let launch = crate::backend::ToolCall {
+        identity: ToolIdentity {
+            name: "task".into(),
+            call_id: "call_task".into(),
+        },
+        status: ToolStatus::Running,
+        started_at: Some(2_000),
+        input: Some(serde_json::json!({ "description": "review the diff" })),
+        detail: crate::backend::ToolDetail::Delegation {
+            runs: vec![crate::backend::AgentRunRef {
+                run_id: "ses_child".into(),
+                status: None,
+            }],
+            effect: crate::backend::DelegationEffect::Launch,
+        },
+        ..crate::backend::ToolCall::default()
+    };
+    Turn::seed_card(&cards, "ses_test", Some("om_test")).await;
+    Turn::push_tool(
+        &cards,
+        "ses_test",
+        "call_task",
+        crate::feishu::card::tool_render::ToolPanel::new(launch),
+    )
+    .await;
+
+    assert!(
+        Turn::has_live_tools(&cards, "ses_test").await,
+        "the retired run's launch panel still reads Running"
+    );
+    assert!(
+        !Turn::has_live_orphan_tools(&cards, "ses_test").await,
+        "a launch panel is not the Turn's orphaned work"
+    );
+    assert!(
+        !Turn::settle_is_stuck(&cards, "ses_test", false, true).await,
+        "Codex completes: the retired run's panel is not live work"
+    );
+    assert!(
+        Turn::settle_is_stuck(&cards, "ses_test", false, false).await,
+        "V1 has no retirer, so the launch panel keeps its grace"
+    );
+}
