@@ -1358,7 +1358,7 @@ pub(super) struct StreamAccumulator {
     /// deliveries insert here so a takeover's re-render skips them. Private to
     /// this module: written by [`Self::push_delegation_receipt`] and
     /// [`Self::mark_delivered_part`]; read through [`Self::receipt_rendered`].
-    receipt_calls: std::collections::HashSet<String>,
+    receipt_calls: std::collections::HashSet<crate::feishu::card::tool_render::ReceiptKey>,
     /// The ledger's render clock ([`Self::set_ledger`]): each row's rendered
     /// numbers — a shell row's elapsed, and any row's activity fragment age, in
     /// whole seconds as of the read that last moved the section (ADR-0060, spec
@@ -2005,6 +2005,16 @@ impl StreamAccumulator {
             .iter()
             .any(|(call_id, panel)| !self.seeded_calls.contains(call_id) && panel.is_live())
             || self.todo_panel.as_ref().is_some_and(|panel| panel.is_live())
+    }
+
+    /// A live panel that is NOT a child run's launch. Such a panel is the
+    /// Turn's own orphaned work when the transcript has settled, and keeps the
+    /// stuck-panel grace; a launch panel's live child is a run with an exit
+    /// owed, and the Waiting yield owns it (spec #1057's P4).
+    pub(super) fn has_live_orphan_tool(&self) -> bool {
+        self.tools.iter().any(|(call_id, panel)| {
+            !self.seeded_calls.contains(call_id) && panel.is_live() && !panel.runs_a_child()
+        }) || self.todo_panel.as_ref().is_some_and(|panel| panel.is_live())
     }
 
     /// The current tool panels keyed by call ID — a test read of the tool
@@ -3079,15 +3089,15 @@ impl StreamAccumulator {
     /// needs the panel's dedupe: one line per call — and, for a report, one
     /// line per STATE, because a report is an observation and the wire reuses
     /// its item id between start and completion (spec #1057).
-    pub(super) fn receipt_rendered(&self, key: &str) -> bool {
+    pub(super) fn receipt_rendered(&self, key: &crate::feishu::card::tool_render::ReceiptKey) -> bool {
         self.receipt_calls.contains(key)
     }
 
     /// Mark one receipt revision as delivered without rendering it — the seed
     /// path's counterpart to [`Self::push_delegation_receipt`], so a takeover
     /// does not replay a receipt that already sits on the previous card.
-    pub(super) fn mark_receipt_delivered(&mut self, key: &str) {
-        self.receipt_calls.insert(key.to_string());
+    pub(super) fn mark_receipt_delivered(&mut self, key: crate::feishu::card::tool_render::ReceiptKey) {
+        self.receipt_calls.insert(key);
     }
 
     /// Render an addressing/reporting call as its one-line receipt instead of
@@ -4286,7 +4296,7 @@ impl StreamAccumulator {
             }
             Part::Tool(call) => {
                 if crate::feishu::card::tool_render::is_receipt_call(call) {
-                    self.mark_receipt_delivered(&crate::feishu::card::tool_render::receipt_key(call));
+                    self.mark_receipt_delivered(crate::feishu::card::tool_render::receipt_key(call));
                 } else if call.identity.name == "todowrite" {
                     self.record_todo_call(call);
                 } else {
