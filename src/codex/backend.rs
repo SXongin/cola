@@ -37,7 +37,8 @@ use crate::backend::types::{
     QuestionRequest, Session, SessionInfo, SessionListInfo, SessionModel, SessionStatus,
 };
 use crate::backend::{
-    Backend, BackendDirectory, ModelIdentity, PromptSkill, SessionTranscript, SkillInfo, TurnDiff,
+    Backend, BackendDirectory, ChildEvidence, ModelIdentity, PromptSkill, SessionTranscript, SkillInfo,
+    TurnDiff,
 };
 use crate::bridge::tasks::TasksHandle;
 use crate::error::{BridgeError, Result};
@@ -2288,6 +2289,31 @@ fn client_error(error: CodexError) -> BridgeError {
     }
 }
 
+/// Whether a `thread/read` failure means the thread does not exist at the
+/// attached server — the `Gone` evidence (a run cannot still be hosted there).
+/// Matched on the protocol's own `-32600 thread not found` reply, never on a
+/// transport failure (which is a failed read, not an ending).
+fn thread_is_gone(error: &CodexError) -> bool {
+    matches!(error, CodexError::Rpc { detail, .. } if detail.contains("thread not found"))
+}
+
+/// The evidence a child thread's own persisted turns carry (spec #1057's P4,
+/// ADR-0080): its newest turn is the terminal item. A turn still `inProgress`
+/// (or one with no completion clock) is no evidence — the run stays exactly as
+/// the read marked it, never guessed dead.
+fn thread_evidence(thread: &Thread) -> ChildEvidence {
+    let Some(turn) = thread.turns.last() else {
+        return ChildEvidence::Unfinished;
+    };
+    if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
+        return ChildEvidence::Unfinished;
+    }
+    let Some(completed_at) = turn.get("completedAt").and_then(Value::as_i64) else {
+        return ChildEvidence::Unfinished;
+    };
+    ChildEvidence::Terminal { completed_at }
+}
+
 fn not_attached() -> BridgeError {
     BridgeError::Client {
         client: "codex",
@@ -3192,6 +3218,30 @@ impl Backend for CodexClient {
         false
     }
 
+    /// …but it **does** report live runs (spec #1057's P4): a collaboration
+    /// child is a real child agent with its own thread, its own activity and a
+    /// terminal item its parent can read. So the ledger and the runtime
+    /// reconciliation gate on `reports_live_runs`, not on the background
+    /// surface. #1062 folds this into `AgentCapabilities::reports_live_runs()`.
+    fn reports_live_runs(&self) -> bool {
+        true
+    }
+
+    /// A child thread's own terminal item (spec #1057's P4, ADR-0080): a child
+    /// agent that ends with no Wake still has to retire its run and settle the
+    /// yielded Turn, and the child thread's last persisted turn is the
+    /// evidence. `thread/read` carries the turns; the newest one is the
+    /// verdict. A thread the server no longer knows is `Gone`; anything the
+    /// read cannot conclude is `Unfinished`, never guessed.
+    async fn child_evidence(&self, child_id: &str) -> Result<ChildEvidence> {
+        let thread = match self.threads().read(child_id, true).await {
+            Ok(thread) => thread,
+            Err(error) if thread_is_gone(&error) => return Ok(ChildEvidence::Gone),
+            Err(error) => return Err(client_error(error)),
+        };
+        Ok(thread_evidence(&thread))
+    }
+
     async fn model_context_window(&self, _provider: &str, _model: &str) -> Result<Option<i64>> {
         // The Codex usage notification states the window for the running
         // model; a read with no attached turn has no figure to report.
@@ -3659,6 +3709,17 @@ impl Backend for CodexLifecycle {
     /// after an attach.
     fn background_tasks_supported(&self) -> bool {
         false
+    }
+
+    /// A Codex attachment reports live runs through its child threads (spec
+    /// #1057's P4), whatever client is attached: the answer does not depend on
+    /// the connection.
+    fn reports_live_runs(&self) -> bool {
+        true
+    }
+
+    async fn child_evidence(&self, child_id: &str) -> Result<ChildEvidence> {
+        Backend::child_evidence(&self.current().await?, child_id).await
     }
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {

@@ -149,10 +149,10 @@ impl RuntimeReconcile {
         transcript: &mut SessionTranscript,
         read_timeout_ms: u64,
     ) -> Option<ReconcilePass> {
-        if !backend.background_tasks_supported() {
-            // A client with no Background Task surface has nothing to
-            // reconcile: no verdict, no child evidence, no shell window. The
-            // absence is the client's declaration, not an empty read.
+        if !backend.reports_live_runs() {
+            // A client with no live-run surface has nothing to reconcile: no
+            // verdict, no child evidence, no shell window. The absence is the
+            // client's declaration, not an empty read.
             return None;
         }
         let (shells, children) = live_task_ids(transcript);
@@ -308,7 +308,7 @@ pub(crate) async fn reconcile_now(
     transcript: &mut SessionTranscript,
     budget: CycleBudget,
 ) -> Option<ReconcilePass> {
-    if !backend.background_tasks_supported() {
+    if !backend.reports_live_runs() {
         return None;
     }
     let (shells, children) = live_task_ids(transcript);
@@ -370,6 +370,41 @@ pub(crate) async fn reconcile_now(
                     }
                     // A read that timed out — or that the spent budget skipped
                     // — yields no verdict, like the runtime read above.
+                    None => {}
+                }
+            }
+            // The child-only runs (spec #1057's P4): a client with no runtime
+            // verdict registry (Codex) still reports a child thread, and its
+            // terminal item is the evidence — so a child that ends with no
+            // Wake retires its row and settles the yielded Turn. A run already
+            // represented by a Background Task was handled above and is not
+            // read twice.
+            //
+            // Only a client WITHOUT the runtime's child verdicts takes this
+            // path. Where the registry answers, a foreground run's child is
+            // read by the evidence path above only after the runtime reports
+            // it inactive; reading every live run here would pre-empt that
+            // verdict and could retire a child on a previous turn's terminal
+            // item.
+            for (run_id, child_id) in transcript
+                .run_evidence_suspects()
+                .into_iter()
+                .filter(|_| !backend.background_tasks_supported())
+            {
+                match budget
+                    .read("run child evidence read", backend.child_evidence(&child_id))
+                    .await
+                {
+                    Some(Ok(evidence)) => {
+                        if transcript.apply_run_child_evidence(&run_id, evidence) {
+                            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::debug!(
+                            "session {session_id} run {run_id} child {child_id} evidence read failed: {error}; keeping its row"
+                        );
+                    }
                     None => {}
                 }
             }
@@ -453,11 +488,19 @@ fn live_task_ids(transcript: &SessionTranscript) -> (Vec<String>, Vec<String>) {
         .iter()
         .filter_map(|task| task.shell_id.clone())
         .collect();
-    let children = transcript
+    let mut children: Vec<String> = transcript
         .background_tasks
         .iter()
         .filter_map(|task| task.child_id.clone())
         .collect();
+    // A child-only run has no Background Task to name it (Codex), so its child
+    // id is a live-run id too. Deduped: a run and its Background Task usually
+    // name the same child.
+    for (_, child) in transcript.run_children() {
+        if !children.contains(&child) {
+            children.push(child);
+        }
+    }
     (shells, children)
 }
 

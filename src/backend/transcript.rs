@@ -622,8 +622,9 @@ impl SessionTranscript {
     /// - [`TurnSettle::Complete`] — the true end: idle with no live Background
     ///   Task.
     ///
-    /// A read with no Executions, Wakes or Background Tasks (V1) decides
-    /// exactly as before: idle with no live Background Task is complete.
+    /// A read with no Executions, Wakes, Background Tasks or live runs (V1,
+    /// or a session with nothing running) decides exactly as before: idle with
+    /// no live run is complete.
     pub fn settle(&self, anchor: Option<&TurnAnchor>) -> TurnSettle {
         if !self.wakes_answered() {
             return TurnSettle::Running;
@@ -646,7 +647,19 @@ impl SessionTranscript {
         // the completion entry on the same card follows its evidence or
         // cleanup. A run with no child id still counts — it is a run with an
         // exit owed, not an empty identity.
-        if self.runs.iter().any(AgentRun::is_live) {
+        //
+        // A run whose launch call is still live is NOT a yielding fact: that
+        // call is the turn's own work (a foreground `task` blocks the turn),
+        // so the transcript still streams and the turn has not ended. Counting
+        // it here would make a stuck call wait forever on a client that cannot
+        // retire it; only a settled launch leaves a run the Turn must wait for.
+        let launch_live = |run: &AgentRun| {
+            run.launched_by.iter().any(|reference| {
+                self.tool_call(&reference.call_id)
+                    .is_some_and(|call| call.status.is_live())
+            })
+        };
+        if self.runs.iter().any(|run| run.is_live() && !launch_live(run)) {
             return TurnSettle::Waiting;
         }
         TurnSettle::Complete

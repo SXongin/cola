@@ -1366,6 +1366,79 @@ async fn autoaccept_on_approves_child_session_permission() {
     );
 }
 
+/// Pitfall `child-session-permissions` after the AgentRun change (spec
+/// #1057's P4): a child's approval still re-homes to the PARENT's live card.
+/// The run fact is a display and settlement layer, not a request route — the
+/// child session id the run names is the same id the request carries.
+#[tokio::test]
+async fn a_childs_approval_still_rehomes_to_the_parents_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permission(crate::backend::types::PermissionRequest {
+        request_id: "per_child".into(),
+        session_id: Some("ses_child".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["rm -rf build".into()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    });
+    backend.with_session_parent("ses_child", "ses_test");
+    // The parent's read names the child as a launched run: the run's identity
+    // IS the child session id the approval arrives for.
+    backend.given_transcript(
+        "ses_test",
+        vec![crate::backend::SessionTranscript::new(vec![typed_message(
+            "msg_launch",
+            crate::backend::MessageRole::Assistant,
+            Some(1_000),
+            vec![crate::backend::Part::Tool(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_task".into(),
+                },
+                status: crate::backend::ToolStatus::Running,
+                started_at: Some(1_000),
+                metadata: Some(serde_json::json!({ "sessionId": "ses_child" })),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "ses_child".into(),
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..crate::backend::ToolCall::default()
+            })],
+        )])],
+    );
+    let (app, platform) = build_app(cfg, backend).await;
+
+    // The parent holds the live card; the child has none of its own.
+    seed_live_card(&app, "ses_test", "om_live").await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let inline = Turn::live_permissions(&app.cards_handle(), "ses_test").await;
+    assert_eq!(inline.len(), 1, "the child's request lands inline on the parent");
+    assert_eq!(inline[0].0, "per_child");
+    assert!(
+        platform.sent_cards().await.is_empty(),
+        "a re-homed child request opens no standalone card: {:?}",
+        platform.calls.lock().await
+    );
+    // The run the parent's read carries names exactly that child.
+    let read = crate::backend::Backend::transcript(app.client.as_ref(), "ses_test")
+        .await
+        .unwrap();
+    assert_eq!(
+        read.run_children(),
+        vec![("ses_child".to_string(), "ses_child".to_string())],
+        "the run's identity is the child session the approval arrived for"
+    );
+}
+
 #[tokio::test]
 async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
     let _wd = test_work_dir();
