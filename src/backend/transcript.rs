@@ -243,10 +243,10 @@ impl SessionTranscript {
     /// the true end) and the ledger renders one 🧹 entry per cleared row. The
     /// ids come from the caller's read of this same transcript, so an id with
     /// no live task or run is ignored: a cleanup never invents a retirement for
-    /// something the read no longer lists. A run represented by a Background
-    /// Task is left to that task's own path (one run, one retirement). The
-    /// cleared ids also leave [`Self::unconfirmed_tasks`]; every other id stays
-    /// as the read left it.
+    /// something the read no longer lists. A run represented by a cleaned
+    /// Background Task leaves with it (one run, one ending). The cleared ids
+    /// also leave [`Self::unconfirmed_tasks`]; every other id stays as the read
+    /// left it.
     pub fn apply_cleanup(&mut self, call_ids: &[String], now_ms: i64) {
         let clearing: std::collections::HashSet<&str> = call_ids.iter().map(String::as_str).collect();
         if clearing.is_empty() {
@@ -254,8 +254,13 @@ impl SessionTranscript {
         }
         let tasks_before = self.background_tasks.clone();
         let mut kept = Vec::with_capacity(self.background_tasks.len());
+        let mut cleaned_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for task in std::mem::take(&mut self.background_tasks) {
             if clearing.contains(task.tool.call_id.as_str()) {
+                cleaned_task_ids.insert(task.tool.call_id.clone());
+                if let Some(child) = task.child_id.clone() {
+                    cleaned_task_ids.insert(child);
+                }
                 self.task_retirements.push(TaskRetirement {
                     task,
                     ending: TaskRetirementEnding::Cleaned,
@@ -267,6 +272,18 @@ impl SessionTranscript {
             }
         }
         self.background_tasks = kept;
+        // A task-owned run leaves with its task: one run, one ending. Its
+        // ids are the ids the task just recorded, so the run loop below cannot
+        // keep it alive or mint a second cleanup ending.
+        if !cleaned_task_ids.is_empty() {
+            self.runs.retain(|run| {
+                !run.ids().any(|id| cleaned_task_ids.contains(id))
+                    && !run
+                        .child_id
+                        .as_ref()
+                        .is_some_and(|child| cleaned_task_ids.contains(child))
+            });
+        }
         // A child-only run has no Background Task to clear: retire it through
         // the same ending machinery, synthesized as the `subagent` row the
         // evidence path uses. A run a task already represents is skipped (the
@@ -326,7 +343,7 @@ impl SessionTranscript {
                 started_at: turn_started_at,
             } => {
                 let turn_start = turn_started_at.unwrap_or(completed_at);
-                if started_at.is_some_and(|started| turn_start < started) {
+                if started_at.is_some_and(|started| turn_start.div_euclid(1000) < started.div_euclid(1000)) {
                     // A previous turn's terminal item: the task stays live.
                     return;
                 }
@@ -406,11 +423,6 @@ impl SessionTranscript {
             || (task.child_id.is_some() && task.child_id == run.child_id)
     }
 
-    /// The live runs whose client still reports them running, in read order.
-    pub fn live_runs(&self) -> impl Iterator<Item = &AgentRun> {
-        self.runs.iter().filter(|run| run.is_live())
-    }
-
     /// Apply one child-evidence read to a run that is not a Background Task
     /// (`apply_child_evidence` is the task path): a terminal child retires the
     /// run as a [`TaskRetirement`] keyed by its durable identity, so the ledger,
@@ -449,10 +461,13 @@ impl SessionTranscript {
                 started_at,
             } => {
                 let turn_start = started_at.unwrap_or(completed_at);
-                if self.runs[index]
-                    .started_at
-                    .is_some_and(|started| turn_start < started)
-                {
+                if self.runs[index].started_at.is_some_and(|started| {
+                    // The wire states a turn's start in whole seconds; compare
+                    // at that granularity, so a turn that actually started a
+                    // few hundred ms after the run but serialized into the same
+                    // second is not rejected as previous.
+                    turn_start.div_euclid(1000) < started.div_euclid(1000)
+                }) {
                     // A previous turn's terminal item, not this run's. Record
                     // the rejection so a persistently stale suspect is
                     // diagnosable instead of silently re-read forever.
@@ -3255,6 +3270,55 @@ mod tests {
         assert!(transcript.background_tasks.is_empty());
         assert_eq!(transcript.task_retirements.len(), 2);
         assert_eq!(transcript.settle(Some(&anchor)), TurnSettle::Complete);
+    }
+
+    /// A task-owned run cleans with its task: one ending, and no live run left
+    /// for the next ledger pass to resurrect.
+    #[test]
+    fn cleanup_removes_the_task_owned_run_without_a_second_ending() {
+        let task = BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_child".into()),
+            started_at: Some(1_000),
+        };
+        let mut transcript = SessionTranscript::default().with_background_tasks(vec![task]);
+        transcript.runs = vec![AgentRun {
+            run_id: "ses_child".into(),
+            task_run_id: Some("ses_child".into()),
+            child_id: Some("ses_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(1_000),
+            status: RunStatus::Running,
+            activity: None,
+            observed_at: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        }];
+        transcript.unconfirmed_tasks.insert("call_sub".into());
+
+        transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+
+        assert!(transcript.background_tasks.is_empty());
+        assert!(
+            transcript.runs.is_empty(),
+            "the task-owned run leaves with its task"
+        );
+        assert_eq!(
+            transcript.task_retirements.len(),
+            1,
+            "one run, one cleaned ending"
+        );
+        assert_eq!(
+            transcript.task_retirements[0].ending,
+            TaskRetirementEnding::Cleaned
+        );
+        assert!(!transcript.unconfirmed_tasks.contains("call_sub"));
     }
 
     /// Spec #588 / #591: a subagent the runtime reports inactive is retirable
