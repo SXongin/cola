@@ -1708,10 +1708,9 @@ pub(super) fn apply_ledger_read(
         // No live-run surface (`reports_live_runs`, ADR-0106): no ledger rows,
         // no completion entries and no `⚠️ 状态待确认` marker — the client
         // declared the surface absent, so the card renders no section rather
-        // than an empty one. A child-only client such as Codex answers true
-        // here without a Background Task surface, and its runs get the same
-        // ledger.
-        return LedgerChange::default();
+        // than an empty one. A reattach can remove the surface mid-chain, so a
+        // ledger an earlier read stored must leave too (and owe its flush).
+        return acc.clear_ledger();
     }
     let mut change = acc.set_ledger_from_read(transcript, activities, now_ms, cadence);
     // A committed entry is rendered content, whatever the ledger's clock did.
@@ -2673,8 +2672,10 @@ fn refresh_ledger(
 ) -> super::state::LedgerChange {
     if !live_runs {
         // The client reports no live runs: the card carries no ledger at all
-        // (never an empty `⏳ 后台任务（0）`, never a status row).
-        return super::state::LedgerChange::default();
+        // (never an empty `⏳ 后台任务（0）`, never a status row). A reattach can
+        // remove the surface mid-chain, so a ledger an earlier read stored must
+        // leave too (and owe its removal flush).
+        return acc.clear_ledger();
     }
     if !acc.has_turn_anchor() {
         return super::state::LedgerChange::default();
@@ -4260,6 +4261,22 @@ mod tests {
         assert!(
             card.contains("状态待确认"),
             "the control renders the unconfirmed marker: {card}"
+        );
+
+        // A reattach can remove the surface mid-chain (ADR-0106): the SAME
+        // accumulator must drop the stored ledger, and owe the flush that takes
+        // the section off.
+        let removed = refresh_ledger(&mut with, &transcript, &std::collections::HashMap::new(), false);
+        assert!(removed.rows, "the capability loss is content the card owes");
+        assert!(
+            !refresh_ledger(&mut with, &transcript, &std::collections::HashMap::new(), false).owes(),
+            "an already-cleared ledger owes nothing"
+        );
+        let card = card_text(&with.build_card());
+        assert!(!card.contains("后台任务"), "the lost section is gone: {card}");
+        assert!(
+            !card.contains("状态待确认"),
+            "the lost surface leaves no marker: {card}"
         );
     }
 

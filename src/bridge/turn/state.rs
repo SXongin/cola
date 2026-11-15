@@ -4532,6 +4532,24 @@ impl StreamAccumulator {
         }
     }
 
+    /// Drop the stored live ledger when the client's capability disappears on a
+    /// reattach (ADR-0106): the next render must omit the section, not keep a
+    /// list the attachment can no longer support. Clears the cached fragments
+    /// and windows with the rows, and reports the removal as a content change
+    /// so the card owes the flush that takes the section off.
+    pub(super) fn clear_ledger(&mut self) -> LedgerChange {
+        let had_rows = !self.ledger.is_empty();
+        let had_clock = !self.ledger_clock.is_empty();
+        self.ledger.clear();
+        self.ledger_clock.clear();
+        self.ledger_activity.clear();
+        self.ledger_outputs.clear();
+        LedgerChange {
+            rows: had_rows || had_clock,
+            clock: false,
+        }
+    }
+
     /// The live Background Task ledger a transcript read owes the card
     /// (ADR-0060): one row per live task, in the read's own (transcript) order,
     /// each labelled from the input of the tool part that started it — joined
