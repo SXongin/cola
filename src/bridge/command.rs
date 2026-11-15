@@ -278,12 +278,13 @@ pub(crate) const STOPPED_WAITING: &str = "⏹ 已停止等待；后台任务结�
 /// (ADR-0082), so the ack says where to look instead of promising a chat reply.
 const COMPACTING: &str = "已提交压缩，完成后会显示在卡片上。";
 
-/// `/agent` on a client with no agent-selection surface (ADR-0106): the
-/// command reports the capability as unsupported instead of posting an empty
-/// picker. `/compact` has its own sentence at its arm.
-fn agent_unavailable(handles: &CommandHandles) -> String {
+/// The one "this Agent Client does not provide <surface>" sentence (ADR-0106):
+/// a command whose capability is absent reports it as unsupported instead of
+/// rendering an empty surface. `surface` and `command` are the reader-facing
+/// words; `/mcp` has its own pair-specific sentence in `bridge::mcp`.
+fn capability_unavailable(handles: &CommandHandles, surface: &str, command: &str) -> String {
     format!(
-        "当前 Agent Client（{}）不提供 Agent 选择，`/agent` 不可用。",
+        "当前 Agent Client（{}）不提供{surface}，`{command}` 不可用。",
         handles.flow.backend.client_name()
     )
 }
@@ -2104,10 +2105,7 @@ pub(crate) async fn handle_command(
                     .platform
                     .reply_text(
                         message_id,
-                        &format!(
-                            "当前 Agent Client（{}）不提供上下文压缩，`/compact` 不可用。",
-                            handles.flow.backend.client_name()
-                        ),
+                        &capability_unavailable(handles, "上下文压缩", "/compact"),
                     )
                     .await?;
                 return Ok(());
@@ -2190,7 +2188,10 @@ pub(crate) async fn handle_command(
                 handles
                     .flow
                     .platform
-                    .reply_text(message_id, &agent_unavailable(handles))
+                    .reply_text(
+                        message_id,
+                        &capability_unavailable(handles, "Agent 选择", "/agent"),
+                    )
                     .await?;
                 return Ok(());
             }
@@ -2201,7 +2202,10 @@ pub(crate) async fn handle_command(
                 handles
                     .flow
                     .platform
-                    .reply_text(message_id, &agent_unavailable(handles))
+                    .reply_text(
+                        message_id,
+                        &capability_unavailable(handles, "Agent 选择", "/agent"),
+                    )
                     .await?;
                 return Ok(());
             }

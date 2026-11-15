@@ -167,8 +167,7 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             // A plan absent from this client's capabilities renders nothing at
             // the source (ADR-0106): its `todowrite` list is not consumed, so
             // no empty panel or stale section can appear.
-            if call.identity.name == "todowrite" && acc.capabilities().plan == crate::backend::PlanMode::None
-            {
+            if call.identity.name == "todowrite" && acc.capabilities().plan.is_absent() {
                 return false;
             }
             // An addressing/reporting call is a one-line receipt on its run,
@@ -283,7 +282,7 @@ fn render_part(
                 // clock rather than the previous call's, which would read as a
                 // write time this list never had. A client with no plan axis
                 // renders no section at all (ADR-0106).
-                if acc.capabilities().plan != crate::backend::PlanMode::None {
+                if !acc.capabilities().plan.is_absent() {
                     acc.record_todo_call(call);
                 }
             } else {
@@ -396,7 +395,7 @@ fn render_part_scoped(
             if crate::feishu::card::tool_render::is_receipt_call(call) {
                 acc.push_delegation_receipt(call);
             } else if call.identity.name == "todowrite" {
-                if acc.capabilities().plan != crate::backend::PlanMode::None {
+                if !acc.capabilities().plan.is_absent() {
                     acc.record_todo_call(call);
                 }
             } else {
@@ -1904,7 +1903,7 @@ pub(super) fn render_turn_parts(
     // background update: otherwise the first pass removes it from "new" and
     // the post-answer pass has nothing left to show (#917 / card-repaints).
     if !acc.awaits_typed_answer()
-        && acc.capabilities().plan != crate::backend::PlanMode::None
+        && !acc.capabilities().plan.is_absent()
         && let Some(todo) = turn.todo
     {
         rendered_any |= acc.set_todo_list(todo, None, false);
@@ -2605,7 +2604,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                         acc.push_delegation_receipt(call);
                         acc.refresh_phase();
                     } else if call.identity.name == "todowrite" {
-                        if acc.capabilities().plan != crate::backend::PlanMode::None {
+                        if !acc.capabilities().plan.is_absent() {
                             acc.record_todo_call(call);
                         }
                         acc.refresh_phase();

@@ -132,3 +132,13 @@ delegations, removed when no caller remains. Landing this ADR changes no renderi
   ("Codex V2: no background runs") rather than only a boolean. Deferred until
   `/status` grows a per-Agent-Client row; the boolean is what the card needs
   today.
+
+## Amendment (2026-11-15): `background_tasks_supported` is removed, not delegating
+
+Decision 5 said the per-subsystem methods delegate to the read.
+`background_tasks_supported` and its per-client overrides are instead **removed**
+(ticket #1062's "one source or is removed"): after the surface gates moved to
+`capabilities()`, no caller remained, and a delegating alias would have kept a
+second name for one fact. `reports_live_runs` stays as the derived
+`background_runs || child_evidence` delegation. The permission always-scope and
+the `mcp` pair's meaning are unchanged. Source: ticket #1062.

@@ -906,6 +906,14 @@ pub enum PlanMode {
     TurnPlan,
 }
 
+impl PlanMode {
+    /// Whether this client states a plan at all — the one predicate every plan
+    /// gate reads.
+    pub const fn is_absent(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// How a client reports **token usage** for the card footer (ADR-0106's
 /// `usage` axis).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -916,6 +924,11 @@ pub enum UsageMode {
     /// message, or a turn-scoped usage notification).
     PerTurn,
     /// Usage is a running cumulative total the client keeps across turns.
+    ///
+    /// No current client states this: OpenCode's per-message counters and
+    /// Codex's turn-scoped notification are both per-turn. The arm stays as
+    /// part of spec #1057's canonical axis shape; a future client that reports
+    /// a session total declares it here.
     Cumulative,
 }
 
@@ -929,6 +942,25 @@ pub enum QuestionMode {
     Session,
     /// Session-backed questions **and** directory-owned Location Forms.
     SessionAndLocation,
+}
+
+impl QuestionMode {
+    /// Whether this client surfaces no question at all.
+    pub const fn is_absent(self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// Whether this mode surfaces `question` — the ONE rule both the poll
+    /// listing and the Session Card read (ADR-0106): `Session` drops a
+    /// directory-owned Location Form, `SessionAndLocation` keeps both, and
+    /// `None` keeps neither.
+    pub fn accepts(self, question: &QuestionRequest) -> bool {
+        match self {
+            Self::None => false,
+            Self::Session => !question.is_location(),
+            Self::SessionAndLocation => true,
+        }
+    }
 }
 
 /// One Agent Client's **capability declaration** (ADR-0106, spec #1057 P5).
@@ -958,18 +990,28 @@ pub struct AgentCapabilities {
     pub usage: UsageMode,
     /// Which question surfaces the client has.
     pub questions: QuestionMode,
-    /// Whether the client has an agent picker/selection surface (`/agent`).
+    /// Whether the client can select an **agent** (`/agent`): an agent list
+    /// plus a per-session selection/override. This is agent *selection*, not
+    /// mere agent metadata — a client with a fixed single agent declares false
+    /// and the command reports the surface as unsupported.
     pub modes: bool,
     /// Whether the client has a session/turn diff read (the card's change
     /// index and its button).
     pub diffs: bool,
-    /// Whether the client publishes MCP server statuses (the `/mcp` card).
+    /// Whether the client publishes the **full `/mcp` pull surface**: MCP
+    /// server **statuses plus** the directory-owned Location Form (ADR-0103).
+    /// A status read alone is not enough — ADR-0103 forbids a status-only
+    /// `/mcp` card, so Codex's `mcpServerStatus/list` and V1's status read both
+    /// declare `false` here; the card needs the elicitation-form surface too.
     pub mcp: bool,
 }
 
 impl AgentCapabilities {
     /// The live-run ledger lists runs, not only background work: a turn-scoped
-    /// child is a run too. Codex and OpenCode V1 are this case.
+    /// child is a run too. **Codex is this case** (child evidence, no
+    /// background surface). OpenCode V1 is not: it has child sessions but no
+    /// child-evidence read, so its derived answer is `false` and its ledger
+    /// waits for that read (ADR-0106's Consequences) — the spec's P4 defers it.
     pub fn reports_live_runs(&self) -> bool {
         self.background_runs || self.child_evidence
     }
@@ -1010,8 +1052,8 @@ impl AgentCapabilities {
     }
 
     /// The optional surfaces this declaration omits, in the ADR-0106 table's
-    /// order. Used by the one attach-time log line and by the per-client
-    /// tests.
+    /// order. [`Self::log_absent`] renders it as the one attach-time line; the
+    /// log itself is pinned by `absent_surfaces_and_the_attach_log_name_the_same_set`.
     pub fn absent_surfaces(&self) -> Vec<&'static str> {
         let mut absent = Vec::new();
         if !self.reports_live_runs() {
@@ -1020,7 +1062,7 @@ impl AgentCapabilities {
         if self.child_agents == ChildAgentMode::None {
             absent.push("panel liveness");
         }
-        if self.plan == PlanMode::None {
+        if self.plan.is_absent() {
             absent.push("plan");
         }
         if !self.compaction {
@@ -1029,7 +1071,7 @@ impl AgentCapabilities {
         if self.usage == UsageMode::None {
             absent.push("usage");
         }
-        if self.questions == QuestionMode::None {
+        if self.questions.is_absent() {
             absent.push("questions");
         }
         if !self.modes {
@@ -1298,5 +1340,63 @@ mod tests {
         assert_eq!(decoded[0].value, Some(FormValue::Text("/a".into())));
         assert_eq!(decoded[1].key, "link");
         assert_eq!(decoded[1].value, Some(FormValue::Bool(true)));
+    }
+
+    /// `QuestionMode::accepts` is the ONE question-surface rule: the poll
+    /// listing and the Session Card both read it (ADR-0106), so a session-only
+    /// client can never surface a directory-owned Location Form by one path
+    /// while dropping it on the other.
+    #[test]
+    fn question_mode_accepts_only_the_surfaces_it_declares() {
+        let session = QuestionRequest {
+            session_id: "ses_1".into(),
+            ..QuestionRequest::default()
+        };
+        let location = QuestionRequest::location("frm_1", "目录".into(), Vec::new(), None, None, None);
+        assert!(location.is_location(), "the fixture is a Location Form");
+        assert!(!QuestionMode::None.accepts(&session));
+        assert!(!QuestionMode::None.accepts(&location));
+        assert!(QuestionMode::Session.accepts(&session));
+        assert!(
+            !QuestionMode::Session.accepts(&location),
+            "session-only drops the directory-owned form"
+        );
+        assert!(QuestionMode::SessionAndLocation.accepts(&session));
+        assert!(QuestionMode::SessionAndLocation.accepts(&location));
+    }
+
+    /// The attach-time line is the ticket's "log the absent surfaces once":
+    /// pin that it names `TestClient`, every omitted surface, and that a full
+    /// client logs nothing.
+    #[tokio::test]
+    async fn absent_surfaces_and_the_attach_log_name_the_same_set() {
+        let absent = AgentCapabilities::none().absent_surfaces();
+        let ((), logs) = crate::bridge::test_support::capture_logs(async {
+            AgentCapabilities::none().log_absent("TestClient");
+        })
+        .await;
+        assert!(
+            logs.contains("TestClient"),
+            "the line names the attachment's client: {logs}"
+        );
+        assert!(
+            logs.contains("agent capabilities: surfaces this attachment omits"),
+            "the line is the one attach-time capability record: {logs}"
+        );
+        for surface in &absent {
+            assert!(
+                logs.contains(surface),
+                "the line names the omitted {surface:?}: {logs}"
+            );
+        }
+
+        let ((), logs) = crate::bridge::test_support::capture_logs(async {
+            AgentCapabilities::full().log_absent("FullClient");
+        })
+        .await;
+        assert!(
+            !logs.contains("FullClient"),
+            "a full-capability client logs nothing: {logs}"
+        );
     }
 }
