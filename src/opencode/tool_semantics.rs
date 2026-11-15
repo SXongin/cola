@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::backend::{
     DelegationEffect, FileAction, FileEdit, NestedCall, SearchScope, ToolCall, ToolDetail, ToolIdentity,
-    ToolKind, ToolOutput, ToolStatus,
+    ToolKind, ToolOutput, ToolStatus, file_edit_from_diff, file_edit_hunks, merge_file_edits,
 };
 
 /// One shared id the adapter claims: the kind it always carries and the
@@ -243,10 +243,18 @@ fn write_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
 /// `metadata.diff` over `metadata.files[]`; the detail mirrors that precedence,
 /// so a payload carrying both describes the change the panel actually renders.
 fn edit_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
-    if let Some(diff) = metadata_diff(metadata) {
-        let edits = one_edit(input, FileAction::Update, Some(diff));
+    if let Some(raw) = metadata_diff_raw(metadata) {
+        let edits = match input_path(input) {
+            Some(path) => vec![FileEdit {
+                path,
+                action: FileAction::Update,
+                rename_to: None,
+                diff: file_edit_hunks(raw),
+            }],
+            None => file_edit_from_diff(None, raw).into_iter().collect(),
+        };
         if !edits.is_empty() {
-            return ToolDetail::FileEdits(edits);
+            return ToolDetail::FileEdits(merge_file_edits(edits));
         }
     }
     let recorded = metadata_files(metadata, None);
@@ -258,41 +266,62 @@ fn edit_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
 
 /// A `patch`/`apply_patch`. Its input is the patch TEXT, which names every
 /// touched file (`*** Add File:` / `*** Update File:` / `*** Delete File:` and
-/// an update's `*** Move to:`) and carries the hunks; that is preferred,
-/// because only the text records a rename. When the text yields no file (an
-/// older/truncated payload) the metadata's recorded files stand in: V2's
-/// `metadata.files[]` (`FileDiff.Info = {file, patch, status}`) and V1's single
-/// `{filepath, diff}` pair.
+/// an update's `*** Move to:`) and may carry the hunks; the text is preferred
+/// only when it yields a real hunk, because metadata can hold the applied diff
+/// the text omitted. A text-only rename still contributes its action and
+/// destination. When neither has a hunk, the raw `metadata.diff`'s headers
+/// recover the path and action.
 fn patch_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
-    if let Some(edits) = input
+    let text = input
         .and_then(|input| input.get("patchText"))
         .and_then(Value::as_str)
         .map(patch_text_edits)
-        .filter(|edits| !edits.is_empty())
-    {
-        return ToolDetail::FileEdits(edits);
-    }
+        .unwrap_or_default();
     let recorded = metadata_files(metadata, None);
-    if !recorded.is_empty() {
-        return ToolDetail::FileEdits(recorded);
+    let mut edits = if text.iter().any(|edit| edit.diff.is_some()) || recorded.is_empty() {
+        text
+    } else {
+        // Metadata holds the applied hunks; the text adds an action/rename a
+        // `FileDiff.Info` status cannot express.
+        let mut merged = recorded;
+        for edit in text {
+            match merged.iter_mut().find(|existing| existing.path == edit.path) {
+                Some(existing) => {
+                    existing.action = edit.action;
+                    existing.rename_to = edit.rename_to.or(existing.rename_to.take());
+                    if existing.diff.is_none() {
+                        existing.diff = edit.diff;
+                    }
+                }
+                None => merged.push(edit),
+            }
+        }
+        merged
+    };
+    if edits.is_empty() {
+        let hint = metadata
+            .and_then(|metadata| metadata.get("filepath"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty());
+        match metadata_diff_raw(metadata) {
+            Some(diff) => {
+                if let Some(edit) = file_edit_from_diff(hint, diff) {
+                    edits = vec![edit];
+                }
+            }
+            None => {
+                if let Some(path) = hint {
+                    edits = vec![FileEdit {
+                        path: path.to_string(),
+                        action: FileAction::Update,
+                        rename_to: None,
+                        diff: None,
+                    }];
+                }
+            }
+        }
     }
-    let raw = metadata_diff_raw(metadata);
-    let diff = raw.and_then(hunk_body);
-    let path = metadata
-        .and_then(|metadata| metadata.get("filepath"))
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-        .map(str::to_string)
-        .or_else(|| raw.and_then(diff_path));
-    match (path, diff) {
-        (Some(path), diff) => ToolDetail::FileEdits(vec![FileEdit {
-            path,
-            action: FileAction::Update,
-            rename_to: None,
-            diff,
-        }]),
-        _ => ToolDetail::FileEdits(Vec::new()),
-    }
+    ToolDetail::FileEdits(merge_file_edits(edits))
 }
 
 fn glob_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
@@ -344,7 +373,7 @@ fn one_edit(input: Option<&Value>, action: FileAction, diff: Option<String>) -> 
 /// reduced to its hunk body: the card names the path and action from the
 /// [`FileEdit`], so a `---`/`+++` or `Index:` header would only repeat it.
 fn metadata_diff(metadata: Option<&Value>) -> Option<String> {
-    metadata_diff_raw(metadata).and_then(hunk_body)
+    metadata_diff_raw(metadata).and_then(file_edit_hunks)
 }
 
 /// The raw `metadata.diff` string, headers included — the only place a V1
@@ -354,20 +383,6 @@ fn metadata_diff_raw(metadata: Option<&Value>) -> Option<&str> {
         .and_then(|metadata| metadata.get("diff"))
         .and_then(Value::as_str)
         .filter(|diff| !diff.is_empty())
-}
-
-/// The file a unified diff's header block names: an `Index:` line, else the
-/// `+++` side (a git `b/` prefix dropped, `/dev/null` ignored). Used only to
-/// recover a target the payload did not state separately.
-fn diff_path(diff: &str) -> Option<String> {
-    diff.lines().find_map(|line| {
-        let rest = line
-            .strip_prefix("Index: ")
-            .or_else(|| line.strip_prefix("+++ "))?;
-        let path = rest.split('\t').next().unwrap_or(rest).trim();
-        let path = path.strip_prefix("b/").unwrap_or(path);
-        (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
-    })
 }
 
 /// The additions an input's `content` represents, as a unified hunk. V1's
@@ -387,7 +402,7 @@ fn input_content_diff(input: Option<&Value>) -> Option<String> {
         body.push_str(line);
         body.push('\n');
     }
-    Some(body.trim_end().to_string())
+    Some(body.trim_end_matches(['\r', '\n']).to_string())
 }
 
 /// V2's recorded `FileDiff.Info` list (`metadata.files[]`, one `{file, patch,
@@ -412,24 +427,13 @@ fn metadata_files(metadata: Option<&Value>, action: Option<FileAction>) -> Vec<F
                 path,
                 action: action.unwrap_or_else(|| file_action(file.get("status").and_then(Value::as_str))),
                 rename_to: None,
-                diff: file.get("patch").and_then(Value::as_str).and_then(hunk_body),
+                diff: file
+                    .get("patch")
+                    .and_then(Value::as_str)
+                    .and_then(file_edit_hunks),
             })
         })
         .collect()
-}
-
-/// A unified diff reduced to the lines a panel renders: everything from the
-/// first `@@` hunk header on (the `Index:`/`---`/`+++` block above it is the
-/// header, and the [`FileEdit`] already carries the path). A value with no hunk
-/// — a binary change's message — is kept whole so the panel can still show it.
-fn hunk_body(diff: &str) -> Option<String> {
-    let lines: Vec<&str> = diff.lines().collect();
-    if let Some(start) = lines.iter().position(|line| line.starts_with("@@")) {
-        let body = lines[start..].join("\n");
-        return (!body.trim().is_empty()).then_some(body);
-    }
-    let text = diff.trim();
-    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// The files OpenCode's patch format names, each with its action, a rename's
@@ -463,7 +467,7 @@ fn patch_text_edits(patch_text: &str) -> Vec<FileEdit> {
                     .cloned()
                     .collect::<Vec<_>>()
                     .join("\n");
-                let body = body.trim_end();
+                let body = body.trim_end_matches(['\r', '\n']);
                 (!body.is_empty()).then(|| body.to_string())
             }
         };
@@ -569,7 +573,7 @@ fn add_hunk(body: &[String]) -> Option<String> {
         diff.push_str(line);
         diff.push('\n');
     }
-    Some(diff.trim_end().to_string())
+    Some(diff.trim_end_matches(['\r', '\n']).to_string())
 }
 
 /// A `FileDiff.Info.status` as a file action; an unknown or absent status is an
