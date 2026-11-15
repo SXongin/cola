@@ -810,10 +810,7 @@ impl FileEditsBody {
         let mut body = String::new();
         let mut clipped = false;
         let mut inside_tail = self.inside_tail.as_deref();
-        let last_hunk = self
-            .sections
-            .iter()
-            .rposition(|section| !section.hunks.is_empty());
+        let last_section = self.sections.len().checked_sub(1);
         for (index, section) in self.sections.iter().enumerate() {
             let action = section.action.as_deref();
             if let Some(action) = action {
@@ -828,7 +825,7 @@ impl FileEditsBody {
                 body.push_str(action);
             }
             let mut hunks = section.hunks.clone();
-            if Some(index) == last_hunk
+            if Some(index) == last_section
                 && let Some(tail) = inside_tail.take()
             {
                 if !hunks.is_empty() {
@@ -5145,6 +5142,30 @@ mod tests {
             "no inline-code action inside the fence: {md}"
         );
         assert!(md.contains("-old \n+new  \n"), "trailing spaces kept: {md:?}");
+    }
+
+    /// A no-hunk edit still shows the tool's own tail: the note attaches to
+    /// the last section even when there is no hunk to carry it.
+    #[test]
+    fn a_no_hunk_edit_keeps_its_output_tail() {
+        let tool = panel_with_edits(
+            "edit",
+            ToolStatus::Completed,
+            json!({"filePath": "src/main.rs"}),
+            vec![FileEdit {
+                path: "src/main.rs".into(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: None,
+            }],
+            Some("Edit applied successfully.\n\nLSP errors detected in this file"),
+        );
+        let md = panel_md(tool);
+        assert!(md.contains("✏️ 编辑 `src/main.rs`"), "the action: {md}");
+        assert!(
+            md.contains("LSP errors detected in this file"),
+            "the tail survives without a hunk: {md}"
+        );
     }
 
     /// A `write`'s LSP note rides AFTER the fence, under its own 500-char
@@ -10107,10 +10128,9 @@ excerpt two";
         }
     }
 
-    /// ADR-0042's amendment's shape gate covers the results renderer too: a
-    /// tool that squats `codex/web_search` without the adapter's
-    /// `{query, action}` input stays on the opaque path and renders its own
-    /// text, not a result list.
+    /// The results renderer is gated on the neutral `Search { scope: Web }`
+    /// detail and the payload shape, not on the id: a call without that detail
+    /// (however it spells its name) renders its own text, not a result list.
     #[test]
     fn a_foreign_codex_web_search_shape_is_not_rendered_as_a_result_list() {
         let tool = ToolPanel::new(ToolCall {
