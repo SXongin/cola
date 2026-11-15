@@ -1291,3 +1291,28 @@ fn a_header_only_metadata_diff_yields_no_hunks() {
         )
     );
 }
+
+/// A binary change keeps its message (the only description it has); a pure
+/// rename/delete header block has nothing left once the framing is stripped.
+#[test]
+fn a_no_hunk_diff_keeps_only_non_framing_text() {
+    let binary = "\
+diff --git a/assets/logo.png b/assets/logo.png
+index 1111111..2222222 100644
+Binary files a/assets/logo.png and b/assets/logo.png differ";
+    assert_eq!(
+        crate::backend::file_edit_hunks(binary).as_deref(),
+        Some("Binary files a/assets/logo.png and b/assets/logo.png differ")
+    );
+    for header_only in [
+        "diff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs",
+        "--- a/gone.rs\n+++ /dev/null",
+        "old mode 100644\nnew mode 100755",
+    ] {
+        assert_eq!(
+            crate::backend::file_edit_hunks(header_only),
+            None,
+            "{header_only}"
+        );
+    }
+}

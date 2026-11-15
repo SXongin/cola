@@ -1796,15 +1796,16 @@ pub fn file_edit_hunks(diff: &str) -> Option<String> {
         let body = lines[start..].join("\n");
         return (!body.trim().is_empty()).then_some(body);
     }
-    let text = diff.trim();
-    // A header block with no hunk (a pure rename, a delete, a mode-only
-    // change) is not a diff body: the FileEdit's action and rename_to already
-    // say what happened. A binary change's message is not a header block and
-    // is kept.
-    if text.lines().any(is_diff_framing_line) {
-        return None;
-    }
-    (!text.is_empty()).then(|| text.to_string())
+    // A body with no hunk: strip the framing lines and keep whatever else the
+    // producer wrote (a binary change's `Binary files … differ`, a mode or
+    // rename explanation). Only framing left means the FileEdit's action and
+    // rename_to already say everything there is.
+    let kept: Vec<&str> = diff
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .filter(|line| !line.trim().is_empty() && !is_diff_framing_line(line))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("\n"))
 }
 
 /// One line of a unified diff's framing (`Index:`, `---`, `+++`, git's
@@ -1816,6 +1817,8 @@ fn is_diff_framing_line(line: &str) -> bool {
         || line.starts_with("+++ ")
         || line.starts_with("rename from ")
         || line.starts_with("rename to ")
+        || line.starts_with("index ")
+        || line.starts_with("===")
         || line.starts_with("similarity index ")
         || line.starts_with("new file mode ")
         || line.starts_with("deleted file mode ")
