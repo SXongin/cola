@@ -361,23 +361,30 @@ pub(crate) async fn reconcile_now(
             // skipped by the spent cycle budget — keeps the row exactly as the
             // runtime marked it, never guessed. A read that DOES conclude
             // records its ending at the derivation too.
-            for (call_id, child_id) in transcript.unconfirmed_children() {
-                match budget
-                    .read("child evidence read", backend.child_evidence(&child_id))
-                    .await
-                {
-                    Some(Ok(evidence)) => {
-                        transcript.apply_child_evidence(&call_id, evidence);
-                        record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
+            // The child-evidence step is a `child_evidence`-only surface: a
+            // client that does not declare the read (V1's shape, or a client
+            // with background runs but no child evidence) must not be asked
+            // for it. Its tasks/runs keep whatever the runtime verdict left.
+            let reads_child_evidence = backend.capabilities().child_evidence;
+            if reads_child_evidence {
+                for (call_id, child_id) in transcript.unconfirmed_children() {
+                    match budget
+                        .read("child evidence read", backend.child_evidence(&child_id))
+                        .await
+                    {
+                        Some(Ok(evidence)) => {
+                            transcript.apply_child_evidence(&call_id, evidence);
+                            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
+                        }
+                        Some(Err(error)) => {
+                            tracing::debug!(
+                                "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
+                            );
+                        }
+                        // A read that timed out — or that the spent budget skipped
+                        // — yields no verdict, like the runtime read above.
+                        None => {}
                     }
-                    Some(Err(error)) => {
-                        tracing::debug!(
-                            "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
-                        );
-                    }
-                    // A read that timed out — or that the spent budget skipped
-                    // — yields no verdict, like the runtime read above.
-                    None => {}
                 }
             }
             // The runs (spec #1057's P4): a child thread's own terminal item is
@@ -385,28 +392,50 @@ pub(crate) async fn reconcile_now(
             // and settles the yielded Turn. A run already represented by a
             // Background Task was handled above and is not read twice.
             //
-            // The gate is the ADR-0106 live-runs predicate this whole pass
-            // already checked (`reports_live_runs = background_runs ||
-            // child_evidence`), not a second, narrower capability: a client
-            // that claims background runs but has no runtime child verdicts
-            // still reads its children here, and the pass itself is the only
-            // thing that can decide whether reading them is meaningful.
-            for (run_id, child_id) in transcript.run_evidence_suspects() {
-                match budget
-                    .read("run child evidence read", backend.child_evidence(&child_id))
-                    .await
-                {
-                    Some(Ok(evidence)) => {
-                        if transcript.apply_run_child_evidence(&run_id, evidence) {
-                            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
+            // The gate is the ADR-0106 `child_evidence` axis, checked above:
+            // a client without the read keeps its runs as the runtime left
+            // them and is never asked for their children.
+            if reads_child_evidence {
+                for (run_id, child_id) in transcript.run_evidence_suspects() {
+                    match budget
+                        .read("run child evidence read", backend.child_evidence(&child_id))
+                        .await
+                    {
+                        Some(Ok(evidence)) => {
+                            let conclusive = matches!(
+                                evidence,
+                                crate::backend::ChildEvidence::Terminal { .. }
+                                    | crate::backend::ChildEvidence::Gone
+                            );
+                            if transcript.apply_run_child_evidence(&run_id, evidence) {
+                                record_new_endings(
+                                    backend,
+                                    session_id,
+                                    transcript,
+                                    &mut recorded_retirements,
+                                );
+                            } else if conclusive {
+                                // The read concluded but the run could not take
+                                // the ending (a pre-resume completion): keep it
+                                // visible as unconfirmed so a Cleanup can end
+                                // it.
+                                transcript.unconfirmed_tasks.insert(run_id.clone());
+                            }
+                        }
+                        Some(Err(error)) => {
+                            // A failed read is no verdict: mark the run
+                            // unconfirmed so the cleanup exit exists.
+                            transcript.unconfirmed_tasks.insert(run_id.clone());
+                            tracing::debug!(
+                                "session {session_id} run {run_id} child {child_id} evidence read failed: {error}; keeping its row"
+                            );
+                        }
+                        None => {
+                            // Inconclusive (timed out or budget-skipped): the
+                            // run still needs a manual exit.
+                            transcript.unconfirmed_tasks.insert(run_id.clone());
                         }
                     }
-                    Some(Err(error)) => {
-                        tracing::debug!(
-                            "session {session_id} run {run_id} child {child_id} evidence read failed: {error}; keeping its row"
-                        );
-                    }
-                    None => {}
                 }
             }
             // NOTHING is committed here (review, PR #595): the caller commits
@@ -706,6 +735,74 @@ mod tests {
         );
     }
 
+    /// A client that declares no child-evidence read is never asked for one:
+    /// `reports_live_runs` (background runs) can be true while
+    /// `child_evidence` is false, and both the task and run loops must stay
+    /// silent.
+    #[tokio::test]
+    async fn a_client_without_child_evidence_is_not_asked() {
+        let mut mock = MockBackend::new(Vec::new());
+        mock.capabilities = crate::backend::AgentCapabilities {
+            background_runs: true,
+            child_evidence: false,
+            ..crate::backend::AgentCapabilities::full()
+        };
+        let mock = Arc::new(mock);
+        let reads = Arc::clone(&mock.child_evidence_calls);
+        let backend: Arc<dyn Backend> = mock;
+
+        let launch = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "task".into(),
+                call_id: "call_run".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_run_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_launch"),
+            role: crate::backend::MessageRole::Assistant,
+            time: None,
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(launch)],
+        }])
+        .with_background_tasks(vec![crate::backend::BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_task".into(),
+            },
+            shell_id: None,
+            child_id: Some("ses_task_child".into()),
+            started_at: Some(1_000),
+        }]);
+        transcript.unconfirmed_tasks.insert("call_task".into());
+
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+        )
+        .await;
+        assert!(pass.is_some(), "the runtime read still runs");
+        assert!(
+            reads.lock().await.is_empty(),
+            "a client without child_evidence is never asked for a child read"
+        );
+        assert_eq!(transcript.runs.len(), 1, "the run keeps its row");
+        assert_eq!(transcript.background_tasks.len(), 1, "the task keeps its row");
+    }
     /// Review finding 1: a freshly spawned child answers "no rollout found"
     /// until it has run a turn. That is `Unfinished`, so the reconcile leaves
     /// the run live with no Lost ending — never a permanent 「已失联」 for a
