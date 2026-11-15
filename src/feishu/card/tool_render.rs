@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use crate::backend::{
     ContentBlock, DelegationEffect, FileAction, FileContent, FileEdit, NestedCall, Phase, RunActivity,
     RunWaits, SearchScope, TodoList, TodoStatus, TodoStep, ToolCall, ToolDetail, ToolKind, ToolStatus,
+    V1_DIRECTORY_TYPE_TAG, V2_DIRECTORY_HEADER_PREFIX, read_output_is_directory,
 };
 
 use super::lang::{PLAIN_TEXT, language_for_path};
@@ -18,15 +19,6 @@ use super::{
 /// old 800: code-wrapped output renders without line wrapping, so a file or
 /// command output can be meaningfully long.
 pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
-
-/// V1's `read` output marks a DIRECTORY listing with this tag line in its XML
-/// envelope, where a file's carries `<type>file</type>` — the shape that says
-/// "this read has no file to open" (ADR-0083 §8 amendment, #770).
-const V1_DIRECTORY_TYPE_TAG: &str = "<type>directory</type>";
-
-/// V2's `read` output opens a DIRECTORY listing's header line with this prefix,
-/// where a file's opens `Read file `; the same verdict in V2's wire shape.
-const V2_DIRECTORY_HEADER_PREFIX: &str = "Read directory ";
 
 /// The line a `read` or `write` panel appends under a body its budget CLIPPED
 /// (ADR-0083 §8 amendment, #770/#788): the panel is a
@@ -828,11 +820,14 @@ fn search_detail(tool: &ToolPanel) -> Option<SearchShape<'_>> {
 }
 
 /// Whether the panel is Codex's `imageView` — a `Read` in the neutral model
-/// (P1's table) whose panel keeps its own `🖼` word and no open button. It is
-/// out of the FileEdits pass's scope; the name check is only this one id's
-/// presentation, never a renderer key for a shared shape.
+/// (P1's table) whose panel keeps its own `🖼` word and no open button. The
+/// name and input shape are only half the gate: the neutral detail must be
+/// `Read` too, so an Opaque `imageGeneration` (which shares the identity and a
+/// `path` input) never takes the image-view presentation.
 fn is_codex_image(tool: &ToolPanel) -> bool {
-    tool.name() == "codex/image" && image_shape(tool.input())
+    tool.name() == "codex/image"
+        && matches!(tool.call().detail, ToolDetail::Read { .. })
+        && image_shape(tool.input())
 }
 
 /// One file's action, with each path formatted by the caller: inline code on
@@ -2992,38 +2987,15 @@ fn format_todo_list_with_explanation(todo: &TodoList) -> String {
     }
 }
 
-/// Whether a `read` call's raw output is a DIRECTORY listing, by output shape
-/// (ADR-0083 §8 amendment, #770): V1's XML envelope marks it
-/// `<type>directory</type>` where a file's marks `<type>file</type>`, and V2's
-/// header line opens `Read directory ` where a file's opens `Read file `. The
-/// one place the two shapes are spelled — [`format_tool_output`] skips the V1
-/// tag from here, [`parse_v2_read_output`] reads V2's prefix from here — so the
-/// verdict a `read` panel's open path hangs on cannot drift from the parsers it
-/// comes from. Each generation is read in its own envelope: the V1 tag only
-/// counts ABOVE `<content>`, so a file whose own text spells the tag is still a
-/// file, and the V2 prefix only on the first line, where its header lives.
-fn read_output_is_directory(output: &str) -> bool {
-    if output.contains("<path>") {
-        return output
-            .lines()
-            .take_while(|line| line.trim() != "<content>")
-            .any(|line| line.trim() == V1_DIRECTORY_TYPE_TAG);
-    }
-    output
-        .lines()
-        .next()
-        .is_some_and(|first| first.starts_with(V2_DIRECTORY_HEADER_PREFIX))
-}
-
 /// Render a tool's raw output string where the neutral shape says it has one.
 /// A **Read** output is OpenCode's envelope — V1's XML wrapper
 /// (`<path>…</path>`, `<type>…</type>`, `<content>…</content>`) or V2's header
 /// line over numbered lines — so the card shows the file's path and lines
 /// rather than the wrapper. A **Search** with web scope is a result envelope —
-/// render it as a title+url list. A tool with no typed detail keeps its own
-/// renderer (a `task`/`subagent` envelope or a `skill` envelope); a plan call
-/// reads the neutral `TodoList` fact ([`plan_output`]); everything else passes
-/// through unchanged.
+/// render it as a title+url list. A launch keeps its own envelope
+/// ([`delegation_output`]); a tool with no typed detail keeps its renderer (a
+/// `skill` envelope); a plan call reads the neutral `TodoList` fact
+/// ([`plan_output`]); everything else passes through unchanged.
 ///
 /// Returns `(header, body style, body)`: the header is the short markdown line
 /// above the body (file path, change count, result count); the style decides
@@ -3043,6 +3015,9 @@ fn format_tool_output(tool: &ToolPanel, output: &str) -> (Option<String>, BodySt
     if search_detail(tool).is_some_and(|search| search.scope == SearchScope::Web) {
         return web_output(output);
     }
+    if is_launch_call(tool) {
+        return delegation_output(output);
+    }
     format_named_output(tool.name(), output)
 }
 
@@ -3058,21 +3033,9 @@ fn web_output(output: &str) -> (Option<String>, BodyStyle, String) {
 }
 
 /// Render a tool's raw output for the ids whose ENVELOPE is vendor-specific
-/// and has no shared shape: a `task`/`subagent` XML envelope around the content
-/// the reader wants, or a `skill` envelope.
+/// and has no shared shape: a `skill` envelope. A launch's envelope is
+/// [`delegation_output`]'s, selected by the neutral detail.
 fn format_named_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
-    if name == "task"
-        && output.starts_with("<task ")
-        && let Some((header, body)) = parse_task_envelope(output)
-    {
-        return (header, BodyStyle::Auto, body);
-    }
-    if name == "subagent"
-        && output.starts_with("<subagent ")
-        && let Some(body) = parse_subagent_envelope(output)
-    {
-        return (None, BodyStyle::Auto, body);
-    }
     if name == "skill"
         && output.starts_with("<skill_content ")
         && let Some(body) = parse_skill_envelope(output)
@@ -3080,6 +3043,49 @@ fn format_named_output(name: &str, output: &str) -> (Option<String>, BodyStyle, 
         return (None, BodyStyle::Auto, body);
     }
     (None, BodyStyle::Auto, output.to_string())
+}
+
+/// Whether a call launches a child run, selected by its neutral detail — never
+/// its vendor name (ADR-0105 §5). A third adapter's launch under a new id takes
+/// the same panel.
+fn is_launch_call(tool: &ToolPanel) -> bool {
+    matches!(
+        &tool.call().detail,
+        ToolDetail::Delegation {
+            effect: DelegationEffect::Launch,
+            ..
+        }
+    )
+}
+
+/// A launch's raw output: V1's `<task …>` envelope (whose `<summary>` can
+/// become the header) or V2's `<subagent …>` envelope. The marker, not the
+/// identity name, picks the parser.
+fn delegation_output(output: &str) -> (Option<String>, BodyStyle, String) {
+    if output.starts_with("<task ")
+        && let Some((header, body)) = parse_task_envelope(output)
+    {
+        return (header, BodyStyle::Auto, body);
+    }
+    if output.starts_with("<subagent ")
+        && let Some(body) = parse_subagent_envelope(output)
+    {
+        return (None, BodyStyle::Auto, body);
+    }
+    (None, BodyStyle::Auto, output.to_string())
+}
+
+/// A launch's Input line: its description and the child agent's type. V1 names
+/// the type `subagent_type`, V2 `agent`; both are payload data, read the same
+/// way whichever identity name the adapter chose.
+fn delegation_input(input: &serde_json::Value) -> String {
+    let get = |key: &str| input.get(key).and_then(serde_json::Value::as_str);
+    let desc = get("description").unwrap_or("子任务");
+    let sub = get("agent")
+        .or_else(|| get("subagent_type"))
+        .map(|s| format!("\n🤖 `{}`", s))
+        .unwrap_or_default();
+    format!("🔀 {}{}", desc, sub)
 }
 
 /// The plan surface's output: the neutral [`TodoList`] parsed from the call's
@@ -3566,6 +3572,24 @@ fn image_shape(input: Option<&serde_json::Value>) -> bool {
         .is_some_and(|obj| obj.contains_key("path"))
 }
 
+/// An `imageView`'s Input line: the file it looked at. Unlike a `read` there is
+/// no preview body to fold, so the panel only names it — with the same backtick
+/// flattening as a file change's path. Selected only when [`is_codex_image`]
+/// holds (the neutral `Read` detail), never by name alone.
+fn image_input(input: &serde_json::Value) -> String {
+    let Some(obj) = input.as_object() else {
+        return input.to_string();
+    };
+    match obj
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    {
+        Some(path) => format!("🖼 {}", inline_code(path)),
+        None => generic_tool_input(obj),
+    }
+}
+
 /// `collabAgentToolCall`: the whole shape cola's adapter writes (issue #962) —
 /// the tool and its status, the sender, the receiver list, the three optional
 /// scalars as **present** keys (the adapter writes them even as `null`, keyed
@@ -3682,10 +3706,7 @@ fn format_tool_input(tool: &ToolPanel) -> String {
         return tool.input().map(plan_input).unwrap_or_default();
     }
     if is_codex_image(tool) {
-        return tool
-            .input()
-            .map(|input| format_named_input(tool.name(), input))
-            .unwrap_or_default();
+        return tool.input().map(image_input).unwrap_or_default();
     }
     if let Some(read) = read_detail(tool) {
         return read_input(tool, read);
@@ -3695,6 +3716,13 @@ fn format_tool_input(tool: &ToolPanel) -> String {
     }
     if tool.call().kind == ToolKind::Fetch {
         return fetch_input(tool.input());
+    }
+    // A Codex collaboration call keeps its own vendor presentation (issue
+    // #962); the shared `Delegation` launch panel below is for the generic
+    // task/subagent shape.
+    let codex_collab = tool.name() == "codex/collab_agent" && collab_agent_shape(tool.input());
+    if is_launch_call(tool) && !codex_collab {
+        return tool.input().map(delegation_input).unwrap_or_default();
     }
     tool.input()
         .map(|input| format_named_input(tool.name(), input))
@@ -3833,28 +3861,12 @@ fn format_named_input(name: &str, input: &serde_json::Value) -> String {
     };
     let get = |k: &str| obj.get(k).and_then(|v| v.as_str());
     match name {
-        // Codex's `imageView`: the file it looked at. Unlike a `read` there is
-        // no preview body to fold, so the panel only names it — with the same
-        // backtick flattening as a file change's path.
-        "codex/image" => match get("path").filter(|path| !path.trim().is_empty()) {
-            Some(path) => format!("🖼 {}", inline_code(path)),
-            None => generic_tool_input(obj),
-        },
         // One collaboration call's report (issue #962) and one child-agent
         // activity line. Both are adapter-written shapes, gated like every
         // other `codex/` arm.
         "codex/collab_agent" if collab_agent_shape(Some(input)) => collab_agent_input(input),
         "codex/sub_agent_activity" if sub_agent_activity_shape(Some(input)) => {
             sub_agent_activity_input(input)
-        }
-        "task" | "subagent" => {
-            let desc = get("description").unwrap_or("子任务");
-            // V1 names the subagent type `subagent_type`, V2 `agent`.
-            let sub = get("agent")
-                .or_else(|| get("subagent_type"))
-                .map(|s| format!("\n🤖 `{}`", s))
-                .unwrap_or_default();
-            format!("🔀 {}{}", desc, sub)
         }
         "skill" => match get("name").or_else(|| get("id")) {
             Some(name) => format!("🧩 {}", name),
@@ -6545,7 +6557,7 @@ Report line 1
 Report line 2
 </task_result>
 </task>";
-        let (header, style, body) = format_named_output("task", raw);
+        let (header, style, body) = delegation_output(raw);
         assert_eq!(header, None, "no summary, no header");
         assert_eq!(style, BodyStyle::Auto);
         assert!(body.starts_with("Report line 1"), "report kept: {body:?}");
@@ -6565,10 +6577,10 @@ Report line 2
 boom
 </task_error>
 </task>";
-        let (header, _, body) = format_named_output("task", raw);
+        let (header, _, body) = delegation_output(raw);
         assert_eq!(header.as_deref(), Some("Background task failed: research"));
         assert_eq!(body.trim(), "boom");
-        assert_eq!(format_named_output("task", "plain text").2, "plain text");
+        assert_eq!(delegation_output("plain text").2, "plain text");
     }
 
     /// An empty `<task_result>` must still lose its envelope — dumping the raw
@@ -6576,12 +6588,28 @@ boom
     #[test]
     fn task_output_with_an_empty_result_still_strips_the_envelope() {
         let raw = "<task id=\"ses_1\" state=\"completed\">\n<task_result>\n</task_result>\n</task>";
-        let tool = ToolPanel::for_test(
-            "task",
-            ToolStatus::Completed,
-            Some(json!({"description": "sub"})),
-            Some(raw),
-        );
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "task".into(),
+                call_id: "call_task".into(),
+            },
+            kind: ToolKind::Other,
+            status: ToolStatus::Completed,
+            input: Some(json!({"description": "sub"})),
+            output: ToolOutput {
+                raw: Some(json!(raw)),
+                blocks: vec![ContentBlock::Text(raw.to_string())],
+                error: None,
+            },
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "ses_child".into(),
+                    status: None,
+                }],
+                effect: DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        });
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -9526,20 +9554,66 @@ Index: /a/one.rs
     #[test]
     fn subagent_input_shows_the_agent_and_description() {
         assert_eq!(
-            format_named_input(
-                "subagent",
+            delegation_input(
                 &json!({"agent": "general", "description": "review the diff", "prompt": "…", "background": true})
             ),
             "🔀 review the diff\n🤖 `general`"
         );
         assert_eq!(
-            format_named_input("task", &json!({"description": "x", "subagent_type": "build"})),
+            delegation_input(&json!({"description": "x", "subagent_type": "build"})),
             "🔀 x\n🤖 `build`"
         );
         assert_eq!(
-            format_named_input("subagent", &json!({"agent": "explore"})),
+            delegation_input(&json!({"agent": "explore"})),
             "🔀 子任务\n🤖 `explore`"
         );
+    }
+
+    /// ADR-0105 §5: a launch's panel is selected by its neutral `Delegation`
+    /// detail, never its identity name. A third adapter's launch under a new id
+    /// renders the same Input line and strips the same envelope.
+    #[test]
+    fn a_launch_panel_is_selected_by_its_detail_not_its_name() {
+        let raw = "\
+<task id=\"ses_1\" state=\"completed\">
+<task_result>
+Report
+</task_result>
+</task>";
+        let launch = |name: &str| {
+            ToolPanel::new(ToolCall {
+                identity: ToolIdentity {
+                    name: name.into(),
+                    call_id: "call_launch".into(),
+                },
+                kind: ToolKind::Other,
+                status: ToolStatus::Completed,
+                input: Some(json!({"description": "review the diff", "agent": "general"})),
+                output: ToolOutput {
+                    raw: Some(json!(raw)),
+                    blocks: vec![ContentBlock::Text(raw.to_string())],
+                    error: None,
+                },
+                detail: ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "thread_1".into(),
+                        status: None,
+                    }],
+                    effect: DelegationEffect::Launch,
+                },
+                ..ToolCall::default()
+            })
+        };
+
+        let third_party = launch("third_party/launch");
+        assert_eq!(
+            format_tool_input(&third_party),
+            "🔀 review the diff\n🤖 `general`",
+            "the detail, not the id, names the launch's input"
+        );
+        let (_, _, body) = format_tool_output(&third_party, raw);
+        assert_eq!(body.trim(), "Report", "the envelope is stripped by detail");
+        assert!(!body.contains("<task"), "wrapper stripped: {body:?}");
     }
 
     /// V2's subagent output is a `<subagent sessionID state>` envelope with the
@@ -9550,7 +9624,7 @@ Index: /a/one.rs
     fn subagent_v2_output_strips_the_envelope() {
         let raw = "<subagent sessionID=\"ses_child\" state=\"completed\">\n\
                    Report line 1\n\nReport line 2\n</subagent>";
-        let (header, style, body) = format_named_output("subagent", raw);
+        let (header, style, body) = delegation_output(raw);
         assert_eq!(header, None);
         assert_eq!(style, BodyStyle::Auto);
         assert!(body.starts_with("Report line 1"), "report kept: {body:?}");
@@ -9559,7 +9633,7 @@ Index: /a/one.rs
         assert!(!body.contains("</subagent>"), "wrapper stripped: {body:?}");
 
         let handle = "The subagent is working in the background (sessionID: ses_x).";
-        assert_eq!(format_named_output("subagent", handle).2, handle);
+        assert_eq!(delegation_output(handle).2, handle);
     }
 
     /// V2's `skill` input is `{id}` where V1's was `{name}`; both render the
@@ -10405,12 +10479,64 @@ Index: /a/one.rs
     #[test]
     fn codex_image_input_names_its_file() {
         assert_eq!(
-            format_named_input("codex/image", &json!({"path": "/w/shot `1`.png"})),
+            image_input(&json!({"path": "/w/shot `1`.png"})),
             "🖼 ``/w/shot `1`.png``"
         );
         assert!(
-            format_named_input("codex/image", &json!({"path": "  "})).starts_with("- path:"),
+            image_input(&json!({"path": "  "})).starts_with("- path:"),
             "a blank path falls back to the generic rendering"
+        );
+    }
+
+    /// `imageView` and `imageGeneration` share the identity `codex/image` and a
+    /// `path` input, but only the former is a neutral `Read`. The Opaque
+    /// generation must not take the image-view Input line or read preview.
+    #[test]
+    fn an_opaque_image_generation_is_not_the_image_view_presentation() {
+        let panel = |kind: ToolKind, detail: ToolDetail, output: &str| {
+            ToolPanel::new(ToolCall {
+                identity: ToolIdentity {
+                    name: "codex/image".into(),
+                    call_id: "call_image".into(),
+                },
+                kind,
+                status: ToolStatus::Completed,
+                input: Some(json!({"path": "/w/shot.png"})),
+                output: ToolOutput {
+                    raw: Some(json!(output)),
+                    blocks: vec![ContentBlock::Text(output.to_string())],
+                    error: None,
+                },
+                detail,
+                ..ToolCall::default()
+            })
+        };
+        let view = panel(
+            ToolKind::Read,
+            ToolDetail::Read {
+                path: Some("/w/shot.png".into()),
+                preview: None,
+                directory: false,
+            },
+            "ok",
+        );
+        assert_eq!(
+            format_tool_input(&view),
+            "🖼 `/w/shot.png`",
+            "the neutral Read takes the image-view Input line"
+        );
+
+        let raw = "Read file /w/gen.png, lines 1-1\n1: data";
+        let generation = panel(ToolKind::Other, ToolDetail::Opaque, raw);
+        assert!(
+            format_tool_input(&generation).starts_with("- path:"),
+            "an Opaque generation renders the raw input: {}",
+            format_tool_input(&generation)
+        );
+        let (_, _, body) = format_tool_output(&generation, raw);
+        assert_eq!(
+            body, raw,
+            "an Opaque generation renders raw output, never a read preview"
         );
     }
 
