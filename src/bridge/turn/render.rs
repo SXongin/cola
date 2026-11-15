@@ -3154,13 +3154,15 @@ async fn render_and_flush_inner(
 /// A child transcript's live activity, or `None` when it has none to show.
 /// ONE predicate for the render gather and its tests:
 ///
-/// - a run whose own read says it ended is not live — the panel shows the
-///   settled result, the ledger row retires on the evidence, and a liveness
-///   line would claim progress that ended (`RunStatus::is_terminal`);
+/// - a child whose newest step finish is terminal is not live, whatever
+///   `RunStatus` that finish maps to — `Other("interrupted")` is `Unknown` for
+///   the status but ended the step, so the panel shows the settled result and
+///   a liveness line would claim progress that ended
+///   (`child_run_finished`); `ToolCalls` and a missing reason are not terminal;
 /// - a read with no timestamp at all proves no clock, so no line is better
 ///   than a made-up age.
 fn child_activity(transcript: &SessionTranscript) -> Option<crate::backend::RunActivity> {
-    if crate::backend::runs::child_run_status(transcript).is_some_and(|status| status.is_terminal()) {
+    if crate::backend::runs::child_run_finished(transcript) {
         return None;
     }
     crate::backend::runs::child_run_activity(transcript)
@@ -3487,9 +3489,9 @@ mod tests {
     }
 
     use crate::backend::{
-        BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, MessageRole,
-        MessageTime, ReasoningPart, StepFinish, StepStart, TodoList, TodoStatus, TodoStep, ToolCall,
-        ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
+        BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, FinishReason, MessageId,
+        MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, TodoList, TodoStatus, TodoStep,
+        ToolCall, ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::backend::{ToolDetail, ToolKind};
     use crate::bridge::App;
@@ -11821,6 +11823,48 @@ Index: /x/src/main.rs
                 wait: None,
             })
         );
+    }
+
+    /// A terminal step finish ends the child even when the client's status
+    /// word is `Unknown`: Codex's `interrupted` and OpenCode's spelled-out
+    /// `unknown` both decode to `Other(..)`, which maps to `RunStatus::Unknown`
+    /// (the honest client statement) but is a **terminal** reason. The
+    /// liveness line must disappear rather than render `waiting <age>` until
+    /// the run retires. A tool-calls pause and a missing reason are not
+    /// finishes, so the line stays.
+    #[test]
+    fn child_liveness_ends_on_any_terminal_step_finish() {
+        let finished = |reason: FinishReason| {
+            SessionTranscript::new(vec![message(
+                "a1",
+                5_000,
+                vec![
+                    tool("bash", "c1", ToolStatus::Running, Some(9_000), None, None),
+                    Part::StepFinish(StepFinish { reason }),
+                ],
+            )])
+        };
+
+        for reason in [
+            FinishReason::Error,
+            FinishReason::Stop,
+            FinishReason::Length,
+            FinishReason::ContentFilter,
+            FinishReason::Other("interrupted".into()),
+            FinishReason::Other("unknown".into()),
+        ] {
+            assert_eq!(
+                child_liveness(&finished(reason.clone())),
+                None,
+                "{reason:?} is a terminal finish: no live line"
+            );
+        }
+        for reason in [FinishReason::ToolCalls, FinishReason::Unknown] {
+            assert!(
+                child_liveness(&finished(reason.clone())).is_some(),
+                "{reason:?} is not a finish: the line stays live"
+            );
+        }
     }
 
     /// A typed `task` call: running, with the child session id in its metadata
