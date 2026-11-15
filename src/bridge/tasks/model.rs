@@ -62,7 +62,7 @@ pub struct TaskLedgerRow {
     pub unconfirmed: bool,
     /// The child session's last successfully gathered liveness (spec #501),
     /// rendered as the front task panel's own fragment — `bash 5s`,
-    /// `思考中 1m30s · 等待你的授权` — after the row's start clock. `None` for a
+    /// `waiting 1m30s · 等待你的授权` — after the row's start clock. `None` for a
     /// shell row, before the child has been read, and while a read cannot
     /// establish one; the timestamps inside are never refreshed by a failed
     /// read, so the rendered age keeps growing truthfully (ADR-0054).

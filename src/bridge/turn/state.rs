@@ -28,8 +28,9 @@ use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::{CardBuilder, RunningToolView};
 use crate::feishu::card::tool_render::{
-    FileDelivery, TaskLiveness, TodoPanel, ToolPanel, todo_panel_estimate, tool_display_name,
+    FileDelivery, TaskLiveness, TodoPanel, ToolPanel, is_plan_call, todo_panel_estimate, tool_display_name,
 };
+use crate::feishu::card::vocab;
 use crate::feishu::card::{AwaitingAction, CardState, format_tokens};
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -307,13 +308,14 @@ impl CursorSeed {
 
     /// The cursorless record's fallback seed (spec #561, ticket #565): no
     /// frontier — nothing replays — but the orphaned Turn's still-live calls
-    /// enter the live set exactly as ADR-0068's carry did. A `todowrite` is
-    /// excluded: the successor's own reads rebuild the todo list.
+    /// enter the live set exactly as ADR-0068's carry did. A plan carrier is
+    /// excluded: the successor's own reads rebuild the plan from its neutral
+    /// fact.
     pub(crate) fn live_calls_only(transcript: &SessionTranscript, scope: &TurnAnchor) -> Self {
         let live_calls: std::collections::BTreeSet<String> = transcript
             .turn_running_tools(scope)
             .iter()
-            .filter(|call| call.identity.name != "todowrite")
+            .filter(|call| !is_plan_call(call))
             .map(|call| call.identity.call_id.clone())
             .collect();
         Self {
@@ -1899,12 +1901,12 @@ impl StreamAccumulator {
     }
 
     /// Whether the current panel IS this tool call's rendered revision — the
-    /// render dedup rule: a `todowrite`'s card-tail panel and its write clock,
-    /// any other call's entry in the `tools` map. An unchanged poll then skips
-    /// the part; a revision (running → settled, late output, a rewritten list)
-    /// differs and re-renders.
+    /// render dedup rule: the plan carrier's card-tail panel and its write
+    /// clock, any other call's entry in the `tools` map. An unchanged poll then
+    /// skips the part; a revision (running → settled, late output, a rewritten
+    /// list) differs and re-renders.
     pub(super) fn tool_panel_current(&self, call: &ToolCall) -> bool {
-        if call.identity.name == "todowrite" {
+        if is_plan_call(call) {
             let panel = TodoPanel::from_tool(call.clone());
             let current = match &panel {
                 // An empty list clears the rendered panel but still records
@@ -2194,7 +2196,7 @@ impl StreamAccumulator {
 
     /// A live adoption is a working card from its first send (spec #561): a
     /// successor that rendered nothing would otherwise show the initial
-    /// Loading 「思考中」 over a run already in flight, so promote it to
+    /// Loading 「waiting」 over a run already in flight, so promote it to
     /// Streaming. A card past Loading is left exactly as it is.
     pub(super) fn mark_adopted_live(&mut self) {
         if self.card_state == CardState::Loading {
@@ -3701,7 +3703,7 @@ impl StreamAccumulator {
     /// live todo panel. This is TURN state, not slice state — the header uses
     /// it even on a card whose slice does not contain the panel, so a split
     /// continuation keeps saying "⏳ tool" instead of falling back to
-    /// "回复中". A tool that finished is not `running`, so it drops out.
+    /// "responding". A tool that finished is not `running`, so it drops out.
     /// Selection is deterministic: `IndexMap` preserves insertion order, so
     /// the first running tool (the one the Turn started first) wins.
     fn running_tool(&self) -> Option<RunningToolView> {
@@ -3713,7 +3715,7 @@ impl StreamAccumulator {
                 self.todo_panel
                     .as_ref()
                     .filter(|todo| todo.is_running())
-                    .map(|_| RunningToolView::new("⏳", "todowrite"))
+                    .map(|_| RunningToolView::new("⏳", vocab::TOOL_PLAN))
             })
     }
 
@@ -4353,7 +4355,7 @@ impl StreamAccumulator {
             Part::Tool(call) => {
                 if crate::feishu::card::tool_render::is_receipt_call(call) {
                     self.mark_receipt_delivered(crate::feishu::card::tool_render::receipt_key(call));
-                } else if call.identity.name == "todowrite" {
+                } else if is_plan_call(call) {
                     self.record_todo_call(call);
                 } else {
                     self.tools
@@ -7442,7 +7444,7 @@ mod tests {
             }]
         };
         let thinking = |last_activity_ms: i64| TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Thinking,
+            activity: crate::feishu::card::tool_render::ChildActivity::Waiting,
             last_activity_ms: Some(last_activity_ms),
             wait: None,
         };
@@ -7450,7 +7452,7 @@ mod tests {
 
         // The first read is a membership change (empty -> one row).
         assert!(acc.set_ledger(row(thinking(start)), start, LedgerCadence::Second));
-        // A new child part 400 ms later: the fragment still renders `思考中 0s`,
+        // A new child part 400 ms later: the fragment still renders `waiting 0s`,
         // so no PATCH — and the fresh timestamp IS stored.
         assert!(!acc.set_ledger(row(thinking(start + 400)), start + 400, LedgerCadence::Second));
         assert_eq!(
@@ -7462,7 +7464,7 @@ mod tests {
         assert!(acc.set_ledger(row(thinking(start + 400)), start + 1_400, LedgerCadence::Second));
         // A shape change at the same instant owes too: the phase word...
         let replying = |at: i64| TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Replying,
+            activity: crate::feishu::card::tool_render::ChildActivity::Responding,
             last_activity_ms: Some(at),
             wait: None,
         };
@@ -7600,7 +7602,7 @@ mod tests {
         );
         // The gather heals to a new typed activity: that change owes at once.
         let replying = TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Replying,
+            activity: crate::feishu::card::tool_render::ChildActivity::Responding,
             last_activity_ms: Some(start + 31_000),
             wait: None,
         };
@@ -7724,7 +7726,7 @@ mod tests {
                 started_at: Some(started_at),
                 unconfirmed: false,
                 activity: Some(TaskLiveness {
-                    activity: crate::feishu::card::tool_render::ChildActivity::Thinking,
+                    activity: crate::feishu::card::tool_render::ChildActivity::Waiting,
                     last_activity_ms: Some(activity_at),
                     wait: None,
                 }),
@@ -8229,7 +8231,7 @@ mod tests {
         acc.card_state = CardState::Reasoning;
         acc.refresh_phase();
         assert!(
-            acc.header_sig().contains("推理中"),
+            acc.header_sig().contains("reasoning"),
             "reasoning phase in sig: {}",
             acc.header_sig()
         );
@@ -8295,7 +8297,7 @@ mod tests {
         assert!(acc.dismiss_interaction("q"));
         assert_eq!(acc.awaiting_action(), AwaitingAction::None);
         assert!(
-            acc.header_sig().contains("推理中"),
+            acc.header_sig().contains("reasoning"),
             "awaiting title must lift back to the phase label: {}",
             acc.header_sig()
         );

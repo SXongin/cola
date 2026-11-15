@@ -2207,7 +2207,7 @@ mod tests {
             "config": { "wide_screen_mode": true, "streaming_mode": true },
             "header": {
                 "template": "blue",
-                "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+                "title": { "tag": "plain_text", "content": "✍️ responding" }
             },
             "body": { "elements": [
                 { "tag": "markdown", "content": "**正文** 第一段" },
@@ -2233,7 +2233,7 @@ mod tests {
 
         let got = client.get_card_view("om_7").await.unwrap();
         assert_eq!(got["schema"], "2.0");
-        assert_eq!(got["header"]["title"]["content"], "✍️ 回复中");
+        assert_eq!(got["header"]["title"]["content"], "✍️ responding");
         assert_eq!(got["body"]["elements"][0]["content"], "**正文** 第一段");
         assert_eq!(got["config"]["streaming_mode"], true);
 

@@ -35,8 +35,8 @@ use super::drain::{
 use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ChildEvidence, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, Part,
-    SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
-    TranscriptMessage, Wake, WakeSource,
+    SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolDetail, ToolIdentity, ToolKind,
+    ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
 use crate::bridge::chain::{ChainRecords, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
 use crate::bridge::tasks::TaskRunId;
@@ -151,6 +151,8 @@ fn todowrite(created: i64, call_id: &str) -> TranscriptMessage {
                     name: "todowrite".into(),
                     call_id: call_id.into(),
                 },
+                kind: ToolKind::Other,
+                detail: ToolDetail::None,
                 status: ToolStatus::Completed,
                 started_at: Some(created),
                 input: Some(serde_json::json!({ "todos": todos.clone() })),
@@ -395,7 +397,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         text.contains("⏳ 后台任务（2）")
             && text.contains("· shell：**npm run build**")
             && text.contains("· subagent：**review the diff**")
-            && text.contains("todowrite")
+            && text.contains("📋 plan")
     })
     .await;
 
@@ -415,7 +417,7 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
         "rows keep transcript order (shell before subagent): {text}"
     );
     assert!(
-        text.contains("todowrite"),
+        text.contains("📋 plan"),
         "the Todo Panel coexists with the ledger: {text}"
     );
     assert!(
@@ -1305,7 +1307,7 @@ fn waiting_shell_and_subagent(shell_started_at: i64, subagent_started_at: i64) -
 
 /// Script the live subagent's child read to an activity-less transcript: the
 /// mock otherwise serves its DEFAULT turn (with fresh timestamps) for any
-/// session, whose `思考中 0s` fragment would tick the yielded refresh every
+/// session, whose `waiting 0s` fragment would tick the yielded refresh every
 /// second and disturb a test's PATCH counts. A test that needs a fragment
 /// scripts `ses_call_sub` itself after this.
 async fn script_child_without_activity(backend: &Arc<MockBackend>) {
@@ -5593,7 +5595,7 @@ fn child_running_tool(started_at: i64, name: &str) -> SessionTranscript {
 }
 
 /// A child-session transcript whose newest content is streamed reply text: no
-/// live tool, so the activity is the phase `回复中` with the age of the newest
+/// live tool, so the activity is the phase `responding` with the age of the newest
 /// activity.
 fn child_replying(at: i64) -> SessionTranscript {
     SessionTranscript::new(vec![typed_message(
@@ -5605,7 +5607,7 @@ fn child_replying(at: i64) -> SessionTranscript {
 }
 
 /// The row starting with `prefix`'s activity fragment — everything it renders
-/// after its start clock (`bash 5s`, `思考中 30s · 等待你的授权`), or `None` when
+/// after its start clock (`bash 5s`, `waiting 30s · 等待你的授权`), or `None` when
 /// the row carries none (a shell row, an unconfirmed row, a subagent row with
 /// no stored fragment). A subagent row renders no total elapsed, so the
 /// fragment follows the `HH:MM` clock directly; a row with no clock has the
@@ -5636,7 +5638,7 @@ fn parsed_task_elapsed(seg: &str) -> Option<u64> {
     }
 }
 
-/// The seconds a fragment's age names — `bash 5s`, `思考中 1m30s`.
+/// The seconds a fragment's age names — `bash 5s`, `waiting 1m30s`.
 fn activity_age_secs(activity: &str) -> u64 {
     let age = activity
         .split(' ')
@@ -5720,7 +5722,7 @@ async fn a_yielded_subagents_row_shows_its_childs_liveness() {
 
 /// The phase form (spec #501, acceptance 1): with no tool running, the row
 /// shows the child's phase and the age of its newest activity — the front
-/// panel's own `回复中 12s` shape.
+/// panel's own `responding 12s` shape.
 #[tokio::test]
 async fn a_yielded_subagents_row_shows_its_childs_phase() {
     let _wd = test_work_dir();
@@ -5736,14 +5738,14 @@ async fn a_yielded_subagents_row_shows_its_childs_phase() {
     spawn_sync(&app);
     wait_for_card_update(&platform, "the subagent's phase", CardUpdates::Latest, |card| {
         ledger_activity(card, "· subagent：**review the diff**")
-            .is_some_and(|activity| activity.starts_with("回复中 "))
+            .is_some_and(|activity| activity.starts_with("responding "))
     })
     .await;
 
     let card = platform.updated_cards().await.last().cloned().unwrap();
     let activity = ledger_activity(&card, "· subagent：**review the diff**").unwrap();
     assert!(
-        activity.starts_with("回复中 ") && activity_age_secs(&activity) >= 5,
+        activity.starts_with("responding ") && activity_age_secs(&activity) >= 5,
         "the phase names itself and keeps the newest activity's age: {activity:?}"
     );
 }
@@ -5938,7 +5940,7 @@ async fn a_failed_child_read_keeps_the_last_fragment_and_grows_its_age() {
         CardUpdates::Latest,
         |card| {
             ledger_activity(card, "· subagent：**review the diff**")
-                .is_some_and(|activity| activity.starts_with("思考中 "))
+                .is_some_and(|activity| activity.starts_with("waiting "))
         },
     )
     .await;
@@ -6505,7 +6507,7 @@ async fn a_live_subagents_row_shows_its_childs_liveness() {
 
 /// Acceptance 2 (spec #501): the fragment follows the child on the card's own
 /// refresh — a later read of the same row renders the child's new typed
-/// activity (its `回复中` phase, then the running tool), each age measured at
+/// activity (its `responding` phase, then the running tool), each age measured at
 /// that render's clock.
 #[tokio::test]
 async fn a_live_subagents_row_refreshes_to_the_childs_new_activity() {
@@ -6529,7 +6531,7 @@ async fn a_live_subagents_row_refreshes_to_the_childs_new_activity() {
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下审阅"));
     wait_for_card_update(&platform, "the child's phase", CardUpdates::Latest, |card| {
         ledger_activity(card, "· subagent：**review the diff**")
-            .is_some_and(|activity| activity.starts_with("回复中 "))
+            .is_some_and(|activity| activity.starts_with("responding "))
     })
     .await;
 

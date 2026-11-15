@@ -195,7 +195,7 @@ async fn click_with_open_message_id_acks_the_cached_card() {
     // card's own header is pinned by
     // `feishu::card::shell::tests::a_terminal_state_wins_over_a_pending_wait`.
     assert!(
-        ack.contains("✍️ 回复中"),
+        ack.contains("✍️ responding"),
         "the ack header must show the live accumulator's post-resolution state: {ack}"
     );
     assert_eq!(
@@ -258,7 +258,7 @@ async fn click_updates_a_non_current_card_through_its_handle() {
     // new turn never carried this one, so its live header must not leak onto
     // the old card.
     assert!(
-        !ack.contains("思考中"),
+        !ack.contains("waiting"),
         "the old card must not wear the NEW turn's live header: {ack}"
     );
     assert_eq!(

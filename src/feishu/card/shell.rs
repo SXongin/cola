@@ -10,10 +10,11 @@ use super::sanitize::CardMarkdown;
 use super::tool_render::{
     TodoPanel, ToolPanel, file_image_elements, todo_panel_element, tool_display_name, tool_panel_element,
 };
+use super::vocab::phase_token;
 use super::{
     CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
 };
-use crate::backend::Compaction;
+use crate::backend::{Compaction, Phase};
 
 /// Format a duration in seconds for the header's live timer (ADR-0014):
 /// `42s`, `1m23s`, `2h5m`, `3d4h`. Whole seconds, so a header signature built
@@ -369,7 +370,7 @@ impl CardBuilder {
     /// The Turn's globally running tool for the header, preferred over this
     /// card's slice-local panels: a split continuation's slice may not carry
     /// the panel the Turn is still executing (`sleep 30` at split time), yet
-    /// its header must keep saying "⏳ tool", not fall back to "回复中".
+    /// its header must keep saying "⏳ tool", not fall back to the responding phase.
     #[cfg(test)]
     pub fn with_header_running_tool(mut self, tool: Option<ToolPanel>) -> Self {
         // Self-defending: only a LIVE panel may drive the header. A stale
@@ -473,8 +474,8 @@ impl CardBuilder {
 /// call still runs, issue #1025) — so the label and the colour cannot drift.
 /// One icon only: `status_icon` already marks running/pending with ⏳, so an
 /// extra hardcoded 🔧 would show TWO icons (e.g. "🔧 ⏳ bench") on long-running
-/// tools. The name goes through the panel's display mapping, so a Codex item
-/// kind reads "命令" here too, never `codex/command_execution`.
+/// tools. The name goes through [`tool_display_name`], so a Codex item kind
+/// reads its token (`shell`) here too, never `codex/command_execution`.
 fn running_tool_header(tool: &RunningToolView) -> (String, &'static str) {
     (format!("{} {}", tool.icon, tool.label), "orange")
 }
@@ -503,7 +504,7 @@ pub(crate) fn header_title_and_template(
         return (title.to_string(), "orange");
     }
     let (label, template) = match state {
-        CardState::Loading => ("⏳ 思考中".to_string(), "blue"),
+        CardState::Loading => (format!("⏳ {}", phase_token(Phase::Waiting)), "blue"),
         // A running tool outranks reasoning (issue #1025): a reasoning part can
         // render while a `task`/`subagent` call is still running — a seeded
         // tail replay, or the model reasoning before the wait is live — and the
@@ -512,13 +513,13 @@ pub(crate) fn header_title_and_template(
         // rather than claiming a reply that was never written.
         CardState::Reasoning => match running_tool {
             Some(tool) => running_tool_header(tool),
-            None => ("💭 推理中".to_string(), "blue"),
+            None => (format!("💭 {}", phase_token(Phase::Reasoning)), "blue"),
         },
         CardState::Streaming => {
             if let Some(tool) = running_tool {
                 running_tool_header(tool)
             } else {
-                ("✍️ 回复中".to_string(), "blue")
+                (format!("✍️ {}", phase_token(Phase::Responding)), "blue")
             }
         }
         CardState::Continued => ("⏳ 部分完成，继续中…".to_string(), "blue"),
@@ -654,7 +655,8 @@ pub(crate) fn collapsible_panel_elements(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::ToolStatus;
+    use crate::backend::{Phase, ToolDetail, ToolKind, ToolStatus};
+    use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
     use crate::feishu::card::{
         AWAITING_BOTH_TITLE, AWAITING_PERMISSION_TITLE, AWAITING_QUESTION_TITLE, AwaitingAction,
     };
@@ -956,8 +958,50 @@ mod tests {
     fn loading_card_header() {
         let card = CardBuilder::new().with_state(CardState::Loading).build();
         let header = &card["header"]["title"]["content"];
-        assert!(header.as_str().unwrap().contains("思考中"));
+        assert!(header.as_str().unwrap().contains(phase_token(Phase::Waiting)));
         assert_eq!(card["schema"].as_str().unwrap(), "2.0");
+    }
+
+    /// ADR-0107 §3: a built card speaks the three phase tokens and none of the
+    /// Chinese synonyms, on the header and on the child-agent activity line.
+    #[test]
+    fn a_built_card_speaks_the_phase_tokens() {
+        let cases = [
+            (CardState::Loading, Phase::Waiting, "⏳"),
+            (CardState::Reasoning, Phase::Reasoning, "💭"),
+            (CardState::Streaming, Phase::Responding, "✍️"),
+        ];
+        for (state, phase, icon) in cases {
+            let card = CardBuilder::new().with_state(state.clone()).build();
+            let header = card["header"]["title"]["content"].as_str().unwrap();
+            assert_eq!(
+                header,
+                format!("{icon} {}", phase_token(phase)),
+                "{state:?} must read its token"
+            );
+            for old in ["思考中", "推理中", "回复中"] {
+                assert!(!header.contains(old), "{state:?} still says {old}: {header}");
+            }
+        }
+
+        // The child-agent activity line reads the same three words (ADR-0054).
+        let activity = |activity: ChildActivity| TaskLiveness {
+            activity,
+            last_activity_ms: None,
+            wait: None,
+        };
+        assert_eq!(
+            activity(ChildActivity::Waiting).title_fragment(1_000),
+            phase_token(Phase::Waiting)
+        );
+        assert_eq!(
+            activity(ChildActivity::Reasoning).title_fragment(1_000),
+            phase_token(Phase::Reasoning)
+        );
+        assert_eq!(
+            activity(ChildActivity::Responding).title_fragment(1_000),
+            phase_token(Phase::Responding)
+        );
     }
 
     #[test]
@@ -967,7 +1011,7 @@ mod tests {
             .with_reasoning("Let me analyze this code...")
             .build();
         let header = &card["header"]["title"]["content"];
-        assert!(header.as_str().unwrap().contains("推理中"));
+        assert!(header.as_str().unwrap().contains(phase_token(Phase::Reasoning)));
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(elements[0]["tag"].as_str().unwrap(), "collapsible_panel");
         assert!(!elements[0]["expanded"].as_bool().unwrap());
@@ -1011,21 +1055,34 @@ mod tests {
         assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
     }
 
-    /// A running Codex command reaches the header with the same display mapping
-    /// the panel uses — never the adapter's namespaced id.
+    /// A running Codex command reaches the header as the same `shell` token the
+    /// panel shows — never the adapter's namespaced id.
     #[test]
-    fn a_running_codex_command_shows_its_display_name_in_the_header() {
-        let tool = ToolPanel::for_test(
-            "codex/command_execution",
-            ToolStatus::Running,
-            Some(json!({"command": "cargo test", "cwd": "/w"})),
-            None,
-        );
+    fn a_running_codex_command_shows_its_token_in_the_header() {
+        let tool = ToolPanel::new(crate::backend::ToolCall {
+            identity: crate::backend::ToolIdentity {
+                name: "codex/command_execution".to_string(),
+                call_id: "call_codex".to_string(),
+            },
+            kind: ToolKind::Execute,
+            detail: ToolDetail::Command {
+                command: "cargo test".to_string(),
+                cwd: Some("/w".to_string()),
+                description: None,
+                exit: None,
+                timeout: false,
+            },
+            status: ToolStatus::Running,
+            ..Default::default()
+        });
         let card = CardBuilder::new()
             .with_state(CardState::Streaming)
             .with_tool(tool)
             .build();
-        assert_eq!(card["header"]["title"]["content"].as_str().unwrap(), "⏳ 命令");
+        assert_eq!(
+            card["header"]["title"]["content"].as_str().unwrap(),
+            format!("⏳ {}", crate::feishu::card::vocab::TOOL_SHELL)
+        );
     }
 
     /// A card whose slice has NO tool panel still shows the Turn's running tool
@@ -1058,7 +1115,8 @@ mod tests {
             .build();
         let header = card["header"]["title"]["content"].as_str().unwrap();
         assert_eq!(
-            header, "✍️ 回复中",
+            header,
+            &format!("✍️ {}", phase_token(Phase::Responding)),
             "without the override the slice-local fallback stays: {header}"
         );
     }
@@ -1100,7 +1158,8 @@ mod tests {
             .build();
         let header = card["header"]["title"]["content"].as_str().unwrap();
         assert_eq!(
-            header, "✍️ 回复中",
+            header,
+            &format!("✍️ {}", phase_token(Phase::Responding)),
             "a non-running override must fall back to the phase label: {header}"
         );
     }
@@ -1381,7 +1440,10 @@ mod tests {
         // Without progress inputs the header is the plain phase label (existing
         // builders/tests unchanged).
         let plain = CardBuilder::new().with_state(CardState::Loading).build();
-        assert_eq!(plain["header"]["title"]["content"].as_str().unwrap(), "⏳ 思考中");
+        assert_eq!(
+            plain["header"]["title"]["content"].as_str().unwrap(),
+            &format!("⏳ {}", phase_token(Phase::Waiting))
+        );
         // With a phase timer the active header counts up.
         let card = CardBuilder::new()
             .with_state(CardState::Loading)
@@ -1391,7 +1453,7 @@ mod tests {
             })
             .build();
         let header = card["header"]["title"]["content"].as_str().unwrap();
-        assert!(header.contains("思考中"), "{}", header);
+        assert!(header.contains(phase_token(Phase::Waiting)), "{}", header);
         assert!(header.contains("1m23s"), "timer missing: {}", header);
     }
 
@@ -1406,7 +1468,7 @@ mod tests {
             })
             .build();
         let header = card["header"]["title"]["content"].as_str().unwrap();
-        assert!(header.contains("推理中"), "{}", header);
+        assert!(header.contains(phase_token(Phase::Reasoning)), "{}", header);
         assert!(header.contains("1m23s"), "timer missing: {}", header);
         assert!(header.contains("2.1k字"), "reasoning length missing: {}", header);
         assert_eq!(card["header"]["template"].as_str().unwrap(), "blue");
@@ -1446,7 +1508,7 @@ mod tests {
             card["header"]["title"]["content"]
                 .as_str()
                 .unwrap()
-                .contains("推理中"),
+                .contains(phase_token(Phase::Reasoning)),
             "no awaiting -> phase label: {card}"
         );
         assert_eq!(card["header"]["template"].as_str().unwrap(), "blue");

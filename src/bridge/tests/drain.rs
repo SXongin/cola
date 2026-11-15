@@ -561,7 +561,7 @@ async fn a_stopped_turn_discards_the_abort_error() {
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
 
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
-    wait_for_card_header(&platform, "思考中").await;
+    wait_for_card_header(&platform, "waiting").await;
     app.handle_message(incoming(
         "msg_stop".into(),
         "chat_1".into(),

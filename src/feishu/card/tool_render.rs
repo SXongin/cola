@@ -1,14 +1,14 @@
 use std::borrow::Cow;
 
 use crate::backend::{
-    CallView, ContentBlock, DelegationEffect, FileAction, FileContent, FileEdit, NestedCall, Phase,
-    RunActivity, RunWaits, SearchScope, TodoList, TodoStatus, TodoStep, ToolCall, ToolDetail, ToolKind,
-    ToolStatus,
+    ContentBlock, DelegationEffect, FileAction, FileContent, FileEdit, NestedCall, Phase, RunActivity,
+    RunWaits, SearchScope, TodoList, TodoStatus, TodoStep, ToolCall, ToolDetail, ToolKind, ToolStatus,
 };
 
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::{CardMarkdown, serialized_len};
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
+use super::vocab::{self, INPUT_LABEL, OUTPUT_LABEL, phase_token};
 use super::{
     AwaitingAction, MAX_ELEMENT_TEXT_CHARS, clip_md, exceeds_md_budget, fenced_block_bytes,
     fenced_block_overhead, fenced_code, fenced_overhead, truncate_md,
@@ -229,18 +229,12 @@ impl ToolPanel {
         }
     }
 
-    /// The neutral list an OpenCode `todowrite` call carries.
+    /// The neutral plan fact an OpenCode `todowrite` call carries: a
+    /// [`TodoList`] parsed from its input or output. The plan surface decides
+    /// *whether* to ask ([`is_plan_call`], the closed `plan` token); this
+    /// method only reports the fact, so no renderer repeats a vendor name.
     pub(crate) fn todo_list(&self) -> Option<TodoList> {
-        if self.name() != "todowrite" {
-            return None;
-        }
-        self.input().and_then(parse_todo_list).or_else(|| {
-            self.output()?
-                .parse::<serde_json::Value>()
-                .ok()
-                .as_ref()
-                .and_then(parse_todo_list)
-        })
+        call_todo_list(self.call())
     }
 
     /// The File Contents this panel carries (ADR-0076), in decoder order.
@@ -611,56 +605,26 @@ pub(crate) fn receipt_key(call: &ToolCall) -> ReceiptKey {
     }
 }
 
-/// The liveness line's token for one live call — ADR-0107's closed table,
-/// derived from `(kind, detail)` for every producer:
-///
-/// `Command` → `shell`, `Program` → `script`, an all-Add `FileEdits` →
-/// `write` (else `edit`), `Search`'s three scopes → `glob`/`grep`/`websearch`,
-/// `Fetch` + `None` → `fetch`, `Read` + `Read` → `read`, and a LAUNCHING
-/// `Delegation` → `subagent`.
-///
-/// An `Other` call with no detail reads the vendor name only for the three
-/// closed name-tokens (`plan`/`skill`/`ask`); every other shape this table
-/// does not cover keeps the **full** vendor name, namespace included — a
-/// vendor tool's identity is its name (ADR-0042/0107). #1063 moves the table
-/// into `vocab.rs`; no word here is new.
-pub(crate) fn call_token(call: &CallView) -> String {
-    let token = match (call.kind, &call.detail) {
-        (ToolKind::Execute, ToolDetail::Command { .. }) => Some("shell"),
-        (ToolKind::Execute, ToolDetail::Program { .. }) => Some("script"),
-        (ToolKind::Edit, ToolDetail::FileEdits(edits)) => {
-            if !edits.is_empty() && edits.iter().all(|edit| edit.action == FileAction::Add) {
-                Some("write")
-            } else {
-                Some("edit")
-            }
-        }
-        (ToolKind::Search, ToolDetail::Search { scope, .. }) => Some(match scope {
-            SearchScope::FileName => "glob",
-            SearchScope::Content => "grep",
-            SearchScope::Web => "websearch",
-        }),
-        (ToolKind::Read, ToolDetail::Read { .. }) => Some("read"),
-        (ToolKind::Fetch, ToolDetail::None) => Some("fetch"),
-        (
-            ToolKind::Other,
-            ToolDetail::Delegation {
-                effect: DelegationEffect::Launch,
-                ..
-            },
-        ) => Some("subagent"),
-        // The closed name-only token set (ADR-0107's one exception).
-        (ToolKind::Other, ToolDetail::None) => match call.identity.name.as_str() {
-            "todowrite" => Some("plan"),
-            "skill" => Some("skill"),
-            "question" => Some("ask"),
-            _ => None,
-        },
-        _ => None,
-    };
-    token
-        .map(str::to_string)
-        .unwrap_or_else(|| call.identity.name.clone())
+/// Whether this call is the plan surface's carrier: the closed `plan` token
+/// (ADR-0107) — a `todowrite` call carrying no shared shape, whose vendor id is
+/// the one sanctioned name read. A raw `todowrite` name comparison would be a
+/// renderer key; this is the token table's concept, and the plan's *content*
+/// is still the neutral `TodoList` [`ToolPanel::todo_list`] parses.
+pub(crate) fn is_plan_call(call: &ToolCall) -> bool {
+    vocab::tool_token(&call.identity, call.kind, &call.detail) == vocab::TOOL_PLAN
+}
+
+/// The neutral plan fact a call carries, parsed from its input first and its
+/// output second (the same precedence the plan panel renders). No vendor id is
+/// read: the shape is the fact.
+fn call_todo_list(call: &ToolCall) -> Option<TodoList> {
+    call.input.as_ref().and_then(parse_todo_list).or_else(|| {
+        tool_output(call)?
+            .parse::<serde_json::Value>()
+            .ok()
+            .as_ref()
+            .and_then(parse_todo_list)
+    })
 }
 
 /// The **Execute** family's two shapes (ADR-0105, spec #1057's P2): a shell-like
@@ -1144,32 +1108,32 @@ pub enum ChildActivity {
     /// The child's newest live tool. `started_at` is the server clock the
     /// duration counts from; a call with no clock yet shows its name alone.
     Tool { name: String, started_at: Option<i64> },
-    /// Between steps: nothing live, waiting on the model.
-    Thinking,
-    /// Its newest part is reasoning.
+    /// Between steps: nothing live, waiting on the model (`waiting`).
+    Waiting,
+    /// Its newest part is reasoning (`reasoning`).
     Reasoning,
-    /// Its newest part is streamed reply text.
-    Replying,
+    /// Its newest part is streamed reply text (`responding`).
+    Responding,
 }
 
 impl TaskLiveness {
     /// The card's view of one run's neutral activity (ADR-0105, spec #1057's
     /// P4). The token comes from the call's `(kind, detail)` via
-    /// [`call_token`]; a phase with no live call maps onto the words the line
-    /// already renders. A wait set renders both waits through the header's own
+    /// [`vocab::tool_token`]; a phase with no live call reads
+    /// [`phase_token`]. A wait set renders both waits through the header's own
     /// vocabulary.
     pub(crate) fn from_run(activity: &RunActivity) -> Self {
         let activity_kind = match &activity.call {
             Some(call) => ChildActivity::Tool {
-                name: call_token(call),
+                name: vocab::tool_token(&call.identity, call.kind, &call.detail).to_string(),
                 // The call's own server start is the clock: `shell 28s` counts
                 // from the call, not from the last activity.
                 started_at: call.started_at,
             },
             None => match activity.phase {
                 Some(Phase::Reasoning) => ChildActivity::Reasoning,
-                Some(Phase::Responding) => ChildActivity::Replying,
-                Some(Phase::Waiting) | None => ChildActivity::Thinking,
+                Some(Phase::Responding) => ChildActivity::Responding,
+                Some(Phase::Waiting) | None => ChildActivity::Waiting,
             },
         };
         let wait = activity.awaiting.and_then(awaiting_action);
@@ -1190,13 +1154,13 @@ impl TaskLiveness {
         TitleParts {
             label: match &self.activity {
                 ChildActivity::Tool { name, .. } => name,
-                ChildActivity::Thinking => "思考中",
-                ChildActivity::Reasoning => "推理中",
-                ChildActivity::Replying => "回复中",
+                ChildActivity::Waiting => phase_token(Phase::Waiting),
+                ChildActivity::Reasoning => phase_token(Phase::Reasoning),
+                ChildActivity::Responding => phase_token(Phase::Responding),
             },
             age_clock_ms: match &self.activity {
                 ChildActivity::Tool { started_at, .. } => *started_at,
-                ChildActivity::Thinking | ChildActivity::Reasoning | ChildActivity::Replying => {
+                ChildActivity::Waiting | ChildActivity::Reasoning | ChildActivity::Responding => {
                     self.last_activity_ms
                 }
             },
@@ -1206,7 +1170,7 @@ impl TaskLiveness {
 
     /// The title fragment a live task panel appends, in the header's own
     /// shape — the activity first, then how long it has run: `bash 28s`,
-    /// `推理中 12s`, `bash · 等待你的授权`. `now_ms` is passed in so the
+    /// `reasoning 12s`, `bash · 等待你的授权`. `now_ms` is passed in so the
     /// elapsed time is measured at card build time.
     pub fn title_fragment(&self, now_ms: i64) -> String {
         let parts = self.title_parts();
@@ -1402,7 +1366,7 @@ impl ToolPanel {
     pub(crate) fn for_test_read(status: ToolStatus, path: Option<&str>, output: Option<&str>) -> Self {
         Self::new(ToolCall {
             identity: crate::backend::ToolIdentity {
-                name: "read".to_string(),
+                name: vocab::TOOL_READ.to_string(),
                 call_id: "call_read".to_string(),
             },
             kind: ToolKind::Read,
@@ -2432,10 +2396,6 @@ pub(super) fn tool_panel_element(
     session_id: Option<&str>,
     md: &mut CardMarkdown,
 ) -> serde_json::Value {
-    // One name read for the panel's name-keyed decisions: the todo section's
-    // detection, the input formatter's fallback table, and the header's display
-    // name. The `Execute` family is selected by its shape instead.
-    let name = tool.name();
     // A `Program` assembles its body from its nested-call list, and a `write`
     // renders its own `content` input, so those have their own builders; every
     // other tool's body is its output text through the per-tool formatter (see
@@ -2443,13 +2403,13 @@ pub(super) fn tool_panel_element(
     // so it is applied over either path.
     let output = panel_output(tool);
     let output = output.map(|(header, style, body)| (search_count_header(tool).or(header), style, body));
-    // The todo panel is a status section, not a transcript: a parsed list is
+    // The plan panel is a status section, not a transcript: a parsed list is
     // the panel, so the generic Input line and Output marker would only frame
     // the checklist (a still-running call has no parsed output yet — the Input
     // line `📋 共 N 项任务` is all it can show), and its prefix names the
     // section rather than the call (a finished call would sit at a permanent ✅
     // while the counts right beside it still report open items).
-    let todo_panel = name == "todowrite";
+    let todo_panel = is_plan_call(tool.call());
     let todowrite_list = todo_panel
         && output
             .as_ref()
@@ -2471,8 +2431,11 @@ pub(super) fn tool_panel_element(
             // Trailing blank line so a multi-line input (edit diff, skill
             // metadata list) can't swallow the Output section as a markdown
             // lazy continuation of its last list line — Feishu would render
-            // `**Output**` glued to the last input line.
-            content.push_str(&format!("**Input**\n{}\n\n", truncate_md(&formatted, budget)));
+            // the output label glued to the last input line.
+            content.push_str(&format!(
+                "**{INPUT_LABEL}**\n{}\n\n",
+                truncate_md(&formatted, budget)
+            ));
         }
     }
     let mut title_details: Option<String> = None;
@@ -2491,7 +2454,7 @@ pub(super) fn tool_panel_element(
             // the marker a lazy continuation — and a Setext underline even turns
             // the whole run above it, marker included, into one heading
             // (`## Output99- …`), glued together.
-            content.push_str("**Output**\n\n");
+            content.push_str(&format!("**{OUTPUT_LABEL}**\n\n"));
             if is_program(tool) {
                 // The call count is the folded panel's progress line; the body
                 // leads with the nested call rows themselves.
@@ -2625,7 +2588,12 @@ pub(super) fn todo_panel_element(
             let details = format!("共 {} 项 · {}", todo.steps.len(), todo_counts(&todo.steps));
             let body = truncate_md(&format_todo_list_with_explanation(todo), TOOL_OUTPUT_MAX_CHARS);
             let content = md.element(&body);
-            let title = format!("📋 todowrite{} · {}", panel_time_suffix(at_ms), details);
+            let title = format!(
+                "📋 {}{} · {}",
+                vocab::TOOL_PLAN,
+                panel_time_suffix(at_ms),
+                details
+            );
             collapsible_panel(&title, &content, element_id)
         }
         TodoPanel::Tool(panel) => tool_panel_element(panel, at_ms, element_id, session_id, md),
@@ -3063,6 +3031,9 @@ fn read_output_is_directory(output: &str) -> bool {
 /// above the body (file path, change count, result count); the style decides
 /// how the body blocks (see [`BodyStyle`]).
 fn format_tool_output(tool: &ToolPanel, output: &str) -> (Option<String>, BodyStyle, String) {
+    if is_plan_call(tool.call()) {
+        return plan_output(output);
+    }
     // A Codex `imageView` is a `Read` in the neutral model but keeps P1's
     // presentation (its panel is not a text preview): show its output raw.
     if is_codex_image(tool) {
@@ -3090,7 +3061,7 @@ fn web_output(output: &str) -> (Option<String>, BodyStyle, String) {
 
 /// Render a tool's raw output for the ids whose ENVELOPE is vendor-specific
 /// and has no shared shape: a `task`/`subagent` XML envelope around the content
-/// the reader wants, a `skill` envelope, or a `todowrite` checklist.
+/// the reader wants, or a `skill` envelope.
 fn format_named_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
     if name == "task"
         && output.starts_with("<task ")
@@ -3110,8 +3081,14 @@ fn format_named_output(name: &str, output: &str) -> (Option<String>, BodyStyle, 
     {
         return (None, BodyStyle::Auto, body);
     }
-    if name == "todowrite"
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
+    (None, BodyStyle::Auto, output.to_string())
+}
+
+/// The plan surface's output: the neutral [`TodoList`] parsed from the call's
+/// output, rendered as the iconed checklist with its count header. A payload
+/// that does not parse passes through unchanged rather than being dropped.
+fn plan_output(output: &str) -> (Option<String>, BodyStyle, String) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
         && let Some(todo) = parse_todo_list(&value)
         && !todo.is_empty()
     {
@@ -3586,87 +3563,17 @@ fn input_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> 
 /// selects its renderer by `(kind, detail)` (ADR-0105), and the remaining name
 /// arms are the migration tickets' to move. The token rename is the vocabulary
 /// ticket's.
-pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
-    match tool.name() {
-        // The **whole** adapter-written shape, not one key: ADR-0042's
-        // amendment requires the exact `{…}` shape cola's adapter writes, and
-        // the `codex/` namespace already keeps its ids apart from a third
-        // party's.
-        "codex/command_execution" if command_execution_shape(tool.input()) => "命令",
-        "codex/file_change" if file_change_shape(tool.input()) => "文件修改",
-        "codex/web_search" if web_search_shape(tool.input()) => "网页搜索",
-        "codex/image" if image_shape(tool.input()) => "图片",
-        // One card per collaboration call (issue #962): the title names the
-        // call itself. An unknown tool name is upstream's to add and is shown
-        // verbatim rather than dropped.
-        "codex/collab_agent" if collab_agent_shape(tool.input()) => collab_tool_name(
-            tool.input()
-                .and_then(|input| input.get("tool"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
-        ),
-        "codex/sub_agent_activity" if sub_agent_activity_shape(tool.input()) => "子 Agent",
-        other => other,
-    }
-}
-
-/// The card's word for a collaboration tool call, keyed on the wire's own tool
-/// name. `other` keeps the server's string (issue #962, acceptance 4).
-fn collab_tool_name(tool: &str) -> &str {
-    match tool {
-        "spawnAgent" => "派生子 Agent",
-        "sendInput" => "发送输入",
-        "sendMessage" => "发送消息",
-        "followupTask" => "追问子 Agent",
-        "resumeAgent" => "恢复子 Agent",
-        "wait" => "等待子 Agent",
-        "closeAgent" => "关闭子 Agent",
-        "interruptAgent" => "中断子 Agent",
-        "listAgents" => "列出子 Agent",
-        other => other,
-    }
-}
-
-/// The input shape cola's Codex adapter writes for `commandExecution`:
-/// `{command: string, cwd: string}`.
-fn command_execution_shape(input: Option<&serde_json::Value>) -> bool {
-    let Some(obj) = input.and_then(serde_json::Value::as_object) else {
-        return false;
-    };
-    obj.get("command").and_then(serde_json::Value::as_str).is_some()
-        && obj.get("cwd").and_then(serde_json::Value::as_str).is_some()
-}
-
-/// `fileChange`: `{changes: [{path: string, kind: …}, …]}`. The adapter starts
-/// the item with an **empty** list and fills it through its patch-update
-/// notification, so an empty array is its shape too; every entry that is
-/// present must still carry both keys.
+/// The word a tool panel and the header show for a call: ADR-0107's token,
+/// derived from `(kind, detail)` by [`vocab::tool_token`]. A vendor tool keeps
+/// its own name (ADR-0042's opaque path), so a third-party tool needs no token
+/// lookup; the id a Codex item kind carries is not a title (`codex/command_execution`
+/// reads `shell`), and neither is any translated noun.
 ///
-/// Kept for the display word and the ADR-0042 gate on the raw payload; the
-/// RENDERER for the change reads the typed detail, so a third-party id with a
-/// partial shape stays opaque.
-fn file_change_shape(input: Option<&serde_json::Value>) -> bool {
-    input
-        .and_then(|input| input.get("changes"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|changes| {
-            changes.iter().all(|change| {
-                change
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|path| !path.trim().is_empty())
-                    && change.get("kind").is_some()
-            })
-        })
-}
-
-/// `webSearch`: `{query: string, action: …}` — the adapter always writes the
-/// `action` key, even when it is `null`.
-fn web_search_shape(input: Option<&serde_json::Value>) -> bool {
-    let Some(obj) = input.and_then(serde_json::Value::as_object) else {
-        return false;
-    };
-    obj.get("query").and_then(serde_json::Value::as_str).is_some() && obj.contains_key("action")
+/// This is a display word, not a renderer key: the renderers select by
+/// `(kind, detail)` (ADR-0105).
+pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
+    let call = tool.call();
+    vocab::tool_token(&call.identity, call.kind, &call.detail)
 }
 
 /// `imageView`: `{path: string | null}`.
@@ -3786,6 +3693,9 @@ fn format_tool_input(tool: &ToolPanel) -> String {
     }
     if let Some(edits) = file_edits(tool) {
         return file_edits_input(&edits);
+    }
+    if is_plan_call(tool.call()) {
+        return tool.input().map(plan_input).unwrap_or_default();
     }
     if is_codex_image(tool) {
         return tool
@@ -3977,13 +3887,17 @@ fn format_named_input(name: &str, input: &serde_json::Value) -> String {
             }
             _ => input.to_string(),
         },
-        "todowrite" => match parse_todos(input) {
-            // The list itself is the Output section; the input only reports
-            // how big the plan is — and is all a still-running panel can show.
-            Some(todos) => format!("📋 共 {} 项任务", todos.len()),
-            None => input.to_string(),
-        },
         _ => generic_tool_input(obj),
+    }
+}
+
+/// The plan surface's Input line: a still-running call has no parsed output
+/// yet, so the plan's size is all it can show (`📋 共 N 项任务`). A payload with
+/// no todo array keeps its raw form.
+fn plan_input(input: &serde_json::Value) -> String {
+    match parse_todos(input) {
+        Some(todos) => format!("📋 共 {} 项任务", todos.len()),
+        None => input.to_string(),
     }
 }
 
@@ -5517,7 +5431,7 @@ mod tests {
         let markdown = &body[1];
         assert_eq!(markdown["tag"], "markdown", "the panel content follows");
         assert!(
-            markdown["content"].as_str().unwrap().contains("**Input**"),
+            markdown["content"].as_str().unwrap().contains("**输入**"),
             "the body is still the rendered call: {markdown}"
         );
     }
@@ -6285,7 +6199,7 @@ mod tests {
     fn settled_task_panel_drops_child_liveness() {
         let mut tool = ToolPanel::for_test("task", ToolStatus::Completed, None, Some("done"));
         tool.set_liveness(Some(TaskLiveness {
-            activity: ChildActivity::Thinking,
+            activity: ChildActivity::Waiting,
             last_activity_ms: Some(1),
             wait: None,
         }));
@@ -6318,11 +6232,14 @@ mod tests {
         assert_eq!(tool(7_200_000, "bash").title_fragment(now), "bash 2h0m");
 
         let thinking = TaskLiveness {
-            activity: ChildActivity::Thinking,
+            activity: ChildActivity::Waiting,
             last_activity_ms: Some(now - 90_000),
             wait: Some(AwaitingAction::Both),
         };
-        assert_eq!(thinking.title_fragment(now), "思考中 1m30s · 等待你的授权/回答");
+        assert_eq!(
+            thinking.title_fragment(now),
+            format!("{} 1m30s · 等待你的授权/回答", phase_token(Phase::Waiting))
+        );
 
         let untimed = TaskLiveness {
             activity: ChildActivity::Tool {
@@ -6353,7 +6270,7 @@ mod tests {
         };
         let untimed = TaskLiveness::from_run(&activity);
         assert_eq!(untimed.age_clock_ms(), None);
-        assert_eq!(untimed.title_fragment(1_000_000), "思考中");
+        assert_eq!(untimed.title_fragment(1_000_000), phase_token(Phase::Waiting));
 
         let timed = TaskLiveness::from_run(&RunActivity {
             call: None,
@@ -6361,7 +6278,10 @@ mod tests {
             awaiting: None,
             since: Some(990_000),
         });
-        assert_eq!(timed.title_fragment(1_000_000), "推理中 10s");
+        assert_eq!(
+            timed.title_fragment(1_000_000),
+            format!("{} 10s", phase_token(Phase::Reasoning))
+        );
     }
 
     /// Review finding 7: a report's unknown and vendor-specific states are
@@ -6401,144 +6321,6 @@ mod tests {
             receipt_key(&report(ToolStatus::Running)),
             receipt_key(&report(ToolStatus::Completed))
         );
-    }
-
-    /// ADR-0107's token table, row by row, and the full-vendor opaque
-    /// fallback (review finding 3).
-    #[test]
-    fn the_liveness_token_is_adr_0107s_table() {
-        let view = |name: &str, kind: ToolKind, detail: ToolDetail| CallView {
-            identity: ToolIdentity {
-                name: name.into(),
-                call_id: "call_1".into(),
-            },
-            kind,
-            detail,
-            started_at: None,
-        };
-        let command = || ToolDetail::Command {
-            command: "ls".into(),
-            cwd: None,
-            description: None,
-            exit: None,
-            timeout: false,
-        };
-        let program = || ToolDetail::Program {
-            source: "return 1".into(),
-            language: None,
-            calls: Vec::new(),
-            error: false,
-        };
-        let edits = |action: FileAction| {
-            ToolDetail::FileEdits(vec![FileEdit {
-                path: "a.rs".into(),
-                action,
-                rename_to: None,
-                diff: None,
-            }])
-        };
-        let search = |scope: SearchScope| ToolDetail::Search {
-            query: None,
-            matches: None,
-            scope,
-        };
-        let read = || ToolDetail::Read {
-            path: Some("a.rs".into()),
-            preview: None,
-            directory: false,
-        };
-        let delegation = |effect| ToolDetail::Delegation {
-            runs: Vec::new(),
-            effect,
-        };
-
-        assert_eq!(call_token(&view("bash", ToolKind::Execute, command())), "shell");
-        assert_eq!(
-            call_token(&view("codex/command_execution", ToolKind::Execute, command())),
-            "shell",
-            "one word for every Command producer"
-        );
-        assert_eq!(
-            call_token(&view("execute", ToolKind::Execute, program())),
-            "script",
-            "a Code Mode program is not a shell"
-        );
-        assert_eq!(
-            call_token(&view("write", ToolKind::Edit, edits(FileAction::Add))),
-            "write"
-        );
-        assert_eq!(
-            call_token(&view("edit", ToolKind::Edit, edits(FileAction::Update))),
-            "edit",
-            "a mixed or updated edit is `edit`"
-        );
-        assert_eq!(
-            call_token(&view("glob", ToolKind::Search, search(SearchScope::FileName))),
-            "glob"
-        );
-        assert_eq!(
-            call_token(&view("grep", ToolKind::Search, search(SearchScope::Content))),
-            "grep"
-        );
-        assert_eq!(
-            call_token(&view("websearch", ToolKind::Search, search(SearchScope::Web))),
-            "websearch"
-        );
-        assert_eq!(call_token(&view("read", ToolKind::Read, read())), "read");
-        assert_eq!(
-            call_token(&view("webfetch", ToolKind::Fetch, ToolDetail::None)),
-            "fetch"
-        );
-        assert_eq!(
-            call_token(&view(
-                "collab",
-                ToolKind::Other,
-                delegation(DelegationEffect::Launch)
-            )),
-            "subagent"
-        );
-        assert_eq!(
-            call_token(&view(
-                "collab",
-                ToolKind::Other,
-                delegation(DelegationEffect::Address)
-            )),
-            "collab",
-            "only a LAUNCHING delegation is a subagent; an address is not a run token"
-        );
-        assert_eq!(
-            call_token(&view("todowrite", ToolKind::Other, ToolDetail::None)),
-            "plan"
-        );
-        assert_eq!(
-            call_token(&view("skill", ToolKind::Other, ToolDetail::None)),
-            "skill"
-        );
-        assert_eq!(
-            call_token(&view("question", ToolKind::Other, ToolDetail::None)),
-            "ask"
-        );
-        assert_eq!(
-            call_token(&view("codex/mystery_tool", ToolKind::Other, ToolDetail::Opaque)),
-            "codex/mystery_tool",
-            "the opaque fallback is the FULL vendor name (ADR-0042/0107)"
-        );
-        assert_eq!(
-            call_token(&view("mcp_server/my_tool", ToolKind::Other, ToolDetail::None)),
-            "mcp_server/my_tool"
-        );
-        for kind in [
-            ToolKind::Think,
-            ToolKind::Delete,
-            ToolKind::Move,
-            ToolKind::SwitchMode,
-        ] {
-            assert_eq!(
-                call_token(&view("vendor/wat", kind, ToolDetail::Opaque)),
-                "vendor/wat",
-                "{kind:?} has no token in the table"
-            );
-        }
     }
 
     /// The child session id is the LAUNCH relation's, not a tool name's (spec
@@ -7008,11 +6790,11 @@ Index: src/main.rs
             .as_str()
             .expect("panel markdown content");
         assert!(
-            md.contains("**Input**\n✏️ 编辑 `src/main.rs`"),
+            md.contains("**输入**\n✏️ 编辑 `src/main.rs`"),
             "file in input: {}",
             md
         );
-        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {}", md);
+        assert!(md.contains("**输出**\n\n+1 −1"), "count header: {}", md);
         // Hunks render inside a fenced code block (monospace, no wrapping),
         // with the edited file's own language so the syntax is coloured.
         assert!(md.contains("```rust\n@@ -1,4 +1,4 @@"), "fenced hunk: {}", md);
@@ -7099,10 +6881,10 @@ Index: src/main.rs
         );
         let md = panel_md_with_session(tool.clone(), "sess");
         assert!(
-            md.contains("**Input**\n✏️ 编辑 `src/main.rs`"),
+            md.contains("**输入**\n✏️ 编辑 `src/main.rs`"),
             "file in input: {md}"
         );
-        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
+        assert!(md.contains("**输出**\n\n+1 −1"), "count header: {md}");
         assert!(
             md.contains("```rust\n@@ -1,4 +1,4 @@"),
             "fenced hunk with the file's language: {md}"
@@ -7113,7 +6895,10 @@ Index: src/main.rs
         assert!(md.contains("\n```"), "closing fence: {md}");
 
         let title = panel_title(tool.clone());
-        assert!(title.contains("文件修改"), "own vocabulary: {title}");
+        assert!(
+            title.contains(crate::feishu::card::vocab::TOOL_EDIT),
+            "own vocabulary: {title}"
+        );
         assert!(
             title.contains("· ✏️ 编辑 main.rs"),
             "named with its action while folded: {title}"
@@ -7918,10 +7703,10 @@ Index: .config/opencode/AGENTS.md
             .as_str()
             .expect("panel markdown content");
         assert!(
-            md.contains("**Input**\n✏️ 编辑 `.config/opencode/AGENTS.md`"),
+            md.contains("**输入**\n✏️ 编辑 `.config/opencode/AGENTS.md`"),
             "file in input: {md}"
         );
-        assert!(md.contains("**Output**\n\n+1 −3"), "count header: {md}");
+        assert!(md.contains("**输出**\n\n+1 −3"), "count header: {md}");
         assert!(md.contains("```markdown\n@@ -1,6 +1,4 @@"), "fenced hunk: {md}");
         assert!(md.contains("-# English Learning Rule"), "removed line: {md}");
         assert!(md.contains("+# Interaction Rules"), "added line: {md}");
@@ -8035,7 +7820,7 @@ Index: src/main.rs
         let md = card["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
             .expect("panel markdown content");
-        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
+        assert!(md.contains("**输出**\n\n+1 −1"), "count header: {md}");
         assert!(md.contains("-let a = 1;"), "removed line: {md}");
         assert!(
             md.contains("LSP errors detected in this file, please fix:"),
@@ -8093,7 +7878,7 @@ Index: /x/one.rs
         let md = card["body"]["elements"][0]["elements"][0]["content"]
             .as_str()
             .expect("panel markdown content");
-        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
+        assert!(md.contains("**输出**\n\n+1 −1"), "count header: {md}");
         assert!(md.contains("```rust\n@@ -1,3 +1,3 @@"), "fenced hunks: {md}");
         assert!(md.contains("-let b = 2;"), "removed line: {md}");
         assert!(md.contains("+let b = 3;"), "added line: {md}");
@@ -8443,7 +8228,7 @@ Index: /a/lua.lua
         );
         assert_eq!(
             panel_title(tool.clone()),
-            "✅ apply_patch · 📄 2 files · +2 −2",
+            "✅ edit · 📄 2 files · +2 −2",
             "the folded title owns the count and the totals"
         );
         let body = panel_md(tool);
@@ -8486,7 +8271,7 @@ Index: /a/lua.lua
         );
         assert_eq!(
             panel_title(tool.clone()),
-            "✅ patch · 📄 3 files · +4 −3",
+            "✅ edit · 📄 3 files · +4 −3",
             "the folded title carries the file count and the totals"
         );
         let body = panel_md(tool);
@@ -8494,7 +8279,7 @@ Index: /a/lua.lua
             !body.contains("📄 3 files") && !body.contains("+4 −3"),
             "the body does not repeat the title's count: {body}"
         );
-        let output = body.split("**Output**").nth(1).expect("the output section");
+        let output = body.split("**输出**").nth(1).expect("the output section");
         assert_eq!(
             output.matches("✏️ 编辑").count(),
             3,
@@ -8540,7 +8325,7 @@ Index: /a/lua.lua
         );
         assert_eq!(panel_title(edit.clone()), "✅ edit · ✏️ 编辑 one.rs");
         assert!(
-            panel_md(edit).contains("**Output**\n\n+1 −1"),
+            panel_md(edit).contains("**输出**\n\n+1 −1"),
             "the body keeps the bare header"
         );
 
@@ -8551,8 +8336,8 @@ Index: /a/lua.lua
             vec![file_edit("/a/one.rs", FileAction::Update, diff)],
             Some("Success. Updated the following files"),
         );
-        assert_eq!(panel_title(patch.clone()), "✅ patch · ✏️ 编辑 one.rs");
-        assert!(panel_md(patch).contains("**Output**\n\n+1 −1"));
+        assert_eq!(panel_title(patch.clone()), "✅ edit · ✏️ 编辑 one.rs");
+        assert!(panel_md(patch).contains("**输出**\n\n+1 −1"));
     }
 
     /// A list that touches two languages has no honest grammar to fence with:
@@ -8640,6 +8425,34 @@ LSP errors detected in a.rs, please fix:
         assert!(text.contains("```"), "closing fence: {}", text);
     }
 
+    /// ADR-0107 §5: the structural section labels are copy, and the card speaks
+    /// them in Chinese — the English `**Input**`/`**Output**` are gone.
+    #[test]
+    fn tool_panel_section_labels_are_the_shared_copy() {
+        let tool = command_panel(
+            "bash",
+            ToolStatus::Completed,
+            "cargo test",
+            None,
+            None,
+            false,
+            Some("ok"),
+        );
+        let md = panel_md(tool);
+        assert!(
+            md.contains(&format!("**{}**", crate::feishu::card::vocab::INPUT_LABEL)),
+            "the input label is the shared copy: {md}"
+        );
+        assert!(
+            md.contains(&format!("**{}**", crate::feishu::card::vocab::OUTPUT_LABEL)),
+            "the output label is the shared copy: {md}"
+        );
+        assert!(
+            !md.contains("**Input**") && !md.contains("**Output**"),
+            "no English section label survives: {md}"
+        );
+    }
+
     /// A `todowrite` call renders as a status checklist, not raw JSON: the
     /// folded header carries the plan size plus the status counts, the body is
     /// the iconed list alone, and the payload's priority (noise) never leaks.
@@ -8651,8 +8464,7 @@ LSP errors detected in a.rs, please fix:
             {"content": "补测试", "status": "pending", "priority": "medium"},
             {"content": "旧方案", "status": "cancelled", "priority": "low"},
         ]);
-        let tool = ToolPanel::for_test(
-            "todowrite",
+        let tool = plan_tool(
             ToolStatus::Completed,
             Some(json!({ "todos": todos.clone() })),
             // Real outputs are `JSON.stringify(todos, null, 2)`.
@@ -8670,15 +8482,16 @@ LSP errors detected in a.rs, please fix:
             .as_str()
             .expect("panel title");
         assert_eq!(
-            title, "📋 todowrite · 共 4 项 · 🔄 1 · ⬜ 1 · ✅ 1 · 🚫 1",
+            title,
+            format!("📋 {} · 共 4 项 · 🔄 1 · ⬜ 1 · ✅ 1 · 🚫 1", vocab::TOOL_PLAN),
             "the folded header must carry the size and status counts"
         );
         assert!(
             md.starts_with("- ✅ ~~调研~~"),
             "the checklist is the whole body: {md}"
         );
-        assert!(!md.contains("**Input**"), "no Input placeholder: {md}");
-        assert!(!md.contains("**Output**"), "no Output marker: {md}");
+        assert!(!md.contains("**输入**"), "no Input placeholder: {md}");
+        assert!(!md.contains("**输出**"), "no Output marker: {md}");
         assert!(!md.contains("共 4 项"), "the size lives in the header: {md}");
         assert!(md.contains("- ✅ ~~调研~~"), "completed struck: {md}");
         assert!(md.contains("- 🔄 **实现渲染**"), "in-progress bolded: {md}");
@@ -8694,8 +8507,7 @@ LSP errors detected in a.rs, please fix:
     /// the call can show yet (and the header carries no counts).
     #[test]
     fn running_todowrite_panel_shows_the_plan_size_in_its_body() {
-        let tool = ToolPanel::for_test(
-            "todowrite",
+        let tool = plan_tool(
             ToolStatus::Running,
             Some(json!({ "todos": [
                 {"content": "第一步", "status": "in_progress"},
@@ -8713,8 +8525,12 @@ LSP errors detected in a.rs, please fix:
         let title = card["body"]["elements"][0]["header"]["title"]["content"]
             .as_str()
             .expect("panel title");
-        assert_eq!(title, "📋 todowrite", "no counts before the list exists");
-        assert!(md.contains("**Input**\n📋 共 2 项任务"), "plan size: {md}");
+        assert_eq!(
+            title,
+            format!("📋 {}", vocab::TOOL_PLAN),
+            "no counts before the list exists"
+        );
+        assert!(md.contains("**输入**\n📋 共 2 项任务"), "plan size: {md}");
     }
 
     /// A todo item long enough to trip the generic long-line rule must stay a
@@ -8722,8 +8538,7 @@ LSP errors detected in a.rs, please fix:
     #[test]
     fn todowrite_long_item_stays_markdown_not_fenced() {
         let content = format!("修复 {}", "很长".repeat(80));
-        let tool = ToolPanel::for_test(
-            "todowrite",
+        let tool = plan_tool(
             ToolStatus::Completed,
             None,
             Some(&json!([{"content": content, "status": "pending"}]).to_string()),
@@ -8739,11 +8554,11 @@ LSP errors detected in a.rs, please fix:
         assert!(!md.contains("```"), "must not be fenced: {md}");
     }
 
-    /// An unparseable `todowrite` output — a running call's placeholder, an
-    /// error, a truncated dump, or a list with one malformed row — passes
-    /// through unchanged rather than being dropped, and so does an empty list.
+    /// An unparseable plan output — a running call's placeholder, an error, a
+    /// truncated dump, or a list with one malformed row — passes through
+    /// unchanged rather than being dropped, and so does an empty list.
     #[test]
-    fn todowrite_output_without_a_todo_array_passes_through() {
+    fn plan_output_without_a_todo_array_passes_through() {
         for raw in [
             "0 todos",
             "❌ permission denied",
@@ -8752,7 +8567,7 @@ LSP errors detected in a.rs, please fix:
             r#"[{"content":"ok","status":"pending"},{"status":"pending"}]"#,
             r#"[{"content":"","status":"pending"}]"#,
         ] {
-            let (header, style, body) = format_named_output("todowrite", raw);
+            let (header, style, body) = plan_output(raw);
             assert_eq!(header, None, "no header for {raw:?}");
             assert_eq!(style, BodyStyle::Auto, "raw fallback for {raw:?}");
             assert_eq!(body, raw, "raw output kept for {raw:?}");
@@ -8835,7 +8650,7 @@ LSP errors detected in a.rs, please fix:
 
     /// Regression: a plain output containing `--` — `rg`'s group separator —
     /// was parsed by Feishu as a Setext heading underline, which folded every
-    /// line above it, `**Output**` included, into one glued heading
+    /// line above it, `**输出**` included, into one glued heading
     /// (`## Output99- …`): the marker must own a paragraph, and the body must
     /// be fenced so the underline stays literal.
     #[test]
@@ -8859,11 +8674,11 @@ LSP errors detected in a.rs, please fix:
             .as_str()
             .expect("panel markdown content");
         assert!(
-            md.contains("**Output**\n\n```\n"),
+            md.contains("**输出**\n\n```\n"),
             "the marker must own a paragraph and the body be fenced: {md}"
         );
         assert!(
-            !md.contains("**Output**99-"),
+            !md.contains("**输出**99-"),
             "the marker must not be swallowed by the output: {md}"
         );
         assert!(
@@ -8891,7 +8706,7 @@ LSP errors detected in a.rs, please fix:
             .as_str()
             .expect("panel markdown content");
         assert!(
-            md.contains("**Output**\n\n    Checking colark"),
+            md.contains("**输出**\n\n    Checking colark"),
             "the marker must stay on its own line: {md}"
         );
     }
@@ -9149,7 +8964,7 @@ LSP errors detected in a.rs, please fix:
     /// Regression: a tool whose input renders as markdown LIST lines (the
     /// generic fallback `- name: ...`, a skill's metadata list) must NOT swallow
     /// the Output marker as a lazy continuation of the last list line — Feishu
-    /// then glues `**Output**` to the end of the input. A blank line between
+    /// then glues `**输出**` to the end of the input. A blank line between
     /// the sections keeps them on separate visual lines.
     #[test]
     fn tool_panel_input_and_output_separated_by_blank_line() {
@@ -9169,15 +8984,15 @@ LSP errors detected in a.rs, please fix:
             .as_str()
             .expect("panel markdown content");
         // The last input list line and the Output marker must not be adjacent —
-        // a single newline would make `**Output**` a lazy continuation of the
+        // a single newline would make `**输出**` a lazy continuation of the
         // `- skill: m15` list item and Feishu would render them on one line.
         assert!(
-            md.contains("- skill: m15\n\n**Output**\n"),
+            md.contains("- skill: m15\n\n**输出**\n"),
             "Input and Output sections must be separated by a blank line: {:?}",
             md
         );
         assert!(
-            !md.contains("- skill: m15\n**Output**"),
+            !md.contains("- skill: m15\n**输出**"),
             "no glued marker: {:?}",
             md
         );
@@ -9353,6 +9168,16 @@ LSP errors detected in a.rs, please fix:
             preview: None,
             directory: false,
         };
+        tool
+    }
+
+    /// An OpenCode plan call as the adapter declares it: `Other` + `None`,
+    /// carrying the neutral `TodoList` payload (ADR-0107's closed `plan`
+    /// token). The card reads the payload, never the vendor id.
+    fn plan_tool(status: ToolStatus, input: Option<serde_json::Value>, output: Option<&str>) -> ToolPanel {
+        let mut tool = ToolPanel::for_test("todowrite", status, input, output);
+        tool.call.kind = ToolKind::Other;
+        tool.call.detail = ToolDetail::None;
         tool
     }
 
@@ -9533,10 +9358,10 @@ Index: /a/one.rs
         );
         let md = panel_md(tool);
         assert!(
-            md.contains("**Input**\n✏️ 编辑 `/a/one.rs`"),
+            md.contains("**输入**\n✏️ 编辑 `/a/one.rs`"),
             "file in input: {md}"
         );
-        assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
+        assert!(md.contains("**输出**\n\n+1 −1"), "count header: {md}");
         assert!(md.contains("```rust\n@@"), "fenced hunks: {md}");
         assert!(
             md.contains("-let b = 2;") && md.contains("+let b = 3;"),
@@ -9653,46 +9478,78 @@ Index: /a/one.rs
         );
     }
 
-    /// Codex's neutral item kinds are protocol names, not tool names: a folded
-    /// panel must say what happened (`命令`, `文件修改`, …) instead of printing
-    /// `command_execution` on nearly every card (issue #900). An OpenCode
-    /// built-in and a third-party tool keep their own names (ADR-0042), which is
-    /// why the mapping is gated on the item's own input shape.
+    /// ADR-0107: a Codex item kind is not a title. The same tokens every
+    /// adapter reaches name its calls (`shell`, `edit`, `websearch`, `read`,
+    /// `subagent`), so no translated noun (`命令`, `文件修改`, …) survives. A
+    /// third-party tool, and a namespaced id whose adapter never declared a
+    /// shape, keep their own full name (ADR-0042).
     #[test]
-    fn codex_item_kinds_render_a_human_title() {
-        let title = |name: &str, input: serde_json::Value| {
-            let tool = ToolPanel::for_test(name, ToolStatus::Completed, Some(input), Some("ok"));
-            let card = CardBuilder::new()
-                .with_state(CardState::Done)
-                .with_tool(tool)
-                .build();
-            card["body"]["elements"][0]["header"]["title"]["content"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
+    fn codex_item_kinds_render_their_tokens() {
+        /// One fixture with the typed shape the adapter declares.
+        fn typed(
+            name: &str,
+            kind: ToolKind,
+            detail: ToolDetail,
+            input: serde_json::Value,
+            output: &str,
+        ) -> ToolPanel {
+            let mut tool = ToolPanel::for_test(name, ToolStatus::Completed, Some(input), Some(output));
+            tool.call.kind = kind;
+            tool.call.detail = detail;
+            tool
+        }
+        let title = |tool: ToolPanel| panel_title(tool);
+
         assert_eq!(
-            title("codex/command_execution", json!({"command": "ls", "cwd": "/w"})),
-            "✅ 命令"
+            title(typed(
+                "codex/command_execution",
+                ToolKind::Execute,
+                ToolDetail::Command {
+                    command: "ls".into(),
+                    cwd: Some("/w".into()),
+                    description: None,
+                    exit: None,
+                    timeout: false,
+                },
+                json!({"command": "ls", "cwd": "/w"}),
+                "ok"
+            )),
+            format!("✅ {}", vocab::TOOL_SHELL)
         );
         // A single-file change also names its file while folded (#902), the way
         // an `edit` panel does.
         assert_eq!(
-            panel_title(codex_file_change_panel(vec![json!({
+            title(codex_file_change_panel(vec![json!({
                 "path": "a.rs",
                 "kind": {"type": "update"},
                 "diff": "@@ -1 +1 @@\n-a\n+b"
             })])),
-            "✅ 文件修改 · ✏️ 编辑 a.rs"
+            format!("✅ {} · ✏️ 编辑 a.rs", vocab::TOOL_EDIT)
         );
         assert_eq!(
-            title("codex/web_search", json!({"query": "rust", "action": null})),
-            "✅ 网页搜索"
+            title(codex_web_search_panel(json!([]))),
+            format!("✅ {}", vocab::TOOL_WEBSEARCH)
         );
-        assert_eq!(title("codex/image", json!({"path": "/w/shot.png"})), "✅ 图片");
-        // A collaboration call names its interaction, and the folded title
-        // names the first target (issue #962). An unknown tool is upstream's to
-        // add: it keeps its own string.
+        // `imageView` is a `read` in the neutral model (it names a file the
+        // card viewed); `imageGeneration` has no read shape and stays opaque.
+        assert_eq!(
+            title(typed(
+                "codex/image",
+                ToolKind::Read,
+                ToolDetail::Read {
+                    path: Some("/w/shot.png".into()),
+                    preview: None,
+                    directory: false,
+                },
+                json!({"path": "/w/shot.png"}),
+                "ok"
+            )),
+            format!("✅ {}", vocab::TOOL_READ)
+        );
+        // A collaboration call names its target on the folded title (issue
+        // #962). A LAUNCH is the `subagent` token; an addressing verb has no
+        // token — production renders it as a receipt, and the panel path keeps
+        // the vendor id rather than a translated noun.
         let collab = |tool: &str| {
             json!({
                 "tool": tool,
@@ -9709,59 +9566,120 @@ Index: /a/one.rs
                 }]
             })
         };
+        let delegation = |effect| ToolDetail::Delegation {
+            runs: Vec::new(),
+            effect,
+        };
         assert_eq!(
-            title("codex/collab_agent", collab("spawnAgent")),
-            "✅ 派生子 Agent · 🧵 0192f0aa"
+            title(typed(
+                "codex/collab_agent",
+                ToolKind::Other,
+                delegation(DelegationEffect::Launch),
+                collab("spawnAgent"),
+                "ok"
+            )),
+            format!("✅ {} · 🧵 0192f0aa", vocab::TOOL_SUBAGENT)
         );
-        assert_eq!(
-            title("codex/collab_agent", collab("wait")),
-            "✅ 等待子 Agent · 🧵 0192f0aa"
-        );
-        assert_eq!(
-            title("codex/collab_agent", collab("futureTool")),
-            "✅ futureTool · 🧵 0192f0aa"
-        );
+        for verb in ["wait", "sendInput", "futureTool"] {
+            assert_eq!(
+                title(typed(
+                    "codex/collab_agent",
+                    ToolKind::Other,
+                    delegation(DelegationEffect::Address),
+                    collab(verb),
+                    "ok"
+                )),
+                "✅ codex/collab_agent · 🧵 0192f0aa",
+                "an addressing call has no token: {verb}"
+            );
+        }
 
-        // A foreign tool keeps its own name even when it shares the raw kind or
-        // a payload key: the ids cola's adapter writes are namespaced.
-        assert_eq!(title("image", json!({"path": "/w/shot.png"})), "✅ image");
+        // A third-party tool keeps its own name even when it shares a payload
+        // key; the ids cola's adapter writes are namespaced and carry a typed
+        // shape, so an undeclared one is opaque.
         assert_eq!(
-            title("command_execution", json!({"command": "ls", "cwd": "/w"})),
+            title(ToolPanel::for_test(
+                "image",
+                ToolStatus::Completed,
+                Some(json!({"path": "/w/shot.png"})),
+                Some("ok")
+            )),
+            "✅ image"
+        );
+        assert_eq!(
+            title(ToolPanel::for_test(
+                "command_execution",
+                ToolStatus::Completed,
+                Some(json!({"command": "ls", "cwd": "/w"})),
+                Some("ok")
+            )),
             "✅ command_execution"
         );
-        // A partial shape under the namespaced id is not the adapter's shape.
         assert_eq!(
-            title("codex/command_execution", json!({"argv": ["ls"]})),
-            "✅ codex/command_execution"
+            title(ToolPanel::for_test(
+                "codex/command_execution",
+                ToolStatus::Completed,
+                Some(json!({"argv": ["ls"]})),
+                Some("ok")
+            )),
+            "✅ codex/command_execution",
+            "a partial shape under the namespaced id is not the adapter's call"
         );
         assert_eq!(
-            title(
+            title(ToolPanel::for_test(
                 "codex/collab_agent",
-                json!({"tool": "spawnAgent", "status": "completed"})
-            ),
+                ToolStatus::Completed,
+                Some(json!({"tool": "spawnAgent", "status": "completed"})),
+                Some("ok")
+            )),
             "✅ codex/collab_agent",
             "the adapter always writes the sender, the receiver list and the rows"
         );
         assert_eq!(
-            title("codex/web_search", json!({"query": "rust"})),
+            title(ToolPanel::for_test(
+                "codex/web_search",
+                ToolStatus::Completed,
+                Some(json!({"query": "rust"})),
+                Some("ok")
+            )),
             "✅ codex/web_search",
             "the adapter always writes `action`; a partial shape stays raw"
         );
         assert_eq!(
-            title("codex/file_change", json!({"changes": []})),
-            "✅ 文件修改",
-            "the adapter's start shape is an empty change list"
-        );
-        assert_eq!(
-            title("codex/file_change", json!({"changes": [{"path": "a.rs"}]})),
+            title(ToolPanel::for_test(
+                "codex/file_change",
+                ToolStatus::Completed,
+                Some(json!({"changes": [{"path": "a.rs"}]})),
+                Some("ok")
+            )),
             "✅ codex/file_change",
             "an entry without `kind` is not the adapter's shape"
         );
-        // An OpenCode built-in keeps its own id.
-        assert_eq!(title("bash", json!({"command": "ls"})), "✅ bash");
+        // An OpenCode built-in reaches its token through the shape, not the id.
+        assert_eq!(
+            title(typed(
+                "bash",
+                ToolKind::Execute,
+                ToolDetail::Command {
+                    command: "ls".into(),
+                    cwd: None,
+                    description: None,
+                    exit: None,
+                    timeout: false,
+                },
+                json!({"command": "ls"}),
+                "ok"
+            )),
+            format!("✅ {}", vocab::TOOL_SHELL)
+        );
         // An MCP tool's own `server/tool` name is never remapped.
         assert_eq!(
-            title("context7/query-docs", json!({"query": "rust"})),
+            title(ToolPanel::for_test(
+                "context7/query-docs",
+                ToolStatus::Completed,
+                Some(json!({"query": "rust"})),
+                Some("ok")
+            )),
             "✅ context7/query-docs"
         );
     }
@@ -9791,10 +9709,10 @@ Index: /a/one.rs
         assert!(md.contains("📝 Review the diff"), "the prompt: {md}");
         assert!(md.contains("🤖 `gpt-5.1-codex` · high"), "the model: {md}");
         assert!(
-            md.contains("**Output**\n\n⏳ `0192f0aa` · 运行中"),
+            md.contains("**输出**\n\n⏳ `0192f0aa` · 运行中"),
             "one row for the target's own state, in the Output body: {md}"
         );
-        assert_eq!(panel_title(tool), "✅ 派生子 Agent · 🧵 0192f0aa");
+        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 0192f0aa");
 
         // The start payload has no receiver yet: no row, no target on the
         // title, and the call reads as running.
@@ -9815,7 +9733,7 @@ Index: /a/one.rs
         );
         let md = panel_md(started.clone());
         assert!(!md.contains("尚无状态"), "no empty rows: {md}");
-        assert_eq!(panel_title(started), "⏳ 派生子 Agent");
+        assert_eq!(panel_title(started), "⏳ codex/collab_agent");
     }
 
     /// Issue #962, review round 1: a long prompt and several targets with long
@@ -9862,7 +9780,7 @@ Index: /a/one.rs
         }
         assert!(md.contains("❌ `00000006` · 出错"), "the failure row: {md}");
         assert!(md.contains("📝 ppp"), "the prompt stays in the Input: {md}");
-        assert_eq!(panel_title(tool), "✅ 等待子 Agent · 🧵 00000001 +5");
+        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 00000001 +5");
     }
 
     /// Review round 2: more targets than the output budget can hold end on an
@@ -9902,7 +9820,7 @@ Index: /a/one.rs
         assert!(last.ends_with(" 个目标"), "{last:?}");
         assert!(md.contains("`00000001`"), "the first rows render: {md}");
         assert!(!md.contains("… ✅"), "no row is clipped mid-body: {md}");
-        assert_eq!(panel_title(tool), "✅ 等待子 Agent · 🧵 00000001 +19");
+        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 00000001 +19");
     }
 
     /// Review round 2: a status this build does not model keeps its own string
@@ -9926,7 +9844,7 @@ Index: /a/one.rs
         );
         let md = panel_md(tool.clone());
         assert!(md.contains("🔧 futureStatus"), "{md}");
-        assert_eq!(panel_title(tool), "🔧 派生子 Agent");
+        assert_eq!(panel_title(tool), "🔧 codex/collab_agent");
     }
 
     /// Every target of a `wait` gets its own row with its own outcome — the
@@ -9967,7 +9885,7 @@ Index: /a/one.rs
             !md.contains("📝"),
             "no prompt line when the call carries none: {md}"
         );
-        assert_eq!(panel_title(tool), "✅ 等待子 Agent · 🧵 0192f0aa +1");
+        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 0192f0aa +1");
     }
 
     /// Issue #962: a `subAgentActivity` is one small row naming what happened,
@@ -9990,7 +9908,7 @@ Index: /a/one.rs
         let md = panel_md(tool.clone());
         assert!(md.contains("🌱 启动 · 🧵 `0192f0aa`"), "{md}");
         assert!(md.contains("🤖 `gpt-5.1-codex` · high"), "{md}");
-        assert_eq!(panel_title(tool), "✅ 子 Agent · 🧵 /root/worker");
+        assert_eq!(panel_title(tool), "✅ codex/sub_agent_activity · 🧵 /root/worker");
     }
 
     /// The folded title's target detail (issue #962) is charged to the card
@@ -10057,7 +9975,7 @@ Index: /a/one.rs
             "the call's own state and why the rows are absent: {md}"
         );
         assert!(!md.contains("_(no details)_"), "never an empty body: {md}");
-        assert_eq!(panel_title(tool), "✅ 等待子 Agent");
+        assert_eq!(panel_title(tool), "✅ codex/collab_agent");
     }
 
     /// Issue #962 acceptance 2's readable name: when the read carried the
@@ -10086,7 +10004,7 @@ Index: /a/one.rs
         );
         assert_eq!(
             panel_title(tool.clone()),
-            "✅ 等待子 Agent · 🧵 /root/spawn_smoke_test"
+            "✅ codex/collab_agent · 🧵 /root/spawn_smoke_test"
         );
         let md = panel_md(tool);
         assert!(
@@ -10148,11 +10066,11 @@ Index: /a/one.rs
         );
         let title = panel_title(tool);
         assert!(
-            title.starts_with("✅ 子 Agent · 🧵 …"),
+            title.starts_with("✅ codex/sub_agent_activity · 🧵 …"),
             "the head is clipped and the tail kept: {title}"
         );
         assert!(
-            title.chars().count() <= 48,
+            title.chars().count() <= 60,
             "the header stays a short line: {title}"
         );
         assert!(title.ends_with("segment/worker"), "the leaf survives: {title}");
@@ -10312,7 +10230,7 @@ Index: /a/one.rs
                 .with_tool(tool)
                 .build();
             let text = card.to_string();
-            assert!(!text.contains("**Input**"), "no empty section: {text}");
+            assert!(!text.contains("**输入**"), "no empty section: {text}");
             assert!(
                 !text.contains("- command:") && !text.contains("- workdir:") && !text.contains("- code:"),
                 "no raw payload key leaks: {text}"
@@ -10475,7 +10393,7 @@ Index: /a/one.rs
             Some(file),
         );
         let md = panel_md(tool);
-        assert!(md.contains("**Output**\n\n📄 `/x/y.rs`"), "read header: {md}");
+        assert!(md.contains("**输出**\n\n📄 `/x/y.rs`"), "read header: {md}");
         assert!(md.contains("```rust\n1: use std::fs;"), "fenced body: {md}");
     }
 
@@ -10553,10 +10471,14 @@ excerpt two";
             },
         ]));
         let title = panel_title(tool.clone());
-        assert_eq!(title, "✅ 网页搜索", "own vocabulary, no invented detail");
+        assert_eq!(
+            title,
+            format!("✅ {}", crate::feishu::card::vocab::TOOL_WEBSEARCH),
+            "own vocabulary, no invented detail"
+        );
         let md = panel_md(tool);
         assert!(md.contains("🔎 `rust lifetimes`"), "query in input: {md}");
-        assert!(md.contains("**Output**\n\n🔎 2 条结果"), "count: {md}");
+        assert!(md.contains("**输出**\n\n🔎 2 条结果"), "count: {md}");
         assert!(
             md.contains("1. [First result](https://a.example/one)"),
             "titled first result: {md}"
@@ -10575,7 +10497,7 @@ excerpt two";
     fn codex_web_search_unrecognized_results_stay_raw() {
         let md = panel_md(codex_web_search_panel(json!([{"foo": 1}])));
         assert!(!md.contains("条结果"), "no invented count: {md}");
-        assert!(md.contains("**Output**\n\n```json"), "fenced raw: {md}");
+        assert!(md.contains("**输出**\n\n```json"), "fenced raw: {md}");
         assert!(md.contains("\"foo\": 1"), "the payload is shown: {md}");
     }
 
@@ -10586,7 +10508,7 @@ excerpt two";
         for empty in [json!(null), json!(""), json!("   ")] {
             let md = panel_md(codex_web_search_panel(empty.clone()));
             assert!(md.contains("🔎 `rust lifetimes`"), "query shown: {empty}");
-            assert!(!md.contains("**Output**"), "no empty Output for {empty}: {md}");
+            assert!(!md.contains("**输出**"), "no empty Output for {empty}: {md}");
         }
     }
 
@@ -10621,7 +10543,7 @@ excerpt two";
     #[test]
     fn codex_web_search_text_results_stay_a_fenced_message() {
         let md = panel_md(codex_web_search_panel(json!("No results found.")));
-        assert!(md.contains("**Output**\n\n```json"), "fenced: {md}");
+        assert!(md.contains("**输出**\n\n```json"), "fenced: {md}");
         assert!(md.contains("No results found."), "the message: {md}");
         assert!(!md.contains("条结果"), "no invented count: {md}");
     }
@@ -10713,7 +10635,7 @@ excerpt two";
         let mut live = codex_web_search_panel(json!([]));
         live.call.status = ToolStatus::Running;
         assert!(
-            !panel_md(live).contains("**Output**"),
+            !panel_md(live).contains("**输出**"),
             "a running search has no verdict yet"
         );
         let settled = codex_web_search_panel(json!([]));
@@ -10872,7 +10794,7 @@ excerpt two";
         assert!(block.starts_with("```\n"), "a long line fences: {block}");
         let md = panel_md(tool);
         assert!(
-            md.contains(&format!("**Output**\n\n{block}")),
+            md.contains(&format!("**输出**\n\n{block}")),
             "the panel writes the block verbatim: {md}"
         );
     }
@@ -10927,7 +10849,7 @@ excerpt two";
             Some("a.rs\nb.rs\nc.rs"),
         );
         let md = panel_md(glob);
-        assert!(md.contains("**Output**\n\n3 个文件"), "glob count: {md}");
+        assert!(md.contains("**输出**\n\n3 个文件"), "glob count: {md}");
 
         let truncated = search_tool_with_metadata(
             "glob",
@@ -10949,7 +10871,7 @@ excerpt two";
             Some("Found 2 matches\nsrc/a.rs:\n  Line 1: fn main() {}"),
         );
         let md = panel_md(grep);
-        assert!(md.contains("**Output**\n\n2 处匹配"), "grep count: {md}");
+        assert!(md.contains("**输出**\n\n2 处匹配"), "grep count: {md}");
 
         assert_eq!(format_named_output("glob", "a.rs\nb.rs").0, None);
     }
@@ -10973,9 +10895,9 @@ excerpt two";
             false,
             Some("boom"),
         );
-        assert_eq!(panel_title(tool.clone()), "❌ execute · 2 个工具调用 · 1 失败");
+        assert_eq!(panel_title(tool.clone()), "❌ script · 2 个工具调用 · 1 失败");
         let md = panel_md(tool);
-        assert!(md.contains("**Input**\n```javascript"), "script fenced: {md}");
+        assert!(md.contains("**输入**\n```javascript"), "script fenced: {md}");
         assert!(md.contains("tools.webfetch"), "script kept: {md}");
         assert!(md.contains("- ✅ `webfetch`"), "nested row: {md}");
         assert!(md.contains("- ❌ `opencode_models`"), "failed nested row: {md}");
@@ -10990,7 +10912,7 @@ excerpt two";
             false,
             Some("1"),
         );
-        assert_eq!(panel_title(ok), "✅ execute · 1 个工具调用");
+        assert_eq!(panel_title(ok), "✅ script · 1 个工具调用");
 
         // The program's OWN error is a fact of its own: a clean nested list does
         // not make a failed program a success, and the header names the failure
@@ -11005,7 +10927,7 @@ excerpt two";
         );
         assert_eq!(
             panel_title(own_error.clone()),
-            "❌ execute · 1 个工具调用 · 程序出错",
+            "❌ script · 1 个工具调用 · 程序出错",
             "the program's own error cannot be inferred from the nested rows"
         );
         assert!(
@@ -11023,7 +10945,7 @@ excerpt two";
             true,
             Some("nope"),
         );
-        assert_eq!(panel_title(both), "❌ execute · 1 个工具调用 · 1 失败 · 程序出错");
+        assert_eq!(panel_title(both), "❌ script · 1 个工具调用 · 1 失败 · 程序出错");
 
         // A live program with no output yet still lists its calls.
         let live = program_panel(
@@ -11034,7 +10956,7 @@ excerpt two";
             false,
             None,
         );
-        assert!(panel_title(live.clone()).starts_with("⏳ execute · 1 个工具调用"));
+        assert!(panel_title(live.clone()).starts_with("⏳ script · 1 个工具调用"));
         let md = panel_md(live);
         assert!(md.contains("- ⏳ `fetch`"), "live nested row: {md}");
 
