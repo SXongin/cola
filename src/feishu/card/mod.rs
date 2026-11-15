@@ -15,6 +15,7 @@ pub(crate) mod terminal;
 pub(crate) mod tool_render;
 pub(crate) mod turn_diff;
 pub(crate) mod viewer;
+pub(crate) mod vocab;
 
 /// Set the given callback fields on a button's callback payload (overwriting
 /// any same-named key). Shared by the `/skill` picker's row buttons — which
@@ -348,9 +349,9 @@ impl AwaitingAction {
     pub(crate) fn label(self) -> Option<&'static str> {
         match self {
             AwaitingAction::None => None,
-            AwaitingAction::Permission => Some("等待你的授权"),
-            AwaitingAction::Question => Some("等待你的回答"),
-            AwaitingAction::Both => Some("等待你的授权/回答"),
+            AwaitingAction::Permission => Some(vocab::AWAITING_PERMISSION),
+            AwaitingAction::Question => Some(vocab::AWAITING_QUESTION),
+            AwaitingAction::Both => Some(vocab::AWAITING_BOTH),
         }
     }
 }
