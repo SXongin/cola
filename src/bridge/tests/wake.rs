@@ -906,7 +906,14 @@ async fn a_wake_after_a_card_read_opens_a_fresh_card_in_a_main_chat() {
 
     // `/card`: the done chain card is replaced by the one-shot read.
     assert!(
-        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        Turn::record_idle_card(
+            &app.cards_handle(),
+            "ses_test",
+            "om_read",
+            "msg_card",
+            app.client.capabilities(),
+        )
+        .await,
         "the read replaces the spent chain card"
     );
 
@@ -979,7 +986,14 @@ async fn a_wake_after_a_card_read_opens_a_fresh_card_in_a_topic() {
         .await
         .unwrap();
     assert!(
-        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        Turn::record_idle_card(
+            &app.cards_handle(),
+            "ses_test",
+            "om_read",
+            "msg_card",
+            app.client.capabilities(),
+        )
+        .await,
         "the read replaces the spent chain card"
     );
 
@@ -1055,7 +1069,14 @@ async fn a_wake_less_tail_after_a_card_read_is_silent() {
     .with_executions(vec![execution(2_500)]);
     let (_dir, app, backend, platform) = scripted_app(vec![late], Some(SessionStatus::Idle)).await;
     assert!(
-        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_card").await,
+        Turn::record_idle_card(
+            &app.cards_handle(),
+            "ses_test",
+            "om_read",
+            "msg_card",
+            app.client.capabilities(),
+        )
+        .await,
         "the read is installed"
     );
 
@@ -4252,6 +4273,49 @@ async fn the_wake_render_probe_consults_the_attachment_axes() {
             .await
             .is_none(),
         "a client with no compaction surface has no new content, so no Wake card arms"
+    );
+}
+
+/// `/card` builds its one-shot read with the attachment's declaration
+/// (ADR-0106). Without it the read's accumulator sat on the `full()` default,
+/// so a compaction-only Wake armed a continuation that then rendered nothing.
+#[tokio::test]
+async fn a_card_read_seeds_the_attachment_declaration_for_a_wake() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let capabilities = crate::backend::AgentCapabilities {
+        compaction: false,
+        ..crate::backend::AgentCapabilities::full()
+    };
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.capabilities = capabilities;
+    let (app, _platform) = build_app(cfg, backend).await;
+    let cards = app.cards_handle();
+    assert!(
+        Turn::record_idle_card(&cards, "ses_test", "om_read", "msg_card", capabilities).await,
+        "the read is installed over the card-less session"
+    );
+    assert_eq!(
+        Turn::card_capabilities(&cards, "ses_test").await,
+        Some(capabilities),
+        "the idle read carries the attachment's declaration, not the full-surface default"
+    );
+
+    let transcript = SessionTranscript::new(vec![
+        compaction_message("msg_cmp", 1_000, "压缩摘要"),
+        user("msg_u", 2_000, "做点活"),
+    ])
+    .with_wakes(vec![shell_wake(3_000)]);
+    let anchor = turn_anchor(2_000);
+    let read_capabilities = Turn::card_capabilities(&cards, "ses_test")
+        .await
+        .expect("the read's declaration");
+    assert!(
+        Turn::wake_continuation(&cards, "ses_test", &transcript, &anchor, read_capabilities)
+            .await
+            .is_none(),
+        "a compaction-only Wake has no new content for a client without the surface"
     );
 }
 

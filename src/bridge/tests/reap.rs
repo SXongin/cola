@@ -6942,7 +6942,14 @@ async fn an_idle_read_does_not_block_the_reaps_live_adoption() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // `/card` left a one-shot read as the Session's current card.
     assert!(
-        Turn::record_idle_card(&app.cards_handle(), "ses_test", "om_read", "msg_user").await,
+        Turn::record_idle_card(
+            &app.cards_handle(),
+            "ses_test",
+            "om_read",
+            "msg_user",
+            app.client.capabilities(),
+        )
+        .await,
         "the read is installed over the card-less session"
     );
 
