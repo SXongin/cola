@@ -156,7 +156,8 @@ impl RuntimeReconcile {
             return None;
         }
         let (shells, children) = live_task_ids(transcript);
-        // A report-terminal run has no live child id (`run_children` lists live
+        // A terminal run (a report, or a launch whose refs all declare a
+        // terminal status) has no live child id (`run_children` lists live
         // runs only), but it still owes a child-evidence read: the client says
         // it ended, and the child read supplies the durable `结束` ending. The
         // work gate must see it, or the row would disappear with no entry.
@@ -316,8 +317,8 @@ pub(crate) async fn reconcile_now(
         return None;
     }
     let (shells, children) = live_task_ids(transcript);
-    // Same gate as [`RuntimeReconcile::observe`]: a run whose report already
-    // ended it has no live child id but still owes the evidence read.
+    // Same gate as [`RuntimeReconcile::observe`]: a terminal run (a report or a
+    // launch/ref status) has no live child id but still owes the evidence read.
     if shells.is_empty() && children.is_empty() && transcript.run_evidence_suspects().is_empty() {
         return None;
     }
@@ -824,6 +825,75 @@ mod tests {
             "the pass applied an ending"
         );
         assert_eq!(reads.lock().await.as_slice(), ["thread_child".to_string()]);
+        assert_eq!(
+            transcript.task_retirements[0].ending,
+            crate::backend::TaskRetirementEnding::ChildEnded
+        );
+        assert!(transcript.runs.is_empty());
+    }
+
+    /// A launch whose refs are ALL terminal creates a terminal run with no
+    /// `reported_by`. It still owes the child read: otherwise the row leaves
+    /// `runs` with no durable ending and no entry. The reconcile reads it and
+    /// records the ending.
+    #[tokio::test]
+    async fn an_all_terminal_launch_still_reads_its_child() {
+        let mock = MockBackend::new(Vec::new());
+        mock.with_child_evidence(
+            "thread_done",
+            crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },
+        )
+        .await;
+        let mock = Arc::new(mock);
+        let reads = Arc::clone(&mock.child_evidence_calls);
+        let backend: Arc<dyn Backend> = mock;
+
+        let launch = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "spawnAgent".into(),
+                call_id: "call_spawn".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_done".into(),
+                    status: Some(crate::backend::RunStatus::Completed),
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_spawn"),
+            role: crate::backend::MessageRole::Assistant,
+            time: None,
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(launch)],
+        }]);
+        assert!(!transcript.runs[0].is_live(), "the ref states it completed");
+        assert!(transcript.runs[0].reported_by.is_empty());
+        assert_eq!(
+            transcript.run_evidence_suspects(),
+            vec![("thread_done".to_string(), "thread_done".to_string())],
+            "a terminal ref still owes its child's own evidence"
+        );
+
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+        )
+        .await;
+        assert!(
+            pass.is_some_and(|pass| pass.changed()),
+            "the pass applied the child's ending"
+        );
+        assert_eq!(reads.lock().await.as_slice(), ["thread_done".to_string()]);
         assert_eq!(
             transcript.task_retirements[0].ending,
             crate::backend::TaskRetirementEnding::ChildEnded
