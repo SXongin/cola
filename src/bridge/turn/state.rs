@@ -1366,14 +1366,13 @@ pub(super) struct StreamAccumulator {
     /// the read names no task and no run, so the ledger has nothing to show;
     /// the line is emitted once per card, never per render.
     ledger_claim_logged: bool,
-    /// The addressing/reporting calls already rendered as one-line receipts
-    /// (ADR-0106 §4, spec #1057's P4), keyed by call id. A receipt stands in
-    /// for a Tool Panel, so it needs a panel's dedupe: the same call seen
-    /// again on a later poll must not append a second line, and a report whose
-    /// state moved is still one call (the run carries the new state). Seeded
-    /// deliveries insert here so a takeover's re-render skips them. Private to
-    /// this module: written by [`Self::push_delegation_receipt`] and
-    /// [`Self::mark_delivered_part`]; read through [`Self::receipt_rendered`].
+    /// The addressing calls already rendered as one-line receipts (ADR-0106 §4,
+    /// spec #1057's P4), keyed by call id. A receipt stands in for a Tool Panel,
+    /// so it needs a panel's dedupe: the same call seen again on a later poll
+    /// must not append a second line. Seeded deliveries insert here so a
+    /// takeover's re-render skips them. Private to this module: written by
+    /// [`Self::push_delegation_receipt`] and [`Self::mark_delivered_part`];
+    /// read through [`Self::receipt_rendered`].
     receipt_calls: std::collections::HashSet<crate::feishu::card::tool_render::ReceiptKey>,
     /// The ledger's render clock ([`Self::set_ledger`]): each row's rendered
     /// numbers — a shell row's elapsed, and any row's activity fragment age, in
@@ -3137,11 +3136,10 @@ impl StreamAccumulator {
             .expect("a receipt always owns one entry")
     }
 
-    /// Whether a call's receipt revision already rendered. A receipt replaces
-    /// a Tool Panel for an addressing/reporting call (ADR-0106 §4), so it
-    /// needs the panel's dedupe: one line per call — and, for a report, one
-    /// line per STATE, because a report is an observation and the wire reuses
-    /// its item id between start and completion (spec #1057).
+    /// Whether a call's receipt already rendered. A receipt replaces a Tool
+    /// Panel for an addressing call (ADR-0106 §4), so it needs the panel's
+    /// dedupe: one line per call. A report is not a receipt — it updates its
+    /// run and renders no line.
     pub(super) fn receipt_rendered(&self, key: &crate::feishu::card::tool_render::ReceiptKey) -> bool {
         self.receipt_calls.contains(key)
     }
@@ -3153,9 +3151,10 @@ impl StreamAccumulator {
         self.receipt_calls.insert(key);
     }
 
-    /// Render an addressing/reporting call as its one-line receipt instead of
-    /// a timeline panel (ADR-0106 §4, spec #1057's P4). The raw call stays in
-    /// the transcript; only its display collapses. Returns whether it rendered
+    /// Render an addressing call as its one-line receipt instead of a timeline
+    /// panel (ADR-0106 §4, spec #1057's P4). A report is not a receipt: it
+    /// updates its run and leaves no line. The raw call stays in the
+    /// transcript; only its display collapses. Returns whether it rendered
     /// (false for a call already shown).
     pub(super) fn push_delegation_receipt(&mut self, call: &crate::backend::ToolCall) -> bool {
         let key = crate::feishu::card::tool_render::receipt_key(call);
@@ -4353,7 +4352,10 @@ impl StreamAccumulator {
                 ));
             }
             Part::Tool(call) => {
-                if crate::feishu::card::tool_render::is_receipt_call(call) {
+                if crate::feishu::card::tool_render::is_report_call(call) {
+                    // A report updates its run; it renders no timeline row and
+                    // so has nothing to mark delivered.
+                } else if crate::feishu::card::tool_render::is_receipt_call(call) {
                     self.mark_receipt_delivered(crate::feishu::card::tool_render::receipt_key(call));
                 } else if is_plan_call(call) {
                     self.record_todo_call(call);

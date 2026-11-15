@@ -170,9 +170,12 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             if crate::feishu::card::tool_render::is_plan_call(call) && acc.capabilities().plan.is_absent() {
                 return false;
             }
-            // An addressing/reporting call is a one-line receipt on its run,
-            // never a panel (ADR-0106 §4): its dedupe is the receipt set, not
-            // the panel map.
+            // An addressing call is a one-line receipt on its run, never a
+            // panel (ADR-0106 §4); a report updates its run and leaves no
+            // timeline row at all.
+            if crate::feishu::card::tool_render::is_report_call(call) {
+                return false;
+            }
             if crate::feishu::card::tool_render::is_receipt_call(call) {
                 return !acc.receipt_rendered(&crate::feishu::card::tool_render::receipt_key(call));
             }
@@ -272,7 +275,9 @@ fn render_part(
             acc.mark_reasoning();
         }
         Part::Tool(call) => {
-            if crate::feishu::card::tool_render::is_receipt_call(call) {
+            if crate::feishu::card::tool_render::is_report_call(call) {
+                // A report updates its run; it is not a timeline row.
+            } else if crate::feishu::card::tool_render::is_receipt_call(call) {
                 acc.push_delegation_receipt(call);
             } else if crate::feishu::card::tool_render::is_plan_call(call) {
                 // A live status section, not a transcript row: the latest call
@@ -392,7 +397,9 @@ fn render_part_scoped(
             acc.mark_reasoning();
         }
         Part::Tool(call) => {
-            if crate::feishu::card::tool_render::is_receipt_call(call) {
+            if crate::feishu::card::tool_render::is_report_call(call) {
+                // A report updates its run; it is not a timeline row.
+            } else if crate::feishu::card::tool_render::is_receipt_call(call) {
                 acc.push_delegation_receipt(call);
             } else if crate::feishu::card::tool_render::is_plan_call(call) {
                 if !acc.capabilities().plan.is_absent() {
@@ -12306,11 +12313,11 @@ Index: /x/src/main.rs
         );
     }
 
-    /// Review finding 9: a report's receipt dedupes by call id AND state, so
-    /// the completion observation renders even though the wire reuses the
-    /// activity's item id — the card no longer freezes on `started`.
+    /// Spec #1057: a report updates its run; it is not a receipt and not a
+    /// panel. The wire reuses one activity item id between `started` and
+    /// `completed`, so the run moves and the card shows no timeline line.
     #[tokio::test]
-    async fn a_report_receipt_renders_its_new_state() {
+    async fn a_report_updates_its_run_without_a_timeline_line() {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -12339,6 +12346,16 @@ Index: /x/src/main.rs
                 })],
             )])
         };
+        assert_eq!(
+            read(ToolStatus::Running).runs[0].status,
+            crate::backend::RunStatus::Running
+        );
+        assert_eq!(
+            read(ToolStatus::Completed).runs[0].status,
+            crate::backend::RunStatus::Completed,
+            "the completion observation updates the run"
+        );
+
         let (app, platform) = build_app(cfg, backend).await;
         let cards = app.cards_handle();
         let sid = "ses_parent";
@@ -12359,13 +12376,10 @@ Index: /x/src/main.rs
 
         let card = platform.updated_cards().await.last().cloned().expect("a flush");
         let text = card_text(&card);
+        assert!(!text.contains("↪"), "a report renders no receipt line: {text}");
         assert!(
-            text.contains("↪ completed · thread_1"),
-            "the completion observation renders: {text}"
-        );
-        assert!(
-            text.contains("↪ started · thread_1"),
-            "the start observation stays as the call's first line: {text}"
+            !text.contains("codex/sub_agent_activity"),
+            "a report renders no panel: {text}"
         );
     }
 
