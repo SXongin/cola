@@ -1253,3 +1253,41 @@ fn a_repeated_patch_header_merges_into_one_file() {
         )
     );
 }
+
+/// A header-only diff is not a body: a pure rename or delete keeps its action
+/// and destination but carries no hunks (and so no `+1 −1`).
+#[test]
+fn a_header_only_metadata_diff_yields_no_hunks() {
+    assert_eq!(
+        v1(
+            "apply_patch",
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"diff": "diff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs"})
+        ),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "old.rs".to_string(),
+                action: FileAction::Rename,
+                rename_to: Some("new.rs".to_string()),
+                diff: None,
+            }])
+        )
+    );
+    assert_eq!(
+        v1(
+            "apply_patch",
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"diff": "--- a/gone.rs\n+++ /dev/null"})
+        ),
+        (
+            ToolKind::Edit,
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "gone.rs".to_string(),
+                action: FileAction::Delete,
+                rename_to: None,
+                diff: None,
+            }])
+        )
+    );
+}
