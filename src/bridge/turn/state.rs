@@ -3074,19 +3074,20 @@ impl StreamAccumulator {
             .expect("a receipt always owns one entry")
     }
 
-    /// Whether a call already rendered as its one-line receipt. A receipt
-    /// replaces a Tool Panel for an addressing/reporting call (ADR-0106 §4), so
-    /// it needs the panel's dedupe: one call, one line, however many polls
-    /// see it; a report whose state moved is still the one call.
-    pub(super) fn receipt_rendered(&self, call_id: &str) -> bool {
-        self.receipt_calls.contains(call_id)
+    /// Whether a call's receipt revision already rendered. A receipt replaces
+    /// a Tool Panel for an addressing/reporting call (ADR-0106 §4), so it
+    /// needs the panel's dedupe: one line per call — and, for a report, one
+    /// line per STATE, because a report is an observation and the wire reuses
+    /// its item id between start and completion (spec #1057).
+    pub(super) fn receipt_rendered(&self, key: &str) -> bool {
+        self.receipt_calls.contains(key)
     }
 
-    /// Mark one call as delivered without rendering it — the seed path's
-    /// counterpart to [`Self::push_delegation_receipt`], so a takeover does not
-    /// replay a receipt that already sits on the previous card.
-    pub(super) fn mark_receipt_delivered(&mut self, call_id: &str) {
-        self.receipt_calls.insert(call_id.to_string());
+    /// Mark one receipt revision as delivered without rendering it — the seed
+    /// path's counterpart to [`Self::push_delegation_receipt`], so a takeover
+    /// does not replay a receipt that already sits on the previous card.
+    pub(super) fn mark_receipt_delivered(&mut self, key: &str) {
+        self.receipt_calls.insert(key.to_string());
     }
 
     /// Render an addressing/reporting call as its one-line receipt instead of
@@ -3094,7 +3095,8 @@ impl StreamAccumulator {
     /// the transcript; only its display collapses. Returns whether it rendered
     /// (false for a call already shown).
     pub(super) fn push_delegation_receipt(&mut self, call: &crate::backend::ToolCall) -> bool {
-        if !self.receipt_calls.insert(call.identity.call_id.clone()) {
+        let key = crate::feishu::card::tool_render::receipt_key(call);
+        if !self.receipt_calls.insert(key) {
             return false;
         }
         self.push_receipt_at(
@@ -4284,7 +4286,7 @@ impl StreamAccumulator {
             }
             Part::Tool(call) => {
                 if crate::feishu::card::tool_render::is_receipt_call(call) {
-                    self.mark_receipt_delivered(&call.identity.call_id);
+                    self.mark_receipt_delivered(&crate::feishu::card::tool_render::receipt_key(call));
                 } else if call.identity.name == "todowrite" {
                     self.record_todo_call(call);
                 } else {
@@ -4485,9 +4487,10 @@ impl StreamAccumulator {
             let kind = task_kind(&task.tool.name);
             let call_id = task.tool.call_id.as_str();
             if kind == TaskKind::Subagent
-                && let Some(run) = transcript.runs.iter().find(|run| {
-                    run.ending_key() == call_id || (task.child_id.is_some() && run.child_id == task.child_id)
-                })
+                && let Some(run) = transcript
+                    .runs
+                    .iter()
+                    .find(|run| transcript.run_is_task(run, task))
             {
                 rows.push(self.run_row(transcript, activities, run, &mut activity_keys));
                 continue;
@@ -4539,15 +4542,15 @@ impl StreamAccumulator {
             });
         }
         // A child-only run has no Background Task to name it (Codex): its own
-        // row follows the Background Tasks, in run order.
-        let represented: Vec<&str> = transcript
-            .background_tasks
-            .iter()
-            .filter(|task| task_kind(&task.tool.name) == TaskKind::Subagent)
-            .flat_map(|task| std::iter::once(task.tool.call_id.as_str()).chain(task.child_id.as_deref()))
-            .collect();
+        // row follows the Background Tasks, in run order. The "already
+        // represented" test is the SAME one rule the row join above uses, so
+        // the two cannot disagree about which runs still owe a row.
         for run in transcript.live_runs() {
-            if represented.iter().any(|id| run.ids().any(|own| own == *id)) {
+            if transcript
+                .background_tasks
+                .iter()
+                .any(|task| transcript.run_is_task(run, task))
+            {
                 continue;
             }
             rows.push(self.run_row(transcript, activities, run, &mut activity_keys));
@@ -4613,13 +4616,24 @@ impl StreamAccumulator {
     ) -> TaskLedgerRow {
         let launch = run.launched_by.first().map(|call| call.call_id.as_str());
         let key = run.run_id.as_str();
+        // The gather may key this run's fragment by the run id (the run-child
+        // pair) or by its launch call id (a background task's pair). Retention
+        // follows the SAME keys the read uses, so a fragment cannot be pruned
+        // by the row that just read it.
         activity_keys.insert(key.to_string());
-        let activity = activities
-            .get(key)
-            .or_else(|| launch.and_then(|call| activities.get(call)))
-            .or_else(|| self.ledger_activity.get(key))
-            .or_else(|| launch.and_then(|call| self.ledger_activity.get(call)))
-            .cloned()
+        if let Some(call) = launch {
+            activity_keys.insert(call.to_string());
+        }
+        let keys = [Some(key), launch];
+        let activity = keys
+            .into_iter()
+            .flatten()
+            .find_map(|key| activities.get(key).cloned())
+            .or_else(|| {
+                keys.into_iter()
+                    .flatten()
+                    .find_map(|key| self.ledger_activity.get(key).cloned())
+            })
             .or_else(|| run.activity.as_ref().map(TaskLiveness::from_run));
         TaskLedgerRow {
             kind: TaskKind::Subagent,
@@ -7342,7 +7356,7 @@ mod tests {
         };
         let thinking = |last_activity_ms: i64| TaskLiveness {
             activity: crate::feishu::card::tool_render::ChildActivity::Thinking,
-            last_activity_ms,
+            last_activity_ms: Some(last_activity_ms),
             wait: None,
         };
         let mut acc = StreamAccumulator::new("test");
@@ -7354,7 +7368,7 @@ mod tests {
         assert!(!acc.set_ledger(row(thinking(start + 400)), start + 400, LedgerCadence::Second));
         assert_eq!(
             acc.ledger[0].activity.as_ref().unwrap().last_activity_ms,
-            start + 400,
+            Some(start + 400),
             "the fresh timestamp is stored without a PATCH"
         );
         // The rendered second turns: 0s -> 1s, which owes.
@@ -7362,7 +7376,7 @@ mod tests {
         // A shape change at the same instant owes too: the phase word...
         let replying = |at: i64| TaskLiveness {
             activity: crate::feishu::card::tool_render::ChildActivity::Replying,
-            last_activity_ms: at,
+            last_activity_ms: Some(at),
             wait: None,
         };
         assert!(acc.set_ledger(row(replying(start + 1_400)), start + 1_400, LedgerCadence::Second));
@@ -7399,7 +7413,7 @@ mod tests {
                 name: name.into(),
                 started_at: Some(start),
             },
-            last_activity_ms: start,
+            last_activity_ms: Some(start),
             wait,
         };
         let mut acc = StreamAccumulator::new("test");
@@ -7467,7 +7481,7 @@ mod tests {
                 name: "bash".into(),
                 started_at: Some(start),
             },
-            last_activity_ms: start,
+            last_activity_ms: Some(start),
             wait: None,
         };
         let mut acc = StreamAccumulator::new("test");
@@ -7500,7 +7514,7 @@ mod tests {
         // The gather heals to a new typed activity: that change owes at once.
         let replying = TaskLiveness {
             activity: crate::feishu::card::tool_render::ChildActivity::Replying,
-            last_activity_ms: start + 31_000,
+            last_activity_ms: Some(start + 31_000),
             wait: None,
         };
         assert!(
@@ -7624,7 +7638,7 @@ mod tests {
                 unconfirmed: false,
                 activity: Some(TaskLiveness {
                     activity: crate::feishu::card::tool_render::ChildActivity::Thinking,
-                    last_activity_ms: activity_at,
+                    last_activity_ms: Some(activity_at),
                     wait: None,
                 }),
 
