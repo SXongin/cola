@@ -437,7 +437,7 @@ mod tests {
     fn report(call_id: &str, child: &str, kind: &str) -> ToolCall {
         let status = match kind {
             "completed" => ToolStatus::Completed,
-            "interrupted" => ToolStatus::Error,
+            "interrupted" => ToolStatus::Other("interrupted".to_string()),
             _ => ToolStatus::Running,
         };
         let mut call = call(call_id, DelegationEffect::Report, &[child], status, Some(2));
@@ -660,7 +660,7 @@ mod tests {
     }
 
     /// A report's state is the adapter's declaration: a completed observation
-    /// ends the run, an interrupted one fails it, and an unknown/new activity
+    /// ends the run, an interrupted one cancels it, and an unknown/new activity
     /// kind (declared `Running`) keeps it live — the fold never parses the
     /// vendor's `kind`.
     #[test]
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(read.runs[0].activity, None, "no live activity once ended");
 
         let read = transcript(vec![report("call_interrupt", "thread_2", "interrupted")]);
-        assert_eq!(read.runs[0].status, RunStatus::Failed);
+        assert_eq!(read.runs[0].status, RunStatus::Cancelled);
 
         let mut unknown = report("call_unknown", "thread_3", "started");
         unknown.status = ToolStatus::Running;

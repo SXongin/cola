@@ -2873,7 +2873,9 @@ fn mcp_status(status: &Option<String>) -> ToolStatus {
 /// the child live. A launch therefore reads `Running` while any target agent
 /// is not terminal (an empty/unknown state included: the start payload's row
 /// names a child that has not reported yet). Every other verb keeps the wire
-/// mapping; `interrupted` stays the failure icon.
+/// mapping; an `interrupted` call keeps the neutral `Other("interrupted")` the
+/// run fold maps to `Cancelled` (the same state `agentsStates` declares), never
+/// `Failed`.
 fn collab_status(
     tool: &str,
     status: &Option<String>,
@@ -2883,7 +2885,8 @@ fn collab_status(
     if tool == "spawnAgent" {
         let launch = match status.as_deref() {
             Some("inProgress") => Some(ToolStatus::Running),
-            Some("failed") | Some("interrupted") => Some(ToolStatus::Error),
+            Some("failed") => Some(ToolStatus::Error),
+            Some("interrupted") => Some(ToolStatus::Other("interrupted".to_string())),
             _ => None,
         };
         if let Some(status) = launch {
@@ -2911,7 +2914,8 @@ fn collab_status(
     match status.as_deref() {
         Some("inProgress") => ToolStatus::Running,
         Some("completed") => ToolStatus::Completed,
-        Some("failed") | Some("interrupted") => ToolStatus::Error,
+        Some("failed") => ToolStatus::Error,
+        Some("interrupted") => ToolStatus::Other("interrupted".to_string()),
         Some(other) => ToolStatus::Other(other.to_string()),
         None => ToolStatus::Unknown,
     }
@@ -4091,7 +4095,7 @@ mod tests {
             ("inProgress", ToolStatus::Running),
             ("completed", ToolStatus::Completed),
             ("failed", ToolStatus::Error),
-            ("interrupted", ToolStatus::Error),
+            ("interrupted", ToolStatus::Other("interrupted".to_string())),
         ] {
             let mut projection = ThreadProjection::new("thread-1");
             replay(
@@ -4120,6 +4124,44 @@ mod tests {
             let call = projected_tool(&projection, "item-collab-status");
             assert_eq!(call.status, expected, "status {status}");
         }
+    }
+
+    /// A `spawnAgent` item that reports `interrupted` with a named receiver is
+    /// the cancelled state, not a failure: the run reads `Cancelled`, the same
+    /// state `agentsStates`/`subAgentActivity` declare.
+    #[test]
+    fn an_interrupted_launch_is_cancelled() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-collab-interrupted",
+                        "tool": "spawnAgent",
+                        "status": "interrupted",
+                        "senderThreadId": "thread-1",
+                        "receiverThreadIds": ["thread-child"],
+                        "prompt": null,
+                        "model": null,
+                        "reasoningEffort": null,
+                        "agentsStates": {}
+                    }
+                }
+            })],
+        );
+        let call = projected_tool(&projection, "item-collab-interrupted");
+        assert_eq!(call.status, ToolStatus::Other("interrupted".into()));
+        assert_eq!(
+            projection.transcript().runs[0].status,
+            RunStatus::Cancelled,
+            "the launch's interrupted state reads Cancelled, not Failed"
+        );
     }
 
     /// A `shutdown` target is terminal: a spawnAgent whose only target was shut
