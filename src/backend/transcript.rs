@@ -41,6 +41,13 @@ pub struct SessionTranscript {
     /// `order=asc`, so oldest first; the decoder never re-sorts). Empty on a
     /// generation without them (V1).
     pub wakes: Vec<Wake>,
+    /// The **Agent Runs** this read names (ADR-0105, spec #1057's P4): one per
+    /// child agent, derived from the transcript's delegation calls. A launch
+    /// naming no receiver creates none; a later call-keyed run fills
+    /// `child_id` without moving `run_id`. Empty on a Session with no child
+    /// agent. The live `activity` is filled by the Bridge's child read, since
+    /// it is not a fact of the parent transcript.
+    pub runs: Vec<AgentRun>,
     /// The Background Tasks still live at the end of the read: derived from the
     /// assistant tool parts that started them, with every matching Wake
     /// applied. Empty on a generation without them (V1).
@@ -96,8 +103,10 @@ pub struct SessionTranscript {
 
 impl SessionTranscript {
     pub fn new(messages: Vec<TranscriptMessage>) -> Self {
+        let runs = crate::backend::runs::derive_runs(&messages);
         Self {
             messages,
+            runs,
             executions: Vec::new(),
             wakes: Vec::new(),
             background_tasks: Vec::new(),
@@ -307,6 +316,82 @@ impl SessionTranscript {
                     .map(|child_id| (task.tool.call_id.clone(), child_id.clone()))
             })
             .collect()
+    }
+
+    /// The live runs that carry a child id and are not already a Background
+    /// Task — the child-evidence suspects for a client with no runtime verdict
+    /// registry (Codex). Each entry is `(ending key, child id)`: the ending key
+    /// is the run's `task_run_id` when minted (ADR-0080), which is what a
+    /// recorded ending resolves. A run represented by a Background Task is
+    /// excluded, because the existing runtime/child-evidence path already
+    /// retires it; reading it twice would spend a request and could retire it
+    /// on a different clock.
+    pub fn run_evidence_suspects(&self) -> Vec<(String, String)> {
+        self.runs
+            .iter()
+            .filter(|run| run.is_live())
+            .filter_map(|run| {
+                let child = run.child_id.as_deref()?;
+                let task = self
+                    .background_tasks
+                    .iter()
+                    .any(|task| task.tool.call_id == run.ending_key());
+                (!task).then(|| (run.ending_key().to_string(), child.to_string()))
+            })
+            .collect()
+    }
+
+    /// The live runs whose client still reports them running, in read order.
+    pub fn live_runs(&self) -> impl Iterator<Item = &AgentRun> {
+        self.runs.iter().filter(|run| run.is_live())
+    }
+
+    /// Apply one child-evidence read to a run that is not a Background Task
+    /// (`apply_child_evidence` is the task path): a terminal child retires the
+    /// run as a [`TaskRetirement`] keyed by its durable identity, so the ledger,
+    /// the completion entry and the settle decision all follow the one
+    /// ADR-0080 machinery; a gone child retires it as lost. `Unfinished` is no
+    /// evidence and changes nothing.
+    ///
+    /// The retirement's synthesized task names the run by its durable key, so
+    /// the ending records under the same `TaskRunId` every other writer resolves.
+    pub fn apply_run_child_evidence(&mut self, run_id: &str, evidence: ChildEvidence) -> bool {
+        if evidence == ChildEvidence::Unfinished {
+            return false;
+        }
+        let Some(index) = self
+            .runs
+            .iter()
+            .position(|run| run.run_id == run_id || run.ending_key() == run_id)
+        else {
+            return false;
+        };
+        let run = self.runs.remove(index);
+        let (ending, finished_at) = match evidence {
+            ChildEvidence::Terminal { completed_at } => {
+                (TaskRetirementEnding::ChildEnded, Some(completed_at))
+            }
+            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
+            ChildEvidence::Unfinished => return false,
+        };
+        self.task_retirements.push(TaskRetirement {
+            task: BackgroundTask {
+                // The ledger's rows stay `shell`/`subagent` (ADR-0105's
+                // consequence): a child agent is a subagent run whatever
+                // producer named it.
+                tool: ToolIdentity {
+                    name: "subagent".to_string(),
+                    call_id: run.ending_key().to_string(),
+                },
+                shell_id: None,
+                child_id: run.child_id.clone(),
+                started_at: run.started_at,
+            },
+            ending,
+            finished_at,
+        });
+        self.unconfirmed_tasks.remove(run.ending_key());
+        true
     }
 
     /// The newest user message by server time, if any — the message a Turn's
@@ -554,6 +639,14 @@ impl SessionTranscript {
             return TurnSettle::Failed(error);
         }
         if !self.background_tasks.is_empty() {
+            return TurnSettle::Waiting;
+        }
+        // A Turn that ends with live runs yields too (spec #1057's P4): a
+        // child agent the client still reports running is an exit owed, and
+        // the completion entry on the same card follows its evidence or
+        // cleanup. A run with no child id still counts — it is a run with an
+        // exit owed, not an empty identity.
+        if self.runs.iter().any(AgentRun::is_live) {
             return TurnSettle::Waiting;
         }
         TurnSettle::Complete
@@ -1974,6 +2067,153 @@ pub enum DelegationEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRunRef {
     pub run_id: String,
+}
+
+/// A reference to one tool call, used by an [`AgentRun`]'s relations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolCallRef {
+    pub call_id: String,
+}
+
+/// One **Agent Run**: a child agent a Turn set running (ADR-0105, spec #1057's
+/// canonical shapes). OpenCode's `task`/`subagent` child session and Codex's
+/// collaboration child are the same fact, so the liveness line, the ledger,
+/// the completion entry and `/sub` read one record instead of four display
+/// paths.
+///
+/// A launch keeps its Tool Panel (the record of the request); a call that only
+/// addresses the run is a receipt on it; a report updates the run and is never
+/// a panel.
+///
+/// The two identities are deliberately separate:
+///
+/// - [`Self::run_id`] is the live run's identity — the child id when one
+///   exists, else the creating call's id — and never moves once minted.
+/// - [`Self::task_run_id`] is ADR-0080's durable key, first minted by any
+///   id-bearing fact naming the run (a launch's call id, else another call's
+///   id); the ledger reads and writes a **Task Ending** by it. It is `None`
+///   only in the instant before such a fact exists.
+///
+/// [`Self::status`] is the client's statement about the run; cola's
+/// `TaskEnding` is a separate, durable fact and is never folded into it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentRun {
+    /// The live run's identity: the child id when one exists, else the creating
+    /// call's id. Never re-keyed by a later sighting.
+    pub run_id: String,
+    /// ADR-0080's durable key (see the type's doc). Never re-minted; later ids
+    /// are aliases.
+    pub task_run_id: Option<String>,
+    /// The client's child session/thread id, when reported. Usually equals
+    /// `run_id`; a run created from a call-only fact fills it later.
+    pub child_id: Option<String>,
+    /// The label the client gave the child (a description, a prompt, an agent
+    /// path), or the run id when it named none.
+    pub label: String,
+    /// The subagent type / agent path / model, when reported.
+    pub agent: Option<String>,
+    pub started_at: Option<i64>,
+    /// The client's own statement only; the durable ending is cola's.
+    pub status: RunStatus,
+    /// What the run is doing now, when the read established it (ADR-0054).
+    pub activity: Option<RunActivity>,
+    /// Every call that launched or resumed this run — a set, because a resumed
+    /// `task` launches the same child again.
+    pub launched_by: Vec<ToolCallRef>,
+    /// Every call that addressed this run, any addressing verb.
+    pub addressed_by: Vec<ToolCallRef>,
+    /// The `subAgentActivity` observations of this run, one entry per call.
+    pub reported_by: Vec<ToolCallRef>,
+}
+
+impl AgentRun {
+    /// Whether the client still reports this run as live. `Unknown` is not
+    /// terminal (spec #1057's "a run always has an exit"), so it counts as
+    /// live until evidence or a cleanup retires it.
+    pub fn is_live(&self) -> bool {
+        matches!(self.status, RunStatus::Running | RunStatus::Unknown)
+    }
+
+    /// Every id the run is known by, the live identity first — what a durable
+    /// ending or a liveness-tier record matches against.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.run_id.as_str())
+            .chain(self.task_run_id.as_deref())
+            .chain(self.child_id.as_deref())
+    }
+
+    /// The `Task Ending` key this run's durable records use (ADR-0080): the
+    /// task run id when minted, else the live identity — never an invented id.
+    pub fn ending_key(&self) -> &str {
+        self.task_run_id.as_deref().unwrap_or(self.run_id.as_str())
+    }
+}
+
+/// The client's statement about an [`AgentRun`]. Never terminal-by-assumption:
+/// see [`AgentRun::is_live`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+/// What a live [`AgentRun`] is doing, in neutral semantics (ADR-0054/0105).
+/// The card renders the tool token from [`Self::call`] and counts
+/// [`Self::since`]; both waits may be live at once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunActivity {
+    /// The newest live call, in neutral semantics.
+    pub call: Option<CallView>,
+    /// Otherwise the phase the run's newest part implies.
+    pub phase: Option<Phase>,
+    /// A pending permission and/or question on the run.
+    pub awaiting: Option<RunWaits>,
+    /// The live call's server start when `call` is set (so a shell's elapsed
+    /// counts from the call), else the newest phase activity's time.
+    pub since: Option<i64>,
+}
+
+impl RunActivity {
+    /// The time the rendered age counts from.
+    pub fn clock_ms(&self) -> Option<i64> {
+        self.call.as_ref().and_then(|call| call.started_at).or(self.since)
+    }
+}
+
+/// The part a [`RunActivity`] renders when no call is live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase {
+    Waiting,
+    Reasoning,
+    Responding,
+}
+
+/// A live call, reduced to what the liveness line needs: the token
+/// (`identity`, `kind`, `detail`) and its own server clock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallView {
+    pub identity: ToolIdentity,
+    pub kind: ToolKind,
+    pub detail: ToolDetail,
+    /// The call's server start, when reported.
+    pub started_at: Option<i64>,
+}
+
+/// The waits a run may be blocked on. Both can be live at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct RunWaits {
+    pub permission: bool,
+    pub question: bool,
+}
+
+impl RunWaits {
+    /// Whether either wait is live.
+    pub fn any(&self) -> bool {
+        self.permission || self.question
+    }
 }
 
 /// A run a settled tool call moved to the background: which tool launched it

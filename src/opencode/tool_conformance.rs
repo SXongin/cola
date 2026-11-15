@@ -23,8 +23,8 @@ use super::tool_semantics::shared_tool_inventory;
 use super::v1::decode_tool_for_conformance as v1_tool;
 use super::v2::decode_tool_for_conformance as v2_tool;
 use crate::backend::{
-    DelegationEffect, FileAction, FileEdit, NestedCall, SearchScope, ToolCall, ToolDetail, ToolKind,
-    ToolStatus,
+    AgentRunRef, DelegationEffect, FileAction, FileEdit, NestedCall, SearchScope, ToolCall, ToolDetail,
+    ToolKind, ToolStatus,
 };
 use crate::codex::read_model::{
     ItemShape, RECOGNIZED_ITEM_TYPES, projected_item_for_conformance as codex_project,
@@ -589,10 +589,65 @@ fn delegation_is_one_shape_per_verb() {
         (
             ToolKind::Other,
             ToolDetail::Delegation {
-                runs: Vec::new(),
+                runs: vec![AgentRunRef {
+                    run_id: "thread-2".to_string(),
+                }],
                 effect: DelegationEffect::Report,
             }
-        )
+        ),
+        "a report names the run it observed"
+    );
+
+    // The receiver list is the run relation on both producers: an OpenCode
+    // `task` names its child session in the state metadata, a Codex launch its
+    // receivers, and a completion naming N children names N runs.
+    let opencode_launch = (
+        ToolKind::Other,
+        ToolDetail::Delegation {
+            runs: vec![AgentRunRef {
+                run_id: "ses_child".to_string(),
+            }],
+            effect: DelegationEffect::Launch,
+        },
+    );
+    assert_eq!(
+        v1(
+            "task",
+            json!({"description": "review"}),
+            json!({"sessionId": "ses_child"})
+        ),
+        opencode_launch
+    );
+    assert_eq!(
+        v2(
+            "subagent",
+            json!({"description": "review"}),
+            json!({"sessionID": "ses_child"})
+        ),
+        opencode_launch,
+        "V2 spells the child id in camelCase"
+    );
+    let two_children = ["thread-2".to_string(), "thread-3".to_string()];
+    let (_, detail) = codex(json!({
+        "type": "collabAgentToolCall",
+        "id": "item-collab",
+        "tool": "spawnAgent",
+        "status": "completed",
+        "senderThreadId": "thread-1",
+        "receiverThreadIds": ["thread-2", "thread-3"],
+        "agentsStates": {"thread-2": {"status": "running"}, "thread-3": {"status": "running"}}
+    }));
+    let ToolDetail::Delegation { runs, effect } = detail else {
+        panic!("a collaboration call is a delegation");
+    };
+    assert_eq!(effect, DelegationEffect::Launch);
+    assert_eq!(
+        runs,
+        two_children
+            .iter()
+            .map(|id| AgentRunRef { run_id: id.clone() })
+            .collect::<Vec<_>>(),
+        "a completion naming two children names two runs"
     );
 }
 
