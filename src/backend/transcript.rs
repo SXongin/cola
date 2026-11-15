@@ -277,9 +277,17 @@ impl SessionTranscript {
     /// [`ChildEvidence::Unfinished`] changes nothing — the row stays exactly as
     /// the runtime marked it. An id with no live task invents no retirement.
     pub fn apply_child_evidence(&mut self, call_id: &str, evidence: ChildEvidence) {
-        if evidence == ChildEvidence::Unfinished {
-            return;
-        }
+        // Exhaustive and honest: no-evidence returns BEFORE anything is
+        // touched, and no other arm can turn it into an ending. A single
+        // `Unfinished => Lost` catch-all (or a guard whose arm disagrees with
+        // it) is how a healthy, unread child would be recorded lost.
+        let (ending, finished_at) = match evidence {
+            ChildEvidence::Terminal { completed_at } => {
+                (TaskRetirementEnding::ChildEnded, Some(completed_at))
+            }
+            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
+            ChildEvidence::Unfinished => return,
+        };
         let Some(index) = self
             .background_tasks
             .iter()
@@ -289,14 +297,6 @@ impl SessionTranscript {
         };
         let task = self.background_tasks.remove(index);
         self.unconfirmed_tasks.remove(call_id);
-        // `Unfinished` returned above, so the two remaining answers are the
-        // only ones here: a terminal child with its clock, or a gone one.
-        let (ending, finished_at) = match evidence {
-            ChildEvidence::Terminal { completed_at } => {
-                (TaskRetirementEnding::ChildEnded, Some(completed_at))
-            }
-            ChildEvidence::Gone | ChildEvidence::Unfinished => (TaskRetirementEnding::Lost, None),
-        };
         self.task_retirements.push(TaskRetirement {
             task,
             ending,
@@ -393,6 +393,15 @@ impl SessionTranscript {
                     .started_at
                     .is_some_and(|started| completed_at < started)
                 {
+                    // A previous turn's terminal item, not this run's. Record
+                    // the rejection so a persistently stale suspect is
+                    // diagnosable instead of silently re-read forever.
+                    tracing::debug!(
+                        run = %self.runs[index].run_id,
+                        completed_at,
+                        started_at = self.runs[index].started_at,
+                        "child evidence predates the run's start; keeping the run live"
+                    );
                     return false;
                 }
                 (TaskRetirementEnding::ChildEnded, Some(completed_at))
@@ -671,24 +680,19 @@ impl SessionTranscript {
         if !self.background_tasks.is_empty() {
             return TurnSettle::Waiting;
         }
-        // A Turn that ends with live runs yields too (spec #1057's P4): a
-        // child agent the client still reports running is an exit owed, and
-        // the completion entry on the same card follows its evidence or
-        // cleanup. A run with no child id still counts — it is a run with an
-        // exit owed, not an empty identity.
+        // A Turn that ends with live runs yields (spec #1057's P4): a child
+        // agent the client still reports running is an exit owed, and the
+        // completion entry on the same card follows its evidence or cleanup. A
+        // run with no child id still counts — it is a run with an exit owed,
+        // not an empty identity.
         //
-        // A run whose launch call is still live is NOT a yielding fact: that
-        // call is the turn's own work (a foreground `task` blocks the turn),
-        // so the transcript still streams and the turn has not ended. Counting
-        // it here would make a stuck call wait forever on a client that cannot
-        // retire it; only a settled launch leaves a run the Turn must wait for.
-        let launch_live = |run: &AgentRun| {
-            run.launched_by.iter().any(|reference| {
-                self.tool_call(&reference.call_id)
-                    .is_some_and(|call| call.status.is_live())
-            })
-        };
-        if self.runs.iter().any(|run| run.is_live() && !launch_live(run)) {
+        // A live LAUNCH does not exempt it: a Codex `spawnAgent` call stays
+        // `Running` while its child runs (the adapter states the targets'
+        // states), and the whole point is that the Turn yields instead of
+        // stamping ✅ over a live child. The card's live tool panel is not a
+        // stuck panel in that case — the drain yields on the waiting decision
+        // (see the two settle loops).
+        if self.runs.iter().any(AgentRun::is_live) {
             return TurnSettle::Waiting;
         }
         TurnSettle::Complete
@@ -2149,8 +2153,9 @@ pub struct AgentRun {
     /// The live run's identity: the child id when one exists, else the creating
     /// call's id. Never re-keyed by a later sighting.
     pub run_id: String,
-    /// ADR-0080's durable key (see the type's doc). Never re-minted; later ids
-    /// are aliases.
+    /// ADR-0080's durable key: the run's **child id**, the one id every fact
+    /// and every read window names the run by. Never re-minted; later ids are
+    /// aliases.
     pub task_run_id: Option<String>,
     /// The client's child session/thread id, when reported. Usually equals
     /// `run_id`; a run created from a call-only fact fills it later.

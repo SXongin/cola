@@ -9,13 +9,12 @@
 //!
 //! The rules are spec #1057's:
 //!
-//! - **Two keys, one mapping.** `run_id` is the live identity (the child id
-//!   when one exists, else the creating call's id) and never moves;
-//!   `task_run_id` is ADR-0080's durable key, minted by the first id-bearing
-//!   fact and never re-minted.
-//! - **Multiplicity.** A launch naming no receiver creates no run. A run
-//!   created from a call-only fact fills `child_id` later and keeps its
-//!   `run_id`.
+//! - **Two keys, one mapping.** `run_id` is the live identity — the child id —
+//!   and never moves; `task_run_id` is ADR-0080's durable key and is the same
+//!   child id, so every read window mints the same identity for one run. A
+//!   fact naming no id names no run (both producers drop empty ids).
+//! - **Multiplicity.** A launch naming no receiver creates no run; one naming
+//!   N children creates N runs, each keyed by its own child.
 //! - **A child may be launched more than once** — a resumed `task` — so
 //!   `launched_by` is a set.
 //! - **A report is an observation.** Identical observations collapse, and a
@@ -53,14 +52,10 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
             .map(|reference| reference.run_id.as_str())
             .filter(|id| !id.is_empty())
             .collect();
-        // One fact naming N children must not give them one durable key: the
-        // endings are per run (ADR-0080). A single-receiver fact keys by its
-        // call id; a multi-receiver one keys each run by its own child id.
-        let multi = names.len() > 1;
         match effect {
             DelegationEffect::Launch => {
                 for run_id in names {
-                    let run = resolve_or_create(&mut runs, run_id, call, multi);
+                    let run = resolve_or_create(&mut runs, run_id, call);
                     push_relation(&mut run.launched_by, call);
                     // A resumed task names the same child: the run it resolves
                     // gains a launch, never a second record.
@@ -80,13 +75,13 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
             }
             DelegationEffect::Address => {
                 for run_id in names {
-                    let run = resolve_or_create(&mut runs, run_id, call, multi);
+                    let run = resolve_or_create(&mut runs, run_id, call);
                     push_relation(&mut run.addressed_by, call);
                 }
             }
             DelegationEffect::Report => {
                 for run_id in names {
-                    let run = resolve_or_create(&mut runs, run_id, call, multi);
+                    let run = resolve_or_create(&mut runs, run_id, call);
                     // Dedupe by the CALL, never by call id alone: an activity
                     // whose state moved is the same call, so the relation is
                     // one entry and the state is applied below.
@@ -104,37 +99,23 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
 /// sighting resolves the same record by either its live identity or its child
 /// id, so `run_id` never moves once minted.
 ///
-/// `task_run_id` (ADR-0080's durable key) is minted here, once:
-///
-/// - a single-receiver fact keys by the creating **call id** — the one id
-///   every writer of that read agrees on, and what "a launch's key is its call
-///   id" means;
-/// - a fact naming **several** children keys each run by its **own child id**,
-///   because one call id cannot be the durable identity of two runs (it would
-///   fold their endings together and prune one on the other's evidence). The
-///   choice is deterministic from the fact itself, so every reader of the same
-///   read mints the same keys.
-fn resolve_or_create<'a>(
-    runs: &'a mut Vec<AgentRun>,
-    run_id: &str,
-    call: &ToolCall,
-    multi: bool,
-) -> &'a mut AgentRun {
+/// `task_run_id` (ADR-0080's durable key) is the run's **child id**. A fact
+/// names a child to create a run, and that id is the only key every read
+/// window agrees on: a window starting at the launch, at a `wait`, or at a
+/// report must mint the same durable identity, and a call-id key would differ
+/// by which call the window happens to begin at (and could not identify two
+/// runs named by one multi-child fact). No fact names a run without an id —
+/// both producers drop empty ids — so no call-keyed arm exists.
+fn resolve_or_create<'a>(runs: &'a mut Vec<AgentRun>, run_id: &str, call: &ToolCall) -> &'a mut AgentRun {
     if let Some(index) = runs
         .iter()
         .position(|run| run.run_id == run_id || run.child_id.as_deref() == Some(run_id))
     {
         return &mut runs[index];
     }
-    let call_id = call.identity.call_id.as_str();
-    let key = if multi || call_id.is_empty() {
-        run_id.to_string()
-    } else {
-        call_id.to_string()
-    };
     runs.push(AgentRun {
         run_id: run_id.to_string(),
-        task_run_id: Some(key),
+        task_run_id: Some(run_id.to_string()),
         child_id: Some(run_id.to_string()),
         label: label_of(call).unwrap_or_else(|| run_id.to_string()),
         agent: agent_of(call),
@@ -427,7 +408,11 @@ mod tests {
         assert_eq!(read.runs.len(), 1);
         let run = &read.runs[0];
         assert_eq!(run.run_id, "ses_child", "the live identity is the child id");
-        assert_eq!(run.task_run_id.as_deref(), Some("call_task"), "ADR-0080's key");
+        assert_eq!(
+            run.task_run_id.as_deref(),
+            Some("ses_child"),
+            "ADR-0080's key is the child id every window agrees on"
+        );
         assert_eq!(run.child_id.as_deref(), Some("ses_child"));
         assert_eq!(run.label, "run call_task", "the client's description labels it");
         assert_eq!(run.status, RunStatus::Running);
@@ -504,7 +489,7 @@ mod tests {
         assert_eq!(run.run_id, "thread_1");
         assert_eq!(
             run.task_run_id.as_deref(),
-            Some("call_activity"),
+            Some("thread_1"),
             "the first id-bearing fact mints the durable key, never re-minted"
         );
         assert_eq!(run.launched_by.len(), 1, "the later launch is a relation");
@@ -588,6 +573,45 @@ mod tests {
         assert_eq!(read.runs[0].status, RunStatus::Running);
     }
 
+    /// The durable key is a property of the RUN, not of where a read window
+    /// starts: a launch first and a `wait` first name the same child and must
+    /// mint the same key, or the ledger would key one run's endings two ways.
+    #[test]
+    fn every_read_window_mints_the_same_durable_key() {
+        let launch = || {
+            call(
+                "call_spawn",
+                DelegationEffect::Launch,
+                &["thread_1"],
+                ToolStatus::Running,
+                Some(1),
+            )
+        };
+        let wait = || {
+            call(
+                "call_wait",
+                DelegationEffect::Address,
+                &["thread_1"],
+                ToolStatus::Completed,
+                Some(2),
+            )
+        };
+        let full = transcript(vec![launch(), wait()]);
+        let late = transcript(vec![wait()]);
+        let reported = transcript(vec![report("call_activity", "thread_1", "started")]);
+        assert_eq!(full.runs[0].ending_key(), "thread_1");
+        assert_eq!(
+            full.runs[0].ending_key(),
+            late.runs[0].ending_key(),
+            "a window starting at the addressing call keys the same run"
+        );
+        assert_eq!(
+            full.runs[0].ending_key(),
+            reported.runs[0].ending_key(),
+            "a window starting at a report keys the same run"
+        );
+    }
+
     /// A resumed `task` launches the same child again: `launched_by` is a set,
     /// and no second run appears.
     #[test]
@@ -617,7 +641,7 @@ mod tests {
         assert_eq!(calls, ["call_1", "call_2"]);
         assert_eq!(
             read.runs[0].task_run_id.as_deref(),
-            Some("call_1"),
+            Some("ses_child"),
             "the key is minted once"
         );
     }
@@ -689,12 +713,12 @@ mod tests {
         assert!(!read.runs[0].is_live(), "the client states the run ended");
         assert_eq!(
             read.run_evidence_suspects(),
-            vec![("call_done".to_string(), "thread_1".to_string())],
+            vec![("thread_1".to_string(), "thread_1".to_string())],
             "the child read still has to confirm the end"
         );
 
         let mut read = read;
-        assert!(read.apply_run_child_evidence("call_done", ChildEvidence::Terminal { completed_at: 3 }));
+        assert!(read.apply_run_child_evidence("thread_1", ChildEvidence::Terminal { completed_at: 3 }));
         assert_eq!(read.task_retirements.len(), 1);
         assert_eq!(
             read.task_retirements[0].label.as_deref(),
@@ -745,7 +769,7 @@ mod tests {
         assert_eq!(retirement.ending, super::super::TaskRetirementEnding::ChildEnded);
         assert_eq!(retirement.finished_at, Some(9));
         assert_eq!(
-            retirement.task.tool.call_id, "call_spawn",
+            retirement.task.tool.call_id, "ses_child",
             "the retirement names the run by its durable key"
         );
         assert_eq!(

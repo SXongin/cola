@@ -1616,7 +1616,7 @@ impl Item {
                 MessageRole::Assistant,
                 vec![self.tool_part(
                     codex_tool_id("collab_agent"),
-                    collab_status(status),
+                    collab_status(tool, status, receivers, agents),
                     Some(json!({
                         "tool": tool,
                         "status": status,
@@ -2838,10 +2838,45 @@ fn mcp_status(status: &Option<String>) -> ToolStatus {
     }
 }
 
-/// A collaboration call's own status. Unlike the other tool kinds, the wire
-/// carries an `interrupted` outcome too (a close/interrupt that landed), which
-/// is a failure for the card's icon rather than an unknown status.
-fn collab_status(status: &Option<String>) -> ToolStatus {
+/// A collaboration call's status, as the honest statement about the RUN.
+///
+/// The call's own wire status is not the whole story: a `spawnAgent` call
+/// completes as soon as it hands back the child handle while the child keeps
+/// running, so a `completed` call would tell the neutral fold the run ended
+/// before its first activity report — and the yielding Turn could close with
+/// the child live. A launch therefore reads `Running` while any target agent
+/// is not terminal (an empty/unknown state included: the start payload's row
+/// names a child that has not reported yet). Every other verb keeps the wire
+/// mapping; `interrupted` stays the failure icon.
+fn collab_status(
+    tool: &str,
+    status: &Option<String>,
+    receivers: &[String],
+    agents: &[AgentState],
+) -> ToolStatus {
+    if tool == "spawnAgent" {
+        let launch = match status.as_deref() {
+            Some("inProgress") => Some(ToolStatus::Running),
+            Some("failed") | Some("interrupted") => Some(ToolStatus::Error),
+            _ => None,
+        };
+        if let Some(status) = launch {
+            return status;
+        }
+        if !receivers.is_empty() {
+            // ANY live target keeps the run live; a receiver with no state row
+            // yet (the start payload) counts as live, never as ended.
+            let mut rows = agents
+                .iter()
+                .filter(|agent| receivers.contains(&agent.thread_id))
+                .peekable();
+            let any_live =
+                rows.peek().is_none() || rows.any(|agent| !agent_status_is_terminal(&agent.status));
+            if any_live {
+                return ToolStatus::Running;
+            }
+        }
+    }
     match status.as_deref() {
         Some("inProgress") => ToolStatus::Running,
         Some("completed") => ToolStatus::Completed,
@@ -2849,6 +2884,16 @@ fn collab_status(status: &Option<String>) -> ToolStatus {
         Some(other) => ToolStatus::Other(other.to_string()),
         None => ToolStatus::Unknown,
     }
+}
+
+/// Whether one target agent's reported state is a terminal one. Unknown
+/// values stay LIVE: an upstream state this build cannot name is not evidence
+/// that the child ended.
+fn agent_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "errored" | "failed" | "interrupted" | "cancelled" | "closed"
+    )
 }
 
 /// A child agent activity carries no status field: its `kind` IS the child's
@@ -3560,7 +3605,9 @@ mod tests {
 
         let call = projected_tool(&projection, "item-collab-spawn");
         assert_eq!(call.identity.name, "codex/collab_agent");
-        assert_eq!(call.status, ToolStatus::Completed);
+        // The spawn call itself completed, but its target is still running:
+        // the client's statement about the RUN is `Running` (spec #1057's P4).
+        assert_eq!(call.status, ToolStatus::Running);
         let input = call.input.as_ref().expect("the adapter's shape");
         assert_eq!(input["tool"], "spawnAgent");
         assert_eq!(input["status"], "completed");
@@ -3828,6 +3875,71 @@ mod tests {
             projected_tool(&projection, "item-activity-live").status,
             ToolStatus::Completed,
             "a completed activity is the client's terminal statement"
+        );
+    }
+
+    /// A spawn call is the honest statement about its RUN: a completed call
+    /// with any live target reads `Running` (the child still runs), and only a
+    /// spawn whose targets are all terminal reads `Completed`.
+    #[test]
+    fn a_spawn_call_reads_its_targets_states() {
+        let mut mixed = ThreadProjection::new("thread-1");
+        replay(
+            &mut mixed,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-mixed",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": "thread-1",
+                        "receiverThreadIds": ["thread-a", "thread-b"],
+                        "agentsStates": {
+                            "thread-a": { "status": "completed", "message": null },
+                            "thread-b": { "status": "running", "message": null }
+                        }
+                    }
+                }
+            })],
+        );
+        assert_eq!(
+            projected_tool(&mixed, "item-mixed").status,
+            ToolStatus::Running,
+            "one live target keeps the run live"
+        );
+
+        let mut done = ThreadProjection::new("thread-1");
+        replay(
+            &mut done,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-done",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": "thread-1",
+                        "receiverThreadIds": ["thread-a"],
+                        "agentsStates": {
+                            "thread-a": { "status": "completed", "message": null }
+                        }
+                    }
+                }
+            })],
+        );
+        assert_eq!(
+            projected_tool(&done, "item-done").status,
+            ToolStatus::Completed,
+            "every target terminal is a completed run"
         );
     }
 

@@ -1216,6 +1216,10 @@ async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
         card_header(&card)
     );
     let text = card_text(&card);
+    assert!(
+        text.contains("⏳ 派生子 Agent"),
+        "the launch reads Running while its child runs, so the Turn yields: {text}"
+    );
     assert!(text.contains("派生子 Agent"), "the call's title: {text}");
     assert!(text.contains("🧵 /root/worker"), "the target thread: {text}");
     assert!(
@@ -1246,8 +1250,11 @@ async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
 
 /// Spec #1057's P4 / ADR-0080: a child thread's own terminal turn is the
 /// evidence a run with **no Wake** retires on. The read is `thread/read`; a
-/// turn still in progress is no evidence (never guessed dead), and a thread the
-/// server does not know is `Gone` (the run cannot be hosted there).
+/// turn still in progress is no evidence (never guessed dead).
+///
+/// "No rollout found" is a healthy child in its FIRST turn, not a lost one: a
+/// thread created by `thread/start` answers it until it has run. `Gone` needs
+/// a definitive absence, which the child-agent `thread/list` probe supplies.
 #[tokio::test]
 async fn a_child_threads_terminal_turn_is_its_evidence() {
     let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
@@ -1294,24 +1301,40 @@ async fn a_child_threads_terminal_turn_is_its_evidence() {
         crate::backend::ChildEvidence::Unfinished,
         "a running child is no terminal evidence"
     );
-    // The protocol's own answer for a child thread the server no longer
-    // holds: `-32600 no rollout found for thread id <id>` — matched on code
-    // and message form, never a phrase.
-    server.answer_next_thread_read_no_rollout("thread-child-unknown");
+    // A freshly spawned child has no rollout yet: the recorded answer is
+    // `-32600 no rollout found for thread id <id>`, and it means the child is
+    // ALIVE in its first turn — never `Gone`.
+    server.answer_next_thread_read_no_rollout("thread-child-fresh");
+    assert_eq!(
+        Backend::child_evidence(&client, "thread-child-fresh")
+            .await
+            .expect("the recorded no-rollout answer is a state, not a read failure"),
+        crate::backend::ChildEvidence::Unfinished,
+        "a first-turn child is healthy, so it keeps its run live"
+    );
+
+    // A child the server's child-agent list does not know is a definitive
+    // absence: the read fails (the fake's unknown-thread error) and the probe
+    // over the `subAgent*` source kinds finds nothing.
     assert_eq!(
         Backend::child_evidence(&client, "thread-child-unknown")
             .await
-            .expect("the recorded no-rollout answer is evidence, not a read failure"),
+            .expect("an absent child is evidence, not a read failure"),
         crate::backend::ChildEvidence::Gone,
-        "a child the server no longer holds cannot be running there"
+        "a child no list holds cannot be running there"
     );
-    // A generic server error is a FAILED read, never an ending: the row must
-    // survive it.
+
+    // A transient read failure for a child the list DOES hold is no evidence:
+    // the row must survive it.
+    let mut probing = ScriptedThread::adopted("thread-child-probe", "session-root", WORK, "worker");
+    probing.parent_thread_id = Some(THREAD.into());
+    server.seed_thread(probing);
+    server.reject_next_thread_read();
     assert!(
-        Backend::child_evidence(&client, "thread-child-unknown")
+        Backend::child_evidence(&client, "thread-child-probe")
             .await
             .is_err(),
-        "a mismatched reply is no evidence"
+        "a failed read on a listed child is no ending"
     );
 }
 
