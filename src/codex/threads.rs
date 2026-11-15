@@ -603,7 +603,7 @@ impl Threads {
             }
             // A never-run thread has no rollout; that is a state of the
             // thread, not a transport failure (the spike's exact answer).
-            Err(CodexError::Rpc { code, detail, .. }) if no_history(code, thread_id, &detail) => {
+            Err(CodexError::Rpc { code, detail, .. }) if is_no_rollout(code, thread_id, &detail) => {
                 Ok(Adoption::NoHistoryYet)
             }
             Err(error) => Err(error),
@@ -648,11 +648,16 @@ impl Threads {
     }
 }
 
-/// Whether `thread/resume`'s error is the documented no-rollout answer for
+/// Whether an app-server error is the documented **no-rollout** answer for
 /// **this** thread: `-32600` and exactly `no rollout found for thread id
 /// <id>`. A near-match (another code, another thread's id, or a message that
 /// merely contains the phrase) is not this state and stays an error.
-fn no_history(code: Option<i64>, thread_id: &str, detail: &str) -> bool {
+///
+/// `thread/resume` reports it for a thread that has not run yet, and a child
+/// thread the server no longer holds answers the same recorded shape — the
+/// evidence a child-only run retires on (`src/codex/backend.rs`'s
+/// `child_evidence`). One predicate, so both readers agree on the form.
+pub(crate) fn is_no_rollout(code: Option<i64>, thread_id: &str, detail: &str) -> bool {
     if code != Some(-32600) {
         return false;
     }
@@ -1483,35 +1488,35 @@ mod tests {
     #[test]
     fn only_the_documented_no_rollout_answer_is_a_named_state() {
         let id = "019a";
-        assert!(no_history(
+        assert!(is_no_rollout(
             Some(-32600),
             id,
             "no rollout found for thread id 019a"
         ));
         // Near matches stay errors: another thread's id, the right phrase in
         // the wrong shape, another code, or no code at all.
-        assert!(!no_history(
+        assert!(!is_no_rollout(
             Some(-32600),
             id,
             "no rollout found for thread id 019b"
         ));
-        assert!(!no_history(
+        assert!(!is_no_rollout(
             Some(-32600),
             id,
             "prefix: no rollout found for thread id 019a"
         ));
-        assert!(!no_history(
+        assert!(!is_no_rollout(
             Some(-32600),
             id,
             "no rollout found for thread id 019a and more"
         ));
-        assert!(!no_history(Some(-32600), id, "no rollout found"));
-        assert!(!no_history(
+        assert!(!is_no_rollout(Some(-32600), id, "no rollout found"));
+        assert!(!is_no_rollout(
             Some(-32602),
             id,
             "no rollout found for thread id 019a"
         ));
-        assert!(!no_history(None, id, "no rollout found for thread id 019a"));
+        assert!(!is_no_rollout(None, id, "no rollout found for thread id 019a"));
     }
 
     /// `SessionListInfo` has no field for the session tree root, so a list row

@@ -732,6 +732,10 @@ struct State {
     /// Answer the next `thread/read` with THIS thread instead of the requested
     /// one, modelling a response that names another thread.
     read_returns: std::sync::Mutex<Option<String>>,
+    /// One-shot: answer the next `thread/read` for this thread id with the
+    /// recorded no-rollout error — the shape a server gives a child thread it
+    /// no longer holds (`-32600 no rollout found for thread id <id>`).
+    read_no_rollout: std::sync::Mutex<Option<String>>,
     /// `model/list` calls received, so a paged catalog is proved by its pages.
     model_list_calls: AtomicUsize,
     /// One-shot: leave the next `model/list` unanswered (a stalled catalog).
@@ -816,6 +820,7 @@ impl Default for State {
             hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             read_returns: std::sync::Mutex::new(None),
+            read_no_rollout: std::sync::Mutex::new(None),
             model_list_calls: AtomicUsize::new(0),
             silent_model_list: std::sync::atomic::AtomicBool::new(false),
             model_list_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
@@ -1519,6 +1524,13 @@ impl FakeServer {
         *self.state.read_returns.lock().expect("read returns") = Some(thread_id.to_string());
     }
 
+    /// Answer the next `thread/read` for `thread_id` with the recorded
+    /// no-rollout error (`-32600 no rollout found for thread id <id>`) — the
+    /// protocol's own answer for a child thread the server no longer holds.
+    pub(crate) fn answer_next_thread_read_no_rollout(&self, thread_id: &str) {
+        *self.state.read_no_rollout.lock().expect("read no rollout") = Some(thread_id.to_string());
+    }
+
     /// Hide a thread's in-progress turns from the next `reads` `thread/read`
     /// answers, modelling `/stop` landing before the server persisted the turn.
     pub(crate) fn hide_live_turn_for(&self, thread_id: &str, reads: usize) {
@@ -1753,6 +1765,25 @@ where
             let requested = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             let substituted = state.read_returns.lock().expect("read returns").take();
             let thread_id = substituted.as_deref().unwrap_or(requested);
+            // The recorded no-rollout answer, when a test scripts it: a child
+            // thread the server no longer holds is `Gone` evidence, and the
+            // shape must be the one the real protocol uses.
+            if state
+                .read_no_rollout
+                .lock()
+                .expect("read no rollout")
+                .take()
+                .as_deref()
+                == Some(thread_id)
+            {
+                return reply_error(
+                    sink,
+                    id,
+                    -32600,
+                    &format!("no rollout found for thread id {thread_id}"),
+                )
+                .await;
+            }
             let hide_live = {
                 let mut hidden = state.hide_live_turns.lock().expect("hidden live turns");
                 match hidden.get_mut(thread_id) {
