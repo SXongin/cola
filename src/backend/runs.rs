@@ -57,7 +57,7 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
         match effect {
             DelegationEffect::Launch => {
                 for (run_id, receiver_status) in names {
-                    let run = resolve_or_create(&mut runs, run_id, call, receiver_status);
+                    let run = resolve_or_create(&mut runs, run_id, call);
                     push_relation(&mut run.launched_by, call);
                     // A resumed task names the same child: the run it resolves
                     // gains a launch, never a second record. The resume also
@@ -90,14 +90,14 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
                 }
             }
             DelegationEffect::Address => {
-                for (run_id, receiver_status) in names {
-                    let run = resolve_or_create(&mut runs, run_id, call, receiver_status);
+                for (run_id, _) in names {
+                    let run = resolve_or_create(&mut runs, run_id, call);
                     push_relation(&mut run.addressed_by, call);
                 }
             }
             DelegationEffect::Report => {
-                for (run_id, receiver_status) in names {
-                    let run = resolve_or_create(&mut runs, run_id, call, receiver_status);
+                for (run_id, _) in names {
+                    let run = resolve_or_create(&mut runs, run_id, call);
                     // Dedupe by the CALL, never by call id alone: an activity
                     // whose state moved is the same call, so the relation is
                     // one entry and the state is applied below.
@@ -122,12 +122,7 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
 /// by which call the window happens to begin at (and could not identify two
 /// runs named by one multi-child fact). No fact names a run without an id —
 /// both producers drop empty ids — so no call-keyed arm exists.
-fn resolve_or_create<'a>(
-    runs: &'a mut Vec<AgentRun>,
-    run_id: &str,
-    call: &ToolCall,
-    receiver_status: Option<RunStatus>,
-) -> &'a mut AgentRun {
+fn resolve_or_create<'a>(runs: &'a mut Vec<AgentRun>, run_id: &str, call: &ToolCall) -> &'a mut AgentRun {
     if let Some(index) = runs
         .iter()
         .position(|run| run.run_id == run_id || run.child_id.as_deref() == Some(run_id))
@@ -141,7 +136,10 @@ fn resolve_or_create<'a>(
         label: label_of(call).unwrap_or_else(|| run_id.to_string()),
         agent: agent_of(call),
         started_at: call.started_at,
-        status: receiver_status.unwrap_or_else(|| status_of(call)),
+        // A non-launch fact (a `wait`/`sendInput` window) names the run but
+        // states nothing about its life: start Unknown/live. Only a launch or a
+        // report supplies the status.
+        status: RunStatus::Unknown,
         activity: None,
         observed_at: None,
         launched_by: Vec::new(),
@@ -854,6 +852,53 @@ mod tests {
         ]);
         assert_eq!(read.runs.len(), 1);
         assert_eq!(read.runs[0].addressed_by[0].call_id, "call_input");
+    }
+
+    /// A run first seen through an addressing receipt takes no status from it:
+    /// a `wait`/`sendInput` window is not a statement about the child's life.
+    /// Only a later launch or report supplies the status.
+    #[test]
+    fn an_address_only_window_keeps_the_run_live() {
+        let read = transcript(vec![call(
+            "call_wait",
+            DelegationEffect::Address,
+            &["thread_1"],
+            ToolStatus::Completed,
+            Some(1),
+        )]);
+        assert_eq!(read.runs.len(), 1);
+        assert_eq!(read.runs[0].status, RunStatus::Unknown);
+        assert!(read.runs[0].is_live(), "the receipt did not end the run");
+
+        let read = transcript(vec![
+            call(
+                "call_wait",
+                DelegationEffect::Address,
+                &["thread_1"],
+                ToolStatus::Completed,
+                Some(1),
+            ),
+            call(
+                "call_spawn",
+                DelegationEffect::Launch,
+                &["thread_1"],
+                ToolStatus::Running,
+                Some(2),
+            ),
+        ]);
+        assert_eq!(read.runs[0].status, RunStatus::Running);
+
+        let read = transcript(vec![
+            call(
+                "call_wait",
+                DelegationEffect::Address,
+                &["thread_1"],
+                ToolStatus::Completed,
+                Some(1),
+            ),
+            report("call_done", "thread_1", "completed"),
+        ]);
+        assert_eq!(read.runs[0].status, RunStatus::Completed);
     }
 
     /// A child approval still resolves through the parent chain: the run fact
