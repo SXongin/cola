@@ -459,8 +459,12 @@ impl ToolPanel {
 
     /// The child Session a launch runs — the run's live identity as the
     /// adapter wrote it into the call's [`ToolDetail::Delegation`] (the launch
-    /// relation replaces the old tool-name check, spec #1057's P4). `None` for
-    /// any call that did not launch a run, or a launch that named no child.
+    /// relation replaces the old tool-name check, spec #1057's P4).
+    ///
+    /// `None` unless the call names EXACTLY one run: a launch with several
+    /// receivers ranks no child above another, and picking `first()` would make
+    /// an arbitrary receiver the panel's liveness source. Such a call's children
+    /// are still read for the ledger, from its runs.
     pub(crate) fn child_session_id(&self) -> Option<&str> {
         let ToolDetail::Delegation {
             runs,
@@ -469,7 +473,10 @@ impl ToolPanel {
         else {
             return None;
         };
-        runs.first().map(|run| run.run_id.as_str())
+        let [run] = runs.as_slice() else {
+            return None;
+        };
+        (!run.run_id.is_empty()).then_some(run.run_id.as_str())
     }
 }
 
@@ -487,23 +494,34 @@ pub(crate) fn is_receipt_call(call: &ToolCall) -> bool {
 }
 
 /// The one-line receipt an addressing or reporting call leaves on its run. The
-/// verb is the wire's own (`wait`, `sendInput`, an activity kind), and the
 /// target names the runs it addressed — or says it addressed the Turn's runs as
 /// a set when it named none. Copy belongs to the card (ADR-0107), so the words
 /// live here until the vocabulary ticket owns them.
+///
+/// A report's verb comes from the call's declared status (a report is an
+/// observation, so its state IS the verb). An addressing verb has no neutral
+/// field yet: `ToolDetail` declares only `{runs, effect}`, so the adapter's own
+/// `input.tool` (`wait`, `sendInput`, `closeAgent`) is the only source, read as
+/// display data exactly as a tool panel reads a vendor title. #1063's
+/// vocabulary/neutral-detail pass can move it; inventing a verb would be worse.
 pub(crate) fn receipt_line(call: &ToolCall) -> String {
-    let verb = call
-        .input
-        .as_ref()
-        .and_then(|input| {
-            input
-                .get("tool")
-                .or_else(|| input.get("kind"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .filter(|verb| !verb.is_empty())
-        .or_else(|| call.title.as_deref().filter(|title| !title.is_empty()))
-        .unwrap_or(call.identity.name.as_str());
+    let effect = match &call.detail {
+        ToolDetail::Delegation { effect, .. } => Some(*effect),
+        _ => None,
+    };
+    let verb = match effect {
+        Some(DelegationEffect::Report) => report_word(&call.status).to_string(),
+        Some(DelegationEffect::Address) => call
+            .input
+            .as_ref()
+            .and_then(|input| input.get("tool"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|verb| !verb.is_empty())
+            .or_else(|| call.title.as_deref().filter(|title| !title.is_empty()))
+            .unwrap_or(call.identity.name.as_str())
+            .to_string(),
+        _ => call.identity.name.clone(),
+    };
     let targets: Vec<&str> = match &call.detail {
         ToolDetail::Delegation { runs, .. } => runs.iter().map(|run| run.run_id.as_str()).collect(),
         _ => Vec::new(),
@@ -515,34 +533,65 @@ pub(crate) fn receipt_line(call: &ToolCall) -> String {
     }
 }
 
-/// The liveness line's token for one live call (ADR-0105/0107). A Codex child
-/// is reported through `(kind, detail)`, so its `commandExecution` reads
-/// `shell`; an OpenCode child keeps its own id (`bash`/`shell`), which is what
-/// the line has always read. The vocabulary ticket (#1063) owns one token for
-/// every producer; until then this bridge keeps the existing words intact for
-/// OpenCode and gives a Codex child the neutral one.
-pub(crate) fn call_token(call: &CallView) -> String {
-    if !call.identity.name.starts_with("codex/") {
-        return call.identity.name.clone();
+/// The word a report's declared state reads. The adapter maps the wire activity
+/// kind onto [`ToolStatus`], so this never parses a vendor payload.
+fn report_word(status: &ToolStatus) -> &str {
+    match status {
+        ToolStatus::Pending | ToolStatus::Running => "started",
+        ToolStatus::Completed => "completed",
+        ToolStatus::Error => "failed",
+        ToolStatus::Other(reason) => reason,
+        ToolStatus::Unknown => "unknown",
     }
+}
+
+/// The receipt's dedupe identity: a call id, plus the STATE for a report.
+/// Dedupe is never by call id alone (spec #1057) — the wire reuses an
+/// activity's item id between its start and completion, so a state move is a
+/// new observation and renders its own one-line receipt. An addressing call's
+/// verb does not move with its status, so it stays one line per call.
+pub(crate) fn receipt_key(call: &ToolCall) -> String {
+    match &call.detail {
+        ToolDetail::Delegation {
+            effect: DelegationEffect::Report,
+            ..
+        } => format!("{}#{:?}", call.identity.call_id, call.status),
+        _ => call.identity.call_id.clone(),
+    }
+}
+
+/// The liveness line's token for one live call (ADR-0105/0107). It derives
+/// from `(kind, detail)` for every producer, so a Codex `commandExecution` and
+/// an OpenCode `shell`/`bash` child read the same word. The vendor name is only
+/// the OPAQUE fallback (an id whose kind/detail this build cannot map), trimmed
+/// of its adapter namespace so the line stays one word. #1063 moves this table
+/// into `vocab.rs`; the words it returns are already ADR-0107's tokens.
+pub(crate) fn call_token(call: &CallView) -> String {
     match (call.kind, &call.detail) {
         (ToolKind::Execute, _) => "shell".to_string(),
         (ToolKind::Edit, ToolDetail::FileEdits(edits)) => {
-            if edits.iter().all(|edit| edit.action == FileAction::Add) {
+            if !edits.is_empty() && edits.iter().all(|edit| edit.action == FileAction::Add) {
                 "write".to_string()
             } else {
                 "edit".to_string()
             }
         }
+        (ToolKind::Edit, _) => "edit".to_string(),
         (ToolKind::Search, ToolDetail::Search { scope, .. }) => match scope {
             SearchScope::FileName => "glob".to_string(),
             SearchScope::Content => "grep".to_string(),
             SearchScope::Web => "websearch".to_string(),
         },
+        (ToolKind::Search, _) => "grep".to_string(),
         (ToolKind::Read, _) => "read".to_string(),
         (ToolKind::Fetch, _) => "fetch".to_string(),
+        (ToolKind::Think, _) => "think".to_string(),
+        (ToolKind::Delete, _) => "delete".to_string(),
+        (ToolKind::Move, _) => "move".to_string(),
+        (ToolKind::SwitchMode, _) => "mode".to_string(),
         (ToolKind::Other, ToolDetail::Delegation { .. }) => "subagent".to_string(),
-        (_, _) => call
+        // The opaque fallback: the vendor's own id is all this build has.
+        (ToolKind::Other, _) => call
             .identity
             .name
             .rsplit('/')
@@ -1019,8 +1068,10 @@ pub struct TaskLiveness {
     pub activity: ChildActivity,
     /// Epoch ms of the child's newest observed activity: the timer a phase
     /// (no tool running) counts from. Stored as a time, not an age, so a
-    /// failed read never freezes a made-up "5s".
-    pub last_activity_ms: i64,
+    /// failed read never freezes a made-up "5s". `None` when the run's
+    /// activity carries no clock at all: the fragment then shows the phase
+    /// word with no age rather than an age measured from the epoch.
+    pub last_activity_ms: Option<i64>,
     /// The child's pending wait, in the header's own vocabulary (ADR-0054).
     pub wait: Option<AwaitingAction>,
 }
@@ -1062,7 +1113,7 @@ impl TaskLiveness {
         let wait = activity.awaiting.and_then(awaiting_action);
         Self {
             activity: activity_kind,
-            last_activity_ms: activity.clock_ms().unwrap_or_default(),
+            last_activity_ms: activity.clock_ms(),
             wait,
         }
     }
@@ -1084,7 +1135,7 @@ impl TaskLiveness {
             age_clock_ms: match &self.activity {
                 ChildActivity::Tool { started_at, .. } => *started_at,
                 ChildActivity::Thinking | ChildActivity::Reasoning | ChildActivity::Replying => {
-                    Some(self.last_activity_ms)
+                    self.last_activity_ms
                 }
             },
             wait: self.wait.and_then(|wait| wait.label()),
@@ -6151,7 +6202,7 @@ mod tests {
                 name: "bash".into(),
                 started_at: Some(chrono::Utc::now().timestamp_millis() - 12_000),
             },
-            last_activity_ms: chrono::Utc::now().timestamp_millis() - 12_000,
+            last_activity_ms: Some(chrono::Utc::now().timestamp_millis() - 12_000),
             wait: Some(AwaitingAction::Permission),
         }));
         let card = CardBuilder::new()
@@ -6173,7 +6224,7 @@ mod tests {
         let mut tool = ToolPanel::for_test("task", ToolStatus::Completed, None, Some("done"));
         tool.set_liveness(Some(TaskLiveness {
             activity: ChildActivity::Thinking,
-            last_activity_ms: 1,
+            last_activity_ms: Some(1),
             wait: None,
         }));
         let card = CardBuilder::new()
@@ -6198,7 +6249,7 @@ mod tests {
                 name: name.into(),
                 started_at: Some(now - ago_ms),
             },
-            last_activity_ms: now - ago_ms,
+            last_activity_ms: Some(now - ago_ms),
             wait: None,
         };
         assert_eq!(tool(5_000, "bash").title_fragment(now), "bash 5s");
@@ -6206,7 +6257,7 @@ mod tests {
 
         let thinking = TaskLiveness {
             activity: ChildActivity::Thinking,
-            last_activity_ms: now - 90_000,
+            last_activity_ms: Some(now - 90_000),
             wait: Some(AwaitingAction::Both),
         };
         assert_eq!(thinking.title_fragment(now), "思考中 1m30s · 等待你的授权/回答");
@@ -6216,7 +6267,7 @@ mod tests {
                 name: "bash".into(),
                 started_at: None,
             },
-            last_activity_ms: now - 1_000,
+            last_activity_ms: Some(now - 1_000),
             wait: None,
         };
         assert_eq!(untimed.title_fragment(now), "bash");
@@ -6226,6 +6277,116 @@ mod tests {
         assert_eq!(tool(5_000, "bash").age_clock_ms(), Some(now - 5_000));
         assert_eq!(thinking.age_clock_ms(), Some(now - 90_000));
         assert_eq!(untimed.age_clock_ms(), None);
+    }
+
+    /// Review finding 7: an activity with no clock at all renders its phase
+    /// word with NO age — never an age measured from the epoch.
+    #[test]
+    fn a_run_activity_with_no_clock_renders_no_age() {
+        let activity = RunActivity {
+            call: None,
+            phase: Some(Phase::Waiting),
+            awaiting: None,
+            since: None,
+        };
+        let untimed = TaskLiveness::from_run(&activity);
+        assert_eq!(untimed.age_clock_ms(), None);
+        assert_eq!(untimed.title_fragment(1_000_000), "思考中");
+
+        let timed = TaskLiveness::from_run(&RunActivity {
+            call: None,
+            phase: Some(Phase::Reasoning),
+            awaiting: None,
+            since: Some(990_000),
+        });
+        assert_eq!(timed.title_fragment(1_000_000), "推理中 10s");
+    }
+
+    /// Review finding 15: the liveness token derives from `(kind, detail)` for
+    /// every producer, and the vendor name is only the opaque fallback.
+    #[test]
+    fn the_liveness_token_derives_from_kind_and_detail() {
+        let view = |name: &str, kind: ToolKind, detail: ToolDetail| CallView {
+            identity: ToolIdentity {
+                name: name.into(),
+                call_id: "call_1".into(),
+            },
+            kind,
+            detail,
+            started_at: None,
+        };
+        let command = || ToolDetail::Command {
+            command: "ls".into(),
+            cwd: None,
+            description: None,
+            exit: None,
+            timeout: false,
+        };
+        let edits = |action: FileAction| {
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "a.rs".into(),
+                action,
+                rename_to: None,
+                diff: None,
+            }])
+        };
+        let search = |scope: SearchScope| ToolDetail::Search {
+            query: None,
+            matches: None,
+            scope,
+        };
+
+        assert_eq!(call_token(&view("bash", ToolKind::Execute, command())), "shell");
+        assert_eq!(
+            call_token(&view("codex/command_execution", ToolKind::Execute, command())),
+            "shell",
+            "one word for every Execute producer"
+        );
+        assert_eq!(
+            call_token(&view("write", ToolKind::Edit, edits(FileAction::Add))),
+            "write"
+        );
+        assert_eq!(
+            call_token(&view("edit", ToolKind::Edit, edits(FileAction::Update))),
+            "edit",
+            "a mixed or updated edit is `edit`"
+        );
+        assert_eq!(
+            call_token(&view("glob", ToolKind::Search, search(SearchScope::FileName))),
+            "glob"
+        );
+        assert_eq!(
+            call_token(&view("grep", ToolKind::Search, search(SearchScope::Content))),
+            "grep"
+        );
+        assert_eq!(
+            call_token(&view("websearch", ToolKind::Search, search(SearchScope::Web))),
+            "websearch"
+        );
+        assert_eq!(
+            call_token(&view("read", ToolKind::Read, ToolDetail::None)),
+            "read"
+        );
+        assert_eq!(
+            call_token(&view("webfetch", ToolKind::Fetch, ToolDetail::None)),
+            "fetch"
+        );
+        assert_eq!(
+            call_token(&view(
+                "collab",
+                ToolKind::Other,
+                ToolDetail::Delegation {
+                    runs: Vec::new(),
+                    effect: DelegationEffect::Launch
+                }
+            )),
+            "subagent"
+        );
+        assert_eq!(
+            call_token(&view("codex/mystery_tool", ToolKind::Other, ToolDetail::Opaque)),
+            "mystery_tool",
+            "the opaque fallback is the vendor id, namespace trimmed"
+        );
     }
 
     /// The child session id is the LAUNCH relation's, not a tool name's (spec
@@ -6290,6 +6451,25 @@ mod tests {
             ToolPanel::for_test("bash", ToolStatus::Running, None, None).child_session_id(),
             None
         );
+
+        // A launch naming SEVERAL children ranks no child above another, so
+        // the panel takes no liveness source from it (the ledger reads them
+        // all from the runs instead).
+        let shared = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: "call_spawn".into(),
+            },
+            detail: ToolDetail::Delegation {
+                runs: ["thread_a", "thread_b"]
+                    .iter()
+                    .map(|id| crate::backend::AgentRunRef { run_id: (*id).into() })
+                    .collect(),
+                effect: DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        });
+        assert_eq!(shared.child_session_id(), None);
     }
 
     #[test]

@@ -973,7 +973,7 @@ mod tests {
                 name: "bash".into(),
                 started_at: Some(now - 5_000),
             },
-            last_activity_ms: now - 5_000,
+            last_activity_ms: Some(now - 5_000),
             wait: None,
         };
         assert_eq!(
@@ -983,7 +983,7 @@ mod tests {
 
         let thinking = TaskLiveness {
             activity: ChildActivity::Thinking,
-            last_activity_ms: now - 30_000,
+            last_activity_ms: Some(now - 30_000),
             wait: Some(crate::feishu::card::AwaitingAction::Permission),
         };
         assert_eq!(
@@ -1002,7 +1002,7 @@ mod tests {
                 name: "bash".into(),
                 started_at: None,
             },
-            last_activity_ms: now,
+            last_activity_ms: Some(now),
             wait: None,
         };
         assert_eq!(
@@ -1016,7 +1016,7 @@ mod tests {
                 name: "we*bash_2".into(),
                 started_at: None,
             },
-            last_activity_ms: now,
+            last_activity_ms: Some(now),
             wait: None,
         };
         assert_eq!(
@@ -1407,7 +1407,7 @@ mod tests {
                     name: "bash".into(),
                     started_at: Some(start + 7_000),
                 },
-                last_activity_ms: start + 7_000,
+                last_activity_ms: Some(start + 7_000),
                 wait: None,
             }),
 
@@ -1521,7 +1521,7 @@ mod tests {
                 name: "bash".into(),
                 started_at: Some(now - 5_000),
             },
-            last_activity_ms: now - 5_000,
+            last_activity_ms: Some(now - 5_000),
             wait: None,
         };
         assert_eq!(
@@ -1549,7 +1549,7 @@ mod tests {
                     name: "bash".into(),
                     started_at: None,
                 },
-                last_activity_ms: 1_000,
+                last_activity_ms: Some(1_000),
                 wait: None,
             }),
 
@@ -1616,7 +1616,7 @@ mod tests {
             unconfirmed: false,
             activity: Some(TaskLiveness {
                 activity: ChildActivity::Thinking,
-                last_activity_ms: 0,
+                last_activity_ms: Some(0),
                 wait,
             }),
 
@@ -1632,7 +1632,7 @@ mod tests {
                     name: "bash".into(),
                     started_at: None,
                 },
-                last_activity_ms: 0,
+                last_activity_ms: Some(0),
                 wait: None,
             }),
 
@@ -1661,7 +1661,7 @@ mod tests {
                 name: "a*b_c&d".into(),
                 started_at: Some(0),
             },
-            last_activity_ms: 0,
+            last_activity_ms: Some(0),
             wait: Some(crate::feishu::card::AwaitingAction::Both),
         };
         let now = 3_599_000; // the age renders `59m59s`, the widest shape
@@ -1679,22 +1679,22 @@ mod tests {
                     name: "bash".into(),
                     started_at: None,
                 },
-                last_activity_ms: 0,
+                last_activity_ms: Some(0),
                 wait: Some(crate::feishu::card::AwaitingAction::Permission),
             },
             TaskLiveness {
                 activity: ChildActivity::Thinking,
-                last_activity_ms: 0,
+                last_activity_ms: Some(0),
                 wait: None,
             },
             TaskLiveness {
                 activity: ChildActivity::Reasoning,
-                last_activity_ms: 0,
+                last_activity_ms: Some(0),
                 wait: Some(crate::feishu::card::AwaitingAction::Both),
             },
             TaskLiveness {
                 activity: ChildActivity::Replying,
-                last_activity_ms: 0,
+                last_activity_ms: Some(0),
                 wait: None,
             },
         ] {

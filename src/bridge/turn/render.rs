@@ -168,7 +168,7 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             // never a panel (ADR-0106 §4): its dedupe is the receipt set, not
             // the panel map.
             if crate::feishu::card::tool_render::is_receipt_call(call) {
-                return !acc.receipt_rendered(&call.identity.call_id);
+                return !acc.receipt_rendered(&crate::feishu::card::tool_render::receipt_key(call));
             }
             // The current panel IS the call's rendered revision: an update
             // (running → completed, a late output, or a todowrite list
@@ -938,7 +938,7 @@ fn plan_wake_entries(
         // launch's own facts when the read still carries it, else what the Wake
         // itself names.
         let identity = match &retired {
-            Some(task) => crate::bridge::tasks::identity_of_task(task, input),
+            Some(task) => crate::bridge::tasks::identity_of_task(task, input, None),
             None => crate::bridge::tasks::identity_of_wake(wake),
         };
         // The identity the entry falls back to when the read no longer carries
@@ -1096,7 +1096,15 @@ fn plan_runtime_entries(
         };
         let entry = TaskCompletionEntry {
             kind,
-            label: super::state::task_label(kind, input)
+            // The retiring run's own label first (spec #1057's P4): the ledger
+            // row, the liveness line and the completion entry name one run by
+            // one label. A Background Task keeps its originating input's
+            // label, and the durable identity is the fallback a compacted read
+            // leaves.
+            label: retirement
+                .label
+                .clone()
+                .or_else(|| super::state::task_label(kind, input))
                 .or_else(|| durable.as_ref().and_then(|identity| identity.label.clone())),
             id,
             started_at: task
@@ -3120,28 +3128,25 @@ async fn render_and_flush_inner(
     })
 }
 
-/// A child session's liveness as its transcript reports it (ADR-0054), read
-/// through the run fact (ADR-0105, spec #1057's P4): the neutral
-/// [`crate::backend::RunActivity`] is the one source, and the card's
-/// [`TaskLiveness`] is its view. `None` when the transcript carries no
-/// timestamp at all (a child that just started, or a payload without times) —
-/// no line is better than a made-up age. Test-only: the shared gather reads
-/// the neutral activity directly (so it can attach the waits as a set).
-#[cfg(test)]
-fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
-    // A child whose own transcript reports a terminal run is not live: its
-    // panel shows the settled result, its ledger row retires on the evidence,
-    // and a liveness line would claim progress that ended.
-    if crate::backend::runs::child_run_status(transcript).is_some_and(|status| {
-        !matches!(
-            status,
-            crate::backend::RunStatus::Running | crate::backend::RunStatus::Unknown
-        )
-    }) {
+/// A child transcript's live activity, or `None` when it has none to show.
+/// ONE predicate for the render gather and its tests:
+///
+/// - a run whose own read says it ended is not live — the panel shows the
+///   settled result, the ledger row retires on the evidence, and a liveness
+///   line would claim progress that ended (`RunStatus::is_terminal`);
+/// - a read with no timestamp at all proves no clock, so no line is better
+///   than a made-up age.
+fn child_activity(transcript: &SessionTranscript) -> Option<crate::backend::RunActivity> {
+    if crate::backend::runs::child_run_status(transcript).is_some_and(|status| status.is_terminal()) {
         return None;
     }
-    let activity = crate::backend::runs::child_run_activity(transcript)?;
-    Some(TaskLiveness::from_run(&activity))
+    crate::backend::runs::child_run_activity(transcript)
+}
+
+/// The card's view of [`child_activity`], the shape the render's tests pin.
+#[cfg(test)]
+fn child_liveness(transcript: &SessionTranscript) -> Option<TaskLiveness> {
+    child_activity(transcript).map(|activity| TaskLiveness::from_run(&activity))
 }
 
 /// One batched gather of child-session liveness (ADR-0054, spec #501): every
@@ -3170,26 +3175,13 @@ pub(super) async fn gather_child_liveness(
         // whose read already failed is not read again for another key.
         if !by_child.contains_key(child.as_str()) {
             let liveness = match backend.transcript(child).await {
-                Ok(transcript) => {
-                    // A child whose own read reports a terminal run is not
-                    // live: its panel shows the settled result, its ledger row
-                    // retires on the evidence, and a liveness line would claim
-                    // progress that ended.
-                    let terminal =
-                        crate::backend::runs::child_run_status(&transcript).is_some_and(|status| {
-                            !matches!(
-                                status,
-                                crate::backend::RunStatus::Running | crate::backend::RunStatus::Unknown
-                            )
-                        });
-                    match crate::backend::runs::child_run_activity(&transcript) {
-                        Some(mut activity) if !terminal => {
-                            activity.awaiting = run_waits(requests.wait_for(child).await);
-                            Some(TaskLiveness::from_run(&activity))
-                        }
-                        Some(_) | None => None,
+                Ok(transcript) => match child_activity(&transcript) {
+                    Some(mut activity) => {
+                        activity.awaiting = run_waits(requests.wait_for(child).await);
+                        Some(TaskLiveness::from_run(&activity))
                     }
-                }
+                    None => None,
+                },
                 Err(_) => None,
             };
             by_child.insert(child.as_str(), liveness);
@@ -3466,12 +3458,12 @@ mod tests {
         );
     }
 
-    use crate::backend::ToolDetail;
     use crate::backend::{
         BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, MessageRole,
         MessageTime, ReasoningPart, StepFinish, StepStart, TodoList, TodoStatus, TodoStep, ToolCall,
         ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
+    use crate::backend::{ToolDetail, ToolKind};
     use crate::bridge::App;
     use crate::bridge::chain::{
         CursorFrontier, CursorPartKind, EndingFacts, PendingGap, RenderedCursor, TaskEndingState,
@@ -11726,7 +11718,7 @@ Index: /x/src/main.rs
                     name: "bash".into(),
                     started_at: Some(9_000),
                 },
-                last_activity_ms: 9_000,
+                last_activity_ms: Some(9_000),
                 wait: None,
             })
         );
@@ -11755,7 +11747,7 @@ Index: /x/src/main.rs
             child_liveness(&transcript),
             Some(TaskLiveness {
                 activity: ChildActivity::Reasoning,
-                last_activity_ms: 8_000,
+                last_activity_ms: Some(8_000),
                 wait: None,
             })
         );
@@ -11771,7 +11763,7 @@ Index: /x/src/main.rs
             child_liveness(&replying),
             Some(TaskLiveness {
                 activity: ChildActivity::Replying,
-                last_activity_ms: 5_000,
+                last_activity_ms: Some(5_000),
                 wait: None,
             })
         );
@@ -11785,7 +11777,7 @@ Index: /x/src/main.rs
             child_liveness(&thinking),
             Some(TaskLiveness {
                 activity: ChildActivity::Thinking,
-                last_activity_ms: 6_000,
+                last_activity_ms: Some(6_000),
                 wait: None,
             })
         );
@@ -11843,18 +11835,37 @@ Index: /x/src/main.rs
         let now = chrono::Utc::now().timestamp_millis();
         let mut backend = MockBackend::new(realistic_parts());
         let child = |started: i64, name: &str| {
-            SessionTranscript::new(vec![message(
-                "a_child",
-                started,
-                vec![tool(
-                    name,
-                    "call_child",
-                    ToolStatus::Running,
-                    Some(started),
-                    Some(serde_json::json!({"command": "sleep 60"})),
-                    None,
-                )],
-            )])
+            // The child's call declares its neutral semantics, exactly as an
+            // adapter does: the liveness token derives from `(kind, detail)`,
+            // so a fixture that left them opaque would only test the fallback.
+            let Part::Tool(mut call) = tool(
+                name,
+                "call_child",
+                ToolStatus::Running,
+                Some(started),
+                Some(serde_json::json!({"command": "sleep 60"})),
+                None,
+            ) else {
+                unreachable!("a tool part");
+            };
+            if name == "read" {
+                call.kind = ToolKind::Read;
+                call.detail = ToolDetail::Read {
+                    path: Some("src/lib.rs".into()),
+                    preview: None,
+                    directory: false,
+                };
+            } else {
+                call.kind = ToolKind::Execute;
+                call.detail = ToolDetail::Command {
+                    command: "sleep 60".into(),
+                    cwd: None,
+                    description: None,
+                    exit: None,
+                    timeout: false,
+                };
+            }
+            SessionTranscript::new(vec![message("a_child", started, vec![Part::Tool(call)])])
         };
         backend.given_transcript(
             "ses_child",
@@ -11883,7 +11894,7 @@ Index: /x/src/main.rs
         let updates = platform.updated_cards().await;
         let first = updates.last().expect("a live flush").to_string();
         assert!(
-            first.contains("bash 5s") || first.contains("bash 6s"),
+            first.contains("shell 5s") || first.contains("shell 6s"),
             "the first poll shows the child's running tool and its elapsed time: {first}"
         );
 
@@ -12072,6 +12083,98 @@ Index: /x/src/main.rs
         assert!(
             parent.tool_call("call_wait").is_some() && parent.tool_call("call_input").is_some(),
             "the raw calls stay in the transcript"
+        );
+    }
+
+    /// Review finding 9: a report's receipt dedupes by call id AND state, so
+    /// the completion observation renders even though the wire reuses the
+    /// activity's item id — the card no longer freezes on `started`.
+    #[tokio::test]
+    async fn a_report_receipt_renders_its_new_state() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let now = chrono::Utc::now().timestamp_millis();
+        let backend = MockBackend::new(realistic_parts());
+        let read = |status: ToolStatus| {
+            SessionTranscript::new(vec![message(
+                "a1",
+                now - 10_000,
+                vec![Part::Tool(ToolCall {
+                    identity: ToolIdentity {
+                        name: "codex/sub_agent_activity".into(),
+                        call_id: "call_activity".into(),
+                    },
+                    status,
+                    started_at: Some(now - 6_000),
+                    input: Some(serde_json::json!({"kind": "started", "agentThreadId": "thread_1"})),
+                    detail: ToolDetail::Delegation {
+                        runs: vec![crate::backend::AgentRunRef {
+                            run_id: "thread_1".into(),
+                        }],
+                        effect: crate::backend::DelegationEffect::Report,
+                    },
+                    ..ToolCall::default()
+                })],
+            )])
+        };
+        let (app, platform) = build_app(cfg, backend).await;
+        let cards = app.cards_handle();
+        let sid = "ses_parent";
+        Turn::seed_card(&cards, sid, Some("om_parent")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(now - 11_000)).await;
+
+        for transcript in [read(ToolStatus::Running), read(ToolStatus::Completed)] {
+            let _ = render_and_flush(
+                &cards,
+                &app.sessions_handle(),
+                &app.client,
+                &app.requests_handle(),
+                sid,
+                &transcript,
+            )
+            .await;
+        }
+
+        let card = platform.updated_cards().await.last().cloned().expect("a flush");
+        let text = card_text(&card);
+        assert!(
+            text.contains("↪ completed · thread_1"),
+            "the completion observation renders: {text}"
+        );
+        assert!(
+            text.contains("↪ started · thread_1"),
+            "the start observation stays as the call's first line: {text}"
+        );
+    }
+
+    /// Review finding 19: both waits reach the run as a set, and the card's
+    /// wait vocabulary renders the combined words.
+    #[test]
+    fn both_waits_reach_the_run_as_a_set() {
+        use crate::feishu::card::AwaitingAction;
+
+        assert_eq!(run_waits(None), None);
+        assert_eq!(
+            run_waits(Some(AwaitingAction::Both)),
+            Some(crate::backend::RunWaits {
+                permission: true,
+                question: true
+            })
+        );
+        assert_eq!(
+            run_waits(Some(AwaitingAction::Permission)),
+            Some(crate::backend::RunWaits {
+                permission: true,
+                question: false
+            })
+        );
+        assert_eq!(
+            run_waits(Some(AwaitingAction::Question)),
+            Some(crate::backend::RunWaits {
+                permission: false,
+                question: true
+            })
         );
     }
 
