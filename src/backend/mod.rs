@@ -29,7 +29,10 @@ pub mod types;
 
 pub(crate) use lifecycle::wait_for_server_ready;
 pub use lifecycle::{AttachOutcome, EnsureAttached, RestartOutcome, ServerLifecycle};
-pub use types::{PERMISSION_BODY_MAX_CHARS, PERMISSION_TARGET_MAX_CHARS};
+pub use types::{
+    AgentCapabilities, ChildAgentMode, PERMISSION_BODY_MAX_CHARS, PERMISSION_TARGET_MAX_CHARS, PlanMode,
+    QuestionMode, UsageMode,
+};
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.
@@ -94,6 +97,10 @@ pub struct SkillInfo {
 /// handle owns it.
 #[async_trait]
 pub trait DirectoryBackend: Send + Sync {
+    /// The attached client's capability declaration (ADR-0106). Per
+    /// **attachment**, not per directory: the handle forwards the one read.
+    fn capabilities(&self) -> AgentCapabilities;
+
     async fn list_permissions(&self) -> Result<Vec<PermissionRequest>>;
 
     async fn reply_permission(&self, session_id: &str, request_id: &str, reply: &str) -> Result<()>;
@@ -131,6 +138,10 @@ impl BackendDirectory {
 
 #[async_trait]
 impl DirectoryBackend for BackendDirectory {
+    fn capabilities(&self) -> AgentCapabilities {
+        self.backend.capabilities()
+    }
+
     async fn list_permissions(&self) -> Result<Vec<PermissionRequest>> {
         self.backend.list_permissions(Some(&self.directory)).await
     }
@@ -194,13 +205,12 @@ impl DirectoryBackend for BackendDirectory {
 /// client has. They carry a default body stating **this client has no such
 /// surface**, in the vocabulary the trait already uses: `Ok(None)`, `false`,
 /// the no-op `Ok(())`, `Ok(TaskRuntime::default())`,
-/// `Ok(ChildEvidence::Unfinished)`. The fourteen are
+/// `Ok(ChildEvidence::Unfinished)`. The thirteen are
 /// [`Self::session_selection`], [`Self::session_last_run_model`],
 /// [`Self::switch_session_model`], [`Self::switch_session_agent`],
 /// [`Self::keeps_session_selection`], [`Self::reuse_continues_an_admitted_turn`],
 /// [`Self::resume_supported`], [`Self::resume`], [`Self::session_diff`],
-/// [`Self::task_runtime`], [`Self::background_tasks_supported`],
-/// [`Self::shell_output`], [`Self::child_evidence`] and
+/// [`Self::task_runtime`], [`Self::shell_output`], [`Self::child_evidence`] and
 /// [`Self::mcp_server_statuses`].
 ///
 /// One more default is structural rather than a missing surface:
@@ -209,9 +219,10 @@ impl DirectoryBackend for BackendDirectory {
 /// thread UUIDs) overrides it so its requests are not filtered out as
 /// unaddressable.
 ///
-/// A future adapter (spec #860) is expected to leave all fourteen defaulted when
+/// A future adapter (spec #860) is expected to leave all thirteen defaulted when
 /// the runtime it attaches to publishes no equivalent surface, and to override
-/// the ones it does publish; the rest of the trait — session lifecycle,
+/// the ones it does publish; it must still state every [`Self::capabilities`]
+/// axis explicitly (ADR-0106). The rest of the trait — session lifecycle,
 /// [`Self::prompt`], [`Self::transcript`], permissions/questions,
 /// [`Self::session_status`], the pickers, the tasks handle and the
 /// directory handle — is the core it must always implement.
@@ -223,6 +234,16 @@ impl DirectoryBackend for BackendDirectory {
 /// `Err`. A default must never look like a failed read.
 #[async_trait]
 pub trait Backend: ServerLifecycle + Send + Sync {
+    /// This attachment's **capability declaration** (ADR-0106, spec #1057 P5).
+    ///
+    /// Required, not defaulted: every Agent Client states every axis, so an
+    /// optional surface's absence is declared instead of discovered from an
+    /// empty read. It is the property of the **attachment** — a reattach may
+    /// change it, and a value read from a stale connection must not render a
+    /// new one. The card never asks which client this is; it asks whether a
+    /// surface exists.
+    fn capabilities(&self) -> AgentCapabilities;
+
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput;
 
     /// Create a session. A client whose provider is a **creation fact**
@@ -870,36 +891,14 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         Ok(TaskRuntime::default())
     }
 
-    /// Whether this client publishes a **Background Task surface** at all: the
-    /// live shells, subagent children and shell output records the Background
-    /// Task Ledger renders, and the runtime verdicts that retire them. It is a
-    /// capability, not a read: it says whether asking the questions is
-    /// meaningful on this client.
-    ///
-    /// The default answers `false`: a client with no such surface renders **no
-    /// ledger** — not an empty section, and never a `⚠️ 状态待确认` row — and the
-    /// Bridge spends no runtime verdict, child-evidence or shell-output read on
-    /// it. `false` is **not applicable to this client**, never a failed read; a
-    /// client that has the surface overrides this, and each of its reads still
-    /// reports its own failure as that read's `Err`.
-    fn background_tasks_supported(&self) -> bool {
-        false
-    }
-
     /// Whether this client reports **live runs** — a Background Task or a
     /// Turn-scoped child agent — so the live-run ledger, the panel liveness
-    /// line and the runtime reconciliation's early return are meaningful. The
-    /// derived answer is `background_runs || child_evidence` (ADR-0106); this
-    /// minimal method is the seam #1062 folds into
-    /// `AgentCapabilities::reports_live_runs()`, and the rest of the ticket
-    /// reads it instead of `background_tasks_supported`.
-    ///
-    /// The default delegates to [`Self::background_tasks_supported`]: a client
-    /// with no background surface reports runs only if it also has a
-    /// child-evidence read, which is exactly the override a child-only client
-    /// (Codex) writes.
+    /// line and the runtime reconciliation's early return are meaningful. This
+    /// is a thin delegation to [`AgentCapabilities::reports_live_runs`]
+    /// (`background_runs || child_evidence`, ADR-0106): the capability is the
+    /// one source, and no client overrides this.
     fn reports_live_runs(&self) -> bool {
-        self.background_tasks_supported()
+        self.capabilities().reports_live_runs()
     }
 
     /// The Background Task State module's handle (ADR-0079, tickets #681/#682)
@@ -1082,6 +1081,12 @@ mod core_only_client {
 
     #[async_trait]
     impl Backend for CoreClient {
+        fn capabilities(&self) -> AgentCapabilities {
+            // The neutral core owns no optional surface; a real client wraps it
+            // and states its own axes.
+            AgentCapabilities::none()
+        }
+
         fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
             CreateSessionInput {
                 id: None,
@@ -1279,7 +1284,7 @@ mod core_only_client {
         client.switch_session_agent("ses_core", "build").await.unwrap();
         assert!(client.shell_output("sh_1", None).await.unwrap().is_none());
         assert!(
-            !client.background_tasks_supported(),
+            !client.capabilities().background_runs,
             "a client with no Background Task surface says so, and renders no ledger"
         );
 

@@ -562,7 +562,7 @@ mod tests {
     fn the_report_takes_background_tasks_from_the_attached_generation() {
         let backend = serverless_backend(crate::config::OpenCodeConfig::default());
         assert!(
-            !backend.background_tasks_supported(),
+            !backend.capabilities().background_runs,
             "the one-shot shape's constructed strategy is V1"
         );
         let attachment = |generation: Option<&str>| AttachmentStatus {

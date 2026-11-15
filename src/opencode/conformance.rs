@@ -37,10 +37,10 @@ pub(crate) struct SessionCase {
     /// `POST /api/session/{id}/resume`, `false` on V1, which has no resume
     /// endpoint). Drives the resume-capability conformance scenario.
     pub(crate) resume_supported: bool,
-    /// Whether this generation publishes a Background Task surface (`true` on
-    /// V2's live shells/subagents, `false` on V1). Drives the capability
-    /// conformance scenario; the Bridge renders no ledger without it.
-    pub(crate) background_tasks_supported: bool,
+    /// This generation's explicit capability declaration (ADR-0106, spec
+    /// #1057 P5): every axis this client claims, pinned here so a change to
+    /// the strategy's own declaration is a test failure.
+    pub(crate) capabilities: crate::backend::AgentCapabilities,
     /// Mount the generation's fake session-read routes (a two-page list, one
     /// session get, the run-state reads), publishing the shared
     /// [`SessionReadFixture`] values in that generation's envelope shapes.
@@ -1100,21 +1100,20 @@ async fn resume_support_matches_the_generation() {
     }
 }
 
-/// The Background Task surface is generation-dependent (spec #860, ticket
-/// #880): V2 publishes the live shells, child sessions and shell records the
-/// Ledger renders; V1 carries none. A client without the surface renders no
-/// ledger at all, so the Bridge reads this capability instead of guessing from
-/// an empty read. It must answer without a wire read.
+/// The Agent Client's capability declaration is generation-dependent and must
+/// answer without a wire read (ADR-0106). Each axis is pinned per client in
+/// [`SessionCase::capabilities`]: V2 publishes the full surface, V1 omits
+/// background runs, child evidence, diffs and MCP.
 #[tokio::test]
-async fn background_task_surface_matches_the_generation() {
+async fn agent_capabilities_match_the_generation() {
     for case in cases() {
         let generation = case.generation.as_str();
         let server = TestHttpServer::start().await;
         let backend = case.backend(&server);
         assert_eq!(
-            backend.background_tasks_supported(),
-            case.background_tasks_supported,
-            "{generation}: the task surface must match the generation"
+            backend.capabilities(),
+            case.capabilities,
+            "{generation}: the capability declaration must match the generation"
         );
         assert!(
             server.requests().is_empty(),

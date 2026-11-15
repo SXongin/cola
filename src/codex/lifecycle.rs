@@ -506,6 +506,10 @@ impl CodexLifecycle {
                         surface = %client.server_info().surface_source,
                         "attached to the codex app-server daemon"
                     );
+                    // The one attach-time capability line (ADR-0106 decision
+                    // 2): absent surfaces are declared once here, never warned
+                    // about on every render.
+                    super::backend::codex_capabilities().log_absent("Codex");
                     let mut attached = self.attached.lock().await;
                     let _provider_fact = self.provider_fact_gate.lock().await;
                     *self

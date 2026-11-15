@@ -649,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn a_background_client_still_reads_its_run_children() {
         let mock = MockBackend::new(Vec::new());
-        // Deliberately the default: `background_tasks_supported()` is true.
+        // Deliberately the default: `capabilities().background_runs` is true.
         mock.with_child_evidence(
             "thread_child",
             crate::backend::ChildEvidence::Terminal { completed_at: 2_000 },

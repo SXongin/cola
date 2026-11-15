@@ -2092,16 +2092,13 @@ pub struct MockBackend {
     /// script a shell the runtime reports ended/missing, or a child session it
     /// reports inactive. Empty by default — no evidence, exactly like V1.
     pub task_runtime: Arc<std::sync::Mutex<crate::backend::TaskRuntime>>,
-    /// Whether this client publishes a Background Task surface (spec #860,
-    /// #880). True by default — the V2-shaped mock every ledger test drives; a
-    /// test that scripts a no-surface client flips it through
-    /// [`Self::without_task_surface`].
-    pub task_surface: bool,
-    /// Whether this client reports live runs WITHOUT a Background Task surface
-    /// — the child-only shape (Codex, spec #1057's P4). It makes
-    /// [`Backend::reports_live_runs`] true while `task_surface` stays false, so
-    /// a test can prove the run ledger renders from child evidence alone.
-    pub live_runs_only: bool,
+    /// The client's capability declaration (ADR-0106). The V2-shaped full
+    /// surface by default — the client every card test drives — with the two
+    /// task-surface scenarios folded in by [`Self::without_task_surface`] and
+    /// [`Self::with_child_only_runs`]; a test that scripts another absent
+    /// surface sets this field directly (the capability flags are construction
+    /// facts, so before the App is built).
+    pub capabilities: crate::backend::AgentCapabilities,
     /// Message ids the client answers as cola-authored through the authorship
     /// seam (ADR-0090): a client that assigns its own ids answers from its own
     /// record, never from the `msg_cola_` prefix. Empty by default, so the mock
@@ -2355,8 +2352,7 @@ impl MockBackend {
             session_statuses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             task_runtime: Arc::new(std::sync::Mutex::new(crate::backend::TaskRuntime::default())),
-            task_surface: true,
-            live_runs_only: false,
+            capabilities: crate::backend::AgentCapabilities::full(),
             authored_message_ids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_task_runtime_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3021,7 +3017,8 @@ impl MockBackend {
     /// the card renders no ledger and the Bridge spends no runtime read, even
     /// when a scripted transcript carries task facts.
     pub(crate) fn without_task_surface(&mut self) -> &mut Self {
-        self.task_surface = false;
+        self.capabilities.background_runs = false;
+        self.capabilities.child_evidence = false;
         self
     }
 
@@ -3030,8 +3027,8 @@ impl MockBackend {
     /// The ledger and the runtime reconciliation gate on `reports_live_runs`,
     /// so they still run.
     pub(crate) fn with_child_only_runs(&mut self) -> &mut Self {
-        self.task_surface = false;
-        self.live_runs_only = true;
+        self.capabilities.background_runs = false;
+        self.capabilities.child_evidence = true;
         self
     }
 
@@ -3373,6 +3370,14 @@ async fn hang_if_scripted(counter: &std::sync::atomic::AtomicUsize) {
 
 #[async_trait::async_trait]
 impl crate::backend::Backend for MockBackend {
+    /// The mock's declared surface, scripted by the test (ADR-0106). The
+    /// default is the full-capability V2 client the card tests drive; the task
+    /// scenarios are folded by [`Self::without_task_surface`] /
+    /// [`Self::with_child_only_runs`].
+    fn capabilities(&self) -> crate::backend::AgentCapabilities {
+        self.capabilities
+    }
+
     fn new_session_input(&self, directory: Option<&str>) -> crate::backend::types::CreateSessionInput {
         crate::backend::types::CreateSessionInput {
             id: None,
@@ -4409,16 +4414,6 @@ impl crate::backend::Backend for MockBackend {
             Some(status) => *status,
             None => Some(crate::backend::types::SessionStatus::Idle),
         })
-    }
-
-    /// Whether this mock publishes a Background Task surface (spec #860,
-    /// #880): the scripted `task_surface` flag.
-    fn background_tasks_supported(&self) -> bool {
-        self.task_surface
-    }
-
-    fn reports_live_runs(&self) -> bool {
-        self.task_surface || self.live_runs_only
     }
 
     /// The scripted runtime verdict (issue #454). Empty by default, so a test

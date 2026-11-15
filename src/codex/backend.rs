@@ -2614,6 +2614,25 @@ impl CodexClient {
     }
 }
 
+/// The one Codex capability declaration (ADR-0106, spec #1057 P5). The pinned
+/// app-server schema is the source, not the connection: every Codex attachment
+/// this adapter can make answers the same struct. `CodexClient` and
+/// `CodexLifecycle` both read it here, so the two cannot disagree.
+pub(crate) fn codex_capabilities() -> crate::backend::AgentCapabilities {
+    crate::backend::AgentCapabilities {
+        background_runs: false,
+        child_agents: crate::backend::ChildAgentMode::ActivityReports,
+        child_evidence: true,
+        plan: crate::backend::PlanMode::TurnPlan,
+        compaction: true,
+        usage: crate::backend::UsageMode::PerTurn,
+        questions: crate::backend::QuestionMode::Session,
+        modes: false,
+        diffs: true,
+        mcp: false,
+    }
+}
+
 #[async_trait]
 impl Backend for CodexClient {
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
@@ -3217,21 +3236,31 @@ impl Backend for CodexClient {
         &self.tasks
     }
 
-    /// Codex's app-server publishes no Background Task surface: its items are
-    /// turn-scoped tool calls, with no shell records, child-session registry or
-    /// runtime verdict endpoint. The Bridge therefore renders no ledger for a
-    /// Codex session and spends no runtime reconcile read on it.
-    fn background_tasks_supported(&self) -> bool {
-        false
-    }
-
-    /// …but it **does** report live runs (spec #1057's P4): a collaboration
-    /// child is a real child agent with its own thread, its own activity and a
-    /// terminal item its parent can read. So the ledger and the runtime
-    /// reconciliation gate on `reports_live_runs`, not on the background
-    /// surface. #1062 folds this into `AgentCapabilities::reports_live_runs()`.
-    fn reports_live_runs(&self) -> bool {
-        true
+    /// Codex's explicit capability declaration (ADR-0106, spec #1057 P5).
+    /// Every axis names the pinned app-server fact:
+    ///
+    /// - `background_runs = false`: Codex publishes no shell records, child
+    ///   session registry or runtime verdict endpoint (`task_runtime` defaults
+    ///   empty); its items are turn-scoped tool calls.
+    /// - `child_agents = ActivityReports`: `collabAgentToolCall` launches a
+    ///   child thread and `subAgentActivity` reports its lifecycle — there is no
+    ///   child transcript of Codex's own to render as a session.
+    /// - `child_evidence = true`: `thread/read` (or the thread list) carries the
+    ///   child thread's terminal item, so a child that ends with no Wake still
+    ///   retires. This is why `reports_live_runs` is true.
+    /// - `plan = TurnPlan`: `turn/plan/updated` replaces the card-tail list.
+    /// - `compaction = true`: `thread/compact/start` plus its compaction item.
+    /// - `usage = PerTurn`: a turn-scoped `tokenUsage` notification.
+    /// - `questions = Session`: `item/tool/requestUserInput` and a form-mode
+    ///   `mcpServer/elicitation/request` are thread-scoped; Codex has no
+    ///   Location Form.
+    /// - `modes = false`: the app-server publishes no agent list
+    ///   (`list_agents` is empty) and no agent-selection surface.
+    /// - `diffs = true`: `turn/diff/updated` reaches the neutral transcript.
+    /// - `mcp = false`: `mcpServerStatus/list` exists, but the full `/mcp`
+    ///   pair (statuses **and** a Location Form) does not (ADR-0103).
+    fn capabilities(&self) -> crate::backend::AgentCapabilities {
+        codex_capabilities()
     }
 
     /// A child thread's own terminal item (spec #1057's P4, ADR-0080): a child
@@ -3723,18 +3752,11 @@ impl Backend for CodexLifecycle {
         &self.tasks
     }
 
-    /// Every Codex client this lifecycle can attach has the same surface: the
-    /// app-server publishes no Background Tasks, so this is false before and
-    /// after an attach.
-    fn background_tasks_supported(&self) -> bool {
-        false
-    }
-
-    /// A Codex attachment reports live runs through its child threads (spec
-    /// #1057's P4), whatever client is attached: the answer does not depend on
-    /// the connection.
-    fn reports_live_runs(&self) -> bool {
-        true
+    /// Every Codex client this lifecycle can attach has the same surface, so
+    /// the declaration does not depend on the connection: read it through the
+    /// one shared constant.
+    fn capabilities(&self) -> crate::backend::AgentCapabilities {
+        codex_capabilities()
     }
 
     async fn child_evidence(&self, child_id: &str) -> Result<ChildEvidence> {
@@ -3830,6 +3852,34 @@ mod tests {
     use crate::codex::transport::Endpoint;
 
     const RECORDING: &str = include_str!("fixtures/turn-recording.json");
+
+    /// ADR-0106 / ticket #1062: Codex declares every capability axis from the
+    /// pinned app-server schema — no field is left at a default, and the
+    /// child-only shape (no background runs, but child evidence) is what makes
+    /// `reports_live_runs` true.
+    #[test]
+    fn capabilities_are_the_pinned_app_server_surface() {
+        let capabilities = codex_capabilities();
+        assert_eq!(
+            capabilities,
+            crate::backend::AgentCapabilities {
+                background_runs: false,
+                child_agents: crate::backend::ChildAgentMode::ActivityReports,
+                child_evidence: true,
+                plan: crate::backend::PlanMode::TurnPlan,
+                compaction: true,
+                usage: crate::backend::UsageMode::PerTurn,
+                questions: crate::backend::QuestionMode::Session,
+                modes: false,
+                diffs: true,
+                mcp: false,
+            }
+        );
+        assert!(
+            capabilities.reports_live_runs(),
+            "child evidence is a live-run surface even without background runs"
+        );
+    }
 
     async fn connect(url: &str) -> CodexClient {
         let endpoint = Endpoint::parse(url).expect("endpoint");

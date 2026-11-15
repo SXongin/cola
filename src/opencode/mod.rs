@@ -229,8 +229,8 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::task_runtime(self, session_id, directory, shells, children).await
     }
 
-    fn background_tasks_supported(&self) -> bool {
-        OpenCodeBackend::background_tasks_supported(self)
+    fn capabilities(&self) -> crate::backend::AgentCapabilities {
+        OpenCodeBackend::capabilities(self)
     }
 
     async fn shell_output(
