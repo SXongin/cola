@@ -357,7 +357,10 @@ async fn update_plan_replaces_the_card_tail_todo_panel() {
         .cloned()
         .expect("the first plan's card");
     let text = card_text(&first);
-    assert!(text.contains("📋 plan"), "the tail Todo Panel renders: {first}");
+    assert!(
+        text.contains(&format!("📋 {}", crate::feishu::card::vocab::TOOL_PLAN)),
+        "the tail Todo Panel renders: {first}"
+    );
     assert!(text.contains("共 3 项 · 🔄 1 · ⬜ 1 · ✅ 1"), "{first}");
     assert!(text.contains("✅ ~~Inspect parser~~"), "{first}");
     assert!(text.contains("🔄 **Patch decoder**"), "{first}");
@@ -398,7 +401,12 @@ async fn update_plan_replaces_the_card_tail_todo_panel() {
         "old steps do not accumulate: {replaced}"
     );
     assert!(text.contains("共 2 项"), "{replaced}");
-    assert_eq!(text.matches("📋 plan").count(), 1, "{replaced}");
+    assert_eq!(
+        text.matches(&format!("📋 {}", crate::feishu::card::vocab::TOOL_PLAN))
+            .count(),
+        1,
+        "{replaced}"
+    );
 
     server.push_to_thread(
         THREAD,
@@ -523,7 +531,8 @@ async fn a_terminal_error_notification_settles_the_card_with_its_text() {
         .cloned()
         .expect("the settled card");
     assert!(
-        !card_header(&card).contains("waiting") && !card_header(&card).contains("responding"),
+        !card_header(&card).contains(crate::feishu::card::vocab::PHASE_WAITING)
+            && !card_header(&card).contains(crate::feishu::card::vocab::PHASE_RESPONDING),
         "the card is not left hanging on a spinner: {}",
         card_header(&card)
     );
@@ -1190,7 +1199,7 @@ async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
     });
 
     wait_for_card_update(&platform, "the collab panel", CardUpdates::Any, |card| {
-        card_text(card).contains("subagent")
+        card_text(card).contains(crate::feishu::card::vocab::TOOL_SUBAGENT)
     })
     .await;
     // The Turn ends while the child is still live, so it YIELDS (ADR-0059's
@@ -1215,10 +1224,13 @@ async fn a_collab_launch_keeps_its_panel_and_a_child_activity_is_a_receipt() {
     );
     let text = card_text(&card);
     assert!(
-        text.contains("⏳ subagent"),
+        text.contains(&format!("⏳ {}", crate::feishu::card::vocab::TOOL_SUBAGENT)),
         "the launch reads Running while its child runs, so the Turn yields: {text}"
     );
-    assert!(text.contains("subagent"), "the call's token: {text}");
+    assert!(
+        text.contains(crate::feishu::card::vocab::TOOL_SUBAGENT),
+        "the call's token: {text}"
+    );
     assert!(text.contains("🧵 /root/worker"), "the target thread: {text}");
     assert!(
         text.contains("📝 Review the diff and report the blocking findings."),

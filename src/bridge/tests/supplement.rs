@@ -417,7 +417,7 @@ async fn a_non_live_advisory_read_starts_a_turn_with_an_ordinary_card() {
             .collect();
         assert!(!cards.is_empty(), "the Turn must send its loading card");
         assert!(
-            card_header(&cards[0]).contains("waiting"),
+            card_header(&cards[0]).contains(crate::feishu::card::vocab::PHASE_WAITING),
             "unreadable={unreadable}: the first card is the ordinary loading card: {}",
             cards[0]
         );

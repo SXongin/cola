@@ -258,7 +258,7 @@ async fn click_updates_a_non_current_card_through_its_handle() {
     // new turn never carried this one, so its live header must not leak onto
     // the old card.
     assert!(
-        !ack.contains("waiting"),
+        !ack.contains(crate::feishu::card::vocab::PHASE_WAITING),
         "the old card must not wear the NEW turn's live header: {ack}"
     );
     assert_eq!(

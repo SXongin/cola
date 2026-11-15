@@ -561,7 +561,7 @@ async fn a_stopped_turn_discards_the_abort_error() {
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
 
     let turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
-    wait_for_card_header(&platform, "waiting").await;
+    wait_for_card_header(&platform, crate::feishu::card::vocab::PHASE_WAITING).await;
     app.handle_message(incoming(
         "msg_stop".into(),
         "chat_1".into(),
@@ -1276,7 +1276,7 @@ async fn pending_permission_app() -> (
             let _ = app.permission.poll_loop(&app.flow_handles()).await;
         }
     });
-    wait_for_card_header(&platform, "等待你的授权").await;
+    wait_for_card_header(&platform, crate::feishu::card::vocab::AWAITING_PERMISSION).await;
     (dir, app, backend, platform)
 }
 
@@ -1309,7 +1309,7 @@ async fn a_pending_permission_waits_past_the_grace_without_error() {
             .updated_cards()
             .await
             .last()
-            .is_some_and(|c| card_header(c).contains("等待你的授权")),
+            .is_some_and(|c| card_header(c).contains(crate::feishu::card::vocab::AWAITING_PERMISSION)),
         "the header still names the wait: {:?}",
         platform.updated_cards().await
     );

@@ -1018,20 +1018,24 @@ fn an_unknown_id_is_opaque_on_both_generations() {
     }
 }
 
-/// Captured from `7c9859da` by rendering the same decoded payload through this
-/// same builder.
+/// Captured at #1063 **after** the token/copy rename by rendering the decoded
+/// V1 payload through this same builder. This is the card the current renderer
+/// emits for that wire payload; a later intentional word or layout change must
+/// update this baseline and its caption together.
 const V1_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**输入**\n`ls -la`\n📁 `/work`\n\n**输出**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ shell","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
 
-/// Captured from `7c9859da` by the same builder, from Codex's decoded command item.
+/// Captured at #1063 after the same rename, from Codex's decoded command item
+/// through the same builder.
 const CODEX_BASELINE_CARD: &str = r#"{"body":{"elements":[{"element_id":"tool_call","elements":[{"content":"**输入**\n`ls -la`\n📁 `/work`\n\n**输出**\n\ntotal 0\n","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"✅ shell","tag":"plain_text"}},"tag":"collapsible_panel"}]},"config":{"wide_screen_mode":true},"header":{"template":"green","title":{"content":"✅ 完成","tag":"plain_text"}},"schema":"2.0"}"#;
 
 /// Byte-identity guard, one producer each: a decoded wire payload renders the
-/// exact card the pre-change code rendered. A renderer that started reading a
-/// semantic field changes one of these.
+/// exact card the #1063 renderer emits, so a later change to the panel's words,
+/// input line, fence or header has to be intentional and update these cards.
 ///
-/// These still hold after P2 moved the Execute renderer onto `(kind, detail)`
-/// (#1059): the command and its cwd are the same facts the name arms read, so
-/// the card did not change — only the way the renderer found them.
+/// The two ids (`bash`, `codex/command_execution`) land on one card because
+/// P2 moved the Execute renderer onto `(kind, detail)` and #1063 put the token
+/// `shell` on its header: the guard pins that convergence, not a pre-rename
+/// card.
 #[test]
 fn a_decoded_v1_bash_renders_the_baseline_card() {
     let call = v1_tool(

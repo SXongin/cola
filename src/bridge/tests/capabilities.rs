@@ -382,7 +382,7 @@ async fn panel_liveness_follows_the_child_agent_axis() {
         "the ledger row still renders under the plain panel: {card}"
     );
     assert!(
-        card_text(&card).contains("subagent"),
+        card_text(&card).contains(crate::feishu::card::vocab::TOOL_SUBAGENT),
         "the row names its run kind: {card}"
     );
     // The ledger row still renders (the client reports live runs through child
