@@ -147,7 +147,7 @@ Decision 5 said the per-subsystem methods delegate to the read.
 `capabilities()`, no caller remained, and a delegating alias would have kept a
 second name for one fact. `reports_live_runs` stays as the derived
 `background_runs || child_evidence` delegation. The permission always-scope is
-unchanged; the `mcp` pair is not: #1062 defined the axis as the statuses
-**plus** the directory-owned Location Form, so Codex and V1 publish statuses
-yet declare `false` (ADR-0103 forbids a status-only `/mcp` card). Source:
-ticket #1062.
+unchanged. The implementation **widens** #1062's `mcp` axis from its status
+card alone to the full pair — the statuses **plus** the directory-owned
+Location Form (ADR-0103 forbids a status-only `/mcp` card) — so Codex and V1
+publish statuses yet declare `false`. Source: ticket #1062.
