@@ -236,20 +236,23 @@ impl SessionTranscript {
     }
 
     /// Apply the user's manual cleanup (spec #588, ticket #590): every named
-    /// **live** Background Task leaves [`Self::background_tasks`] as a
+    /// **live** Background Task or child-only run leaves its live list as a
     /// [`TaskRetirement`] with the [`TaskRetirementEnding::Cleaned`] ending and
     /// the click's own clock, exactly as a runtime reconciliation retires what
     /// the runtime confirmed — so the settle rule follows (the last task gone is
     /// the true end) and the ledger renders one 🧹 entry per cleared row. The
     /// ids come from the caller's read of this same transcript, so an id with
-    /// no live task is ignored: a cleanup never invents a retirement for a task
-    /// the read no longer lists. The cleared task also leaves
-    /// [`Self::unconfirmed_tasks`]; every other id stays as the read left it.
+    /// no live task or run is ignored: a cleanup never invents a retirement for
+    /// something the read no longer lists. A run represented by a Background
+    /// Task is left to that task's own path (one run, one retirement). The
+    /// cleared ids also leave [`Self::unconfirmed_tasks`]; every other id stays
+    /// as the read left it.
     pub fn apply_cleanup(&mut self, call_ids: &[String], now_ms: i64) {
         let clearing: std::collections::HashSet<&str> = call_ids.iter().map(String::as_str).collect();
         if clearing.is_empty() {
             return;
         }
+        let tasks_before = self.background_tasks.clone();
         let mut kept = Vec::with_capacity(self.background_tasks.len());
         for task in std::mem::take(&mut self.background_tasks) {
             if clearing.contains(task.tool.call_id.as_str()) {
@@ -264,6 +267,34 @@ impl SessionTranscript {
             }
         }
         self.background_tasks = kept;
+        // A child-only run has no Background Task to clear: retire it through
+        // the same ending machinery, synthesized as the `subagent` row the
+        // evidence path uses. A run a task already represents is skipped (the
+        // task loop above owns that record).
+        let mut kept_runs = Vec::with_capacity(self.runs.len());
+        for run in std::mem::take(&mut self.runs) {
+            let named = run.ids().any(|id| clearing.contains(id));
+            let task_owned = tasks_before.iter().any(|task| self.run_is_task(&run, task));
+            if named && !task_owned {
+                self.task_retirements.push(TaskRetirement {
+                    task: BackgroundTask {
+                        tool: ToolIdentity {
+                            name: "subagent".to_string(),
+                            call_id: run.ending_key().to_string(),
+                        },
+                        shell_id: None,
+                        child_id: run.child_id.clone(),
+                        started_at: run.started_at,
+                    },
+                    ending: TaskRetirementEnding::Cleaned,
+                    finished_at: Some(now_ms),
+                    label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
+                });
+            } else {
+                kept_runs.push(run);
+            }
+        }
+        self.runs = kept_runs;
         self.unconfirmed_tasks
             .retain(|id| !clearing.contains(id.as_str()));
     }

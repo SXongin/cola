@@ -2552,6 +2552,147 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
     assert!(later.runs.is_empty(), "the retirement overlay prunes the run");
 }
 
+/// Spec #1057's P4: a child-only run whose evidence read keeps failing has no
+/// Wake and no terminal transcript to retire on. The failed read marks it
+/// unconfirmed, so the waiting card offers the cleanup exit; the click drops
+/// the run and records its 🧹 cleanup ending through the same machinery.
+#[tokio::test]
+async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
+    let _wd = test_work_dir();
+    let launch = TranscriptMessage {
+        id: MessageId::new("msg_launch_call_spawn"),
+        role: MessageRole::Assistant,
+        time: Some(crate::backend::MessageTime {
+            created: 2_000,
+            completed: Some(2_000),
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: "call_spawn".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(2_000),
+            input: Some(serde_json::json!({
+                "tool": "spawnAgent",
+                "receiverThreadIds": ["thread_child"],
+                "prompt": "review the diff"
+            })),
+            output: ToolOutput::default(),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        })],
+    };
+    let activity = TranscriptMessage {
+        id: MessageId::new("msg_activity_call_activity"),
+        role: MessageRole::Assistant,
+        time: Some(crate::backend::MessageTime {
+            created: 2_100,
+            completed: Some(2_100),
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: "call_activity".into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(2_100),
+            input: Some(serde_json::json!({
+                "kind": "started",
+                "agentThreadId": "thread_child",
+                "agentPath": "/root/worker"
+            })),
+            output: ToolOutput::default(),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..ToolCall::default()
+        })],
+    };
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "审阅这次的改动"),
+        assistant(1_500, "交给子 Agent 了。"),
+        launch,
+        activity,
+    ])
+    .with_executions(vec![execution(2_500)]);
+    assert_eq!(waiting.runs.len(), 1, "one child is one run");
+    let (_dir, app, backend, platform) = scripted_app_prepared(
+        vec![waiting],
+        Some(SessionStatus::Idle),
+        |_| {},
+        |backend| {
+            backend.with_child_only_runs();
+        },
+    )
+    .await;
+    backend
+        .given_transcript_after_build("thread_child", vec![SessionTranscript::new(vec![])])
+        .await;
+    backend
+        .fail_child_evidence_reads
+        .store(usize::MAX, Ordering::SeqCst);
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "审阅这次的改动"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the live run keeps the wait"
+    );
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the unconfirmed run", CardUpdates::Latest, |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+    let marked = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&marked).contains("清理待确认任务"),
+        "the waiting card offers the cleanup exit: {marked}"
+    );
+
+    let ack = app
+        .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
+        .await
+        .expect("the cleanup click acks");
+    assert!(ack.card.is_none(), "the ack keeps the card for the pipeline");
+    wait_for_card_update(&platform, "the cleaned run", CardUpdates::Latest, |card| {
+        card_header(card).contains("✅")
+            && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
+    })
+    .await;
+
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(
+        !text.contains("后台任务（") && !text.contains("状态待确认"),
+        "the child-only run's row left the live ledger: {settled}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "clearing the last run settles the wait"
+    );
+    assert!(text.contains("🧹 subagent 已清理：review the diff（人工）"));
+}
+
 /// Spec #1057's P4, review finding 1: ONE launch naming two children mints a
 /// distinct durable key per run, so A's ending is A's: one record and one
 /// completion entry, B stays live and keeps the Turn yielding, and A's

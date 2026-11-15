@@ -6925,12 +6925,9 @@ impl App {
             return;
         };
         let changed = pass.changed();
-        let cleared: Vec<String> = transcript
-            .background_tasks
-            .iter()
-            .filter(|task| transcript.unconfirmed_tasks.contains(&task.tool.call_id))
-            .map(|task| task.tool.call_id.clone())
-            .collect();
+        // Every id the read marks unconfirmed — a task's call id or a
+        // child-only run's durable key — is a row the click may clear.
+        let cleared: Vec<String> = transcript.unconfirmed_tasks.iter().cloned().collect();
         // The click owes the card a refresh whenever its own verdict moved the
         // read — not only when a row was cleared or retired (spec #588, review
         // PR #595): a verdict that reports a carried child RUNNING resolves the
