@@ -745,6 +745,15 @@ impl SessionTranscript {
     /// or a session with nothing running) decides exactly as before: idle with
     /// no live run is complete.
     pub fn settle(&self, anchor: Option<&TurnAnchor>) -> TurnSettle {
+        self.settle_with(anchor, true)
+    }
+
+    /// [`Self::settle`] with the attachment's ability to retire a child run:
+    /// only a client that can actually read child evidence (or is otherwise a
+    /// live-runs client) keeps a terminal child-id run owing the Turn. A
+    /// client with no such surface (OpenCode V1) lets the completed run settle,
+    /// exactly as before the child-id clause existed.
+    pub fn settle_with(&self, anchor: Option<&TurnAnchor>, retires_runs: bool) -> TurnSettle {
         if !self.wakes_answered() {
             return TurnSettle::Running;
         }
@@ -770,8 +779,12 @@ impl SessionTranscript {
         // A CLIENT-TERMINAL run is not the true end either: its own status is
         // not the durable ending. The child evidence read (or a Cleanup) still
         // owes the entry, so a run that names a child keeps the Turn waiting
-        // even after the client reports Failed/Cancelled. A terminal run with no
-        // child id has no read left and cannot block.
+        // even after the client reports Failed/Cancelled. This applies only
+        // when the attachment can retire the run (`retires_runs`): a client
+        // with no child-evidence read and no live-run surface (OpenCode V1)
+        // lets the terminal run settle as before, rather than waiting forever
+        // on an ending no surface can produce. A terminal run with no child id
+        // has no read left and cannot block.
         //
         // A live LAUNCH does not exempt it: a Codex `spawnAgent` call stays
         // `Running` while its child runs (the adapter states the targets'
@@ -782,7 +795,7 @@ impl SessionTranscript {
         if self
             .runs
             .iter()
-            .any(|run| run.is_live() || run.child_id.is_some())
+            .any(|run| run.is_live() || (retires_runs && run.child_id.is_some()))
         {
             return TurnSettle::Waiting;
         }

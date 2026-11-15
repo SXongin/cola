@@ -1106,7 +1106,7 @@ impl Turn {
             let anchor = transcript
                 .anchor_of_user(&self.cola_message_id)
                 .or_else(|| captured_anchor.clone());
-            transcript.settle(anchor.as_ref())
+            transcript.settle_with(anchor.as_ref(), handles.backend.reports_live_runs())
         });
         // The ending the drain already decided outranks a later re-decision:
         // its two graces (#603) are loop-only endings the settle table cannot
@@ -2003,7 +2003,13 @@ impl Turn {
             // evidence the session is not live, so it can never decide the
             // Unreceived ending — see `settle_or_yield`.
             Some(Ok(_)) => DrainRead {
-                state: self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Idle),
+                state: self.settle_or_yield(
+                    transcript,
+                    anchor.as_ref(),
+                    observed,
+                    IdleRead::Idle,
+                    handles.backend.reports_live_runs(),
+                ),
                 live: false,
                 settled_readable: true,
                 contact: true,
@@ -2011,7 +2017,13 @@ impl Turn {
             Some(Err(e)) => {
                 tracing::warn!("turn drain session status: {}", e);
                 DrainRead {
-                    state: self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable),
+                    state: self.settle_or_yield(
+                        transcript,
+                        anchor.as_ref(),
+                        observed,
+                        IdleRead::Unreadable,
+                        handles.backend.reports_live_runs(),
+                    ),
                     live: false,
                     settled_readable: false,
                     contact: false,
@@ -2019,7 +2031,13 @@ impl Turn {
             }
             // The bounded status call timed out: same rule as a failed read.
             None => DrainRead {
-                state: self.settle_or_yield(transcript, anchor.as_ref(), observed, IdleRead::Unreadable),
+                state: self.settle_or_yield(
+                    transcript,
+                    anchor.as_ref(),
+                    observed,
+                    IdleRead::Unreadable,
+                    handles.backend.reports_live_runs(),
+                ),
                 live: false,
                 settled_readable: false,
                 contact: false,
@@ -2051,6 +2069,7 @@ impl Turn {
         anchor: Option<&TurnAnchor>,
         observed: bool,
         read: IdleRead,
+        retires_runs: bool,
     ) -> DrainState {
         if anchor.is_none() && read == IdleRead::Unreadable {
             return DrainState::Running;
@@ -2061,7 +2080,7 @@ impl Turn {
                 return DrainState::Running;
             }
         }
-        Self::drain_ending(transcript.settle(anchor))
+        Self::drain_ending(transcript.settle_with(anchor, retires_runs))
     }
 
     /// The [`DrainState`] one settle decision gives the drain — the ONE
@@ -3390,8 +3409,11 @@ impl Turn {
                     // wait is the exception: the true end is content, not
                     // progress, and falls through to settle below.
                     if card.acc.awaits_typed_answer()
-                        && Disposition::of_quiet_settle(transcript.settle(card.acc.turn_anchor()), stopped)
-                            .is_none()
+                        && Disposition::of_quiet_settle(
+                            transcript.settle_with(card.acc.turn_anchor(), backend.reports_live_runs()),
+                            stopped,
+                        )
+                        .is_none()
                     {
                         return YieldedUpdate::Unchanged;
                     }
@@ -3443,7 +3465,10 @@ impl Turn {
             // stop dominates ✅. A Waiting card always carries an anchor (the
             // yield is only decided from one), so the anchorless Unreceived
             // decision cannot arise here; a Running read keeps observing.
-            let settled = Disposition::of_quiet_settle(transcript.settle(anchor.as_ref()), stopped);
+            let settled = Disposition::of_quiet_settle(
+                transcript.settle_with(anchor.as_ref(), backend.reports_live_runs()),
+                stopped,
+            );
             // The typed-answer check again, now under the write lock the write
             // below shares: a question that surfaced while this pass spent its
             // reads brings its form onto the card, and this read must neither
