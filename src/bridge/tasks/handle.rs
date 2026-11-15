@@ -350,13 +350,16 @@ impl TasksHandle {
     /// cleared run (ADR-0080): durable the moment the click derives it — outside
     /// the refresh's accepted-write gate, because the fact is about the run, not
     /// the card that will show its 🧹 entry. A cleaned run's later Wake is its
-    /// own ending (#590), so this never claims the run ended.
+    /// own ending (#590), so this never claims the run ended. `label` is the
+    /// derived `TaskRetirement`'s own label, which a child-only run has even
+    /// when the read no longer carries its launch input.
     pub(crate) fn record_cleanup_ending(
         &self,
         session_id: &str,
         task: &BackgroundTask,
         finished_at: i64,
         input: Option<&serde_json::Value>,
+        label: Option<&str>,
     ) -> bool {
         self.record_ending(
             session_id,
@@ -366,7 +369,7 @@ impl TasksHandle {
                 state: TaskEndingState::Owed,
                 finished_at: Some(finished_at),
                 evidence: None,
-                identity: identity_of_task(task, input, None),
+                identity: identity_of_task(task, input, label),
             },
         )
     }

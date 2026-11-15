@@ -6963,6 +6963,17 @@ impl App {
             .iter()
             .filter(|retirement| matches!(retirement.ending, TaskRetirementEnding::Cleaned))
         {
+            // Record the fact BEFORE the best-effort release: a stalled or
+            // cancelled release must not lose the Cleanup ending (ADR-0080:
+            // recorded when derived).
+            let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
+            handles.backend.tasks().record_cleanup_ending(
+                &session_id,
+                &retirement.task,
+                now_ms,
+                input,
+                retirement.label.as_deref(),
+            );
             // The cleaned run/task no longer needs its child subscription: a
             // Codex child adopted for liveness is released at the retirement.
             if let Some(child) = retirement.task.child_id.as_deref()
@@ -6970,11 +6981,6 @@ impl App {
             {
                 tracing::debug!("cleanup: releasing child session {child} failed: {error}; best-effort");
             }
-            let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
-            handles
-                .backend
-                .tasks()
-                .record_cleanup_ending(&session_id, &retirement.task, now_ms, input);
         }
         let stopped = handles.waits.is_stopped(&session_id).await;
         let update = crate::bridge::turn::Turn::refresh_yielded_ledger(

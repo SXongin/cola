@@ -2633,7 +2633,7 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
     ])
     .with_executions(vec![execution(2_500)]);
     assert_eq!(waiting.runs.len(), 1, "one child is one run");
-    let (_dir, app, backend, platform) = scripted_app_prepared(
+    let (dir, app, backend, platform) = scripted_app_prepared(
         vec![waiting],
         Some(SessionStatus::Idle),
         |_| {},
@@ -2667,30 +2667,47 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
         card_text(&marked).contains("清理待确认任务"),
         "the waiting card offers the cleanup exit: {marked}"
     );
+    // The release is best-effort and may fail, and the card write is refused:
+    // the Cleanup ending must still be recorded, owed, before either await.
+    backend.fail_release_count.store(1, Ordering::SeqCst);
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
 
     let ack = app
         .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
         .await
         .expect("the cleanup click acks");
     assert!(ack.card.is_none(), "the ack keeps the card for the pipeline");
-    wait_for_card_update(&platform, "the cleaned run", CardUpdates::Latest, |card| {
-        card_header(card).contains("✅")
-            && card_text(card).contains("🧹 subagent 已清理：review the diff（人工）")
-    })
-    .await;
 
-    let settled = platform.updated_cards().await.last().cloned().unwrap();
-    let text = card_text(&settled);
-    assert!(
-        !text.contains("后台任务（") && !text.contains("状态待确认"),
-        "the child-only run's row left the live ledger: {settled}"
-    );
+    // The pipeline records the ending at derivation even though the refresh's
+    // PATCH fails; poll the durable record rather than the card.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let ending = loop {
+        let persisted = ChainRecords::load(
+            crate::state::StateLayout::new(dir.path().join("sessions.json"), None).chain_records(),
+        );
+        if let Some(ending) = persisted.endings("ses_test").iter().find_map(|record| {
+            record.run.names("thread_child").then(|| {
+                record
+                    .endings
+                    .iter()
+                    .find(|ending| ending.class == TaskEndingClass::Cleanup)
+            })?
+        }) {
+            break ending.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cleanup ending was recorded at derivation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(ending.state, crate::bridge::chain::TaskEndingState::Owed);
     assert_eq!(
-        Turn::card_state(&app.cards_handle(), "ses_test").await,
-        Some(CardState::Done),
-        "clearing the last run settles the wait"
+        ending.identity.label.as_deref(),
+        Some("review the diff"),
+        "the durable cleanup ending keeps the child-only run's label"
     );
-    assert!(text.contains("🧹 subagent 已清理：review the diff（人工）"));
+    assert_eq!(ending.identity.child_id.as_deref(), Some("thread_child"));
     assert!(
         backend
             .release_calls
