@@ -823,6 +823,7 @@ async fn a_compaction_renders_once_and_survives_a_restart() {
         WORK,
         None,
         None,
+        flow.backend.capabilities(),
     )
     .await;
     Turn::render_and_flush(

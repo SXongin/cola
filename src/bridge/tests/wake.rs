@@ -4120,9 +4120,15 @@ async fn a_wake_does_not_replace_a_done_card_that_owes_a_continuation() {
         variant: None,
     };
     assert!(
-        Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts())
-            .await
-            .is_none(),
+        Turn::arm_wake_continuation(
+            &cards,
+            "ses_test",
+            &anchor,
+            facts(),
+            crate::backend::AgentCapabilities::full()
+        )
+        .await
+        .is_none(),
         "a Wake must not replace a card that still owes its queued continuation"
     );
     // The card, its queue and its reply target are untouched.
@@ -4135,9 +4141,15 @@ async fn a_wake_does_not_replace_a_done_card_that_owes_a_continuation() {
     Turn::flush_card(&cards, "ses_test").await;
     assert!(!Turn::has_pending_split(&cards, "ses_test").await);
 
-    let armed = Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts())
-        .await
-        .expect("the Wake arms once the owed continuation is served");
+    let armed = Turn::arm_wake_continuation(
+        &cards,
+        "ses_test",
+        &anchor,
+        facts(),
+        crate::backend::AgentCapabilities::full(),
+    )
+    .await
+    .expect("the Wake arms once the owed continuation is served");
     assert!(
         card_text(&armed).contains(WAKE_LEAD),
         "the Fresh continuation opens with the 承接 line: {armed}"
@@ -4145,6 +4157,54 @@ async fn a_wake_does_not_replace_a_done_card_that_owes_a_continuation() {
     assert!(
         Turn::card_message_id(&cards, "ses_test").await.is_none(),
         "the Fresh arm replaced the served card with its un-sent continuation"
+    );
+}
+
+/// A Wake's initial send is built before any render pass, so the Fresh arm must
+/// seed the attachment's declaration itself (ADR-0106): a client with no plan,
+/// compaction or usage posts a card with none of those surfaces, and the stored
+/// accumulator carries the declaration the later renders obey.
+#[tokio::test]
+async fn the_wake_initial_send_carries_the_attachments_capability_declaration() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let cards = app.cards_handle();
+    let anchor = turn_anchor(3_000);
+    let facts = ContinuationFacts {
+        reply_to: Some("msg_user"),
+        chat_id: "chat_1",
+        subtitle: "test",
+        directory: "/work",
+        variant: None,
+    };
+    let capabilities = crate::backend::AgentCapabilities {
+        plan: crate::backend::PlanMode::None,
+        compaction: false,
+        usage: crate::backend::UsageMode::None,
+        ..crate::backend::AgentCapabilities::full()
+    };
+    let armed = Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts, capabilities)
+        .await
+        .expect("a fresh session's Wake arms");
+    assert_eq!(
+        Turn::card_capabilities(&cards, "ses_test").await,
+        Some(capabilities),
+        "the initial card is built from the attachment's declaration, never the full-surface guess"
+    );
+    let text = card_text(&armed);
+    assert!(
+        !text.contains("📋"),
+        "no plan surface in the initial send: {text}"
+    );
+    assert!(
+        !text.contains("压缩"),
+        "no compaction surface in the initial send: {text}"
+    );
+    assert!(
+        !text.contains("📊"),
+        "no usage surface in the initial send: {text}"
     );
 }
 
@@ -4178,9 +4238,15 @@ async fn a_wake_does_not_replace_a_terminal_card_with_a_live_block() {
         variant: None,
     };
     assert!(
-        Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts)
-            .await
-            .is_none(),
+        Turn::arm_wake_continuation(
+            &cards,
+            "ses_test",
+            &anchor,
+            facts,
+            crate::backend::AgentCapabilities::full()
+        )
+        .await
+        .is_none(),
         "a Wake must not replace a terminal card that still carries a live block"
     );
     assert_eq!(
@@ -4251,9 +4317,15 @@ async fn a_wake_does_not_replace_a_bare_actionable_terminal_card() {
             variant: None,
         };
         assert!(
-            Turn::arm_wake_continuation(&cards, "ses_test", &anchor, facts)
-                .await
-                .is_none(),
+            Turn::arm_wake_continuation(
+                &cards,
+                "ses_test",
+                &anchor,
+                facts,
+                crate::backend::AgentCapabilities::full()
+            )
+            .await
+            .is_none(),
             "{state:?}: a Wake must not replace a card that offers recovery"
         );
         assert_eq!(

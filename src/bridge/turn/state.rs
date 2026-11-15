@@ -2507,10 +2507,12 @@ impl StreamAccumulator {
 
     /// The attachment's capability declaration (ADR-0106). Invariant: every
     /// production card is seeded before any render — `Turn::start`, the Wake's
-    /// projected card and each render loop install the backend's value, and
-    /// [`Self::new`] seeds the neutral full surface for fixtures. A `None` here
-    /// is a programming miss (a `Default` accumulator), so it is logged once
-    /// rather than silently rendering every surface.
+    /// projected **and Fresh** arms, and every external renderer's prepared
+    /// accumulator install the backend's value before their first card is
+    /// built; the render loops re-read it each pass. [`Self::new`] seeds the
+    /// neutral full surface for fixtures. A `None` here is a programming miss
+    /// (a `Default` accumulator), so it is logged once rather than silently
+    /// rendering every surface.
     pub(super) fn capabilities(&self) -> AgentCapabilities {
         match self.capabilities {
             Some(capabilities) => capabilities,
