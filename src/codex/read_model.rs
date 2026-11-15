@@ -2923,7 +2923,7 @@ fn collab_status(
 fn agent_status_is_terminal(status: &str) -> bool {
     matches!(
         status,
-        "completed" | "errored" | "failed" | "interrupted" | "cancelled" | "closed"
+        "completed" | "errored" | "failed" | "interrupted" | "cancelled" | "closed" | "shutdown"
     )
 }
 
@@ -4118,6 +4118,46 @@ mod tests {
             let call = projected_tool(&projection, "item-collab-status");
             assert_eq!(call.status, expected, "status {status}");
         }
+    }
+
+    /// A `shutdown` target is terminal: a spawnAgent whose only target was shut
+    /// down completes instead of leaving the card with a persistent ⏳.
+    #[test]
+    fn a_shutdown_target_ends_the_spawn_agent_call() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-collab-shutdown",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": "thread-1",
+                        "receiverThreadIds": ["thread-child"],
+                        "prompt": null,
+                        "model": null,
+                        "reasoningEffort": null,
+                        "agentsStates": {"thread-child": {"status": "shutdown"}}
+                    }
+                }
+            })],
+        );
+        let call = projected_tool(&projection, "item-collab-shutdown");
+        assert_eq!(
+            call.status,
+            ToolStatus::Completed,
+            "the shutdown child is terminal, so the launch completes"
+        );
+        let ToolDetail::Delegation { runs, .. } = &call.detail else {
+            panic!("a collaboration call is a delegation");
+        };
+        assert_eq!(runs[0].status, Some(RunStatus::Cancelled));
     }
 
     /// The row order is the wire's receiver order first, then any extra state,
