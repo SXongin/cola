@@ -252,14 +252,11 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         children: &[String],
     ) -> Result<TaskRuntime>;
 
-    /// Whether this generation publishes a Background Task surface at all
-    /// (V2's live shells, subagent child sessions and shell records). V1
-    /// carries none, so it keeps the default `false`; the adapter forwards this
-    /// to the neutral [`crate::backend::Backend::background_tasks_supported`],
-    /// which the Bridge reads to render no ledger and spend no runtime read.
-    fn background_tasks_supported(&self) -> bool {
-        false
-    }
+    /// This generation's explicit capability declaration (ADR-0106, spec
+    /// #1057 P5). The generation is the source: each strategy names every
+    /// axis with the wire fact that makes it so. The adapter forwards it to
+    /// [`crate::backend::Backend::capabilities`].
+    fn capabilities(&self) -> crate::backend::AgentCapabilities;
 
     /// One shell's captured output window (spec #588, #592): V2 reads
     /// `GET /api/shell/{id}/output` twice — once with a cursor past the end to

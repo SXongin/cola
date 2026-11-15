@@ -100,6 +100,43 @@ pub(crate) struct V1Strategy;
 
 #[async_trait]
 impl GenerationStrategy for V1Strategy {
+    /// V1's explicit capability declaration (ADR-0106). Every axis names the
+    /// wire fact:
+    ///
+    /// - `background_runs = false`: V1 publishes no live shell/session runtime
+    ///   (`task_runtime` answers empty without a request) and no shell records.
+    /// - `child_agents = ChildSessions`: its `task`/`subagent` tool call runs
+    ///   the child as its own session, whose transcript the panel can read.
+    /// - `child_evidence = false`: V1 has no child-evidence read (`Unfinished`
+    ///   without a request), so a run could outlive its exit — `reports_live_runs`
+    ///   stays false and the ledger never opens.
+    /// - `plan = TodoTool`: `todowrite` replaces the card-tail list.
+    /// - `compaction = true`: a `compaction` part plus its paired summary
+    ///   message (ADR-0082).
+    /// - `usage = PerTurn`: each assistant message carries its own token
+    ///   counters (`tokens.total`).
+    /// - `questions = Session`: `GET /question` serves session-backed questions
+    ///   only; V1 has no elicitation-form/Location Form surface.
+    /// - `modes = true`: `GET /agent` serves the agent picker, and a per-prompt
+    ///   `agent` rides each prompt.
+    /// - `diffs = false`: V1 has no `session.diff` endpoint.
+    /// - `mcp = false`: V1 publishes a status read but no Location Form
+    ///   surface, so the full `/mcp` pair is not applicable (ADR-0103).
+    fn capabilities(&self) -> crate::backend::AgentCapabilities {
+        crate::backend::AgentCapabilities {
+            background_runs: false,
+            child_agents: crate::backend::ChildAgentMode::ChildSessions,
+            child_evidence: false,
+            plan: crate::backend::PlanMode::TodoTool,
+            compaction: true,
+            usage: crate::backend::UsageMode::PerTurn,
+            questions: crate::backend::QuestionMode::Session,
+            modes: true,
+            diffs: false,
+            mcp: false,
+        }
+    }
+
     /// List sessions across the shared store, most recently active first.
     ///
     /// Uses the cross-project list `GET /experimental/session`

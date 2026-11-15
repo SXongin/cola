@@ -324,6 +324,38 @@ async fn write_failure(
 
 #[async_trait]
 impl GenerationStrategy for V2Strategy {
+    /// V2's explicit capability declaration (ADR-0106). Every axis names the
+    /// wire fact:
+    ///
+    /// - `background_runs = true`: `GET /api/shell`, `GET /api/session/active`
+    ///   and the shell records the ledger renders.
+    /// - `child_agents = ChildSessions`: a `task`/`subagent` child is its own
+    ///   session with a readable transcript.
+    /// - `child_evidence = true`: the one-page newest-assistant read answers a
+    ///   child's terminal item (or a 404 as `Gone`).
+    /// - `plan = TodoTool`: the `todowrite` tool call.
+    /// - `compaction = true`: compaction parts on the transcript (ADR-0082).
+    /// - `usage = PerTurn`: each assistant message's `tokens` counters.
+    /// - `questions = SessionAndLocation`: `GET /api/form` serves session-backed
+    ///   forms **and** directory-owned Location Forms (ADR-0103).
+    /// - `modes = true`: `GET /api/agent` plus the durable session switch.
+    /// - `diffs = true`: `GET /api/session/{id}/diff`.
+    /// - `mcp = true`: `GET /api/mcp` statuses plus the Location Form surface.
+    fn capabilities(&self) -> crate::backend::AgentCapabilities {
+        crate::backend::AgentCapabilities {
+            background_runs: true,
+            child_agents: crate::backend::ChildAgentMode::ChildSessions,
+            child_evidence: true,
+            plan: crate::backend::PlanMode::TodoTool,
+            compaction: true,
+            usage: crate::backend::UsageMode::PerTurn,
+            questions: crate::backend::QuestionMode::SessionAndLocation,
+            modes: true,
+            diffs: true,
+            mcp: true,
+        }
+    }
+
     /// List sessions across the shared store, most recently active first.
     ///
     /// `GET /api/session` returns `{data: Session.Info[], cursor: {previous,
@@ -783,13 +815,6 @@ impl GenerationStrategy for V2Strategy {
             }
         }
         Ok(runtime)
-    }
-
-    /// V2 publishes the live shell/subagent runtime, the shell records and the
-    /// child sessions the Background Task Ledger renders, so its task surface
-    /// is present.
-    fn background_tasks_supported(&self) -> bool {
-        true
     }
 
     /// The evidence one child session's newest assistant message carries (#591,

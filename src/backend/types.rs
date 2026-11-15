@@ -880,6 +880,185 @@ impl PermissionRequest {
     }
 }
 
+/// How one Agent Client can show a **child agent** (ADR-0106's `child_agents`
+/// axis, spec #1057 P5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildAgentMode {
+    /// The client launches no child agents at all.
+    None,
+    /// The client runs each child as its own child session, whose transcript
+    /// can be read for liveness (OpenCode's `task`/`subagent`).
+    ChildSessions,
+    /// The client only reports a child's lifecycle activity (Codex's
+    /// `subAgentActivity`); it has no readable child session of its own.
+    ActivityReports,
+}
+
+/// Where a client states a **plan** (ADR-0106's `plan` axis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanMode {
+    /// The client has no plan surface.
+    None,
+    /// A `todowrite`-style tool call replaces a card-tail list (OpenCode V1/V2).
+    TodoTool,
+    /// A turn-scoped plan notification replaces the card-tail list (Codex's
+    /// `turn/plan/updated`).
+    TurnPlan,
+}
+
+/// How a client reports **token usage** for the card footer (ADR-0106's
+/// `usage` axis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageMode {
+    /// The client reports no token usage.
+    None,
+    /// Usage is stated for the turn/message that just ran (each assistant
+    /// message, or a turn-scoped usage notification).
+    PerTurn,
+    /// Usage is a running cumulative total the client keeps across turns.
+    Cumulative,
+}
+
+/// Which **questions/forms** a client can surface (ADR-0106's `questions`
+/// axis). The location arm is the directory-owned Location Form (ADR-0103).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionMode {
+    /// The client has no question/form surface.
+    None,
+    /// Session-backed questions only.
+    Session,
+    /// Session-backed questions **and** directory-owned Location Forms.
+    SessionAndLocation,
+}
+
+/// One Agent Client's **capability declaration** (ADR-0106, spec #1057 P5).
+///
+/// Every optional surface asks this struct instead of guessing from an empty
+/// read or a failed request. It is a property of the **attachment**: a reattach
+/// may change it, so a value read from a stale connection must not render a new
+/// one. The fields are declared explicitly per client — there is deliberately
+/// no `Default` impl, so a client cannot leave an axis at an accidental value.
+///
+/// The permission always-scope is **not** an axis: it rides each
+/// [`PermissionRequest::always_supported`](crate::backend::types::PermissionRequest)
+/// (ADR-0018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentCapabilities {
+    /// The client publishes Background Tasks (live shells/child sessions).
+    pub background_runs: bool,
+    /// How the client shows child agents.
+    pub child_agents: ChildAgentMode,
+    /// Whether a child's terminal item can be read (run retirement evidence).
+    pub child_evidence: bool,
+    /// Where the client states a plan.
+    pub plan: PlanMode,
+    /// Whether the client emits Compaction facts.
+    pub compaction: bool,
+    /// How the client reports token usage.
+    pub usage: UsageMode,
+    /// Which question surfaces the client has.
+    pub questions: QuestionMode,
+    /// Whether the client has an agent picker/selection surface (`/agent`).
+    pub modes: bool,
+    /// Whether the client has a session/turn diff read (the card's change
+    /// index and its button).
+    pub diffs: bool,
+    /// Whether the client publishes MCP server statuses (the `/mcp` card).
+    pub mcp: bool,
+}
+
+impl AgentCapabilities {
+    /// The live-run ledger lists runs, not only background work: a turn-scoped
+    /// child is a run too. Codex and OpenCode V1 are this case.
+    pub fn reports_live_runs(&self) -> bool {
+        self.background_runs || self.child_evidence
+    }
+
+    /// Every surface present. This is the **neutral unknown** a card holds
+    /// before an attachment is known (and the fixture default in tests); a
+    /// real client must answer with its own explicit struct, never this value
+    /// by omission.
+    pub const fn full() -> Self {
+        Self {
+            background_runs: true,
+            child_agents: ChildAgentMode::ChildSessions,
+            child_evidence: true,
+            plan: PlanMode::TodoTool,
+            compaction: true,
+            usage: UsageMode::PerTurn,
+            questions: QuestionMode::SessionAndLocation,
+            modes: true,
+            diffs: true,
+            mcp: true,
+        }
+    }
+
+    /// Every surface absent.
+    pub const fn none() -> Self {
+        Self {
+            background_runs: false,
+            child_agents: ChildAgentMode::None,
+            child_evidence: false,
+            plan: PlanMode::None,
+            compaction: false,
+            usage: UsageMode::None,
+            questions: QuestionMode::None,
+            modes: false,
+            diffs: false,
+            mcp: false,
+        }
+    }
+
+    /// The optional surfaces this declaration omits, in the ADR-0106 table's
+    /// order. Used by the one attach-time log line and by the per-client
+    /// tests.
+    pub fn absent_surfaces(&self) -> Vec<&'static str> {
+        let mut absent = Vec::new();
+        if !self.reports_live_runs() {
+            absent.push("live-run ledger");
+        }
+        if self.child_agents == ChildAgentMode::None {
+            absent.push("panel liveness");
+        }
+        if self.plan == PlanMode::None {
+            absent.push("plan");
+        }
+        if !self.compaction {
+            absent.push("compaction");
+        }
+        if self.usage == UsageMode::None {
+            absent.push("usage");
+        }
+        if self.questions == QuestionMode::None {
+            absent.push("questions");
+        }
+        if !self.modes {
+            absent.push("agent picker");
+        }
+        if !self.diffs {
+            absent.push("turn diff");
+        }
+        if !self.mcp {
+            absent.push("mcp");
+        }
+        absent
+    }
+
+    /// Record the absent surfaces **once at attach** (ADR-0106 decision 2):
+    /// one line naming every surface this client omits, never a warning per
+    /// render. A full-capability client logs nothing.
+    pub fn log_absent(self, client: &str) {
+        let absent = self.absent_surfaces();
+        if !absent.is_empty() {
+            tracing::info!(
+                client,
+                absent = ?absent,
+                "agent capabilities: surfaces this attachment omits"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

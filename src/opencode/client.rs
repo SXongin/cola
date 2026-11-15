@@ -257,10 +257,12 @@ impl OpenCodeBackend {
             Some(server) => {
                 self.transport
                     .repoint(&server.url, &server.password, Some(&server.username));
+                let strategy = server.generation.strategy();
+                let capabilities = strategy.capabilities();
                 *self
                     .strategy
                     .write()
-                    .expect("the strategy lock is never poisoned") = server.generation.strategy();
+                    .expect("the strategy lock is never poisoned") = strategy;
                 *self
                     .attached_pid
                     .write()
@@ -270,6 +272,10 @@ impl OpenCodeBackend {
                     server.url,
                     server.generation.as_str()
                 );
+                // The one attach-time capability line (ADR-0106 decision 2):
+                // absent surfaces are declared here, never warned about on
+                // every render.
+                capabilities.log_absent(server.generation.as_str());
             }
             None => {
                 self.transport.repoint("", "", self.username.as_deref());
@@ -599,11 +605,11 @@ impl OpenCodeBackend {
             .await
     }
 
-    /// Whether the attached generation publishes a Background Task surface
-    /// (V2 does; V1 carries none). See
-    /// [`crate::backend::Backend::background_tasks_supported`].
-    pub fn background_tasks_supported(&self) -> bool {
-        self.strategy().background_tasks_supported()
+    /// The attached generation's explicit capability declaration (ADR-0106,
+    /// spec #1057 P5). Read per attachment: a generation switch swaps the
+    /// strategy and with it every axis.
+    pub fn capabilities(&self) -> crate::backend::AgentCapabilities {
+        self.strategy().capabilities()
     }
 
     /// One shell's captured output window (spec #588, #592). See
