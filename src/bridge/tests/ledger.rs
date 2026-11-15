@@ -2609,10 +2609,10 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
                 name: "codex/sub_agent_activity".into(),
                 call_id: "call_activity".into(),
             },
-            status: ToolStatus::Running,
+            status: ToolStatus::Error,
             started_at: Some(2_100),
             input: Some(serde_json::json!({
-                "kind": "started",
+                "kind": "failed",
                 "agentThreadId": "thread_child",
                 "agentPath": "/root/worker"
             })),

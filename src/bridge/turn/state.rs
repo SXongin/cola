@@ -4689,10 +4689,18 @@ impl StreamAccumulator {
             });
         }
         // A child-only run has no Background Task to name it (Codex): its own
-        // row follows the Background Tasks, in run order. The "already
-        // represented" test is the SAME one rule the row join above uses, so
-        // the two cannot disagree about which runs still owe a row.
-        for run in transcript.live_runs() {
+        // row follows the Background Tasks, in run order. A client-terminal run
+        // that still names a child owes an ending (its evidence read or a
+        // Cleanup), so it keeps its row — marked ⚠️ while unconfirmed — until
+        // that ending is derived; only a run with no child left to read drops
+        // out. The "already represented" test is the SAME one rule the row join
+        // above uses, so the two cannot disagree about which runs still owe a
+        // row.
+        for run in transcript
+            .runs
+            .iter()
+            .filter(|run| run.is_live() || run.child_id.is_some())
+        {
             if transcript
                 .background_tasks
                 .iter()
