@@ -131,6 +131,7 @@ fn resolve_or_create<'a>(
         started_at: call.started_at,
         status: receiver_status.unwrap_or_else(|| status_of(call)),
         activity: None,
+        observed_at: None,
         launched_by: Vec::new(),
         addressed_by: Vec::new(),
         reported_by: Vec::new(),
@@ -163,6 +164,19 @@ fn push_relation(relations: &mut Vec<ToolCallRef>, call: &ToolCall) {
 /// in transcript order; the call id is never the dedupe key, because the wire
 /// reuses an activity item's id between its start and its completion.
 fn apply_report(run: &mut AgentRun, call: &ToolCall) {
+    // A replayed observation older than the newest one is history: the relation
+    // is already recorded by the caller, but it must never move the status
+    // back — a completed child cannot read live again because an old
+    // `started` arrived late (the wire reuses an activity item's id, and a
+    // replay can re-deliver it).
+    if let (Some(seen), Some(reported_at)) = (run.observed_at, call.started_at)
+        && reported_at < seen
+    {
+        return;
+    }
+    if call.started_at.is_some() {
+        run.observed_at = call.started_at;
+    }
     let status = status_of(call);
     run.status = status;
     if status.is_terminal() {
@@ -552,6 +566,7 @@ mod tests {
             started_at: Some(1),
             status: RunStatus::Running,
             activity: None,
+            observed_at: None,
             launched_by: Vec::new(),
             addressed_by: Vec::new(),
             reported_by: Vec::new(),
@@ -654,6 +669,28 @@ mod tests {
         unknown.status = ToolStatus::Running;
         let read = transcript(vec![unknown]);
         assert_eq!(read.runs[0].status, RunStatus::Running);
+    }
+
+    /// A replayed older observation must not revive a run a later report
+    /// already ended: the relation stays recorded, the status does not move
+    /// back.
+    #[test]
+    fn an_older_report_cannot_revive_a_terminal_run() {
+        let mut completed = report("call_done", "thread_1", "completed");
+        completed.started_at = Some(3);
+        let mut replayed = report("call_started_old", "thread_1", "started");
+        replayed.started_at = Some(2);
+        let read = transcript(vec![completed, replayed]);
+        assert_eq!(read.runs[0].status, RunStatus::Completed);
+        assert!(
+            read.runs[0].activity.is_none(),
+            "a terminal run keeps no live activity"
+        );
+        assert_eq!(
+            read.runs[0].reported_by.len(),
+            2,
+            "the older observation is still a relation on the run"
+        );
     }
 
     /// The durable key is a property of the RUN, not of where a read window
