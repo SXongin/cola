@@ -1604,7 +1604,12 @@ impl Turn {
             // apply to it.
             if tick.contact
                 && tick.state == Some(DrainState::Waiting)
-                && !Turn::has_live_orphan_tools(&handles.cards, &self.session_id).await
+                && !Turn::waiting_panels_are_stuck(
+                    &handles.cards,
+                    &self.session_id,
+                    handles.backend.reports_live_runs(),
+                )
+                .await
             {
                 return Some(DrainState::Waiting);
             }
@@ -4082,6 +4087,23 @@ impl Turn {
             .await
             .get(session_id)
             .is_some_and(|c| c.acc.has_live_orphan_tool())
+    }
+
+    /// Whether a Waiting decision's live panels must still take the stuck-panel
+    /// grace. A client that can retire a run (`reports_live_runs`: background
+    /// runs or child evidence) yields on a live launch panel — the run owns the
+    /// exit. A client that cannot (OpenCode V1) has no way to end that run, so
+    /// a launch panel there is the Turn's own orphaned work and keeps #386's
+    /// grace; any non-launch live panel is orphaned work on every client.
+    pub(crate) async fn waiting_panels_are_stuck(
+        cards: &CardsHandle,
+        session_id: &str,
+        retires_runs: bool,
+    ) -> bool {
+        if !Self::has_live_tools(cards, session_id).await {
+            return false;
+        }
+        !retires_runs || Self::has_live_orphan_tools(cards, session_id).await
     }
 
     /// Refresh the live card's work context at turn end (ADR-0019): re-read the
