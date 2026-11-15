@@ -1596,6 +1596,18 @@ impl Turn {
             {
                 Turn::flush_card(&handles.cards, &self.session_id).await;
             }
+            // A Waiting decision yields even while a panel is live: a run can
+            // be live with its launch panel still `⏳` (a Codex spawn names a
+            // child and settles only when the parent turn does), and the
+            // ledger/liveness tail is what the yielded card shows. Waiting is
+            // not a terminal stamp, so the stuck-panel grace below does not
+            // apply to it.
+            if tick.contact
+                && tick.state == Some(DrainState::Waiting)
+                && !Turn::has_live_orphan_tools(&handles.cards, &self.session_id).await
+            {
+                return Some(DrainState::Waiting);
+            }
             // The stuck-panel grace (#386): a readable, settled card still
             // carrying a live `⏳` panel must not be stamped Done over it — give
             // the panel the grace to settle, then end Error.
@@ -4058,6 +4070,18 @@ impl Turn {
             .await
             .get(session_id)
             .is_some_and(|c| c.acc.has_live_tool())
+    }
+
+    /// [`Self::has_live_tools`] for the panels that are NOT a child run's
+    /// launch: those are the turn's own orphaned work the stuck-panel grace
+    /// owns; a live launch panel yields with its run.
+    pub(crate) async fn has_live_orphan_tools(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|c| c.acc.has_live_orphan_tool())
     }
 
     /// Refresh the live card's work context at turn end (ADR-0019): re-read the

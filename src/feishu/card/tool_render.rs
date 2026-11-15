@@ -457,14 +457,29 @@ impl ToolPanel {
         self.liveness = liveness;
     }
 
+    /// Whether this panel is the launch of a child run (a `Delegation` with at
+    /// least one run). Such a panel is live while its child runs, but it is
+    /// not the Turn's own orphaned work: the run owns the wait, so the drain
+    /// must not grace it into `StuckPanel`.
+    pub(crate) fn runs_a_child(&self) -> bool {
+        matches!(
+            &self.call.detail,
+            ToolDetail::Delegation {
+                effect: DelegationEffect::Launch,
+                runs,
+            } if runs.iter().any(|run| !run.run_id.is_empty())
+        )
+    }
+
     /// The child Session a launch runs — the run's live identity as the
     /// adapter wrote it into the call's [`ToolDetail::Delegation`] (the launch
     /// relation replaces the old tool-name check, spec #1057's P4).
     ///
     /// `None` unless the call names EXACTLY one run: a launch with several
     /// receivers ranks no child above another, and picking `first()` would make
-    /// an arbitrary receiver the panel's liveness source. Such a call's children
-    /// are still read for the ledger, from its runs.
+    /// an arbitrary receiver the panel's liveness source. A multi-child
+    /// launch's liveness comes from `SessionTranscript::run_children()` (the
+    /// ledger/gather path) instead, and no single child exists to name here.
     pub(crate) fn child_session_id(&self) -> Option<&str> {
         let ToolDetail::Delegation {
             runs,
@@ -545,60 +560,99 @@ fn report_word(status: &ToolStatus) -> &str {
     }
 }
 
-/// The receipt's dedupe identity: a call id, plus the STATE for a report.
-/// Dedupe is never by call id alone (spec #1057) — the wire reuses an
+/// A receipt's dedupe identity: the call, plus the OBSERVED state for a
+/// report. Dedupe is never by call id alone (spec #1057) — the wire reuses an
 /// activity's item id between its start and completion, so a state move is a
 /// new observation and renders its own one-line receipt. An addressing call's
 /// verb does not move with its status, so it stays one line per call.
-pub(crate) fn receipt_key(call: &ToolCall) -> String {
-    match &call.detail {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ReceiptKey {
+    call_id: String,
+    state: ReceiptState,
+}
+
+/// The reported state a receipt's identity carries. Typed on purpose: an
+/// identity must never be a `Debug` rendering of a vendor string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReceiptState {
+    Live,
+    Completed,
+    Failed,
+    Unknown,
+    /// A status this build does not know, kept verbatim as its own state.
+    Other(String),
+}
+
+pub(crate) fn receipt_key(call: &ToolCall) -> ReceiptKey {
+    let state = match &call.detail {
         ToolDetail::Delegation {
             effect: DelegationEffect::Report,
             ..
-        } => format!("{}#{:?}", call.identity.call_id, call.status),
-        _ => call.identity.call_id.clone(),
+        } => match &call.status {
+            ToolStatus::Pending | ToolStatus::Running => ReceiptState::Live,
+            ToolStatus::Completed => ReceiptState::Completed,
+            ToolStatus::Error => ReceiptState::Failed,
+            ToolStatus::Unknown => ReceiptState::Unknown,
+            ToolStatus::Other(reason) => ReceiptState::Other(reason.clone()),
+        },
+        _ => ReceiptState::Live,
+    };
+    ReceiptKey {
+        call_id: call.identity.call_id.clone(),
+        state,
     }
 }
 
-/// The liveness line's token for one live call (ADR-0105/0107). It derives
-/// from `(kind, detail)` for every producer, so a Codex `commandExecution` and
-/// an OpenCode `shell`/`bash` child read the same word. The vendor name is only
-/// the OPAQUE fallback (an id whose kind/detail this build cannot map), trimmed
-/// of its adapter namespace so the line stays one word. #1063 moves this table
-/// into `vocab.rs`; the words it returns are already ADR-0107's tokens.
+/// The liveness line's token for one live call — ADR-0107's closed table,
+/// derived from `(kind, detail)` for every producer:
+///
+/// `Command` → `shell`, `Program` → `script`, an all-Add `FileEdits` →
+/// `write` (else `edit`), `Search`'s three scopes → `glob`/`grep`/`websearch`,
+/// `Fetch` + `None` → `fetch`, `Read` + `Read` → `read`, and a LAUNCHING
+/// `Delegation` → `subagent`.
+///
+/// An `Other` call with no detail reads the vendor name only for the three
+/// closed name-tokens (`plan`/`skill`/`ask`); every other shape this table
+/// does not cover keeps the **full** vendor name, namespace included — a
+/// vendor tool's identity is its name (ADR-0042/0107). #1063 moves the table
+/// into `vocab.rs`; no word here is new.
 pub(crate) fn call_token(call: &CallView) -> String {
-    match (call.kind, &call.detail) {
-        (ToolKind::Execute, _) => "shell".to_string(),
+    let token = match (call.kind, &call.detail) {
+        (ToolKind::Execute, ToolDetail::Command { .. }) => Some("shell"),
+        (ToolKind::Execute, ToolDetail::Program { .. }) => Some("script"),
         (ToolKind::Edit, ToolDetail::FileEdits(edits)) => {
             if !edits.is_empty() && edits.iter().all(|edit| edit.action == FileAction::Add) {
-                "write".to_string()
+                Some("write")
             } else {
-                "edit".to_string()
+                Some("edit")
             }
         }
-        (ToolKind::Edit, _) => "edit".to_string(),
-        (ToolKind::Search, ToolDetail::Search { scope, .. }) => match scope {
-            SearchScope::FileName => "glob".to_string(),
-            SearchScope::Content => "grep".to_string(),
-            SearchScope::Web => "websearch".to_string(),
+        (ToolKind::Search, ToolDetail::Search { scope, .. }) => Some(match scope {
+            SearchScope::FileName => "glob",
+            SearchScope::Content => "grep",
+            SearchScope::Web => "websearch",
+        }),
+        (ToolKind::Read, ToolDetail::Read { .. }) => Some("read"),
+        (ToolKind::Fetch, ToolDetail::None) => Some("fetch"),
+        (
+            ToolKind::Other,
+            ToolDetail::Delegation {
+                effect: DelegationEffect::Launch,
+                ..
+            },
+        ) => Some("subagent"),
+        // The closed name-only token set (ADR-0107's one exception).
+        (ToolKind::Other, ToolDetail::None) => match call.identity.name.as_str() {
+            "todowrite" => Some("plan"),
+            "skill" => Some("skill"),
+            "question" => Some("ask"),
+            _ => None,
         },
-        (ToolKind::Search, _) => "grep".to_string(),
-        (ToolKind::Read, _) => "read".to_string(),
-        (ToolKind::Fetch, _) => "fetch".to_string(),
-        (ToolKind::Think, _) => "think".to_string(),
-        (ToolKind::Delete, _) => "delete".to_string(),
-        (ToolKind::Move, _) => "move".to_string(),
-        (ToolKind::SwitchMode, _) => "mode".to_string(),
-        (ToolKind::Other, ToolDetail::Delegation { .. }) => "subagent".to_string(),
-        // The opaque fallback: the vendor's own id is all this build has.
-        (ToolKind::Other, _) => call
-            .identity
-            .name
-            .rsplit('/')
-            .next()
-            .unwrap_or(call.identity.name.as_str())
-            .to_string(),
-    }
+        _ => None,
+    };
+    token
+        .map(str::to_string)
+        .unwrap_or_else(|| call.identity.name.clone())
 }
 
 /// The **Execute** family's two shapes (ADR-0105, spec #1057's P2): a shell-like
@@ -6302,10 +6356,10 @@ mod tests {
         assert_eq!(timed.title_fragment(1_000_000), "推理中 10s");
     }
 
-    /// Review finding 15: the liveness token derives from `(kind, detail)` for
-    /// every producer, and the vendor name is only the opaque fallback.
+    /// ADR-0107's token table, row by row, and the full-vendor opaque
+    /// fallback (review finding 3).
     #[test]
-    fn the_liveness_token_derives_from_kind_and_detail() {
+    fn the_liveness_token_is_adr_0107s_table() {
         let view = |name: &str, kind: ToolKind, detail: ToolDetail| CallView {
             identity: ToolIdentity {
                 name: name.into(),
@@ -6322,6 +6376,12 @@ mod tests {
             exit: None,
             timeout: false,
         };
+        let program = || ToolDetail::Program {
+            source: "return 1".into(),
+            language: None,
+            calls: Vec::new(),
+            error: false,
+        };
         let edits = |action: FileAction| {
             ToolDetail::FileEdits(vec![FileEdit {
                 path: "a.rs".into(),
@@ -6335,12 +6395,26 @@ mod tests {
             matches: None,
             scope,
         };
+        let read = || ToolDetail::Read {
+            path: Some("a.rs".into()),
+            preview: None,
+            directory: false,
+        };
+        let delegation = |effect| ToolDetail::Delegation {
+            runs: Vec::new(),
+            effect,
+        };
 
         assert_eq!(call_token(&view("bash", ToolKind::Execute, command())), "shell");
         assert_eq!(
             call_token(&view("codex/command_execution", ToolKind::Execute, command())),
             "shell",
-            "one word for every Execute producer"
+            "one word for every Command producer"
+        );
+        assert_eq!(
+            call_token(&view("execute", ToolKind::Execute, program())),
+            "script",
+            "a Code Mode program is not a shell"
         );
         assert_eq!(
             call_token(&view("write", ToolKind::Edit, edits(FileAction::Add))),
@@ -6363,10 +6437,7 @@ mod tests {
             call_token(&view("websearch", ToolKind::Search, search(SearchScope::Web))),
             "websearch"
         );
-        assert_eq!(
-            call_token(&view("read", ToolKind::Read, ToolDetail::None)),
-            "read"
-        );
+        assert_eq!(call_token(&view("read", ToolKind::Read, read())), "read");
         assert_eq!(
             call_token(&view("webfetch", ToolKind::Fetch, ToolDetail::None)),
             "fetch"
@@ -6375,18 +6446,52 @@ mod tests {
             call_token(&view(
                 "collab",
                 ToolKind::Other,
-                ToolDetail::Delegation {
-                    runs: Vec::new(),
-                    effect: DelegationEffect::Launch
-                }
+                delegation(DelegationEffect::Launch)
             )),
             "subagent"
         );
         assert_eq!(
-            call_token(&view("codex/mystery_tool", ToolKind::Other, ToolDetail::Opaque)),
-            "mystery_tool",
-            "the opaque fallback is the vendor id, namespace trimmed"
+            call_token(&view(
+                "collab",
+                ToolKind::Other,
+                delegation(DelegationEffect::Address)
+            )),
+            "collab",
+            "only a LAUNCHING delegation is a subagent; an address is not a run token"
         );
+        assert_eq!(
+            call_token(&view("todowrite", ToolKind::Other, ToolDetail::None)),
+            "plan"
+        );
+        assert_eq!(
+            call_token(&view("skill", ToolKind::Other, ToolDetail::None)),
+            "skill"
+        );
+        assert_eq!(
+            call_token(&view("question", ToolKind::Other, ToolDetail::None)),
+            "ask"
+        );
+        assert_eq!(
+            call_token(&view("codex/mystery_tool", ToolKind::Other, ToolDetail::Opaque)),
+            "codex/mystery_tool",
+            "the opaque fallback is the FULL vendor name (ADR-0042/0107)"
+        );
+        assert_eq!(
+            call_token(&view("mcp_server/my_tool", ToolKind::Other, ToolDetail::None)),
+            "mcp_server/my_tool"
+        );
+        for kind in [
+            ToolKind::Think,
+            ToolKind::Delete,
+            ToolKind::Move,
+            ToolKind::SwitchMode,
+        ] {
+            assert_eq!(
+                call_token(&view("vendor/wat", kind, ToolDetail::Opaque)),
+                "vendor/wat",
+                "{kind:?} has no token in the table"
+            );
+        }
     }
 
     /// The child session id is the LAUNCH relation's, not a tool name's (spec

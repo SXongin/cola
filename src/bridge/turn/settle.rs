@@ -249,9 +249,18 @@ pub(super) async fn run(
             stuck_since = None;
             continue;
         };
+        // The single settle decision (ADR-0059, ADR-0062), through the one
+        // ending table. It is read BEFORE the live-panel grace: a Waiting
+        // decision legitimately carries a live panel when that panel is a
+        // child run's launch (the run owns the wait), while the turn's own
+        // orphaned work still takes the grace.
+        let disposition = Disposition::from(transcript.settle(anchor.as_ref()));
         // A `⏳` panel must not be stamped over: a crash-orphaned call gets the
-        // grace to settle, then ends Error rather than a false `✅`.
-        if Turn::has_live_tools(&flow.cards, session_id).await {
+        // grace to settle, then ends Error rather than a false `✅`. A
+        // Waiting decision whose only live panel is a launch yields instead.
+        if (disposition != Disposition::Waiting || Turn::has_live_orphan_tools(&flow.cards, session_id).await)
+            && Turn::has_live_tools(&flow.cards, session_id).await
+        {
             let since = *stuck_since.get_or_insert_with(tokio::time::Instant::now);
             if since.elapsed() >= grace {
                 return finish(Disposition::StuckPanel, session_id, label);
@@ -266,11 +275,10 @@ pub(super) async fn run(
         if flow.waits.is_stopped(session_id).await {
             return finish(Disposition::Stopped, session_id, label);
         }
-        // The single settle decision (ADR-0059, ADR-0062), through the one
-        // ending table: an undecided read keeps observing (nothing is
-        // stamped), and every decided outcome is that disposition — the
-        // caller's shared application owns its card translation.
-        let disposition = Disposition::from(transcript.settle(anchor.as_ref()));
+        // The disposition was decided above (before the live-panel grace).
+        // An undecided read keeps observing (nothing is stamped), and every
+        // decided outcome is that disposition — the caller's shared application
+        // owns its card translation.
         match disposition {
             // A Wake's Execution has not reached its boundary yet: the ending
             // is not decided, and the Wake's content must not declare it.
