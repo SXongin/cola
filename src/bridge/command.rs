@@ -280,11 +280,13 @@ const COMPACTING: &str = "已提交压缩，完成后会显示在卡片上。";
 
 /// The one "this Agent Client does not provide <surface>" sentence (ADR-0106):
 /// a command whose capability is absent reports it as unsupported instead of
-/// rendering an empty surface. `surface` and `command` are the reader-facing
-/// words; `/mcp` has its own pair-specific sentence in `bridge::mcp`.
-fn capability_unavailable(handles: &CommandHandles, surface: &str, command: &str) -> String {
+/// rendering an empty surface. `refusal` is the full predicate (`不提供 …`) so
+/// each command keeps its own copy — notably the space before a Latin noun
+/// (`不提供 Agent 选择`) that a shared template separator would get wrong.
+/// `/mcp` has its own pair-specific sentence in `bridge::mcp`.
+fn capability_unavailable(handles: &CommandHandles, refusal: &str, command: &str) -> String {
     format!(
-        "当前 Agent Client（{}）不提供{surface}，`{command}` 不可用。",
+        "当前 Agent Client（{}）{refusal}，`{command}` 不可用。",
         handles.flow.backend.client_name()
     )
 }
@@ -1575,6 +1577,20 @@ pub(crate) async fn handle_command(
             return Ok(());
         }
     }
+    // `/agent` is one surface: both the picker and the direct selection are
+    // unsupported on a client without agent selection, so the gate runs once
+    // before the dispatch instead of in each arm.
+    if matches!(&cmd, Command::AgentCard | Command::Agent(_)) && !handles.flow.backend.capabilities().modes {
+        handles
+            .flow
+            .platform
+            .reply_text(
+                message_id,
+                &capability_unavailable(handles, "不提供 Agent 选择", "/agent"),
+            )
+            .await?;
+        return Ok(());
+    }
     match cmd {
         Command::Dir(path) => {
             let Some(dir_str) = resolve_directory_or_reply(
@@ -2105,7 +2121,7 @@ pub(crate) async fn handle_command(
                     .platform
                     .reply_text(
                         message_id,
-                        &capability_unavailable(handles, "上下文压缩", "/compact"),
+                        &capability_unavailable(handles, "不提供上下文压缩", "/compact"),
                     )
                     .await?;
                 return Ok(());
@@ -2184,31 +2200,9 @@ pub(crate) async fn handle_command(
             post_idle_card(handles, &session_id, message_id, !is_child).await?;
         }
         Command::AgentCard => {
-            if !handles.flow.backend.capabilities().modes {
-                handles
-                    .flow
-                    .platform
-                    .reply_text(
-                        message_id,
-                        &capability_unavailable(handles, "Agent 选择", "/agent"),
-                    )
-                    .await?;
-                return Ok(());
-            }
             crate::feishu::card::command::send_agent_card(handles, &thread_key, message_id).await?;
         }
         Command::Agent(name) => {
-            if !handles.flow.backend.capabilities().modes {
-                handles
-                    .flow
-                    .platform
-                    .reply_text(
-                        message_id,
-                        &capability_unavailable(handles, "Agent 选择", "/agent"),
-                    )
-                    .await?;
-                return Ok(());
-            }
             // `/agent` records the per-session override and — on a generation
             // whose selection is durable (V2) — switches the session's agent,
             // so the next turn uses it with nothing re-sent (the server honors

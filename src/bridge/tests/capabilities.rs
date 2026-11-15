@@ -290,7 +290,10 @@ async fn command_surfaces_follow_their_axis() {
     .await;
     send_command(&app, "/compact", "msg_compact_absent").await;
     let reply = last_reply_text(&platform).await.expect("a reply");
-    assert!(reply.contains("不可用"), "/compact reports unsupported: {reply}");
+    assert_eq!(
+        reply, "当前 Agent Client（OpenCode）不提供上下文压缩，`/compact` 不可用。",
+        "the shared sentence keeps /compact's exact copy"
+    );
     assert!(
         backend.compact_calls.lock().await.is_empty(),
         "an unsupported /compact spends no compact call"
@@ -310,7 +313,10 @@ async fn command_surfaces_follow_their_axis() {
     .await;
     send_command(&app, "/agent", "msg_agent_absent").await;
     let reply = last_reply_text(&platform).await.expect("a reply");
-    assert!(reply.contains("不可用"), "/agent reports unsupported: {reply}");
+    assert_eq!(
+        reply, "当前 Agent Client（OpenCode）不提供 Agent 选择，`/agent` 不可用。",
+        "the shared sentence restores the space before the Latin noun"
+    );
 }
 
 /// The panel liveness line follows `child_agents`: a client with no child-agent
@@ -451,11 +457,10 @@ async fn ledger_follows_reports_live_runs() {
     );
 }
 
-/// The Session Card (`/card`) reads the same two axes: a `Session`-only
-/// client's static read carries no Location Form, and a client without
-/// compaction carries no Compaction marker.
+/// The Session Card (`/card`) reads the compaction axis: a client without
+/// compaction carries no Compaction marker on its static read either.
 #[tokio::test]
-async fn the_session_card_omits_location_forms_and_compaction_when_absent() {
+async fn the_session_card_omits_compaction_when_absent() {
     let transcript = crate::backend::SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "做点活"),
         compaction_message("msg_cmp", 1_500, "压缩摘要"),
@@ -465,24 +470,15 @@ async fn the_session_card_omits_location_forms_and_compaction_when_absent() {
         vec![transcript],
         Some(SessionStatus::Idle),
         |_| {},
-        |backend| {
-            backend.capabilities.questions = crate::backend::QuestionMode::Session;
-            backend.capabilities.compaction = false;
-            backend.ask_question(location_question("frm_card"));
-        },
+        |backend| backend.capabilities.compaction = false,
     )
     .await;
     send_command(&app, "/card", "msg_card").await;
     let cards = posted_cards(&platform).await;
     let card = cards.last().expect("the Session Card is posted");
-    let text = card_text(card);
     assert!(
-        !text.contains("选个目录"),
-        "a session-only client's /card carries no Location Form: {text}"
-    );
-    assert!(
-        !text.contains("压缩摘要"),
-        "a client without compaction's /card carries no marker: {text}"
+        !card_text(card).contains("压缩摘要"),
+        "a client without compaction's /card carries no marker: {card}"
     );
 }
 

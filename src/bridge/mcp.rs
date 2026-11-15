@@ -116,10 +116,14 @@ pub(crate) async fn run(
         Err(error) => return reply_error(handles, message_id, "待处理 Location Form ", error).await,
     };
     // Only directory-owned Location Forms: a session-backed question keeps its
-    // own Question card and must never be duplicated on the pull surface.
+    // own Question card and must never be duplicated on the pull surface. The
+    // question axis gates each row too (`QuestionMode::accepts`), so every
+    // reader of the question surface shares one rule even where `mcp` is the
+    // outer gate.
+    let question_mode = handles.flow.backend.capabilities().questions;
     let rows: Vec<McpFormRow<'_>> = forms
         .iter()
-        .filter(|form| form.is_location())
+        .filter(|form| form.is_location() && question_mode.accepts(form))
         .map(|form| McpFormRow {
             request: form,
             state: form_state(handles, form),
@@ -215,9 +219,10 @@ pub(crate) async fn handle_action(
             None
         }
     };
+    let question_mode = handles.flow.backend.capabilities().questions;
     let Some(form) = forms
         .iter()
-        .find(|form| form.id == request_id && form.is_location())
+        .find(|form| form.id == request_id && form.is_location() && question_mode.accepts(form))
         .cloned()
     else {
         return Some(toast("该 Location Form 已不在待处理列表中。"));
@@ -246,7 +251,7 @@ pub(crate) async fn handle_action(
             statuses.map(|statuses| {
                 let rows: Vec<McpFormRow<'_>> = forms
                     .iter()
-                    .filter(|form| form.is_location())
+                    .filter(|form| form.is_location() && question_mode.accepts(form))
                     .map(|form| McpFormRow {
                         request: form,
                         state: form_state(handles, form),

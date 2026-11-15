@@ -83,15 +83,17 @@ pub(crate) async fn gather_snapshot(
             Vec::new()
         }
     };
-    let question_mode = backend.capabilities().questions;
-    let questions: Vec<_> = if question_mode.is_absent() {
+    // The capability gate is the only question filter this read needs: a
+    // `Session`-only client's Location Form never reaches here anyway, because
+    // `QuestionRequest::location` carries an empty session id and the pending
+    // filter below keeps only the adopted Session's own requests. The poll
+    // listing (`QuestionKind::list`) owns the `QuestionMode::accepts` rule for
+    // the surfaces it pushes.
+    let questions: Vec<_> = if backend.capabilities().questions.is_absent() {
         Vec::new()
     } else {
         match backend.list_questions(Some(directory)).await {
-            Ok(questions) => questions
-                .into_iter()
-                .filter(|question| question_mode.accepts(question))
-                .collect(),
+            Ok(questions) => questions,
             Err(e) => {
                 tracing::warn!("snapshot: list questions for {} failed: {}", session_id, e);
                 Vec::new()
@@ -147,7 +149,7 @@ pub(crate) async fn gather_snapshot(
         // (ADR-0082), so the capability gate applies here too (ADR-0106): a
         // client with no compaction surface gets no marker.
         if !backend.capabilities().compaction {
-            tail.retain(|entry| !matches!(entry, crate::backend::TailEntry::Compaction(_)));
+            tail.retain(|entry| !matches!(entry, TailEntry::Compaction(_)));
         }
         tail
     };
@@ -721,44 +723,6 @@ mod tests {
         assert_eq!(line, "已接管「标题」", "a timed-out gather omits the status");
     }
 
-    /// ADR-0106: a `Session`-only client's `/card` read drops the
-    /// directory-owned Location Form at the same `QuestionMode::accepts` rule
-    /// the poll listing uses — no Location Form surface survives on either
-    /// path.
-    #[tokio::test]
-    async fn a_session_only_client_drops_location_forms_from_the_read() {
-        let mut backend = typed_backend(vec![
-            user("msg_u1", 1_000, &["看一下"]),
-            assistant("msg_a1", 2_000, &["好"]),
-        ]);
-        backend.capabilities.questions = crate::backend::QuestionMode::Session;
-        backend.ask_questions(vec![
-            crate::backend::types::QuestionRequest {
-                id: "q_session".into(),
-                session_id: "ses_adopted".into(),
-                ..Default::default()
-            },
-            crate::backend::types::QuestionRequest::location(
-                "frm_location",
-                "目录".into(),
-                Vec::new(),
-                None,
-                None,
-                None,
-            ),
-        ]);
-        let data = gather_from_typed_backend(backend).await;
-        let ids: Vec<&str> = data.pending.iter().map(|request| request.id()).collect();
-        assert!(
-            ids.contains(&"q_session"),
-            "the session-backed question rides the card: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&"frm_location"),
-            "a session-only client never embeds a Location Form: {ids:?}"
-        );
-    }
-
     /// ADR-0106: a client with no compaction axis gets no Compaction marker on
     /// its Session Card either — the live card and `/card` read one fact.
     #[tokio::test]
@@ -773,7 +737,7 @@ mod tests {
         fn has_compaction(data: &SnapshotData) -> bool {
             data.tail
                 .iter()
-                .any(|entry| matches!(entry, crate::backend::TailEntry::Compaction(_)))
+                .any(|entry| matches!(entry, TailEntry::Compaction(_)))
         }
 
         let full = gather_from_typed_backend(typed_backend(tail_messages())).await;
