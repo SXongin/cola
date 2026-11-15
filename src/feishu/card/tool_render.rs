@@ -1266,7 +1266,7 @@ impl ToolPanel {
         input: Option<serde_json::Value>,
         output: Option<&str>,
     ) -> Self {
-        Self::new(ToolCall {
+        let mut call = ToolCall {
             identity: crate::backend::ToolIdentity {
                 name: name.to_string(),
                 call_id: format!("call_{name}"),
@@ -1283,7 +1283,17 @@ impl ToolPanel {
                 error: None,
             },
             ..ToolCall::default()
-        })
+        };
+        // A test fixture built by name still carries the detail the production
+        // adapter declares for that vendor shape: the card selects by
+        // `(kind, detail)`, never by the name, and the fixture must obey that.
+        if name == "codex/collab_agent" && collab_agent_shape(call.input.as_ref()) {
+            call.detail = ToolDetail::Delegation {
+                runs: Vec::new(),
+                effect: DelegationEffect::Launch,
+            };
+        }
+        Self::new(call)
     }
 
     /// A test panel whose typed detail IS the fixture: the adapter's shape,
@@ -1592,27 +1602,18 @@ fn multi_file_detail(files: usize, totals: Option<(usize, usize)>) -> String {
 /// The target agents a collaboration panel's folded title names (issue #962):
 /// the first row's thread — the call's receiver when it has one — plus how many
 /// other targets the same call covers. The label is the very eight-character id
-/// the body rows use, so the folded and unfolded views cannot disagree. A child
-/// agent activity names the child's `agentPath` instead, which is the readable
-/// identity a sub-agent has on this wire.
+/// the body rows use, so the folded and unfolded views cannot disagree. The
+/// selection is the launch's neutral detail plus the adapter's input shape,
+/// never the identity name.
 fn panel_target_detail(tool: &ToolPanel) -> Option<String> {
+    if !is_collab_launch(tool) {
+        return None;
+    }
     let obj = tool.input()?.as_object()?;
-    let (label, count) = match tool.name() {
-        "codex/collab_agent" if collab_agent_shape(tool.input()) => {
-            let agents = obj.get("agents")?.as_array()?;
-            let first = agents.first()?;
-            (collab_agent_label(first)?, agents.len())
-        }
-        "codex/sub_agent_activity" if sub_agent_activity_shape(tool.input()) => {
-            // A folded header is one `plain_text` line with its own budget: a
-            // deep path keeps its tail (the agent's own name) and drops its
-            // head, and any line-breaking character folds to a space — the same
-            // rules a long file name takes, since both ride the title.
-            let path = folded_header_fragment(obj.get("agentPath")?.as_str()?);
-            (clip_header_name_tail(&path, FILE_HEADER_NAME_MAX_CHARS), 1)
-        }
-        _ => return None,
-    };
+    let agents = obj.get("agents")?.as_array()?;
+    let first = agents.first()?;
+    let label = collab_agent_label(first)?;
+    let count = agents.len();
     let mut detail = format!(" · 🧵 {label}");
     if count > 1 {
         detail.push_str(&format!(" +{}", count - 1));
@@ -2981,7 +2982,14 @@ fn format_tool_output(tool: &ToolPanel, output: &str) -> (Option<String>, BodySt
     if is_launch_call(tool) {
         return delegation_output(output);
     }
-    format_named_output(tool.name(), output)
+    let call = tool.call();
+    if vocab::name_only_token(&call.identity, call.kind, &call.detail) == Some(vocab::TOOL_SKILL)
+        && output.starts_with("<skill_content ")
+        && let Some(body) = parse_skill_envelope(output)
+    {
+        return (None, BodyStyle::Auto, body);
+    }
+    (None, BodyStyle::Auto, output.to_string())
 }
 
 /// A **web search**'s raw output: V1 emits a JSON envelope (`parallel`) or
@@ -2995,19 +3003,6 @@ fn web_output(output: &str) -> (Option<String>, BodyStyle, String) {
     }
 }
 
-/// Render a tool's raw output for the ids whose ENVELOPE is vendor-specific
-/// and has no shared shape: a `skill` envelope. A launch's envelope is
-/// [`delegation_output`]'s, selected by the neutral detail.
-fn format_named_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
-    if name == "skill"
-        && output.starts_with("<skill_content ")
-        && let Some(body) = parse_skill_envelope(output)
-    {
-        return (None, BodyStyle::Auto, body);
-    }
-    (None, BodyStyle::Auto, output.to_string())
-}
-
 /// Whether a call launches a child run, selected by its neutral detail — never
 /// its vendor name (ADR-0105 §5). A third adapter's launch under a new id takes
 /// the same panel.
@@ -3019,6 +3014,13 @@ fn is_launch_call(tool: &ToolPanel) -> bool {
             ..
         }
     )
+}
+
+/// A Codex collaboration launch: the neutral launch detail plus the adapter's
+/// input shape. The rich collab presentation (prompt/model/target rows) needs
+/// that shape; the identity name is never the selector.
+fn is_collab_launch(tool: &ToolPanel) -> bool {
+    is_launch_call(tool) && collab_agent_shape(tool.input())
 }
 
 /// A launch's raw output: V1's `<task …>` envelope (whose `<summary>` can
@@ -3598,24 +3600,6 @@ fn collab_agent_shape(input: Option<&serde_json::Value>) -> bool {
             })
 }
 
-/// `subAgentActivity`: `{kind, agentThreadId, agentPath, model, reasoningEffort}`
-/// — the first three are always written, the last two as present keys.
-fn sub_agent_activity_shape(input: Option<&serde_json::Value>) -> bool {
-    let Some(obj) = input.and_then(serde_json::Value::as_object) else {
-        return false;
-    };
-    let string = |key: &str| obj.get(key).and_then(serde_json::Value::as_str).is_some();
-    let optional_scalar = |key: &str| {
-        obj.get(key)
-            .is_some_and(|value| value.is_null() || value.is_string())
-    };
-    string("kind")
-        && string("agentThreadId")
-        && string("agentPath")
-        && optional_scalar("model")
-        && optional_scalar("reasoningEffort")
-}
-
 /// Wrap `text` in an inline code span whose delimiter is longer than any
 /// backtick run inside it, so a command or path containing backticks cannot
 /// close the span (Markdown's own rule). Content that starts or ends with a
@@ -3680,11 +3664,14 @@ fn format_tool_input(tool: &ToolPanel) -> String {
     if tool.call().kind == ToolKind::Fetch {
         return fetch_input(tool.input());
     }
-    // A Codex collaboration call keeps its own vendor presentation (issue
+    // A Codex collaboration launch keeps its own vendor presentation (issue
     // #962); the shared `Delegation` launch panel below is for the generic
-    // task/subagent shape.
-    let codex_collab = tool.name() == "codex/collab_agent" && collab_agent_shape(tool.input());
-    if is_launch_call(tool) && !codex_collab {
+    // task/subagent shape. Both are selected by the neutral detail, never the
+    // identity name.
+    if is_collab_launch(tool) {
+        return tool.input().map(collab_agent_input).unwrap_or_default();
+    }
+    if is_launch_call(tool) {
         return tool.input().map(delegation_input).unwrap_or_default();
     }
     tool.input()
@@ -3824,13 +3811,6 @@ fn format_named_input(name: &str, input: &serde_json::Value) -> String {
     };
     let get = |k: &str| obj.get(k).and_then(|v| v.as_str());
     match name {
-        // One collaboration call's report (issue #962) and one child-agent
-        // activity line. Both are adapter-written shapes, gated like every
-        // other `codex/` arm.
-        "codex/collab_agent" if collab_agent_shape(Some(input)) => collab_agent_input(input),
-        "codex/sub_agent_activity" if sub_agent_activity_shape(Some(input)) => {
-            sub_agent_activity_input(input)
-        }
         "skill" => match get("name").or_else(|| get("id")) {
             Some(name) => format!("🧩 {}", name),
             None => input.to_string(),
@@ -3926,7 +3906,7 @@ fn collab_payload_less_line(status: &str) -> String {
 /// message. `None` when the call has no target rows (a start payload), so the
 /// panel shows no empty Output section.
 fn codex_collab_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    if tool.name() != "codex/collab_agent" || !collab_agent_shape(tool.input()) {
+    if !is_collab_launch(tool) {
         return None;
     }
     let agents = tool.input()?.get("agents")?.as_array()?;
@@ -3993,25 +3973,6 @@ fn collab_agent_row(agent: &serde_json::Value) -> Option<String> {
     Some(row)
 }
 
-/// One child-agent activity, on one line: what happened, to which thread, and
-/// the model it was started with (issue #962). The agent's path is on the
-/// folded title, the same place every other panel names its subject.
-fn sub_agent_activity_input(input: &serde_json::Value) -> String {
-    let Some(obj) = input.as_object() else {
-        return input.to_string();
-    };
-    let get = |key: &str| obj.get(key).and_then(serde_json::Value::as_str);
-    let mut line = format!("🌱 {}", activity_label(get("kind").unwrap_or_default()));
-    if let Some(thread_id) = get("agentThreadId").filter(|id| !id.is_empty()) {
-        line.push_str(&format!(" · 🧵 {}", inline_code(&thread_short_id(thread_id))));
-    }
-    if let Some(model) = collab_model_line(get("model"), get("reasoningEffort")) {
-        line.push('\n');
-        line.push_str(&model);
-    }
-    line
-}
-
 /// The model / reasoning-effort line a collab body shows, from whichever half
 /// the wire carried — omitted entirely when it carried neither.
 fn collab_model_line(model: Option<&str>, effort: Option<&str>) -> Option<String> {
@@ -4070,17 +4031,6 @@ fn collab_state_label(status: &str) -> &str {
         "shutdown" => "已关闭",
         "notFound" => "未找到",
         "" => "尚无状态",
-        other => other,
-    }
-}
-
-/// A child-agent activity kind's word, keeping an unknown kind's own string.
-fn activity_label(kind: &str) -> &str {
-    match kind {
-        "started" => "启动",
-        "interacted" => "交互",
-        "interrupted" => "中断",
-        "completed" => "完成",
         other => other,
     }
 }
@@ -6459,8 +6409,9 @@ mod tests {
     #[test]
     fn non_read_tool_output_passes_through() {
         let raw = "some\nplain output";
-        assert_eq!(format_named_output("bash", raw).2, raw);
-        assert_eq!(format_named_output("bash", raw).0, None);
+        let tool = ToolPanel::for_test("bash", ToolStatus::Completed, None, None);
+        assert_eq!(format_tool_output(&tool, raw).2, raw);
+        assert_eq!(format_tool_output(&tool, raw).0, None);
         // Even a read-named tool without the wrapper is left alone.
         assert_eq!(read_output("no wrapper here").2, "no wrapper here");
     }
@@ -6605,7 +6556,24 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
 <file>/root/.agents/skills/implement/other.md</file>
 </skill_files>
 </skill_content>";
-        let (header, style, body) = format_named_output("skill", raw);
+        let skill = |output: &str| {
+            ToolPanel::new(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "skill".into(),
+                    call_id: "call_skill".into(),
+                },
+                kind: crate::backend::ToolKind::Other,
+                detail: crate::backend::ToolDetail::None,
+                status: ToolStatus::Completed,
+                output: ToolOutput {
+                    raw: Some(serde_json::Value::String(output.to_string())),
+                    blocks: vec![ContentBlock::Text(output.to_string())],
+                    error: None,
+                },
+                ..crate::backend::ToolCall::default()
+            })
+        };
+        let (header, style, body) = format_tool_output(&skill(raw), raw);
         assert_eq!(header, None, "the input names the skill");
         assert_eq!(style, BodyStyle::Auto);
         assert!(body.contains("Do the work."), "content kept: {body:?}");
@@ -6613,7 +6581,8 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
         assert!(!body.contains("skill_files"), "file list stripped: {body:?}");
         assert!(!body.contains("other.md"), "sampled files stripped: {body:?}");
         // An empty envelope is stripped too, never leaked raw.
-        let (_, _, empty) = format_named_output("skill", "<skill_content name=\"x\">\n</skill_content>");
+        let empty_raw = "<skill_content name=\"x\">\n</skill_content>";
+        let (_, _, empty) = format_tool_output(&skill(empty_raw), empty_raw);
         assert_eq!(empty, "");
     }
 
@@ -9730,8 +9699,8 @@ Report
                     collab(verb),
                     "ok"
                 )),
-                "✅ codex/collab_agent · 🧵 0192f0aa",
-                "an addressing call has no token: {verb}"
+                "✅ codex/collab_agent",
+                "an addressing call is a receipt, not a launch panel: {verb}"
             );
         }
 
@@ -9853,7 +9822,7 @@ Report
             md.contains(&format!("{}\n\n⏳ `0192f0aa` · 运行中", output_md())),
             "one row for the target's own state, in the Output body: {md}"
         );
-        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 0192f0aa");
+        assert_eq!(panel_title(tool), "✅ subagent · 🧵 0192f0aa");
 
         // The start payload has no receiver yet: no row, no target on the
         // title, and the call reads as running.
@@ -9874,7 +9843,7 @@ Report
         );
         let md = panel_md(started.clone());
         assert!(!md.contains("尚无状态"), "no empty rows: {md}");
-        assert_eq!(panel_title(started), "⏳ codex/collab_agent");
+        assert_eq!(panel_title(started), "⏳ subagent");
     }
 
     /// Issue #962, review round 1: a long prompt and several targets with long
@@ -9921,7 +9890,7 @@ Report
         }
         assert!(md.contains("❌ `00000006` · 出错"), "the failure row: {md}");
         assert!(md.contains("📝 ppp"), "the prompt stays in the Input: {md}");
-        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 00000001 +5");
+        assert_eq!(panel_title(tool), "✅ subagent · 🧵 00000001 +5");
     }
 
     /// Review round 2: more targets than the output budget can hold end on an
@@ -9961,7 +9930,7 @@ Report
         assert!(last.ends_with(" 个目标"), "{last:?}");
         assert!(md.contains("`00000001`"), "the first rows render: {md}");
         assert!(!md.contains("… ✅"), "no row is clipped mid-body: {md}");
-        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 00000001 +19");
+        assert_eq!(panel_title(tool), "✅ subagent · 🧵 00000001 +19");
     }
 
     /// Review round 2: a status this build does not model keeps its own string
@@ -9985,7 +9954,7 @@ Report
         );
         let md = panel_md(tool.clone());
         assert!(md.contains("🔧 futureStatus"), "{md}");
-        assert_eq!(panel_title(tool), "🔧 codex/collab_agent");
+        assert_eq!(panel_title(tool), "🔧 subagent");
     }
 
     /// Every target of a `wait` gets its own row with its own outcome — the
@@ -10026,272 +9995,7 @@ Report
             !md.contains("📝"),
             "no prompt line when the call carries none: {md}"
         );
-        assert_eq!(panel_title(tool), "✅ codex/collab_agent · 🧵 0192f0aa +1");
-    }
-
-    /// Issue #962: a `subAgentActivity` is one small row naming what happened,
-    /// which child, and the model it was started with; the folded title carries
-    /// the child's readable path.
-    #[test]
-    fn a_sub_agent_activity_row_names_its_path_and_kind() {
-        let tool = ToolPanel::for_test(
-            "codex/sub_agent_activity",
-            ToolStatus::Completed,
-            Some(json!({
-                "kind": "started",
-                "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
-                "agentPath": "/root/worker",
-                "model": "gpt-5.1-codex",
-                "reasoningEffort": "high"
-            })),
-            None,
-        );
-        let md = panel_md(tool.clone());
-        assert!(md.contains("🌱 启动 · 🧵 `0192f0aa`"), "{md}");
-        assert!(md.contains("🤖 `gpt-5.1-codex` · high"), "{md}");
-        assert_eq!(panel_title(tool), "✅ codex/sub_agent_activity · 🧵 /root/worker");
-    }
-
-    /// The folded title's target detail (issue #962) is charged to the card
-    /// estimate, exactly as the file detail is: an uncharged fragment could let
-    /// a split pass the size check and then be rejected by Feishu.
-    #[test]
-    fn the_collab_target_detail_is_charged() {
-        let collab = |agents: serde_json::Value| {
-            ToolPanel::for_test(
-                "codex/collab_agent",
-                ToolStatus::Completed,
-                Some(json!({
-                    "tool": "spawnAgent",
-                    "status": "completed",
-                    "senderThreadId": "thread-root",
-                    "receiverThreadIds": ["0192f0aa-0000-7000-8000-000000000001"],
-                    "prompt": null,
-                    "model": null,
-                    "reasoningEffort": null,
-                    "agents": agents
-                })),
-                None,
-            )
-        };
-        let row = json!([{
-            "threadId": "0192f0aa-0000-7000-8000-000000000001",
-            "status": "running",
-            "message": null
-        }]);
-        assert!(panel_target_detail_estimate(&collab(row)) > 0);
-
-        // No rows (the start payload): the title carries no target fragment.
-        assert_eq!(panel_target_detail_estimate(&collab(json!([]))), 0);
-        // A panel that is not a collaboration panel carries none either.
-        let bash = ToolPanel::for_test("bash", ToolStatus::Completed, None, None);
-        assert_eq!(panel_target_detail_estimate(&bash), 0);
-    }
-
-    /// Review round 4, from a live Codex run: V2's `wait` item is always empty
-    /// (`receiverThreadIds: []`, `agentsStates: {}`) and its result is a tool
-    /// output the item stream does not carry. The card must not read as a
-    /// rendering gap — it names the call's own state and says the target state
-    /// was not reported.
-    #[test]
-    fn a_payload_less_wait_card_says_why_it_has_no_rows() {
-        let tool = ToolPanel::for_test(
-            "codex/collab_agent",
-            ToolStatus::Completed,
-            Some(json!({
-                "tool": "wait",
-                "status": "completed",
-                "senderThreadId": "thread-root",
-                "receiverThreadIds": [],
-                "prompt": null,
-                "model": null,
-                "reasoningEffort": null,
-                "agents": []
-            })),
-            None,
-        );
-        let md = panel_md(tool.clone());
-        assert!(
-            md.contains("✅ 完成 · 未上报目标状态"),
-            "the call's own state and why the rows are absent: {md}"
-        );
-        assert!(!md.contains("_(no details)_"), "never an empty body: {md}");
-        assert_eq!(panel_title(tool), "✅ codex/collab_agent");
-    }
-
-    /// Issue #962 acceptance 2's readable name: when the read carried the
-    /// child's own `agentPath`, the title and the row name it, not its id.
-    #[test]
-    fn a_target_with_a_known_agent_path_is_named_by_it() {
-        let tool = ToolPanel::for_test(
-            "codex/collab_agent",
-            ToolStatus::Completed,
-            Some(json!({
-                "tool": "wait",
-                "status": "completed",
-                "senderThreadId": "thread-root",
-                "receiverThreadIds": ["0192f0aa-0000-7000-8000-000000000001"],
-                "prompt": null,
-                "model": null,
-                "reasoningEffort": null,
-                "agents": [{
-                    "threadId": "0192f0aa-0000-7000-8000-000000000001",
-                    "label": "/root/spawn_smoke_test",
-                    "status": "completed",
-                    "message": null
-                }]
-            })),
-            None,
-        );
-        assert_eq!(
-            panel_title(tool.clone()),
-            "✅ codex/collab_agent · 🧵 /root/spawn_smoke_test"
-        );
-        let md = panel_md(tool);
-        assert!(
-            md.contains("✅ `/root/spawn_smoke_test` · 完成"),
-            "the row names the agent path: {md}"
-        );
-        assert!(
-            !md.contains("未上报目标状态"),
-            "a call with rows is not payload-less: {md}"
-        );
-    }
-
-    /// Review round 7: the payload-less fallback is about the ROW list, not
-    /// just the prompt/model lines — a call with target states but no prompt
-    /// must not claim no state was reported.
-    #[test]
-    fn rows_without_a_prompt_do_not_claim_no_state_was_reported() {
-        let tool = ToolPanel::for_test(
-            "codex/collab_agent",
-            ToolStatus::Completed,
-            Some(json!({
-                "tool": "wait",
-                "status": "completed",
-                "senderThreadId": "thread-root",
-                "receiverThreadIds": ["0192f0aa-0000-7000-8000-000000000001"],
-                "prompt": null,
-                "model": null,
-                "reasoningEffort": null,
-                "agents": [{
-                    "threadId": "0192f0aa-0000-7000-8000-000000000001",
-                    "status": "errored",
-                    "message": "boom"
-                }]
-            })),
-            None,
-        );
-        let md = panel_md(tool);
-        assert!(!md.contains("未上报目标状态"), "{md}");
-        assert!(md.contains("❌ `0192f0aa` · 出错 · boom"), "{md}");
-    }
-
-    /// Review round 5: a very deep `agentPath` must not blow the folded
-    /// header's one-line budget — the activity keeps the path's tail (the
-    /// agent's own name) and clips its head, like a long file name.
-    #[test]
-    fn a_deep_activity_path_keeps_its_tail_within_the_header_budget() {
-        let deep = format!("/root/{}worker", "segment/".repeat(400));
-        let tool = ToolPanel::for_test(
-            "codex/sub_agent_activity",
-            ToolStatus::Completed,
-            Some(json!({
-                "kind": "started",
-                "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
-                "agentPath": deep,
-                "model": null,
-                "reasoningEffort": null
-            })),
-            None,
-        );
-        let title = panel_title(tool);
-        assert!(
-            title.starts_with("✅ codex/sub_agent_activity · 🧵 …"),
-            "the head is clipped and the tail kept: {title}"
-        );
-        assert!(
-            title.chars().count() <= 60,
-            "the header stays a short line: {title}"
-        );
-        assert!(title.ends_with("segment/worker"), "the leaf survives: {title}");
-    }
-
-    /// Review round 6: a path is a valid Unix path even when it carries a
-    /// newline or a Unicode line separator, and the folded title is one
-    /// `plain_text` line — every break folds to a space (the file-name rule).
-    #[test]
-    fn a_line_breaking_activity_path_stays_one_title_line() {
-        let tool = ToolPanel::for_test(
-            "codex/sub_agent_activity",
-            ToolStatus::Completed,
-            Some(json!({
-                "kind": "started",
-                "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
-                "agentPath": "/root/worker\nsegment\u{2028}leaf",
-                "model": null,
-                "reasoningEffort": null
-            })),
-            None,
-        );
-        let title = panel_title(tool);
-        assert_eq!(title.lines().count(), 1, "one title line: {title:?}");
-        assert!(
-            !title.contains('\n') && !title.contains('\u{2028}'),
-            "no break survives: {title:?}"
-        );
-    }
-
-    /// The activity arm is gated on the adapter's whole shape (ADR-0042): a
-    /// payload missing `agentPath`, or carrying a non-string optional field, is
-    /// not the adapter's and stays opaque rather than rendering a partial row.
-    #[test]
-    fn a_partial_sub_agent_activity_shape_stays_raw() {
-        let title = |input: serde_json::Value| {
-            let tool = ToolPanel::for_test(
-                "codex/sub_agent_activity",
-                ToolStatus::Completed,
-                Some(input),
-                None,
-            );
-            let card = CardBuilder::new()
-                .with_state(CardState::Done)
-                .with_tool(tool)
-                .build();
-            card["body"]["elements"][0]["header"]["title"]["content"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
-        let missing_path = json!({
-            "kind": "started",
-            "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
-            "model": null,
-            "reasoningEffort": null
-        });
-        assert_eq!(
-            title(missing_path.clone()),
-            "✅ codex/sub_agent_activity",
-            "the adapter always writes agentPath"
-        );
-        assert_eq!(
-            title(json!({
-                "kind": "started",
-                "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
-                "agentPath": "/root/worker",
-                "model": 3,
-                "reasoningEffort": null
-            })),
-            "✅ codex/sub_agent_activity",
-            "an optional field must be a string or null"
-        );
-        // The body falls back to the generic key-value list, never a partial
-        // activity row.
-        let body = format_named_input("codex/sub_agent_activity", &missing_path);
-        assert!(
-            body.contains("- kind: started") && !body.contains("🌱"),
-            "the generic key-value fallback, never a partial row: {body}"
-        );
+        assert_eq!(panel_title(tool), "✅ subagent · 🧵 0192f0aa +1");
     }
 
     /// The `Execute` family's `Command` shape renders one Input line on every
@@ -11090,7 +10794,8 @@ excerpt two";
             "grep count: {md}"
         );
 
-        assert_eq!(format_named_output("glob", "a.rs\nb.rs").0, None);
+        let glob = ToolPanel::for_test("glob", ToolStatus::Completed, None, None);
+        assert_eq!(format_tool_output(&glob, "a.rs\nb.rs").0, None);
     }
 
     /// A Code Mode `Program` (ADR-0105, spec #1057's P2): the source renders as
