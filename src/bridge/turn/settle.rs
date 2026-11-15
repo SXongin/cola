@@ -258,12 +258,16 @@ pub(super) async fn run(
         // A `⏳` panel must not be stamped over: a crash-orphaned call gets the
         // grace to settle, then ends Error rather than a false `✅`. A Waiting
         // decision yields instead only when its live panel is a launch THIS
-        // client can retire (see `Turn::waiting_panels_are_stuck`).
-        let stuck = if disposition == Disposition::Waiting {
-            Turn::waiting_panels_are_stuck(&flow.cards, session_id, flow.backend.reports_live_runs()).await
-        } else {
-            Turn::has_live_tools(&flow.cards, session_id).await
-        };
+        // client can retire (see `Turn::waiting_panels_are_stuck`); any other
+        // decision ignores a retired run's launch panel on such a client too,
+        // while a client that cannot retire runs keeps its grace.
+        let stuck = Turn::settle_is_stuck(
+            &flow.cards,
+            session_id,
+            disposition == Disposition::Waiting,
+            flow.backend.reports_live_runs(),
+        )
+        .await;
         if stuck {
             let since = *stuck_since.get_or_insert_with(tokio::time::Instant::now);
             if since.elapsed() >= grace {
