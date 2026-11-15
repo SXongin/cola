@@ -311,31 +311,52 @@ pub fn child_run_activity(transcript: &SessionTranscript) -> Option<RunActivity>
     })
 }
 
-/// The client's terminal statement a child transcript carries, if any: its
-/// newest step finish is a terminal reason, with the message's completion
-/// stamp. This is the run's `RunStatus` (the client's own statement) — never
-/// cola's `TaskEnding`, which the evidence path records separately.
-pub fn child_run_status(transcript: &SessionTranscript) -> Option<RunStatus> {
+/// The newest step finish a child transcript's newest assistant message
+/// carries, if any. The one read both the client's status statement and the
+/// liveness suppression use, so they cannot disagree about which finish is
+/// "the finish".
+fn newest_step_finish(transcript: &SessionTranscript) -> Option<&super::FinishReason> {
     let message = transcript
         .messages
         .iter()
         .rev()
         .find(|message| message.role == super::MessageRole::Assistant)?;
     message.parts.iter().rev().find_map(|part| match part {
-        Part::StepFinish(finish) => match &finish.reason {
-            super::FinishReason::Error => Some(RunStatus::Failed),
-            super::FinishReason::Stop | super::FinishReason::Length | super::FinishReason::ContentFilter => {
-                Some(RunStatus::Completed)
-            }
-            // A reason this build cannot name is not a client statement that
-            // the run was cancelled: it still owes an exit (its evidence or a
-            // cleanup), the same honesty `ToolStatus::Other` gets in
-            // `status_of`.
-            super::FinishReason::Other(_) => Some(RunStatus::Unknown),
-            super::FinishReason::ToolCalls | super::FinishReason::Unknown => None,
-        },
+        Part::StepFinish(finish) => Some(&finish.reason),
         _ => None,
     })
+}
+
+/// The client's terminal statement a child transcript carries, if any: its
+/// newest step finish is a terminal reason, with the message's completion
+/// stamp. This is the run's `RunStatus` (the client's own statement) — never
+/// cola's `TaskEnding`, which the evidence path records separately.
+pub fn child_run_status(transcript: &SessionTranscript) -> Option<RunStatus> {
+    match newest_step_finish(transcript)? {
+        super::FinishReason::Error => Some(RunStatus::Failed),
+        super::FinishReason::Stop | super::FinishReason::Length | super::FinishReason::ContentFilter => {
+            Some(RunStatus::Completed)
+        }
+        // A reason this build cannot name is not a client statement that the
+        // run was cancelled: it still owes an exit (its evidence or a
+        // cleanup), the same honesty `ToolStatus::Other` gets in `status_of`.
+        super::FinishReason::Other(_) => Some(RunStatus::Unknown),
+        super::FinishReason::ToolCalls | super::FinishReason::Unknown => None,
+    }
+}
+
+/// Whether the child has finished, whatever [`RunStatus`] its finish maps to.
+///
+/// The status word is terminal for the ordinary finishes; a terminal finish
+/// that maps to a non-terminal status is the case the status alone misses:
+/// `Other` is a **terminal** reason — Codex's `interrupted`, OpenCode's
+/// spelled-out `unknown` — yet maps to `RunStatus::Unknown` so the client's
+/// statement stays honest. A finished child must not keep rendering a
+/// live-looking `waiting <age>` line while the run awaits its evidence, so
+/// liveness asks this, not the status name.
+pub fn child_run_finished(transcript: &SessionTranscript) -> bool {
+    child_run_status(transcript).is_some_and(|status| status.is_terminal())
+        || newest_step_finish(transcript).is_some_and(super::FinishReason::is_terminal)
 }
 
 #[cfg(test)]
