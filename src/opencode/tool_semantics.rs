@@ -340,9 +340,25 @@ fn fetch_detail(_input: Option<&Value>, _metadata: Option<&Value>) -> ToolDetail
     ToolDetail::None
 }
 
-fn delegation_detail(_input: Option<&Value>, _metadata: Option<&Value>) -> ToolDetail {
+fn delegation_detail(_input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
+    // A `task`/`subagent` call names the child session it runs in its state
+    // metadata — V1 `sessionId`, V2 `sessionID` (AGENTS.md pitfall
+    // `wire-shapes`). That id is the run's live identity; a call whose metadata
+    // names none launches nothing the read can follow.
+    let child = metadata.and_then(|metadata| {
+        ["sessionId", "sessionID"]
+            .iter()
+            .find_map(|key| metadata.get(*key).and_then(Value::as_str))
+            .filter(|id| !id.is_empty())
+    });
     ToolDetail::Delegation {
-        runs: Vec::new(),
+        runs: child
+            .map(|id| {
+                vec![crate::backend::AgentRunRef {
+                    run_id: id.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
         effect: DelegationEffect::Launch,
     }
 }

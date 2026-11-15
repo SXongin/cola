@@ -22,6 +22,7 @@ pub mod diff_html;
 pub mod file_content;
 pub mod lifecycle;
 pub mod parsing;
+pub mod runs;
 pub mod transcript;
 pub mod turn_diff;
 pub mod types;
@@ -883,6 +884,22 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// reports its own failure as that read's `Err`.
     fn background_tasks_supported(&self) -> bool {
         false
+    }
+
+    /// Whether this client reports **live runs** — a Background Task or a
+    /// Turn-scoped child agent — so the live-run ledger, the panel liveness
+    /// line and the runtime reconciliation's early return are meaningful. The
+    /// derived answer is `background_runs || child_evidence` (ADR-0106); this
+    /// minimal method is the seam #1062 folds into
+    /// `AgentCapabilities::reports_live_runs()`, and the rest of the ticket
+    /// reads it instead of `background_tasks_supported`.
+    ///
+    /// The default delegates to [`Self::background_tasks_supported`]: a client
+    /// with no background surface reports runs only if it also has a
+    /// child-evidence read, which is exactly the override a child-only client
+    /// (Codex) writes.
+    fn reports_live_runs(&self) -> bool {
+        self.background_tasks_supported()
     }
 
     /// The Background Task State module's handle (ADR-0079, tickets #681/#682)

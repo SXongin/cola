@@ -33,8 +33,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::{
-    Compaction, CompactionReason, CompactionStatus, ContentBlock, DelegationEffect, FileAction, FileContent,
-    FileEdit, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part,
+    AgentRunRef, Compaction, CompactionReason, CompactionStatus, ContentBlock, DelegationEffect, FileAction,
+    FileContent, FileEdit, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part,
     ReasoningPart, SearchScope, SessionTranscript, StepFinish, TextPart, TodoList, TodoStatus, TodoStep,
     TokenUsage, ToolCall, ToolDetail, ToolIdentity, ToolKind, ToolOutput, ToolStatus, TranscriptMessage,
     TurnDiff, TurnDiffFile,
@@ -2335,20 +2335,29 @@ impl ItemKind {
                 },
             ),
             Self::Image { generated: true, .. } => (ToolKind::Other, ToolDetail::Opaque),
-            Self::Collab { tool, .. } => (
+            Self::Collab {
+                tool,
+                receivers,
+                agents,
+                ..
+            } => (
                 ToolKind::Other,
                 ToolDetail::Delegation {
-                    // The run facts land with the AgentRun ticket; P1 only
-                    // declares which verb this call is.
-                    runs: Vec::new(),
+                    runs: collab_runs(receivers, agents),
                     effect: collab_effect(tool),
                 },
             ),
             // A child's lifecycle observation is a report on its run.
-            Self::SubAgentActivity { .. } => (
+            Self::SubAgentActivity { agent_thread_id, .. } => (
                 ToolKind::Other,
                 ToolDetail::Delegation {
-                    runs: Vec::new(),
+                    runs: if agent_thread_id.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![AgentRunRef {
+                            run_id: agent_thread_id.clone(),
+                        }]
+                    },
                     effect: DelegationEffect::Report,
                 },
             ),
@@ -2637,6 +2646,24 @@ fn collab_effect(tool: &str) -> DelegationEffect {
         "spawnAgent" => DelegationEffect::Launch,
         _ => DelegationEffect::Address,
     }
+}
+
+/// The runs one collaboration call names: the wire's receiver list in order,
+/// then any target its state map names that the receiver list did not (a start
+/// payload may fill one before the other). A call naming none is a turn-level
+/// receipt and creates no run (spec #1057).
+fn collab_runs(receivers: &[String], agents: &[AgentState]) -> Vec<AgentRunRef> {
+    let mut runs: Vec<AgentRunRef> = Vec::new();
+    for id in receivers
+        .iter()
+        .chain(agents.iter().map(|agent| &agent.thread_id))
+    {
+        if id.is_empty() || runs.iter().any(|run| &run.run_id == id) {
+            continue;
+        }
+        runs.push(AgentRunRef { run_id: id.clone() });
+    }
+    runs
 }
 
 fn combine_reasoning(summary: &str, text: &str) -> Option<String> {
