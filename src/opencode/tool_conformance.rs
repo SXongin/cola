@@ -192,13 +192,23 @@ fn read_is_one_file_read_on_every_producer() {
             path: Some("src/a.rs".to_string()),
             preview: None,
             directory: false,
+            image: false,
         },
     );
     assert_eq!(v1("read", json!({"filePath": "src/a.rs"}), Value::Null), expected);
     assert_eq!(v2("read", json!({"path": "src/a.rs"}), Value::Null), expected);
+    let image = (
+        ToolKind::Read,
+        ToolDetail::Read {
+            path: Some("src/a.rs".to_string()),
+            preview: None,
+            directory: false,
+            image: true,
+        },
+    );
     assert_eq!(
         codex(json!({"type": "imageView", "id": "item-image", "path": "src/a.rs"})),
-        expected
+        image
     );
 
     let no_path = (
@@ -207,17 +217,27 @@ fn read_is_one_file_read_on_every_producer() {
             path: None,
             preview: None,
             directory: false,
+            image: false,
         },
     );
     assert_eq!(v1("read", json!({}), Value::Null), no_path);
     assert_eq!(v2("read", json!({}), Value::Null), no_path);
+    let image_no_path = (
+        ToolKind::Read,
+        ToolDetail::Read {
+            path: None,
+            preview: None,
+            directory: false,
+            image: true,
+        },
+    );
     assert_eq!(
         codex(json!({"type": "imageView", "id": "item-image", "path": null})),
-        no_path
+        image_no_path
     );
     assert_eq!(
         codex(json!({"type": "imageView", "id": "item-image", "path": ""})),
-        no_path
+        image_no_path
     );
 }
 
@@ -845,6 +865,7 @@ fn an_image_generation_is_opaque_where_an_image_view_is_a_read() {
                 path: Some("in.png".to_string()),
                 preview: None,
                 directory: false,
+                image: true,
             }
         )
     );

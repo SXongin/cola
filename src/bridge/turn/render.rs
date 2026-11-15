@@ -12580,6 +12580,7 @@ Index: /x/src/main.rs
                     path: Some("src/lib.rs".into()),
                     preview: None,
                     directory: false,
+                    image: false,
                 };
             } else {
                 call.kind = ToolKind::Execute;

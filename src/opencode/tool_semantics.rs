@@ -227,6 +227,7 @@ fn read_detail(input: Option<&Value>, _metadata: Option<&Value>) -> ToolDetail {
         path: input_path(input),
         preview: None,
         directory: false,
+        image: false,
     }
 }
 
@@ -708,6 +709,7 @@ mod tests {
                     path: Some("src/a.rs".to_string()),
                     preview: None,
                     directory: false,
+                    image: false,
                 }
             );
         }
