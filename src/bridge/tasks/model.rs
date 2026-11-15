@@ -296,10 +296,17 @@ impl TaskRunId {
 }
 
 /// The identity a just-derived ending records (ADR-0080): the launch's own
-/// facts, plus the label its originating tool input names. Captured when the
-/// ending is derived — that read necessarily carries the launch — so a later
-/// card's entry is immune to compaction and to a truncated read.
-pub(crate) fn identity_of_task(task: &BackgroundTask, input: Option<&serde_json::Value>) -> TaskRunIdentity {
+/// facts, plus the label its originating tool input names — or the label the
+/// retiring **Agent Run** already carries (`label_override`), so a completion
+/// entry names the run it belongs to even when a multi-child launch or a
+/// compacted read cannot re-join the input. Captured when the ending is
+/// derived, so a later card's entry is immune to compaction and to a truncated
+/// read.
+pub(crate) fn identity_of_task(
+    task: &BackgroundTask,
+    input: Option<&serde_json::Value>,
+    label_override: Option<&str>,
+) -> TaskRunIdentity {
     let tool = task.tool.name.clone();
     TaskRunIdentity {
         tool: Some(tool.clone()),
@@ -307,7 +314,11 @@ pub(crate) fn identity_of_task(task: &BackgroundTask, input: Option<&serde_json:
         shell_id: task.shell_id.clone(),
         child_id: task.child_id.clone(),
         started_at: task.started_at,
-        label: task_label(task_kind(&tool), input),
+        label: label_override
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+            .or_else(|| task_label(task_kind(&tool), input)),
     }
 }
 

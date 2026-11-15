@@ -26,8 +26,8 @@
 //!   to no single run.
 
 use super::{
-    AgentRun, AgentRunRef, DelegationEffect, Part, Phase, RunActivity, RunStatus, SessionTranscript,
-    ToolCall, ToolCallRef, ToolDetail, ToolStatus, TranscriptMessage,
+    AgentRun, DelegationEffect, Part, Phase, RunActivity, RunStatus, SessionTranscript, ToolCall,
+    ToolCallRef, ToolDetail, ToolStatus, TranscriptMessage,
 };
 
 /// Derive the runs one read names, in the order their first fact appears.
@@ -44,18 +44,28 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
         let ToolDetail::Delegation { runs: refs, effect } = &call.detail else {
             continue;
         };
+        // A reference naming no id is not a run: an addressing call with no
+        // target addresses the Turn's live runs as a SET and mints nothing
+        // (spec #1057), and a producer strips the empty ids it cannot name. So
+        // every ref this fold acts on names exactly one child.
+        let names: Vec<&str> = refs
+            .iter()
+            .map(|reference| reference.run_id.as_str())
+            .filter(|id| !id.is_empty())
+            .collect();
+        // One fact naming N children must not give them one durable key: the
+        // endings are per run (ADR-0080). A single-receiver fact keys by its
+        // call id; a multi-receiver one keys each run by its own child id.
+        let multi = names.len() > 1;
         match effect {
             DelegationEffect::Launch => {
-                for reference in refs {
-                    if reference.run_id.is_empty() {
-                        continue;
-                    }
-                    let run = resolve_or_create(&mut runs, reference, call);
+                for run_id in names {
+                    let run = resolve_or_create(&mut runs, run_id, call, multi);
                     push_relation(&mut run.launched_by, call);
                     // A resumed task names the same child: the run it resolves
                     // gains a launch, never a second record.
                     if run.child_id.is_none() {
-                        run.child_id = Some(reference.run_id.clone());
+                        run.child_id = Some(run_id.to_string());
                     }
                     // The launch call is the client's statement about the run
                     // it created or resumed: a foreground `task` settles only
@@ -69,20 +79,14 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
                 }
             }
             DelegationEffect::Address => {
-                // No receiver: a turn-level receipt. It names the Turn's live
-                // runs as a set and mints nothing (spec #1057). A reference
-                // that names no id is a call-keyed run — a non-launch fact
-                // without a child id, which fills it on a later sighting.
-                for reference in refs {
-                    let run = resolve_or_create(&mut runs, reference, call);
-                    fill_child(run, reference);
+                for run_id in names {
+                    let run = resolve_or_create(&mut runs, run_id, call, multi);
                     push_relation(&mut run.addressed_by, call);
                 }
             }
             DelegationEffect::Report => {
-                for reference in refs {
-                    let run = resolve_or_create(&mut runs, reference, call);
-                    fill_child(run, reference);
+                for run_id in names {
+                    let run = resolve_or_create(&mut runs, run_id, call, multi);
                     // Dedupe by the CALL, never by call id alone: an activity
                     // whose state moved is the same call, so the relation is
                     // one entry and the state is applied below.
@@ -95,44 +99,44 @@ pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
     runs
 }
 
-/// The run a delegation call names, created when no fact has named it yet.
+/// The run one delegation call names by `run_id`, created when no fact has
+/// named it yet. The live identity is the child id (spec #1057), and a later
+/// sighting resolves the same record by either its live identity or its child
+/// id, so `run_id` never moves once minted.
 ///
-/// - A reference naming an id is keyed by it (the child id — the live
-///   identity).
-/// - A reference naming **no** id is a non-launch fact without a child id: the
-///   run is keyed by the creating call's id, so no two such runs can share an
-///   empty-id identity, and a later sighting of the same call fills
-///   `child_id`.
-/// - A later sighting of the same call (its `task_run_id`) resolves the run it
-///   created even when that fact now names the child id, so `run_id` never
-///   moves once minted.
+/// `task_run_id` (ADR-0080's durable key) is minted here, once:
+///
+/// - a single-receiver fact keys by the creating **call id** — the one id
+///   every writer of that read agrees on, and what "a launch's key is its call
+///   id" means;
+/// - a fact naming **several** children keys each run by its **own child id**,
+///   because one call id cannot be the durable identity of two runs (it would
+///   fold their endings together and prune one on the other's evidence). The
+///   choice is deterministic from the fact itself, so every reader of the same
+///   read mints the same keys.
 fn resolve_or_create<'a>(
     runs: &'a mut Vec<AgentRun>,
-    reference: &AgentRunRef,
+    run_id: &str,
     call: &ToolCall,
+    multi: bool,
 ) -> &'a mut AgentRun {
-    let named = !reference.run_id.is_empty();
-    if let Some(index) = runs.iter().position(|run| {
-        (named
-            && (run.run_id == reference.run_id || run.child_id.as_deref() == Some(reference.run_id.as_str())))
-            || (run.child_id.is_none() && run.task_run_id.as_deref() == Some(call.identity.call_id.as_str()))
-    }) {
+    if let Some(index) = runs
+        .iter()
+        .position(|run| run.run_id == run_id || run.child_id.as_deref() == Some(run_id))
+    {
         return &mut runs[index];
     }
-    // `task_run_id` is minted from the creating call (ADR-0080) — never
-    // invented when the call has no id. An unnamed reference takes the call's
-    // id as the live identity, which is the only id the fact carries.
-    let task_run_id = (!call.identity.call_id.is_empty()).then(|| call.identity.call_id.clone());
-    let run_id = if named {
-        reference.run_id.clone()
+    let call_id = call.identity.call_id.as_str();
+    let key = if multi || call_id.is_empty() {
+        run_id.to_string()
     } else {
-        call.identity.call_id.clone()
+        call_id.to_string()
     };
     runs.push(AgentRun {
-        run_id: run_id.clone(),
-        task_run_id,
-        child_id: named.then(|| reference.run_id.clone()),
-        label: label_of(call).unwrap_or_else(|| run_id.clone()),
+        run_id: run_id.to_string(),
+        task_run_id: Some(key),
+        child_id: Some(run_id.to_string()),
+        label: label_of(call).unwrap_or_else(|| run_id.to_string()),
         agent: agent_of(call),
         started_at: call.started_at,
         status: status_of(call),
@@ -142,15 +146,6 @@ fn resolve_or_create<'a>(
         reported_by: Vec::new(),
     });
     runs.last_mut().expect("just pushed")
-}
-
-/// Fill a call-keyed run's child id from a later sighting without moving
-/// `run_id` (spec #1057: the live identity is minted once; only `child_id`
-/// fills).
-fn fill_child(run: &mut AgentRun, reference: &AgentRunRef) {
-    if run.child_id.is_none() && !reference.run_id.is_empty() {
-        run.child_id = Some(reference.run_id.clone());
-    }
 }
 
 /// Add one relation unless that call is already recorded. The relation set is
@@ -171,42 +166,35 @@ fn push_relation(relations: &mut Vec<ToolCallRef>, call: &ToolCall) {
     });
 }
 
-/// Apply one `subAgentActivity` observation. The activity's `kind` is the state
-/// the client reported; identical states collapse, and a state a later report
-/// supersedes wins because the fold is in transcript order. The call id is never
-/// the dedupe key: the wire reuses an activity item's id between its start and
-/// its completion, and the completion must still apply.
+/// Apply one report observation. The state is the **adapter's declaration**
+/// ([`ToolCall::status`]): a Codex `subAgentActivity` maps its wire `kind` onto
+/// that status before it reaches the read model, so this fold never parses a
+/// vendor payload. A state a later report supersedes wins because the fold is
+/// in transcript order; the call id is never the dedupe key, because the wire
+/// reuses an activity item's id between its start and its completion.
 fn apply_report(run: &mut AgentRun, call: &ToolCall) {
-    let kind = call
-        .input
-        .as_ref()
-        .and_then(|input| input.get("kind"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let (status, phase) = match kind {
-        "started" | "interacted" | "resumed" => (RunStatus::Running, Some(Phase::Reasoning)),
-        "completed" => (RunStatus::Completed, None),
-        "interrupted" => (RunStatus::Cancelled, None),
-        // An activity kind this build does not know: the client reported
-        // something, but not a status this read can name — never guessed.
-        _ => (RunStatus::Running, None),
-    };
-    if run.status != status {
-        run.status = status;
+    let status = status_of(call);
+    run.status = status;
+    if status.is_terminal() {
+        // The client states the run ended: no live activity to render. The
+        // durable ending still comes from the child read (the ledger's entry
+        // and ADR-0080 record), never from this observation.
+        run.activity = None;
+        return;
     }
-    if let Some(phase) = phase {
-        let activity = run.activity.get_or_insert(RunActivity {
-            call: None,
-            phase: None,
-            awaiting: None,
-            since: call.started_at,
-        });
-        if activity.phase.is_none() && activity.call.is_none() {
-            activity.phase = Some(phase);
-        }
-        if activity.since.is_none() {
-            activity.since = call.started_at;
-        }
+    let activity = run.activity.get_or_insert(RunActivity {
+        call: None,
+        phase: None,
+        awaiting: None,
+        since: call.started_at,
+    });
+    if activity.phase.is_none() && activity.call.is_none() {
+        // The report says the child is live, not what it is doing: `Waiting`
+        // is the honest phase until the child's own read establishes one.
+        activity.phase = Some(Phase::Waiting);
+    }
+    if activity.since.is_none() {
+        activity.since = call.started_at;
     }
 }
 
@@ -237,7 +225,11 @@ fn label_of(call: &ToolCall) -> Option<String> {
         let Some(text) = input.get(key).and_then(serde_json::Value::as_str) else {
             continue;
         };
-        let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+        // A field that is present but blank is not a label: keep probing the
+        // remaining fields rather than abandoning the whole payload.
+        let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+            continue;
+        };
         return Some(line.to_string());
     }
     None
@@ -364,7 +356,7 @@ pub fn child_run_status(transcript: &SessionTranscript) -> Option<RunStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{ChildEvidence, MessageId, MessageTime, ToolIdentity};
+    use crate::backend::{AgentRunRef, ChildEvidence, MessageId, MessageTime, ToolIdentity};
 
     fn call(
         call_id: &str,
@@ -394,14 +386,16 @@ mod tests {
         }
     }
 
+    /// One report call the way the Codex adapter declares it: the wire
+    /// `kind` already mapped onto the call's status, so the fold reads the
+    /// adapter's declaration and never the raw payload.
     fn report(call_id: &str, child: &str, kind: &str) -> ToolCall {
-        let mut call = call(
-            call_id,
-            DelegationEffect::Report,
-            &[child],
-            ToolStatus::Completed,
-            Some(2),
-        );
+        let status = match kind {
+            "completed" => ToolStatus::Completed,
+            "interrupted" => ToolStatus::Error,
+            _ => ToolStatus::Running,
+        };
+        let mut call = call(call_id, DelegationEffect::Report, &[child], status, Some(2));
         call.input = Some(serde_json::json!({"kind": kind, "agentThreadId": child}));
         call
     }
@@ -452,29 +446,49 @@ mod tests {
         assert!(read.runs.is_empty(), "a receiverless launch mints nothing");
     }
 
-    /// The identity is minted once: a call-keyed run keeps its `run_id` when a
-    /// later fact names its child id, and only `child_id` fills in.
+    /// An addressing call with no target addresses the Turn's runs as a SET:
+    /// it mints nothing (spec #1057). The same holds for a report naming no
+    /// child — an empty reference is not a run identity, and the producers
+    /// strip the ids they cannot name.
     #[test]
-    fn a_call_keyed_run_never_rekeys_when_its_child_id_appears() {
-        // `wait` addresses a run it can only name by its own call (the shape a
-        // wire gives when the target list is empty): the run is keyed by the
-        // creating call's id.
-        let mut address = call(
+    fn an_unnamed_reference_mints_nothing() {
+        let mut wait = call(
             "call_wait",
             DelegationEffect::Address,
             &[],
-            ToolStatus::Running,
+            ToolStatus::Completed,
             Some(5),
         );
-        address.input = Some(serde_json::json!({"tool": "wait"}));
-        let read = transcript(vec![address]);
+        wait.input = Some(serde_json::json!({"tool": "wait"}));
+        let mut empty_address = call(
+            "call_empty",
+            DelegationEffect::Address,
+            &[""],
+            ToolStatus::Completed,
+            Some(5),
+        );
+        empty_address.input = Some(serde_json::json!({"tool": "sendInput"}));
+        let mut empty_report = call(
+            "call_activity",
+            DelegationEffect::Report,
+            &[""],
+            ToolStatus::Running,
+            Some(6),
+        );
+        empty_report.input = Some(serde_json::json!({"kind": "started", "agentThreadId": ""}));
+        let read = transcript(vec![wait, empty_address, empty_report]);
         assert!(
             read.runs.is_empty(),
-            "an addressing call with no target mints nothing"
+            "a call that names no run mints no run: {:?}",
+            read.runs
         );
+        assert!(read.run_evidence_suspects().is_empty());
+    }
 
-        // A report naming the child before its launch creates the run keyed by
-        // the child, which the later launch resolves (never a second record).
+    /// A report naming the child before its launch creates the run, and the
+    /// later launch resolves it: one record, and `run_id` never moves.
+    #[test]
+    fn a_report_before_its_launch_resolves_the_same_run() {
         let read = transcript(vec![
             report("call_activity", "thread_1", "started"),
             call(
@@ -495,6 +509,83 @@ mod tests {
         );
         assert_eq!(run.launched_by.len(), 1, "the later launch is a relation");
         assert_eq!(run.reported_by.len(), 1);
+    }
+
+    /// Spec #1057's acceptance: a run with no child id (if a producer has none)
+    /// still carries its label and status, and its identity/durable key come
+    /// from the creating call — never an empty-id record. No producer emits one
+    /// today (both strip ids they cannot name), so the shape is asserted
+    /// directly.
+    #[test]
+    fn a_run_with_no_child_id_keeps_its_label_and_key() {
+        let run = AgentRun {
+            run_id: "call_creator".into(),
+            task_run_id: Some("call_creator".into()),
+            child_id: None,
+            label: "review the diff".into(),
+            agent: Some("worker".into()),
+            started_at: Some(1),
+            status: RunStatus::Running,
+            activity: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        };
+        let mut read = SessionTranscript::default();
+        read.runs = vec![run];
+        assert_eq!(read.runs[0].ending_key(), "call_creator");
+        assert!(read.runs[0].is_live());
+        assert!(
+            read.run_children().is_empty(),
+            "nothing to read for a run with no child id"
+        );
+        assert!(read.run_evidence_suspects().is_empty());
+    }
+
+    /// A launch naming N children mints a DISTINCT durable key per run
+    /// (spec #1057's P4, review finding 1): one call id cannot identify two
+    /// runs' endings. A single-receiver fact keeps the call id (ADR-0080).
+    #[test]
+    fn one_launch_naming_two_children_mints_one_key_each() {
+        let read = transcript(vec![call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["thread_a", "thread_b"],
+            ToolStatus::Running,
+            Some(10),
+        )]);
+        assert_eq!(read.runs.len(), 2);
+        let keys: Vec<&str> = read.runs.iter().map(AgentRun::ending_key).collect();
+        assert_eq!(keys, ["thread_a", "thread_b"]);
+        assert_ne!(keys[0], keys[1], "two runs never share a durable key");
+        assert!(
+            read.runs
+                .iter()
+                .all(|run| run.task_run_id.as_deref() == run.child_id.as_deref()),
+            "a multi-receiver fact keys each run by its own child id"
+        );
+    }
+
+    /// A report's state is the adapter's declaration: a completed observation
+    /// ends the run, an interrupted one fails it, and an unknown/new activity
+    /// kind (declared `Running`) keeps it live — the fold never parses the
+    /// vendor's `kind`.
+    #[test]
+    fn a_report_uses_the_adapters_status() {
+        let read = transcript(vec![
+            report("call_start", "thread_1", "started"),
+            report("call_done", "thread_1", "completed"),
+        ]);
+        assert_eq!(read.runs[0].status, RunStatus::Completed);
+        assert_eq!(read.runs[0].activity, None, "no live activity once ended");
+
+        let read = transcript(vec![report("call_interrupt", "thread_2", "interrupted")]);
+        assert_eq!(read.runs[0].status, RunStatus::Failed);
+
+        let mut unknown = report("call_unknown", "thread_3", "started");
+        unknown.status = ToolStatus::Running;
+        let read = transcript(vec![unknown]);
+        assert_eq!(read.runs[0].status, RunStatus::Running);
     }
 
     /// A resumed `task` launches the same child again: `launched_by` is a set,
@@ -587,44 +678,53 @@ mod tests {
         );
     }
 
-    /// A non-launch fact that names no child id creates a CALL-KEYED run: the
-    /// creating call's id is the live identity, `task_run_id` is ADR-0080's
-    /// key, and nothing shares an empty-id identity. A later sighting of the
-    /// same call fills `child_id` and never moves the key.
+    /// Review finding 6: a run a report already declared terminal is still an
+    /// evidence suspect. The client's statement removes the live row, but only
+    /// the child's own read supplies the durable `结束` ending — otherwise the
+    /// row would vanish with no entry and no ADR-0080 record.
     #[test]
-    fn a_call_keyed_run_keeps_its_key_and_fills_a_later_child_id() {
-        let mut anonymous = report("call_report", "", "started");
-        anonymous.input = Some(serde_json::json!({"kind": "started", "agentThreadId": ""}));
-        let read = transcript(vec![anonymous.clone()]);
-        assert_eq!(read.runs.len(), 1);
-        let run = &read.runs[0];
-        assert_eq!(
-            run.run_id, "call_report",
-            "the creating call's id, never an empty one"
-        );
-        assert_eq!(run.child_id, None, "no child id was reported yet");
-        assert_eq!(run.task_run_id.as_deref(), Some("call_report"));
-        assert!(!run.label.is_empty(), "the run still renders a label");
-
-        // The same activity's completion (one wire item, two states) gains the
-        // child id: the run is the SAME record and the key does not move.
-        let mut completed = report("call_report", "thread_1", "completed");
-        completed.input = Some(serde_json::json!({
-            "kind": "completed",
-            "agentThreadId": "thread_1"
-        }));
-        let read = transcript(vec![anonymous, completed]);
-        assert_eq!(read.runs.len(), 1, "one call is one run");
-        assert_eq!(read.runs[0].run_id, "call_report", "the key never moves");
-        assert_eq!(read.runs[0].child_id.as_deref(), Some("thread_1"));
+    fn a_report_terminal_run_remains_an_evidence_suspect() {
+        let read = transcript(vec![report("call_done", "thread_1", "completed")]);
         assert_eq!(read.runs[0].status, RunStatus::Completed);
+        assert!(!read.runs[0].is_live(), "the client states the run ended");
+        assert_eq!(
+            read.run_evidence_suspects(),
+            vec![("call_done".to_string(), "thread_1".to_string())],
+            "the child read still has to confirm the end"
+        );
 
-        // Two call-keyed runs never share an empty identity.
-        let mut other = report("call_other", "", "started");
-        other.input = Some(serde_json::json!({"kind": "started", "agentThreadId": ""}));
-        let read = transcript(vec![other]);
-        assert_eq!(read.runs[0].run_id, "call_other");
-        assert_ne!(read.runs[0].run_id, run.run_id);
+        let mut read = read;
+        assert!(read.apply_run_child_evidence("call_done", ChildEvidence::Terminal { completed_at: 3 }));
+        assert_eq!(read.task_retirements.len(), 1);
+        assert_eq!(
+            read.task_retirements[0].label.as_deref(),
+            Some("thread_1"),
+            "the entry names the run (its own label fallback here)"
+        );
+    }
+
+    /// A run a Background Task already represents is not read twice: the
+    /// runtime's child path owns it, and the two rules share one predicate.
+    #[test]
+    fn a_run_represented_by_a_task_is_not_an_evidence_suspect() {
+        let mut read = transcript(vec![call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["thread_1"],
+            ToolStatus::Running,
+            Some(1),
+        )]);
+        read.background_tasks.push(crate::backend::BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_spawn".into(),
+            },
+            shell_id: None,
+            child_id: Some("thread_1".into()),
+            started_at: Some(1),
+        });
+        assert!(read.run_evidence_suspects().is_empty());
+        assert!(read.run_is_task(&read.runs[0], &read.background_tasks[0]));
     }
 
     /// A child that ends with no Wake retires through its child evidence: the

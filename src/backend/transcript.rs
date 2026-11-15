@@ -197,6 +197,7 @@ impl SessionTranscript {
                             task,
                             ending: TaskRetirementEnding::Ended(end.clone()),
                             finished_at: *completed_at,
+                            label: None,
                         });
                     }
                     Some(ShellRuntime::Missing) => {
@@ -205,6 +206,7 @@ impl SessionTranscript {
                             task,
                             ending: TaskRetirementEnding::Lost,
                             finished_at: None,
+                            label: None,
                         });
                     }
                 }
@@ -255,6 +257,7 @@ impl SessionTranscript {
                     task,
                     ending: TaskRetirementEnding::Cleaned,
                     finished_at: Some(now_ms),
+                    label: None,
                 });
             } else {
                 kept.push(task);
@@ -286,18 +289,19 @@ impl SessionTranscript {
         };
         let task = self.background_tasks.remove(index);
         self.unconfirmed_tasks.remove(call_id);
+        // `Unfinished` returned above, so the two remaining answers are the
+        // only ones here: a terminal child with its clock, or a gone one.
         let (ending, finished_at) = match evidence {
             ChildEvidence::Terminal { completed_at } => {
                 (TaskRetirementEnding::ChildEnded, Some(completed_at))
             }
-            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
-            // Returned above; kept for the match's exhaustiveness.
-            ChildEvidence::Unfinished => return,
+            ChildEvidence::Gone | ChildEvidence::Unfinished => (TaskRetirementEnding::Lost, None),
         };
         self.task_retirements.push(TaskRetirement {
             task,
             ending,
             finished_at,
+            label: None,
         });
     }
 
@@ -318,27 +322,41 @@ impl SessionTranscript {
             .collect()
     }
 
-    /// The live runs that carry a child id and are not already a Background
-    /// Task — the child-evidence suspects for a client with no runtime verdict
-    /// registry (Codex). Each entry is `(ending key, child id)`: the ending key
-    /// is the run's `task_run_id` when minted (ADR-0080), which is what a
-    /// recorded ending resolves. A run represented by a Background Task is
-    /// excluded, because the existing runtime/child-evidence path already
-    /// retires it; reading it twice would spend a request and could retire it
-    /// on a different clock.
+    /// The runs a child-evidence read must cover: a live run, or a run a
+    /// `subAgentActivity` report already declared terminal. The report is the
+    /// client's statement, never the durable ending: its live ROW leaves the
+    /// ledger immediately (the client says it ended), and the child read still
+    /// has to supply the `结束` entry and the ADR-0080 record — otherwise the
+    /// row would disappear with neither.
+    ///
+    /// Each entry is `(ending key, child id)`: the ending key is the run's
+    /// `task_run_id` when minted (ADR-0080), which is what a recorded ending
+    /// resolves. A run represented by a Background Task is excluded, because
+    /// the existing runtime/child-evidence path already retires it; reading it
+    /// twice would spend a request and could retire it on a different clock.
     pub fn run_evidence_suspects(&self) -> Vec<(String, String)> {
         self.runs
             .iter()
-            .filter(|run| run.is_live())
+            .filter(|run| run.is_live() || !run.reported_by.is_empty())
             .filter_map(|run| {
                 let child = run.child_id.as_deref()?;
                 let task = self
                     .background_tasks
                     .iter()
-                    .any(|task| task.tool.call_id == run.ending_key());
+                    .any(|task| self.run_is_task(run, task));
                 (!task).then(|| (run.ending_key().to_string(), child.to_string()))
             })
             .collect()
+    }
+
+    /// Whether one run and one Background Task name the same live run: the
+    /// launch call id, the durable key or the child id matches. The one rule
+    /// the ledger's row join and the evidence-suspect exclusion share, so they
+    /// cannot disagree about which rows a task already represents.
+    pub fn run_is_task(&self, run: &AgentRun, task: &BackgroundTask) -> bool {
+        task.tool.call_id == run.ending_key()
+            || run.ids().any(|id| task.tool.call_id == id)
+            || (task.child_id.is_some() && task.child_id == run.child_id)
     }
 
     /// The live runs whose client still reports them running, in read order.
@@ -355,10 +373,13 @@ impl SessionTranscript {
     ///
     /// The retirement's synthesized task names the run by its durable key, so
     /// the ending records under the same `TaskRunId` every other writer resolves.
+    ///
+    /// A terminal child clock BEFORE the run's own start is a previous turn's
+    /// evidence, not this run's: a resumed child's newest assistant message can
+    /// still be the old turn's until the new one emits, and retiring on it
+    /// would end a run that just began. `Gone` carries no clock and is always
+    /// this run's (the child cannot be hosted at all).
     pub fn apply_run_child_evidence(&mut self, run_id: &str, evidence: ChildEvidence) -> bool {
-        if evidence == ChildEvidence::Unfinished {
-            return false;
-        }
         let Some(index) = self
             .runs
             .iter()
@@ -366,14 +387,21 @@ impl SessionTranscript {
         else {
             return false;
         };
-        let run = self.runs.remove(index);
         let (ending, finished_at) = match evidence {
             ChildEvidence::Terminal { completed_at } => {
+                if self.runs[index]
+                    .started_at
+                    .is_some_and(|started| completed_at < started)
+                {
+                    return false;
+                }
                 (TaskRetirementEnding::ChildEnded, Some(completed_at))
             }
             ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
+            // No evidence: the run stays exactly as the client stated it.
             ChildEvidence::Unfinished => return false,
         };
+        let run = self.runs.remove(index);
         self.task_retirements.push(TaskRetirement {
             task: BackgroundTask {
                 // The ledger's rows stay `shell`/`subagent` (ADR-0105's
@@ -389,6 +417,7 @@ impl SessionTranscript {
             },
             ending,
             finished_at,
+            label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
         });
         self.unconfirmed_tasks.remove(run.ending_key());
         true
@@ -1431,6 +1460,12 @@ pub struct TaskRetirement {
     /// When the run ended, when the runtime reported a completion time; the
     /// `Lost` ending carries none (the runtime had nothing to report).
     pub finished_at: Option<i64>,
+    /// The run's own label when the retirement came from an [`AgentRun`]
+    /// (spec #1057's P4): the completion entry names the run it belongs to,
+    /// not a re-join through the launch payload (which a multi-child launch or
+    /// a compacted read may not carry). `None` for a Background Task, whose
+    /// label is still joined from its originating input.
+    pub label: Option<String>,
 }
 
 /// What took a task out of the live list, as its [`TaskRetirement`] records it.
@@ -2144,7 +2179,7 @@ impl AgentRun {
     /// terminal (spec #1057's "a run always has an exit"), so it counts as
     /// live until evidence or a cleanup retires it.
     pub fn is_live(&self) -> bool {
-        matches!(self.status, RunStatus::Running | RunStatus::Unknown)
+        !self.status.is_terminal()
     }
 
     /// Every id the run is known by, the live identity first — what a durable
@@ -2171,6 +2206,20 @@ pub enum RunStatus {
     Failed,
     Cancelled,
     Unknown,
+}
+
+impl RunStatus {
+    /// Whether the client's statement is a terminal one. `Unknown` is NOT
+    /// terminal: a run with no client statement still has an exit owed (its
+    /// evidence or a cleanup), and `Running` obviously is not. This is the one
+    /// predicate the fold, the render gather and the ledger read, so no surface
+    /// can disagree about whether a run is still live.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        )
+    }
 }
 
 /// What a live [`AgentRun`] is doing, in neutral semantics (ADR-0054/0105).
@@ -2849,6 +2898,7 @@ mod tests {
                 task: shell_task("call_done", "sh_done"),
                 ending: TaskRetirementEnding::Ended(ShellEnd::Exited),
                 finished_at: Some(2_000),
+                label: None,
             }]
         );
         assert_eq!(
@@ -2937,6 +2987,7 @@ mod tests {
                 task: shell_task("call_clear", "sh_clear"),
                 ending: TaskRetirementEnding::Cleaned,
                 finished_at: Some(3_000),
+                label: None,
             }],
             "the cleaned task keeps its identity, the click's clock, and the manual ending"
         );
@@ -3006,6 +3057,7 @@ mod tests {
                 task: child_task("call_sub", "ses_child"),
                 ending: TaskRetirementEnding::ChildEnded,
                 finished_at: Some(2_000),
+                label: None,
             }],
             "the child's own ending carries its completion clock"
         );
@@ -3027,6 +3079,7 @@ mod tests {
                 task: child_task("call_sub", "ses_child"),
                 ending: TaskRetirementEnding::Lost,
                 finished_at: None,
+                label: None,
             }],
             "a gone child is the Lost ending with no invented clock"
         );
