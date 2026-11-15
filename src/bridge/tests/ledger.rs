@@ -2212,6 +2212,7 @@ async fn a_run_rendered_row_keeps_the_unconfirmed_marker() {
                 call.detail = crate::backend::ToolDetail::Delegation {
                     runs: vec![crate::backend::AgentRunRef {
                         run_id: "ses_call_sub".into(),
+                        status: None,
                     }],
                     effect: crate::backend::DelegationEffect::Launch,
                 };
@@ -2436,6 +2437,7 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
             detail: crate::backend::ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_child".into(),
+                    status: None,
                 }],
                 effect: crate::backend::DelegationEffect::Launch,
             },
@@ -2468,6 +2470,7 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
             detail: crate::backend::ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_child".into(),
+                    status: None,
                 }],
                 effect: crate::backend::DelegationEffect::Report,
             },
@@ -2574,7 +2577,10 @@ async fn a_multi_launch_retires_each_child_on_its_own_ending() {
             detail: crate::backend::ToolDetail::Delegation {
                 runs: ["thread_a", "thread_b"]
                     .iter()
-                    .map(|id| crate::backend::AgentRunRef { run_id: (*id).into() })
+                    .map(|id| crate::backend::AgentRunRef {
+                        run_id: (*id).into(),
+                        status: None,
+                    })
                     .collect(),
                 effect: crate::backend::DelegationEffect::Launch,
             },
@@ -2605,7 +2611,10 @@ async fn a_multi_launch_retires_each_child_on_its_own_ending() {
                 "agentThreadId": child
             })),
             detail: crate::backend::ToolDetail::Delegation {
-                runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: child.into(),
+                    status: None,
+                }],
                 effect: crate::backend::DelegationEffect::Report,
             },
             ..ToolCall::default()

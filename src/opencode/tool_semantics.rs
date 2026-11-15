@@ -356,6 +356,7 @@ fn delegation_detail(_input: Option<&Value>, metadata: Option<&Value>) -> ToolDe
             .map(|id| {
                 vec![crate::backend::AgentRunRef {
                     run_id: id.to_string(),
+                    status: None,
                 }]
             })
             .unwrap_or_default(),

@@ -1405,6 +1405,7 @@ async fn a_childs_approval_still_rehomes_to_the_parents_card() {
                 detail: crate::backend::ToolDetail::Delegation {
                     runs: vec![crate::backend::AgentRunRef {
                         run_id: "ses_child".into(),
+                        status: None,
                     }],
                     effect: crate::backend::DelegationEffect::Launch,
                 },

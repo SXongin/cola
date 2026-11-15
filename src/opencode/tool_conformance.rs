@@ -591,6 +591,7 @@ fn delegation_is_one_shape_per_verb() {
             ToolDetail::Delegation {
                 runs: vec![AgentRunRef {
                     run_id: "thread-2".to_string(),
+                    status: None
                 }],
                 effect: DelegationEffect::Report,
             }
@@ -631,6 +632,7 @@ fn delegation_is_one_shape_per_verb() {
         ToolDetail::Delegation {
             runs: vec![AgentRunRef {
                 run_id: "ses_child".to_string(),
+                status: None,
             }],
             effect: DelegationEffect::Launch,
         },
@@ -670,9 +672,12 @@ fn delegation_is_one_shape_per_verb() {
         runs,
         two_children
             .iter()
-            .map(|id| AgentRunRef { run_id: id.clone() })
+            .map(|id| AgentRunRef {
+                run_id: id.clone(),
+                status: Some(crate::backend::RunStatus::Running)
+            })
             .collect::<Vec<_>>(),
-        "a completion naming two children names two runs"
+        "a completion naming two children names two runs, each with its own state"
     );
 }
 

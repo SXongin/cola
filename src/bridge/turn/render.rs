@@ -11672,6 +11672,7 @@ Index: /x/src/main.rs
                     detail: ToolDetail::Delegation {
                         runs: vec![crate::backend::AgentRunRef {
                             run_id: "ses_shared".into(),
+                            status: None,
                         }],
                         effect: crate::backend::DelegationEffect::Launch,
                     },
@@ -11881,7 +11882,10 @@ Index: /x/src/main.rs
             metadata: Some(serde_json::json!({"sessionId": child, "parentSessionId": "ses_parent"})),
             output: ToolOutput::default(),
             detail: ToolDetail::Delegation {
-                runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: child.into(),
+                    status: None,
+                }],
                 effect: crate::backend::DelegationEffect::Launch,
             },
             ..ToolCall::default()
@@ -11902,7 +11906,10 @@ Index: /x/src/main.rs
             metadata: Some(serde_json::json!({"sessionID": child, "status": "running"})),
             output: ToolOutput::default(),
             detail: ToolDetail::Delegation {
-                runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: child.into(),
+                    status: None,
+                }],
                 effect: crate::backend::DelegationEffect::Launch,
             },
             ..ToolCall::default()
@@ -12080,6 +12087,7 @@ Index: /x/src/main.rs
                     .iter()
                     .map(|id| crate::backend::AgentRunRef {
                         run_id: id.to_string(),
+                        status: None,
                     })
                     .collect(),
                 effect,
@@ -12195,6 +12203,7 @@ Index: /x/src/main.rs
                     detail: ToolDetail::Delegation {
                         runs: vec![crate::backend::AgentRunRef {
                             run_id: "thread_1".into(),
+                            status: None,
                         }],
                         effect: crate::backend::DelegationEffect::Report,
                     },

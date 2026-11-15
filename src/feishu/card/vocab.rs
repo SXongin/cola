@@ -386,7 +386,8 @@ mod tests {
                 ToolKind::Other,
                 ToolDetail::Delegation {
                     runs: vec![AgentRunRef {
-                        run_id: "run_1".to_string()
+                        run_id: "run_1".to_string(),
+                        status: None
                     }],
                     effect: DelegationEffect::Launch,
                 }

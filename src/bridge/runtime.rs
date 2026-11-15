@@ -669,6 +669,7 @@ mod tests {
             detail: crate::backend::ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_child".into(),
+                    status: None,
                 }],
                 effect: crate::backend::DelegationEffect::Launch,
             },
@@ -728,6 +729,7 @@ mod tests {
             detail: crate::backend::ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_fresh".into(),
+                    status: None,
                 }],
                 effect: crate::backend::DelegationEffect::Launch,
             },
@@ -791,6 +793,7 @@ mod tests {
             detail: crate::backend::ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_child".into(),
+                    status: None,
                 }],
                 effect: crate::backend::DelegationEffect::Report,
             },

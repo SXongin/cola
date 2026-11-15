@@ -6319,6 +6319,7 @@ mod tests {
             detail: ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_1".into(),
+                    status: None,
                 }],
                 effect: DelegationEffect::Report,
             },
@@ -6357,7 +6358,10 @@ mod tests {
                     call_id: format!("call_{child}"),
                 },
                 detail: ToolDetail::Delegation {
-                    runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: child.into(),
+                        status: None,
+                    }],
                     effect: DelegationEffect::Launch,
                 },
                 ..ToolCall::default()
@@ -6395,6 +6399,7 @@ mod tests {
             detail: ToolDetail::Delegation {
                 runs: vec![crate::backend::AgentRunRef {
                     run_id: "thread_1".into(),
+                    status: None,
                 }],
                 effect: DelegationEffect::Address,
             },
@@ -6418,7 +6423,10 @@ mod tests {
             detail: ToolDetail::Delegation {
                 runs: ["thread_a", "thread_b"]
                     .iter()
-                    .map(|id| crate::backend::AgentRunRef { run_id: (*id).into() })
+                    .map(|id| crate::backend::AgentRunRef {
+                        run_id: (*id).into(),
+                        status: None,
+                    })
                     .collect(),
                 effect: DelegationEffect::Launch,
             },

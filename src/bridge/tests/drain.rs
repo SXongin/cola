@@ -4394,6 +4394,7 @@ fn wedged_launch_transcript() -> SessionTranscript {
                 detail: crate::backend::ToolDetail::Delegation {
                     runs: vec![crate::backend::AgentRunRef {
                         run_id: "ses_child".into(),
+                        status: None,
                     }],
                     effect: crate::backend::DelegationEffect::Launch,
                 },
