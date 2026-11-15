@@ -85,6 +85,11 @@ pub(crate) const AWAITING_PERMISSION_TITLE: &str = "⏳ 等待你的授权";
 pub(crate) const AWAITING_QUESTION_TITLE: &str = "⏳ 等待你的回答";
 pub(crate) const AWAITING_BOTH_TITLE: &str = "⏳ 等待你的授权/回答";
 
+/// The waiting card's header while Background Tasks are still live (ADR-0059)
+/// and the Session Card's matching status chip (#586): one word, two surfaces,
+/// so the card keeps no private copy.
+pub(crate) const WAITING_BACKGROUND_CHIP: &str = "⏳ 等待后台任务";
+
 /// The turn-level target a receiverless addressing receipt names (ADR-0106:
 /// a `wait` with no receiver addresses the Turn's live runs as a set). Copy,
 /// because a translator would touch it.
@@ -451,6 +456,21 @@ mod tests {
         assert_eq!(phase_token(Phase::Responding), PHASE_RESPONDING);
         assert_ne!(PHASE_WAITING, PHASE_REASONING);
         assert_ne!(PHASE_REASONING, PHASE_RESPONDING);
+        // The ADR's visible-change evidence: one literal pin, so every other
+        // assertion reading the constant cannot hide a silent rename.
+        assert_eq!(PHASE_WAITING, "waiting");
+        assert_eq!(PHASE_REASONING, "reasoning");
+        assert_eq!(PHASE_RESPONDING, "responding");
+    }
+
+    /// The header titles are the wait labels behind the header's ⏳. One home,
+    /// but two constants (rustc cannot concatenate constants), so this pins the
+    /// shape both surfaces rely on.
+    #[test]
+    fn the_awaiting_titles_are_the_labels_behind_the_header_icon() {
+        assert_eq!(AWAITING_PERMISSION_TITLE, format!("⏳ {AWAITING_PERMISSION}"));
+        assert_eq!(AWAITING_QUESTION_TITLE, format!("⏳ {AWAITING_QUESTION}"));
+        assert_eq!(AWAITING_BOTH_TITLE, format!("⏳ {AWAITING_BOTH}"));
     }
 
     /// Every `TaskEnding` renders a word, and the client's `RunStatus` never

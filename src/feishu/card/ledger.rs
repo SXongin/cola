@@ -637,6 +637,7 @@ mod tests {
     use super::*;
     use crate::backend::Phase;
     use crate::feishu::card::tool_render::ChildActivity;
+    use crate::feishu::card::vocab::{LEDGER_TITLE, TOOL_SHELL, TOOL_SUBAGENT};
 
     /// A shell row's output window (spec #588, #592) renders under the row as
     /// the pinned copy: the cutoff label (`截至于 HH:MM`) then the tail as a
@@ -884,10 +885,15 @@ mod tests {
                 output: None,
             },
         ];
-        assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2）");
+        assert_eq!(
+            task_ledger_title(&rows).unwrap(),
+            format!("⏳ {LEDGER_TITLE}（2）")
+        );
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "· shell：**gh run watch** · 14:02 · 3m12s\n· subagent：**review the diff** · 14:04"
+            format!(
+                "· {TOOL_SHELL}：**gh run watch** · 14:02 · 3m12s\n· {TOOL_SUBAGENT}：**review the diff** · 14:04"
+            )
         );
     }
 
@@ -989,13 +995,13 @@ mod tests {
         assert_eq!(
             render(&row(Some(thinking.clone()), false)),
             format!(
-                "· subagent：**review the diff** · 14:04 · {} 30s · 等待你的授权",
+                "· {TOOL_SUBAGENT}：**review the diff** · 14:04 · {} 30s · 等待你的授权",
                 super::super::vocab::phase_token(crate::backend::Phase::Waiting)
             )
         );
         assert_eq!(
             render(&row(Some(thinking), true)),
-            "· subagent：**review the diff** · 14:04 · ⚠️ 状态待确认",
+            format!("· {TOOL_SUBAGENT}：**review the diff** · 14:04 · ⚠️ 状态待确认"),
             "an unconfirmed row renders no activity at all"
         );
         // A tool whose server clock has not landed shows its name alone, and a
@@ -1073,10 +1079,13 @@ mod tests {
                 output: None,
             },
         ];
-        assert_eq!(task_ledger_title(&rows).unwrap(), "⏳ 后台任务（2 · 1 待确认）");
+        assert_eq!(
+            task_ledger_title(&rows).unwrap(),
+            format!("⏳ {LEDGER_TITLE}（2 · 1 待确认）")
+        );
         assert_eq!(
             task_ledger_text(&rows, now).unwrap(),
-            "· shell：**npm run build** · 14:02 · 3m12s · ⚠️ 状态待确认\n· subagent"
+            format!("· {TOOL_SHELL}：**npm run build** · 14:02 · 3m12s · ⚠️ 状态待确认\n· {TOOL_SUBAGENT}")
         );
         // A fully unconfirmed section keeps the same shape; the marker only
         // appends, it never replaces a row's own facts.

@@ -21,7 +21,6 @@ use crate::feishu::card::question::FallbackLoss;
 use crate::feishu::card::tool_render::{
     DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_from_metadata, parse_edit_diff,
 };
-use crate::feishu::card::vocab::INPUT_LABEL;
 
 use super::companion::{
     companion_target_digest, describe_permission_for, describe_permission_target_summary,
@@ -3009,6 +3008,12 @@ pub(crate) fn describe_action(action: &str) -> (&'static str, &'static str) {
 /// though the target budget is much larger — the spec's fixed 150 characters.
 const PERMISSION_REASON_MAX_CHARS: usize = 150;
 
+/// The permission card's caption for a request's free-form `input` field. It
+/// happens to read like the Tool Panel's section label, but it is a separate
+/// surface: keeping a local constant means a panel-label rename cannot silently
+/// rename a permission caption.
+const PERMISSION_INPUT_CAPTION: &str = "输入";
+
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by its inline block, so the two look and
 /// behave alike).
@@ -3104,7 +3109,7 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
             ("command", "命令"),
             ("cwd", "目录"),
             ("description", "说明"),
-            ("input", INPUT_LABEL),
+            ("input", PERMISSION_INPUT_CAPTION),
             ("path", "路径"),
         ] {
             if let Some(v) = meta.get(key) {

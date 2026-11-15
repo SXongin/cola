@@ -1454,8 +1454,9 @@ pub(crate) const BUSY_CHIP: &str = "⚙️ 运行中";
 /// The 等待后台任务 chip (#586, ADR-0059): the adopted Session's Execution has
 /// ended while Background Tasks are still live, so the card follows the wait
 /// instead of reporting 空闲 — the card yields ⏳ with the ledger, and the
-/// completion Wake resumes it in place.
-pub(crate) const WAITING_BACKGROUND_CHIP: &str = "⏳ 等待后台任务";
+/// completion Wake resumes it in place. The words live in [`vocab`] beside the
+/// card header that renders the same wait.
+pub(crate) use super::vocab::WAITING_BACKGROUND_CHIP;
 
 /// The retry run-state chip.
 pub(crate) const RETRY_CHIP: &str = "🔁 需要重试";

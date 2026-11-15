@@ -43,6 +43,7 @@ use crate::bridge::tasks::TaskRunId;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::feishu::card::CardState;
+use crate::feishu::card::vocab::{LEDGER_TITLE, TOOL_SHELL, TOOL_SUBAGENT};
 
 /// A live Background Task of the `shell` kind: the tool call that started it
 /// and the shell it runs in.
@@ -394,9 +395,9 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
     let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建并审阅"));
     wait_for_card_update(&platform, "the full tail", CardUpdates::Any, |card| {
         let text = card_text(card);
-        text.contains("⏳ 后台任务（2）")
-            && text.contains("· shell：**npm run build**")
-            && text.contains("· subagent：**review the diff**")
+        text.contains(&format!("⏳ {LEDGER_TITLE}（2）"))
+            && text.contains(&format!("· {TOOL_SHELL}：**npm run build**"))
+            && text.contains(&format!("· {TOOL_SUBAGENT}：**review the diff**"))
             && text.contains(&format!("📋 {}", crate::feishu::card::vocab::TOOL_PLAN))
     })
     .await;
@@ -404,13 +405,15 @@ async fn several_tasks_list_in_transcript_order_beside_the_other_tail_sections()
     let card = platform.updated_cards().await.last().cloned().unwrap();
     let text = card_text(&card);
     assert_eq!(
-        text.matches("⏳ 后台任务（2）").count(),
+        text.matches(&format!("⏳ {LEDGER_TITLE}（2）")).count(),
         1,
         "exactly one ledger section: {text}"
     );
-    let shell_row = text.find("· shell：**npm run build**").expect("the shell row");
+    let shell_row = text
+        .find(&format!("· {TOOL_SHELL}：**npm run build**"))
+        .expect("the shell row");
     let sub_row = text
-        .find("· subagent：**review the diff**")
+        .find(&format!("· {TOOL_SUBAGENT}：**review the diff**"))
         .expect("the subagent row");
     assert!(
         shell_row < sub_row,
@@ -2507,8 +2510,8 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
     );
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&yielded).contains("⏳ 后台任务（1）")
-            && card_text(&yielded).contains(crate::feishu::card::vocab::TOOL_SUBAGENT),
+        card_text(&yielded).contains(&format!("⏳ {LEDGER_TITLE}（1）"))
+            && card_text(&yielded).contains(TOOL_SUBAGENT),
         "the child-only run has its own ledger row: {yielded}"
     );
 
