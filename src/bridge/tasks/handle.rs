@@ -330,6 +330,8 @@ impl TasksHandle {
             TaskRetirementEnding::Ended(end) => TaskEndingEvidence::Ended(end.as_str().to_string()),
             TaskRetirementEnding::Lost => TaskEndingEvidence::Lost,
             TaskRetirementEnding::ChildEnded => TaskEndingEvidence::ChildEnded,
+            TaskRetirementEnding::ClientFailed => TaskEndingEvidence::ClientFailed,
+            TaskRetirementEnding::ClientCancelled => TaskEndingEvidence::ClientCancelled,
             // Never derived by the reconcile; the cleanup click records its own.
             TaskRetirementEnding::Cleaned => return false,
         };
@@ -575,6 +577,8 @@ fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option
             }
             TaskEndingEvidence::Lost => TaskRetirementEnding::Lost,
             TaskEndingEvidence::ChildEnded => TaskRetirementEnding::ChildEnded,
+            TaskEndingEvidence::ClientFailed => TaskRetirementEnding::ClientFailed,
+            TaskEndingEvidence::ClientCancelled => TaskRetirementEnding::ClientCancelled,
             TaskEndingEvidence::Wake(_) => return None,
         },
         TaskEndingClass::Cleanup => TaskRetirementEnding::Cleaned,

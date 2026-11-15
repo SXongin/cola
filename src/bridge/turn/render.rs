@@ -1097,6 +1097,8 @@ fn plan_runtime_entries(
             // assistant message finished — the same 结束 entry the runtime's
             // own shell ending renders.
             TaskRetirementEnding::ChildEnded => TaskEnding::RuntimeEnded,
+            TaskRetirementEnding::ClientFailed => TaskEnding::ClientFailed,
+            TaskRetirementEnding::ClientCancelled => TaskEnding::ClientCancelled,
             // The user's own cleanup (spec #588, #590): the click recorded the
             // overlay and synthesized the retirement, and the same render site
             // gives it its 🧹 entry — exactly once, through the ending's shown

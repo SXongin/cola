@@ -210,6 +210,8 @@ pub(crate) fn run_outcome_copy(ending: &TaskEnding) -> &'static str {
         TaskEnding::RuntimeEnded => RUN_ENDED,
         TaskEnding::Lost => RUN_LOST,
         TaskEnding::Cleaned => RUN_CLEANED,
+        TaskEnding::ClientFailed => RUN_FAILED,
+        TaskEnding::ClientCancelled => RUN_CANCELLED,
     }
 }
 
@@ -525,13 +527,15 @@ mod tests {
             (TaskEnding::RuntimeEnded, RUN_ENDED),
             (TaskEnding::Lost, RUN_LOST),
             (TaskEnding::Cleaned, RUN_CLEANED),
+            (TaskEnding::ClientFailed, RUN_FAILED),
+            (TaskEnding::ClientCancelled, RUN_CANCELLED),
         ];
         let mut words = std::collections::BTreeSet::new();
         for (ending, expected) in &cases {
             assert_eq!(run_outcome_copy(ending), *expected, "{ending:?}");
             words.insert(*expected);
         }
-        assert_eq!(words.len(), 6, "the six endings are six distinct words");
+        assert_eq!(words.len(), 6, "the endings share six distinct words");
     }
 
     /// The guard's list is built from the module's constants, so a rename

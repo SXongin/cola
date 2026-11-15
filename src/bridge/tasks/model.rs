@@ -39,6 +39,13 @@ pub enum TaskEnding {
     /// ended it. Never derived by a read — the Bridge synthesizes this ending
     /// from the click, together with the retirement overlay record.
     Cleaned,
+    /// The client itself reported the run `Failed`; its child's terminal
+    /// evidence supplied the clock. The entry reads 失败, not the runtime's
+    /// generic 结束.
+    ClientFailed,
+    /// The client itself reported the run `Cancelled`; its child's terminal
+    /// evidence supplied the clock. The entry reads 已取消.
+    ClientCancelled,
 }
 
 /// One live Background Task as its ledger row renders it: the task's type, the

@@ -423,6 +423,10 @@ pub(crate) async fn reconcile_now(
                         .await
                     {
                         Some(Ok(evidence)) => {
+                            let was_live = transcript
+                                .runs
+                                .iter()
+                                .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
                             let conclusive = matches!(
                                 evidence,
                                 crate::backend::ChildEvidence::Terminal { .. }
@@ -435,10 +439,10 @@ pub(crate) async fn reconcile_now(
                                     transcript,
                                     &mut recorded_retirements,
                                 );
-                            } else if conclusive {
-                                // The read concluded but the run could not take
-                                // the ending (a pre-resume completion): keep it
-                                // visible as unconfirmed so a Cleanup can end
+                            } else if conclusive || !was_live {
+                                // Inconclusive for a client-terminal run, or a
+                                // concluded read the stale guard refused: keep
+                                // it visible as unconfirmed so a Cleanup can end
                                 // it.
                                 transcript.unconfirmed_tasks.insert(run_id.clone());
                             }
