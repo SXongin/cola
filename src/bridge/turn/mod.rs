@@ -1223,7 +1223,7 @@ impl Turn {
                         render::rendered_bound(&handles.cards, &self.session_id, transcript),
                         render::Endings::of(&handles.cards, &self.session_id),
                         plans,
-                        handles.backend.background_tasks_supported(),
+                        handles.backend.reports_live_runs(),
                     );
                 }
                 // Capture the answering model + token usage from the LATEST
@@ -3059,7 +3059,7 @@ impl Turn {
                     state::LedgerCadence::Minute,
                     render::Endings::of(cards, session_id),
                     plans,
-                    backend.background_tasks_supported(),
+                    backend.reports_live_runs(),
                 )
                 .owes();
             card.pending_split.push(state::PendingSplit {
@@ -3154,7 +3154,7 @@ impl Turn {
                 state::LedgerCadence::Second,
                 render::Endings::of(cards, session_id),
                 plans,
-                backend.background_tasks_supported(),
+                backend.reports_live_runs(),
             );
             // The chain has taken this completion's work over, when there is
             // one. Its entry may already be on the card (a yielded ledger
@@ -3438,7 +3438,7 @@ impl Turn {
                 state::LedgerCadence::Second,
                 render::Endings::of(cards, session_id),
                 plans,
-                backend.background_tasks_supported(),
+                backend.reports_live_runs(),
             );
             if let Some(disposition) = &settled {
                 card.acc.apply_ending(disposition);

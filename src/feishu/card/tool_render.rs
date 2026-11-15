@@ -1,8 +1,9 @@
 use std::borrow::Cow;
 
 use crate::backend::{
-    ContentBlock, FileAction, FileContent, FileEdit, NestedCall, SearchScope, TodoList, TodoStatus, TodoStep,
-    ToolCall, ToolDetail, ToolKind, ToolStatus,
+    CallView, ContentBlock, DelegationEffect, FileAction, FileContent, FileEdit, NestedCall, Phase,
+    RunActivity, RunWaits, SearchScope, TodoList, TodoStatus, TodoStep, ToolCall, ToolDetail, ToolKind,
+    ToolStatus,
 };
 
 use super::lang::{PLAIN_TEXT, language_for_path};
@@ -456,18 +457,98 @@ impl ToolPanel {
         self.liveness = liveness;
     }
 
-    /// The child Session a `task`/`subagent` call runs — V1 records
-    /// `state.metadata.sessionId`, V2 `state.metadata.sessionID` (the camelCase
-    /// field each generation's contract carries; AGENTS.md pitfall `wire-shapes`). `None` for any
-    /// other tool, or when the payload recorded no session id.
+    /// The child Session a launch runs — the run's live identity as the
+    /// adapter wrote it into the call's [`ToolDetail::Delegation`] (the launch
+    /// relation replaces the old tool-name check, spec #1057's P4). `None` for
+    /// any call that did not launch a run, or a launch that named no child.
     pub(crate) fn child_session_id(&self) -> Option<&str> {
-        if !is_task_tool(&self.call.identity.name) {
+        let ToolDetail::Delegation {
+            runs,
+            effect: DelegationEffect::Launch,
+        } = &self.call.detail
+        else {
             return None;
+        };
+        runs.first().map(|run| run.run_id.as_str())
+    }
+}
+
+/// Whether a call only addresses or reports on a run — it renders as a one-line
+/// receipt, never a Tool Panel (ADR-0106 §4, spec #1057's P4). Only a launch
+/// keeps its panel: the record of the request.
+pub(crate) fn is_receipt_call(call: &ToolCall) -> bool {
+    matches!(
+        &call.detail,
+        ToolDetail::Delegation {
+            effect: DelegationEffect::Address | DelegationEffect::Report,
+            ..
         }
-        let metadata = self.call.metadata.as_ref()?;
-        ["sessionId", "sessionID"]
-            .iter()
-            .find_map(|key| metadata.get(*key).and_then(serde_json::Value::as_str))
+    )
+}
+
+/// The one-line receipt an addressing or reporting call leaves on its run. The
+/// verb is the wire's own (`wait`, `sendInput`, an activity kind), and the
+/// target names the runs it addressed — or says it addressed the Turn's runs as
+/// a set when it named none. Copy belongs to the card (ADR-0107), so the words
+/// live here until the vocabulary ticket owns them.
+pub(crate) fn receipt_line(call: &ToolCall) -> String {
+    let verb = call
+        .input
+        .as_ref()
+        .and_then(|input| {
+            input
+                .get("tool")
+                .or_else(|| input.get("kind"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|verb| !verb.is_empty())
+        .or_else(|| call.title.as_deref().filter(|title| !title.is_empty()))
+        .unwrap_or(call.identity.name.as_str());
+    let targets: Vec<&str> = match &call.detail {
+        ToolDetail::Delegation { runs, .. } => runs.iter().map(|run| run.run_id.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    if targets.is_empty() {
+        format!("↪ {verb} · 本回合的运行")
+    } else {
+        format!("↪ {verb} · {}", targets.join("、"))
+    }
+}
+
+/// The liveness line's token for one live call (ADR-0105/0107). A Codex child
+/// is reported through `(kind, detail)`, so its `commandExecution` reads
+/// `shell`; an OpenCode child keeps its own id (`bash`/`shell`), which is what
+/// the line has always read. The vocabulary ticket (#1063) owns one token for
+/// every producer; until then this bridge keeps the existing words intact for
+/// OpenCode and gives a Codex child the neutral one.
+pub(crate) fn call_token(call: &CallView) -> String {
+    if !call.identity.name.starts_with("codex/") {
+        return call.identity.name.clone();
+    }
+    match (call.kind, &call.detail) {
+        (ToolKind::Execute, _) => "shell".to_string(),
+        (ToolKind::Edit, ToolDetail::FileEdits(edits)) => {
+            if edits.iter().all(|edit| edit.action == FileAction::Add) {
+                "write".to_string()
+            } else {
+                "edit".to_string()
+            }
+        }
+        (ToolKind::Search, ToolDetail::Search { scope, .. }) => match scope {
+            SearchScope::FileName => "glob".to_string(),
+            SearchScope::Content => "grep".to_string(),
+            SearchScope::Web => "websearch".to_string(),
+        },
+        (ToolKind::Read, _) => "read".to_string(),
+        (ToolKind::Fetch, _) => "fetch".to_string(),
+        (ToolKind::Other, ToolDetail::Delegation { .. }) => "subagent".to_string(),
+        (_, _) => call
+            .identity
+            .name
+            .rsplit('/')
+            .next()
+            .unwrap_or(call.identity.name.as_str())
+            .to_string(),
     }
 }
 
@@ -925,20 +1006,12 @@ fn file_edits_tail(tool: &ToolPanel) -> Option<String> {
 /// rather than riding the diff budget.
 const WRITE_TAIL_MAX_CHARS: usize = 500;
 
-/// The built-in tools whose calls spawn a child session — V1's `task` and V2's
-/// `subagent`: the one call kind whose panel carries liveness, checked by name
-/// in the card and the Bridge.
-pub(crate) const TASK_TOOLS: [&str; 2] = ["task", "subagent"];
-
-/// Whether `name` is a child-session-spawning built-in ([`TASK_TOOLS`]).
-pub(crate) fn is_task_tool(name: &str) -> bool {
-    TASK_TOOLS.contains(&name)
-}
-
-/// A live `task` call's child-session liveness (ADR-0054): what the child is
-/// doing right now, as the panel title shows it. Display-only data — the Bridge
-/// gathers it, the Platform formats it — so the panel stays a view over the
-/// call plus one read-only line.
+/// A live `task`/`subagent` call's child-session liveness (ADR-0054): what the
+/// child is doing right now, as the panel title shows it. Display-only data —
+/// the Bridge gathers it, the Platform formats it — so the panel stays a view
+/// over the call plus one read-only line. It is the card's view of the run's
+/// neutral [`RunActivity`] (`from_run`), so the panel, the ledger and the
+/// completion entry cannot disagree about one run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskLiveness {
     /// The child's current activity: its newest live tool, or the phase its
@@ -967,6 +1040,33 @@ pub enum ChildActivity {
 }
 
 impl TaskLiveness {
+    /// The card's view of one run's neutral activity (ADR-0105, spec #1057's
+    /// P4). The token comes from the call's `(kind, detail)` via
+    /// [`call_token`]; a phase with no live call maps onto the words the line
+    /// already renders. A wait set renders both waits through the header's own
+    /// vocabulary.
+    pub(crate) fn from_run(activity: &RunActivity) -> Self {
+        let activity_kind = match &activity.call {
+            Some(call) => ChildActivity::Tool {
+                name: call_token(call),
+                // The call's own server start is the clock: `shell 28s` counts
+                // from the call, not from the last activity.
+                started_at: call.started_at,
+            },
+            None => match activity.phase {
+                Some(Phase::Reasoning) => ChildActivity::Reasoning,
+                Some(Phase::Responding) => ChildActivity::Replying,
+                Some(Phase::Waiting) | None => ChildActivity::Thinking,
+            },
+        };
+        let wait = activity.awaiting.and_then(awaiting_action);
+        Self {
+            activity: activity_kind,
+            last_activity_ms: activity.clock_ms().unwrap_or_default(),
+            wait,
+        }
+    }
+
     /// The fragment's parts, spelled once (ADR-0054, spec #501): the
     /// activity's display label (a tool's own name, or the word for a phase
     /// with no live tool), the clock its age counts from (`None` when the
@@ -1029,6 +1129,20 @@ pub(crate) struct TitleParts<'a> {
     pub(crate) age_clock_ms: Option<i64>,
     /// The wait's words without the header's icon, when one is pending.
     pub(crate) wait: Option<&'a str>,
+}
+
+/// The liveness fragment's wait vocabulary, from the run's own set: both waits
+/// can be live at once (spec #1057's `RunWaits`).
+fn awaiting_action(waits: RunWaits) -> Option<AwaitingAction> {
+    if !waits.any() {
+        return None;
+    }
+    match (waits.permission, waits.question) {
+        (false, false) => None,
+        (true, false) => Some(AwaitingAction::Permission),
+        (false, true) => Some(AwaitingAction::Question),
+        (true, true) => Some(AwaitingAction::Both),
+    }
 }
 
 /// Seconds between two epoch-ms clocks, never negative.
@@ -6114,52 +6228,68 @@ mod tests {
         assert_eq!(untimed.age_clock_ms(), None);
     }
 
-    /// The child session id is read from a child-spawning call's metadata only:
-    /// V1's `task` records it as `sessionId`, V2's `subagent` as `sessionID`.
-    /// Every other tool and a metadata-less call yield nothing.
+    /// The child session id is the LAUNCH relation's, not a tool name's (spec
+    /// #1057's P4): a call that launched a run names the child its
+    /// `Delegation` ran, and nothing else does — a metadata field alone is no
+    /// longer enough, and an addressing call never names one.
     #[test]
-    fn task_child_session_id_reads_both_generations_metadata() {
-        let plain = ToolPanel::for_test("task", ToolStatus::Running, None, None);
-        assert_eq!(plain.child_session_id(), None);
+    fn a_launch_relation_names_the_child_session() {
+        fn launched(name: &str, child: &str) -> ToolPanel {
+            ToolPanel::new(ToolCall {
+                identity: ToolIdentity {
+                    name: name.into(),
+                    call_id: format!("call_{child}"),
+                },
+                detail: ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef { run_id: child.into() }],
+                    effect: DelegationEffect::Launch,
+                },
+                ..ToolCall::default()
+            })
+        }
 
-        let with_metadata = ToolPanel::new(ToolCall {
-            identity: ToolIdentity {
-                name: "task".into(),
-                call_id: "call_1".into(),
-            },
-            status: ToolStatus::Running,
-            started_at: None,
-            input: None,
-            metadata: Some(json!({"sessionId": "ses_child", "parentSessionId": "ses_parent"})),
-            output: ToolOutput::default(),
-            ..ToolCall::default()
-        });
-        assert_eq!(with_metadata.child_session_id(), Some("ses_child"));
+        assert_eq!(
+            launched("task", "ses_child").child_session_id(),
+            Some("ses_child")
+        );
+        assert_eq!(
+            launched("subagent", "ses_v2_child").child_session_id(),
+            Some("ses_v2_child"),
+            "the relation, not the vendor id, decides"
+        );
 
-        let subagent = ToolPanel::new(ToolCall {
+        // Metadata alone is no launch fact: the old name check is gone.
+        let metadata_only = ToolPanel::new(ToolCall {
             identity: ToolIdentity {
                 name: "subagent".into(),
-                call_id: "call_2".into(),
+                call_id: "call_bare".into(),
             },
-            status: ToolStatus::Running,
-            started_at: None,
-            input: None,
-            metadata: Some(json!({"sessionID": "ses_v2_child", "status": "running"})),
-            output: ToolOutput::default(),
+            metadata: Some(json!({"sessionID": "ses_v2_child"})),
             ..ToolCall::default()
         });
-        assert_eq!(subagent.child_session_id(), Some("ses_v2_child"));
+        assert_eq!(metadata_only.child_session_id(), None);
 
-        // A `subagent` part without a recorded child id yields nothing.
-        let bare = ToolPanel::for_test("subagent", ToolStatus::Running, None, None);
-        assert_eq!(bare.child_session_id(), None);
+        // An addressing call is a receipt on an existing run: it launches
+        // nothing.
+        let addressing = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "collab".into(),
+                call_id: "call_wait".into(),
+            },
+            detail: ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_1".into(),
+                }],
+                effect: DelegationEffect::Address,
+            },
+            ..ToolCall::default()
+        });
+        assert_eq!(addressing.child_session_id(), None);
 
-        let mut bash = ToolPanel::for_test("bash", ToolStatus::Running, None, None);
-        bash.call = ToolCall {
-            metadata: Some(json!({"sessionId": "ses_child"})),
-            ..bash.call.clone()
-        };
-        assert_eq!(bash.child_session_id(), None);
+        assert_eq!(
+            ToolPanel::for_test("bash", ToolStatus::Running, None, None).child_session_id(),
+            None
+        );
     }
 
     #[test]

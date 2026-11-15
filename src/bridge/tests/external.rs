@@ -99,6 +99,14 @@ fn subagent_reply(created: i64, child: &str, status: ToolStatus) -> TranscriptMe
                 blocks: vec![],
                 error: None,
             },
+            // The launch relation (spec #1057's P4): the panel joins its run
+            // and the child liveness gather reads the child the run names.
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: child.to_string(),
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
             ..ToolCall::default()
         })],
     )
