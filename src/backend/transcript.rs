@@ -1781,6 +1781,142 @@ pub enum FileAction {
     Rename,
 }
 
+/// The hunk body of a unified diff: everything from the first `@@` line on.
+/// The [`FileEdit`] already names the path and action, so the header block
+/// (`Index:`, `diff --git`, `---`/`+++`) is not part of the body the card
+/// renders — and its `---`/`+++` lines must not be counted as a deletion and an
+/// addition. A value with no hunk (a binary change's message) is kept whole.
+///
+/// This is the read model's normalisation, shared by every adapter that
+/// declares a [`ToolDetail::FileEdits`] (ADR-0105): a producer never hands the
+/// card a diff framing it would have to parse again.
+pub fn file_edit_hunks(diff: &str) -> Option<String> {
+    let lines: Vec<&str> = diff.lines().collect();
+    if let Some(start) = lines.iter().position(|line| line.starts_with("@@")) {
+        let body = lines[start..].join("\n");
+        return (!body.trim().is_empty()).then_some(body);
+    }
+    let text = diff.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// One [`FileEdit`] recovered from a unified diff whose payload does not state
+/// the path separately (V1's patch metadata, a bare `metadata.diff`). The
+/// header block supplies the action and the names: `/dev/null` on the old side
+/// is an Add, on the new side a Delete, two different names a Rename; anything
+/// else is an Update on `path_hint`, the index line, or the new side.
+pub fn file_edit_from_diff(path_hint: Option<&str>, diff: &str) -> Option<FileEdit> {
+    let hunks = file_edit_hunks(diff)?;
+    let mut index = None;
+    let mut old = DiffSide::default();
+    let mut new = DiffSide::default();
+    let mut rename_from = None;
+    let mut rename_to = None;
+    let mut git_old = None;
+    let mut git_new = None;
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            break;
+        }
+        if let Some(path) = line.strip_prefix("Index: ") {
+            index = Some(path.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some((a, b)) = rest.split_once(" b/") {
+                git_old = Some(a.trim_start_matches("a/").to_string());
+                git_new = Some(b.trim().to_string());
+            }
+        } else if let Some(path) = line.strip_prefix("rename from ") {
+            rename_from = Some(path.trim().to_string());
+        } else if let Some(path) = line.strip_prefix("rename to ") {
+            rename_to = Some(path.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            old = DiffSide::parse(rest);
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            new = DiffSide::parse(rest);
+        }
+    }
+    let header_old = rename_from.or(old.path.clone()).or(git_old);
+    let header_new = rename_to.or(new.path.clone()).or(git_new);
+    let (action, path, rename_to) = if old.null && new.path.is_some() {
+        (FileAction::Add, new.path.clone(), None)
+    } else if new.null && old.path.is_some() {
+        (FileAction::Delete, old.path.clone(), None)
+    } else if old.path.is_some() && new.path.is_some() && old.path != new.path {
+        (FileAction::Rename, old.path.clone(), new.path.clone())
+    } else if header_old.is_some() && header_new.is_some() && header_old != header_new {
+        (FileAction::Rename, header_old.clone(), header_new.clone())
+    } else {
+        (
+            FileAction::Update,
+            path_hint
+                .map(str::to_string)
+                .or(index)
+                .or(header_new)
+                .or(header_old),
+            None,
+        )
+    };
+    Some(FileEdit {
+        path: path?,
+        action,
+        rename_to,
+        diff: Some(hunks),
+    })
+}
+
+/// One side of a `---`/`+++` header: its path (`a/`/`b/` dropped) or the
+/// `/dev/null` marker.
+#[derive(Default)]
+struct DiffSide {
+    path: Option<String>,
+    null: bool,
+}
+
+impl DiffSide {
+    fn parse(rest: &str) -> Self {
+        let path = rest.split('\t').next().unwrap_or(rest).trim();
+        if path == "/dev/null" {
+            return Self {
+                path: None,
+                null: true,
+            };
+        }
+        let path = path
+            .strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path);
+        Self {
+            path: (!path.is_empty()).then(|| path.to_string()),
+            null: false,
+        }
+    }
+}
+
+/// Merge edits that name the same path, in first-seen order: a patch that
+/// updates one file twice is one file (the `+A −D` totals and the open button
+/// must not see two), and a rename/add/delete later in the patch wins the
+/// action while every hunk stays.
+pub fn merge_file_edits(edits: impl IntoIterator<Item = FileEdit>) -> Vec<FileEdit> {
+    let mut merged: Vec<FileEdit> = Vec::new();
+    for mut edit in edits {
+        if let Some(existing) = merged.iter_mut().find(|existing| existing.path == edit.path) {
+            existing.action = edit.action;
+            if edit.rename_to.is_some() {
+                existing.rename_to = edit.rename_to.take();
+            }
+            if let Some(diff) = edit.diff.take() {
+                existing.diff = Some(match existing.diff.take() {
+                    Some(previous) => format!("{previous}\n{diff}"),
+                    None => diff,
+                });
+            }
+        } else {
+            merged.push(edit);
+        }
+    }
+    merged
+}
+
 /// A Code Mode program's nested tool call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NestedCall {
