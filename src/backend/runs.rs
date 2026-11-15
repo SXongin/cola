@@ -782,14 +782,14 @@ mod tests {
     #[test]
     fn a_resumed_launch_refreshes_the_run_and_rejects_pre_resume_evidence() {
         let mut completed = report("call_activity", "ses_child", "completed");
-        completed.started_at = Some(4);
+        completed.started_at = Some(4_000);
         let mut read = transcript(vec![
             call(
                 "call_1",
                 DelegationEffect::Launch,
                 &["ses_child"],
                 ToolStatus::Running,
-                Some(1),
+                Some(1_000),
             ),
             completed,
             call(
@@ -797,11 +797,11 @@ mod tests {
                 DelegationEffect::Launch,
                 &["ses_child"],
                 ToolStatus::Running,
-                Some(5),
+                Some(5_000),
             ),
         ]);
         let run = &read.runs[0];
-        assert_eq!(run.started_at, Some(5), "the resume moves the run's start");
+        assert_eq!(run.started_at, Some(5_000), "the resume moves the run's start");
         assert_eq!(
             run.status,
             RunStatus::Running,
@@ -813,11 +813,13 @@ mod tests {
             !read.apply_run_child_evidence(
                 "ses_child",
                 ChildEvidence::Terminal {
-                    completed_at: 4,
-                    started_at: None
+                    // The completion lands AFTER the resume, but the turn it
+                    // belongs to started before it.
+                    completed_at: 6_000,
+                    started_at: Some(4_000)
                 }
             ),
-            "a pre-resume completion is older than the resumed start"
+            "a pre-resume turn is older than the resumed start"
         );
         assert_eq!(read.runs.len(), 1, "the resumed run stays live");
     }
@@ -1053,13 +1055,15 @@ mod tests {
         assert!(read.apply_run_child_evidence(
             "ses_child",
             ChildEvidence::Terminal {
+                // The wire serializes the turn start into second 1; the run
+                // started at 1_500 ms. Both floor to second 1.
                 completed_at: 2_000,
-                started_at: Some(2_000)
+                started_at: Some(1_000)
             }
         ));
         assert!(
             read.runs.is_empty(),
-            "a same-second completion of a turn that began after the run is accepted"
+            "a same-second turn start is accepted, not treated as pre-run"
         );
 
         let mut read = transcript(vec![call(
@@ -1091,7 +1095,7 @@ mod tests {
             !read.apply_run_child_evidence(
                 "ses_child",
                 ChildEvidence::Terminal {
-                    completed_at: 1_499,
+                    completed_at: 999,
                     started_at: None
                 }
             ),
