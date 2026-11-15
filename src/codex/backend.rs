@@ -2308,8 +2308,8 @@ fn thread_has_no_history(error: &CodexError, child_id: &str) -> bool {
 /// ADR-0080): its newest turn is the terminal item. A turn still `inProgress`
 /// (or one with no completion clock) is no evidence — the run stays exactly as
 /// the read marked it, never guessed dead.
-fn thread_evidence(thread: &Thread) -> ChildEvidence {
-    let Some(turn) = thread.turns.last() else {
+fn thread_evidence(turns: &[Value]) -> ChildEvidence {
+    let Some(turn) = turns.last() else {
         return ChildEvidence::Unfinished;
     };
     if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
@@ -3283,8 +3283,8 @@ impl Backend for CodexClient {
     /// child), listed + some other read failure → the read stays failed. A
     /// failed probe is never an absence.
     async fn child_evidence(&self, child_id: &str) -> Result<ChildEvidence> {
-        let thread = match self.threads().read(child_id, true).await {
-            Ok(thread) => thread,
+        match self.threads().read(child_id, false).await {
+            Ok(_) => {}
             Err(error) => {
                 let no_history = thread_has_no_history(&error, child_id);
                 return match self.threads().child_exists(child_id).await {
@@ -3293,8 +3293,13 @@ impl Backend for CodexClient {
                     Ok(true) | Err(_) => Err(client_error(error)),
                 };
             }
-        };
-        Ok(thread_evidence(&thread))
+        }
+        // `thread/read` carries only a bounded page of turns, so the newest
+        // persisted turn (the evidence) can lie outside it. Page the full list
+        // through `thread/turns/list`; `all_turns` returns oldest-first, so the
+        // last element is the newest.
+        let turns = self.threads().all_turns(child_id).await.map_err(client_error)?;
+        Ok(thread_evidence(&turns))
     }
 
     async fn model_context_window(&self, _provider: &str, _model: &str) -> Result<Option<i64>> {
