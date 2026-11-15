@@ -729,7 +729,7 @@ impl Turn {
     async fn attempt(&mut self, handles: &TurnHandles) -> crate::error::Result<()> {
         // The renderer is spawned for the whole attempt and stopped on **every**
         // exit — including a pre-flight refusal, which returns before the
-        // submit. A leaked poll would keep repainting `⏳ 思考中` on a turn that
+        // submit. A leaked poll would keep repainting `⏳ waiting` on a turn that
         // was never sent, hiding the named error card (issue #910).
         let render = render::RenderPoll::spawn(handles, &self.session_id, &self.thread_key);
         let result = self.pre_flight_and_submit(handles).await;

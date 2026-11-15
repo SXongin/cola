@@ -2286,7 +2286,7 @@ mod tests {
             },
             "header": {
                 "template": "blue",
-                "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+                "title": { "tag": "plain_text", "content": "✍️ responding" }
             },
             "body": { "elements": [
                 { "tag": "markdown", "content": "**正文** 第一段" },

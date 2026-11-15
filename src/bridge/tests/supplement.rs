@@ -417,7 +417,7 @@ async fn a_non_live_advisory_read_starts_a_turn_with_an_ordinary_card() {
             .collect();
         assert!(!cards.is_empty(), "the Turn must send its loading card");
         assert!(
-            card_header(&cards[0]).contains("思考中"),
+            card_header(&cards[0]).contains("waiting"),
             "unreadable={unreadable}: the first card is the ordinary loading card: {}",
             cards[0]
         );
@@ -433,7 +433,7 @@ async fn a_non_live_advisory_read_starts_a_turn_with_an_ordinary_card() {
 /// A split while a tool is running: the panel is live tail content (ADR-0045),
 /// so the finalized card finalizes WITHOUT it and the continuation — the new
 /// live card — carries it, its header still naming the Turn's running tool
-/// instead of falling back to "✍️ 回复中". A tool that already finished is not
+/// instead of falling back to "✍️ responding". A tool that already finished is not
 /// running, so it does not leak into the continuation's header.
 #[tokio::test]
 async fn a_split_continuation_takes_the_running_tool_panel_over() {
@@ -612,7 +612,7 @@ async fn a_finished_tool_does_not_leak_into_the_continuation_header() {
     let (_, card) = continuation(&platform).await;
     let header = card["header"]["title"]["content"].as_str().unwrap();
     assert!(
-        header.starts_with("✍️ 回复中"),
+        header.starts_with("✍️ responding"),
         "a finished tool must not show in the continuation header: {card}"
     );
 }

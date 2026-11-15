@@ -59,33 +59,27 @@ const OUTPUT_UNAVAILABLE: &str = "输出已不可用";
 pub(crate) const CLEANUP_BUTTON_TEXT: &str = "清理待确认任务";
 
 impl TaskKind {
-    /// The row's type noun: the tool's own name, `shell` / `subagent` (#502).
-    /// Shared by the live row and the completion entry's fold body, so one
-    /// task type reads the same wherever the ledger renders it.
+    /// The row's type noun: the tool's own token, `shell` / `subagent` (#502,
+    /// ADR-0107). Shared by the live row and the completion entry's fold body,
+    /// so one task type reads the same wherever the ledger renders it.
     fn noun(self) -> &'static str {
         match self {
-            Self::Shell => "shell",
-            Self::Subagent => "subagent",
+            Self::Shell => super::vocab::TOOL_SHELL,
+            Self::Subagent => super::vocab::TOOL_SUBAGENT,
         }
     }
 
-    /// The completion entry's collapsed-title phrase: the tool's own name plus
+    /// The completion entry's collapsed-title phrase: the tool's own token plus
     /// what happened to the task — `🔔 shell 完成` / `🔔 subagent 已取消`. A
     /// Wake that reported a cancelled/error state, a runtime-confirmed end
     /// without a Wake, and a lost completion record each get their own ending —
     /// the entry never claims 完成 for work that was stopped or lost (issue
-    /// #454). Built on [`Self::noun`], so the completion entry and the live row
-    /// name the task type with one word.
+    /// #454). The ending word is [`run_outcome_copy`], the one place the
+    /// ending layer names it; [`Self::noun`] is the one task noun.
+    ///
+    /// [`run_outcome_copy`]: super::vocab::run_outcome_copy
     fn completion_noun(self, ending: &TaskEnding) -> String {
-        let ending = match ending {
-            TaskEnding::Wake { state } if state.as_deref() == Some("cancelled") => "已取消",
-            TaskEnding::Wake { state } if state.as_deref() == Some("error") => "失败",
-            TaskEnding::Wake { .. } => "完成",
-            TaskEnding::RuntimeEnded => "结束",
-            TaskEnding::Lost => "已失联",
-            TaskEnding::Cleaned => "已清理",
-        };
-        format!("{} {ending}", self.noun())
+        format!("{} {}", self.noun(), super::vocab::run_outcome_copy(ending))
     }
 }
 
@@ -286,9 +280,14 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
     }
     let unconfirmed = rows.iter().filter(|row| row.unconfirmed).count();
     Some(if unconfirmed > 0 {
-        format!("⏳ 后台任务（{} · {} 待确认）", rows.len(), unconfirmed)
+        format!(
+            "⏳ {}（{} · {} 待确认）",
+            super::vocab::LEDGER_TITLE,
+            rows.len(),
+            unconfirmed
+        )
     } else {
-        format!("⏳ 后台任务（{}）", rows.len())
+        format!("⏳ {}（{}）", super::vocab::LEDGER_TITLE, rows.len())
     })
 }
 
@@ -306,7 +305,7 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
 /// A `shell` row's bare elapsed follows it — the elapsed is a shell row's only
 /// liveness — while a `subagent` row never renders a total: its liveness is its
 /// child's activity fragment ([`TaskLiveness::title_fragment`]), appended after
-/// the clock (`bash 5s`, `思考中 1m30s · 等待你的授权`), so the fragment's age is
+/// the clock (`bash 5s`, `waiting 1m30s · 等待你的授权`), so the fragment's age is
 /// the only runtime it shows. A part the read named none of is omitted whole:
 /// `· shell · 14:02 · 0m05s`, `· shell：**npm run build**`, `· shell`,
 /// `· subagent：**review the diff** · 14:04`. A row a runtime reconciliation
@@ -982,13 +981,16 @@ mod tests {
         );
 
         let thinking = TaskLiveness {
-            activity: ChildActivity::Thinking,
+            activity: ChildActivity::Waiting,
             last_activity_ms: Some(now - 30_000),
             wait: Some(crate::feishu::card::AwaitingAction::Permission),
         };
         assert_eq!(
             render(&row(Some(thinking.clone()), false)),
-            "· subagent：**review the diff** · 14:04 · 思考中 30s · 等待你的授权"
+            format!(
+                "· subagent：**review the diff** · 14:04 · {} 30s · 等待你的授权",
+                super::super::vocab::phase_token(crate::backend::Phase::Waiting)
+            )
         );
         assert_eq!(
             render(&row(Some(thinking), true)),
@@ -1615,7 +1617,7 @@ mod tests {
             started_at: None,
             unconfirmed: false,
             activity: Some(TaskLiveness {
-                activity: ChildActivity::Thinking,
+                activity: ChildActivity::Waiting,
                 last_activity_ms: Some(0),
                 wait,
             }),
@@ -1683,7 +1685,7 @@ mod tests {
                 wait: Some(crate::feishu::card::AwaitingAction::Permission),
             },
             TaskLiveness {
-                activity: ChildActivity::Thinking,
+                activity: ChildActivity::Waiting,
                 last_activity_ms: Some(0),
                 wait: None,
             },
@@ -1693,7 +1695,7 @@ mod tests {
                 wait: Some(crate::feishu::card::AwaitingAction::Both),
             },
             TaskLiveness {
-                activity: ChildActivity::Replying,
+                activity: ChildActivity::Responding,
                 last_activity_ms: Some(0),
                 wait: None,
             },

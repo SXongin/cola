@@ -498,7 +498,7 @@ async fn error_card_retry_reuses_the_unstored_id_and_replies_a_new_card() {
 
     // The card the first attempt used: the loading reply card id.
     let card_id = match calls.first().unwrap() {
-        PlatformCall::ReplyCard { card, .. } if card_text(card).contains("思考中") => "msg_reply",
+        PlatformCall::ReplyCard { card, .. } if card_text(card).contains("waiting") => "msg_reply",
         _ => panic!("expected a loading reply card first: {:?}", calls),
     };
     assert_eq!(card_id, "msg_reply");
@@ -1136,7 +1136,7 @@ async fn busy_retry_reattaches_and_finalizes_done_from_the_transcript() {
         &platform,
         "the re-attached live card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("回复中") && card_text(card).contains("OLD_TEXT"),
+        |card| card_header(card).contains("responding") && card_text(card).contains("OLD_TEXT"),
     )
     .await;
     let ids = backend.prompt_message_ids.lock().await.clone();
@@ -1196,7 +1196,7 @@ async fn busy_retry_reattach_finalizes_error_with_a_working_retry() {
         &platform,
         "the re-attached live card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("回复中"),
+        |card| card_header(card).contains("responding"),
     )
     .await;
 
@@ -1273,7 +1273,7 @@ async fn stop_after_a_reattach_ends_the_card_promptly() {
         &platform,
         "the re-attached live card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("回复中"),
+        |card| card_header(card).contains("responding"),
     )
     .await;
 
@@ -1348,7 +1348,7 @@ async fn a_message_during_a_reattach_follow_splits_the_live_chain() {
         &platform,
         "the re-attached live card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("回复中"),
+        |card| card_header(card).contains("responding"),
     )
     .await;
     let followed = crate::bridge::turn::Turn::armed_turn_anchor(&app.cards_handle(), "ses_test").await;
@@ -1475,7 +1475,7 @@ async fn a_quick_reattached_end_does_not_measure_the_original_turn() {
         &platform,
         "the re-attached live card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("回复中"),
+        |card| card_header(card).contains("responding"),
     )
     .await;
 
@@ -1535,7 +1535,7 @@ async fn a_long_reattached_run_still_sends_the_notice() {
         &platform,
         "the re-attached live card",
         CardUpdates::Latest,
-        |card| card_header(card).contains("回复中"),
+        |card| card_header(card).contains("responding"),
     )
     .await;
 

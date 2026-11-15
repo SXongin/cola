@@ -286,7 +286,7 @@ impl Turn {
     ///
     /// With `ending: None` the successor follows a still-live run (ticket
     /// #564): it wears a working header from its first send — never an initial
-    /// 「思考中」, the run it continues is not starting — and the caller arms
+    /// 「waiting」, the run it continues is not starting — and the caller arms
     /// the external follow on this same accumulator.
     ///
     /// The first send itself stays with the caller (the reap's apply): the
@@ -401,7 +401,7 @@ impl Turn {
             None => {
                 // A live adoption follows a run already in flight: the
                 // successor is a working card from its first send, never an
-                // initial 「思考中」.
+                // initial 「waiting」.
                 acc.mark_adopted_live();
             }
         }

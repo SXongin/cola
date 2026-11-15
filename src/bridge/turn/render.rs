@@ -167,7 +167,7 @@ fn renders_part(acc: &StreamAccumulator, part: &Part) -> bool {
             // A plan absent from this client's capabilities renders nothing at
             // the source (ADR-0106): its `todowrite` list is not consumed, so
             // no empty panel or stale section can appear.
-            if call.identity.name == "todowrite" && acc.capabilities().plan.is_absent() {
+            if crate::feishu::card::tool_render::is_plan_call(call) && acc.capabilities().plan.is_absent() {
                 return false;
             }
             // An addressing/reporting call is a one-line receipt on its run,
@@ -274,7 +274,7 @@ fn render_part(
         Part::Tool(call) => {
             if crate::feishu::card::tool_render::is_receipt_call(call) {
                 acc.push_delegation_receipt(call);
-            } else if call.identity.name == "todowrite" {
+            } else if crate::feishu::card::tool_render::is_plan_call(call) {
                 // A live status section, not a transcript row: the latest call
                 // replaces the panel the card tail renders (on the live card,
                 // so a split can't strand an outdated list). The clock is
@@ -394,7 +394,7 @@ fn render_part_scoped(
         Part::Tool(call) => {
             if crate::feishu::card::tool_render::is_receipt_call(call) {
                 acc.push_delegation_receipt(call);
-            } else if call.identity.name == "todowrite" {
+            } else if crate::feishu::card::tool_render::is_plan_call(call) {
                 if !acc.capabilities().plan.is_absent() {
                     acc.record_todo_call(call);
                 }
@@ -2603,7 +2603,7 @@ fn resolve_seeded_calls(acc: &mut StreamAccumulator, transcript: &SessionTranscr
                     if crate::feishu::card::tool_render::is_receipt_call(call) {
                         acc.push_delegation_receipt(call);
                         acc.refresh_phase();
-                    } else if call.identity.name == "todowrite" {
+                    } else if crate::feishu::card::tool_render::is_plan_call(call) {
                         if !acc.capabilities().plan.is_absent() {
                             acc.record_todo_call(call);
                         }
@@ -4549,6 +4549,8 @@ mod tests {
                 name: "todowrite".into(),
                 call_id: call_id.into(),
             },
+            kind: ToolKind::Other,
+            detail: ToolDetail::None,
             status: ToolStatus::Completed,
             started_at: Some(at_ms),
             input: Some(serde_json::json!({ "todos": todos.clone() })),
@@ -6452,6 +6454,8 @@ Index: /x/src/main.rs
                     name: "todowrite".into(),
                     call_id: "call_todo".into(),
                 },
+                kind: ToolKind::Other,
+                detail: ToolDetail::None,
                 status: ToolStatus::Running,
                 started_at: Some(1_000_000 + 5_000),
                 input: Some(serde_json::json!({"todos": []})),
@@ -7901,7 +7905,7 @@ Index: /x/src/main.rs
     }
 
     /// A running `task` call outranks reasoning in the header (issue #1025):
-    /// the card is waiting on the subagent, so it must not read 「💭 推理中」
+    /// the card is waiting on the subagent, so it must not read 「💭 reasoning」
     /// however much reasoning sits before the call.
     #[test]
     fn a_running_tool_outranks_reasoning_in_the_header() {
@@ -7951,7 +7955,7 @@ Index: /x/src/main.rs
             "the header still names the running call: {title}"
         );
         assert!(
-            !title.contains("推理中") && !title.contains('字'),
+            !title.contains("reasoning") && !title.contains('字'),
             "no reasoning label or count while the tool runs: {title}"
         );
 
@@ -7963,7 +7967,7 @@ Index: /x/src/main.rs
         ));
         assert_eq!(acc.current_phase(), Some(&HeaderPhase::Reasoning));
         assert!(
-            acc.header_title_and_template().0.contains("推理中"),
+            acc.header_title_and_template().0.contains("reasoning"),
             "a settled tool restores the reasoning header: {}",
             acc.header_title_and_template().0
         );
@@ -8463,7 +8467,7 @@ Index: /x/src/main.rs
         );
         let card = acc.build_card().to_string();
         assert_eq!(
-            card.matches("todowrite").count(),
+            card.matches("plan").count(),
             1,
             "exactly one todo panel must render: {card}"
         );
@@ -8476,7 +8480,7 @@ Index: /x/src/main.rs
         );
         // The header shows the latest update's clock, size and counts.
         assert!(
-            card.contains("📋 todowrite · 10:07 · 共 2 项"),
+            card.contains("📋 plan · 10:07 · 共 2 项"),
             "latest clock and size: {card}"
         );
         assert!(card.contains("· ⬜ 1 · ✅ 1"), "header counts: {card}");
@@ -9122,7 +9126,7 @@ Index: /x/src/main.rs
             "a header change alone must re-flush the card: {updates:?}"
         );
         assert!(
-            updates.last().unwrap().to_string().contains("推理中"),
+            updates.last().unwrap().to_string().contains("reasoning"),
             "the re-flush carries the new header: {}",
             updates.last().unwrap()
         );
@@ -11718,7 +11722,7 @@ Index: /x/src/main.rs
         );
         assert!(
             text.lines()
-                .any(|line| line.contains("task") && line.contains("bash ")),
+                .any(|line| line.contains("⏳ subagent") && line.contains("bash ")),
             "the live panel carries the same fragment: {text}"
         );
     }
@@ -11781,8 +11785,8 @@ Index: /x/src/main.rs
         );
     }
 
-    /// The phase follows the newest part: streamed reply text reads 回复中, and
-    /// a completed tool with nothing newer reads 思考中 (the model is working
+    /// The phase follows the newest part: streamed reply text reads responding, and
+    /// a completed tool with nothing newer reads waiting (the model is working
     /// through the result).
     #[test]
     fn child_liveness_derives_the_phase_from_the_newest_part() {
@@ -11790,7 +11794,7 @@ Index: /x/src/main.rs
         assert_eq!(
             child_liveness(&replying),
             Some(TaskLiveness {
-                activity: ChildActivity::Replying,
+                activity: ChildActivity::Responding,
                 last_activity_ms: Some(5_000),
                 wait: None,
             })
@@ -11804,7 +11808,7 @@ Index: /x/src/main.rs
         assert_eq!(
             child_liveness(&thinking),
             Some(TaskLiveness {
-                activity: ChildActivity::Thinking,
+                activity: ChildActivity::Waiting,
                 last_activity_ms: Some(6_000),
                 wait: None,
             })
@@ -12105,7 +12109,7 @@ Index: /x/src/main.rs
             "no addressing call becomes a timeline panel: {text}"
         );
         assert!(
-            text.contains("codex/collab_agent") && !text.contains("↪ spawnAgent"),
+            text.contains("✅ subagent") && !text.contains("↪ spawnAgent"),
             "the launch keeps its panel (the record of the request): {text}"
         );
         assert!(

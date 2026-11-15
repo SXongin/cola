@@ -342,7 +342,7 @@ pub(super) fn realistic_card_view() -> serde_json::Value {
         "config": { "wide_screen_mode": true, "streaming_mode": true },
         "header": {
             "template": "blue",
-            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            "title": { "tag": "plain_text", "content": "✍️ responding" }
         },
         "body": { "elements": [
             { "tag": "markdown", "content": "**正文** 第一段" },
@@ -1655,7 +1655,7 @@ fn live_tail_orphan_view() -> serde_json::Value {
         "config": { "wide_screen_mode": true, "streaming_mode": true },
         "header": {
             "template": "blue",
-            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            "title": { "tag": "plain_text", "content": "✍️ responding" }
         },
         "body": { "elements": [
             { "tag": "markdown", "content": "**正文** 已经写完的部分" },
@@ -5605,7 +5605,7 @@ async fn a_projection_settles_a_tool_that_finished_while_cola_was_down() {
             "schema": "2.0",
             "config": { "wide_screen_mode": true },
             "header": { "template": "blue",
-                        "title": { "tag": "plain_text", "content": "✍️ 回复中" } },
+                        "title": { "tag": "plain_text", "content": "✍️ responding" } },
             "body": { "elements": [
                 { "tag": "markdown", "content": "**正文** 第一段" },
                 { "tag": "collapsible_panel", "expanded": false, "element_id": "tool_call_1",
@@ -6650,7 +6650,7 @@ async fn a_restart_mid_run_follows_the_live_run_onto_a_successor() {
     // The successor is a live continuation — a working card, not a stamped
     // orphan — and the delivered prefix is never repeated.
     assert!(
-        card_header(&successor).contains("回复中"),
+        card_header(&successor).contains("responding"),
         "the successor is a working card: {successor}"
     );
     assert!(
@@ -6902,7 +6902,7 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
-        card_header(&successor).contains("回复中"),
+        card_header(&successor).contains("responding"),
         "the adoption follows the live run: {successor}"
     );
     assert!(successor_text.contains("CI 通过了。"), "{successor}");
@@ -6949,7 +6949,7 @@ async fn an_idle_read_does_not_block_the_reaps_live_adoption() {
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(
-        card_header(&successor).contains("回复中"),
+        card_header(&successor).contains("responding"),
         "the adoption follows the live run: {successor}"
     );
     assert!(
@@ -7555,7 +7555,7 @@ async fn a_live_adoption_is_generation_neutral() {
         spawn_sync(&app);
         let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
         assert!(
-            card_header(&successor).contains("回复中"),
+            card_header(&successor).contains("responding"),
             "a working successor on the {generation} mock: {successor}"
         );
         assert_successor_header(&successor, "项目乙", 1_000);
@@ -7651,7 +7651,7 @@ fn orphan_running_card_view() -> serde_json::Value {
         "config": { "wide_screen_mode": true, "streaming_mode": true },
         "header": {
             "template": "blue",
-            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            "title": { "tag": "plain_text", "content": "✍️ responding" }
         },
         "body": { "elements": [
             { "tag": "markdown", "content": "**正文** 已经写了一半。" },
@@ -7671,7 +7671,7 @@ fn running_panel_card_view(call_id: &str) -> serde_json::Value {
         "config": { "wide_screen_mode": true, "streaming_mode": true },
         "header": {
             "template": "blue",
-            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            "title": { "tag": "plain_text", "content": "✍️ responding" }
         },
         "body": { "elements": [
             { "tag": "markdown", "content": "**正文** 已经写了一半。" },
@@ -7692,7 +7692,7 @@ fn two_running_panels_card_view() -> serde_json::Value {
         "config": { "wide_screen_mode": true, "streaming_mode": true },
         "header": {
             "template": "blue",
-            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            "title": { "tag": "plain_text", "content": "✍️ responding" }
         },
         "body": { "elements": [
             { "tag": "markdown", "content": "**正文** 已经写了一半。" },
@@ -8957,7 +8957,7 @@ fn late_successor_view(tail: &str) -> serde_json::Value {
         "config": { "wide_screen_mode": true, "streaming_mode": true },
         "header": {
             "template": "blue",
-            "title": { "tag": "plain_text", "content": "✍️ 回复中" }
+            "title": { "tag": "plain_text", "content": "✍️ responding" }
         },
         "body": { "elements": [
             { "tag": "markdown", "content": tail }
