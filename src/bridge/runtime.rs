@@ -178,6 +178,15 @@ impl RuntimeReconcile {
     }
 }
 
+/// Release one child session's backend subscription, best-effort: a client that
+/// keeps nothing (the trait default) is a no-op, and a failed release must not
+/// fail the pass that retired the run.
+pub(crate) async fn release_child_session(backend: &Arc<dyn Backend>, child_id: &str) {
+    if let Err(error) = backend.release_session(child_id).await {
+        tracing::debug!("release child session {child_id} failed: {error}");
+    }
+}
+
 /// One admitted reconcile cycle's read budget (spec #588, review PR #595): the
 /// runtime verdict read, the child-evidence reads and the shell-window reads
 /// all spend ONE `read_timeout_ms` window. Each read is bounded by what remains
@@ -373,7 +382,19 @@ pub(crate) async fn reconcile_now(
                         .await
                     {
                         Some(Ok(evidence)) => {
+                            let had_task = transcript
+                                .background_tasks
+                                .iter()
+                                .any(|task| task.tool.call_id == call_id);
                             transcript.apply_child_evidence(&call_id, evidence);
+                            let retired = had_task
+                                && !transcript
+                                    .background_tasks
+                                    .iter()
+                                    .any(|task| task.tool.call_id == call_id);
+                            if retired {
+                                release_child_session(backend, &child_id).await;
+                            }
                             record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
                         }
                         Some(Err(error)) => {
@@ -420,6 +441,15 @@ pub(crate) async fn reconcile_now(
                                 // visible as unconfirmed so a Cleanup can end
                                 // it.
                                 transcript.unconfirmed_tasks.insert(run_id.clone());
+                            }
+                            let still_live = transcript
+                                .runs
+                                .iter()
+                                .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
+                            if !still_live {
+                                // The run retired, or is terminal and no longer
+                                // needs its child subscription.
+                                release_child_session(backend, &child_id).await;
                             }
                         }
                         Some(Err(error)) => {
@@ -815,6 +845,7 @@ mod tests {
         // answer.
         let mock = Arc::new(mock);
         let reads = Arc::clone(&mock.child_evidence_calls);
+        let releases = Arc::clone(&mock.release_calls);
         let backend: Arc<dyn Backend> = mock;
 
         let launch = crate::backend::ToolCall {
@@ -852,6 +883,10 @@ mod tests {
         )
         .await;
         assert_eq!(reads.lock().await.as_slice(), ["thread_fresh".to_string()]);
+        assert!(
+            releases.lock().await.is_empty(),
+            "a still-live run keeps its child subscription"
+        );
         assert_eq!(transcript.runs.len(), 1, "the run stays live");
         assert!(transcript.runs[0].is_live());
         assert!(
@@ -943,6 +978,7 @@ mod tests {
         .await;
         let mock = Arc::new(mock);
         let reads = Arc::clone(&mock.child_evidence_calls);
+        let releases = Arc::clone(&mock.release_calls);
         let backend: Arc<dyn Backend> = mock;
 
         let launch = crate::backend::ToolCall {
@@ -991,6 +1027,11 @@ mod tests {
             "the pass applied the child's ending"
         );
         assert_eq!(reads.lock().await.as_slice(), ["thread_done".to_string()]);
+        assert_eq!(
+            releases.lock().await.as_slice(),
+            ["thread_done".to_string()],
+            "the retired run's child subscription is released"
+        );
         assert_eq!(
             transcript.task_retirements[0].ending,
             crate::backend::TaskRetirementEnding::ChildEnded

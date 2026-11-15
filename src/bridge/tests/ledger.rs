@@ -2691,6 +2691,15 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
         "clearing the last run settles the wait"
     );
     assert!(text.contains("🧹 subagent 已清理：review the diff（人工）"));
+    assert!(
+        backend
+            .release_calls
+            .lock()
+            .await
+            .iter()
+            .any(|id| id == "thread_child"),
+        "the cleaned run's child subscription is released"
+    );
 }
 
 /// Spec #1057's P4, review finding 1: ONE launch naming two children mints a

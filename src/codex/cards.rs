@@ -1415,6 +1415,98 @@ async fn a_truncated_thread_read_still_finds_the_newest_turn() {
     );
 }
 
+/// A child adopted for panel liveness is released when its run retires, while a
+/// still-live run keeps its subscription.
+#[tokio::test]
+async fn a_retired_child_run_releases_its_liveness_subscription() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+    let mut done = ScriptedThread::adopted("thread-child-done", "session-root", WORK, "done");
+    done.parent_thread_id = Some(THREAD.into());
+    done.turns = vec![json!({
+        "id": "turn-done",
+        "status": "completed",
+        "startedAt": 1,
+        "completedAt": 2,
+        "items": []
+    })];
+    server.seed_thread(done);
+    let mut live = ScriptedThread::adopted("thread-child-live", "session-root", WORK, "live");
+    live.parent_thread_id = Some(THREAD.into());
+    live.turns = vec![json!({
+        "id": "turn-live",
+        "status": "inProgress",
+        "startedAt": 1,
+        "items": []
+    })];
+    server.seed_thread(live);
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (_app, _platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    // The panel liveness gather adopts both children.
+    Backend::transcript(&client, "thread-child-done")
+        .await
+        .expect("adopt the done child");
+    Backend::transcript(&client, "thread-child-live")
+        .await
+        .expect("adopt the live child");
+    server.wait_for_subscribers("thread-child-done", 1).await;
+    server.wait_for_subscribers("thread-child-live", 1).await;
+
+    let launch = crate::backend::ToolCall {
+        identity: crate::backend::ToolIdentity {
+            name: "codex/collab_agent".into(),
+            call_id: "call_spawn".into(),
+        },
+        status: crate::backend::ToolStatus::Running,
+        started_at: Some(1_000),
+        detail: crate::backend::ToolDetail::Delegation {
+            runs: vec![
+                crate::backend::AgentRunRef {
+                    run_id: "thread-child-done".into(),
+                    status: None,
+                },
+                crate::backend::AgentRunRef {
+                    run_id: "thread-child-live".into(),
+                    status: None,
+                },
+            ],
+            effect: crate::backend::DelegationEffect::Launch,
+        },
+        ..crate::backend::ToolCall::default()
+    };
+    let mut transcript = crate::backend::SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+        id: crate::backend::MessageId::new("msg_spawn"),
+        role: crate::backend::MessageRole::Assistant,
+        time: None,
+        model: None,
+        tokens: None,
+        error: None,
+        parts: vec![crate::backend::Part::Tool(launch)],
+    }]);
+    let backend: std::sync::Arc<dyn Backend> = std::sync::Arc::new(client.clone());
+    let _ = crate::bridge::runtime::reconcile_now(
+        &backend,
+        "ses_test",
+        Some("/work"),
+        &mut transcript,
+        crate::bridge::runtime::CycleBudget::within(200),
+    )
+    .await;
+
+    assert_eq!(
+        server.unsubscribe_calls(),
+        1,
+        "the retired child's liveness subscription is released exactly once"
+    );
+    assert!(
+        transcript
+            .runs
+            .iter()
+            .any(|run| run.run_id == "thread-child-live" && run.is_live()),
+        "the still-live run keeps its subscription and its row"
+    );
+}
+
 /// Ticket #881 acceptance 3 through the bridge: a second message while cola owns
 /// the live run is a Supplement → `turn/steer`, never a second `turn/start`, and
 /// its text renders once on the split continuation.
