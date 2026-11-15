@@ -341,7 +341,7 @@ impl TasksHandle {
                 state: TaskEndingState::Owed,
                 finished_at: retirement.finished_at,
                 evidence: Some(evidence),
-                identity: identity_of_task(&retirement.task, input),
+                identity: identity_of_task(&retirement.task, input, retirement.label.as_deref()),
             },
         )
     }
@@ -366,7 +366,7 @@ impl TasksHandle {
                 state: TaskEndingState::Owed,
                 finished_at: Some(finished_at),
                 evidence: None,
-                identity: identity_of_task(task, input),
+                identity: identity_of_task(task, input, None),
             },
         )
     }
@@ -581,6 +581,7 @@ fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option
         task: identity_task(&ending.identity, &record.run.key),
         ending: retirement_ending,
         finished_at: ending.finished_at,
+        label: ending.identity.label.clone(),
     })
 }
 

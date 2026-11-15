@@ -598,6 +598,31 @@ fn delegation_is_one_shape_per_verb() {
         "a report names the run it observed"
     );
 
+    // Both producers strip an id they cannot name: an activity naming no child
+    // carries no run, so the derivation can never mint an empty-id run.
+    assert_eq!(
+        codex(json!({
+            "type": "subAgentActivity",
+            "id": "item-activity-empty",
+            "kind": "started",
+            "agentThreadId": "",
+            "agentPath": ""
+        })),
+        (
+            ToolKind::Other,
+            ToolDetail::Delegation {
+                runs: Vec::new(),
+                effect: DelegationEffect::Report,
+            }
+        ),
+        "an activity that names no child names no run"
+    );
+    assert_eq!(
+        v1("task", json!({"description": "review"}), json!({})),
+        launch,
+        "a task whose metadata carries no child id launches no run"
+    );
+
     // The receiver list is the run relation on both producers: an OpenCode
     // `task` names its child session in the state metadata, a Codex launch its
     // receivers, and a completion naming N children names N runs.

@@ -1652,7 +1652,7 @@ impl Item {
                 MessageRole::Assistant,
                 vec![self.tool_part(
                     codex_tool_id("sub_agent_activity"),
-                    activity_status(kind, self.completed),
+                    activity_status(kind),
                     Some(json!({
                         "kind": kind,
                         "agentThreadId": agent_thread_id,
@@ -2851,16 +2851,18 @@ fn collab_status(status: &Option<String>) -> ToolStatus {
     }
 }
 
-/// A child agent activity carries no status field. An interruption is the
-/// card's failure mark; any other activity is live until its completion
-/// arrives (the same rule `webSearch`/`image` use).
-fn activity_status(kind: &str, completed: bool) -> ToolStatus {
-    if kind == "interrupted" {
-        ToolStatus::Error
-    } else if completed {
-        ToolStatus::Completed
-    } else {
-        ToolStatus::Running
+/// A child agent activity carries no status field: its `kind` IS the child's
+/// state. The item's own start/completion events are transport (every activity
+/// arrives as both), so they never settle the run — `started`/`interacted`/
+/// `resumed` (and an upstream kind this build does not know) stay `Running`,
+/// `completed` is `Completed`, and `interrupted` is the failure mark. This is
+/// the declaration the neutral AgentRun fold reads (spec #1057's P4), which is
+/// why it must not conflate "the item was delivered" with "the run ended".
+fn activity_status(kind: &str) -> ToolStatus {
+    match kind {
+        "completed" => ToolStatus::Completed,
+        "interrupted" => ToolStatus::Error,
+        _ => ToolStatus::Running,
     }
 }
 
@@ -3763,11 +3765,12 @@ mod tests {
         );
     }
 
-    /// Review round 6: an activity is live between its start and its
-    /// completion (the same rule every statusless item takes), and the
-    /// completion settles it.
+    /// The activity's `kind` is the child's state (spec #1057's P4): the
+    /// item's own start/completion events are transport, so a `started`
+    /// activity stays `Running` across both, and a `completed` activity is
+    /// `Completed`.
     #[test]
-    fn a_sub_agent_activity_is_running_until_its_completion_arrives() {
+    fn a_sub_agent_activitys_kind_is_its_run_state() {
         let start = json!({
             "method": "item/started",
             "params": {
@@ -3812,7 +3815,19 @@ mod tests {
         replay(&mut projection, std::slice::from_ref(&completed));
         assert_eq!(
             projected_tool(&projection, "item-activity-live").status,
-            ToolStatus::Completed
+            ToolStatus::Running,
+            "the item's delivery is not the child's end"
+        );
+
+        let ended = completed.clone();
+        let mut ended = ended;
+        ended["params"]["item"]["kind"] = json!("completed");
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(&mut projection, std::slice::from_ref(&ended));
+        assert_eq!(
+            projected_tool(&projection, "item-activity-live").status,
+            ToolStatus::Completed,
+            "a completed activity is the client's terminal statement"
         );
     }
 
@@ -3977,15 +3992,23 @@ mod tests {
         assert_eq!(again, first, "a replay must not reorder the rows");
     }
 
-    /// Issue #962: a `subAgentActivity` becomes one small Tool Panel carrying
-    /// the child's path and the model it was started with. An interrupted
-    /// activity is the card's failure mark, never a settled ✅.
+    /// Issue #962 / spec #1057's P4: a `subAgentActivity` is a REPORT carrying
+    /// the child's path and the model it was started with — its kind is the
+    /// run's state (a `started` activity is live), and an interrupted activity
+    /// is the failure mark. It is never a Tool Panel of its own.
     #[test]
-    fn a_sub_agent_activity_becomes_one_panel_with_its_path() {
+    fn a_sub_agent_activity_is_a_report_with_its_path() {
         let projection = projected();
         let call = projected_tool(&projection, "item-subagent-activity");
         assert_eq!(call.identity.name, "codex/sub_agent_activity");
-        assert_eq!(call.status, ToolStatus::Completed);
+        assert_eq!(call.status, ToolStatus::Running);
+        assert!(matches!(
+            call.detail,
+            ToolDetail::Delegation {
+                effect: DelegationEffect::Report,
+                ..
+            }
+        ));
         let input = call.input.as_ref().expect("the shape");
         assert_eq!(input["kind"], "started");
         assert_eq!(input["agentThreadId"], "0192f0aa-0000-7000-8000-000000000001");
