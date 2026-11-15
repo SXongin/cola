@@ -272,6 +272,7 @@ mod tests {
             path: Some("/x".to_string()),
             preview: None,
             directory: false,
+            image: false,
         }
     }
 

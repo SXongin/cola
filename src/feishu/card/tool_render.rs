@@ -371,7 +371,7 @@ impl ToolPanel {
         }
         // A Codex `imageView` reads a file, but its panel is not a preview of
         // one (P1's read, out of the FileEdits ticket's scope): no button.
-        if is_codex_image(self) {
+        if is_image_read(self) {
             return None;
         }
         let read = read_detail(self)?;
@@ -782,15 +782,12 @@ fn search_detail(tool: &ToolPanel) -> Option<SearchShape<'_>> {
     }
 }
 
-/// Whether the panel is Codex's `imageView` — a `Read` in the neutral model
-/// (P1's table) whose panel keeps its own `🖼` word and no open button. The
-/// name and input shape are only half the gate: the neutral detail must be
-/// `Read` too, so an Opaque `imageGeneration` (which shares the identity and a
-/// `path` input) never takes the image-view presentation.
-fn is_codex_image(tool: &ToolPanel) -> bool {
-    tool.name() == "codex/image"
-        && matches!(tool.call().detail, ToolDetail::Read { .. })
-        && image_shape(tool.input())
+/// Whether the panel is an IMAGE view — a neutral `Read { image: true }` the
+/// adapter declared. The image presentation is selected by that detail, never
+/// the vendor name, so a second adapter's image read under another id takes the
+/// same panel.
+fn is_image_read(tool: &ToolPanel) -> bool {
+    matches!(tool.call().detail, ToolDetail::Read { image: true, .. })
 }
 
 /// One file's action, with each path formatted by the caller: inline code on
@@ -1339,6 +1336,7 @@ impl ToolPanel {
                 path: path.map(str::to_string),
                 preview: None,
                 directory: false,
+                image: false,
             },
             status,
             started_at: None,
@@ -1570,7 +1568,7 @@ fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
         }
         return Some(format!(" · {}", file_edit_title(edits.first()?)));
     }
-    if is_codex_image(tool) {
+    if is_image_read(tool) {
         return None;
     }
     let read = read_detail(tool)?;
@@ -2196,7 +2194,7 @@ fn truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'stati
 /// [`preview_truncation_note`] renders is the one charged. A FileEdits diff is
 /// [`diff_truncation_note`]'s, not this one's.
 fn preview_body_clipped(tool: &ToolPanel) -> bool {
-    if is_codex_image(tool) || read_detail(tool).is_none() {
+    if is_image_read(tool) || read_detail(tool).is_none() {
         return false;
     }
     tool.output()
@@ -2970,7 +2968,7 @@ fn format_tool_output(tool: &ToolPanel, output: &str) -> (Option<String>, BodySt
     }
     // A Codex `imageView` is a `Read` in the neutral model but keeps P1's
     // presentation (its panel is not a text preview): show its output raw.
-    if is_codex_image(tool) {
+    if is_image_read(tool) {
         return (None, BodyStyle::Auto, output.to_string());
     }
     if read_detail(tool).is_some() {
@@ -3530,16 +3528,9 @@ pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
     vocab::tool_token(&call.identity, call.kind, &call.detail)
 }
 
-/// `imageView`: `{path: string | null}`.
-fn image_shape(input: Option<&serde_json::Value>) -> bool {
-    input
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|obj| obj.contains_key("path"))
-}
-
-/// An `imageView`'s Input line: the file it looked at. Unlike a `read` there is
+/// An image read's Input line: the file it looked at. Unlike a `read` there is
 /// no preview body to fold, so the panel only names it — with the same backtick
-/// flattening as a file change's path. Selected only when [`is_codex_image`]
+/// flattening as a file change's path. Selected only when [`is_image_read`]
 /// holds (the neutral `Read` detail), never by name alone.
 fn image_input(input: &serde_json::Value) -> String {
     let Some(obj) = input.as_object() else {
@@ -3652,7 +3643,7 @@ fn format_tool_input(tool: &ToolPanel) -> String {
     if tool.is_plan() {
         return tool.input().map(plan_input).unwrap_or_default();
     }
-    if is_codex_image(tool) {
+    if is_image_read(tool) {
         return tool.input().map(image_input).unwrap_or_default();
     }
     if let Some(read) = read_detail(tool) {
@@ -4119,6 +4110,7 @@ mod tests {
                 path: Some(name.to_string()),
                 preview: None,
                 directory: false,
+                image: false,
             },
             status: ToolStatus::Completed,
             started_at: None,
@@ -4790,6 +4782,7 @@ mod tests {
             path: Some("/x/shot.png".into()),
             preview: None,
             directory: false,
+            image: false,
         };
         assert_eq!(
             panel.file_open_path(),
@@ -9255,6 +9248,7 @@ LSP errors detected in a.rs, please fix:
             path,
             preview: None,
             directory: false,
+            image: false,
         };
         tool
     }
@@ -9700,6 +9694,7 @@ Report
                     path: Some("/w/shot.png".into()),
                     preview: None,
                     directory: false,
+                    image: true,
                 },
                 json!({"path": "/w/shot.png"}),
                 "ok"
@@ -10239,6 +10234,7 @@ Report
                 path: Some("/w/shot.png".into()),
                 preview: None,
                 directory: false,
+                image: true,
             },
             "ok",
         );
@@ -10246,6 +10242,28 @@ Report
             format_tool_input(&view),
             "🖼 `/w/shot.png`",
             "the neutral Read takes the image-view Input line"
+        );
+
+        let other = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "acme/picture".into(),
+                call_id: "call_other_image".into(),
+            },
+            kind: ToolKind::Read,
+            status: ToolStatus::Completed,
+            input: Some(json!({"path": "/w/shot.png"})),
+            detail: ToolDetail::Read {
+                path: Some("/w/shot.png".into()),
+                preview: None,
+                directory: false,
+                image: true,
+            },
+            ..ToolCall::default()
+        });
+        assert_eq!(
+            format_tool_input(&other),
+            "🖼 `/w/shot.png`",
+            "the detail, not the identity name, selects the image presentation"
         );
 
         let raw = "Read file /w/gen.png, lines 1-1\n1: data";

@@ -2332,6 +2332,9 @@ impl ItemKind {
                     path: path.clone().filter(|path| !path.is_empty()),
                     preview: None,
                     directory: false,
+                    // Codex's `imageView`: the image-view presentation, under
+                    // the neutral detail, not the vendor id.
+                    image: true,
                 },
             ),
             Self::Image { generated: true, .. } => (ToolKind::Other, ToolDetail::Opaque),
@@ -4424,6 +4427,7 @@ mod tests {
                 path: Some("/work/in.png".to_string()),
                 preview: None,
                 directory: false,
+                image: true,
             }
         );
         assert_eq!(

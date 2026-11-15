@@ -1962,6 +1962,11 @@ pub enum ToolDetail {
         path: Option<String>,
         preview: Option<String>,
         directory: bool,
+        /// Whether the call's presentation is an IMAGE view, not a text
+        /// preview. The adapter declares it (Codex's `imageView` is true); the
+        /// card selects the image panel by this neutral fact, never the vendor
+        /// name.
+        image: bool,
     },
     /// A call that launches, addresses or reports on an agent run. The `runs`
     /// are filled by the AgentRun ticket; P1 only lands the variant.
