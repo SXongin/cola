@@ -3380,6 +3380,14 @@ async fn gather_render_liveness(
                     gathered.insert(launch.call_id.clone(), liveness.clone());
                 }
             }
+            // A terminal run no longer needs its child subscription; the live
+            // ones keep theirs for the next pass. Release is best-effort and
+            // idempotent (the runtime retirement paths release the same id).
+            for run in transcript.runs.iter().filter(|run| !run.is_live()) {
+                if let Some(child) = run.child_id.as_deref() {
+                    crate::bridge::runtime::release_child_session(backend, child).await;
+                }
+            }
             RenderLiveness {
                 panels,
                 gathered,

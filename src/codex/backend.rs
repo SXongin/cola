@@ -1350,8 +1350,11 @@ impl CodexClient {
     }
 
     /// Release every thread this connection holds, best-effort within `budget`
-    /// (issue #918). Only a process exit calls this — never a turn, a switch or
-    /// a read — so the normal path gains no requests.
+    /// (issue #918). Process exit calls this; a turn or a reconcile also
+    /// releases a child session once the run it served retires, while a live
+    /// run keeps its subscription. A connection's ordinary reads release only
+    /// what they retired (never the parent chain), so the normal path gains no
+    /// extra requests.
     ///
     /// Each release goes through the thread's subscriber task, the only holder
     /// of its [`ThreadSubscription`], so the "last local handle" rule still
