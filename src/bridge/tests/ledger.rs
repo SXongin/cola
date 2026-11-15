@@ -2187,6 +2187,73 @@ async fn the_shared_throttle_bounds_the_waiting_cards_reconcile() {
     );
 }
 
+/// Issue #454/#590, review round 3: a row rendered FROM THE RUN must keep the
+/// 待确认 marker. The runtime keys the marker by the LAUNCH call id while the
+/// run's durable key is the child id, so the run's known-id set has to carry
+/// both — otherwise the marker (and the cleanup button it gates) disappears
+/// exactly on the newer, run-rendered rows.
+#[tokio::test]
+async fn a_run_rendered_row_keeps_the_unconfirmed_marker() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut timeline = two_task_timeline(vec![]);
+    // The launch declares its run, as the OpenCode adapter now does: the row is
+    // built from the run instead of the Background Task's own fields.
+    for message in &mut timeline {
+        for part in &mut message.parts {
+            if let Part::Tool(call) = part
+                && call.identity.call_id == "call_sub"
+            {
+                call.detail = crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "ses_call_sub".into(),
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                };
+            }
+        }
+    }
+    let live = SessionTranscript::new(timeline)
+        .with_executions(vec![execution(2_500)])
+        .with_background_tasks(vec![
+            live_shell(now - 5_000, "call_bg"),
+            live_subagent(now - 3_000, "call_sub"),
+        ]);
+    assert_eq!(live.runs.len(), 1, "the subagent launch is a run");
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    {
+        let mut runtime = backend.task_runtime.lock().unwrap();
+        runtime.shells = vec![("sh_call_bg".into(), ShellRuntime::Running)];
+        runtime.children = vec![("ses_call_sub".into(), ChildRuntime::Inactive)];
+    }
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the unconfirmed run row",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("⚠️ 状态待确认"),
+    )
+    .await;
+
+    let latest = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&latest);
+    assert!(
+        text.contains("⏳ 后台任务（2 · 1 待确认）"),
+        "the run-rendered row counts its marker: {latest}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("subagent：**review the diff**") && line.ends_with("⚠️ 状态待确认")),
+        "the marker trails the run's own facts: {latest}"
+    );
+    assert!(
+        text.contains("清理待确认任务"),
+        "the cleanup exit is offered for the run-rendered row: {latest}"
+    );
+}
+
 /// Issue #454, extended by #591: a subagent the runtime reports INACTIVE is
 /// evidence, not an ending — the row gains the 待确认 marker, the card stays
 /// waiting, and only its own terminal child transcript (#591), its Wake, the

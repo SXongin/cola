@@ -1302,8 +1302,11 @@ async fn a_child_threads_terminal_turn_is_its_evidence() {
         "a running child is no terminal evidence"
     );
     // A freshly spawned child has no rollout yet: the recorded answer is
-    // `-32600 no rollout found for thread id <id>`, and it means the child is
-    // ALIVE in its first turn — never `Gone`.
+    // `-32600 no rollout found for thread id <id>`, and the list HOLDS it — so
+    // it is a healthy first-turn child, never `Gone`.
+    let mut fresh = ScriptedThread::adopted("thread-child-fresh", "session-root", WORK, "worker");
+    fresh.parent_thread_id = Some(THREAD.into());
+    server.seed_thread(fresh);
     server.answer_next_thread_read_no_rollout("thread-child-fresh");
     assert_eq!(
         Backend::child_evidence(&client, "thread-child-fresh")
@@ -1313,9 +1316,19 @@ async fn a_child_threads_terminal_turn_is_its_evidence() {
         "a first-turn child is healthy, so it keeps its run live"
     );
 
-    // A child the server's child-agent list does not know is a definitive
-    // absence: the read fails (the fake's unknown-thread error) and the probe
-    // over the `subAgent*` source kinds finds nothing.
+    // A DELETED child can answer no-rollout too; the list no longer holds it,
+    // which is the definitive absence.
+    server.answer_next_thread_read_no_rollout("thread-child-deleted");
+    assert_eq!(
+        Backend::child_evidence(&client, "thread-child-deleted")
+            .await
+            .expect("a deleted child is evidence, not a read failure"),
+        crate::backend::ChildEvidence::Gone,
+        "no list holds the deleted child"
+    );
+
+    // A child the server's list does not know is a definitive absence: the
+    // read fails (the fake's unknown-thread error) and the probe finds nothing.
     assert_eq!(
         Backend::child_evidence(&client, "thread-child-unknown")
             .await
