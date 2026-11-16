@@ -37,7 +37,7 @@ use crate::backend::{
     FileContent, FileEdit, FinishReason, MessageId, MessageRole, MessageTime, ModelIdentity, OtherPart, Part,
     ReasoningPart, RunStatus, SearchScope, SessionTranscript, StepFinish, TextPart, TodoList, TodoStatus,
     TodoStep, TokenUsage, ToolCall, ToolDetail, ToolIdentity, ToolKind, ToolOutput, ToolStatus,
-    TranscriptMessage, TurnDiff, TurnDiffFile,
+    TranscriptMessage, TurnDiff, TurnDiffFile, merge_file_edits,
 };
 
 /// `item/started`: the server's opening payload for one item.
@@ -2306,7 +2306,7 @@ impl ItemKind {
             ),
             Self::FileChange { changes, .. } => (
                 ToolKind::Edit,
-                ToolDetail::FileEdits(changes.iter().map(file_edit).collect()),
+                ToolDetail::FileEdits(merge_file_edits(changes.iter().map(file_edit))),
             ),
             // An MCP tool is third-party: its payload is never sniffed.
             Self::Mcp { .. } => (ToolKind::Other, ToolDetail::Opaque),
@@ -5540,5 +5540,25 @@ mod tests {
         assert_eq!(parsed.0[0].additions, 2);
         assert_eq!(parsed.0[1].status, "deleted");
         assert_eq!(parsed.0[1].deletions, 1);
+    }
+
+    /// Codex's `fileChange` can repeat one path across `changes[]`; the read
+    /// model merges them adapter-side (the card's re-merge is a safety net),
+    /// so the detail and its `locations` carry one entry per file.
+    #[test]
+    fn a_repeated_file_change_path_is_merged_in_the_read_model() {
+        let call = tool_for_conformance(&json!({
+            "type": "fileChange",
+            "id": "item-file-repeated",
+            "changes": [
+                {"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-a\n+b"},
+                {"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -10 +10 @@\n-c\n+d"}
+            ]
+        }));
+        let ToolDetail::FileEdits(edits) = &call.detail else {
+            panic!("a fileChange is a FileEdits detail");
+        };
+        assert_eq!(edits.len(), 1, "one path, one merged edit");
+        assert_eq!(call.locations.len(), 1, "and one location");
     }
 }
