@@ -234,10 +234,21 @@ fn apply_report(run: &mut AgentRun, call: &ToolCall) {
     {
         return;
     }
+    let status = status_of(call);
+    // A terminal statement latches: only a report that proves it is newer (a
+    // clock strictly after the last observation) may revive the run. A start
+    // with no clock (or the same second) cannot establish a new generation.
+    let newer = match (run.observed_at, call.started_at) {
+        (Some(seen), Some(at)) => at > seen,
+        (None, Some(_)) => true,
+        (_, None) => false,
+    };
+    if run.status.is_terminal() && !status.is_terminal() && !newer {
+        return;
+    }
     if call.started_at.is_some() {
         run.observed_at = call.started_at;
     }
-    let status = status_of(call);
     run.status = status;
     if status.is_terminal() {
         // The client states the run ended: no live activity to render. The
@@ -900,6 +911,22 @@ mod tests {
             2,
             "the older observation is still a relation on the run"
         );
+    }
+
+    /// A terminal statement latches even without clocks: a start that cannot
+    /// prove it is newer cannot revive a finished child.
+    #[test]
+    fn a_clockless_start_cannot_revive_a_terminal_run() {
+        let mut completed = report("call_done", "thread_1", "completed");
+        completed.started_at = Some(3);
+        let mut clockless = report("call_started_none", "thread_1", "started");
+        clockless.started_at = None;
+        let mut same_second = report("call_started_same", "thread_1", "started");
+        same_second.started_at = Some(3);
+        let read = transcript(vec![completed, clockless, same_second]);
+        assert_eq!(read.runs[0].status, RunStatus::Completed);
+        assert!(read.runs[0].activity.is_none());
+        assert_eq!(read.runs[0].reported_by.len(), 3);
     }
 
     /// The durable key is a property of the RUN, not of where a read window
