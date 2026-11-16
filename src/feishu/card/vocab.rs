@@ -136,9 +136,9 @@ pub(crate) fn name_only_token(
 /// `(kind, detail)` first and the vendor name last.
 ///
 /// The name is read in exactly one place — [`name_only_token`], where a closed
-/// three-entry table maps `todowrite`/`skill`/`question` to
-/// `plan`/`skill`/`ask` (OpenCode is their only producer, so they have no
-/// shared shape). Everywhere else the name is only the opaque fallback: a
+/// two-entry table maps `skill`/`question` to `skill`/`ask` (OpenCode is their
+/// only producer, so they have no shared shape; the plan carrier is the neutral
+/// [`ToolDetail::Plan`]). Everywhere else the name is only the opaque fallback: a
 /// vendor tool keeps its **full** vendor name, namespace included (ADR-0042).
 /// It never selects a renderer.
 ///

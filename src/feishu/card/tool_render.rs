@@ -434,7 +434,7 @@ impl ToolPanel {
     /// already applied the sources' precedence into the typed output's blocks,
     /// so a payload carrying more than one text source can never render twice.
     pub fn output(&self) -> Option<String> {
-        tool_output(&self.call)
+        tool_output(&self.call, self.detail_failure())
     }
 
     /// The child-session liveness gathered for a live `task` call (ADR-0054).
@@ -579,7 +579,7 @@ pub(crate) fn is_plan_call(call: &ToolCall) -> bool {
 /// read: the shape is the fact.
 fn call_todo_list(call: &ToolCall) -> Option<TodoList> {
     call.input.as_ref().and_then(parse_todo_list).or_else(|| {
-        tool_output(call)?
+        tool_output(call, false)?
             .parse::<serde_json::Value>()
             .ok()
             .as_ref()
@@ -1184,7 +1184,7 @@ fn secs_since(at_ms: i64, now_ms: i64) -> u64 {
 ///
 /// Non-text blocks and the raw payload stay out: the panel renders the plain
 /// string the card has always shown.
-fn tool_output(call: &ToolCall) -> Option<String> {
+fn tool_output(call: &ToolCall, detail_failed: bool) -> Option<String> {
     let mut out = String::new();
     let mut has_output = false;
     for block in &call.output.blocks {
@@ -1193,7 +1193,7 @@ fn tool_output(call: &ToolCall) -> Option<String> {
             out.push_str(text);
         }
     }
-    if call.status.is_failure()
+    if (call.status.is_failure() || detail_failed)
         && let Some(error) = &call.output.error
     {
         if !out.is_empty() {
@@ -10696,6 +10696,23 @@ excerpt two";
         assert!(md.contains("🔎 80 条结果"), "count kept: {md}");
         assert!(!md.contains("```"), "the list is not fenced: {md}");
         assert!(md.contains('…'), "the list is truncated: {md}");
+    }
+
+    /// A failure the protocol left `completed` still renders its error body.
+    #[test]
+    fn a_detail_failure_renders_its_error_body() {
+        let mut tool = command_panel(
+            "shell",
+            ToolStatus::Completed,
+            "make",
+            Some("/work"),
+            Some(1),
+            false,
+            None,
+        );
+        tool.call.output.error = Some("build failed".to_string());
+        let text = tool.output().unwrap_or_default();
+        assert!(text.contains("❌ build failed"), "the error body: {text}");
     }
 
     /// The `Command` shape's recorded outcome decides the failure verdict on a

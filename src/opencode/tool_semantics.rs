@@ -290,7 +290,8 @@ fn patch_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
         .map(patch_text_edits)
         .unwrap_or_default();
     let recorded = metadata_files(metadata, None);
-    let mut edits = if text.iter().any(|edit| edit.diff.is_some()) || recorded.is_empty() {
+    let has_recorded = !recorded.is_empty();
+    let mut edits = if text.iter().any(|edit| edit.diff.is_some()) || !has_recorded {
         text
     } else {
         // Metadata holds the applied hunks; the text adds an action/rename a
@@ -310,6 +311,21 @@ fn patch_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
         }
         merged
     };
+    // A text that names files but carries no hunk can still sit beside the
+    // applied diff V1 records as one `metadata.diff`: fill the hunks from it
+    // so the panel renders the change the previous card showed.
+    if !edits.is_empty() && edits.iter().all(|edit| edit.diff.is_none()) && !has_recorded {
+        let hint = metadata
+            .and_then(|metadata| metadata.get("filepath"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty());
+        if let Some(applied) = metadata_diff_raw(metadata).and_then(|diff| file_edit_from_diff(hint, diff)) {
+            match edits.iter_mut().find(|edit| edit.path == applied.path) {
+                Some(existing) => existing.diff = applied.diff,
+                None => edits.push(applied),
+            }
+        }
+    }
     if edits.is_empty() {
         let hint = metadata
             .and_then(|metadata| metadata.get("filepath"))
@@ -941,6 +957,24 @@ mod tests {
             patch_detail(None, Some(&json!({"diff": "@@ -1 +1 @@\n-a\n+b"}))),
             ToolDetail::FileEdits(Vec::new()),
             "a path-less diff waits for P3's patch-text parse"
+        );
+    }
+
+    /// A patch text that names files but carries no hunk still gets the
+    /// applied diff V1 records beside it.
+    #[test]
+    fn a_hunkless_patch_text_takes_the_recorded_diff() {
+        assert_eq!(
+            patch_detail(
+                Some(&json!({"patchText": "*** Update File: src/a.rs"})),
+                Some(&json!({"filepath": "src/a.rs", "diff": "@@ -1 +1 @@\n-a\n+b"}))
+            ),
+            ToolDetail::FileEdits(vec![FileEdit {
+                path: "src/a.rs".to_string(),
+                action: FileAction::Update,
+                rename_to: None,
+                diff: Some("@@ -1 +1 @@\n-a\n+b".to_string()),
+            }])
         );
     }
 
