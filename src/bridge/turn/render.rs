@@ -12229,11 +12229,11 @@ Index: /x/src/main.rs
         let text = card_text(&card);
         let panel = text
             .lines()
-            .find(|line| line.contains("⏳ subagent"))
+            .find(|line| line.contains("subagent"))
             .expect("the launch panel");
         assert!(
-            !panel.contains("waiting "),
-            "a terminal report clears the liveness line: {panel:?}"
+            !panel.contains("⏳") && !panel.contains("waiting "),
+            "a terminal report settles the launch panel and clears its liveness: {panel:?}"
         );
     }
 
