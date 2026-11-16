@@ -6976,10 +6976,8 @@ impl App {
             );
             // The cleaned run/task no longer needs its child subscription: a
             // Codex child adopted for liveness is released at the retirement.
-            if let Some(child) = retirement.task.child_id.as_deref()
-                && let Err(error) = handles.backend.release_session(child).await
-            {
-                tracing::debug!("cleanup: releasing child session {child} failed: {error}; best-effort");
+            if let Some(child) = retirement.task.child_id.as_deref() {
+                crate::bridge::runtime::release_child_session(&handles.backend, child).await;
             }
         }
         let stopped = handles.waits.is_stopped(&session_id).await;
