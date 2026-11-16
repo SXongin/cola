@@ -2053,6 +2053,26 @@ impl ChainRecords {
         resolved
     }
 
+    /// The newest ending clock the record for `held` carries, when a record
+    /// exists: `Some(None)` is a record whose ending has no clock. A resumed
+    /// run is contrasted against it (a newer start is a new generation, so an
+    /// old ending must not suppress it), which is why this reads the clock
+    /// rather than only "has an ending".
+    pub(crate) fn run_ended_at(&self, session_id: &str, held: &TaskRunId) -> Option<Option<i64>> {
+        let state = self.lock();
+        let client = state.client_id.clone();
+        let session_id = resolved_session(&state, session_id);
+        let records = state.endings.get(&client, &session_id)?;
+        let index = resolve_run(records, held)?;
+        Some(
+            records[index]
+                .endings
+                .iter()
+                .filter_map(|ending| ending.finished_at)
+                .max(),
+        )
+    }
+
     /// Flip the entries `shown` names — a `(run, class)` pair each — to SHOWN
     /// (ADR-0080), the confirmed card write's own half: a PATCH `Ok`, a create
     /// `Ok`, or a queued payload the drain delivered. Monotonic and additive, so

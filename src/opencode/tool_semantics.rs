@@ -105,12 +105,14 @@ const SHARED_TOOLS: &[SharedTool] = &[
         kind: ToolKind::Execute,
         detail: program_detail,
     },
-    // Known shared tools with no extra shape to declare.
+    // The plan's own carrier: the card renders it as the plan surface from
+    // this fact, never from the vendor id or an arbitrary payload.
     SharedTool {
         id: "todowrite",
         kind: ToolKind::Other,
-        detail: no_detail,
+        detail: |_, _| ToolDetail::Plan,
     },
+    // Known shared tools with no extra shape to declare.
     SharedTool {
         id: "skill",
         kind: ToolKind::Other,

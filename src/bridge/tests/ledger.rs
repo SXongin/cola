@@ -153,7 +153,7 @@ fn todowrite(created: i64, call_id: &str) -> TranscriptMessage {
                     call_id: call_id.into(),
                 },
                 kind: ToolKind::Other,
-                detail: ToolDetail::None,
+                detail: ToolDetail::Plan,
                 status: ToolStatus::Completed,
                 started_at: Some(created),
                 input: Some(serde_json::json!({ "todos": todos.clone() })),

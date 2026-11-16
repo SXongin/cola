@@ -124,7 +124,6 @@ pub(crate) fn name_only_token(
 ) -> Option<&'static str> {
     match (kind, detail) {
         (ToolKind::Other, ToolDetail::None) => match identity.name.as_str() {
-            "todowrite" => Some(TOOL_PLAN),
             "skill" => Some(TOOL_SKILL),
             "question" => Some(TOOL_ASK),
             _ => None,
@@ -175,6 +174,7 @@ pub(crate) fn tool_token<'a>(identity: &'a ToolIdentity, kind: ToolKind, detail:
             SearchScope::Web => TOOL_WEBSEARCH,
         },
         (ToolKind::Read, ToolDetail::Read { .. }) => TOOL_READ,
+        (ToolKind::Other, ToolDetail::Plan) => TOOL_PLAN,
         (ToolKind::Fetch, ToolDetail::None) => TOOL_FETCH,
         (
             ToolKind::Other,
@@ -448,11 +448,11 @@ mod tests {
         );
     }
 
-    /// The three name-only tokens are the closed exception; the name is read
-    /// nowhere else.
+    /// The name-only tokens are the closed exception; the name is read
+    /// nowhere else. The plan needs no name: its carrier is `ToolDetail::Plan`.
     #[test]
-    fn the_three_name_only_tokens_are_closed() {
-        assert_eq!(token("todowrite", ToolKind::Other, ToolDetail::None), TOOL_PLAN);
+    fn the_name_only_tokens_are_closed() {
+        assert_eq!(token("todowrite", ToolKind::Other, ToolDetail::Plan), TOOL_PLAN);
         assert_eq!(token("skill", ToolKind::Other, ToolDetail::None), TOOL_SKILL);
         assert_eq!(token("question", ToolKind::Other, ToolDetail::None), TOOL_ASK);
     }
