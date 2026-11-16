@@ -207,6 +207,10 @@ pub(crate) struct RecoveryReads<'a> {
     /// read is warranted to resolve the seed and follow the run, and a
     /// cursorless record keeps today's one-time restart stamp.
     pub(crate) cursor: bool,
+    /// Whether the attachment can retire a child run (child evidence). The
+    /// settle decision treats a terminal child-id run as still owing the Turn
+    /// only when this is true; V1 must settle on its terminal run.
+    pub(crate) can_retire_runs: bool,
 }
 
 impl RecoveryReads<'_> {
@@ -367,7 +371,7 @@ pub(crate) fn reconcile(record: &ChainRecord, reads: &RecoveryReads<'_>) -> Chai
                     let scope = record
                         .anchor()
                         .or_else(|| transcript.anchor_of_user(record.message_id.as_str()));
-                    match transcript.settle(scope.as_ref()) {
+                    match transcript.settle_with(scope.as_ref(), reads.can_retire_runs) {
                         // The read's boundary rule is unsatisfied (a Wake's
                         // Execution has not closed): the ending is not decided
                         // — keep observing.
@@ -579,6 +583,8 @@ mod tests {
             status: None,
             transcript: None,
             cursor: false,
+            // The tests' existing child-id cases model a retirable client.
+            can_retire_runs: true,
         }
     }
 
@@ -605,6 +611,7 @@ mod tests {
             status: Some(StatusRead::Named(SessionStatus::Idle)),
             transcript: None,
             cursor: false,
+            can_retire_runs: true,
         };
         assert_eq!(reconcile(&record, &reads), ChainDisposition::Keep);
     }
@@ -1553,6 +1560,42 @@ mod tests {
             fresh(&reads(false)),
             FreshDisposition::Announce(anchor),
             "a recordless post keeps the Watermark gate"
+        );
+    }
+
+    /// A V1 completed `task` derives a terminal child-id run, but V1 has no
+    /// child-evidence read: the recovery decision must let it settle, while a
+    /// client that can retire runs keeps the record observing.
+    #[test]
+    fn recovery_settles_a_v1_terminal_run_and_keeps_a_retirable_one() {
+        let record = record();
+        let mut transcript = SessionTranscript::default();
+        transcript.runs = vec![crate::backend::AgentRun {
+            run_id: "ses_child".into(),
+            task_run_id: Some("ses_child".into()),
+            child_id: Some("ses_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(2_000),
+            status: crate::backend::RunStatus::Completed,
+            activity: None,
+            observed_at: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        }];
+        let mut reads = idle_transcript(transcript);
+        reads.can_retire_runs = false;
+        assert_ne!(
+            reconcile(&record, &reads),
+            ChainDisposition::Keep,
+            "V1 cannot retire the run, so its terminal run settles"
+        );
+        reads.can_retire_runs = true;
+        assert_eq!(
+            reconcile(&record, &reads),
+            ChainDisposition::Settle(TurnSettle::Waiting),
+            "a retirable client still waits for the child's evidence"
         );
     }
 }

@@ -1007,6 +1007,13 @@ pub struct AgentCapabilities {
 }
 
 impl AgentCapabilities {
+    /// Whether the attachment can retire a child run from its own child
+    /// evidence — the one capability the "a child-id run still owes an ending"
+    /// settle clause needs. Background-run reporting alone does not answer it.
+    pub const fn can_retire_runs(&self) -> bool {
+        self.child_evidence
+    }
+
     /// The live-run ledger lists runs, not only background work: a turn-scoped
     /// child is a run too. **Codex is this case** (child evidence, no
     /// background surface). OpenCode V1 is not: it has child sessions but no
@@ -1397,6 +1404,48 @@ mod tests {
         assert!(
             !logs.contains("FullClient"),
             "a full-capability client logs nothing: {logs}"
+        );
+    }
+
+    /// The retire-a-run question is child evidence, not the broader live-run
+    /// predicate: a client with background runs but no child evidence still
+    /// cannot end a terminal child-only run, so settle must not wait for it.
+    #[test]
+    fn can_retire_runs_requires_child_evidence_not_just_live_runs() {
+        let capabilities = AgentCapabilities {
+            background_runs: true,
+            child_evidence: false,
+            ..AgentCapabilities::full()
+        };
+        assert!(capabilities.reports_live_runs());
+        assert!(
+            !capabilities.can_retire_runs(),
+            "background runs alone cannot read child evidence"
+        );
+
+        let mut transcript = crate::backend::SessionTranscript::default();
+        transcript.runs = vec![crate::backend::AgentRun {
+            run_id: "ses_child".into(),
+            task_run_id: Some("ses_child".into()),
+            child_id: Some("ses_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(1_000),
+            status: crate::backend::RunStatus::Completed,
+            activity: None,
+            observed_at: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        }];
+        let anchor = crate::backend::TurnAnchor {
+            message_id: crate::backend::MessageId::new("msg_u"),
+            created_ms: 1_000,
+        };
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), capabilities.can_retire_runs()),
+            crate::backend::TurnSettle::Complete,
+            "a background-only client's terminal child run settles"
         );
     }
 }
