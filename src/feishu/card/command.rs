@@ -140,11 +140,17 @@ pub(crate) async fn send_switch_card(
 /// The row's identity is the run's `run_id` (its child id), its title is the
 /// run's label, and its child id is the attach target the card's takeover
 /// resolves. A run with no start clock renders no relative-time segment.
-fn run_child_row(run: &crate::backend::AgentRun, parent_id: &str) -> crate::backend::types::SessionListInfo {
+fn run_child_row(
+    run: &crate::backend::AgentRun,
+    parent_id: &str,
+    directory: &str,
+) -> crate::backend::types::SessionListInfo {
     crate::backend::types::SessionListInfo {
         id: run.run_id.clone(),
         title: run.label.clone(),
-        directory: String::new(),
+        // The run lives in the parent Session's project; an adopted child must
+        // keep that directory (ADR-0010).
+        directory: directory.to_string(),
         parent_id: Some(parent_id.to_string()),
         agent: run.agent.clone(),
         model: None,
@@ -212,11 +218,17 @@ pub(crate) async fn child_card_data(
         .await
         .map(|transcript| transcript.runs)
         .unwrap_or_default();
+    let active_directory = handles
+        .flow
+        .sessions
+        .current_directory(thread_key)
+        .await
+        .unwrap_or_default();
     for run in &runs {
         if !seen.insert(run.run_id.clone()) {
             continue;
         }
-        let row = run_child_row(run, active_id.as_str());
+        let row = run_child_row(run, active_id.as_str(), &active_directory);
         if !lower.is_empty() && !matches_keyword(&row, &lower) {
             continue;
         }
