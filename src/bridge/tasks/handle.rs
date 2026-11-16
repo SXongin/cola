@@ -524,14 +524,21 @@ impl TasksHandle {
                     .run_ended_at(session_id, &identity)
                     .is_some_and(|ended_at| match (ended_at, run.started_at) {
                         (Some(ended_at), Some(started_at)) => ended_at >= started_at,
+                        // An undated ending cannot be compared with a run
+                        // that has a start: keep the run (a resumed generation
+                        // is live; evidence will retire it if it is not).
+                        (None, Some(_)) => false,
                         _ => true,
                     }),
                 None => false,
             };
-            let retired = state
-                .retired
-                .get(session_id)
-                .is_some_and(|ids| identity.ids().any(|id| ids.contains(id)));
+            // The process-local set carries no clock: it may only suppress a
+            // run the client already reports ended, never a live resume.
+            let retired = !run.is_live()
+                && state
+                    .retired
+                    .get(session_id)
+                    .is_some_and(|ids| identity.ids().any(|id| ids.contains(id)));
             !ended && !retired
         });
         let Some(ids) = state.unconfirmed.get(session_id) else {
