@@ -3047,6 +3047,35 @@ async fn handle_sub_attach(
         .filter(|s| s.is_child_of(&active_id) && !s.is_archived())
         .cloned()
         .collect();
+    // A child-only run (a Codex collaboration child) has no session-list row:
+    // its run id is still a direct child the attach may name. Union it in,
+    // de-duped by id so OpenCode's session rows are unchanged.
+    let runs = handles
+        .flow
+        .backend
+        .transcript(&active_id)
+        .await
+        .map(|transcript| transcript.runs)
+        .unwrap_or_default();
+    let mut children = children;
+    for run in &runs {
+        if children.iter().any(|child| child.id == run.run_id) {
+            continue;
+        }
+        children.push(crate::backend::types::SessionListInfo {
+            id: run.run_id.clone(),
+            title: run.label.clone(),
+            directory: String::new(),
+            parent_id: Some(active_id.clone()),
+            agent: run.agent.clone(),
+            model: None,
+            time: run.started_at.map(|at| crate::backend::types::SessionTime {
+                created: at,
+                updated: at,
+                archived: None,
+            }),
+        });
+    }
     match resolve_session(&children, query) {
         SessionResolution::Hit(s) => {
             adopt_session(handles, thread_key, s, message_id, kind, force, "/sub attach").await
