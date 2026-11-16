@@ -207,8 +207,12 @@ fn apply_report(run: &mut AgentRun, call: &ToolCall) {
         // is the honest phase until the child's own read establishes one.
         activity.phase = Some(Phase::Waiting);
     }
-    if activity.since.is_none() {
-        activity.since = call.started_at;
+    // The newest live observation is the phase's own clock: a later
+    // `interacted`/`resumed` report moves it forward, never back.
+    if let Some(at) = call.started_at
+        && activity.since.is_none_or(|since| at > since)
+    {
+        activity.since = Some(at);
     }
 }
 
@@ -297,6 +301,11 @@ pub fn child_run_activity(transcript: &SessionTranscript) -> Option<RunActivity>
     for message in &transcript.messages {
         if let Some(time) = &message.time {
             observe(&mut newest_ms, Some(time.completed.unwrap_or(time.created)));
+        }
+        // Only the child's own output is a phase: a user prompt it has received
+        // but not answered is `waiting`, not `responding`.
+        if message.role != super::MessageRole::Assistant {
+            continue;
         }
         for part in &message.parts {
             newest_part = Some(part);
@@ -458,6 +467,31 @@ mod tests {
             error: None,
             parts: calls.into_iter().map(Part::Tool).collect(),
         }])
+    }
+
+    /// A child that has received a prompt but not answered is `waiting`: only
+    /// its own output is a phase.
+    #[test]
+    fn a_user_prompt_alone_is_waiting_not_responding() {
+        let read = SessionTranscript::new(vec![TranscriptMessage {
+            id: MessageId::new("msg_user"),
+            role: super::super::MessageRole::User,
+            time: Some(MessageTime {
+                created: 5,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Text(crate::backend::TextPart {
+                text: "resume please".to_string(),
+                started_at: Some(5),
+            })],
+        }]);
+        assert_eq!(
+            child_run_activity(&read).map(|activity| activity.phase),
+            Some(Some(Phase::Waiting))
+        );
     }
 
     #[test]

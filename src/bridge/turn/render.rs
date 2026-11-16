@@ -3209,27 +3209,36 @@ pub(super) async fn gather_child_liveness(
     backend: &Arc<dyn crate::backend::Backend>,
     requests: &RequestsHandle,
     children: &[(String, String)],
-) -> std::collections::HashMap<String, TaskLiveness> {
+) -> (
+    std::collections::HashMap<String, TaskLiveness>,
+    std::collections::HashSet<String>,
+) {
     // Panel liveness is a child-agent surface (ADR-0106): a client with no
     // child-agent concept renders the plain panel and spends no child read.
     if backend.capabilities().child_agents == crate::backend::ChildAgentMode::None {
-        return std::collections::HashMap::new();
+        return (std::collections::HashMap::new(), std::collections::HashSet::new());
     }
     let mut by_child: std::collections::HashMap<&str, Option<TaskLiveness>> =
         std::collections::HashMap::new();
     let mut gathered = std::collections::HashMap::new();
+    let mut finished = std::collections::HashSet::new();
     for (key, child) in children {
         // The distinct-child cache holds failures too (`None`), so a child
         // whose read already failed is not read again for another key.
         if !by_child.contains_key(child.as_str()) {
             let liveness = match backend.transcript(child).await {
-                Ok(transcript) => match child_activity(&transcript) {
-                    Some(mut activity) => {
-                        activity.awaiting = run_waits(requests.wait_for(child).await);
-                        Some(TaskLiveness::from_run(&activity))
+                Ok(transcript) => {
+                    if crate::backend::runs::child_run_finished(&transcript) {
+                        finished.insert(child.clone());
                     }
-                    None => None,
-                },
+                    match child_activity(&transcript) {
+                        Some(mut activity) => {
+                            activity.awaiting = run_waits(requests.wait_for(child).await);
+                            Some(TaskLiveness::from_run(&activity))
+                        }
+                        None => None,
+                    }
+                }
                 Err(_) => None,
             };
             by_child.insert(child.as_str(), liveness);
@@ -3238,7 +3247,7 @@ pub(super) async fn gather_child_liveness(
             gathered.insert(key.clone(), liveness.clone());
         }
     }
-    gathered
+    (gathered, finished)
 }
 
 /// The header's wait words as the run's own set: both may be live at once
@@ -3347,14 +3356,14 @@ async fn gather_render_liveness(
                     children.push(pair);
                 }
             }
-            let child_liveness = if children.is_empty() {
-                std::collections::HashMap::new()
+            let (child_liveness, finished) = if children.is_empty() {
+                (std::collections::HashMap::new(), std::collections::HashSet::new())
             } else {
                 gather_child_liveness(backend, requests, &children).await
             };
             let mut gathered = std::collections::HashMap::new();
             for run in &transcript.runs {
-                if !run.is_live() {
+                if !run.is_live() || finished.contains(&run.run_id) {
                     continue;
                 }
                 let child = child_liveness.get(&run.run_id).cloned();
@@ -3413,7 +3422,7 @@ async fn gather_render_liveness(
             }
             RenderLiveness {
                 panels,
-                gathered: gather_child_liveness(backend, requests, &children).await,
+                gathered: gather_child_liveness(backend, requests, &children).await.0,
                 clear_missing: false,
             }
         }
