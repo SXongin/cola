@@ -566,15 +566,13 @@ pub(crate) fn receipt_key(call: &ToolCall) -> ReceiptKey {
     }
 }
 
-/// Whether this call is the plan surface's carrier: the closed `plan` arm of
-/// the **name-only** table ([`vocab::name_only_token`]) — `Other`, `None` and
-/// the vendor id `todowrite`. It is deliberately not a rendered-token
-/// comparison: the opaque fallback returns the identity's own name, so an
-/// MCP/plugin call literally named `plan` must not disappear into the plan
-/// surface. The plan's *content* is still the neutral `TodoList`
-/// [`ToolPanel::todo_list`] parses.
+/// Whether this call is the plan surface's carrier: its payload carries the
+/// neutral `TodoList` fact ([`call_todo_list`]). The vendor id is never read —
+/// the shape is the fact — so a third adapter's plan tool feeds the same
+/// surface, and an `Other` call named `todowrite` without a todo list is an
+/// ordinary tool panel.
 pub(crate) fn is_plan_call(call: &ToolCall) -> bool {
-    vocab::name_only_token(&call.identity, call.kind, &call.detail) == Some(vocab::TOOL_PLAN)
+    call_todo_list(call).is_some()
 }
 
 /// The neutral plan fact a call carries, parsed from its input first and its

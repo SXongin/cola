@@ -3057,6 +3057,12 @@ async fn handle_sub_attach(
         .await
         .map(|transcript| transcript.runs)
         .unwrap_or_default();
+    let active_directory = handles
+        .flow
+        .sessions
+        .current_directory(thread_key)
+        .await
+        .unwrap_or_default();
     let mut children = children;
     for run in &runs {
         if children.iter().any(|child| child.id == run.run_id) {
@@ -3065,7 +3071,8 @@ async fn handle_sub_attach(
         children.push(crate::backend::types::SessionListInfo {
             id: run.run_id.clone(),
             title: run.label.clone(),
-            directory: String::new(),
+            // The run lives in the parent Session's project (ADR-0010).
+            directory: active_directory.clone(),
             parent_id: Some(active_id.clone()),
             agent: run.agent.clone(),
             model: None,
