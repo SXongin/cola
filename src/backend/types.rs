@@ -899,7 +899,9 @@ pub enum ChildAgentMode {
 pub enum PlanMode {
     /// The client has no plan surface.
     None,
-    /// A `todowrite`-style tool call replaces a card-tail list (OpenCode V1/V2).
+    /// A `todowrite`-style tool call replaces a card-tail list (OpenCode V1
+    /// only: V2 removed the tool, and Codex states its plan through
+    /// `turn/plan/updated`).
     TodoTool,
     /// A turn-scoped plan notification replaces the card-tail list (Codex's
     /// `turn/plan/updated`).
