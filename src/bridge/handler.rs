@@ -3126,6 +3126,11 @@ impl App {
             // (#477/spec #797): route it before the action match, without
             // widening the button's exact four-key payload.
             if op == crate::feishu::card::turn_diff::TURN_DIFF_OP {
+                // A card persisted under a client that had the surface may be
+                // clicked after a reattach: omit the read, don't guess it.
+                if !self.core.flow_handles().backend.capabilities().diffs {
+                    return None;
+                }
                 return self.handle_turn_diff_action(&value).await;
             }
             match action {
@@ -3186,8 +3191,13 @@ impl App {
                     }
                     _ => self.handle_file_card_action(&self.core, &value).await,
                 },
-                "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
-                "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
+                "agent" if self.core.flow_handles().backend.capabilities().modes => {
+                    self.handle_agent_card_action(&self.core, &value, false).await
+                }
+                "agent_clear" if self.core.flow_handles().backend.capabilities().modes => {
+                    self.handle_agent_card_action(&self.core, &value, true).await
+                }
+                "agent" | "agent_clear" => None,
                 "model" => {
                     self.handle_model_card_action(&self.core, &value, callback_started)
                         .await

@@ -4198,8 +4198,8 @@ mod tests {
         let call = projected_tool(&projection, "item-collab-shutdown");
         assert_eq!(
             call.status,
-            ToolStatus::Completed,
-            "the shutdown child is terminal, so the launch completes"
+            ToolStatus::Other("interrupted".to_string()),
+            "the launch settles with its cancelled run"
         );
         let ToolDetail::Delegation { runs, .. } = &call.detail else {
             panic!("a collaboration call is a delegation");
@@ -4278,8 +4278,8 @@ mod tests {
         let call = projected_tool(&projection, "item-collab-done");
         assert_eq!(
             call.status,
-            ToolStatus::Completed,
-            "every named target is terminal"
+            ToolStatus::Other("interrupted".to_string()),
+            "every named target is terminal; a cancelled one names the launch's word"
         );
     }
 

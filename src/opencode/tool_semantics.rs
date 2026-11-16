@@ -368,6 +368,18 @@ fn fetch_detail(_input: Option<&Value>, _metadata: Option<&Value>) -> ToolDetail
     ToolDetail::None
 }
 
+/// The client's own run status, from the metadata's state word.
+fn run_status(status: &str) -> Option<crate::backend::RunStatus> {
+    use crate::backend::RunStatus;
+    match status {
+        "running" | "in_progress" => Some(RunStatus::Running),
+        "completed" => Some(RunStatus::Completed),
+        "error" | "failed" => Some(RunStatus::Failed),
+        "cancelled" | "cancelled_by_user" => Some(RunStatus::Cancelled),
+        _ => None,
+    }
+}
+
 fn delegation_detail(_input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
     // A `task`/`subagent` call names the child session it runs in its state
     // metadata — V1 `sessionId`, V2 `sessionID` (AGENTS.md pitfall
@@ -379,12 +391,19 @@ fn delegation_detail(_input: Option<&Value>, metadata: Option<&Value>) -> ToolDe
             .find_map(|key| metadata.get(*key).and_then(Value::as_str))
             .filter(|id| !id.is_empty())
     });
+    // The state metadata is the client's statement about the run: the call's
+    // own `state.status` is the handle's (it completes when the background
+    // handle returns), while `metadata.status` says whether the child runs.
+    let status = metadata
+        .and_then(|metadata| metadata.get("status"))
+        .and_then(Value::as_str)
+        .and_then(run_status);
     ToolDetail::Delegation {
         runs: child
             .map(|id| {
                 vec![crate::backend::AgentRunRef {
                     run_id: id.to_string(),
-                    status: None,
+                    status,
                 }]
             })
             .unwrap_or_default(),
