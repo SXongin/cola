@@ -179,11 +179,20 @@ impl RuntimeReconcile {
 }
 
 /// Release one child session's backend subscription, best-effort: a client that
-/// keeps nothing (the trait default) is a no-op, and a failed release must not
-/// fail the pass that retired the run.
+/// keeps nothing (the trait default) is a no-op, and a failed or hung release
+/// must not fail or stall the pass that retired the run. The ending is recorded
+/// before this call; the bound only protects the pass from a daemon that never
+/// answers `thread/unsubscribe`.
 pub(crate) async fn release_child_session(backend: &Arc<dyn Backend>, child_id: &str) {
-    if let Err(error) = backend.release_session(child_id).await {
-        tracing::debug!("release child session {child_id} failed: {error}");
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        backend.release_session(child_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::debug!("release child session {child_id} failed: {error}"),
+        Err(_) => tracing::debug!("release child session {child_id} timed out; detached"),
     }
 }
 
@@ -392,10 +401,10 @@ pub(crate) async fn reconcile_now(
                                     .background_tasks
                                     .iter()
                                     .any(|task| task.tool.call_id == call_id);
+                            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
                             if retired {
                                 release_child_session(backend, &child_id).await;
                             }
-                            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
                         }
                         Some(Err(error)) => {
                             tracing::debug!(
@@ -978,6 +987,76 @@ mod tests {
             "no Lost ending for a child with no history yet"
         );
         assert_eq!(transcript.settle(None), crate::backend::TurnSettle::Unreceived);
+    }
+
+    /// The ending is durable before the release attempt: a daemon that never
+    /// answers `thread/unsubscribe` is bounded, never allowed to stall the
+    /// reconcile or lose the fact.
+    #[tokio::test]
+    async fn a_hung_child_release_does_not_lose_the_ending() {
+        let mock = MockBackend::new(Vec::new());
+        mock.with_child_evidence(
+            "thread_done",
+            crate::backend::ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None,
+            },
+        )
+        .await;
+        mock.hang_release.store(1, std::sync::atomic::Ordering::SeqCst);
+        let mock = Arc::new(mock);
+        let releases = Arc::clone(&mock.release_calls);
+        let backend: Arc<dyn Backend> = mock;
+
+        let launch = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "spawnAgent".into(),
+                call_id: "call_spawn".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_done".into(),
+                    status: Some(crate::backend::RunStatus::Completed),
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_spawn"),
+            role: crate::backend::MessageRole::Assistant,
+            time: None,
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(launch)],
+        }]);
+        let started = tokio::time::Instant::now();
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a hung release must not stall the reconcile: {:?}",
+            started.elapsed()
+        );
+        assert!(pass.is_some_and(|pass| pass.changed()), "the ending was derived");
+        assert_eq!(
+            transcript.task_retirements[0].ending,
+            crate::backend::TaskRetirementEnding::ChildEnded
+        );
+        assert_eq!(
+            releases.lock().await.as_slice(),
+            ["thread_done".to_string()],
+            "the release was still attempted"
+        );
     }
 
     /// Review finding 2: a report-terminal run is the ONLY work, so no live

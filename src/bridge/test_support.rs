@@ -1703,6 +1703,9 @@ pub struct MockBackend {
     /// failure as best-effort and must not fail the command that dropped the
     /// mapping.
     pub fail_release_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of initial `release_session` calls to hang forever, proving a
+    /// caller's bound keeps a wedged daemon from stalling the pass.
+    pub hang_release: Arc<std::sync::atomic::AtomicUsize>,
     /// Request ids cola answered via `reply_permission` — filtered out of
     /// `list_permissions` like the real server drops a replied request. A test
     /// simulating resolution by ANOTHER client inserts the id here directly.
@@ -2240,6 +2243,7 @@ impl MockBackend {
             compact_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             release_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_release_count: std::sync::atomic::AtomicUsize::new(0).into(),
+            hang_release: std::sync::atomic::AtomicUsize::new(0).into(),
             replied_permissions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             reply_permission_not_found: false,
             fail_reply_permission_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -3472,6 +3476,11 @@ impl crate::backend::Backend for MockBackend {
     /// lands when the client cannot free its mirror.
     async fn release_session(&self, session_id: &str) -> crate::error::Result<()> {
         self.release_calls.lock().await.push(session_id.to_string());
+        if self.hang_release.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.hang_release
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
         if self.fail_release_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             self.fail_release_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
