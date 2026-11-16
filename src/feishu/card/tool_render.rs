@@ -566,13 +566,12 @@ pub(crate) fn receipt_key(call: &ToolCall) -> ReceiptKey {
     }
 }
 
-/// Whether this call is the plan surface's carrier: its payload carries the
-/// neutral `TodoList` fact ([`call_todo_list`]). The vendor id is never read —
-/// the shape is the fact — so a third adapter's plan tool feeds the same
-/// surface, and an `Other` call named `todowrite` without a todo list is an
-/// ordinary tool panel.
+/// Whether this call is the plan surface's carrier: the adapter declared
+/// [`ToolDetail::Plan`]. Neither the vendor id nor an arbitrary payload is
+/// read — a third adapter's plan tool maps to the same fact, and an `Opaque`
+/// call carrying a todo-shaped payload is never sniffed (ADR-0042).
 pub(crate) fn is_plan_call(call: &ToolCall) -> bool {
-    call_todo_list(call).is_some()
+    matches!(call.detail, ToolDetail::Plan)
 }
 
 /// The neutral plan fact a call carries, parsed from its input first and its
@@ -9257,7 +9256,7 @@ LSP errors detected in a.rs, please fix:
     fn plan_tool(status: ToolStatus, input: Option<serde_json::Value>, output: Option<&str>) -> ToolPanel {
         let mut tool = ToolPanel::for_test("todowrite", status, input, output);
         tool.call.kind = ToolKind::Other;
-        tool.call.detail = ToolDetail::None;
+        tool.call.detail = ToolDetail::Plan;
         tool
     }
 

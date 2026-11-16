@@ -517,8 +517,15 @@ impl TasksHandle {
                 job_id: None,
                 wake_id: None,
             };
+            // A resumed run is a new generation of the same child: an ending
+            // older than the run's newest start must not suppress it.
             let ended = match &chains {
-                Some(chains) => chains.observe_run(session_id, &identity),
+                Some(chains) => chains
+                    .run_ended_at(session_id, &identity)
+                    .is_some_and(|ended_at| match (ended_at, run.started_at) {
+                        (Some(ended_at), Some(started_at)) => ended_at >= started_at,
+                        _ => true,
+                    }),
                 None => false,
             };
             let retired = state

@@ -1936,6 +1936,13 @@ pub struct ToolLocation {
 pub enum ToolDetail {
     /// A known shared tool with nothing extra to declare.
     None,
+    /// The call is the plan surface's carrier: a tool whose payload carries the
+    /// plan's own list (`todowrite` today). Additive to spec #1057's canonical
+    /// shape: it is the neutral fact that lets the card render the plan without
+    /// reading either a vendor id or an arbitrary payload — an adapter maps its
+    /// plan tool here, and a call the adapter leaves `Opaque`/`None` is never
+    /// sniffed for a todo list.
+    Plan,
     /// A shell-like command: the command line, its working directory, the
     /// client's own one-line description of it, the exit code it recorded, and
     /// whether it timed out.
