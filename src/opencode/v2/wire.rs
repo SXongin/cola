@@ -866,10 +866,26 @@ pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
     let wakes: Vec<Wake> = data.iter().filter_map(decode_wake).collect();
     let messages: Vec<TranscriptMessage> = data.iter().map(decode_message).collect();
     let background_tasks = decode_background_tasks(&messages, &wakes);
-    SessionTranscript::new(messages)
+    let wakes_for_runs = wakes.clone();
+    let mut transcript = SessionTranscript::new(messages)
         .with_executions(executions)
         .with_wakes(wakes)
-        .with_background_tasks(background_tasks)
+        .with_background_tasks(background_tasks);
+    // A Wake that retired the task also retired its run (one run, one ending):
+    // the launch-derived run must not survive beside the Wake's completion.
+    transcript.runs.retain(|run| {
+        let task = crate::backend::BackgroundTask {
+            tool: crate::backend::ToolIdentity {
+                name: "subagent".to_string(),
+                call_id: run.ending_key().to_string(),
+            },
+            shell_id: None,
+            child_id: run.child_id.clone(),
+            started_at: run.started_at,
+        };
+        !wakes_for_runs.iter().any(|wake| wake.retires(&task))
+    });
+    transcript
 }
 
 /// Decode one durable `idle` marker into an Execution boundary. A marker

@@ -39,19 +39,30 @@ pub(crate) fn derive_runs(messages: &mut [TranscriptMessage]) -> Vec<AgentRun> {
     // the request: once the client reports the run ended, the panel settles
     // with it rather than reading `Running` beside a finished run.
     let mut settled: Vec<(String, ToolStatus)> = Vec::new();
-    for run in &runs {
-        if run.reported_by.is_empty() {
+    let mut launch_ids: Vec<String> = runs
+        .iter()
+        .flat_map(|run| run.launched_by.iter().map(|launch| launch.call_id.clone()))
+        .collect();
+    launch_ids.sort();
+    launch_ids.dedup();
+    for launch_id in launch_ids {
+        let group: Vec<&AgentRun> = runs
+            .iter()
+            .filter(|run| run.launched_by.iter().any(|launch| launch.call_id == launch_id))
+            .collect();
+        // One launch may name N children: it settles only when every one of
+        // them is terminal, and a failure outranks a cancellation/complete.
+        if group.is_empty() || !group.iter().all(|run| run.status.is_terminal()) {
             continue;
         }
-        let status = match run.status {
-            RunStatus::Completed => ToolStatus::Completed,
-            RunStatus::Failed => ToolStatus::Error,
-            RunStatus::Cancelled => ToolStatus::Other("interrupted".to_string()),
-            _ => continue,
+        let status = if group.iter().any(|run| run.status == RunStatus::Failed) {
+            ToolStatus::Error
+        } else if group.iter().any(|run| run.status == RunStatus::Cancelled) {
+            ToolStatus::Other("interrupted".to_string())
+        } else {
+            ToolStatus::Completed
         };
-        for launch in &run.launched_by {
-            settled.push((launch.call_id.clone(), status.clone()));
-        }
+        settled.push((launch_id, status));
     }
     if !settled.is_empty() {
         for message in messages.iter_mut() {
@@ -555,6 +566,54 @@ mod tests {
             })
             .expect("the launch call");
         assert_eq!(launch_status, ToolStatus::Completed);
+    }
+
+    /// A shared launch settles only when every child it named is terminal, and
+    /// a failure outranks a cancellation or a complete.
+    #[test]
+    fn a_multi_child_launch_settles_with_the_last_terminal_run() {
+        let launch = call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["ses_a", "ses_b"],
+            ToolStatus::Running,
+            Some(10),
+        );
+        let a_done = {
+            let mut report = report("call_a", "ses_a", "completed");
+            report.started_at = Some(20);
+            report
+        };
+        let b_live = {
+            let mut report = report("call_b", "ses_b", "interrupted");
+            report.started_at = Some(21);
+            report
+        };
+        let read = SessionTranscript::new(vec![TranscriptMessage {
+            id: MessageId::new("msg_1"),
+            role: super::super::MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: 10,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Tool(launch), Part::Tool(a_done), Part::Tool(b_live)],
+        }]);
+        let launch = read.messages[0]
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == "call_spawn" => Some(call.status.clone()),
+                _ => None,
+            })
+            .expect("the launch call");
+        assert_eq!(
+            launch,
+            ToolStatus::Other("interrupted".to_string()),
+            "a cancelled child names the settled launch's word"
+        );
     }
 
     /// A child that has received a prompt but not answered is `waiting`: only
