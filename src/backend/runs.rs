@@ -358,6 +358,15 @@ pub fn child_run_activity(transcript: &SessionTranscript) -> Option<RunActivity>
 /// liveness suppression use, so they cannot disagree about which finish is
 /// "the finish".
 fn newest_step_finish(transcript: &SessionTranscript) -> Option<&super::FinishReason> {
+    // A user message newer than the last assistant output is a new generation
+    // of the same child: the previous turn's finish no longer states this one.
+    if transcript
+        .messages
+        .last()
+        .is_some_and(|message| message.role == super::MessageRole::User)
+    {
+        return None;
+    }
     let message = transcript
         .messages
         .iter()
@@ -470,24 +479,42 @@ mod tests {
     }
 
     /// A child that has received a prompt but not answered is `waiting`: only
-    /// its own output is a phase.
+    /// its own output is a phase, and a new user turn makes the previous
+    /// turn's finish stale.
     #[test]
     fn a_user_prompt_alone_is_waiting_not_responding() {
-        let read = SessionTranscript::new(vec![TranscriptMessage {
-            id: MessageId::new("msg_user"),
-            role: super::super::MessageRole::User,
-            time: Some(MessageTime {
-                created: 5,
-                completed: None,
-            }),
-            model: None,
-            tokens: None,
-            error: None,
-            parts: vec![Part::Text(crate::backend::TextPart {
-                text: "resume please".to_string(),
-                started_at: Some(5),
-            })],
-        }]);
+        let read = SessionTranscript::new(vec![
+            TranscriptMessage {
+                id: MessageId::new("msg_assistant"),
+                role: super::super::MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created: 1,
+                    completed: Some(2),
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::StepFinish(StepFinish {
+                    reason: FinishReason::Stop,
+                })],
+            },
+            TranscriptMessage {
+                id: MessageId::new("msg_user"),
+                role: super::super::MessageRole::User,
+                time: Some(MessageTime {
+                    created: 5,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![Part::Text(crate::backend::TextPart {
+                    text: "resume please".to_string(),
+                    started_at: Some(5),
+                })],
+            },
+        ]);
+        assert!(!child_run_finished(&read), "a new user turn is not finished");
         assert_eq!(
             child_run_activity(&read).map(|activity| activity.phase),
             Some(Some(Phase::Waiting))
