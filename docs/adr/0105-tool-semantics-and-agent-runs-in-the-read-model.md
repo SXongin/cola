@@ -1,5 +1,11 @@
 # The read model carries tool semantics and agent runs
 
+> **Amended by ADR-0107 (2026-11-16, spec #1057 ticket #1063)**: decision 3's
+> variant list gains `ToolDetail::Plan` — the call that carries the plan list.
+> The vocabulary ticket needs the plan surface to read a neutral fact rather
+> than a vendor id or a sniffed payload; the closed name-only table keeps only
+> `skill`/`ask`, and an adapter maps its plan tool to `Plan`.
+
 > **Amends**: ADR-0042 (built-ins are tailored by tool id, payloads are
 > interpreted by the Platform), ADR-0053's rejected option ("per-built-in-tool
 > typed payloads inside the read model") and ADR-0090's second-adapter rule (the

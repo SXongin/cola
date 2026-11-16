@@ -333,7 +333,8 @@ impl GenerationStrategy for V2Strategy {
     ///   session with a readable transcript.
     /// - `child_evidence = true`: the one-page newest-assistant read answers a
     ///   child's terminal item (or a 404 as `Gone`).
-    /// - `plan = TodoTool`: the `todowrite` tool call.
+    /// - `plan = None`: OpenCode 2 removed `todowrite` (ADR-0042); the card-tail
+    ///   plan list has no V2 producer, and guessing one would invent a surface.
     /// - `compaction = true`: compaction parts on the transcript (ADR-0082).
     /// - `usage = PerTurn`: each assistant message's `tokens` counters.
     /// - `questions = SessionAndLocation`: `GET /api/form` serves session-backed
@@ -346,7 +347,7 @@ impl GenerationStrategy for V2Strategy {
             background_runs: true,
             child_agents: crate::backend::ChildAgentMode::ChildSessions,
             child_evidence: true,
-            plan: crate::backend::PlanMode::TodoTool,
+            plan: crate::backend::PlanMode::None,
             compaction: true,
             usage: crate::backend::UsageMode::PerTurn,
             questions: crate::backend::QuestionMode::SessionAndLocation,

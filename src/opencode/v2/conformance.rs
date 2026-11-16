@@ -26,7 +26,7 @@ pub(crate) fn case() -> SessionCase {
             background_runs: true,
             child_agents: crate::backend::ChildAgentMode::ChildSessions,
             child_evidence: true,
-            plan: crate::backend::PlanMode::TodoTool,
+            plan: crate::backend::PlanMode::None,
             compaction: true,
             usage: crate::backend::UsageMode::PerTurn,
             questions: crate::backend::QuestionMode::SessionAndLocation,
