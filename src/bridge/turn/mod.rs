@@ -3441,7 +3441,9 @@ impl Turn {
             } else {
                 crate::bridge::bounded_call("yielded ledger child liveness", read_timeout_ms, async {
                     Ok::<_, crate::error::BridgeError>(
-                        render::gather_child_liveness(backend, requests, &children).await,
+                        render::gather_child_liveness(backend, requests, &children)
+                            .await
+                            .0,
                     )
                 })
                 .await
