@@ -1106,7 +1106,7 @@ impl Turn {
             let anchor = transcript
                 .anchor_of_user(&self.cola_message_id)
                 .or_else(|| captured_anchor.clone());
-            transcript.settle_with(anchor.as_ref(), handles.backend.reports_live_runs())
+            transcript.settle_with(anchor.as_ref(), handles.backend.capabilities().can_retire_runs())
         });
         // The ending the drain already decided outranks a later re-decision:
         // its two graces (#603) are loop-only endings the settle table cannot
@@ -2008,7 +2008,7 @@ impl Turn {
                     anchor.as_ref(),
                     observed,
                     IdleRead::Idle,
-                    handles.backend.reports_live_runs(),
+                    handles.backend.capabilities().can_retire_runs(),
                 ),
                 live: false,
                 settled_readable: true,
@@ -2022,7 +2022,7 @@ impl Turn {
                         anchor.as_ref(),
                         observed,
                         IdleRead::Unreadable,
-                        handles.backend.reports_live_runs(),
+                        handles.backend.capabilities().can_retire_runs(),
                     ),
                     live: false,
                     settled_readable: false,
@@ -2036,7 +2036,7 @@ impl Turn {
                     anchor.as_ref(),
                     observed,
                     IdleRead::Unreadable,
-                    handles.backend.reports_live_runs(),
+                    handles.backend.capabilities().can_retire_runs(),
                 ),
                 live: false,
                 settled_readable: false,
@@ -3410,7 +3410,10 @@ impl Turn {
                     // progress, and falls through to settle below.
                     if card.acc.awaits_typed_answer()
                         && Disposition::of_quiet_settle(
-                            transcript.settle_with(card.acc.turn_anchor(), backend.reports_live_runs()),
+                            transcript.settle_with(
+                                card.acc.turn_anchor(),
+                                backend.capabilities().can_retire_runs(),
+                            ),
                             stopped,
                         )
                         .is_none()
@@ -3466,7 +3469,7 @@ impl Turn {
             // yield is only decided from one), so the anchorless Unreceived
             // decision cannot arise here; a Running read keeps observing.
             let settled = Disposition::of_quiet_settle(
-                transcript.settle_with(anchor.as_ref(), backend.reports_live_runs()),
+                transcript.settle_with(anchor.as_ref(), backend.capabilities().can_retire_runs()),
                 stopped,
             );
             // The typed-answer check again, now under the write lock the write

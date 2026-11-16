@@ -601,6 +601,7 @@ async fn gather_reads<'a>(
         status: None,
         transcript: None,
         cursor: record.cursor.is_some(),
+        can_retire_runs: handles.backend.capabilities().can_retire_runs(),
     }
 }
 

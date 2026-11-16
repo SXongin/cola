@@ -744,15 +744,18 @@ impl SessionTranscript {
     /// A read with no Executions, Wakes, Background Tasks or live runs (V1,
     /// or a session with nothing running) decides exactly as before: idle with
     /// no live run is complete.
+    #[cfg(test)]
     pub fn settle(&self, anchor: Option<&TurnAnchor>) -> TurnSettle {
-        self.settle_with(anchor, true)
+        self.settle_with(anchor, false)
     }
 
     /// [`Self::settle`] with the attachment's ability to retire a child run:
-    /// only a client that can actually read child evidence (or is otherwise a
-    /// live-runs client) keeps a terminal child-id run owing the Turn. A
-    /// client with no such surface (OpenCode V1) lets the completed run settle,
-    /// exactly as before the child-id clause existed.
+    /// only a client that can actually read child evidence keeps a terminal
+    /// child-id run owing the Turn. The wrapper defaults to `false` — an
+    /// unknown caller does not claim retirement support, so it cannot wedge a
+    /// client that has none. A client with child evidence (Codex, OpenCode V2)
+    /// passes `true`; OpenCode V1 lets the completed run settle, exactly as
+    /// before the child-id clause existed.
     pub fn settle_with(&self, anchor: Option<&TurnAnchor>, retires_runs: bool) -> TurnSettle {
         if !self.wakes_answered() {
             return TurnSettle::Running;
@@ -3028,13 +3031,13 @@ mod tests {
             .with_executions(vec![boundary(1_200)]);
         failed.runs = vec![run(RunStatus::Failed)];
         assert_eq!(
-            failed.settle(Some(&anchor)),
+            failed.settle_with(Some(&anchor), true),
             TurnSettle::Waiting,
             "a client-terminal run still owes its evidence"
         );
         assert!(!failed.apply_run_child_evidence("thread_child", ChildEvidence::Unfinished));
         assert_eq!(
-            failed.settle(Some(&anchor)),
+            failed.settle_with(Some(&anchor), true),
             TurnSettle::Waiting,
             "Unfinished evidence is no exit"
         );
@@ -3049,7 +3052,7 @@ mod tests {
             failed.task_retirements[0].ending,
             TaskRetirementEnding::ClientFailed
         );
-        assert_eq!(failed.settle(Some(&anchor)), TurnSettle::Complete);
+        assert_eq!(failed.settle_with(Some(&anchor), true), TurnSettle::Complete);
 
         let mut cancelled = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)]);
