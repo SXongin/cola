@@ -303,8 +303,11 @@ pub fn child_run_activity(transcript: &SessionTranscript) -> Option<RunActivity>
             observe(&mut newest_ms, Some(time.completed.unwrap_or(time.created)));
         }
         // Only the child's own output is a phase: a user prompt it has received
-        // but not answered is `waiting`, not `responding`.
+        // but not answered is `waiting`, not `responding` — so the previous
+        // turn's part and call no longer describe this one.
         if message.role != super::MessageRole::Assistant {
+            newest_part = None;
+            current = None;
             continue;
         }
         for part in &message.parts {

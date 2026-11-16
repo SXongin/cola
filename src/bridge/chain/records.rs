@@ -360,12 +360,6 @@ pub(crate) enum TaskEndingEvidence {
     Lost,
     /// The child session's own newest assistant message ended the run (#591).
     ChildEnded,
-    /// The child session's terminal evidence ended a run the client had
-    /// already reported `Failed` — the entry keeps 失败.
-    ClientFailed,
-    /// The child session's terminal evidence ended a run the client had
-    /// already reported `Cancelled` — the entry keeps 已取消.
-    ClientCancelled,
     /// The state a **Wake** reported (`completed` / `cancelled` / `error`),
     /// `None` when it reported none.
     Wake(Option<String>),
