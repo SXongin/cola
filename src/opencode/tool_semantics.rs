@@ -627,6 +627,10 @@ fn file_action(status: Option<&str>) -> FileAction {
     match status {
         Some("added") => FileAction::Add,
         Some("deleted") => FileAction::Delete,
+        // The status carries the action; a rename's destination is the file
+        // name only when the payload records one, so a status-only rename
+        // still reads 📦 with its own path.
+        Some("renamed") => FileAction::Rename,
         _ => FileAction::Update,
     }
 }
@@ -985,7 +989,7 @@ mod tests {
         assert_eq!(file_action(Some("added")), FileAction::Add);
         assert_eq!(file_action(Some("deleted")), FileAction::Delete);
         assert_eq!(file_action(Some("modified")), FileAction::Update);
-        assert_eq!(file_action(Some("renamed")), FileAction::Update);
+        assert_eq!(file_action(Some("renamed")), FileAction::Rename);
         assert_eq!(file_action(None), FileAction::Update);
 
         let edits = metadata_files(

@@ -102,8 +102,8 @@ pub struct SessionTranscript {
 }
 
 impl SessionTranscript {
-    pub fn new(messages: Vec<TranscriptMessage>) -> Self {
-        let runs = crate::backend::runs::derive_runs(&messages);
+    pub fn new(mut messages: Vec<TranscriptMessage>) -> Self {
+        let runs = crate::backend::runs::derive_runs(&mut messages);
         Self {
             messages,
             runs,

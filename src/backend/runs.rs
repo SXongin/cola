@@ -30,7 +30,46 @@ use super::{
 };
 
 /// Derive the runs one read names, in the order their first fact appears.
-pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
+pub(crate) fn derive_runs(messages: &mut [TranscriptMessage]) -> Vec<AgentRun> {
+    let runs = {
+        let read: &[TranscriptMessage] = messages;
+        derive_runs_read(read)
+    };
+    // A report is an update to its run, and the launch panel is the record of
+    // the request: once the client reports the run ended, the panel settles
+    // with it rather than reading `Running` beside a finished run.
+    let mut settled: Vec<(String, ToolStatus)> = Vec::new();
+    for run in &runs {
+        if run.reported_by.is_empty() {
+            continue;
+        }
+        let status = match run.status {
+            RunStatus::Completed => ToolStatus::Completed,
+            RunStatus::Failed => ToolStatus::Error,
+            RunStatus::Cancelled => ToolStatus::Other("interrupted".to_string()),
+            _ => continue,
+        };
+        for launch in &run.launched_by {
+            settled.push((launch.call_id.clone(), status.clone()));
+        }
+    }
+    if !settled.is_empty() {
+        for message in messages.iter_mut() {
+            for part in &mut message.parts {
+                if let Part::Tool(call) = part
+                    && let Some((_, status)) = settled
+                        .iter()
+                        .find(|(call_id, _)| call_id == &call.identity.call_id)
+                {
+                    call.status = status.clone();
+                }
+            }
+        }
+    }
+    runs
+}
+
+fn derive_runs_read(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
     let mut runs: Vec<AgentRun> = Vec::new();
     for call in messages
         .iter()
@@ -479,6 +518,43 @@ mod tests {
             error: None,
             parts: calls.into_iter().map(Part::Tool).collect(),
         }])
+    }
+
+    /// A terminal report settles the launch panel with its run: the record of
+    /// the request must not read `Running` beside a finished run.
+    #[test]
+    fn a_terminal_report_settles_the_launch_call() {
+        let launch = call(
+            "call_task",
+            DelegationEffect::Launch,
+            &["ses_child"],
+            ToolStatus::Running,
+            Some(10),
+        );
+        let mut report = report("call_report", "ses_child", "completed");
+        report.started_at = Some(20);
+        let read = SessionTranscript::new(vec![TranscriptMessage {
+            id: MessageId::new("msg_1"),
+            role: super::super::MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: 10,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Tool(launch), Part::Tool(report)],
+        }]);
+        assert_eq!(read.runs[0].status, RunStatus::Completed);
+        let launch_status = read.messages[0]
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == "call_task" => Some(call.status.clone()),
+                _ => None,
+            })
+            .expect("the launch call");
+        assert_eq!(launch_status, ToolStatus::Completed);
     }
 
     /// A child that has received a prompt but not answered is `waiting`: only
