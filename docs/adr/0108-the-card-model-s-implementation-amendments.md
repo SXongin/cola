@@ -90,6 +90,16 @@ evidence ending settles it too. A failure the CLIENT stated on the call itself
 stays: it is a fact about the request, not a run state a later report can
 overwrite. Identity, input, metadata and output are untouched.
 
+**11. A live run whose child evidence never concludes gets a Cleanup exit
+too.** A child that dies before its first turn answers `Unfinished` forever
+(listed + no rollout), so no evidence read can ever end its run; the rule "a
+run always has an exit" would be false. Once the run has outlived the in-flight
+window (ten minutes) — measured from its launch, or from the first observation
+for a run no launch has dated — with the read concluding nothing (`Unfinished`,
+a failed read, or an inconclusive one), the reconcile marks it ⚠️ like any
+other unconfirmable task, and the user's click ends it. A child still inside
+the window keeps its live line untouched, a transient failure included.
+
 ## Consequences
 
 - The durable chain-record format is unchanged: a client-reported Failed or

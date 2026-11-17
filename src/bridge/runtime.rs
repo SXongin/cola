@@ -441,16 +441,17 @@ pub(crate) async fn reconcile_now(
             // a client without the read keeps its runs as the runtime left
             // them and is never asked for their children.
             if reads_child_evidence {
+                let now_ms = chrono::Utc::now().timestamp_millis();
                 for (run_id, child_id) in transcript.run_evidence_suspects(anchor) {
+                    let was_live = transcript
+                        .runs
+                        .iter()
+                        .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
                     match budget
                         .read("run child evidence read", backend.child_evidence(&child_id))
                         .await
                     {
                         Some(Ok(evidence)) => {
-                            let was_live = transcript
-                                .runs
-                                .iter()
-                                .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
                             if transcript.apply_run_child_evidence(&run_id, evidence) {
                                 record_new_endings(
                                     backend,
@@ -458,13 +459,18 @@ pub(crate) async fn reconcile_now(
                                     transcript,
                                     &mut recorded_retirements,
                                 );
-                            } else if !was_live {
+                            } else if !was_live
+                                || (matches!(evidence, crate::backend::ChildEvidence::Unfinished)
+                                    && transcript.live_run_stale(&run_id, now_ms))
+                            {
                                 // A client-terminal run whose read did not
                                 // conclude stays visible as unconfirmed so a
-                                // Cleanup can end it. A live run — including a
-                                // stale terminal read, which is the previous
-                                // generation's evidence — keeps its live line
-                                // and the next read retries.
+                                // Cleanup can end it. A live run keeps its live
+                                // line while the child may still be starting —
+                                // but once it has outlived the in-flight window
+                                // and the read still concludes nothing, no
+                                // machine can end it: the ⚠️ row and its button
+                                // are its exit.
                                 transcript.unconfirmed_tasks.insert(run_id.clone());
                             }
                             let still_live = transcript
@@ -478,17 +484,24 @@ pub(crate) async fn reconcile_now(
                             }
                         }
                         Some(Err(error)) => {
-                            // A failed read is no verdict: mark the run
-                            // unconfirmed so the cleanup exit exists.
-                            transcript.unconfirmed_tasks.insert(run_id.clone());
+                            // A failed read is no verdict. A young live child
+                            // may still be starting, so it keeps its live line
+                            // and the next read retries; a stale one can only
+                            // end by the Cleanup.
+                            if !was_live || transcript.live_run_stale(&run_id, now_ms) {
+                                transcript.unconfirmed_tasks.insert(run_id.clone());
+                            }
                             tracing::debug!(
                                 "session {session_id} run {run_id} child {child_id} evidence read failed: {error}; keeping its row"
                             );
                         }
                         None => {
                             // Inconclusive (timed out or budget-skipped): the
-                            // run still needs a manual exit.
-                            transcript.unconfirmed_tasks.insert(run_id.clone());
+                            // same rule as a failed read — a young live child
+                            // retries, a stale one needs the manual exit.
+                            if !was_live || transcript.live_run_stale(&run_id, now_ms) {
+                                transcript.unconfirmed_tasks.insert(run_id.clone());
+                            }
                         }
                     }
                 }
@@ -1357,6 +1370,161 @@ mod tests {
             crate::backend::TaskRetirementEnding::ChildEnded
         );
         assert!(transcript.runs.is_empty());
+    }
+
+    /// A live child whose read never concludes (a child that died before its
+    /// first turn answers `Unfinished` forever) has no machine-made exit. Once
+    /// it outlives the in-flight window the pass marks it for the Cleanup
+    /// click; a young child keeps its live line.
+    #[tokio::test]
+    async fn a_stale_live_run_is_marked_for_cleanup() {
+        let mock = MockBackend::new(Vec::new());
+        mock.with_child_evidence("thread_child", crate::backend::ChildEvidence::Unfinished)
+            .await;
+        let backend: Arc<dyn Backend> = Arc::new(mock);
+        let now = chrono::Utc::now().timestamp_millis();
+        let transcript_at = |at: i64| {
+            let launch = crate::backend::ToolCall {
+                identity: ToolIdentity {
+                    name: "spawnAgent".into(),
+                    call_id: "call_spawn".into(),
+                },
+                status: crate::backend::ToolStatus::Running,
+                started_at: Some(at),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "thread_child".into(),
+                        status: None,
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..crate::backend::ToolCall::default()
+            };
+            SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+                id: crate::backend::MessageId::new("msg_1"),
+                role: crate::backend::MessageRole::Assistant,
+                time: Some(crate::backend::MessageTime {
+                    created: at,
+                    completed: None,
+                }),
+                model: None,
+                tokens: None,
+                error: None,
+                parts: vec![crate::backend::Part::Tool(launch)],
+            }])
+        };
+
+        let mut young = transcript_at(now - 60_000);
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut young,
+            CycleBudget::within(200),
+            None,
+        )
+        .await;
+        assert!(!pass.is_some_and(|pass| pass.changed()));
+        assert!(
+            !young.unconfirmed_tasks.contains("thread_child"),
+            "a young child keeps its live line: {:?}",
+            young.unconfirmed_tasks
+        );
+
+        let mut stale = transcript_at(now - 11 * 60 * 1000);
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut stale,
+            CycleBudget::within(200),
+            None,
+        )
+        .await;
+        assert!(
+            pass.is_some_and(|pass| pass.changed()),
+            "the marker alone makes a pass"
+        );
+        assert!(
+            stale.unconfirmed_tasks.contains("thread_child"),
+            "the stale live run is clearable: {:?}",
+            stale.unconfirmed_tasks
+        );
+
+        // A transient failure on a YOUNG live run is no verdict: the line stays
+        // and the next read retries.
+        let failing = MockBackend::new(Vec::new());
+        failing
+            .fail_child_evidence_reads
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let failing: Arc<dyn Backend> = Arc::new(failing);
+        let mut young_failure = transcript_at(now - 60_000);
+        for _ in 0..2 {
+            reconcile_now(
+                &failing,
+                "ses_test",
+                Some("/work"),
+                &mut young_failure,
+                CycleBudget::within(200),
+                None,
+            )
+            .await;
+        }
+        assert!(
+            !young_failure.unconfirmed_tasks.contains("thread_child"),
+            "a transient failure (then recovery) never marks a young child: {:?}",
+            young_failure.unconfirmed_tasks
+        );
+
+        // A run first seen by an address has no launch clock; its observation
+        // still ages it past the window.
+        let at = now - 11 * 60 * 1000;
+        let address = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "spawnAgent".into(),
+                call_id: "call_wait".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(at),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Address,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        let mut addressed = SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_1"),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(address)],
+        }]);
+        assert_eq!(
+            addressed.runs[0].started_at, None,
+            "an address does not date the child"
+        );
+        reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut addressed,
+            CycleBudget::within(200),
+            None,
+        )
+        .await;
+        assert!(
+            addressed.unconfirmed_tasks.contains("thread_child"),
+            "a no-start live run still ages: {:?}",
+            addressed.unconfirmed_tasks
+        );
     }
 
     /// Spec #860, ticket #880: a client that declares no Background Task
