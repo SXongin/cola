@@ -750,12 +750,11 @@ impl SessionTranscript {
                 started_at,
             } => {
                 let turn_start = started_at.unwrap_or(completed_at);
-                // The newest fact about the run orders the evidence: a resume
-                // (`sendInput`/`resumeAgent`) or a later report moves
-                // `observed_at` past the launch, so an older generation's
-                // terminal item must not end the live generation.
-                let boundary = self.runs[index].started_at.max(self.runs[index].observed_at);
-                if boundary.is_some_and(|started| {
+                // Only a launch (or a resume, which moves `started_at`) dates
+                // the generation. A report is an observation, not a new
+                // generation: a terminal report between the child's turn start
+                // and its evidence must not reject the child's own ending.
+                if self.runs[index].started_at.is_some_and(|started| {
                     // The turn start is the ordering fact. A strictly earlier
                     // second is a previous turn; a same-second start is
                     // genuinely ambiguous (a normal first turn starts with its
@@ -775,8 +774,7 @@ impl SessionTranscript {
                         completed_at,
                         turn_start,
                         started_at = self.runs[index].started_at,
-                        observed_at = self.runs[index].observed_at,
-                        "child evidence predates the run's newest fact; keeping the run live"
+                        "child evidence predates the run's start; keeping the run live"
                     );
                     return false;
                 }

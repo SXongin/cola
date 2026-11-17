@@ -819,7 +819,18 @@ fn file_edit_title(edit: &FileEdit) -> String {
 /// The Input line a FileEdits panel renders: one action line per touched file
 /// (#947), so a multi-file patch names every file's action rather than only
 /// its first path.
-fn file_edits_input(edits: &[FileEdit]) -> String {
+fn file_edits_input(edits: &[FileEdit], failed: bool) -> String {
+    // Ticket #1060: one file names it and its action; several keep the count
+    // and totals fragment — the per-file actions belong in the body. A failed
+    // call's changes are unknown, so it names the count only (the folded title
+    // makes the same call).
+    if edits.len() > 1 {
+        if failed {
+            return format!("📄 {} files", edits.len());
+        }
+        let (additions, deletions) = file_edits_totals(edits);
+        return format!("📄 {} files · +{additions} −{deletions}", edits.len());
+    }
     edits
         .iter()
         .map(file_edit_action_line)
@@ -3634,7 +3645,7 @@ fn format_tool_input(tool: &ToolPanel) -> String {
         return program_input(source, language);
     }
     if let Some(edits) = file_edits(tool) {
-        return file_edits_input(&edits);
+        return file_edits_input(&edits, call_failed(tool));
     }
     if tool.is_plan() {
         return tool.input().map(plan_input).unwrap_or_default();
@@ -7774,8 +7785,8 @@ Index: .config/opencode/AGENTS.md
         );
         let md = panel_md(tool);
         assert!(
-            !md.contains("📄 2 files"),
-            "the expanded body does not repeat the title's count: {md}"
+            md.contains("📄 2 files · +3 −2"),
+            "the Input line keeps the count/totals fragment (#1060): {md}"
         );
         assert_eq!(
             md.matches("@@ -1 +1 @@").count() + md.matches("@@ -1 +1,2 @@").count(),
@@ -8288,8 +8299,8 @@ Index: /a/lua.lua
         );
         let body = panel_md(tool);
         assert!(
-            !body.contains("📄 3 files") && !body.contains("+4 −3"),
-            "the body does not repeat the title's count: {body}"
+            body.contains("📄 3 files · +4 −3"),
+            "the Input line keeps the count/totals fragment (#1060): {body}"
         );
         let output_label = output_md();
         let output = body
@@ -9469,7 +9480,16 @@ Index: /a/one.rs
             ],
             None,
         );
-        assert_eq!(format_tool_input(&several), "➕ 新增 `a.rs`\n🗑 删除 `b.rs`");
+        assert_eq!(
+            format_tool_input(&several),
+            "📄 2 files · +0 −0",
+            "several files keep the count/totals fragment (#1060)"
+        );
+        let several_body = panel_md(several);
+        assert!(
+            several_body.contains("➕ 新增 `a.rs`") && several_body.contains("🗑 删除 `b.rs`"),
+            "the per-file actions stay in the body: {several_body}"
+        );
         // An unparseable patchText falls back to the generic key-value list,
         // never a raw JSON dump.
         assert_eq!(
@@ -10144,7 +10164,16 @@ Report
             json!({"path": "a.rs", "kind": {"type": "update"}, "diff": "@@ -1 +1 @@\n-a\n+b"}),
             json!({"path": "b.rs", "kind": {"type": "add"}, "diff": "@@ -0,0 +1 @@\n+b"}),
         ]);
-        assert_eq!(format_tool_input(&two), "✏️ 编辑 `a.rs`\n➕ 新增 `b.rs`");
+        assert_eq!(
+            format_tool_input(&two),
+            "📄 2 files · +2 −1",
+            "several files keep the count/totals fragment, not one line per file"
+        );
+        let body = panel_md(two.clone());
+        assert!(
+            body.contains("✏️ 编辑 `a.rs`") && body.contains("➕ 新增 `b.rs`"),
+            "the per-file actions stay in the body: {body}"
+        );
 
         // A rename names the old → new pair.
         let rename = codex_file_change_panel(vec![json!({

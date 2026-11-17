@@ -15,10 +15,13 @@ code. Each is recorded here rather than edited into the earlier ADRs.
 **1. An `AgentRun`'s durable key is its child id whenever one is known.** A
 report that names no child creates a call-keyed run under its own call id; when
 a later fact names the child, the key moves to the child id once, before any
-ending is derived (a terminal childless run is never adopted). This keeps one
-run's ending key independent of where the read window began — the property
-ADR-0080's amendment exists for. A Background Task's `TaskRunId` selection is
-unchanged.
+ending is derived (a terminal childless run is never adopted). Adoption is
+**id-correlated**: the same activity item's later sighting resolves by its call
+id. A fact naming an unrelated child creates its own run — inheriting a lone
+childless run would attribute that child's facts to the wrong identity — and
+the orphan stays for the Cleanup click (7). This keeps one run's ending key
+independent of where the read window began — the property ADR-0080's amendment
+exists for. A Background Task's `TaskRunId` selection is unchanged.
 
 **2. `ToolDetail` gains `Plan`, `Skill` and `Ask`.** These are carrier facts,
 not vendor ids: the plan/skill/question surfaces must render from a neutral
