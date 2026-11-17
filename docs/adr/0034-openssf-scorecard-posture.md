@@ -519,9 +519,11 @@ remediation and the paths it directly touches, with the author assembling the
 fix and the gate re-reading the whole diff (it has no round history); when round
 3 still raises blocking findings, they are fixed in one push that needs the
 user's explicit approval; a `critical` security or data-loss finding is fixed
-and pushed first, without waiting for that approval. Only non-blocking, pre-existing and out-of-scope
-findings may be deferred, into a follow-up issue and the PR's deferred list; a
-blocking finding is never deferred. If the gate still FAILs after that round,
+and pushed first, without waiting for that approval. Only non-blocking,
+pre-existing and out-of-scope findings may be deferred, into the dossier; a
+blocking finding is never deferred. Whenever the loop ends, a non-empty deferred
+list becomes a follow-up issue linked from the dossier, a round-3 PASS included.
+If the gate still FAILs after that round,
 the agent stops and hands the PR to the user: further rounds need their
 approval, and the admin bypass or closing the PR is theirs to decide. The budget
 counts every gate run that posts a review — a non-draft push, the
