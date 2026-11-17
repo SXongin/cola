@@ -475,31 +475,33 @@ once. Once the gate passes, push again only for a real finding (yours or the
 user's) or a required rebase, and wait for that round's PASS; never merge on a
 stale approval.
 
-**Three gate rounds, then ask.** A PR gets 3 automatic gate rounds — rounds that
-carry a fix. Round 1 is broad discovery; rounds 2–3 verify the remediation and
-the paths it directly touches, with the author assembling the fix and the gate
-re-reading the whole diff. A `critical` security or data-loss finding the diff
-introduces or makes newly reachable is fixed and pushed first, without waiting
-for the fourth-round approval — the one exception to that approval rule. When
-round 3 still raises other blocking findings, fix them in one batch and push
-once more; that verification round needs the user's explicit approval. Only
-non-blocking, pre-existing and out-of-scope findings may be deferred, into a
-follow-up issue and the PR's deferred list — a blocking finding is never
-deferred. If the gate still FAILs after the user-approved round, stop and hand
-the PR to the user with the remaining findings: each further gate round needs
-their approval, and merging with the admin bypass or closing the PR is theirs to
-decide, never the agent's. The budget counts every gate run that posts a review —
-a non-draft push, the `ready_for_review` flip that spends a draft's first review,
-or an `edited` body re-run. A run that fails before the model (an unfetchable
-reference, a credential failure) posts none and is not a round. The agent never
-re-runs the gate on an unchanged head to fish for a different verdict. The local
-pair and gate rehearsal still run until no blocking finding remains
-(`docs/agents/flow.md`). The PR body carries the record — the rounds spent and
-the deferred findings (`## Gate rounds`, `## Deferred findings`) — written when
-the PR opens and updated once at the end. The update is not a fix round: after a
-PASS it re-reviews the approved head but cannot revoke that approval, and after a
-handover it waits for the user's direction, so it is made only inside the round
-they approve. Never update it while a fix is being prepared.
+**Three gate rounds, then ask.** A PR gets 3 automatic gate rounds. Round 1 is
+broad discovery; rounds 2–3 verify the remediation and the paths it directly
+touches, with the author assembling the fix and the gate re-reading the whole
+diff. A `critical` security or data-loss finding the diff introduces or makes
+newly reachable is fixed and pushed first, without waiting for the fourth-round
+approval — the one exception to that approval rule. When round 3 still raises
+other blocking findings, fix them in one batch and push once more; that
+verification round needs the user's explicit approval. Only non-blocking,
+pre-existing and out-of-scope findings may be deferred, into a follow-up issue
+and the PR's dossier — a blocking finding is never deferred. If the gate still
+FAILs after the user-approved round, stop and hand the PR to the user with the
+remaining findings: each further gate round needs their approval, and merging
+with the admin bypass or closing the PR is theirs to decide, never the agent's.
+The budget counts every gate run that posts a review — a non-draft push, the
+`ready_for_review` flip that spends a draft's first review, or an `edited` body
+re-run. A run that fails before the model (an unfetchable reference, a credential
+failure) posts none and is not a round, and the agent never re-runs the gate on
+an unchanged head to fish for a different verdict. The local pair and gate
+rehearsal still run until no blocking finding remains (`docs/agents/flow.md`).
+
+**The dossier is a PR comment, not the body.** A comment carrying
+`<!-- gate-dossier -->` records the rounds spent and the deferred findings; it is
+updated with `gh api --method PATCH` after each round and before stopping. A
+comment does not trigger the gate, so the record never spends a round and cannot
+re-review an approved or handed-over head. The body carries
+`## Deferred findings` only when the linked issue itself defers an acceptance
+criterion, written when the PR opens so the gate can see it.
 
 ## Releasing
 

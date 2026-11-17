@@ -528,11 +528,12 @@ re-run; a run that fails before the model (an unfetchable reference, a credentia
 failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict. The local pair and the gate
 rehearsal keep their no-round-cap rule, and non-blocking findings are answered
-or deferred, not fixed. The PR body carries the record — the rounds spent and
-the deferred findings — written when the PR opens and updated once at the end.
-The update is not a fix round: after a PASS it re-reviews the approved head but
-cannot revoke that approval; after a handover it waits for the user's direction
-and is made inside the round they approve.
+or deferred, not fixed. The dossier is a PR comment (`<!-- gate-dossier -->`) —
+the rounds spent and the deferred findings — updated with `gh api --method PATCH`
+after each round. A comment does not trigger the gate, so the record never
+spends a round or re-reviews an approved or handed-over head. A deferral of an
+acceptance criterion the issue itself names goes in the body's
+`## Deferred findings` when the PR opens, so the gate can see it.
 
 The two axes and the adversarial pass are unchanged; the amendment adds a
 severity policy to the rubric. What this ADR pins is otherwise untouched: the
