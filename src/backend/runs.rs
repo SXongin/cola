@@ -224,7 +224,10 @@ fn resolve_call_keyed<'a>(runs: &'a mut Vec<AgentRun>, call: &ToolCall) -> &'a m
         child_id: None,
         label: label_of(call).unwrap_or(run_id),
         agent: agent_of(call),
-        started_at: call.started_at,
+        // A report is an observation, not the child's start: the child may
+        // have begun long before (the stale-evidence guard must not reject its
+        // real turn). A later launch supplies the clock.
+        started_at: None,
         status: RunStatus::Unknown,
         activity: None,
         launched_by: Vec::new(),
@@ -314,7 +317,11 @@ fn resolve_or_create<'a>(runs: &'a mut Vec<AgentRun>, run_id: &str, call: &ToolC
         child_id: Some(run_id.to_string()),
         label: label_of(call).unwrap_or_else(|| run_id.to_string()),
         agent: agent_of(call),
-        started_at: call.started_at,
+        // Only a LAUNCH dates the child (the `Launch` arm fills it): an
+        // addressing fact names a run whose window may begin at the `wait`,
+        // and its clock says nothing about when the child started — the
+        // stale-evidence guard must not use it.
+        started_at: None,
         // A non-launch fact (a `wait`/`sendInput` window) names the run but
         // states nothing about its life: start Unknown/live. Only a launch or a
         // report supplies the status.
@@ -821,6 +828,34 @@ mod tests {
         assert_eq!(read.runs.len(), 1, "one child is one run");
         assert_eq!(read.runs[0].label, "review the diff");
         assert_eq!(read.runs[0].agent.as_deref(), Some("reviewer"));
+    }
+
+    /// An addressing fact names a run whose window may begin at the `wait`; its
+    /// clock is not the child's start, so the stale-evidence guard must accept
+    /// a terminal child that began earlier.
+    #[test]
+    fn an_address_created_run_takes_no_start_clock() {
+        let address = call(
+            "call_wait",
+            DelegationEffect::Address,
+            &["thread_1"],
+            ToolStatus::Running,
+            Some(12_000),
+        );
+        let mut read = transcript(vec![address]);
+        assert_eq!(read.runs.len(), 1);
+        assert_eq!(
+            read.runs[0].started_at, None,
+            "an address does not date the child"
+        );
+        assert!(read.apply_run_child_evidence(
+            "thread_1",
+            ChildEvidence::Terminal {
+                completed_at: 12_010,
+                started_at: Some(12_001)
+            }
+        ));
+        assert!(read.runs.is_empty(), "the child's own turn ends it");
     }
 
     /// A later ADDRESS naming the child fills the call-keyed run's identity
