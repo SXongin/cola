@@ -516,7 +516,8 @@ carry the **three-round gate budget**: round 1 discovers; rounds 2–3 verify th
 remediation and the paths it directly touches, with the author assembling the
 fix and the gate re-reading the whole diff (it has no round history); when round
 3 still raises blocking findings, they are fixed in one push that needs the
-user's explicit approval. Only non-blocking, pre-existing and out-of-scope
+user's explicit approval; a `critical` security or data-loss finding is fixed
+and pushed first, without waiting for that approval. Only non-blocking, pre-existing and out-of-scope
 findings may be deferred, into a follow-up issue and the PR's deferred list; a
 blocking finding is never deferred. If the gate still FAILs after that round,
 the agent stops and hands the PR to the user: further rounds need their
@@ -527,9 +528,11 @@ re-run; a run that fails before the model (an unfetchable reference, a credentia
 failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict. The local pair and the gate
 rehearsal keep their no-round-cap rule, and non-blocking findings are answered
-or deferred, not fixed. The PR body carries the record from the first push — the
-rounds spent and the deferred findings — and an update to it is a round like any
-other.
+or deferred, not fixed. The PR body carries the record — the rounds spent and
+the deferred findings — written when the PR opens and updated once after the
+loop has ended; that update's `edited` run is not a budget round, and it is
+never made while a fix is being prepared or after a handover FAIL without the
+user's direction.
 
 The two axes and the adversarial pass are unchanged; the amendment adds a
 severity policy to the rubric. What this ADR pins is otherwise untouched: the
