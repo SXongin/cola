@@ -495,7 +495,7 @@ failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict. The local pair and gate
 rehearsal still run until no blocking finding remains (`docs/agents/flow.md`).
 
-**The dossier is a PR comment, not the body.** A comment carrying
+**The dossier is a PR comment, not the body.** A comment whose first line is
 `<!-- gate-dossier -->` records the rounds spent and the deferred findings; it is
 updated with `gh api --method PATCH` after each round and before stopping. A
 comment does not trigger the gate, so the record never spends a round and cannot
