@@ -140,6 +140,7 @@ pub(super) async fn run(
                             directory,
                             &mut transcript,
                             timing.read_timeout_ms,
+                            anchor.as_ref(),
                         )
                         .await;
                 }

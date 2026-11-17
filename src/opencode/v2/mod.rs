@@ -846,7 +846,43 @@ impl GenerationStrategy for V2Strategy {
                 body_preview(&text)
             ))
         })?;
-        Ok(page.newest_assistant_evidence())
+        let evidence = page.newest_assistant_evidence();
+        if !matches!(evidence, ChildEvidence::Unfinished) {
+            return Ok(evidence);
+        }
+        // The page cannot conclude — an abrupt child failure leaves no
+        // terminal step finish. The session's own statement can: a terminal
+        // outcome on an idle session means no turn is live, so the run it
+        // served ended (the 13-hour failed subagent this read exists for).
+        let resp = http
+            .client()
+            .get(http.url(&format!("{SESSION}/{session_id}")))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(ChildEvidence::Gone);
+        }
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "child session status").await);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        let data = body.get("data").unwrap_or(&body);
+        let outcome = data.get("outcome").and_then(serde_json::Value::as_str);
+        let terminal = matches!(outcome, Some("succeeded" | "failed" | "cancelled"));
+        let busy = data.pointer("/time/busy").and_then(serde_json::Value::as_i64);
+        let idle = data.pointer("/time/idle").and_then(serde_json::Value::as_i64);
+        let running = matches!((busy, idle), (Some(busy), Some(idle)) if busy > idle);
+        if terminal
+            && !running
+            && let Some(completed_at) =
+                idle.or_else(|| data.pointer("/time/updated").and_then(serde_json::Value::as_i64))
+        {
+            return Ok(ChildEvidence::Terminal {
+                completed_at,
+                started_at: None,
+            });
+        }
+        Ok(evidence)
     }
 
     /// The session's durable selection (`GET /api/session/{id}`): the model

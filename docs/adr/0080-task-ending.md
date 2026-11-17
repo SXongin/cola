@@ -8,7 +8,7 @@
 > The body below is the historical record and is not rewritten; this banner is
 > authoritative (convention: #1065).
 
-> **Amended by #1061 (Agent Run)**: an **Agent Run**'s durable key
+> **Amended by ADR-0108 (2026-11-16)**: an **Agent Run**'s durable key
 > (`task_run_id`) is its **child id** whenever a naming fact carries one, not
 > the launch's call id. A call id cannot identify the runs one multi-child fact
 > names, and it made the key depend on where a read window began (a window

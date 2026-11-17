@@ -3008,11 +3008,9 @@ pub(crate) fn describe_action(action: &str) -> (&'static str, &'static str) {
 /// though the target budget is much larger — the spec's fixed 150 characters.
 const PERMISSION_REASON_MAX_CHARS: usize = 150;
 
-/// The permission card's caption for a request's free-form `input` field. It
-/// happens to read like the Tool Panel's section label, but it is a separate
-/// surface: keeping a local constant means a panel-label rename cannot silently
-/// rename a permission caption.
-const PERMISSION_INPUT_CAPTION: &str = "输入";
+/// The permission card's caption for a request's free-form `input` field: the
+/// card's one shared word (ADR-0107 §6).
+const PERMISSION_INPUT_CAPTION: &str = crate::feishu::card::vocab::INPUT_LABEL;
 
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by its inline block, so the two look and

@@ -110,37 +110,13 @@ pub(crate) const RUN_CLEANED: &str = "已清理";
 /// ("live runs") keeps `后台任务` as its heading for now (spec #1057's P4).
 pub(crate) const LEDGER_TITLE: &str = "后台任务";
 
-/// The closed name-only token arm — the one place a vendor name may become a
-/// token. It matches **only** `Other` + `None`, because `todowrite`, `skill`
-/// and `question` are the three tools OpenCode alone produces and they have no
-/// shared shape (ADR-0107's recorded exception). `None` means "no token from
-/// the name": the name is opaque data, even when it happens to spell a token
-/// (`{name: "plan", detail: Opaque}` keeps its vendor name and is **not** the
-/// plan surface).
-pub(crate) fn name_only_token(
-    identity: &ToolIdentity,
-    kind: ToolKind,
-    detail: &ToolDetail,
-) -> Option<&'static str> {
-    match (kind, detail) {
-        (ToolKind::Other, ToolDetail::None) => match identity.name.as_str() {
-            "skill" => Some(TOOL_SKILL),
-            "question" => Some(TOOL_ASK),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 /// The tool token for one call: ADR-0107's closed table, derived from
 /// `(kind, detail)` first and the vendor name last.
 ///
-/// The name is read in exactly one place — [`name_only_token`], where a closed
-/// two-entry table maps `skill`/`question` to `skill`/`ask` (OpenCode is their
-/// only producer, so they have no shared shape; the plan carrier is the neutral
-/// [`ToolDetail::Plan`], never the name). Everywhere else the name is only the opaque fallback: a
-/// vendor tool keeps its **full** vendor name, namespace included (ADR-0042).
-/// It never selects a renderer.
+/// There is no name-only arm: the plan/skill/ask carriers are the neutral
+/// `ToolDetail::Plan`/`Skill`/`Ask` the adapter declares. The name is only the
+/// opaque fallback: a vendor tool keeps its **full** vendor name, namespace
+/// included (ADR-0042), and never selects a renderer.
 ///
 /// The return borrows the identity for the opaque case, so the lifetime is
 /// the identity's rather than `'static`: the derived tokens are `'static`
@@ -175,6 +151,8 @@ pub(crate) fn tool_token<'a>(identity: &'a ToolIdentity, kind: ToolKind, detail:
         },
         (ToolKind::Read, ToolDetail::Read { .. }) => TOOL_READ,
         (ToolKind::Other, ToolDetail::Plan) => TOOL_PLAN,
+        (ToolKind::Other, ToolDetail::Skill) => TOOL_SKILL,
+        (ToolKind::Other, ToolDetail::Ask) => TOOL_ASK,
         (ToolKind::Fetch, ToolDetail::None) => TOOL_FETCH,
         (
             ToolKind::Other,
@@ -183,9 +161,9 @@ pub(crate) fn tool_token<'a>(identity: &'a ToolIdentity, kind: ToolKind, detail:
                 ..
             },
         ) => TOOL_SUBAGENT,
-        // The closed name-only token set (ADR-0107's one exception); every
-        // other name is the opaque fallback.
-        _ => name_only_token(identity, kind, detail).unwrap_or(identity.name.as_str()),
+        // No name-only token remains; an id outside the table is the opaque
+        // fallback and keeps its full vendor name.
+        _ => identity.name.as_str(),
     }
 }
 
@@ -436,25 +414,19 @@ mod tests {
             "plan",
             "the opaque fallback keeps the vendor name"
         );
-        assert_eq!(
-            name_only_token(&identity, ToolKind::Other, &ToolDetail::Opaque),
-            None,
-            "an opaque vendor name is not a token table entry"
-        );
-        assert_eq!(
-            name_only_token(&identity, ToolKind::Other, &ToolDetail::None),
-            None,
-            "a vendor name outside the closed three is not a token either"
-        );
     }
 
-    /// The name-only tokens are the closed exception; the name is read
-    /// nowhere else. The plan needs no name: its carrier is `ToolDetail::Plan`.
+    /// The plan/skill/ask tokens come from the neutral detail, never the name.
     #[test]
-    fn the_name_only_tokens_are_closed() {
+    fn the_carrier_tokens_are_their_details() {
         assert_eq!(token("todowrite", ToolKind::Other, ToolDetail::Plan), TOOL_PLAN);
-        assert_eq!(token("skill", ToolKind::Other, ToolDetail::None), TOOL_SKILL);
-        assert_eq!(token("question", ToolKind::Other, ToolDetail::None), TOOL_ASK);
+        assert_eq!(token("skill", ToolKind::Other, ToolDetail::Skill), TOOL_SKILL);
+        assert_eq!(token("question", ToolKind::Other, ToolDetail::Ask), TOOL_ASK);
+        assert_eq!(
+            token("skill", ToolKind::Other, ToolDetail::None),
+            "skill",
+            "a name alone is the opaque fallback, not the token arm"
+        );
     }
 
     /// A vendor id is never tokenized: the opaque fallback keeps the **full**

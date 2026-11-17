@@ -2977,8 +2977,7 @@ fn format_tool_output(tool: &ToolPanel, output: &str) -> (Option<String>, BodySt
     if is_launch_call(tool) {
         return delegation_output(output);
     }
-    let call = tool.call();
-    if vocab::name_only_token(&call.identity, call.kind, &call.detail) == Some(vocab::TOOL_SKILL)
+    if matches!(tool.call().detail, ToolDetail::Skill)
         && output.starts_with("<skill_content ")
         && let Some(body) = parse_skill_envelope(output)
     {
@@ -3662,12 +3661,10 @@ fn format_tool_input(tool: &ToolPanel) -> String {
     if is_launch_call(tool) {
         return tool.input().map(delegation_input).unwrap_or_default();
     }
-    let call = tool.call();
-    let token = vocab::name_only_token(&call.identity, call.kind, &call.detail);
     tool.input()
-        .map(|input| match token {
-            Some(vocab::TOOL_SKILL) => skill_input(input),
-            Some(vocab::TOOL_ASK) => question_input(input),
+        .map(|input| match tool.call().detail {
+            ToolDetail::Skill => skill_input(input),
+            ToolDetail::Ask => question_input(input),
             _ => format_generic_input(input),
         })
         .unwrap_or_default()
@@ -3801,7 +3798,7 @@ fn format_generic_input(input: &serde_json::Value) -> String {
     generic_tool_input(obj)
 }
 
-/// A `skill` call's Input line (the closed `name_only_token` arm).
+/// A **skill** call's Input line (`ToolDetail::Skill`).
 fn skill_input(input: &serde_json::Value) -> String {
     let obj = match input.as_object() {
         Some(o) => o,
@@ -3814,7 +3811,7 @@ fn skill_input(input: &serde_json::Value) -> String {
         .unwrap_or_else(|| input.to_string())
 }
 
-/// A `question` call's Input line (the closed `name_only_token` arm).
+/// A **question** call's Input line (`ToolDetail::Ask`).
 fn question_input(input: &serde_json::Value) -> String {
     let obj = match input.as_object() {
         Some(o) => o,
@@ -6568,7 +6565,7 @@ Relative paths in this skill (e.g., scripts/, reference/) are relative to this b
                     call_id: "call_skill".into(),
                 },
                 kind: crate::backend::ToolKind::Other,
-                detail: crate::backend::ToolDetail::None,
+                detail: crate::backend::ToolDetail::Skill,
                 status: ToolStatus::Completed,
                 output: ToolOutput {
                     raw: Some(serde_json::Value::String(output.to_string())),
@@ -8985,7 +8982,7 @@ LSP errors detected in a.rs, please fix:
                 call_id: "call_skill".into(),
             },
             kind: ToolKind::Other,
-            detail: ToolDetail::None,
+            detail: ToolDetail::Skill,
             status: ToolStatus::Completed,
             input: Some(json!({"name": "implement"})),
             ..ToolCall::default()
@@ -9016,7 +9013,7 @@ LSP errors detected in a.rs, please fix:
                 call_id: "call_question".into(),
             },
             kind: ToolKind::Other,
-            detail: ToolDetail::None,
+            detail: ToolDetail::Ask,
             status: ToolStatus::Running,
             input: Some(input.clone()),
             ..ToolCall::default()
@@ -9601,7 +9598,7 @@ Report
     }
 
     /// An opaque third-party tool named `skill` or `question` is not the
-    /// built-in: only the closed `name_only_token` arm (`Other + None`) gets
+    /// built-in: only a call declaring `ToolDetail::Skill`/`Ask` gets
     /// the tailored Input line.
     #[test]
     fn an_opaque_tool_named_skill_or_question_stays_generic() {

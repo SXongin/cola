@@ -483,6 +483,91 @@ async fn sub_attach_resolves_a_child_only_run_id() {
     assert_eq!(entry.session_id, "thread_child");
 }
 
+/// `/sub attach` targets a **child id**, never a call-keyed run's creating call.
+/// An id-less activity's run is not a session until a launch fills its child,
+/// and even then only the child id resolves.
+#[tokio::test]
+async fn sub_attach_never_adopts_a_childless_run_call_id() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_root", "根会话", "/work/root", 100)]);
+    let report = |id: &str, at: i64| {
+        crate::backend::Part::Tool(crate::backend::ToolCall {
+            identity: crate::backend::ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: id.into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(at),
+            input: Some(serde_json::json!({"kind": "started", "description": "review the diff"})),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: Vec::new(),
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..crate::backend::ToolCall::default()
+        })
+    };
+    let launch = crate::backend::Part::Tool(crate::backend::ToolCall {
+        identity: crate::backend::ToolIdentity {
+            name: "codex/collab_agent".into(),
+            call_id: "call_spawn".into(),
+        },
+        status: crate::backend::ToolStatus::Running,
+        started_at: Some(2_000),
+        input: Some(serde_json::json!({"description": "review the diff"})),
+        detail: crate::backend::ToolDetail::Delegation {
+            runs: vec![crate::backend::AgentRunRef {
+                run_id: "thread_child".into(),
+                status: None,
+            }],
+            effect: crate::backend::DelegationEffect::Launch,
+        },
+        ..crate::backend::ToolCall::default()
+    });
+    let transcript = crate::backend::SessionTranscript::new(vec![
+        typed_message(
+            "msg_activity",
+            crate::backend::MessageRole::Assistant,
+            Some(1_000),
+            vec![report("call_activity", 1_000)],
+        ),
+        typed_message(
+            "msg_spawn",
+            crate::backend::MessageRole::Assistant,
+            Some(2_000),
+            vec![launch],
+        ),
+    ]);
+    backend
+        .given_transcript_after_build("ses_root", vec![transcript])
+        .await;
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub attach call_activity", "m1").await;
+    let texts = platform.texts().await;
+    assert!(
+        texts.iter().any(|text| text.contains("没有匹配的子会话")),
+        "the call id is no session: {texts:?}"
+    );
+    let entry = app.sessions.lock().await.get_active(&key()).cloned().unwrap();
+    assert_eq!(
+        entry.session_id, "ses_root",
+        "a refused attach leaves the Active Session alone"
+    );
+
+    // The adopted run's real child id is the attach target.
+    send_command(&app, "/sub attach thread_child", "m2").await;
+    let entry = app.sessions.lock().await.get_active(&key()).cloned().unwrap();
+    assert_eq!(entry.session_id, "thread_child");
+}
+
 /// `/sub attach <id>` adopts a direct child: the chat receives exactly ONE
 /// confirmation text line carrying the child's status (ADR-0100 — no card), the
 /// child becomes the Active Session, and the parent stays mapped — `/switch`

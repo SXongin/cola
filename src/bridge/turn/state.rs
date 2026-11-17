@@ -895,6 +895,12 @@ impl CardSession {
         self.chain_id
     }
 
+    /// The card's Turn anchor, for a caller outside this module that needs the
+    /// run scope (the cleanup click's reconcile).
+    pub(crate) fn card_turn_anchor(&self) -> Option<&crate::backend::TurnAnchor> {
+        self.acc.turn_anchor()
+    }
+
     /// Whether the accumulator still owes an unrendered orphan gap (spec #561,
     /// review #569): the durable fact on the Chain Record is the only record of
     /// that tail until a read places it and a confirmed write carries it, so
@@ -4480,11 +4486,12 @@ impl StreamAccumulator {
         &mut self,
         transcript: &SessionTranscript,
         activities: &HashMap<String, TaskLiveness>,
+        finished: &std::collections::HashSet<String>,
         now_ms: i64,
         cadence: LedgerCadence,
     ) -> LedgerChange {
         self.note_empty_ledger_claim(transcript);
-        let rows = self.ledger_rows(transcript, activities);
+        let rows = self.ledger_rows(transcript, activities, finished);
         self.set_ledger_change(rows, now_ms, cadence)
     }
 
@@ -4612,6 +4619,7 @@ impl StreamAccumulator {
         &mut self,
         transcript: &SessionTranscript,
         activities: &HashMap<String, TaskLiveness>,
+        finished: &std::collections::HashSet<String>,
     ) -> Vec<TaskLedgerRow> {
         // The common case (V1, or a session with no live task or run) does no
         // scan: an empty read clears an empty ledger — and every cached
@@ -4631,7 +4639,7 @@ impl StreamAccumulator {
         let mut rows: Vec<TaskLedgerRow> = Vec::new();
         let mut activity_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         for task in &transcript.background_tasks {
-            let kind = task_kind(&task.tool.name);
+            let kind = task_kind(task);
             let call_id = task.tool.call_id.as_str();
             if kind == TaskKind::Subagent
                 && let Some(run) = transcript
@@ -4639,10 +4647,10 @@ impl StreamAccumulator {
                     .iter()
                     .find(|run| transcript.run_is_task(run, task))
             {
-                rows.push(self.run_row(transcript, activities, run, &mut activity_keys));
+                rows.push(self.run_row(transcript, activities, finished, run, &mut activity_keys));
                 continue;
             }
-            let activity = (kind == TaskKind::Subagent)
+            let activity = (kind == TaskKind::Subagent && !finished.contains(call_id))
                 .then(|| {
                     activities
                         .get(call_id)
@@ -4692,15 +4700,30 @@ impl StreamAccumulator {
         // row follows the Background Tasks, in run order. A client-terminal run
         // that still names a child owes an ending (its evidence read or a
         // Cleanup), so it keeps its row — marked ⚠️ while unconfirmed — until
-        // that ending is derived; only a run with no child left to read drops
-        // out. The "already represented" test is the SAME one rule the row join
-        // above uses, so the two cannot disagree about which runs still owe a
-        // row.
-        for run in transcript
-            .runs
-            .iter()
-            .filter(|run| run.is_live() || run.child_id.is_some())
-        {
+        // that ending is derived. A childless run has no evidence read at all,
+        // so its ⚠️ row is its only exit: it stays visible until a Cleanup
+        // retires it, on whichever Turn's card is waiting on it. The "already
+        // represented" test is the SAME one rule the row join above uses, so
+        // the two cannot disagree about which runs still owe a row.
+        // The Turn this card renders: a run launched before it is history, not
+        // a live row. A live run always shows (a background child may outlive
+        // its launching Turn); a terminal one only when it belongs to the
+        // current Turn, and a terminal run with no start cannot be placed, so
+        // it is not history either. Without an anchor, the newest user message
+        // is the same bound for a Session Card.
+        let cutoff = self.turn_anchor().map(|anchor| anchor.created_ms).or_else(|| {
+            transcript
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == crate::backend::MessageRole::User)
+                .and_then(|message| message.time.as_ref().map(|time| time.created))
+        });
+        for run in transcript.runs.iter().filter(|run| {
+            transcript.unconfirmed_tasks.contains(run.ending_key())
+                || run.is_live()
+                || cutoff.is_none_or(|cut| run.started_at.is_none_or(|start| start >= cut))
+        }) {
             if transcript
                 .background_tasks
                 .iter()
@@ -4708,7 +4731,7 @@ impl StreamAccumulator {
             {
                 continue;
             }
-            rows.push(self.run_row(transcript, activities, run, &mut activity_keys));
+            rows.push(self.run_row(transcript, activities, finished, run, &mut activity_keys));
         }
         // Keep the cache to the live runs (a retired run's fragment leaves with
         // its row) and fold in this read's fresh successes — a failed child
@@ -4716,7 +4739,7 @@ impl StreamAccumulator {
         // fragment above.
         let live_subagents = activity_keys;
         self.ledger_activity
-            .retain(|call_id, _| live_subagents.contains(call_id.as_str()));
+            .retain(|call_id, _| live_subagents.contains(call_id.as_str()) && !finished.contains(call_id));
         for (call_id, liveness) in activities {
             if live_subagents.contains(call_id.as_str()) {
                 self.ledger_activity.insert(call_id.clone(), liveness.clone());
@@ -4730,7 +4753,7 @@ impl StreamAccumulator {
         let live_shells: std::collections::HashSet<&str> = transcript
             .background_tasks
             .iter()
-            .filter(|task| task_kind(&task.tool.name) == TaskKind::Shell)
+            .filter(|task| task_kind(task) == TaskKind::Shell)
             .filter_map(|task| task.shell_id.as_deref())
             .collect();
         self.ledger_outputs
@@ -4766,6 +4789,7 @@ impl StreamAccumulator {
         &self,
         transcript: &SessionTranscript,
         activities: &HashMap<String, TaskLiveness>,
+        finished: &std::collections::HashSet<String>,
         run: &crate::backend::AgentRun,
         activity_keys: &mut std::collections::HashSet<String>,
     ) -> TaskLedgerRow {
@@ -4774,22 +4798,33 @@ impl StreamAccumulator {
         // The gather may key this run's fragment by the run id (the run-child
         // pair) or by its launch call id (a background task's pair). Retention
         // follows the SAME keys the read uses, so a fragment cannot be pruned
-        // by the row that just read it.
-        activity_keys.insert(key.to_string());
-        if let Some(call) = launch {
-            activity_keys.insert(call.to_string());
+        // by the row that just read it — but only a LIVE run retains one: a
+        // terminal run is authoritative-absent, and its last fragment must not
+        // outlive it.
+        if run.is_live() {
+            activity_keys.insert(key.to_string());
+            if let Some(call) = launch {
+                activity_keys.insert(call.to_string());
+            }
         }
         let keys = [Some(key), launch];
-        let activity = keys
-            .into_iter()
-            .flatten()
-            .find_map(|key| activities.get(key).cloned())
-            .or_else(|| {
-                keys.into_iter()
-                    .flatten()
-                    .find_map(|key| self.ledger_activity.get(key).cloned())
-            })
-            .or_else(|| run.activity.as_ref().map(TaskLiveness::from_run));
+        // A finished child (or the client's terminal statement) is
+        // authoritative-absent: the gathered map has no entry for it, so
+        // without this the cache would keep the last live-looking line.
+        let child_finished = finished.contains(key) || launch.is_some_and(|call| finished.contains(call));
+        let activity = if child_finished || !run.is_live() {
+            None
+        } else {
+            keys.into_iter()
+                .flatten()
+                .find_map(|key| activities.get(key).cloned())
+                .or_else(|| {
+                    keys.into_iter()
+                        .flatten()
+                        .find_map(|key| self.ledger_activity.get(key).cloned())
+                })
+                .or_else(|| run.activity.as_ref().map(TaskLiveness::from_run))
+        };
         TaskLedgerRow {
             kind: TaskKind::Subagent,
             label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
@@ -6097,6 +6132,335 @@ pub(super) use crate::bridge::tasks::{task_kind, task_label};
 mod tests {
     use super::*;
     use crate::backend::{BackgroundTask, FileAction, FileEdit, ToolIdentity, ToolStatus};
+    use std::collections::HashSet;
+
+    /// A terminal run launched before the Turn this card renders is history:
+    /// only the current Turn's runs (and any live one) become ledger rows.
+    #[test]
+    fn historical_terminal_runs_are_not_ledger_rows() {
+        let user = |id: &str, at: i64| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new(id),
+            role: crate::backend::MessageRole::User,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Text(crate::backend::TextPart {
+                text: "prompt".into(),
+                started_at: Some(at),
+            })],
+        };
+        let launch = |id: &str, child: &str, at: i64, label: &str| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new(id),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "task".into(),
+                    call_id: format!("call_{id}"),
+                },
+                status: ToolStatus::Completed,
+                started_at: Some(at),
+                input: Some(serde_json::json!({"description": label})),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: child.into(),
+                        status: None,
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..crate::backend::ToolCall::default()
+            })],
+        };
+        let transcript = crate::backend::SessionTranscript::new(vec![
+            user("msg_u1", 1_000),
+            launch("msg_old", "ses_old", 2_000, "old work"),
+            user("msg_u2", 5_000),
+            launch("msg_new", "ses_new", 6_000, "current work"),
+        ]);
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_capabilities(crate::backend::AgentCapabilities::full());
+        assert!(
+            acc.set_ledger_from_read(
+                &transcript,
+                &HashMap::new(),
+                &HashSet::new(),
+                7_000,
+                LedgerCadence::Minute,
+            )
+            .owes()
+        );
+        assert_eq!(
+            acc.ledger.len(),
+            1,
+            "only the current Turn's run: {:?}",
+            acc.ledger
+        );
+        assert!(
+            acc.ledger[0]
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("current work"))
+        );
+    }
+
+    /// A childless run's ⚠️ row is the affordance for its only exit (the
+    /// Cleanup click): it stays in the ledger even when it belongs to an
+    /// earlier Turn, so the Waiting card can offer the button.
+    #[test]
+    fn an_unconfirmed_childless_run_keeps_its_row_across_turns() {
+        let user = |id: &str, at: i64| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new(id),
+            role: crate::backend::MessageRole::User,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Text(crate::backend::TextPart {
+                text: "prompt".into(),
+                started_at: Some(at),
+            })],
+        };
+        let activity = |at: i64| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_activity"),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "codex/sub_agent_activity".into(),
+                    call_id: "call_activity".into(),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(at),
+                input: Some(serde_json::json!({"kind": "started"})),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: Vec::new(),
+                    effect: crate::backend::DelegationEffect::Report,
+                },
+                ..crate::backend::ToolCall::default()
+            })],
+        };
+        let mut transcript = crate::backend::SessionTranscript::new(vec![
+            user("msg_u1", 1_000),
+            activity(2_000),
+            user("msg_u2", 5_000),
+        ]);
+        transcript.unconfirmed_tasks.insert("call_activity".into());
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_capabilities(crate::backend::AgentCapabilities::full());
+        assert!(
+            acc.set_ledger_from_read(
+                &transcript,
+                &HashMap::new(),
+                &HashSet::new(),
+                7_000,
+                LedgerCadence::Minute,
+            )
+            .owes()
+        );
+        assert_eq!(acc.ledger.len(), 1, "the orphan keeps its row: {:?}", acc.ledger);
+        assert!(acc.ledger[0].unconfirmed, "the row carries the ⚠️ marker");
+    }
+
+    /// A child transcript that reported a terminal finish is an
+    /// authoritative-absent line: the row renders no activity and the cached
+    /// fragment leaves, so a later read cannot resurrect the last `waiting`.
+    #[test]
+    fn a_finished_child_clears_the_ledger_line_and_its_cache() {
+        let user = |id: &str, at: i64| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new(id),
+            role: crate::backend::MessageRole::User,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Text(crate::backend::TextPart {
+                text: "prompt".into(),
+                started_at: Some(at),
+            })],
+        };
+        let launch = |id: &str, child: &str, at: i64| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new(id),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "task".into(),
+                    call_id: format!("call_{id}"),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(at),
+                input: Some(serde_json::json!({"description": "child work"})),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: child.into(),
+                        status: None,
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..crate::backend::ToolCall::default()
+            })],
+        };
+        let transcript = crate::backend::SessionTranscript::new(vec![
+            user("msg_u1", 1_000),
+            launch("msg_child", "ses_child", 2_000),
+        ]);
+        let fragment = TaskLiveness {
+            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+                name: "shell".into(),
+                started_at: Some(2_000),
+            },
+            last_activity_ms: Some(2_000),
+            wait: None,
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_capabilities(crate::backend::AgentCapabilities::full());
+        acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::from([("ses_child".to_string(), fragment)]),
+            &HashSet::new(),
+            3_000,
+            LedgerCadence::Minute,
+        );
+        assert!(
+            acc.ledger[0].activity.is_some(),
+            "the live child line is established first"
+        );
+
+        acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::new(),
+            &HashSet::from(["ses_child".to_string()]),
+            4_000,
+            LedgerCadence::Minute,
+        );
+        assert!(
+            acc.ledger[0].activity.is_none(),
+            "the finished child's line is gone: {:?}",
+            acc.ledger
+        );
+        assert!(
+            !acc.ledger_activity.contains_key("ses_child"),
+            "the cached fragment leaves with the line"
+        );
+    }
+
+    /// A client-terminal run is authoritative-absent: its row keeps the label
+    /// and start but not the last `waiting` fragment, and the cache entry
+    /// leaves so a later read cannot resurrect it. (The panel clears through
+    /// `clear_missing`; the ledger must not disagree.)
+    #[test]
+    fn a_terminal_run_clears_its_ledger_line_and_cache() {
+        let user = |at: i64| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_u1"),
+            role: crate::backend::MessageRole::User,
+            time: Some(crate::backend::MessageTime {
+                created: at,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Text(crate::backend::TextPart {
+                text: "prompt".into(),
+                started_at: Some(at),
+            })],
+        };
+        let launch = |status: ToolStatus| crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_child"),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: 2_000,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_child".into(),
+                },
+                status,
+                started_at: Some(2_000),
+                input: Some(serde_json::json!({"description": "child work"})),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "ses_child".into(),
+                        status: None,
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..crate::backend::ToolCall::default()
+            })],
+        };
+        let fragment = TaskLiveness {
+            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+                name: "shell".into(),
+                started_at: Some(2_000),
+            },
+            last_activity_ms: Some(2_000),
+            wait: None,
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_capabilities(crate::backend::AgentCapabilities::full());
+        let live = crate::backend::SessionTranscript::new(vec![user(1_000), launch(ToolStatus::Running)]);
+        acc.set_ledger_from_read(
+            &live,
+            &HashMap::from([("ses_child".to_string(), fragment)]),
+            &HashSet::new(),
+            3_000,
+            LedgerCadence::Minute,
+        );
+        assert!(acc.ledger[0].activity.is_some(), "the live line is cached");
+
+        let terminal =
+            crate::backend::SessionTranscript::new(vec![user(1_000), launch(ToolStatus::Completed)]);
+        acc.set_ledger_from_read(
+            &terminal,
+            &HashMap::new(),
+            &HashSet::new(),
+            4_000,
+            LedgerCadence::Minute,
+        );
+        assert_eq!(acc.ledger.len(), 1, "the row stays");
+        assert!(
+            acc.ledger[0].activity.is_none(),
+            "a terminal run renders no live line: {:?}",
+            acc.ledger
+        );
+        assert!(
+            !acc.ledger_activity.contains_key("ses_child"),
+            "the cached fragment leaves with the terminal run"
+        );
+    }
 
     fn write_panel(path: &str, content: &str, output: Option<&str>) -> ToolPanel {
         let lines: Vec<&str> = content.lines().collect();
@@ -7638,6 +8002,7 @@ mod tests {
             acc.set_ledger_from_read(
                 &transcript,
                 &HashMap::from([("call_sub".to_string(), bash.clone())]),
+                &HashSet::new(),
                 start,
                 LedgerCadence::Minute
             )
@@ -7649,6 +8014,7 @@ mod tests {
             !acc.set_ledger_from_read(
                 &transcript,
                 &HashMap::new(),
+                &HashSet::new(),
                 start + 30_000,
                 LedgerCadence::Minute
             )
@@ -7670,6 +8036,7 @@ mod tests {
             acc.set_ledger_from_read(
                 &transcript,
                 &HashMap::from([("call_sub".to_string(), replying.clone())]),
+                &HashSet::new(),
                 start + 31_000,
                 LedgerCadence::Minute
             )
@@ -7683,6 +8050,7 @@ mod tests {
             acc.set_ledger_from_read(
                 &transcript,
                 &HashMap::from([("call_sub".to_string(), waiting)]),
+                &HashSet::new(),
                 start + 31_100,
                 LedgerCadence::Minute
             )
@@ -7692,6 +8060,7 @@ mod tests {
             acc.set_ledger_from_read(
                 &transcript,
                 &HashMap::from([("call_sub".to_string(), replying)]),
+                &HashSet::new(),
                 start + 31_200,
                 LedgerCadence::Minute
             )

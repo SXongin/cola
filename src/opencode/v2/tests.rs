@@ -1189,6 +1189,7 @@ async fn child_evidence_keeps_every_inconclusive_read_unfinished() {
         200,
         message("tool-calls", Some(2_500)),
     );
+    still_working.route("GET", "/api/session/ses_child", 200, busy_session("succeeded"));
     assert_eq!(
         v2_wire_client(&still_working)
             .child_evidence("ses_child")
@@ -1205,6 +1206,7 @@ async fn child_evidence_keeps_every_inconclusive_read_unfinished() {
         200,
         message("stop", None),
     );
+    unstamped.route("GET", "/api/session/ses_child", 200, busy_session("succeeded"));
     assert_eq!(
         v2_wire_client(&unstamped)
             .child_evidence("ses_child")
@@ -1221,10 +1223,57 @@ async fn child_evidence_keeps_every_inconclusive_read_unfinished() {
         200,
         serde_json::json!({"data": [], "cursor": {}}).to_string(),
     );
+    empty.route("GET", "/api/session/ses_child", 200, busy_session("succeeded"));
     assert_eq!(
         v2_wire_client(&empty).child_evidence("ses_child").await.unwrap(),
         ChildEvidence::Unfinished,
         "no assistant message is no evidence"
+    );
+}
+
+/// A child session that is idle with a terminal outcome has ended even when
+/// its newest assistant message carries no terminal finish (an abrupt
+/// failure). This is the read that retires a failed subagent.
+fn busy_session(outcome: &str) -> String {
+    serde_json::json!({
+        "data": {
+            "id": "ses_child",
+            "outcome": outcome,
+            "time": {"created": 1_000, "updated": 3_000, "busy": 2_900, "idle": 2_000}
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn child_evidence_reads_an_idle_session_outcome_as_terminal() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/ses_child/message",
+        200,
+        serde_json::json!({"data": [], "cursor": {}}).to_string(),
+    );
+    server.route(
+        "GET",
+        "/api/session/ses_child",
+        200,
+        serde_json::json!({
+            "data": {
+                "id": "ses_child",
+                "outcome": "failed",
+                "time": {"created": 1_000, "updated": 3_000, "busy": 2_000, "idle": 3_000}
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        v2_wire_client(&server).child_evidence("ses_child").await.unwrap(),
+        ChildEvidence::Terminal {
+            completed_at: 3_000,
+            started_at: None
+        },
+        "an idle session with a terminal outcome is terminal evidence"
     );
 }
 

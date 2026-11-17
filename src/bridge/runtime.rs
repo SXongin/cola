@@ -57,7 +57,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::backend::{Backend, SessionTranscript, ShellOutputRead};
+use crate::backend::{Backend, SessionTranscript, ShellOutputRead, TurnAnchor};
 
 /// The default spacing between two runtime verdicts of one Session (ms): the
 /// shared cadence Session Sync and the live loops observe together.
@@ -148,6 +148,7 @@ impl RuntimeReconcile {
         directory: &str,
         transcript: &mut SessionTranscript,
         read_timeout_ms: u64,
+        anchor: Option<&TurnAnchor>,
     ) -> Option<ReconcilePass> {
         if !backend.reports_live_runs() {
             // A client with no live-run surface has nothing to reconcile: no
@@ -160,15 +161,22 @@ impl RuntimeReconcile {
         // terminal status) has no live child id (`run_children` lists live
         // runs only), but it still owes a child-evidence read: the client says
         // it ended, and the child read supplies the durable `结束` ending. The
-        // work gate must see it, or the row would disappear with no entry.
-        if shells.is_empty() && children.is_empty() && transcript.run_evidence_suspects().is_empty() {
+        // work gate must see it, or the row would disappear with no entry. A
+        // childless run owes no read, but the pass is the only producer of its
+        // Cleanup marker: the Waiting card's button would otherwise never
+        // exist, and the Turn would wait on a run nothing can end.
+        if shells.is_empty()
+            && children.is_empty()
+            && transcript.run_evidence_suspects(anchor).is_empty()
+            && !transcript.has_childless_run()
+        {
             return None;
         }
         if !self.begin(session_id) {
             return None;
         }
         let budget = CycleBudget::within(read_timeout_ms);
-        let pass = reconcile_now(backend, session_id, Some(directory), transcript, budget).await;
+        let pass = reconcile_now(backend, session_id, Some(directory), transcript, budget, anchor).await;
         // The windows are read after the verdicts: a shell the runtime just
         // retired leaves the live list here and spends no tail read. A failed
         // runtime read changes nothing about them — the transcript still lists
@@ -330,6 +338,7 @@ pub(crate) async fn reconcile_now(
     directory: Option<&str>,
     transcript: &mut SessionTranscript,
     budget: CycleBudget,
+    anchor: Option<&TurnAnchor>,
 ) -> Option<ReconcilePass> {
     if !backend.reports_live_runs() {
         return None;
@@ -337,7 +346,13 @@ pub(crate) async fn reconcile_now(
     let (shells, children) = live_task_ids(transcript);
     // Same gate as [`RuntimeReconcile::observe`]: a terminal run (a report or a
     // launch/ref status) has no live child id but still owes the evidence read.
-    if shells.is_empty() && children.is_empty() && transcript.run_evidence_suspects().is_empty() {
+    // A childless run owes no read at all — its only exit is the Cleanup the
+    // pass below marks it for — so it alone still justifies a pass.
+    if shells.is_empty()
+        && children.is_empty()
+        && transcript.run_evidence_suspects(anchor).is_empty()
+        && !transcript.has_childless_run()
+    {
         return None;
     }
     match budget
@@ -426,7 +441,7 @@ pub(crate) async fn reconcile_now(
             // a client without the read keeps its runs as the runtime left
             // them and is never asked for their children.
             if reads_child_evidence {
-                for (run_id, child_id) in transcript.run_evidence_suspects() {
+                for (run_id, child_id) in transcript.run_evidence_suspects(anchor) {
                     match budget
                         .read("run child evidence read", backend.child_evidence(&child_id))
                         .await
@@ -436,11 +451,6 @@ pub(crate) async fn reconcile_now(
                                 .runs
                                 .iter()
                                 .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
-                            let conclusive = matches!(
-                                evidence,
-                                crate::backend::ChildEvidence::Terminal { .. }
-                                    | crate::backend::ChildEvidence::Gone
-                            );
                             if transcript.apply_run_child_evidence(&run_id, evidence) {
                                 record_new_endings(
                                     backend,
@@ -448,11 +458,13 @@ pub(crate) async fn reconcile_now(
                                     transcript,
                                     &mut recorded_retirements,
                                 );
-                            } else if conclusive || !was_live {
-                                // Inconclusive for a client-terminal run, or a
-                                // concluded read the stale guard refused: keep
-                                // it visible as unconfirmed so a Cleanup can end
-                                // it.
+                            } else if !was_live {
+                                // A client-terminal run whose read did not
+                                // conclude stays visible as unconfirmed so a
+                                // Cleanup can end it. A live run — including a
+                                // stale terminal read, which is the previous
+                                // generation's evidence — keeps its live line
+                                // and the next read retries.
                                 transcript.unconfirmed_tasks.insert(run_id.clone());
                             }
                             let still_live = transcript
@@ -481,6 +493,10 @@ pub(crate) async fn reconcile_now(
                     }
                 }
             }
+            // A childless run has no evidence read to conclude it: its only
+            // exit is the user's Cleanup. Mark it so the ⚠️ row rides the
+            // ledger and the Waiting card offers the button.
+            transcript.mark_childless_runs_unconfirmed();
             // NOTHING is committed here (review, PR #595): the caller commits
             // the returned pass only after the flush that carried this read's
             // entries was accepted.
@@ -680,6 +696,7 @@ mod tests {
                 None,
                 &mut transcript,
                 CycleBudget::within(200),
+                None,
             )
             .await
         });
@@ -766,6 +783,7 @@ mod tests {
             Some("/work"),
             &mut transcript,
             CycleBudget::within(200),
+            None,
         )
         .await;
         assert!(pass.is_some(), "the pass applied a verdict");
@@ -839,6 +857,7 @@ mod tests {
             Some("/work"),
             &mut transcript,
             CycleBudget::within(200),
+            None,
         )
         .await;
         assert!(pass.is_some(), "the runtime read still runs");
@@ -910,6 +929,7 @@ mod tests {
             Some("/work"),
             &mut transcript,
             CycleBudget::within(200),
+            None,
         )
         .await;
         assert!(pass.is_some_and(|pass| pass.changed()));
@@ -973,6 +993,7 @@ mod tests {
             Some("/work"),
             &mut transcript,
             CycleBudget::within(200),
+            None,
         )
         .await;
         assert_eq!(reads.lock().await.as_slice(), ["thread_fresh".to_string()]);
@@ -1040,6 +1061,7 @@ mod tests {
             Some("/work"),
             &mut transcript,
             CycleBudget::within(200),
+            None,
         )
         .await;
         assert!(
@@ -1116,6 +1138,7 @@ mod tests {
             Some("/work"),
             &mut transcript,
             CycleBudget::within(200),
+            None,
         )
         .await;
         assert!(
@@ -1128,6 +1151,95 @@ mod tests {
             crate::backend::TaskRetirementEnding::ChildEnded
         );
         assert!(transcript.runs.is_empty());
+    }
+
+    /// The transcript a Codex `subAgentActivity` with no `agentThreadId` reads
+    /// as: one call-keyed run, no child id, no background task, no suspect.
+    fn childless_activity() -> SessionTranscript {
+        let report = crate::backend::ToolCall {
+            identity: ToolIdentity {
+                name: "codex/sub_agent_activity".into(),
+                call_id: "call_activity".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            input: Some(serde_json::json!({"kind": "started"})),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: Vec::new(),
+                effect: crate::backend::DelegationEffect::Report,
+            },
+            ..crate::backend::ToolCall::default()
+        };
+        SessionTranscript::new(vec![crate::backend::TranscriptMessage {
+            id: crate::backend::MessageId::new("msg_activity"),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(crate::backend::MessageTime {
+                created: 1_000,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![crate::backend::Part::Tool(report)],
+        }])
+    }
+
+    /// A childless run has no child-evidence read at all. The reconcile must
+    /// still run — nothing is live and no suspect exists — and mark it so the
+    /// Waiting card offers the Cleanup exit, the only ending it can have.
+    #[tokio::test]
+    async fn a_childless_run_is_marked_for_cleanup() {
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Vec::new()));
+        let mut transcript = childless_activity();
+        assert!(
+            transcript.has_childless_run(),
+            "the report minted a call-keyed run"
+        );
+
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+            None,
+        )
+        .await;
+        assert!(
+            pass.is_some_and(|pass| pass.changed()),
+            "the marker alone still makes a pass"
+        );
+        assert!(
+            transcript.unconfirmed_tasks.contains("call_activity"),
+            "the run rides the ledger as ⚠️: {:?}",
+            transcript.unconfirmed_tasks
+        );
+    }
+
+    /// The throttled poll path is the one every read uses. It must admit the
+    /// childless run too, or the marker (and with it the cleanup button) is
+    /// never produced and the Turn waits on a run nothing can end.
+    #[tokio::test]
+    async fn the_throttled_pass_marks_a_childless_run() {
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Vec::new()));
+        let mut transcript = childless_activity();
+        let reconcile = RuntimeReconcile::new();
+        reconcile
+            .interval_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let pass = reconcile
+            .observe(&backend, "ses_test", "/work", &mut transcript, 50, None)
+            .await;
+        assert!(
+            pass.is_some_and(|pass| pass.changed()),
+            "the throttled pass must not skip the only work there is"
+        );
+        assert!(
+            transcript.unconfirmed_tasks.contains("call_activity"),
+            "the ⚠️ marker reaches the card that will wait: {:?}",
+            transcript.unconfirmed_tasks
+        );
     }
 
     /// A launch whose refs are ALL terminal creates a terminal run with no
@@ -1178,7 +1290,7 @@ mod tests {
         assert!(!transcript.runs[0].is_live(), "the ref states it completed");
         assert!(transcript.runs[0].reported_by.is_empty());
         assert_eq!(
-            transcript.run_evidence_suspects(),
+            transcript.run_evidence_suspects(None),
             vec![("thread_done".to_string(), "thread_done".to_string())],
             "a terminal ref still owes its child's own evidence"
         );
@@ -1189,6 +1301,7 @@ mod tests {
             Some("/work"),
             &mut transcript,
             CycleBudget::within(200),
+            None,
         )
         .await;
         assert!(
@@ -1231,7 +1344,7 @@ mod tests {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(
             reconcile
-                .observe(&backend, "ses_test", "/work", &mut transcript, 50)
+                .observe(&backend, "ses_test", "/work", &mut transcript, 50, None)
                 .await
                 .is_none(),
             "a client with no task surface has nothing to reconcile"
@@ -1242,7 +1355,8 @@ mod tests {
                 "ses_test",
                 Some("/work"),
                 &mut transcript,
-                CycleBudget::within(50)
+                CycleBudget::within(50),
+                None,
             )
             .await
             .is_none()

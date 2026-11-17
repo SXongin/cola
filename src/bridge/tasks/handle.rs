@@ -524,16 +524,20 @@ impl TasksHandle {
             // A resumed run is a new generation of the same child: an ending
             // older than the run's newest start must not suppress it.
             let ended = match &chains {
-                Some(chains) => chains
-                    .run_ended_at(session_id, &identity)
-                    .is_some_and(|ended_at| match (ended_at, run.started_at) {
-                        (Some(ended_at), Some(started_at)) => ended_at >= started_at,
-                        // An undated ending cannot be compared with a run
-                        // that has a start: keep the run (a resumed generation
-                        // is live; evidence will retire it if it is not).
-                        (None, Some(_)) => false,
-                        _ => true,
-                    }),
+                Some(chains) => {
+                    chains
+                        .run_ended_at(session_id, &identity)
+                        .is_some_and(|(ended_at, ending_start)| match (ended_at, run.started_at) {
+                            (Some(ended_at), Some(started_at)) => ended_at >= started_at,
+                            // An undated ending still names its generation by the
+                            // start the derivation captured: a resumed run (a
+                            // later start) survives, the ended one does not.
+                            (None, Some(started_at)) => {
+                                ending_start.is_none_or(|ending_start| started_at <= ending_start)
+                            }
+                            _ => true,
+                        })
+                }
                 None => false,
             };
             // The process-local set carries no clock: it may only suppress a
@@ -554,7 +558,14 @@ impl TasksHandle {
             }
         }
         for run in &transcript.runs {
-            if run.ids().any(|id| ids.contains(id)) {
+            // A marker minted while a call-keyed run had no child id names its
+            // creating call. Once a later sighting fills the child id, the
+            // durable key moves and that marker no longer names this run's
+            // ending: drop it, so a live child never reads as unconfirmed.
+            let stale_childless = run.child_id.is_some()
+                && !ids.contains(run.ending_key())
+                && ids.contains(run.run_id.as_str());
+            if !stale_childless && run.ids().any(|id| ids.contains(id)) {
                 transcript.unconfirmed_tasks.insert(run.ending_key().to_string());
             }
         }
@@ -611,7 +622,7 @@ fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{MessageId, Wake, WakeSource};
+    use crate::backend::{AgentRun, MessageId, RunStatus, ToolCallRef, Wake, WakeSource};
     use crate::bridge::chain::TaskRunIdentity;
 
     /// A Wake naming only the shell id it reports — the launchless shape a read
@@ -736,6 +747,39 @@ mod tests {
             records[0].run.names("call_bg") && records[0].run.names("sh_call_bg"),
             "the record carries both ids the read observed: {:?}",
             records[0].run
+        );
+    }
+
+    /// A childless run's Cleanup marker is keyed by its creating call. Once a
+    /// later sighting fills the child id, the durable key moves: that marker no
+    /// longer names the run's ending and must not make a live child read as
+    /// unconfirmed.
+    #[test]
+    fn an_adopted_run_drops_its_childless_marker() {
+        let handle = TasksHandle::new();
+        handle.set_unconfirmed("ses_a", &["call_activity".to_string()]);
+        let mut transcript = SessionTranscript::new(vec![]);
+        transcript.runs = vec![AgentRun {
+            run_id: "call_activity".into(),
+            task_run_id: Some("ses_child".into()),
+            child_id: Some("ses_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(1_000),
+            status: RunStatus::Running,
+            activity: None,
+            observed_at: Some(1_000),
+            launched_by: vec![ToolCallRef {
+                call_id: "spawn_1".into(),
+            }],
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        }];
+        handle.apply("ses_a", &mut transcript);
+        assert!(
+            transcript.unconfirmed_tasks.is_empty(),
+            "the child-bearing run is evidence-owned now: {:?}",
+            transcript.unconfirmed_tasks
         );
     }
 }

@@ -3205,11 +3205,14 @@ impl Backend for CodexClient {
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {
         self.ensure_subscription(session_id).await.map_err(client_error)?;
-        let transcript = self.projections.transcript(session_id);
+        let mut transcript = self.projections.transcript(session_id);
         // The read is where a lost `turn/start` response is reconciled: a
         // pending chosen id binds to the turn whose user item carries it, so
         // the authorship answer is exact even before the next prompt.
         self.reconcile_submissions(session_id, &transcript);
+        // The same life's retirement overlay OpenCode applies: a child run the
+        // reconcile ended must not reappear from the parent's launch items.
+        self.tasks.apply(session_id, &mut transcript);
         Ok(transcript)
     }
 

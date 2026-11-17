@@ -1,11 +1,12 @@
 # The card speaks in tokens and copy
 
-> **Amended by ADR-0105 (2026-11-16, spec #1057 ticket #1063)**: the `plan`
-> token now derives from the neutral `ToolDetail::Plan` rather than the
-> name-only table; the table keeps `skill`/`ask`, and the OpenCode V1 adapter
-> declares `Plan` for `todowrite`. The derivation table below otherwise stands.
+> **Amended by ADR-0108 (2026-11-16)**: the
+> `plan`/`skill`/`ask` tokens now derive from the neutral
+> `ToolDetail::Plan`/`Skill`/`Ask` rather than a name-only table; the OpenCode
+> adapter declares each for `todowrite`/`skill`/`question`. The derivation
+> table below otherwise stands.
 
-> **Amended by #1057 (2026-11-15)**: §2's derivation table names only `Edit` + `FileEdits`,
+> **Amended by ADR-0108 (2026-11-16)**: §2's derivation table names only `Edit` + `FileEdits`,
 > but the implementation gives a `Delete` or `Move` kind carrying `FileEdits`
 > the same `write`/`edit` word, because ACP's kinds are the adapter's
 > declaration and the FileEdits renderer admits those shapes. The table below

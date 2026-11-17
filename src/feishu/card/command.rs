@@ -137,16 +137,18 @@ pub(crate) async fn send_switch_card(
 
 /// One `/sub` row for an `AgentRun` the client's session list does not carry
 /// (spec #1057's P4; Codex filters sub-agent threads out of `thread/list`).
-/// The row's identity is the run's `run_id` (its child id), its title is the
-/// run's label, and its child id is the attach target the card's takeover
-/// resolves. A run with no start clock renders no relative-time segment.
+/// The row's identity is the run's **child id** — the attach target the card's
+/// takeover resolves — and its title is the run's label. A call-keyed run's
+/// `run_id` is its creating call, never a session id, so it is not the row.
+/// A run with no start clock renders no relative-time segment.
 fn run_child_row(
     run: &crate::backend::AgentRun,
+    child_id: &str,
     parent_id: &str,
     directory: &str,
 ) -> crate::backend::types::SessionListInfo {
     crate::backend::types::SessionListInfo {
-        id: run.run_id.clone(),
+        id: child_id.to_string(),
         title: run.label.clone(),
         // The run lives in the parent Session's project; an adopted child must
         // keep that directory (ADR-0010).
@@ -174,10 +176,11 @@ fn run_child_row(
 /// rather than guessing (ADR-0028).
 ///
 /// The current session's `AgentRun`s are unioned in (spec #1057's P4): a
-/// Codex collaboration child has no session-list row, so its run's `run_id`
-/// is its `/sub` identity and its live/terminal state decides the row's
-/// status without a session read. A run whose id already names a session row
-/// is that row, unchanged.
+/// Codex collaboration child has no session-list row, so its run's **child id**
+/// is its `/sub` identity and its live/terminal state decides the row's status
+/// without a session read. A run with no child id is not a session and renders
+/// no row (its `run_id` is the creating call). A child id that already names a
+/// session row is that row, unchanged.
 pub(crate) async fn child_card_data(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -211,13 +214,17 @@ pub(crate) async fn child_card_data(
     let mut seen: std::collections::HashSet<String> = children.iter().map(|child| child.id.clone()).collect();
     let mut run_statuses: std::collections::HashMap<String, crate::backend::types::SessionStatus> =
         std::collections::HashMap::new();
-    let runs = handles
-        .flow
-        .backend
-        .transcript(active_id.as_str())
-        .await
-        .map(|transcript| transcript.runs)
-        .unwrap_or_default();
+    // A card callback has a ~2 s ack budget: a stalled transcript read must
+    // not hold the page/search click past it.
+    let runs = match tokio::time::timeout(
+        std::time::Duration::from_millis(1_500),
+        handles.flow.backend.transcript(active_id.as_str()),
+    )
+    .await
+    {
+        Ok(Ok(transcript)) => transcript.runs,
+        _ => Vec::new(),
+    };
     let active_directory = handles
         .flow
         .sessions
@@ -225,15 +232,22 @@ pub(crate) async fn child_card_data(
         .await
         .unwrap_or_default();
     for run in &runs {
-        if !seen.insert(run.run_id.clone()) {
+        // Only a run that names a child is a session row: a call-keyed run
+        // whose child id never arrived has a call id for `run_id`, which is
+        // not an attach target. `children` already holds the session rows, so
+        // a child id that is one of them is that row, unchanged.
+        let Some(child_id) = run.child_id.as_deref() else {
+            continue;
+        };
+        if !seen.insert(child_id.to_string()) {
             continue;
         }
-        let row = run_child_row(run, active_id.as_str(), &active_directory);
+        let row = run_child_row(run, child_id, active_id.as_str(), &active_directory);
         if !lower.is_empty() && !matches_keyword(&row, &lower) {
             continue;
         }
         run_statuses.insert(
-            run.run_id.clone(),
+            child_id.to_string(),
             if run.is_live() {
                 crate::backend::types::SessionStatus::Busy
             } else {
@@ -1097,12 +1111,106 @@ mod tests {
 
         let (children, statuses) = child_card_data(&app.command_handles(), &key(), "", 1).await;
         assert_eq!(children.len(), 1, "the child-only run is a /sub row");
-        assert_eq!(children[0].id, "thread_child", "the row's identity is run_id");
+        assert_eq!(
+            children[0].id, "thread_child",
+            "the launch run's identity is its child id"
+        );
         assert_eq!(children[0].title, "review the diff");
         assert_eq!(
             statuses.get("thread_child"),
             Some(&Some(crate::backend::types::SessionStatus::Busy)),
             "the live run's state, no session read needed"
+        );
+    }
+
+    /// A call-keyed run is a `/sub` row only once it names a child. The row's
+    /// identity is that child id — never the creating call, which is not a
+    /// session — and a run that never got one renders no row at all.
+    #[tokio::test]
+    async fn child_card_data_uses_the_child_id_and_skips_a_childless_run() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let mut backend = MockBackend::new(realistic_parts());
+        backend.given_sessions(Vec::new());
+        let report = |id: &str, at: i64, label: &str| {
+            crate::backend::Part::Tool(crate::backend::ToolCall {
+                identity: crate::backend::ToolIdentity {
+                    name: "codex/sub_agent_activity".into(),
+                    call_id: id.into(),
+                },
+                status: crate::backend::ToolStatus::Running,
+                started_at: Some(at),
+                input: Some(serde_json::json!({"kind": "started", "description": label})),
+                detail: crate::backend::ToolDetail::Delegation {
+                    runs: Vec::new(),
+                    effect: crate::backend::DelegationEffect::Report,
+                },
+                ..crate::backend::ToolCall::default()
+            })
+        };
+        let launch = crate::backend::Part::Tool(crate::backend::ToolCall {
+            identity: crate::backend::ToolIdentity {
+                name: "codex/collab_agent".into(),
+                call_id: "call_spawn".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(2_000),
+            input: Some(serde_json::json!({"description": "review the diff"})),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "thread_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..crate::backend::ToolCall::default()
+        });
+        let transcript = crate::backend::SessionTranscript::new(vec![
+            typed_message(
+                "msg_activity",
+                crate::backend::MessageRole::Assistant,
+                Some(1_000),
+                vec![report("call_activity", 1_000, "review the diff")],
+            ),
+            typed_message(
+                "msg_spawn",
+                crate::backend::MessageRole::Assistant,
+                Some(2_000),
+                vec![launch],
+            ),
+            typed_message(
+                "msg_orphan",
+                crate::backend::MessageRole::Assistant,
+                Some(3_000),
+                vec![report("call_orphan", 3_000, "orphan")],
+            ),
+        ]);
+        backend
+            .given_transcript_after_build("ses_root", vec![transcript])
+            .await;
+        let (app, _platform) = build_app(cfg, backend).await;
+        seed_session(&app, "ses_root", "/work").await;
+
+        let (children, statuses) = child_card_data(&app.command_handles(), &key(), "", 1).await;
+        assert_eq!(
+            children.len(),
+            1,
+            "only the adopted run names a child: {children:?}"
+        );
+        assert_eq!(
+            children[0].id, "thread_child",
+            "the row's identity is the child id, never the creating call"
+        );
+        assert_eq!(children[0].title, "review the diff");
+        assert_eq!(
+            statuses.get("call_activity"),
+            None,
+            "the call id is not a session"
+        );
+        assert_eq!(
+            statuses.get("thread_child"),
+            Some(&Some(crate::backend::types::SessionStatus::Busy))
         );
     }
 
