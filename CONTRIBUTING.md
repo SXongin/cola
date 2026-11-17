@@ -485,11 +485,13 @@ newly reachable is fixed and pushed first, without waiting for the fourth-round
 approval — the one exception to that approval rule. When round 3 still raises
 other blocking findings, fix them in one batch and push once more; that
 verification round needs the user's explicit approval. Only non-blocking,
-pre-existing and out-of-scope findings may be deferred, into a follow-up issue
-and the PR's dossier — a blocking finding is never deferred. If the gate still
-FAILs after the user-approved round, stop and hand the PR to the user with the
-remaining findings: each further gate round needs their approval, and merging
-with the admin bypass or closing the PR is theirs to decide, never the agent's.
+pre-existing and out-of-scope findings may be deferred, into the PR's dossier —
+a blocking finding is never deferred. Whenever the loop ends — green or handed
+over — a non-empty deferred list becomes a follow-up issue linked from the
+dossier, a round-3 PASS included. If the gate still FAILs after the user-approved
+round, stop and hand the PR to the user with the remaining findings: each further
+gate round needs their approval, and merging with the admin bypass or closing the
+PR is theirs to decide, never the agent's.
 The budget counts every gate run that posts a review — a non-draft push, the
 `ready_for_review` flip that spends a draft's first review, or an `edited` body
 re-run. A run that fails before the model (an unfetchable reference, a credential
