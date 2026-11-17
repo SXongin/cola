@@ -3048,8 +3048,10 @@ async fn handle_sub_attach(
         .cloned()
         .collect();
     // A child-only run (a Codex collaboration child) has no session-list row:
-    // its run id is still a direct child the attach may name. Union it in,
-    // de-duped by id so OpenCode's session rows are unchanged.
+    // its child id is still a direct child the attach may name. Union it in,
+    // de-duped by id so OpenCode's session rows are unchanged. A run with no
+    // child id is not a session — its `run_id` is the creating call, so it must
+    // never become an attach target.
     let runs = handles
         .flow
         .backend
@@ -3065,11 +3067,14 @@ async fn handle_sub_attach(
         .unwrap_or_default();
     let mut children = children;
     for run in &runs {
-        if children.iter().any(|child| child.id == run.run_id) {
+        let Some(child_id) = run.child_id.as_deref() else {
+            continue;
+        };
+        if children.iter().any(|child| child.id == child_id) {
             continue;
         }
         children.push(crate::backend::types::SessionListInfo {
-            id: run.run_id.clone(),
+            id: child_id.to_string(),
             title: run.label.clone(),
             // The run lives in the parent Session's project (ADR-0010).
             directory: active_directory.clone(),

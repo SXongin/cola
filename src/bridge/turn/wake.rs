@@ -390,6 +390,7 @@ impl Turn {
             &mut acc,
             transcript,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
             chrono::Utc::now().timestamp_millis(),
             state::LedgerCadence::Minute,
             endings,

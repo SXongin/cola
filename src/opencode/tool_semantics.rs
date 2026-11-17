@@ -116,12 +116,12 @@ const SHARED_TOOLS: &[SharedTool] = &[
     SharedTool {
         id: "skill",
         kind: ToolKind::Other,
-        detail: no_detail,
+        detail: |_, _| ToolDetail::Skill,
     },
     SharedTool {
         id: "question",
         kind: ToolKind::Other,
-        detail: no_detail,
+        detail: |_, _| ToolDetail::Ask,
     },
 ];
 
@@ -311,6 +311,20 @@ fn patch_detail(input: Option<&Value>, metadata: Option<&Value>) -> ToolDetail {
         }
         merged
     };
+    // A text that carries a hunk for one file can still sit beside metadata
+    // that recorded another file's applied hunk: keep both, text first.
+    if edits.iter().any(|edit| edit.diff.is_some()) {
+        for applied in metadata_files(metadata, None) {
+            match edits.iter_mut().find(|edit| edit.path == applied.path) {
+                Some(existing) => {
+                    if existing.diff.is_none() {
+                        existing.diff = applied.diff;
+                    }
+                }
+                None => edits.push(applied),
+            }
+        }
+    }
     // A text that names files but carries no hunk can still sit beside the
     // applied diff V1 records as one `metadata.diff`: fill the hunks from it
     // so the panel renders the change the previous card showed.
@@ -409,10 +423,6 @@ fn delegation_detail(_input: Option<&Value>, metadata: Option<&Value>) -> ToolDe
             .unwrap_or_default(),
         effect: DelegationEffect::Launch,
     }
-}
-
-fn no_detail(_input: Option<&Value>, _metadata: Option<&Value>) -> ToolDetail {
-    ToolDetail::None
 }
 
 /// The structured input path: V1 names it `filePath`, V2 `path`.

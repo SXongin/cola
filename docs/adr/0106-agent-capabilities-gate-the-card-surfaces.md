@@ -1,8 +1,10 @@
 # An Agent Client declares its capabilities; surfaces degrade, never guess
 
-> **Amended by #1062 (2026-11-15)**: decision 5's `background_tasks_supported`
-> is **removed**, not delegated — see the trailing amendment. Its per-client
-> overrides went with it; `reports_live_runs` remains the derived delegation.
+> **Amended by ADR-0108 (2026-11-16)**: decision 5's `background_tasks_supported`
+> is **removed, not delegated** (the ticket allowed removal), and its
+> per-client overrides went with it; `reports_live_runs` remains the derived
+> delegation. The `mcp` axis is the statuses plus the directory-owned Location
+> Form (ADR-0103 forbids a status-only card).
 
 ## Context
 
@@ -76,8 +78,7 @@ and the exact row are spec #1057's.
 
 **5. Existing per-subsystem methods fold into the read.**
 `background_tasks_supported` and its siblings are not a second source of truth.
-`background_tasks_supported` delegates to `background_runs` **(amended
-2026-11-15: removed, not delegated — see the trailing amendment)**; the live-run
+`background_tasks_supported` delegates to `background_runs`; the live-run
 ledger
 and the **runtime reconciliation's early return** gate on `reports_live_runs()`,
 so a child-only Agent Client still gets its verdict. The rest are thin

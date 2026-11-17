@@ -325,7 +325,7 @@ pub(crate) fn identity_of_task(
             .map(str::trim)
             .filter(|label| !label.is_empty())
             .map(str::to_string)
-            .or_else(|| task_label(task_kind(&tool), input)),
+            .or_else(|| task_label(task_kind(task), input)),
     }
 }
 
@@ -369,16 +369,17 @@ pub(crate) fn identity_task(identity: &TaskRunIdentity, fallback_key: &str) -> B
     }
 }
 
-/// The ledger kind of a Background Task's tool: it keys on the **neutral
-/// launch noun** the V2 decoder writes for a background run — `shell` or
-/// `subagent` — not a vendor id, and it is not the per-adapter semantics table
-/// (`SHARED_TOOLS`, which still exists). `background_launch` returns `None`
-/// for every other name, so only those two ever background. A matching pair,
-/// matched once, here.
-pub(crate) fn task_kind(tool: &str) -> TaskKind {
-    match tool {
-        "subagent" => TaskKind::Subagent,
-        _ => TaskKind::Shell,
+/// The ledger kind of a Background Task. The **child fact** wins: a task that
+/// carries a child session is a subagent, whatever it is called, so a third
+/// adapter's own launch noun never picks the renderer (ADR-0105 §5). The one
+/// identity-less shape is a V2 `subagent` launch whose metadata omitted its
+/// session id: there the adapter's neutral launch noun — never a vendor id, and
+/// exactly the ADR-0107 "name as a last fact" exception — is all that is left.
+pub(crate) fn task_kind(task: &BackgroundTask) -> TaskKind {
+    if task.child_id.is_some() || task.tool.name == "subagent" {
+        TaskKind::Subagent
+    } else {
+        TaskKind::Shell
     }
 }
 
@@ -475,6 +476,46 @@ mod tests {
             both.names("job_1"),
             "a later writer holding the job id resolves the run"
         );
+    }
+
+    /// The ledger kind comes from the run's identity first — a child session,
+    /// else a shell — so an adapter's own name cannot pick the renderer. A V2
+    /// subagent launch with no session id is the identity-less shape, and there
+    /// its neutral launch noun (never a vendor id) is the remaining fact.
+    #[test]
+    fn the_ledger_kind_reads_the_identity_not_the_name() {
+        let task = |name: &str, child: Option<&str>, shell: Option<&str>| BackgroundTask {
+            tool: crate::backend::ToolIdentity {
+                name: name.into(),
+                call_id: "call_1".into(),
+            },
+            shell_id: shell.map(str::to_string),
+            child_id: child.map(str::to_string),
+            started_at: None,
+        };
+        let shell = task("spawn_agent", None, Some("sh_1"));
+        assert_eq!(task_kind(&shell), TaskKind::Shell);
+        assert_eq!(
+            task_label(task_kind(&shell), Some(&serde_json::json!({"command": "ls"}))),
+            Some("ls".to_string())
+        );
+        let child = task("spawn_agent", Some("ses_child"), None);
+        assert_eq!(task_kind(&child), TaskKind::Subagent);
+        assert_eq!(
+            task_label(
+                task_kind(&child),
+                Some(&serde_json::json!({"description": "review"}))
+            ),
+            Some("review".to_string())
+        );
+        // The supported V2 state: a `subagent` launch whose metadata omitted
+        // its session id. The neutral noun is the fact left; it must not read
+        // as a shell row.
+        let childless = task("subagent", None, None);
+        assert_eq!(task_kind(&childless), TaskKind::Subagent);
+        // A third adapter's identity-less name is not a subagent token: the
+        // tolerant default stays shell.
+        assert_eq!(task_kind(&task("spawn_agent", None, None)), TaskKind::Shell);
     }
 
     /// A record carries EVERY id its run is known by: a later writer holding

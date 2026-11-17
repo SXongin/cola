@@ -400,6 +400,7 @@ impl ExternalFlow {
                     directory,
                     &mut transcript,
                     self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    None,
                 )
                 .await
         } else {

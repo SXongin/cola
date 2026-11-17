@@ -1088,7 +1088,7 @@ fn plan_runtime_entries(
         if acc.ending_announced_any(&run) || facts.shown_any(&run) {
             continue;
         }
-        let kind = super::state::task_kind(&task.tool.name);
+        let kind = super::state::task_kind(task);
         let ending = match &retirement.ending {
             TaskRetirementEnding::Ended(_) => TaskEnding::RuntimeEnded,
             TaskRetirementEnding::Lost => TaskEnding::Lost,
@@ -1707,6 +1707,7 @@ pub(super) fn apply_ledger_read(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
+    finished: &std::collections::HashSet<String>,
     now_ms: i64,
     cadence: LedgerCadence,
     endings: Endings<'_>,
@@ -1721,7 +1722,7 @@ pub(super) fn apply_ledger_read(
         // ledger an earlier read stored must leave too (and owe its flush).
         return acc.clear_ledger();
     }
-    let mut change = acc.set_ledger_from_read(transcript, activities, now_ms, cadence);
+    let mut change = acc.set_ledger_from_read(transcript, activities, finished, now_ms, cadence);
     // A committed entry is rendered content, whatever the ledger's clock did.
     if commit_planned_entries(acc, plans, endings) {
         change.rows = true;
@@ -1752,7 +1753,16 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     let rendered = render_turn_parts(acc, transcript, None);
     let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor(), Endings::none());
     let entries = commit_planned_entries(acc, plans, Endings::none());
-    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new(), true).owes() | entries
+    rendered
+        | refresh_ledger(
+            acc,
+            transcript,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            true,
+        )
+        .owes()
+        | entries
 }
 
 /// The completion entries a FINALIZATION read owes (spec #588, #593): capture
@@ -1791,7 +1801,16 @@ pub(super) fn render_new_turn_parts_committing(
 ) -> bool {
     let rendered = render_turn_parts(acc, transcript, bound);
     let entries = commit_planned_entries(acc, plans, endings);
-    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new(), live_runs).owes() | entries
+    rendered
+        | refresh_ledger(
+            acc,
+            transcript,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            live_runs,
+        )
+        .owes()
+        | entries
 }
 
 /// The read's message positions, keyed by message id (spec #1040): the
@@ -2677,6 +2696,7 @@ fn refresh_ledger(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
+    finished: &std::collections::HashSet<String>,
     live_runs: bool,
 ) -> super::state::LedgerChange {
     if !live_runs {
@@ -2692,6 +2712,7 @@ fn refresh_ledger(
     acc.set_ledger_from_read(
         transcript,
         activities,
+        finished,
         chrono::Utc::now().timestamp_millis(),
         LedgerCadence::Minute,
     )
@@ -3115,15 +3136,26 @@ async fn render_and_flush_inner(
             let RenderLiveness {
                 panels: panel_children,
                 gathered: liveness,
+                finished,
                 clear_missing,
             } = liveness;
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) => {
-                    let ledger =
-                        refresh_ledger(&mut card.acc, transcript, &liveness, backend.reports_live_runs());
-                    let liveness_changed =
-                        apply_task_liveness(&mut card.acc, &panel_children, &liveness, clear_missing);
+                    let ledger = refresh_ledger(
+                        &mut card.acc,
+                        transcript,
+                        &liveness,
+                        &finished,
+                        backend.reports_live_runs(),
+                    );
+                    let liveness_changed = apply_task_liveness(
+                        &mut card.acc,
+                        &panel_children,
+                        &liveness,
+                        &finished,
+                        clear_missing,
+                    );
                     // Only the ROW half is progress: a rendered elapsed/age
                     // crossing its cadence (the clock half) must not renew the
                     // external renderer's idle bound, or a silent task's
@@ -3281,7 +3313,7 @@ pub(super) fn background_subagent_children(transcript: &SessionTranscript) -> Ve
         .background_tasks
         .iter()
         .filter(|task| {
-            super::state::task_kind(&task.tool.name) == TaskKind::Subagent
+            super::state::task_kind(task) == TaskKind::Subagent
                 && !transcript.unconfirmed_tasks.contains(task.tool.call_id.as_str())
         })
         .filter_map(|task| {
@@ -3311,6 +3343,10 @@ async fn live_panel_children(cards: &CardsHandle, session_id: &str) -> Vec<(Stri
 struct RenderLiveness {
     panels: Vec<(String, String)>,
     gathered: std::collections::HashMap<String, TaskLiveness>,
+    /// Every surface key whose child transcript reported a terminal finish.
+    /// Its line is authoritative-absent even on a mode that keeps a failed
+    /// read's last fragment (`clear_missing` is false for `ChildSessions`).
+    finished: std::collections::HashSet<String>,
     clear_missing: bool,
 }
 
@@ -3343,6 +3379,7 @@ async fn gather_render_liveness(
         crate::backend::ChildAgentMode::None => RenderLiveness {
             panels,
             gathered: std::collections::HashMap::new(),
+            finished: std::collections::HashSet::new(),
             clear_missing: true,
         },
         crate::backend::ChildAgentMode::ActivityReports => {
@@ -3361,9 +3398,20 @@ async fn gather_render_liveness(
             } else {
                 gather_child_liveness(backend, requests, &children).await
             };
+            // A finished child is authoritative-absent on every surface key
+            // that named it — the panel's call id and the run's identity.
+            let finished_keys = finished_keys(&children, &finished);
             let mut gathered = std::collections::HashMap::new();
             for run in &transcript.runs {
-                if !run.is_live() || finished.contains(&run.run_id) {
+                // A finished child's line is gone even while the client still
+                // reports the run live: `run_id` and `child_id` differ for a
+                // call-keyed run, so the child id is the identity to test.
+                if !run.is_live()
+                    || run
+                        .child_id
+                        .as_deref()
+                        .is_some_and(|child| finished.contains(child))
+                {
                     continue;
                 }
                 let child = child_liveness.get(&run.run_id).cloned();
@@ -3402,6 +3450,7 @@ async fn gather_render_liveness(
             RenderLiveness {
                 panels,
                 gathered,
+                finished: finished_keys,
                 clear_missing: true,
             }
         }
@@ -3417,16 +3466,33 @@ async fn gather_render_liveness(
                 return RenderLiveness {
                     panels,
                     gathered: std::collections::HashMap::new(),
+                    finished: std::collections::HashSet::new(),
                     clear_missing: false,
                 };
             }
+            let (gathered, finished) = gather_child_liveness(backend, requests, &children).await;
             RenderLiveness {
                 panels,
-                gathered: gather_child_liveness(backend, requests, &children).await.0,
+                gathered,
+                finished: finished_keys(&children, &finished),
                 clear_missing: false,
             }
         }
     }
+}
+
+/// The surface keys (a panel's call id, a Background Task's call id, a run's
+/// identity) whose child reported a terminal finish, from the pairs the gather
+/// read and the child ids it found finished.
+fn finished_keys(
+    children: &[(String, String)],
+    finished: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    children
+        .iter()
+        .filter(|(_, child)| finished.contains(child))
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 /// Attach the render's gather to every live `task` panel in `acc` (ADR-0054).
@@ -3438,10 +3504,19 @@ fn apply_task_liveness(
     acc: &mut StreamAccumulator,
     panels: &[(String, String)],
     gathered: &std::collections::HashMap<String, TaskLiveness>,
+    finished: &std::collections::HashSet<String>,
     clear_missing: bool,
 ) -> bool {
     let mut changed = false;
     for (call_id, _) in panels {
+        // A finished child is the one authoritative absence every mode shares:
+        // its transcript ended, so the line leaves even while the call itself
+        // still reads live (and even on a ChildSessions client, whose failed
+        // read keeps the last fragment below).
+        if finished.contains(call_id) {
+            changed |= acc.set_tool_liveness(call_id, None);
+            continue;
+        }
         match gathered.get(call_id).cloned() {
             Some(liveness) => changed |= acc.set_tool_liveness(call_id, Some(liveness)),
             None if clear_missing => changed |= acc.set_tool_liveness(call_id, None),
@@ -4347,6 +4422,7 @@ mod tests {
                 &mut without,
                 &transcript,
                 &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
                 false
             )
             .owes(),
@@ -4361,7 +4437,14 @@ mod tests {
         with.adopt_turn_anchor(&transcript.anchor_of_user("msg_user").expect("the turn anchor"));
         render_turn_parts(&mut with, &transcript, None);
         assert!(
-            refresh_ledger(&mut with, &transcript, &std::collections::HashMap::new(), true).owes(),
+            refresh_ledger(
+                &mut with,
+                &transcript,
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
+                true,
+            )
+            .owes(),
             "the surface owes its ledger"
         );
         let card = card_text(&with.build_card());
@@ -4374,10 +4457,23 @@ mod tests {
         // A reattach can remove the surface mid-chain (ADR-0106): the SAME
         // accumulator must drop the stored ledger, and owe the flush that takes
         // the section off.
-        let removed = refresh_ledger(&mut with, &transcript, &std::collections::HashMap::new(), false);
+        let removed = refresh_ledger(
+            &mut with,
+            &transcript,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            false,
+        );
         assert!(removed.rows, "the capability loss is content the card owes");
         assert!(
-            !refresh_ledger(&mut with, &transcript, &std::collections::HashMap::new(), false).owes(),
+            !refresh_ledger(
+                &mut with,
+                &transcript,
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
+                false,
+            )
+            .owes(),
             "an already-cleared ledger owes nothing"
         );
         let card = card_text(&with.build_card());
@@ -12018,11 +12114,64 @@ Index: /x/src/main.rs
             &mut acc,
             &panels,
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
             true
         ));
         assert!(
             acc.tools()["call_panel"].liveness().is_none(),
             "the lost surface clears the line instead of keeping it"
+        );
+    }
+
+    /// A child transcript that reported a terminal finish is an authoritative
+    /// absence: the line leaves even while the run still reads live, and even on
+    /// a mode whose failed reads keep the last fragment.
+    #[test]
+    fn a_finished_child_clears_a_panels_liveness() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_tool(
+            "call_panel",
+            ToolPanel::new(ToolCall {
+                identity: ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_panel".into(),
+                },
+                kind: ToolKind::Other,
+                status: ToolStatus::Running,
+                started_at: Some(1_000),
+                detail: ToolDetail::Delegation {
+                    runs: vec![crate::backend::AgentRunRef {
+                        run_id: "thread_child".into(),
+                        status: None,
+                    }],
+                    effect: crate::backend::DelegationEffect::Launch,
+                },
+                ..ToolCall::default()
+            }),
+        );
+        acc.set_tool_liveness(
+            "call_panel",
+            Some(TaskLiveness {
+                activity: ChildActivity::Tool {
+                    name: "shell".into(),
+                    started_at: Some(1_000),
+                },
+                last_activity_ms: Some(1_000),
+                wait: None,
+            }),
+        );
+        let panels = [("call_panel".to_string(), "thread_child".to_string())];
+        let finished = std::collections::HashSet::from(["call_panel".to_string()]);
+        assert!(apply_task_liveness(
+            &mut acc,
+            &panels,
+            &std::collections::HashMap::new(),
+            &finished,
+            false,
+        ));
+        assert!(
+            acc.tools()["call_panel"].liveness().is_none(),
+            "a finished child's line leaves even with clear_missing off"
         );
     }
 

@@ -1128,6 +1128,14 @@ async fn a_collab_launch_keeps_its_panel_and_a_child_activity_updates_its_run() 
     server.echo_prompts(THREAD);
     let now = chrono::Utc::now().timestamp();
     let child = "0192f0aa-0000-7000-8000-000000000001";
+    // The spawned child exists as a thread with no persisted turn yet: a live
+    // child, not a deleted one, so its evidence is `Unfinished`.
+    server.seed_thread(ScriptedThread::adopted(
+        child,
+        "session-child",
+        WORK,
+        "a child thread",
+    ));
     server.script_turn(
         THREAD,
         vec![
@@ -1492,6 +1500,7 @@ async fn a_retired_child_run_releases_its_liveness_subscription() {
         Some("/work"),
         &mut transcript,
         crate::bridge::runtime::CycleBudget::within(200),
+        None,
     )
     .await;
 

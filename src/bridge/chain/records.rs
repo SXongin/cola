@@ -2052,19 +2052,31 @@ impl ChainRecords {
     /// run is contrasted against it (a newer start is a new generation, so an
     /// old ending must not suppress it), which is why this reads the clock
     /// rather than only "has an ending".
-    pub(crate) fn run_ended_at(&self, session_id: &str, held: &TaskRunId) -> Option<Option<i64>> {
+    pub(crate) fn run_ended_at(
+        &self,
+        session_id: &str,
+        held: &TaskRunId,
+    ) -> Option<(Option<i64>, Option<i64>)> {
         let state = self.lock();
         let client = state.client_id.clone();
         let session_id = resolved_session(&state, session_id);
         let records = state.endings.get(&client, &session_id)?;
         let index = resolve_run(records, held)?;
-        Some(
-            records[index]
-                .endings
-                .iter()
-                .filter_map(|ending| ending.finished_at)
-                .max(),
-        )
+        let record = &records[index];
+        let finished = record
+            .endings
+            .iter()
+            .filter_map(|ending| ending.finished_at)
+            .max();
+        // An undated ending (a Lost child) still names the generation it
+        // ended: the run's start, when the derivation captured it, lets a
+        // resumed launch survive while the ended generation stays retired.
+        let started = record
+            .endings
+            .iter()
+            .filter_map(|ending| ending.identity.started_at)
+            .max();
+        Some((finished, started))
     }
 
     /// Flip the entries `shown` names — a `(run, class)` pair each — to SHOWN

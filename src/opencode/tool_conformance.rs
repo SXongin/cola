@@ -57,6 +57,8 @@ fn codex(item: Value) -> (ToolKind, ToolDetail) {
 enum DetailShape {
     None,
     Plan,
+    Skill,
+    Ask,
     Command,
     Program,
     FileEdits,
@@ -70,6 +72,8 @@ fn detail_shape(detail: &ToolDetail) -> DetailShape {
     match detail {
         ToolDetail::None => DetailShape::None,
         ToolDetail::Plan => DetailShape::Plan,
+        ToolDetail::Skill => DetailShape::Skill,
+        ToolDetail::Ask => DetailShape::Ask,
         ToolDetail::Command { .. } => DetailShape::Command,
         ToolDetail::Program { .. } => DetailShape::Program,
         ToolDetail::FileEdits(_) => DetailShape::FileEdits,
@@ -810,15 +814,15 @@ fn code_mode_carries_the_program_and_its_nested_calls() {
 /// is never sniffed.
 #[test]
 fn other_is_none_for_known_ids_and_opaque_for_third_party_ids() {
-    for name in ["skill", "question"] {
+    for (name, shape) in [("skill", ToolDetail::Skill), ("question", ToolDetail::Ask)] {
         assert_eq!(
             v1(name, json!({}), Value::Null),
-            (ToolKind::Other, ToolDetail::None),
+            (ToolKind::Other, shape.clone()),
             "{name} (V1)"
         );
         assert_eq!(
             v2(name, json!({}), Value::Null),
-            (ToolKind::Other, ToolDetail::None),
+            (ToolKind::Other, shape),
             "{name} (V2)"
         );
     }
@@ -1077,7 +1081,6 @@ fn every_declared_shared_id_is_mapped() {
         &["bash", "shell"][..],
         &["patch", "apply_patch"],
         &["task", "subagent"],
-        &["skill", "question"],
     ] {
         let first = group[0];
         let (expected_kind, expected_detail) = v1(first, json!({}), Value::Null);

@@ -356,10 +356,22 @@ impl SessionTranscript {
         // One run, one ending: the run this task represents leaves with it, so
         // the run-evidence loop cannot read the same child again and append a
         // second retirement under its own key.
+        let mut launch_calls = vec![task.tool.call_id.clone()];
         if let Some(child) = task.child_id.as_deref() {
+            for run in self
+                .runs
+                .iter()
+                .filter(|run| run.run_id == child || run.child_id.as_deref() == Some(child))
+            {
+                launch_calls.extend(run.launched_by.iter().map(|launch| launch.call_id.clone()));
+            }
             self.runs
                 .retain(|run| run.run_id != child && run.child_id.as_deref() != Some(child));
         }
+        // The launch panel is the record of the request, not the run: it
+        // settles with the ending instead of looking live beside it. A shared
+        // launch waits for its other children (see `settle_run_launch_panels`).
+        self.settle_run_launch_panels(&launch_calls, task.child_id.as_deref(), &ending);
         self.unconfirmed_tasks.remove(call_id);
         self.task_retirements.push(TaskRetirement {
             task,
@@ -399,9 +411,18 @@ impl SessionTranscript {
     /// resolves. A run represented by a Background Task is excluded, because
     /// the existing runtime/child-evidence path already retires it; reading it
     /// twice would spend a request and could retire it on a different clock.
-    pub fn run_evidence_suspects(&self) -> Vec<(String, String)> {
+    pub fn run_evidence_suspects(&self, anchor: Option<&TurnAnchor>) -> Vec<(String, String)> {
+        // Only a live run, or a terminal one belonging to the current Turn,
+        // needs an evidence read. A terminal run from an earlier Turn is
+        // history: every read would otherwise re-read the session's whole child
+        // history and mint a completion entry for each. The Turn's own anchor is
+        // the boundary — the newest user message can be a Supplement, which is
+        // NOT a new Turn (ADR-0043) — and only a caller with no Turn (a Session
+        // Card read) falls back to it.
+        let cutoff = self.run_cutoff(anchor);
         self.runs
             .iter()
+            .filter(|run| Self::run_in_turn(run, cutoff))
             .filter_map(|run| {
                 let child = run.child_id.as_deref()?;
                 let task = self
@@ -411,6 +432,168 @@ impl SessionTranscript {
                 (!task).then(|| (run.ending_key().to_string(), child.to_string()))
             })
             .collect()
+    }
+
+    /// The boundary between the current Turn and history: the Turn's own
+    /// anchor when the caller has one, else the newest user message (a caller
+    /// with no Turn at all — a Session Card read). `None` when neither exists,
+    /// which leaves terminal runs in scope.
+    fn run_cutoff(&self, anchor: Option<&TurnAnchor>) -> Option<i64> {
+        anchor
+            .map(|anchor| anchor.created_ms)
+            .or_else(|| self.newest_turn_start())
+    }
+
+    /// The server time of the newest user message — where history ends and the
+    /// newest Turn begins. `None` when no user message carries a time (a
+    /// synthetic or a Wake-only read), which leaves terminal runs in scope.
+    fn newest_turn_start(&self) -> Option<i64> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == super::MessageRole::User)
+            .and_then(|message| message.time.as_ref().map(|time| time.created))
+    }
+
+    /// Whether `run` still lies inside the newest Turn's scope: a live run
+    /// always does (its exit is owed), a terminal one only when a KNOWN start
+    /// precedes the cutoff. A run with no start cannot be placed — the window
+    /// that read it may have dropped its clock — so it is not history: only a
+    /// dated start proves the run belongs to an earlier Turn. A same-second
+    /// start counts as inside (ADR-0108 accepts that ambiguity).
+    fn run_in_turn(run: &AgentRun, cutoff: Option<i64>) -> bool {
+        run.is_live() || cutoff.is_none_or(|cut| run.started_at.is_none_or(|start| start >= cut))
+    }
+
+    /// Whether the read carries a run with no child id — the call-keyed run a
+    /// report created (spec #1057). It has no child transcript to read, so the
+    /// runtime reconcile must run even when nothing is live: the Cleanup it
+    /// marks is this run's only exit.
+    pub fn has_childless_run(&self) -> bool {
+        self.runs.iter().any(|run| run.child_id.is_none())
+    }
+
+    /// Mark every childless run for the Cleanup exit: with no child there is no
+    /// evidence read that can end it, so the ⚠️ row and its button are the only
+    /// way the run — and the Turn waiting on it — can end.
+    pub fn mark_childless_runs_unconfirmed(&mut self) {
+        for run in self.runs.iter().filter(|run| run.child_id.is_none()) {
+            self.unconfirmed_tasks.insert(run.ending_key().to_string());
+        }
+    }
+
+    /// Settle the launch calls an ended run named: the panel is the record of
+    /// the request, so it must not keep reading live beside a finished run.
+    fn settle_launch_calls(&mut self, call_ids: &[String], status: ToolStatus) {
+        for message in &mut self.messages {
+            for part in &mut message.parts {
+                if let Part::Tool(call) = part
+                    && call.status.is_live()
+                    && call_ids.iter().any(|id| id == &call.identity.call_id)
+                {
+                    call.status = status.clone();
+                }
+            }
+        }
+    }
+
+    /// Settle the launch panels a retired run shared. One launch may name N
+    /// children, and the fold's rule is that the panel settles only when every
+    /// one of them has an ending, with a failure outranking a cancellation or a
+    /// complete (`derive_runs`). A sibling still in `runs` keeps the panel live:
+    /// evidence retires one child at a time.
+    fn settle_run_launch_panels(
+        &mut self,
+        call_ids: &[String],
+        retiring_child: Option<&str>,
+        retiring: &TaskRetirementEnding,
+    ) {
+        for call_id in call_ids {
+            let pending = self
+                .runs
+                .iter()
+                .any(|run| run.launched_by.iter().any(|launch| &launch.call_id == call_id));
+            if pending {
+                continue;
+            }
+            let status = self.launch_status_after(call_id, retiring_child, retiring);
+            self.settle_launch_calls(std::slice::from_ref(call_id), status);
+        }
+    }
+
+    /// The launch panel's status once its last child has an ending: failure
+    /// outranks a cancellation, which outranks a complete. The retiring run's
+    /// own ending is passed in (it has just left `runs`); a sibling's comes
+    /// from this read's retirements, or from the launch's per-receiver
+    /// declaration when the sibling retired in an earlier read.
+    fn launch_status_after(
+        &self,
+        call_id: &str,
+        retiring_child: Option<&str>,
+        retiring: &TaskRetirementEnding,
+    ) -> ToolStatus {
+        let mut failed = matches!(retiring, TaskRetirementEnding::ClientFailed);
+        let mut cancelled = matches!(retiring, TaskRetirementEnding::ClientCancelled);
+        for child in self.launch_children(call_id) {
+            if Some(child.as_str()) == retiring_child {
+                continue;
+            }
+            if let Some(retirement) = self.task_retirements.iter().find(|retirement| {
+                retirement.task.child_id.as_deref() == Some(child.as_str())
+                    || retirement.task.tool.call_id == child
+            }) {
+                failed |= matches!(retirement.ending, TaskRetirementEnding::ClientFailed);
+                cancelled |= matches!(retirement.ending, TaskRetirementEnding::ClientCancelled);
+                continue;
+            }
+            if let Some(status) = self.launch_child_status(call_id, &child) {
+                failed |= status == RunStatus::Failed;
+                cancelled |= status == RunStatus::Cancelled;
+            }
+        }
+        if failed {
+            ToolStatus::Error
+        } else if cancelled {
+            ToolStatus::Other("interrupted".to_string())
+        } else {
+            ToolStatus::Completed
+        }
+    }
+
+    /// The child ids a launch call named, from its own delegation detail.
+    fn launch_children(&self, call_id: &str) -> Vec<String> {
+        self.messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call)
+                    if call.identity.call_id == call_id
+                        && let ToolDetail::Delegation { runs, .. } = &call.detail =>
+                {
+                    Some(runs.iter().map(|run| run.run_id.clone()).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// One receiver's declared state on a launch call, when the adapter stated
+    /// it (Codex's `agentsStates`).
+    fn launch_child_status(&self, call_id: &str, child: &str) -> Option<RunStatus> {
+        self.messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call)
+                    if call.identity.call_id == call_id
+                        && let ToolDetail::Delegation { runs, .. } = &call.detail =>
+                {
+                    runs.iter()
+                        .find(|run| run.run_id == child)
+                        .and_then(|run| run.status)
+                }
+                _ => None,
+            })
     }
 
     /// Whether one run and one Background Task name the same live run: the
@@ -462,10 +645,15 @@ impl SessionTranscript {
             } => {
                 let turn_start = started_at.unwrap_or(completed_at);
                 if self.runs[index].started_at.is_some_and(|started| {
-                    // The wire states a turn's start in whole seconds; compare
-                    // at that granularity, so a turn that actually started a
-                    // few hundred ms after the run but serialized into the same
-                    // second is not rejected as previous.
+                    // The turn start is the ordering fact. A strictly earlier
+                    // second is a previous turn; a same-second start is
+                    // genuinely ambiguous (a normal first turn starts with its
+                    // spawn, and a resume can land in the same second as the
+                    // old turn) — ADR-0108 records that the ambiguity is
+                    // accepted in favour of not rejecting a fresh child's first
+                    // turn, and a completion is not compared (the wire states
+                    // it in whole seconds too, so a same-second completion
+                    // floors below a millisecond start).
                     turn_start.div_euclid(1000) < started.div_euclid(1000)
                 }) {
                     // A previous turn's terminal item, not this run's. Record
@@ -492,6 +680,15 @@ impl SessionTranscript {
             ChildEvidence::Unfinished => return false,
         };
         let run = self.runs.remove(index);
+        // The launch panel is the record of the request, not the run: it
+        // settles with the ending instead of reading live beside it. A shared
+        // launch waits for its other children (see `settle_run_launch_panels`).
+        let launch_calls: Vec<String> = run
+            .launched_by
+            .iter()
+            .map(|launch| launch.call_id.clone())
+            .collect();
+        self.settle_run_launch_panels(&launch_calls, run.child_id.as_deref(), &ending);
         self.task_retirements.push(TaskRetirement {
             task: BackgroundTask {
                 // The ledger's rows stay `shell`/`subagent` (ADR-0105's
@@ -786,8 +983,22 @@ impl SessionTranscript {
         // when the attachment can retire the run (`retires_runs`): a client
         // with no child-evidence read and no live-run surface (OpenCode V1)
         // lets the terminal run settle as before, rather than waiting forever
-        // on an ending no surface can produce. A terminal run with no child id
-        // has no read left and cannot block.
+        // on an ending no surface can produce.
+        //
+        // A run with NO child id has no evidence read at all: the client
+        // reported an agent cola cannot name a child for. Its only exit is a
+        // Cleanup, so it keeps the Turn waiting (the ⚠️ row and its button are
+        // the wait's own affordance) whatever its own status, and it is not
+        // scoped to its Turn — an orphan from an earlier Turn still owes the
+        // ending and must stay clearable.
+        //
+        // The wait for a child-bearing run is scoped to the run's OWN Turn, the
+        // same cut [`Self::run_evidence_suspects`] reads: a DATED terminal run
+        // from an earlier Turn is history, and no read will ever mint its
+        // ending. Waiting on it would wedge the newest Turn forever (and every
+        // restart, since the lingering run is durable state). A run with no
+        // start cannot be placed, so it stays in scope (its read still owes the
+        // ending). A live run blocks regardless — its exit is still owed.
         //
         // A live LAUNCH does not exempt it: a Codex `spawnAgent` call stays
         // `Running` while its child runs (the adapter states the targets'
@@ -795,10 +1006,17 @@ impl SessionTranscript {
         // stamping ✅ over a live child. The card's live tool panel is not a
         // stuck panel in that case — the drain yields on the waiting decision
         // (see the two settle loops).
-        if self
-            .runs
-            .iter()
-            .any(|run| run.is_live() || (retires_runs && run.child_id.is_some()))
+        // Only a client that can retire a run waits on one: a V1 live run has
+        // no evidence read and no ledger cleanup, so it must settle as before
+        // (its live launch panel still takes the stuck-panel grace).
+        // The Turn's own anchor is the scope: the newest user message may be a
+        // Supplement, which does not begin a new Turn (ADR-0043).
+        let cutoff = Some(anchor.created_ms);
+        if retires_runs
+            && self.runs.iter().any(|run| match run.child_id {
+                None => true,
+                Some(_) => Self::run_in_turn(run, cutoff),
+            })
         {
             return TurnSettle::Waiting;
         }
@@ -1943,6 +2161,12 @@ pub enum ToolDetail {
     /// plan tool here, and a call the adapter leaves `Opaque`/`None` is never
     /// sniffed for a todo list.
     Plan,
+    /// The call carries a loaded **skill** (`skill` today): the card's
+    /// skill-envelope presentation is chosen by this fact, never by the id.
+    Skill,
+    /// The call carries a **question** (`question` today): the card's question
+    /// summary is chosen by this fact, never by the id.
+    Ask,
     /// A shell-like command: the command line, its working directory, the
     /// client's own one-line description of it, the exit code it recorded, and
     /// whether it timed out.
@@ -2275,14 +2499,16 @@ pub struct ToolCallRef {
 /// addresses the run is a receipt on it; a report updates the run and is never
 /// a panel.
 ///
-/// The reached shape is one identity: every derived run has
+/// The reached shape is one identity for a child-bearing run:
 /// `run_id == child_id == task_run_id`, because a fact names a child to create
-/// a run and both producers drop the ids they cannot name. The three fields
-/// stay for their ROLES, not for three values: `run_id` is the live identity a
-/// relation/`AgentRunRef` keys on, `child_id` is the client's session/thread
-/// the liveness gather reads, and `task_run_id` is ADR-0080's durable key the
-/// ledger writes an ending under. A future call-only producer would fill
-/// `child_id` later without moving `run_id`; no such producer exists today.
+/// it. The three fields stay for their ROLES, not for three values: `run_id` is
+/// the live identity a relation/`AgentRunRef` keys on, `child_id` is the
+/// client's session/thread the liveness gather reads, and `task_run_id` is
+/// ADR-0080's durable key the ledger writes an ending under. A report that
+/// names no child is the call-keyed case (ADR-0108 §1): `run_id` is the
+/// creating call's id, `child_id` is filled by a later sighting, and
+/// `task_run_id` moves to the child id with it. A call-keyed run has no
+/// evidence read, so its only exit is a Cleanup.
 ///
 /// [`Self::status`] is the client's statement about the run; cola's
 /// `TaskEnding` is a separate, durable fact and is never folded into it.
@@ -2296,7 +2522,8 @@ pub struct AgentRun {
     /// Never re-minted; later ids are aliases.
     pub task_run_id: Option<String>,
     /// The client's child session/thread id — the identity the liveness gather
-    /// reads. Equal to `run_id` for every derived run.
+    /// reads. Equal to `run_id` for every derived run except a call-keyed one
+    /// waiting for its child id, whose `run_id` is the creating call's.
     pub child_id: Option<String>,
     /// The label the client gave the child (a description, a prompt, an agent
     /// path), or the run id when it named none.
@@ -3014,6 +3241,39 @@ mod tests {
         assert_eq!(v1.settle(Some(&anchor)), TurnSettle::Complete);
     }
 
+    /// A live run on a client that cannot retire it must not wedge the Turn:
+    /// V1 has no child-evidence read, so its run settles as before.
+    #[test]
+    fn a_v1_live_run_does_not_block_the_settle() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let mut transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)]);
+        transcript.runs = vec![AgentRun {
+            run_id: "ses_child".into(),
+            task_run_id: Some("ses_child".into()),
+            child_id: Some("ses_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(1_000),
+            status: RunStatus::Unknown,
+            activity: None,
+            observed_at: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        }];
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), false),
+            TurnSettle::Complete,
+            "V1 has no exit path for the run, so the Turn settles"
+        );
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), true),
+            TurnSettle::Waiting,
+            "a retirable client still waits for the child's evidence"
+        );
+    }
+
     /// A client-terminal run is not the true end: the child evidence (or a
     /// Cleanup) still owes its entry, so the Turn keeps waiting until the read
     /// concludes. The ending then carries the client's own word.
@@ -3089,6 +3349,232 @@ mod tests {
         assert_eq!(
             runtime_end.task_retirements[0].ending,
             TaskRetirementEnding::ChildEnded
+        );
+    }
+
+    /// The Turn scope is a cutoff, not a blanket exemption: a client-terminal
+    /// run that started INSIDE the newest Turn still owes its evidence and
+    /// keeps that Turn waiting.
+    #[test]
+    fn a_terminal_run_inside_its_own_turn_still_waits() {
+        let (user, anchor) = anchored("msg_u1", 1_000);
+        let mut transcript = SessionTranscript::new(vec![user, assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)]);
+        transcript.runs = vec![AgentRun {
+            run_id: "ses_child".into(),
+            task_run_id: Some("ses_child".into()),
+            child_id: Some("ses_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(1_100),
+            status: RunStatus::Completed,
+            activity: None,
+            observed_at: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        }];
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), true),
+            TurnSettle::Waiting,
+            "a run started after the anchor still owes this Turn its ending"
+        );
+    }
+
+    /// A childless call-keyed run has no evidence read at all: its only exit is
+    /// the Cleanup, so it keeps the Turn waiting whatever its own status or
+    /// which Turn started it, and the click retires it with the 🧹 ending.
+    #[test]
+    fn a_childless_run_waits_for_its_cleanup() {
+        let (user, anchor) = anchored("msg_u1", 1_000);
+        let childless = |status| AgentRun {
+            run_id: "call_activity".into(),
+            task_run_id: Some("call_activity".into()),
+            child_id: None,
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(1_100),
+            status,
+            activity: None,
+            observed_at: Some(1_100),
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        };
+        for status in [RunStatus::Running, RunStatus::Completed] {
+            let mut transcript =
+                SessionTranscript::new(vec![user.clone(), assistant_step("msg_a1", 1_100, None)])
+                    .with_executions(vec![boundary(1_200)]);
+            transcript.runs = vec![childless(status)];
+            assert_eq!(
+                transcript.settle_with(Some(&anchor), true),
+                TurnSettle::Waiting,
+                "a childless run has no read to end it: only a Cleanup can"
+            );
+            transcript.mark_childless_runs_unconfirmed();
+            assert!(
+                transcript.unconfirmed_tasks.contains("call_activity"),
+                "the ⚠️ row and its button are the wait's affordance"
+            );
+            transcript.apply_cleanup(&["call_activity".to_string()], 2_000);
+            assert!(transcript.runs.is_empty(), "the click retires the run");
+            assert_eq!(
+                transcript.task_retirements[0].ending,
+                TaskRetirementEnding::Cleaned
+            );
+            // The synthesized row is the `subagent` shape the ledger renders:
+            // a childless subagent must not read as a shell cleanup.
+            assert_eq!(transcript.task_retirements[0].task.tool.name, "subagent");
+            assert_eq!(transcript.task_retirements[0].task.child_id, None);
+            assert_eq!(
+                transcript.settle_with(Some(&anchor), true),
+                TurnSettle::Complete,
+                "the cleanup is the run's own exit"
+            );
+        }
+
+        // An orphan from an earlier Turn still owes its Cleanup: unlike a
+        // child-bearing run it has no evidence read that history can drop.
+        let (user_b, anchor_b) = anchored("msg_u2", 5_000);
+        let mut history = SessionTranscript::new(vec![user, assistant_step("msg_a1", 1_100, None), user_b])
+            .with_executions(vec![boundary(1_200)]);
+        history.runs = vec![childless(RunStatus::Completed)];
+        assert_eq!(history.settle_with(Some(&anchor_b), true), TurnSettle::Waiting);
+    }
+
+    /// One launch may name several children: a finished child's evidence must
+    /// not stamp a verdict on the shared panel while its sibling still runs,
+    /// and the eventual status keeps failure precedence (the fold's rule).
+    #[test]
+    fn a_shared_launch_settles_only_when_every_child_ends() {
+        let multi_launch = |a_state: Option<RunStatus>| {
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_spawn".into(),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(1_100),
+                detail: ToolDetail::Delegation {
+                    runs: vec![
+                        AgentRunRef {
+                            run_id: "thread_a".into(),
+                            status: a_state,
+                        },
+                        AgentRunRef {
+                            run_id: "thread_b".into(),
+                            status: None,
+                        },
+                    ],
+                    effect: DelegationEffect::Launch,
+                },
+                ..ToolCall::default()
+            })
+        };
+        let launch_status = |transcript: &SessionTranscript| {
+            transcript
+                .messages
+                .iter()
+                .flat_map(|message| &message.parts)
+                .find_map(|part| match part {
+                    Part::Tool(call) if call.identity.call_id == "call_spawn" => Some(call.status.clone()),
+                    _ => None,
+                })
+                .expect("the launch call")
+        };
+        let read = |a_state| {
+            SessionTranscript::new(vec![message(
+                "msg_a1",
+                MessageRole::Assistant,
+                Some(MessageTime {
+                    created: 1_100,
+                    completed: None,
+                }),
+                vec![multi_launch(a_state)],
+            )])
+        };
+
+        // Both children complete: the panel settles only with the last one.
+        let mut transcript = read(None);
+        assert_eq!(transcript.runs.len(), 2, "one run per named child");
+        assert!(transcript.apply_run_child_evidence(
+            "thread_a",
+            ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None
+            }
+        ));
+        assert_eq!(
+            launch_status(&transcript),
+            ToolStatus::Running,
+            "the sibling still runs: no ✅ beside a live child"
+        );
+        assert!(transcript.apply_run_child_evidence(
+            "thread_b",
+            ChildEvidence::Terminal {
+                completed_at: 3_000,
+                started_at: None
+            }
+        ));
+        assert_eq!(launch_status(&transcript), ToolStatus::Completed);
+
+        // A failed child outranks its completed sibling, even though the
+        // failure retired first.
+        let mut failed = read(Some(RunStatus::Failed));
+        assert!(failed.apply_run_child_evidence(
+            "thread_a",
+            ChildEvidence::Terminal {
+                completed_at: 2_000,
+                started_at: None
+            }
+        ));
+        assert_eq!(launch_status(&failed), ToolStatus::Running);
+        assert!(failed.apply_run_child_evidence(
+            "thread_b",
+            ChildEvidence::Terminal {
+                completed_at: 3_000,
+                started_at: None
+            }
+        ));
+        assert_eq!(
+            launch_status(&failed),
+            ToolStatus::Error,
+            "the earlier failure still wins"
+        );
+    }
+
+    /// A Supplement is a user message, not a new Turn (ADR-0043): a terminal
+    /// run launched before it still owes its evidence inside the SAME Turn, so
+    /// the Turn's own anchor — never the newest user message — is the cutoff.
+    #[test]
+    fn a_supplement_does_not_cut_off_the_turns_child_evidence() {
+        let (prompt, anchor) = anchored("msg_u1", 1_000);
+        let (supplement, _) = anchored("msg_supplement", 10_000);
+        let mut transcript =
+            SessionTranscript::new(vec![prompt, assistant_step("msg_a1", 2_000, None), supplement]);
+        transcript.runs = vec![AgentRun {
+            run_id: "ses_child".into(),
+            task_run_id: Some("ses_child".into()),
+            child_id: Some("ses_child".into()),
+            label: "review the diff".into(),
+            agent: None,
+            started_at: Some(2_000),
+            status: RunStatus::Completed,
+            activity: None,
+            observed_at: None,
+            launched_by: Vec::new(),
+            addressed_by: Vec::new(),
+            reported_by: Vec::new(),
+        }];
+        assert_eq!(
+            transcript.run_evidence_suspects(Some(&anchor)),
+            vec![("ses_child".to_string(), "ses_child".to_string())],
+            "the Turn's anchor, not the supplement, is the boundary"
+        );
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), true),
+            TurnSettle::Waiting,
+            "the run still owes the Turn its evidence"
         );
     }
 

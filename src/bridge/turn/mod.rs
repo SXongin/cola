@@ -1714,7 +1714,8 @@ impl Turn {
         // task; a failed or timed-out read changes nothing.
         // The pass is applied to the transcript only (review, PR #595): it is
         // committed below, after the render that carries its entries lands.
-        let pass = if self.drain_anchor_visible(handles, &transcript).await {
+        let visible_anchor = self.drain_anchor_visible(handles, &transcript).await;
+        let pass = if let Some(anchor) = visible_anchor.as_ref() {
             handles
                 .runtime_reconcile
                 .observe(
@@ -1723,6 +1724,7 @@ impl Turn {
                     &self.directory,
                     &mut transcript,
                     timeout_ms,
+                    Some(anchor),
                 )
                 .await
         } else {
@@ -1855,14 +1857,18 @@ impl Turn {
     /// tick is on its way to the Unreceived ending, where a recorded
     /// retirement would be swallowed by the overlay with no entry rendered;
     /// observing resumes on the first tick whose read is anchored.
-    async fn drain_anchor_visible(&self, handles: &TurnHandles, transcript: &SessionTranscript) -> bool {
+    async fn drain_anchor_visible(
+        &self,
+        handles: &TurnHandles,
+        transcript: &SessionTranscript,
+    ) -> Option<TurnAnchor> {
         let mut cards = handles.cards.cards.lock().await;
         match cards.get_mut(&self.session_id) {
             Some(card) => {
                 card.acc.capture_turn_anchor(transcript);
-                card.acc.has_turn_anchor()
+                card.acc.turn_anchor().cloned()
             }
-            None => false,
+            None => None,
         }
     }
 
@@ -3097,6 +3103,7 @@ impl Turn {
                     &mut card.acc,
                     transcript,
                     &HashMap::new(),
+                    &std::collections::HashSet::new(),
                     now_ms,
                     state::LedgerCadence::Minute,
                     render::Endings::of(cards, session_id),
@@ -3192,6 +3199,7 @@ impl Turn {
                 &mut card.acc,
                 transcript,
                 &HashMap::new(),
+                &std::collections::HashSet::new(),
                 now_ms,
                 state::LedgerCadence::Second,
                 render::Endings::of(cards, session_id),
@@ -3434,16 +3442,14 @@ impl Turn {
             }
         };
         render::read_planned_outputs(backend, &mut plans).await;
-        let activities = if admitted {
+        let (activities, finished) = if admitted {
             let children = render::background_subagent_children(transcript);
             if children.is_empty() {
-                HashMap::new()
+                (HashMap::new(), std::collections::HashSet::new())
             } else {
                 crate::bridge::bounded_call("yielded ledger child liveness", read_timeout_ms, async {
                     Ok::<_, crate::error::BridgeError>(
-                        render::gather_child_liveness(backend, requests, &children)
-                            .await
-                            .0,
+                        render::gather_child_liveness(backend, requests, &children).await,
                     )
                 })
                 .await
@@ -3451,7 +3457,7 @@ impl Turn {
                 .unwrap_or_default()
             }
         } else {
-            HashMap::new()
+            (HashMap::new(), std::collections::HashSet::new())
         };
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
@@ -3487,6 +3493,7 @@ impl Turn {
                 &mut card.acc,
                 transcript,
                 &activities,
+                &finished,
                 now_ms,
                 state::LedgerCadence::Second,
                 render::Endings::of(cards, session_id),

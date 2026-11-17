@@ -6914,6 +6914,14 @@ impl App {
         // nothing and so clears nothing (ADR-0073): the carried markers stay
         // on the card and the claim goes back, keeping the button usable.
         // (`None` is also the zero-live-task case: there is nothing to clear.)
+        // The waiting card's Turn is the run scope: a supplement is not a new
+        // Turn (ADR-0043), so the newest user message cannot stand in for it.
+        let anchor = {
+            let cards = handles.cards.cards.lock().await;
+            cards
+                .get(&session_id)
+                .and_then(|card| card.card_turn_anchor().cloned())
+        };
         let verdict = crate::bridge::runtime::reconcile_now(
             &handles.backend,
             &session_id,
@@ -6924,6 +6932,7 @@ impl App {
             // window, exactly like a poll cycle's, so a stalled read cannot
             // stack per-suspect timeouts on the click either.
             crate::bridge::runtime::CycleBudget::within(read_timeout_ms),
+            anchor.as_ref(),
         )
         .await;
         // The pass's evidence endings are already durable (recorded by
