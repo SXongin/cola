@@ -20,7 +20,7 @@ If that file is absent, take the two axes from the repo: **Standards** from `COD
 
 ## The adversarial half
 
-Run the `adversarial-review` skill over the **same base** and, when one was given, the **same pathspec**. Do not invent the rubric: that skill — or `.github/codex/prompts/review.md`'s `## What blocks the merge`, `## The adversarial pass` and `## Rules` — is the source, and its final `CODEX_REVIEW_VERDICT` line is kept.
+Run the `adversarial-review` skill over the **same base** and, when one was given, the **same pathspec**. Do not invent the rubric: that skill — or `.github/codex/prompts/review.md`'s `## What blocks the merge`, `## The adversarial pass` and `## Rules` — is the source, and its own `CODEX_REVIEW_VERDICT` line is the input to the pair's aggregate.
 
 ## Re-review round (same scope)
 
@@ -41,6 +41,6 @@ Start fresh reviewers the moment the scope is no longer the one that raised the 
 
 ## Aggregate
 
-Present three sections — `## Standards`, `## Spec`, `## Adversarial` — verbatim or lightly cleaned. **Never merge or rerank across them**: the axes are deliberately separate, and a single cross-axis "worst issue" is the reranking the separation exists to prevent. Close with a one-line per-axis finding count (and each axis's worst issue, if any) — but keep the adversarial section's `CODEX_REVIEW_VERDICT` line **last, with nothing after it**, so a gate that parses it is not broken by the summary. The verdict is the pair's, not the adversarial half's: when any axis reports a blocking or `critical` finding, the final line is `CODEX_REVIEW_VERDICT: FAIL` even if the adversarial run alone passed, and the report names the axis that blocks.
+Present three sections — `## Standards`, `## Spec`, `## Adversarial` — verbatim or lightly cleaned. **Never merge or rerank across them**: the axes are deliberately separate, and a single cross-axis "worst issue" is the reranking the separation exists to prevent. Close with a one-line per-axis finding count (and each axis's worst issue, if any). The verdict is the pair's, not the adversarial half's: the report's last line is `CODEX_REVIEW_VERDICT: PASS` only when no axis has a blocking or `critical` finding, and `FAIL` otherwise, naming the axis that blocks. That line replaces the adversarial half's own footer — do not emit two verdict lines, and put nothing after the final one.
 
 This skill reports; it never edits.

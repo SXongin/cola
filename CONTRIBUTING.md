@@ -464,7 +464,7 @@ itself a non-blocking finding. The gate reports at most 3 blocking and 5
 non-blocking findings in full per review, lists any held-back blocking findings
 as one-line stubs (`file:line` and one clause), and exempts a security or
 data-loss finding the PR introduces or makes newly reachable, marking it
-`critical`.
+`critical` and blocking.
 
 **A push the gate reviews is a new review round.** The approval is pinned to
 the reviewed commit and `main: review` requires the last push to be approved,
