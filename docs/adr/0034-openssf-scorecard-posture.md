@@ -490,10 +490,10 @@ narrower by design: it flags only P0/P1.
 merge"): blocking is a concrete input, state, or timing the diff newly fails; an
 unmet acceptance criterion of a linked issue the PR closes (`Closes`/`Fixes`/
 `Resolves`, not `Refs`); a regression the PR introduces; or a silent
-contradiction of an accepted ADR. A failure on a changed path whose origin the
-review cannot establish also blocks — it is not moved to the backlog — while
-unchanged code never becomes a blocking finding. Pre-existing defects that the
-diff neither creates nor makes newly reachable,
+contradiction of an accepted ADR. A failure on a changed path is blocking unless
+the diff is shown neither to create nor make it newly reachable — it is not moved
+to the backlog — while unchanged code never becomes a blocking finding.
+Pre-existing defects that the diff neither creates nor makes newly reachable,
 out-of-scope suggestions, naming and style, speculative edge cases, "could add a
 guard", and tests for impossible inputs are non-blocking, listed under `Backlog
 (non-blocking)`, and never decide the verdict. Adding a guard for an input that
@@ -519,8 +519,9 @@ remediation and the paths it directly touches, with the author assembling the
 fix and the gate re-reading the whole diff (it has no round history); when round
 3 still raises blocking findings, they are fixed in one push that needs the
 user's explicit approval; a `critical` security or data-loss finding is fixed
-and pushed first, without waiting for that approval. Only non-blocking,
-pre-existing and out-of-scope findings may be deferred, into the dossier; a
+and pushed first, without waiting for that approval. Only non-blocking and
+out-of-scope findings, and pre-existing defects the diff neither creates nor
+makes newly reachable, may be deferred, into the dossier; a
 blocking finding is never deferred. Whenever the loop ends, a non-empty deferred
 list becomes a follow-up issue linked from the dossier, a round-3 PASS included.
 If the gate still FAILs after that round,
@@ -530,7 +531,8 @@ counts every gate run that posts a review — a non-draft push, the
 `ready_for_review` flip that spends a draft's first review, or an `edited` body
 re-run; a run that fails before the model (an unfetchable reference, a credential
 failure) posts none and is not a round, and the agent never re-runs the gate on
-an unchanged head to fish for a different verdict. The local pair and the gate
+an unchanged head to fish for a different verdict; a push after a PASS for a real
+finding or a required rebase is a round like any other. The local pair and the gate
 rehearsal keep their no-round-cap rule, and non-blocking findings are answered
 or deferred, not fixed. The dossier is a PR comment whose first line is
 `<!-- gate-dossier -->` — the rounds spent and the deferred findings — updated
