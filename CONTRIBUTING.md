@@ -450,14 +450,19 @@ remains for emergencies; the bot can never lock the maintainer out.
 **Only blocking findings decide the verdict, and blocking is defined.** The
 prompt carries the definition (`.github/codex/prompts/review.md`, "What blocks
 the merge"): a concrete input, state, or timing the diff newly fails; an unmet
-acceptance criterion of a linked issue the PR claims to complete; a regression
-the PR introduces; or a silent contradiction of an accepted ADR. Pre-existing
-code, out-of-scope suggestions, naming and style, speculative edge cases, "could
-add a guard", and tests for impossible inputs are non-blocking: the gate lists
-them under `Backlog (non-blocking)` and they never decide the verdict. A change
-that adds a guard for an input that cannot occur is itself a finding. The gate
-reports at most 3 blocking and 5 non-blocking findings per review; a security or
-data-loss finding is exempt and marked `critical`.
+acceptance criterion of a linked issue the PR closes (`Closes`, `Fixes` or
+`Resolves`, not `Refs`); a regression the PR introduces; or a silent
+contradiction of an accepted ADR. A candidate blocking finding whose origin
+cannot be established also blocks. Pre-existing defects the diff neither creates
+nor makes newly reachable, out-of-scope suggestions, naming and style,
+speculative edge cases, "could add a guard", and tests for impossible inputs are
+non-blocking: the gate lists them under `Backlog (non-blocking)` and they never
+decide the verdict. A change that adds a guard for an input that cannot occur is
+itself a non-blocking finding. The gate reports at most 3 blocking and 5
+non-blocking findings per review, names how many blocking findings the cap held
+back, and exempts security or data-loss findings, marking them `critical`. A
+held-back blocking finding is surfaced by the next round — the cap never turns
+it into a PASS.
 
 **A push is a new review round.** The approval is pinned to the reviewed
 commit and `main: review` requires the last push to be approved, so a fix, a
@@ -481,11 +486,12 @@ and the PR's deferred list — a blocking finding is never deferred. If the gate
 still FAILs after the user-approved round, stop and hand the PR to the user with
 the remaining findings: each further gate round needs their approval, and
 merging with the admin bypass or closing the PR is theirs to decide, never the
-agent's. The budget counts pushes that change the diff — an `edited`,
-`reopened` or `ready_for_review` run is not a round — and the local pair and
-gate rehearsal still run until no blocking finding remains
-(`docs/agents/flow.md`). The PR body records the deferred findings whenever
-there are any, and the rounds spent when the budget ended the loop
+agent's. The budget counts gate runs on a diff the gate has not reviewed before
+— a push, and the `ready_for_review` flip that spends a draft's first review; an
+`edited` body re-run or a `reopened` re-run of the same head is not a round —
+and the local pair and gate rehearsal still run until no blocking finding
+remains (`docs/agents/flow.md`). The PR body records the deferred findings
+whenever there are any, and the rounds spent when the budget ended the loop
 (`## Gate rounds`, `## Deferred findings`).
 
 ## Releasing
