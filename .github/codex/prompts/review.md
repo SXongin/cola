@@ -33,10 +33,12 @@ A finding is **blocking** when it names a concrete input, state, or timing the
 diff newly fails; an acceptance criterion of a linked issue this PR closes
 (`Closes`, `Fixes` or `Resolves`, not `Refs`) that is unmet; a regression this PR
 introduces; or a silent contradiction of an accepted ADR (an ADR the PR adds or
-explicitly amends is not a contradiction). Nothing else blocks.
+explicitly amends is not a contradiction). Nothing else blocks. Flag only
+actionable issues introduced by this pull request: do not turn unchanged code
+into a blocking finding.
 
-If you cannot establish whether the diff introduced a candidate blocking
-finding, it blocks: say what you could not determine in the finding rather than
+Where a failure lies on a changed path and you cannot establish that it predates
+the PR, it blocks — say what you could not determine in the finding rather than
 moving it to the backlog.
 
 Everything else is non-blocking and is listed only under a
