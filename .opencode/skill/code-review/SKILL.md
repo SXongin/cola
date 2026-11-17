@@ -41,6 +41,6 @@ Start fresh reviewers the moment the scope is no longer the one that raised the 
 
 ## Aggregate
 
-Present three sections — `## Standards`, `## Spec`, `## Adversarial` — verbatim or lightly cleaned. **Never merge or rerank across them**: the axes are deliberately separate, and a single cross-axis "worst issue" is the reranking the separation exists to prevent. Close with a one-line per-axis finding count (and each axis's worst issue, if any) — but keep the adversarial section's `CODEX_REVIEW_VERDICT` line **last, with nothing after it**, so a gate that parses it is not broken by the summary.
+Present three sections — `## Standards`, `## Spec`, `## Adversarial` — verbatim or lightly cleaned. **Never merge or rerank across them**: the axes are deliberately separate, and a single cross-axis "worst issue" is the reranking the separation exists to prevent. Close with a one-line per-axis finding count (and each axis's worst issue, if any) — but keep the adversarial section's `CODEX_REVIEW_VERDICT` line **last, with nothing after it**, so a gate that parses it is not broken by the summary. The verdict is the pair's, not the adversarial half's: when any axis reports a blocking finding, the final line is `CODEX_REVIEW_VERDICT: FAIL` even if the adversarial run alone passed, and the report names the axis that blocks.
 
 This skill reports; it never edits.
