@@ -120,7 +120,7 @@ Communicate with sub-agents through sparse **context pointers** — the spec, ti
    The rehearsal is valid only on the gate's own lane. The command reads `GATE_MODEL` but not `GATE_ENDPOINT`; `codex exec` uses the local config's provider. If the repository's `vars.GATE_ENDPOINT`/`vars.GATE_MODEL` name another provider, select a matching profile with `codex exec -p <profile>` (the profile lives in `~/.codex/<profile>.config.toml`) or skip the rehearsal and let CI review — a PASS from a different lane is not a rehearsal. Record the skip.
 
    **Trusted input only.** The action keeps the key inside its Responses proxy and `GH_TOKEN` out of the Codex step; a local `codex exec` runs with the user's files and auth, and read-only blocks writes, not reads. Rehearse only the batch's own spec and tickets, never an external PR or issue body; keep the token variables unset as above, and do not read or echo `~/.codex/config.toml` or the gh config. Untrusted text belongs in CI.
-4. A failed rehearsal is a review round: route each finding like the gate's (a ticket-local finding to the implementer that wrote that window; a cross-ticket one to a fresh implementer), fix **every blocking** finding — answer each non-blocking one with a reason and carry it to the PR's deferred list rather than fixing it — re-run the pair and the rehearsal at the same scope, then push once.
+4. A failed rehearsal is a review round: route each finding like the gate's (a ticket-local finding to the implementer that wrote that window; a cross-ticket one to a fresh implementer), fix **every blocking** finding — answer each non-blocking one with a reason and carry it to the batch's deferred list (a scratch note until the PR exists) rather than fixing it — re-run the pair and the rehearsal at the same scope, then push once.
 
 [cola] **A passing rehearsal is not an approval.** The `main: review` approval comes only from the CI gate and is pinned to the commit it reviewed. A local PASS only says the push is worth spending a gate round on.
 
@@ -144,7 +144,7 @@ Communicate with sub-agents through sparse **context pointers** — the spec, ti
 - The orchestrating session calls the reviewers (`implementer` and `merger` deny `subagent`); the merger only lands.
 - One PR per spec. Never merge.
 - [cola] One push per review round: batch the blocking findings, rehearse, push once; a gate PASS covers only the commit it reviewed, and a recorded lane skip defers the review to CI.
-- [cola] The progress comments are the only writes the batch makes to the tracker; the PR closes the tickets.
+- [cola] The progress comments and the gate-dossier comment are the only writes the batch makes to the tracker; the PR closes the tickets.
 - The integration branch stays merge-commit-free and rebase-mergeable.
 
 ## Resume
@@ -152,7 +152,7 @@ Communicate with sub-agents through sparse **context pointers** — the spec, ti
 [cola] Re-run `/implement-spec <spec>` after an interruption. The integration branch's log and the tickets' progress comments are the batch's state; the session's captured ticket sessions do not survive it:
 
 - **Adopt the branch**: resume only a branch whose every commit `origin/main` lacks carries a `Refs: #<n>` trailer naming one of this spec's tickets — a commit without one is not the batch's, and adopting the branch would ride it into the PR. A branch failing that check stops and asks instead of being resumed.
-- **Adopt the PR**: a branch that already has an open PR adopts it and its `<!-- gate-dossier -->` comment (by marker, not by position); never open a second PR or a second dossier, and PATCH the existing comment.
+- **Adopt the PR**: a branch that already has an open PR adopts it and its `<!-- gate-dossier -->` comment (by marker, not by position); never open a second PR or a second dossier. Rebuild the round count from the gate reviews already on the PR before trusting the comment, and patch a comment that is behind them.
 - **Windows**: a ticket's window is the commits carrying its `Refs: #<n>` trailer, with the base at the commit before the first of them — normally one contiguous run, because landings are linear.
 - **Tickets**: a ticket is done only when its progress comment names this branch, names a commit still on the integration tip (`git merge-base --is-ancestor <sha> HEAD`), and that commit is the **last** one carrying the ticket's trailer — only then does the comment's review cover the whole window. A trailer-bearing commit *after* the comment is unreviewed work: review the extended window and replace the ticket's comment (never a second one), never re-dispatch over landed commits. A ticket with trailer commits but no comment covering them is landed but unreviewed: review its window and post the comment, not a new implementer. A ticket with neither is dispatched.
 - **Interleaved**: when another ticket's commits sit between this ticket's (a fix that landed after a later ticket), no single run defines its diff — leave that ticket to the whole-branch pass rather than reconstructing a partial window, and name it in the dossier.
