@@ -274,14 +274,21 @@ impl SessionTranscript {
         self.background_tasks = kept;
         // A task-owned run leaves with its task: one run, one ending. Its
         // ids are the ids the task just recorded, so the run loop below cannot
-        // keep it alive or mint a second cleanup ending.
+        // keep it alive or mint a second cleanup ending. Its launch panel still
+        // settles with it (ADR-0108 §10), once the kept runs are back in place
+        // so a shared launch's live sibling keeps the panel running.
+        let mut cleaned_task_runs: Vec<AgentRun> = Vec::new();
         if !cleaned_task_ids.is_empty() {
             self.runs.retain(|run| {
-                !run.ids().any(|id| cleaned_task_ids.contains(id))
-                    && !run
+                let gone = run.ids().any(|id| cleaned_task_ids.contains(id))
+                    || run
                         .child_id
                         .as_ref()
-                        .is_some_and(|child| cleaned_task_ids.contains(child))
+                        .is_some_and(|child| cleaned_task_ids.contains(child));
+                if gone {
+                    cleaned_task_runs.push(run.clone());
+                }
+                !gone
             });
         }
         // A child-only run has no Background Task to clear: retire it through
@@ -289,29 +296,43 @@ impl SessionTranscript {
         // evidence path uses. A run a task already represents is skipped (the
         // task loop above owns that record).
         let mut kept_runs = Vec::with_capacity(self.runs.len());
+        let mut cleaned_runs: Vec<AgentRun> = Vec::new();
         for run in std::mem::take(&mut self.runs) {
             let named = run.ids().any(|id| clearing.contains(id));
             let task_owned = tasks_before.iter().any(|task| self.run_is_task(&run, task));
             if named && !task_owned {
-                self.task_retirements.push(TaskRetirement {
-                    task: BackgroundTask {
-                        tool: ToolIdentity {
-                            name: "subagent".to_string(),
-                            call_id: run.ending_key().to_string(),
-                        },
-                        shell_id: None,
-                        child_id: run.child_id.clone(),
-                        started_at: run.started_at,
-                    },
-                    ending: TaskRetirementEnding::Cleaned,
-                    finished_at: Some(now_ms),
-                    label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
-                });
+                cleaned_runs.push(run);
             } else {
                 kept_runs.push(run);
             }
         }
         self.runs = kept_runs;
+        // The launch panel is the record of the request: a cleaned run settles
+        // it with the click's own ending, exactly as the evidence paths do.
+        for run in cleaned_task_runs.iter().chain(cleaned_runs.iter()) {
+            let launches: Vec<String> = run
+                .launched_by
+                .iter()
+                .map(|launch| launch.call_id.clone())
+                .collect();
+            self.settle_run_launch_panels(&launches, run.child_id.as_deref(), &TaskRetirementEnding::Cleaned);
+        }
+        for run in cleaned_runs {
+            self.task_retirements.push(TaskRetirement {
+                task: BackgroundTask {
+                    tool: ToolIdentity {
+                        name: "subagent".to_string(),
+                        call_id: run.ending_key().to_string(),
+                    },
+                    shell_id: None,
+                    child_id: run.child_id.clone(),
+                    started_at: run.started_at,
+                },
+                ending: TaskRetirementEnding::Cleaned,
+                finished_at: Some(now_ms),
+                label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
+            });
+        }
         self.unconfirmed_tasks
             .retain(|id| !clearing.contains(id.as_str()));
     }
@@ -463,6 +484,23 @@ impl SessionTranscript {
     /// start counts as inside (ADR-0108 accepts that ambiguity).
     fn run_in_turn(run: &AgentRun, cutoff: Option<i64>) -> bool {
         run.is_live() || cutoff.is_none_or(|cut| run.started_at.is_none_or(|start| start >= cut))
+    }
+
+    /// Whether a live run has outlived the in-flight window with its child
+    /// evidence still not concluded: no machine can end it (a child that died
+    /// before its first turn answers `Unfinished` forever), so the Cleanup
+    /// click is its exit.
+    pub fn live_run_stale(&self, key: &str, now_ms: i64) -> bool {
+        self.runs.iter().any(|run| {
+            // A launch dates the child; a run first seen by an address/report
+            // has only the observation clock — but it still ages.
+            run.is_live()
+                && run.ids().any(|id| id == key)
+                && run
+                    .started_at
+                    .or(run.observed_at)
+                    .is_some_and(|at| now_ms.saturating_sub(at) > IN_FLIGHT_STALE_AFTER_MS)
+        })
     }
 
     /// Whether the read carries an exit nothing else can produce: a run with no
@@ -3772,6 +3810,73 @@ mod tests {
             transcript.settle_with(Some(&anchor), true),
             TurnSettle::Complete,
             "the cleanup is the task's own exit"
+        );
+    }
+
+    /// Cleaning a run settles its launch panel too: the panel must not keep
+    /// reading `Running` beside the 🧹 entry (ADR-0108 §10), and a shared
+    /// launch with a live sibling keeps the panel running.
+    #[test]
+    fn a_cleanup_settles_the_runs_launch_panel() {
+        let launch = |runs: &[&str]| {
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_spawn".into(),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(1_100),
+                detail: ToolDetail::Delegation {
+                    runs: runs
+                        .iter()
+                        .map(|run| AgentRunRef {
+                            run_id: (*run).into(),
+                            status: None,
+                        })
+                        .collect(),
+                    effect: DelegationEffect::Launch,
+                },
+                ..ToolCall::default()
+            })
+        };
+        let status = |transcript: &SessionTranscript| {
+            transcript
+                .messages
+                .iter()
+                .flat_map(|message| &message.parts)
+                .find_map(|part| match part {
+                    Part::Tool(call) if call.identity.call_id == "call_spawn" => Some(call.status.clone()),
+                    _ => None,
+                })
+                .expect("the launch call")
+        };
+        let transcript_at = |runs: &[&str]| {
+            SessionTranscript::new(vec![message(
+                "msg_a1",
+                MessageRole::Assistant,
+                Some(MessageTime {
+                    created: 1_100,
+                    completed: None,
+                }),
+                vec![launch(runs)],
+            )])
+        };
+
+        // The only child is cleaned: the panel settles with it.
+        let mut transcript = transcript_at(&["ses_child"]);
+        transcript.unconfirmed_tasks.insert("ses_child".into());
+        transcript.apply_cleanup(&["ses_child".to_string()], 2_000);
+        assert!(transcript.runs.is_empty());
+        assert_eq!(status(&transcript), ToolStatus::Completed);
+
+        // A shared launch keeps reading live while its sibling still runs.
+        let mut shared = transcript_at(&["ses_a", "ses_b"]);
+        shared.unconfirmed_tasks.insert("ses_a".into());
+        shared.apply_cleanup(&["ses_a".to_string()], 2_000);
+        assert_eq!(
+            status(&shared),
+            ToolStatus::Running,
+            "the sibling keeps the panel live"
         );
     }
 

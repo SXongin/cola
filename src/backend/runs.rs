@@ -175,6 +175,12 @@ fn derive_runs_read(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
                 for (run_id, _) in names {
                     let run = resolve_or_create(&mut runs, run_id, call);
                     fill_child(run, run_id);
+                    // An address states nothing about the child's life, but its
+                    // own clock is the first observation: a run with no launch
+                    // clock still ages toward the stale-cleanup exit.
+                    if run.observed_at.is_none() {
+                        run.observed_at = call.started_at;
+                    }
                     push_relation(&mut run.addressed_by, call);
                 }
             }

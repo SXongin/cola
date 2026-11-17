@@ -2570,7 +2570,7 @@ async fn a_child_only_run_retires_on_its_childs_terminal_evidence() {
     );
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&yielded).contains(&format!("⏳ {LEDGER_TITLE}（1）"))
+        card_text(&yielded).contains(&format!("⏳ {LEDGER_TITLE}（1 · 1 待确认）"))
             && card_text(&yielded).contains(TOOL_SUBAGENT),
         "the child-only run has its own ledger row: {yielded}"
     );
@@ -2890,8 +2890,8 @@ async fn a_multi_launch_retires_each_child_on_its_own_ending() {
     );
     let yielded = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&yielded).contains("⏳ 后台任务（2）"),
-        "both children are live runs: {yielded}"
+        card_text(&yielded).contains("⏳ 后台任务（2 · 2 待确认）"),
+        "both children are live runs (and, with the fixture's old clock, stale for cleanup): {yielded}"
     );
 
     // A's child thread ended; B's is still in progress.
@@ -2918,8 +2918,8 @@ async fn a_multi_launch_retires_each_child_on_its_own_ending() {
 
     let mid = platform.updated_cards().await.last().cloned().unwrap();
     assert!(
-        card_text(&mid).contains("⏳ 后台任务（1）"),
-        "B keeps its row while A's entry renders: {mid}"
+        card_text(&mid).contains("⏳ 后台任务（1 · 1 待确认）"),
+        "B keeps its row (stale for cleanup in this old-clock fixture) while A's entry renders: {mid}"
     );
     assert_eq!(
         card_text(&mid).matches("🔔 subagent 结束").count(),
