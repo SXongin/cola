@@ -529,10 +529,10 @@ failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict. The local pair and the gate
 rehearsal keep their no-round-cap rule, and non-blocking findings are answered
 or deferred, not fixed. The PR body carries the record — the rounds spent and
-the deferred findings — written when the PR opens and updated once after the
-loop has ended; that update's `edited` run is not a budget round, and it is
-never made while a fix is being prepared or after a handover FAIL without the
-user's direction.
+the deferred findings — written when the PR opens and updated once at the end.
+The update is not a fix round: after a PASS it re-reviews the approved head but
+cannot revoke that approval; after a handover it waits for the user's direction
+and is made inside the round they approve.
 
 The two axes and the adversarial pass are unchanged; the amendment adds a
 severity policy to the rubric. What this ADR pins is otherwise untouched: the
