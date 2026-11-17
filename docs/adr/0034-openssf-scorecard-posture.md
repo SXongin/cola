@@ -500,27 +500,31 @@ cannot occur is itself a non-blocking finding. The gate reports at most 3
 blocking and 5 non-blocking findings in full, with security and data loss exempt
 and marked `critical`, and lists any held-back blocking findings as one-line
 stubs (`file:line` and one clause) so the cap loses no blocking finding. The
-completeness rule narrows to "the diff or metadata cannot be read, or a claimed
-acceptance criterion cannot be checked": a missing tool no longer fails the
-review, and the existing host-tree exemption stands.
+completeness rule keeps "a missing or failed part of the review is a blocking
+finding" and defines the parts as reading the diff and the PR metadata and
+checking each claimed acceptance criterion: an unreadable diff or an uncheckable
+criterion fails the review, an absent optional tool does not, and the existing
+host-tree exemption stands.
 
 `CONTRIBUTING.md` ("Reviewing"), `docs/agents/flow.md` and `/implement-spec`
-carry the **three-round gate budget**: round 1 discovers, rounds 2–3 are
-remediation rounds (the gate still reads the whole diff — it has no round
-history); when round 3 still raises blocking findings, they are fixed in one
-push that needs the user's explicit approval. Only non-blocking, pre-existing
-and out-of-scope findings may be deferred, into a follow-up issue and the PR's
-deferred list; a blocking finding is never deferred. If the gate still FAILs
-after that round, the agent stops and hands the PR to the user: further rounds
-need their approval, and the admin bypass or closing the PR is theirs to decide.
-The budget counts every gate run that posts a review — a non-draft push, the
+carry the **three-round gate budget**: round 1 discovers; rounds 2–3 verify the
+remediation and the paths it directly touches, with the author assembling the
+fix and the gate re-reading the whole diff (it has no round history); when round
+3 still raises blocking findings, they are fixed in one push that needs the
+user's explicit approval. Only non-blocking, pre-existing and out-of-scope
+findings may be deferred, into a follow-up issue and the PR's deferred list; a
+blocking finding is never deferred. If the gate still FAILs after that round,
+the agent stops and hands the PR to the user: further rounds need their
+approval, and the admin bypass or closing the PR is theirs to decide. The budget
+counts every gate run that posts a review — a non-draft push, the
 `ready_for_review` flip that spends a draft's first review, or an `edited` body
 re-run; a run that fails before the model (an unfetchable reference, a credential
 failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict. The local pair and the gate
 rehearsal keep their no-round-cap rule, and non-blocking findings are answered
-or deferred, not fixed. The PR body records the deferred findings and the rounds
-spent.
+or deferred, not fixed. The PR body records the rounds spent and the deferred
+findings once the loop has ended, so the bookkeeping edit cannot spend the
+verification round.
 
 The two axes and the adversarial pass are unchanged; the amendment adds a
 severity policy to the rubric. What this ADR pins is otherwise untouched: the

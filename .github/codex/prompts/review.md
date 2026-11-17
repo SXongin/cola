@@ -71,11 +71,13 @@ limits and is marked `critical`; it blocks.
   enforces (fmt, clippy).
 - Blocking findings first, then `Backlog (non-blocking)`; no summary of what the
   diff does. Keep the review under ~800 words.
-- The review is incomplete only when the diff or the PR metadata cannot be read,
-  or a claimed acceptance criterion cannot be checked — that is a blocking
-  finding. A missing tool does not make the review incomplete: verify against
-  the diff's tests, fixtures and the quoted issue text instead; if that leaves a
-  candidate blocking finding unattributed, the rule above makes it block.
+- A missing or failed part of the review is a blocking finding. The review's
+  parts are reading the diff and the PR metadata and checking each claimed
+  acceptance criterion; if one cannot be completed, the review is incomplete. An
+  absent tool that the review does not require is not a missing part: verify
+  against the diff's tests, fixtures and the quoted issue text instead, and if
+  that leaves a candidate blocking finding unattributed, the rule above makes it
+  block.
 - The host-only reference trees named in `docs/agents/references.md` (e.g.
   `/root/workspace/dev/opencode`) are absent in CI. Their absence is not a
   missing part of this review: verify wire-contract claims against the diff's
