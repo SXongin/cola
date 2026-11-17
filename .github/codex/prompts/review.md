@@ -56,8 +56,10 @@ guards.
 Report at most 3 blocking and 5 non-blocking findings in full per review, most
 consequential first. When you hold further blocking findings back, list them as
 one-line stubs — `file:line` and one clause each — so none is lost; the stubs do
-not count against the cap. A security or data-loss finding is exempt from both
-limits and is marked `critical`; it blocks.
+not count against the cap. A security or data-loss finding the diff introduces
+or makes newly reachable is exempt from both limits and is marked `critical`; it
+blocks. A pre-existing security finding is non-blocking like any other
+pre-existing defect.
 
 ## Rules
 
@@ -73,11 +75,12 @@ limits and is marked `critical`; it blocks.
   diff does. Keep the review under ~800 words.
 - A missing or failed part of the review is a blocking finding. The review's
   parts are reading the diff and the PR metadata and checking each claimed
-  acceptance criterion; if one cannot be completed, the review is incomplete. An
-  absent tool that the review does not require is not a missing part: verify
-  against the diff's tests, fixtures and the quoted issue text instead, and if
-  that leaves a candidate blocking finding unattributed, the rule above makes it
-  block.
+  acceptance criterion of the issues whose bodies are appended below — an issue
+  named only by number is not one you can check; if a part cannot be completed,
+  the review is incomplete. An absent tool that the review does not require is
+  not a missing part: verify against the diff's tests, fixtures and the quoted
+  issue text instead, and if that leaves a candidate blocking finding
+  unattributed, the rule above makes it block.
 - The host-only reference trees named in `docs/agents/references.md` (e.g.
   `/root/workspace/dev/opencode`) are absent in CI. Their absence is not a
   missing part of this review: verify wire-contract claims against the diff's
