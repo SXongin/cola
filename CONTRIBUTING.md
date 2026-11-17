@@ -447,15 +447,46 @@ PRs are skipped (their runs get no repository secrets). Release PRs
 reviewed on `main`, and the cut merges with the admin bypass. The admin bypass
 remains for emergencies; the bot can never lock the maintainer out.
 
+**Only blocking findings decide the verdict, and blocking is defined.** The
+prompt carries the definition (`.github/codex/prompts/review.md`, "What blocks
+the merge"): a concrete input, state, or timing the diff newly fails; an unmet
+acceptance criterion of a linked issue the PR claims to complete; a regression
+the PR introduces; or a silent contradiction of an accepted ADR. Pre-existing
+code, out-of-scope suggestions, naming and style, speculative edge cases, "could
+add a guard", and tests for impossible inputs are non-blocking: the gate lists
+them under `Backlog (non-blocking)` and they never decide the verdict. A change
+that adds a guard for an input that cannot occur is itself a finding. The gate
+reports at most 3 blocking and 5 non-blocking findings per review; a security or
+data-loss finding is exempt and marked `critical`.
+
 **A push is a new review round.** The approval is pinned to the reviewed
 commit and `main: review` requires the last push to be approved, so a fix, a
-rebase, or any later commit needs its own PASS. Batch the findings a round
-raised — including non-blocking ones, or answer them — rehearse the batch's gate
-locally (`implement-spec`'s "Gate rehearsal"; trusted batch text, the gate's
-own lane; or record a lane skip when that lane cannot be reproduced locally),
-and push once. Once the gate passes, push again only for a real
-finding (yours or the user's) or a required rebase, and wait for that round's
-PASS; never merge on a stale approval.
+rebase, or any later commit needs its own PASS. Batch the blocking findings a
+round raised — and answer each non-blocking one and carry it to the PR's
+deferred list rather than fixing it — rehearse the batch's gate locally
+(`implement-spec`'s "Gate rehearsal"; trusted batch text, the gate's own lane;
+or record a lane skip when that lane cannot be reproduced locally), and push
+once. Once the gate passes, push again only for a real finding (yours or the
+user's) or a required rebase, and wait for that round's PASS; never merge on a
+stale approval.
+
+**Three gate rounds, then ask.** A PR gets 3 automatic gate rounds: round 1 is
+broad discovery, rounds 2–3 are remediation rounds — push the fixes for the
+previous round's findings, and the gate re-reads the whole diff. A `critical`
+security or data-loss finding is fixed first whatever the count. When round 3
+still raises blocking findings, fix them in one batch and push once more; that
+verification round needs the user's explicit approval. Only non-blocking,
+pre-existing and out-of-scope findings may be deferred, into a follow-up issue
+and the PR's deferred list — a blocking finding is never deferred. If the gate
+still FAILs after the user-approved round, stop and hand the PR to the user with
+the remaining findings: each further gate round needs their approval, and
+merging with the admin bypass or closing the PR is theirs to decide, never the
+agent's. The budget counts pushes that change the diff — an `edited`,
+`reopened` or `ready_for_review` run is not a round — and the local pair and
+gate rehearsal still run until no blocking finding remains
+(`docs/agents/flow.md`). The PR body records the deferred findings whenever
+there are any, and the rounds spent when the budget ended the loop
+(`## Gate rounds`, `## Deferred findings`).
 
 ## Releasing
 

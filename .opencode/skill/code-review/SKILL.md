@@ -20,7 +20,7 @@ If that file is absent, take the two axes from the repo: **Standards** from `COD
 
 ## The adversarial half
 
-Run the `adversarial-review` skill over the **same base** and, when one was given, the **same pathspec**. Do not invent the rubric: that skill — or `.github/codex/prompts/review.md`'s `## The adversarial pass` and `## Rules` — is the source, and its final `CODEX_REVIEW_VERDICT` line is kept.
+Run the `adversarial-review` skill over the **same base** and, when one was given, the **same pathspec**. Do not invent the rubric: that skill — or `.github/codex/prompts/review.md`'s `## What blocks the merge`, `## The adversarial pass` and `## Rules` — is the source, and its final `CODEX_REVIEW_VERDICT` line is kept.
 
 ## Re-review round (same scope)
 
