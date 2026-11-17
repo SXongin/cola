@@ -475,7 +475,8 @@ PR's deferred list rather than fixing it — rehearse the batch's gate locally
 or record a lane skip when that lane cannot be reproduced locally), and push
 once. Once the gate passes, push again only for a real finding (yours or the
 user's) or a required rebase, and wait for that round's PASS; never merge on a
-stale approval.
+stale approval. That push is a round in the budget — past round 3 it needs the
+user's approval like any other.
 
 **Three gate rounds, then ask.** A PR gets 3 automatic gate rounds. Round 1 is
 broad discovery; rounds 2–3 verify the remediation and the paths it directly

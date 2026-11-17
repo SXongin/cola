@@ -37,9 +37,9 @@ explicitly amends is not a contradiction). Nothing else blocks. Flag only
 actionable issues introduced by this pull request: do not turn unchanged code
 into a blocking finding.
 
-Where a failure lies on a changed path and you cannot establish that it predates
-the PR, it blocks — say what you could not determine in the finding rather than
-moving it to the backlog.
+Where a failure lies on a changed path, it is blocking unless you can show the
+diff neither creates nor makes it newly reachable — say what you could not
+determine in the finding rather than moving it to the backlog.
 
 Everything else is non-blocking and is listed only under a
 `Backlog (non-blocking)` heading:
@@ -57,11 +57,11 @@ guards.
 
 Report at most 3 blocking and 5 non-blocking findings in full per review, most
 consequential first. When you hold further blocking findings back, list them as
-one-line stubs — `file:line` and one clause each — so none is lost; the stubs do
-not count against the cap. A security or data-loss finding the diff introduces
-or makes newly reachable is exempt from both limits and is marked `critical`; it
-blocks. A pre-existing security finding is non-blocking like any other
-pre-existing defect.
+one-line stubs — `file:line` and one clause each — exempt from the full finding
+shape and from the cap, so none is lost. A security or data-loss finding the diff
+introduces or makes newly reachable is exempt from both limits and is marked
+`critical`; it blocks. A pre-existing security finding is non-blocking like any
+other pre-existing defect.
 
 ## Rules
 
@@ -69,11 +69,12 @@ pre-existing defect.
   `git show`, `git log`, `git grep`, and plain file reads. Do not post reviews,
   comments, or labels yourself.
 - Every finding: file:line, the failing scenario, severity (blocking /
-  non-blocking / critical). A blocking finding must be tied to a changed line; a
-  newly reachable defect ties to the changed line that creates the state, not to
-  the failing one. A backlog entry for a pre-existing defect names the line it
-  sits on, changed or not. Leave out anything else with no such line. Skip
-  anything tooling enforces (fmt, clippy).
+  non-blocking / critical). A blocking finding must be tied to a changed line; an
+  unmet acceptance criterion or a missing part of the review names the issue line
+  or the missing input instead. A newly reachable defect ties to the changed line
+  that creates the state, not to the failing one. A backlog entry for a
+  pre-existing defect names the line it sits on, changed or not. Leave out
+  anything else with no such line. Skip anything tooling enforces (fmt, clippy).
 - Blocking findings first, then `Backlog (non-blocking)`; no summary of what the
   diff does. Keep the review under ~800 words.
 - A missing or failed part of the review is a blocking finding. The review's
