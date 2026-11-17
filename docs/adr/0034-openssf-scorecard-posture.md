@@ -1,7 +1,7 @@
 # OpenSSF Scorecard: fix what is cheap and real, record the rest as deliberate no-s
 
-> **Amended (2026-11-17)**: the Codex gate has a blocking definition and a
-> three-round budget — see the amendment at the end.
+> **Amended (2026-11-17)**: the Codex gate's blocking definition, finding cap
+> and three-round budget — see the amendment at the end.
 
 The repository runs OpenSSF Scorecard (weekly workflow, published results, README
 badge) and scored 6/10. The aggregate is a **risk-weighted** average
@@ -497,8 +497,9 @@ out-of-scope suggestions, naming and style, speculative edge cases, "could add a
 guard", and tests for impossible inputs are non-blocking, listed under `Backlog
 (non-blocking)`, and never decide the verdict. Adding a guard for an input that
 cannot occur is itself a non-blocking finding. The gate reports at most 3
-blocking and 5 non-blocking findings, with security and data loss exempt and
-marked `critical`, and names how many blocking findings the cap held back. The
+blocking and 5 non-blocking findings in full, with security and data loss exempt
+and marked `critical`, and lists any held-back blocking findings as one-line
+stubs (`file:line` and one clause) so the cap loses no blocking finding. The
 completeness rule narrows to "the diff or metadata cannot be read, or a claimed
 acceptance criterion cannot be checked": a missing tool no longer fails the
 review, and the existing host-tree exemption stands.
@@ -512,12 +513,14 @@ and out-of-scope findings may be deferred, into a follow-up issue and the PR's
 deferred list; a blocking finding is never deferred. If the gate still FAILs
 after that round, the agent stops and hands the PR to the user: further rounds
 need their approval, and the admin bypass or closing the PR is theirs to decide.
-The budget counts gate runs on a diff the gate has not reviewed before — a push,
-and the `ready_for_review` flip that spends a draft's first review; an `edited`
-or `reopened` re-run of the same head is not a round — while the local pair and
-the gate rehearsal keep their no-round-cap rule, and non-blocking findings are
-answered or deferred, not fixed. The PR body records the deferred findings and
-the rounds spent.
+The budget counts every gate run that posts a review — a non-draft push, the
+`ready_for_review` flip that spends a draft's first review, or an `edited` body
+re-run; a run that fails before the model (an unfetchable reference, a credential
+failure) posts none and is not a round, and the agent never re-runs the gate on
+an unchanged head to fish for a different verdict. The local pair and the gate
+rehearsal keep their no-round-cap rule, and non-blocking findings are answered
+or deferred, not fixed. The PR body records the deferred findings and the rounds
+spent.
 
 The two axes and the adversarial pass are unchanged; the amendment adds a
 severity policy to the rubric. What this ADR pins is otherwise untouched: the

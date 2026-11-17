@@ -459,16 +459,15 @@ speculative edge cases, "could add a guard", and tests for impossible inputs are
 non-blocking: the gate lists them under `Backlog (non-blocking)` and they never
 decide the verdict. A change that adds a guard for an input that cannot occur is
 itself a non-blocking finding. The gate reports at most 3 blocking and 5
-non-blocking findings per review, names how many blocking findings the cap held
-back, and exempts security or data-loss findings, marking them `critical`. A
-held-back blocking finding is surfaced by the next round — the cap never turns
-it into a PASS.
+non-blocking findings in full per review, lists any held-back blocking findings
+as one-line stubs (`file:line` and one clause), and exempts security or
+data-loss findings, marking them `critical`.
 
-**A push is a new review round.** The approval is pinned to the reviewed
-commit and `main: review` requires the last push to be approved, so a fix, a
-rebase, or any later commit needs its own PASS. Batch the blocking findings a
-round raised — and answer each non-blocking one and carry it to the PR's
-deferred list rather than fixing it — rehearse the batch's gate locally
+**A push the gate reviews is a new review round.** The approval is pinned to
+the reviewed commit and `main: review` requires the last push to be approved,
+so a fix, a rebase, or any later commit needs its own PASS. Batch the blocking
+findings a round raised — and answer each non-blocking one and carry it to the
+PR's deferred list rather than fixing it — rehearse the batch's gate locally
 (`implement-spec`'s "Gate rehearsal"; trusted batch text, the gate's own lane;
 or record a lane skip when that lane cannot be reproduced locally), and push
 once. Once the gate passes, push again only for a real finding (yours or the
@@ -486,12 +485,15 @@ and the PR's deferred list — a blocking finding is never deferred. If the gate
 still FAILs after the user-approved round, stop and hand the PR to the user with
 the remaining findings: each further gate round needs their approval, and
 merging with the admin bypass or closing the PR is theirs to decide, never the
-agent's. The budget counts gate runs on a diff the gate has not reviewed before
-— a push, and the `ready_for_review` flip that spends a draft's first review; an
-`edited` body re-run or a `reopened` re-run of the same head is not a round —
-and the local pair and gate rehearsal still run until no blocking finding
-remains (`docs/agents/flow.md`). The PR body records the deferred findings
-whenever there are any, and the rounds spent when the budget ended the loop
+agent's. The budget counts every gate run that posts a review — a non-draft
+push, the `ready_for_review` flip that spends a draft's first review, or an
+`edited` body re-run. A run that fails before the model (an unfetchable
+reference, a credential failure) posts none and is not a round. The agent never
+re-runs the gate on an unchanged head to fish for a different verdict. The local
+pair and gate rehearsal still run until no blocking finding remains
+(`docs/agents/flow.md`). Write the PR body's record before the final push, so
+the bookkeeping edit does not spend a round: the deferred findings whenever
+there are any, and the rounds spent when the budget ended the loop
 (`## Gate rounds`, `## Deferred findings`).
 
 ## Releasing

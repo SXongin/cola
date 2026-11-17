@@ -53,10 +53,11 @@ If a change adds a guard, branch, or test for an input that cannot occur, that
 over-engineering is itself a non-blocking finding: report it, never ask for more
 guards.
 
-Report at most 3 blocking and 5 non-blocking findings per review, most
-consequential first; when you hold further blocking findings back, say how many.
-A security or data-loss finding is exempt from both limits and is marked
-`critical`; it blocks.
+Report at most 3 blocking and 5 non-blocking findings in full per review, most
+consequential first. When you hold further blocking findings back, list them as
+one-line stubs — `file:line` and one clause each — so none is lost; the stubs do
+not count against the cap. A security or data-loss finding is exempt from both
+limits and is marked `critical`; it blocks.
 
 ## Rules
 
