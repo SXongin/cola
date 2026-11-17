@@ -48,12 +48,15 @@ Rejecting same-second evidence would reject a fresh child's first turn, which
 starts with its spawn.
 
 **6. A terminal run's evidence wait is scoped to its own Turn.** The evidence
-read and the settle decision share one cutoff: the newest user message's server
-time. A terminal child-bearing run dated before it is history — no read fetches
-its evidence any more, so it must not keep a later Turn waiting on an ending
-that can never arrive. A run with no start cannot be placed in any Turn, so it
-is never history: it keeps owing its read (otherwise its ending would be
-dropped). A live run blocks regardless: its exit is still owed.
+read and the settle decision share one cutoff: the current Turn's own anchor —
+the card's — because a Supplement is a user message but not a new Turn
+(ADR-0043). Only a caller with no Turn at all (a Session Card read) falls back
+to the newest user message. A terminal child-bearing run dated before the anchor
+is history — no read fetches its evidence any more, so it must not keep a later
+Turn waiting on an ending that can never arrive. A run with no start cannot be
+placed in any Turn, so it is never history: it keeps owing its read (otherwise
+its ending would be dropped). A live run blocks regardless: its exit is still
+owed.
 
 **7. A childless run's only exit is a Cleanup.** The call-keyed run a report
 creates has no child transcript, so no evidence read can end it and no Turn
@@ -77,6 +80,15 @@ row and attach therefore use the child id — the only session identity — and 
 run that has not learned one (an id-less report the ledger already renders as
 ⚠️) shows no `/sub` row. `run_id` remains the run's stable identity in the read
 model, the ledger and the completion entry.
+
+**10. A launch call's status is derived from the runs it launched.** ADR-0105
+§1 and §6 say a call's status is unchanged and nothing else moves; the card
+model needs the launch panel — the record of the request — to settle with its
+children, so the read derives a launch call's status once every run sharing it
+is terminal (failure outranks cancellation, then complete), and a child's
+evidence ending settles it too. A failure the CLIENT stated on the call itself
+stays: it is a fact about the request, not a run state a later report can
+overwrite. Identity, input, metadata and output are untouched.
 
 ## Consequences
 

@@ -78,8 +78,7 @@ and the exact row are spec #1057's.
 
 **5. Existing per-subsystem methods fold into the read.**
 `background_tasks_supported` and its siblings are not a second source of truth.
-`background_tasks_supported` delegates to `background_runs`; the live-run
-ledger
+`background_tasks_supported` delegates to `background_runs`; the live-run ledger
 and the **runtime reconciliation's early return** gate on `reports_live_runs()`,
 so a child-only Agent Client still gets its verdict. The rest are thin
 delegations, removed when no caller remains. Landing this ADR changes no rendering by itself.

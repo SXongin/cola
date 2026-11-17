@@ -465,20 +465,34 @@ impl SessionTranscript {
         run.is_live() || cutoff.is_none_or(|cut| run.started_at.is_none_or(|start| start >= cut))
     }
 
-    /// Whether the read carries a run with no child id — the call-keyed run a
-    /// report created (spec #1057). It has no child transcript to read, so the
-    /// runtime reconcile must run even when nothing is live: the Cleanup it
-    /// marks is this run's only exit.
-    pub fn has_childless_run(&self) -> bool {
+    /// Whether the read carries an exit nothing else can produce: a run with no
+    /// child id (the call-keyed run a report created, spec #1057) or a
+    /// Background Task with neither a shell nor a child id. Neither has a
+    /// transcript to read and no Wake can name it, so the runtime reconcile
+    /// must run even when nothing is live — the Cleanup it marks is the only
+    /// exit.
+    pub fn needs_cleanup_marking(&self) -> bool {
         self.runs.iter().any(|run| run.child_id.is_none())
+            || self
+                .background_tasks
+                .iter()
+                .any(|task| task.shell_id.is_none() && task.child_id.is_none())
     }
 
-    /// Mark every childless run for the Cleanup exit: with no child there is no
-    /// evidence read that can end it, so the ⚠️ row and its button are the only
-    /// way the run — and the Turn waiting on it — can end.
-    pub fn mark_childless_runs_unconfirmed(&mut self) {
+    /// Mark every childless run and identity-less task for the Cleanup exit:
+    /// with no child there is no evidence read that can end it, so the ⚠️ row
+    /// and its button are the only way the run/task — and the Turn waiting on
+    /// it — can end.
+    pub fn mark_cleanup_exits(&mut self) {
         for run in self.runs.iter().filter(|run| run.child_id.is_none()) {
             self.unconfirmed_tasks.insert(run.ending_key().to_string());
+        }
+        for task in self
+            .background_tasks
+            .iter()
+            .filter(|task| task.shell_id.is_none() && task.child_id.is_none())
+        {
+            self.unconfirmed_tasks.insert(task.tool.call_id.clone());
         }
     }
 
@@ -502,7 +516,7 @@ impl SessionTranscript {
     /// one of them has an ending, with a failure outranking a cancellation or a
     /// complete (`derive_runs`). A sibling still in `runs` keeps the panel live:
     /// evidence retires one child at a time.
-    fn settle_run_launch_panels(
+    pub(crate) fn settle_run_launch_panels(
         &mut self,
         call_ids: &[String],
         retiring_child: Option<&str>,
@@ -546,6 +560,15 @@ impl SessionTranscript {
                 cancelled |= matches!(retirement.ending, TaskRetirementEnding::ClientCancelled);
                 continue;
             }
+            // A sibling that retired in an EARLIER read is pruned from `runs`
+            // by the liveness overlay, and the durable evidence ending keeps no
+            // client word. Its newest report/launch is still in the read's
+            // messages, so the client's own statement survives the prune.
+            if let Some(status) = self.reported_child_status(&child) {
+                failed |= status == RunStatus::Failed;
+                cancelled |= status == RunStatus::Cancelled;
+                continue;
+            }
             if let Some(status) = self.launch_child_status(call_id, &child) {
                 failed |= status == RunStatus::Failed;
                 cancelled |= status == RunStatus::Cancelled;
@@ -558,6 +581,51 @@ impl SessionTranscript {
         } else {
             ToolStatus::Completed
         }
+    }
+
+    /// The newest client statement about `child` still in this read, from its
+    /// own report or launch call (an address states nothing about its life).
+    /// The fold applies reports in read order and refuses an older clock, so
+    /// the same rule picks the winner here; a terminal statement needs a
+    /// clock at or after the held one to win.
+    fn reported_child_status(&self, child: &str) -> Option<RunStatus> {
+        let mut newest: Option<(Option<i64>, RunStatus)> = None;
+        for call in self
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                Part::Tool(call) => Some(call),
+                _ => None,
+            })
+        {
+            let ToolDetail::Delegation { runs, effect } = &call.detail else {
+                continue;
+            };
+            if matches!(effect, DelegationEffect::Address) {
+                continue;
+            }
+            let Some(reference) = runs.iter().find(|run| run.run_id == child) else {
+                continue;
+            };
+            let status = reference
+                .status
+                .unwrap_or_else(|| crate::backend::runs::status_of(call));
+            let at = call.started_at;
+            let wins = match (newest.as_ref(), at) {
+                (None, _) => true,
+                (Some((Some(held), _)), Some(at)) => at >= *held,
+                // A clockless fact cannot prove it is newer: it only fills a
+                // record that has no clock yet.
+                (Some((None, _)), None) => true,
+                (Some((Some(_), _)), None) => false,
+                (Some((None, _)), Some(_)) => true,
+            };
+            if wins {
+                newest = Some((at, status));
+            }
+        }
+        newest.map(|(_, status)| status)
     }
 
     /// The child ids a launch call named, from its own delegation detail.
@@ -644,7 +712,12 @@ impl SessionTranscript {
                 started_at,
             } => {
                 let turn_start = started_at.unwrap_or(completed_at);
-                if self.runs[index].started_at.is_some_and(|started| {
+                // The newest fact about the run orders the evidence: a resume
+                // (`sendInput`/`resumeAgent`) or a later report moves
+                // `observed_at` past the launch, so an older generation's
+                // terminal item must not end the live generation.
+                let boundary = self.runs[index].started_at.max(self.runs[index].observed_at);
+                if boundary.is_some_and(|started| {
                     // The turn start is the ordering fact. A strictly earlier
                     // second is a previous turn; a same-second start is
                     // genuinely ambiguous (a normal first turn starts with its
@@ -664,7 +737,8 @@ impl SessionTranscript {
                         completed_at,
                         turn_start,
                         started_at = self.runs[index].started_at,
-                        "child evidence predates the run's start; keeping the run live"
+                        observed_at = self.runs[index].observed_at,
+                        "child evidence predates the run's newest fact; keeping the run live"
                     );
                     return false;
                 }
@@ -3411,7 +3485,7 @@ mod tests {
                 TurnSettle::Waiting,
                 "a childless run has no read to end it: only a Cleanup can"
             );
-            transcript.mark_childless_runs_unconfirmed();
+            transcript.mark_cleanup_exits();
             assert!(
                 transcript.unconfirmed_tasks.contains("call_activity"),
                 "the ⚠️ row and its button are the wait's affordance"
@@ -3543,6 +3617,93 @@ mod tests {
         );
     }
 
+    /// A sibling that retired in an EARLIER read is pruned from `runs` by the
+    /// liveness overlay, and the durable evidence ending carries no client
+    /// word. Its report is still in the read's messages, so the shared launch
+    /// must still settle on the failure once the last sibling ends.
+    #[test]
+    fn a_pruned_siblings_report_still_fails_the_shared_launch() {
+        let launch = || {
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "task".into(),
+                    call_id: "call_spawn".into(),
+                },
+                status: ToolStatus::Running,
+                started_at: Some(1_100),
+                detail: ToolDetail::Delegation {
+                    runs: vec![
+                        AgentRunRef {
+                            run_id: "thread_a".into(),
+                            status: None,
+                        },
+                        AgentRunRef {
+                            run_id: "thread_b".into(),
+                            status: None,
+                        },
+                    ],
+                    effect: DelegationEffect::Launch,
+                },
+                ..ToolCall::default()
+            })
+        };
+        let report = || {
+            Part::Tool(ToolCall {
+                identity: ToolIdentity {
+                    name: "codex/sub_agent_activity".into(),
+                    call_id: "call_activity_a".into(),
+                },
+                status: ToolStatus::Error,
+                started_at: Some(2_000),
+                input: Some(serde_json::json!({"kind": "failed"})),
+                detail: ToolDetail::Delegation {
+                    runs: vec![AgentRunRef {
+                        run_id: "thread_a".into(),
+                        status: None,
+                    }],
+                    effect: DelegationEffect::Report,
+                },
+                ..ToolCall::default()
+            })
+        };
+        // The later read: A's run was pruned by the liveness overlay (its
+        // durable ending exists); its report is still in the transcript.
+        let mut transcript = SessionTranscript::new(vec![message(
+            "msg_a1",
+            MessageRole::Assistant,
+            Some(MessageTime {
+                created: 1_100,
+                completed: None,
+            }),
+            vec![launch(), report()],
+        )]);
+        transcript
+            .runs
+            .retain(|run| run.child_id.as_deref() != Some("thread_a"));
+        assert_eq!(transcript.runs.len(), 1, "only B is left in the live list");
+        assert!(transcript.apply_run_child_evidence(
+            "thread_b",
+            ChildEvidence::Terminal {
+                completed_at: 3_000,
+                started_at: None
+            }
+        ));
+        let status = transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == "call_spawn" => Some(call.status.clone()),
+                _ => None,
+            })
+            .expect("the launch call");
+        assert_eq!(
+            status,
+            ToolStatus::Error,
+            "A's report still outranks B's completion"
+        );
+    }
+
     /// A Supplement is a user message, not a new Turn (ADR-0043): a terminal
     /// run launched before it still owes its evidence inside the SAME Turn, so
     /// the Turn's own anchor — never the newest user message — is the cutoff.
@@ -3575,6 +3736,42 @@ mod tests {
             transcript.settle_with(Some(&anchor), true),
             TurnSettle::Waiting,
             "the run still owes the Turn its evidence"
+        );
+    }
+
+    /// A Background Task with neither a shell nor a child id has no transcript
+    /// to read and no Wake that can name it: the Cleanup is its only exit, and
+    /// it must not leave the Turn waiting without a button.
+    #[test]
+    fn an_identityless_task_waits_for_its_cleanup() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let mut transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![BackgroundTask {
+                tool: ToolIdentity {
+                    name: "subagent".into(),
+                    call_id: "call_sub".into(),
+                },
+                shell_id: None,
+                child_id: None,
+                started_at: Some(1_100),
+            }]);
+        assert!(transcript.needs_cleanup_marking());
+        assert_eq!(transcript.settle_with(Some(&anchor), true), TurnSettle::Waiting);
+        transcript.mark_cleanup_exits();
+        assert!(
+            transcript.unconfirmed_tasks.contains("call_sub"),
+            "the ⚠️ row and its button are the wait's affordance"
+        );
+        transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "the click retires the task"
+        );
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), true),
+            TurnSettle::Complete,
+            "the cleanup is the task's own exit"
         );
     }
 
