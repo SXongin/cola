@@ -485,9 +485,10 @@ diff. A `critical` security or data-loss finding the diff introduces or makes
 newly reachable is fixed and pushed first, without waiting for the fourth-round
 approval — the one exception to that approval rule. When round 3 still raises
 other blocking findings, fix them in one batch and push once more; that
-verification round needs the user's explicit approval. Only non-blocking,
-pre-existing and out-of-scope findings may be deferred, into the PR's dossier —
-a blocking finding is never deferred. Whenever the loop ends — green or handed
+verification round needs the user's explicit approval. Only non-blocking and
+out-of-scope findings, and pre-existing defects the diff neither creates nor
+makes newly reachable, may be deferred, into the PR's dossier — a blocking
+finding is never deferred. Whenever the loop ends — green or handed
 over — a non-empty deferred list becomes a follow-up issue linked from the
 dossier, a round-3 PASS included. If the gate still FAILs after the user-approved
 round, stop and hand the PR to the user with the remaining findings: each further
