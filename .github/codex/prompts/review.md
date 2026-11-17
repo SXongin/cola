@@ -81,6 +81,9 @@ pre-existing defect.
   not a missing part: verify against the diff's tests, fixtures and the quoted
   issue text instead, and if that leaves a candidate blocking finding
   unattributed, the rule above makes it block.
+- An acceptance criterion the linked issue itself defers to later work is
+  satisfied by recording the deferral under `## Deferred findings` in the PR
+  body; it is not an uncheckable criterion.
 - The host-only reference trees named in `docs/agents/references.md` (e.g.
   `/root/workspace/dev/opencode`) are absent in CI. Their absence is not a
   missing part of this review: verify wire-contract claims against the diff's

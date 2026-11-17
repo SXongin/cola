@@ -38,7 +38,7 @@ All of it runs under the `CONTRIBUTING.md` branch loop: start on `main`, branch,
 - `## What` opens with the smallest visual — a diff sketch, tree, sequence diagram, or pseudocode — then the paragraph.
 - `## How tested` reads as **Before:** → **After:** — failing → passing test, old log → new log, card screenshots for visual changes — ahead of the verification-loop commands.
 - Add `## Merge Danger` only when the change is non-trivial: **Door** (two-way, or one-way naming what reversal would cost) and **Blast Radius**. A one-way door is where an ADR is due.
-- Add `## Gate rounds` and `## Deferred findings` once the gate loop has ended (`CONTRIBUTING.md` "Reviewing") — the rounds spent and the findings carried to the follow-up issue.
+- Add `## Gate rounds` and `## Deferred findings` when the PR opens (`CONTRIBUTING.md` "Reviewing") — the rounds spent so far and anything deferred; update them only when a round changes them, and an update is a round like any other.
 
 ## On-ramps
 
