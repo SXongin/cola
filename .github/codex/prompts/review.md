@@ -67,10 +67,11 @@ pre-existing defect.
   `git show`, `git log`, `git grep`, and plain file reads. Do not post reviews,
   comments, or labels yourself.
 - Every finding: file:line, the failing scenario, severity (blocking /
-  non-blocking / critical). A finding must be tied to a changed line; a newly
-  reachable defect ties to the changed line that creates the state, not to the
-  failing one. If it has no such line, leave it out. Skip anything tooling
-  enforces (fmt, clippy).
+  non-blocking / critical). A blocking finding must be tied to a changed line; a
+  newly reachable defect ties to the changed line that creates the state, not to
+  the failing one. A backlog entry for a pre-existing defect names the line it
+  sits on, changed or not. Leave out anything else with no such line. Skip
+  anything tooling enforces (fmt, clippy).
 - Blocking findings first, then `Backlog (non-blocking)`; no summary of what the
   diff does. Keep the review under ~800 words.
 - A missing or failed part of the review is a blocking finding. The review's
