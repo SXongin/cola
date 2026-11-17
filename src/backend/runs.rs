@@ -51,13 +51,27 @@ pub(crate) fn derive_runs(messages: &mut [TranscriptMessage]) -> Vec<AgentRun> {
             .filter(|run| run.launched_by.iter().any(|launch| launch.call_id == launch_id))
             .collect();
         // One launch may name N children: it settles only when every one of
-        // them is terminal, and a failure outranks a cancellation/complete.
+        // them is terminal, and a failure outranks a cancellation/complete. The
+        // launch CALL's own status is a client fact too: a call the client
+        // reported failed stays failed even if a later report completes the
+        // child (ADR-0108 §10 records the derivation).
         if group.is_empty() || !group.iter().all(|run| run.status.is_terminal()) {
             continue;
         }
-        let status = if group.iter().any(|run| run.status == RunStatus::Failed) {
+        let client_status = messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == launch_id => Some(call.status.clone()),
+                _ => None,
+            });
+        let failed = group.iter().any(|run| run.status == RunStatus::Failed)
+            || matches!(client_status, Some(ToolStatus::Error));
+        let cancelled = group.iter().any(|run| run.status == RunStatus::Cancelled)
+            || matches!(&client_status, Some(ToolStatus::Other(reason)) if reason == "interrupted");
+        let status = if failed {
             ToolStatus::Error
-        } else if group.iter().any(|run| run.status == RunStatus::Cancelled) {
+        } else if cancelled {
             ToolStatus::Other("interrupted".to_string())
         } else {
             ToolStatus::Completed
@@ -414,7 +428,7 @@ fn apply_report(run: &mut AgentRun, call: &ToolCall) {
 /// foreground `task` returns only when its child ends, and a resumed task that
 /// settled is a finished child. A client whose launch is only a handle states
 /// the child's later state through a `subAgentActivity` report.
-fn status_of(call: &ToolCall) -> RunStatus {
+pub(crate) fn status_of(call: &ToolCall) -> RunStatus {
     match &call.status {
         ToolStatus::Error => RunStatus::Failed,
         ToolStatus::Other(reason) if reason == "interrupted" => RunStatus::Cancelled,
@@ -682,8 +696,11 @@ mod tests {
         }])
     }
 
-    /// A terminal report settles the launch panel with its run: the record of
-    /// the request must not read `Running` beside a finished run.
+    /// A report is an update to its run, and the launch panel is the record of
+    /// the request: once the client reports the run ended, the panel settles
+    /// with it rather than reading `Running` beside a finished run. A failure
+    /// the CLIENT reported on the call itself stays: it is a fact about the
+    /// request, not a stale run state.
     #[test]
     fn a_terminal_report_settles_the_launch_call() {
         let launch = call(
@@ -717,6 +734,43 @@ mod tests {
             })
             .expect("the launch call");
         assert_eq!(launch_status, ToolStatus::Completed);
+    }
+
+    /// The client's failure on the launch call itself is sticky: a later report
+    /// that completes the child must not paint ✅ over the ❌ the client stated.
+    #[test]
+    fn a_client_failed_launch_keeps_its_panel() {
+        let launch = call(
+            "call_task",
+            DelegationEffect::Launch,
+            &["ses_child"],
+            ToolStatus::Error,
+            Some(10),
+        );
+        let mut report = report("call_report", "ses_child", "completed");
+        report.started_at = Some(20);
+        let read = SessionTranscript::new(vec![TranscriptMessage {
+            id: MessageId::new("msg_1"),
+            role: super::super::MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: 10,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Tool(launch), Part::Tool(report)],
+        }]);
+        assert_eq!(read.runs[0].status, RunStatus::Completed);
+        let launch_status = read.messages[0]
+            .parts
+            .iter()
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == "call_task" => Some(call.status.clone()),
+                _ => None,
+            })
+            .expect("the launch call");
+        assert_eq!(launch_status, ToolStatus::Error, "the client's ❌ stays");
     }
 
     /// A report naming no child is still a run: keyed by its own call, with no

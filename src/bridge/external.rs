@@ -388,10 +388,9 @@ impl ExternalFlow {
         // #595) — a card the supersede path collects cannot render the
         // retirement, so recording it would hide the task with no entry ever
         // rendered. A dropped pass changes nothing.
-        let pass = if CardOwnership::read(&handles.cards, &handles.waits, sid)
-            .await
-            .admits_ledger_refresh()
-        {
+        let ownership = CardOwnership::read(&handles.cards, &handles.waits, sid).await;
+        let anchor = ownership.anchor().cloned();
+        let pass = if ownership.admits_ledger_refresh() {
             handles
                 .runtime_reconcile
                 .observe(
@@ -400,7 +399,7 @@ impl ExternalFlow {
                     directory,
                     &mut transcript,
                     self.request_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    None,
+                    anchor.as_ref(),
                 )
                 .await
         } else {

@@ -512,6 +512,7 @@ impl TasksHandle {
         // any id it is known by. The run carries the durable key as
         // `task_run_id`, so the record a launchless writer minted resolves
         // here too.
+        let mut pruned_runs: Vec<crate::backend::AgentRun> = Vec::new();
         transcript.runs.retain(|run| {
             let identity = TaskRunId {
                 key: run.ending_key().to_string(),
@@ -547,8 +548,28 @@ impl TasksHandle {
                     .retired
                     .get(session_id)
                     .is_some_and(|ids| identity.ids().any(|id| ids.contains(id)));
-            !ended && !retired
+            let keep = !ended && !retired;
+            if !keep {
+                pruned_runs.push(run.clone());
+            }
+            keep
         });
+        // A run with a durable ending leaves the read before the fold that
+        // would settle its launch panel, so the panel would keep reading live
+        // beside the ledger's entry. The prune settles it (ADR-0108 §10); the
+        // newest report still in the messages supplies a failure word.
+        for run in &pruned_runs {
+            let launches: Vec<String> = run
+                .launched_by
+                .iter()
+                .map(|launch| launch.call_id.clone())
+                .collect();
+            transcript.settle_run_launch_panels(
+                &launches,
+                run.child_id.as_deref(),
+                &crate::backend::TaskRetirementEnding::ChildEnded,
+            );
+        }
         let Some(ids) = state.unconfirmed.get(session_id) else {
             return;
         };
@@ -622,7 +643,10 @@ fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{AgentRun, MessageId, RunStatus, ToolCallRef, Wake, WakeSource};
+    use crate::backend::{
+        AgentRun, MessageId, MessageTime, Part, RunStatus, ToolCall, ToolCallRef, ToolIdentity,
+        TranscriptMessage, Wake, WakeSource,
+    };
     use crate::bridge::chain::TaskRunIdentity;
 
     /// A Wake naming only the shell id it reports — the launchless shape a read
@@ -747,6 +771,73 @@ mod tests {
             records[0].run.names("call_bg") && records[0].run.names("sh_call_bg"),
             "the record carries both ids the read observed: {:?}",
             records[0].run
+        );
+    }
+
+    /// A run pruned by its durable ending settles the launch panel it came
+    /// from: the card must not finish with a live panel beside the entry.
+    #[test]
+    fn a_pruned_run_settles_its_launch_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join("chain_records.json"));
+        chains.record_ending(
+            "ses_a",
+            &TaskRunId {
+                key: "ses_child".into(),
+                call_id: Some("call_child".into()),
+                shell_id: None,
+                child_id: Some("ses_child".into()),
+                job_id: None,
+                wake_id: None,
+            },
+            TaskEnding::owed(TaskEndingClass::Evidence, TaskRunIdentity::default()),
+        );
+        let handle = TasksHandle::new();
+        handle.attach_chains(std::sync::Arc::new(chains));
+        let launch = ToolCall {
+            identity: ToolIdentity {
+                name: "spawnAgent".into(),
+                call_id: "call_spawn".into(),
+            },
+            status: crate::backend::ToolStatus::Running,
+            started_at: Some(1_000),
+            detail: crate::backend::ToolDetail::Delegation {
+                runs: vec![crate::backend::AgentRunRef {
+                    run_id: "ses_child".into(),
+                    status: None,
+                }],
+                effect: crate::backend::DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![TranscriptMessage {
+            id: MessageId::new("msg_spawn"),
+            role: crate::backend::MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: 1_000,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: vec![Part::Tool(launch)],
+        }]);
+        assert_eq!(transcript.runs.len(), 1, "the launch derives one run");
+        handle.apply("ses_a", &mut transcript);
+        assert!(transcript.runs.is_empty(), "the durable ending prunes the run");
+        let status = transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == "call_spawn" => Some(call.status.clone()),
+                _ => None,
+            })
+            .expect("the launch call");
+        assert_eq!(
+            status,
+            crate::backend::ToolStatus::Completed,
+            "the panel settles with the pruned run"
         );
     }
 

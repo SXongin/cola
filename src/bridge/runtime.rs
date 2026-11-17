@@ -168,7 +168,7 @@ impl RuntimeReconcile {
         if shells.is_empty()
             && children.is_empty()
             && transcript.run_evidence_suspects(anchor).is_empty()
-            && !transcript.has_childless_run()
+            && !transcript.needs_cleanup_marking()
         {
             return None;
         }
@@ -351,7 +351,7 @@ pub(crate) async fn reconcile_now(
     if shells.is_empty()
         && children.is_empty()
         && transcript.run_evidence_suspects(anchor).is_empty()
-        && !transcript.has_childless_run()
+        && !transcript.needs_cleanup_marking()
     {
         return None;
     }
@@ -496,7 +496,7 @@ pub(crate) async fn reconcile_now(
             // A childless run has no evidence read to conclude it: its only
             // exit is the user's Cleanup. Mark it so the ⚠️ row rides the
             // ledger and the Waiting card offers the button.
-            transcript.mark_childless_runs_unconfirmed();
+            transcript.mark_cleanup_exits();
             // NOTHING is committed here (review, PR #595): the caller commits
             // the returned pass only after the flush that carried this read's
             // entries was accepted.
@@ -1192,7 +1192,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Vec::new()));
         let mut transcript = childless_activity();
         assert!(
-            transcript.has_childless_run(),
+            transcript.needs_cleanup_marking(),
             "the report minted a call-keyed run"
         );
 
@@ -1238,6 +1238,44 @@ mod tests {
         assert!(
             transcript.unconfirmed_tasks.contains("call_activity"),
             "the ⚠️ marker reaches the card that will wait: {:?}",
+            transcript.unconfirmed_tasks
+        );
+    }
+
+    /// A Background Task with neither a shell nor a child id is the same shape
+    /// as a childless run: no runtime read can end it and no Wake names it, so
+    /// the pass must mark it for the Cleanup click.
+    #[tokio::test]
+    async fn an_identityless_task_is_marked_for_cleanup() {
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Vec::new()));
+        let mut transcript =
+            SessionTranscript::new(vec![]).with_background_tasks(vec![crate::backend::BackgroundTask {
+                tool: ToolIdentity {
+                    name: "subagent".into(),
+                    call_id: "call_sub".into(),
+                },
+                shell_id: None,
+                child_id: None,
+                started_at: Some(1_000),
+            }]);
+        assert!(transcript.needs_cleanup_marking());
+
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+            None,
+        )
+        .await;
+        assert!(
+            pass.is_some_and(|pass| pass.changed()),
+            "the marker alone still makes a pass"
+        );
+        assert!(
+            transcript.unconfirmed_tasks.contains("call_sub"),
+            "the task rides the ledger as ⚠️: {:?}",
             transcript.unconfirmed_tasks
         );
     }
