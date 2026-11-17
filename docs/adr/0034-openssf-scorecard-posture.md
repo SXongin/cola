@@ -504,12 +504,13 @@ other pre-existing defect), and lists any held-back blocking findings as
 one-line stubs (`file:line` and one clause) so the cap loses no blocking
 finding. The completeness rule keeps "a missing or failed part of the review is
 a blocking finding" and defines the parts as reading the diff and the PR
-metadata and checking each claimed acceptance criterion of the issues whose
-bodies the prompt embeds: an unreadable diff or an uncheckable criterion fails
-the review, an issue named only by number is not one the review can check, an
-absent optional tool does not fail it, and the existing host-tree exemption
-stands. A criterion the linked issue itself defers to later work is satisfied by
-the PR body's `## Deferred findings`, not treated as uncheckable.
+metadata and checking each claimed criterion the diff, the metadata or the
+appended issues can decide: an unreadable diff fails the review, an issue named
+only by number or a criterion about an artifact outside them (a comment, a
+tracker entry, a later measurement) is not one the review can check, an absent
+optional tool does not fail it, and the host-tree exemption stands. A criterion
+the linked issue itself defers to later work is satisfied by the PR body's
+`## Deferred findings`, not treated as uncheckable.
 
 `CONTRIBUTING.md` ("Reviewing"), `docs/agents/flow.md` and `/implement-spec`
 carry the **three-round gate budget**: round 1 discovers; rounds 2–3 verify the

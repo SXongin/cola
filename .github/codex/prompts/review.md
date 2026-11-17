@@ -76,12 +76,13 @@ pre-existing defect.
   diff does. Keep the review under ~800 words.
 - A missing or failed part of the review is a blocking finding. The review's
   parts are reading the diff and the PR metadata and checking each claimed
-  acceptance criterion of the issues whose bodies are appended below — an issue
-  named only by number is not one you can check; if a part cannot be completed,
-  the review is incomplete. An absent tool that the review does not require is
-  not a missing part: verify against the diff's tests, fixtures and the quoted
-  issue text instead, and if that leaves a candidate blocking finding
-  unattributed, the rule above makes it block.
+  acceptance criterion the diff, the metadata or the appended issues can decide
+  — an issue named only by number, or a criterion about an artifact outside them
+  (a comment, a tracker entry, a later measurement), is not one you can check;
+  if a part cannot be completed, the review is incomplete. An absent tool that
+  the review does not require is not a missing part: verify against the diff's
+  tests, fixtures and the quoted issue text instead, and if that leaves a
+  candidate blocking finding unattributed, the rule above makes it block.
 - An acceptance criterion the linked issue itself defers to later work is
   satisfied by recording the deferral under `## Deferred findings` in the PR
   body; it is not an uncheckable criterion.
