@@ -1,5 +1,8 @@
 # OpenSSF Scorecard: fix what is cheap and real, record the rest as deliberate no-s
 
+> **Amended (2026-11-17)**: the Codex gate has a blocking definition and a
+> three-round budget — see the amendment at the end.
+
 The repository runs OpenSSF Scorecard (weekly workflow, published results, README
 badge) and scored 6/10. The aggregate is a **risk-weighted** average
 (Critical 10, High 7.5, Medium 5, Low 2.5), not a plain mean, so the zeros are
@@ -471,3 +474,53 @@ contract, approval only on `PASS` pinned to the reviewed commit, and the skips.
 The pair stays the repo's review pass — `/code-review` now *carries* both the axes
 and the adversarial pass in one skill, still never one alone — and the author-side
 model sharing the gate's lens (the 2026-10-09 trade) stands.
+
+## Amendment (2026-11-17): the gate has a blocking definition and a three-round budget
+
+The 2026-10-09 amendment bought fewer round-trips by sharing the gate's
+adversarial pass with the author-side pair, but the gate's own prompt still
+asked for every finding and defined nothing as blocking. PR #1067 (spec #1057)
+spent **39 gate rounds** on a 20k-line, 100-commit diff — 37 FAIL against 2 PASS
+— and 76 of its last 100 commits are `fix`; nothing stopped the loop but the
+model running out of findings. That is the convergence failure reported upstream
+(`openai/codex#51247`, `#42130`, `#38375`), and OpenAI's own GitHub review is
+narrower by design: it flags only P0/P1.
+
+`.github/codex/prompts/review.md` now carries the definition ("What blocks the
+merge"): blocking is a concrete input, state, or timing the diff newly fails; an
+unmet acceptance criterion of a linked issue the PR closes (`Closes`/`Fixes`/
+`Resolves`, not `Refs`); a regression the PR introduces; or a silent
+contradiction of an accepted ADR. A candidate blocking finding whose origin the
+review cannot establish also blocks — it is not moved to the backlog.
+Pre-existing defects that the diff neither creates nor makes newly reachable,
+out-of-scope suggestions, naming and style, speculative edge cases, "could add a
+guard", and tests for impossible inputs are non-blocking, listed under `Backlog
+(non-blocking)`, and never decide the verdict. Adding a guard for an input that
+cannot occur is itself a non-blocking finding. The gate reports at most 3
+blocking and 5 non-blocking findings, with security and data loss exempt and
+marked `critical`, and names how many blocking findings the cap held back. The
+completeness rule narrows to "the diff or metadata cannot be read, or a claimed
+acceptance criterion cannot be checked": a missing tool no longer fails the
+review, and the existing host-tree exemption stands.
+
+`CONTRIBUTING.md` ("Reviewing"), `docs/agents/flow.md` and `/implement-spec`
+carry the **three-round gate budget**: round 1 discovers, rounds 2–3 are
+remediation rounds (the gate still reads the whole diff — it has no round
+history); when round 3 still raises blocking findings, they are fixed in one
+push that needs the user's explicit approval. Only non-blocking, pre-existing
+and out-of-scope findings may be deferred, into a follow-up issue and the PR's
+deferred list; a blocking finding is never deferred. If the gate still FAILs
+after that round, the agent stops and hands the PR to the user: further rounds
+need their approval, and the admin bypass or closing the PR is theirs to decide.
+The budget counts pushes that change the diff — an `edited` or
+`ready_for_review` run is not a round — while the local pair and the gate
+rehearsal keep their no-round-cap rule, and non-blocking findings are answered
+or deferred, not fixed. The PR body records the deferred findings and the rounds
+spent.
+
+The two axes and the adversarial pass are unchanged; the amendment adds a
+severity policy to the rubric. What this ADR pins is otherwise untouched: the
+Codex Action, the read-only posture, the line-final
+`CODEX_REVIEW_VERDICT: PASS|FAIL` contract, approval only on `PASS` pinned to
+the reviewed commit, and the skips. The verdict parser is unchanged, so this is
+a rubric and process amendment, not a contract change.
