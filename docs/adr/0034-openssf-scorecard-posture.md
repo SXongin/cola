@@ -1,7 +1,7 @@
 # OpenSSF Scorecard: fix what is cheap and real, record the rest as deliberate no-s
 
-> **Amended (2026-11-17)**: the Codex gate's blocking definition, finding cap
-> and three-round budget — see the amendment at the end.
+> **Amended by ADR-0034 (2026-11-17)**: the Codex gate's blocking definition,
+> finding cap and three-round budget — see the amendment at the end.
 
 The repository runs OpenSSF Scorecard (weekly workflow, published results, README
 badge) and scored 6/10. The aggregate is a **risk-weighted** average
@@ -503,8 +503,10 @@ finding the diff introduces or makes newly reachable `critical` (exempt from the
 limits, and blocking — a pre-existing security finding is non-blocking like any
 other pre-existing defect), and lists any held-back blocking findings as
 one-line stubs (`file:line` and one clause) so the cap loses no blocking
-finding. The completeness rule keeps "a missing or failed part of the review is
-a blocking finding" and defines the parts as reading the diff and the PR
+finding. The issue's "always allowed" is read as "always allowed to exceed the
+cap": a security finding the diff does not introduce or make newly reachable is
+non-blocking like any other pre-existing defect. The completeness rule keeps "a
+missing or failed part of the review is a blocking finding" and defines the parts as reading the diff and the PR
 metadata and checking each claimed criterion the diff, the metadata or the
 appended issues can decide: an unreadable diff fails the review, an issue named
 only by number or a criterion about an artifact outside them (a comment, a
