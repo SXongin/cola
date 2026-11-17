@@ -173,6 +173,10 @@ fn derive_runs_read(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
             }
             DelegationEffect::Address => {
                 for (run_id, _) in names {
+                    let was_terminal = !runs
+                        .iter()
+                        .find(|run| run.run_id == run_id || run.child_id.as_deref() == Some(run_id))
+                        .is_none_or(|run| run.is_live());
                     let run = resolve_or_create(&mut runs, run_id, call);
                     fill_child(run, run_id);
                     // An address states nothing about the child's life, but its
@@ -180,6 +184,16 @@ fn derive_runs_read(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
                     // clock still ages toward the stale-cleanup exit.
                     if run.observed_at.is_none() {
                         run.observed_at = call.started_at;
+                    }
+                    // A resume of a TERMINAL child is a new generation: its
+                    // clock orders that generation's evidence. A wait on a live
+                    // child (or an address that created the run) must not date
+                    // the child — its current turn began earlier.
+                    if was_terminal
+                        && let Some(at) = call.started_at
+                        && run.started_at.is_none_or(|start| at > start)
+                    {
+                        run.started_at = Some(at);
                     }
                     push_relation(&mut run.addressed_by, call);
                 }
@@ -244,23 +258,6 @@ fn resolve_call_keyed<'a>(runs: &'a mut Vec<AgentRun>, call: &ToolCall) -> &'a m
     runs.last_mut().expect("just pushed")
 }
 
-/// The single live childless run a fact naming a child may adopt: the report
-/// that created it named no child, and a later fact is the first to learn which
-/// child it is (ADR-0108 §1). `None` when none or several are live — adopting
-/// one of two would be a guess.
-fn sole_childless_candidate(runs: &[AgentRun]) -> Option<usize> {
-    let candidates: Vec<usize> = runs
-        .iter()
-        .enumerate()
-        .filter(|(_, run)| run.child_id.is_none() && run.launched_by.is_empty() && run.is_live())
-        .map(|(index, _)| index)
-        .collect();
-    match candidates.as_slice() {
-        [index] => Some(*index),
-        _ => None,
-    }
-}
-
 /// The run a launch names: an existing record, else a childless call-keyed run
 /// it can adopt (the report that created it named no child), else a new run.
 /// Adoption only happens when exactly one childless run is live — two
@@ -271,17 +268,6 @@ fn resolve_launch<'a>(runs: &'a mut Vec<AgentRun>, run_id: &str, call: &ToolCall
         .position(|run| run.run_id == run_id || run.child_id.as_deref() == Some(run_id));
     if let Some(index) = existing {
         return &mut runs[index];
-    }
-    // Only a live childless run can be adopted: a terminal one may already own
-    // an ending under its call id, and moving its key would split that record.
-    if let Some(index) = sole_childless_candidate(runs) {
-        let run = &mut runs[index];
-        run.child_id = Some(run_id.to_string());
-        // The child id is the run's durable key once it is known: a call-keyed
-        // run's provisional id would otherwise make the key depend on where
-        // the read window began (ADR-0080's amendment).
-        run.task_run_id = Some(run_id.to_string());
-        return run;
     }
     resolve_or_create(runs, run_id, call)
 }
@@ -311,12 +297,10 @@ fn resolve_or_create<'a>(runs: &'a mut Vec<AgentRun>, run_id: &str, call: &ToolC
     }) {
         return &mut runs[index];
     }
-    // A fact naming a child may be the first to learn which child a report's
-    // call-keyed run is (ADR-0108 §1): adopt the single live childless run, so
-    // one child never owns two runs. Two candidates would be a guess.
-    if let Some(index) = sole_childless_candidate(runs) {
-        return &mut runs[index];
-    }
+    // No id correlation, no adoption: an unrelated launch/address must not
+    // inherit a report's call-keyed run (ADR-0108 §1). The same activity item
+    // later naming its child resolves through the call-id matcher above; an
+    // orphaned childless run stays for the Cleanup click.
     runs.push(AgentRun {
         run_id: run_id.to_string(),
         task_run_id: Some(run_id.to_string()),
@@ -864,11 +848,71 @@ mod tests {
         assert!(read.runs.is_empty(), "the child's own turn ends it");
     }
 
-    /// A later ADDRESS naming the child fills the call-keyed run's identity
-    /// instead of minting a second run. `sendInput`/`wait` do not relaunch, but
-    /// they are the first fact to learn which child the report meant.
+    /// A resume of a TERMINAL child is a new generation: its clock orders
+    /// that generation's evidence, so an older turn's terminal item is stale.
     #[test]
-    fn an_address_adopts_the_childless_run() {
+    fn a_resumed_run_rejects_a_previous_generations_evidence() {
+        let launch = call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["thread_1"],
+            ToolStatus::Running,
+            Some(1_000),
+        );
+        let mut done = report("call_report", "thread_1", "completed");
+        done.started_at = Some(2_000);
+        let resume = call(
+            "call_wait",
+            DelegationEffect::Address,
+            &["thread_1"],
+            ToolStatus::Running,
+            Some(20_000),
+        );
+        let mut read = transcript(vec![launch, done, resume]);
+        assert_eq!(
+            read.runs[0].started_at,
+            Some(20_000),
+            "the resume dates the new generation"
+        );
+        assert!(!read.apply_run_child_evidence(
+            "thread_1",
+            ChildEvidence::Terminal {
+                completed_at: 20_010,
+                started_at: Some(12_001)
+            }
+        ));
+        assert_eq!(read.runs.len(), 1, "the live generation survives");
+    }
+
+    /// A terminal report is an observation, not a new generation: a child's
+    /// own terminal evidence whose turn began before the report still ends it.
+    #[test]
+    fn a_terminal_report_does_not_date_the_child_turn() {
+        let launch = call(
+            "call_spawn",
+            DelegationEffect::Launch,
+            &["thread_1"],
+            ToolStatus::Running,
+            Some(1_800),
+        );
+        let mut done = report("call_report", "thread_1", "completed");
+        done.started_at = Some(2_100);
+        let mut read = transcript(vec![launch, done]);
+        assert!(read.apply_run_child_evidence(
+            "thread_1",
+            ChildEvidence::Terminal {
+                completed_at: 3_000,
+                started_at: Some(1_900)
+            }
+        ));
+        assert!(read.runs.is_empty(), "the child's own ending still applies");
+    }
+
+    /// An unrelated address does not adopt a childless run either: with no id
+    /// link the report's run stays its own (and clearable), and the address
+    /// mints the run it names.
+    #[test]
+    fn an_unrelated_address_does_not_adopt_the_childless_run() {
         let activity = call(
             "call_activity",
             DelegationEffect::Report,
@@ -884,11 +928,23 @@ mod tests {
             Some(6),
         );
         let read = transcript(vec![activity, address]);
-        assert_eq!(read.runs.len(), 1, "one run, filled not split");
-        assert_eq!(read.runs[0].run_id, "call_activity", "the live id never moves");
-        assert_eq!(read.runs[0].child_id.as_deref(), Some("thread_1"));
-        assert_eq!(read.runs[0].task_run_id.as_deref(), Some("thread_1"));
-        assert_eq!(read.runs[0].addressed_by[0].call_id, "call_wait");
+        assert_eq!(
+            read.runs.len(),
+            2,
+            "the orphan stays, the address owns its own run"
+        );
+        let orphan = read
+            .runs
+            .iter()
+            .find(|run| run.run_id == "call_activity")
+            .expect("the report's run");
+        assert_eq!(orphan.child_id, None, "no unrelated child is inherited");
+        let addressed = read
+            .runs
+            .iter()
+            .find(|run| run.child_id.as_deref() == Some("thread_1"))
+            .expect("the address's run");
+        assert_eq!(addressed.addressed_by[0].call_id, "call_wait");
     }
 
     /// An id-less report that arrives AFTER a sighting filled the child is the
@@ -903,9 +959,9 @@ mod tests {
             ToolStatus::Running,
             Some(5),
         );
-        let launch = call(
-            "call_spawn",
-            DelegationEffect::Launch,
+        let named = call(
+            "call_activity",
+            DelegationEffect::Report,
             &["thread_1"],
             ToolStatus::Running,
             Some(6),
@@ -917,7 +973,7 @@ mod tests {
             ToolStatus::Completed,
             Some(7),
         );
-        let read = transcript(vec![activity, launch, done]);
+        let read = transcript(vec![activity, named, done]);
         assert_eq!(read.runs.len(), 1, "the same call id is one run: {:?}", read.runs);
         assert_eq!(read.runs[0].child_id.as_deref(), Some("thread_1"));
         assert_eq!(read.runs[0].status, RunStatus::Completed);
@@ -952,39 +1008,41 @@ mod tests {
         );
     }
 
-    /// The durable key is window-independent even when the child id is learned
-    /// after the run was created call-keyed.
+    /// The durable key is window-independent when the SAME activity item later
+    /// names its child: both windows mint the child id (the call id correlates
+    /// them; an unrelated launch does not).
     #[test]
-    fn an_adopted_call_keyed_run_keeps_one_window_stable_key() {
-        let mut activity = call(
-            "activity_1",
+    fn a_call_keyed_run_keeps_one_window_stable_key() {
+        let mut start = call(
+            "call_activity",
             DelegationEffect::Report,
             &[],
             ToolStatus::Running,
             Some(5),
         );
-        activity.input = Some(serde_json::json!({"kind": "started"}));
-        let spawn = call(
-            "spawn_1",
-            DelegationEffect::Launch,
+        start.input = Some(serde_json::json!({"kind": "started"}));
+        let named = call(
+            "call_activity",
+            DelegationEffect::Report,
             &["thread_1"],
             ToolStatus::Running,
             Some(6),
         );
-        let full = transcript(vec![activity, spawn.clone()]);
-        let launch_only = transcript(vec![spawn]);
+        let full = transcript(vec![start, named.clone()]);
+        let named_only = transcript(vec![named]);
+        assert_eq!(full.runs.len(), 1, "one activity is one run");
         assert_eq!(
             full.runs[0].ending_key(),
-            launch_only.runs[0].ending_key(),
-            "a window beginning at the launch mints the same durable key"
+            named_only.runs[0].ending_key(),
+            "both windows mint the same durable key"
         );
         assert_eq!(full.runs[0].ending_key(), "thread_1");
     }
 
-    /// A later launch adopts the one childless run a report created, so the
-    /// child's run is never split in two.
+    /// An unrelated launch does not adopt a childless run: with no id link it
+    /// would misattribute its child, so the orphan stays for the Cleanup.
     #[test]
-    fn a_later_launch_adopts_the_childless_run() {
+    fn an_unrelated_launch_does_not_adopt_the_childless_run() {
         let mut activity = call(
             "activity_1",
             DelegationEffect::Report,
@@ -1001,15 +1059,28 @@ mod tests {
             Some(6),
         );
         let read = transcript(vec![activity, spawn]);
-        assert_eq!(read.runs.len(), 1, "one run, adopted not split");
-        assert_eq!(read.runs[0].run_id, "activity_1", "the live id never moves");
-        assert_eq!(read.runs[0].child_id.as_deref(), Some("thread_1"));
         assert_eq!(
-            read.runs[0].task_run_id.as_deref(),
-            Some("thread_1"),
-            "the durable key is the child id once it is known"
+            read.runs.len(),
+            2,
+            "the orphan stays, the launch owns its own run"
         );
-        assert_eq!(read.runs[0].launched_by[0].call_id, "spawn_1");
+        let orphan = read
+            .runs
+            .iter()
+            .find(|run| run.run_id == "activity_1")
+            .expect("the report's run");
+        assert_eq!(orphan.child_id, None, "no unrelated child is inherited");
+        assert_eq!(
+            orphan.task_run_id.as_deref(),
+            Some("activity_1"),
+            "the orphan keeps its creating call as the durable key"
+        );
+        let launched = read
+            .runs
+            .iter()
+            .find(|run| run.child_id.as_deref() == Some("thread_1"))
+            .expect("the launch's run");
+        assert_eq!(launched.launched_by[0].call_id, "spawn_1");
     }
 
     /// The same activity item's later sighting fills the call-keyed run's

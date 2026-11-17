@@ -522,10 +522,23 @@ pub(crate) async fn reconcile_now(
             tracing::debug!(
                 "session {session_id} task runtime read failed: {error}; waiting for the next read"
             );
-            None
+            // No runtime verdict, but the Cleanup exits do not depend on it:
+            // a childless run or identity-less task must still get its button,
+            // or a permanently failing runtime read wedges the Turn.
+            cleanup_mark_pass(transcript)
         }
-        None => None,
+        None => cleanup_mark_pass(transcript),
     }
+}
+
+/// Mark the exit paths that need no runtime verdict (a childless run, an
+/// identity-less task) on a read that spent no verdict: the marker is the only
+/// way the waiting Turn can end, so a failed or skipped read must not withhold
+/// it. Returns a pass only when the set moved.
+fn cleanup_mark_pass(transcript: &mut SessionTranscript) -> Option<ReconcilePass> {
+    let before = transcript.unconfirmed_tasks.clone();
+    transcript.mark_cleanup_exits();
+    (transcript.unconfirmed_tasks != before).then_some(ReconcilePass { changed: true })
 }
 
 /// Record every evidence ending the read derived after
@@ -1251,6 +1264,37 @@ mod tests {
         assert!(
             transcript.unconfirmed_tasks.contains("call_activity"),
             "the ⚠️ marker reaches the card that will wait: {:?}",
+            transcript.unconfirmed_tasks
+        );
+    }
+
+    /// A failed runtime verdict read is no reason to withhold the Cleanup
+    /// exit: a childless run has no other way out, so the marker is still
+    /// produced on the error path.
+    #[tokio::test]
+    async fn a_failed_runtime_read_still_marks_the_cleanup_exit() {
+        let mock = MockBackend::new(Vec::new());
+        mock.fail_task_runtime_reads(usize::MAX);
+        let backend: Arc<dyn Backend> = Arc::new(mock);
+        let mut transcript = childless_activity();
+        assert!(transcript.needs_cleanup_marking());
+
+        let pass = reconcile_now(
+            &backend,
+            "ses_test",
+            Some("/work"),
+            &mut transcript,
+            CycleBudget::within(200),
+            None,
+        )
+        .await;
+        assert!(
+            pass.is_some_and(|pass| pass.changed()),
+            "the marker alone still makes a pass"
+        );
+        assert!(
+            transcript.unconfirmed_tasks.contains("call_activity"),
+            "the failed verdict read does not withhold the exit: {:?}",
             transcript.unconfirmed_tasks
         );
     }
