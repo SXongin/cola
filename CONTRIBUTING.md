@@ -488,14 +488,12 @@ their approval, and merging with the admin bypass or closing the PR is theirs to
 decide, never the agent's. The budget counts every gate run that posts a review —
 a non-draft push, the `ready_for_review` flip that spends a draft's first review,
 or an `edited` body re-run. A run that fails before the model (an unfetchable
-reference, a credential failure) posts none and is not a round, and the one
-`edited` run the dossier's own bookkeeping edit triggers is not a budget round
-when that edit touches only `## Gate rounds` and `## Deferred findings`. The
-agent never re-runs the gate on an unchanged head to fish for a different
-verdict. The local pair and gate rehearsal still run until no blocking finding
-remains (`docs/agents/flow.md`). The PR body records the rounds spent and the
-deferred findings (`## Gate rounds`, `## Deferred findings`), written once the
-loop has ended — after the final push or at handover.
+reference, a credential failure) posts none and is not a round. The agent never
+re-runs the gate on an unchanged head to fish for a different verdict. The local
+pair and gate rehearsal still run until no blocking finding remains
+(`docs/agents/flow.md`). The PR body carries the record from the first push —
+the rounds spent and the deferred findings (`## Gate rounds`,
+`## Deferred findings`) — and an update to it is a round like any other.
 
 ## Releasing
 

@@ -508,7 +508,8 @@ metadata and checking each claimed acceptance criterion of the issues whose
 bodies the prompt embeds: an unreadable diff or an uncheckable criterion fails
 the review, an issue named only by number is not one the review can check, an
 absent optional tool does not fail it, and the existing host-tree exemption
-stands.
+stands. A criterion the linked issue itself defers to later work is satisfied by
+the PR body's `## Deferred findings`, not treated as uncheckable.
 
 `CONTRIBUTING.md` ("Reviewing"), `docs/agents/flow.md` and `/implement-spec`
 carry the **three-round gate budget**: round 1 discovers; rounds 2–3 verify the
@@ -523,14 +524,12 @@ approval, and the admin bypass or closing the PR is theirs to decide. The budget
 counts every gate run that posts a review — a non-draft push, the
 `ready_for_review` flip that spends a draft's first review, or an `edited` body
 re-run; a run that fails before the model (an unfetchable reference, a credential
-failure) posts none and is not a round, and the one `edited` run the dossier's
-own bookkeeping edit triggers is not a budget round when that edit touches only
-`## Gate rounds` and `## Deferred findings`. The agent never re-runs the gate on
+failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict. The local pair and the gate
 rehearsal keep their no-round-cap rule, and non-blocking findings are answered
-or deferred, not fixed. The PR body records the rounds spent and the deferred
-findings once the loop has ended, so the bookkeeping edit cannot spend the
-verification round.
+or deferred, not fixed. The PR body carries the record from the first push — the
+rounds spent and the deferred findings — and an update to it is a round like any
+other.
 
 The two axes and the adversarial pass are unchanged; the amendment adds a
 severity policy to the rubric. What this ADR pins is otherwise untouched: the
