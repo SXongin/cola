@@ -452,9 +452,11 @@ prompt carries the definition (`.github/codex/prompts/review.md`, "What blocks
 the merge"): a concrete input, state, or timing the diff newly fails; an unmet
 acceptance criterion of a linked issue the PR closes (`Closes`, `Fixes` or
 `Resolves`, not `Refs`); a regression the PR introduces; or a silent
-contradiction of an accepted ADR. A candidate blocking finding whose origin
-cannot be established also blocks. Pre-existing defects the diff neither creates
-nor makes newly reachable, out-of-scope suggestions, naming and style,
+contradiction of an accepted ADR. A failure on a changed path whose origin
+cannot be established also blocks; flag only issues the PR introduces, and never
+turn unchanged code into a blocking finding. Pre-existing defects the diff
+neither creates nor makes newly reachable, out-of-scope suggestions, naming and
+style,
 speculative edge cases, "could add a guard", and tests for impossible inputs are
 non-blocking: the gate lists them under `Backlog (non-blocking)` and they never
 decide the verdict. A change that adds a guard for an input that cannot occur is

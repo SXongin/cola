@@ -490,9 +490,10 @@ narrower by design: it flags only P0/P1.
 merge"): blocking is a concrete input, state, or timing the diff newly fails; an
 unmet acceptance criterion of a linked issue the PR closes (`Closes`/`Fixes`/
 `Resolves`, not `Refs`); a regression the PR introduces; or a silent
-contradiction of an accepted ADR. A candidate blocking finding whose origin the
-review cannot establish also blocks — it is not moved to the backlog.
-Pre-existing defects that the diff neither creates nor makes newly reachable,
+contradiction of an accepted ADR. A failure on a changed path whose origin the
+review cannot establish also blocks — it is not moved to the backlog — while
+unchanged code never becomes a blocking finding. Pre-existing defects that the
+diff neither creates nor makes newly reachable,
 out-of-scope suggestions, naming and style, speculative edge cases, "could add a
 guard", and tests for impossible inputs are non-blocking, listed under `Backlog
 (non-blocking)`, and never decide the verdict. Adding a guard for an input that
