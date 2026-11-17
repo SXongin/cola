@@ -475,26 +475,26 @@ user's) or a required rebase, and wait for that round's PASS; never merge on a
 stale approval.
 
 **Three gate rounds, then ask.** A PR gets 3 automatic gate rounds: round 1 is
-broad discovery, rounds 2–3 are remediation rounds — push the fixes for the
-previous round's findings, and the gate re-reads the whole diff. A `critical`
-security or data-loss finding is fixed first whatever the count. When round 3
-still raises blocking findings, fix them in one batch and push once more; that
-verification round needs the user's explicit approval. Only non-blocking,
-pre-existing and out-of-scope findings may be deferred, into a follow-up issue
-and the PR's deferred list — a blocking finding is never deferred. If the gate
-still FAILs after the user-approved round, stop and hand the PR to the user with
-the remaining findings: each further gate round needs their approval, and
-merging with the admin bypass or closing the PR is theirs to decide, never the
-agent's. The budget counts every gate run that posts a review — a non-draft
-push, the `ready_for_review` flip that spends a draft's first review, or an
-`edited` body re-run. A run that fails before the model (an unfetchable
+broad discovery; rounds 2–3 verify the remediation and the paths it directly
+touches, with the author assembling the fix and the gate re-reading the whole
+diff. A `critical` security or data-loss finding is fixed first whatever the
+count. When round 3 still raises blocking findings, fix them in one batch and
+push once more; that verification round needs the user's explicit approval. Only
+non-blocking, pre-existing and out-of-scope findings may be deferred, into a
+follow-up issue and the PR's deferred list — a blocking finding is never
+deferred. If the gate still FAILs after the user-approved round, stop and hand
+the PR to the user with the remaining findings: each further gate round needs
+their approval, and merging with the admin bypass or closing the PR is theirs to
+decide, never the agent's. The budget counts every gate run that posts a review —
+a non-draft push, the `ready_for_review` flip that spends a draft's first review,
+or an `edited` body re-run. A run that fails before the model (an unfetchable
 reference, a credential failure) posts none and is not a round. The agent never
 re-runs the gate on an unchanged head to fish for a different verdict. The local
 pair and gate rehearsal still run until no blocking finding remains
-(`docs/agents/flow.md`). Write the PR body's record before the final push, so
-the bookkeeping edit does not spend a round: the deferred findings whenever
-there are any, and the rounds spent when the budget ended the loop
-(`## Gate rounds`, `## Deferred findings`).
+(`docs/agents/flow.md`). The PR body records the rounds spent and the deferred
+findings (`## Gate rounds`, `## Deferred findings`), written once the loop has
+ended — after the final push or at handover — so the bookkeeping edit cannot
+spend the verification round.
 
 ## Releasing
 
