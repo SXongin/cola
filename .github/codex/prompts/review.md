@@ -64,8 +64,10 @@ A security or data-loss finding is exempt from both limits and is marked
   `git show`, `git log`, `git grep`, and plain file reads. Do not post reviews,
   comments, or labels yourself.
 - Every finding: file:line, the failing scenario, severity (blocking /
-  non-blocking / critical). A finding must be tied to a changed line; if it is
-  not, leave it out. Skip anything tooling enforces (fmt, clippy).
+  non-blocking / critical). A finding must be tied to a changed line; a newly
+  reachable defect ties to the changed line that creates the state, not to the
+  failing one. If it has no such line, leave it out. Skip anything tooling
+  enforces (fmt, clippy).
 - Blocking findings first, then `Backlog (non-blocking)`; no summary of what the
   diff does. Keep the review under ~800 words.
 - The review is incomplete only when the diff or the PR metadata cannot be read,

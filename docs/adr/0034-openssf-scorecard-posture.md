@@ -512,11 +512,12 @@ and out-of-scope findings may be deferred, into a follow-up issue and the PR's
 deferred list; a blocking finding is never deferred. If the gate still FAILs
 after that round, the agent stops and hands the PR to the user: further rounds
 need their approval, and the admin bypass or closing the PR is theirs to decide.
-The budget counts pushes that change the diff — an `edited` or
-`ready_for_review` run is not a round — while the local pair and the gate
-rehearsal keep their no-round-cap rule, and non-blocking findings are answered
-or deferred, not fixed. The PR body records the deferred findings and the rounds
-spent.
+The budget counts gate runs on a diff the gate has not reviewed before — a push,
+and the `ready_for_review` flip that spends a draft's first review; an `edited`
+or `reopened` re-run of the same head is not a round — while the local pair and
+the gate rehearsal keep their no-round-cap rule, and non-blocking findings are
+answered or deferred, not fixed. The PR body records the deferred findings and
+the rounds spent.
 
 The two axes and the adversarial pass are unchanged; the amendment adds a
 severity policy to the rubric. What this ADR pins is otherwise untouched: the
