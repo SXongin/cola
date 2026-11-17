@@ -7,6 +7,11 @@ db-path = "~/.cargo/advisory-db"
 yanked = "warn"
 # Error only if an unmaintained crate is a direct dependency.
 unmaintained = "workspace"
+ignore = [
+  # chrono 0.4.45 is unmaintained with no safe upgrade; it is a direct
+  # dependency through tracing-subscriber. Migration tracked by #1073.
+  "RUSTSEC-2026-0543",
+]
 
 [bans]
 multiple-versions = "warn"
