@@ -1,5 +1,9 @@
 # File Content delivery: embed images in the card, send the rest as a File Message
 
+> **Amended by ADR-0076 (2026-11-18)**: the inbound Prompt Attachment contract
+> gains Codex — an image rides as an inline `image` input part and a non-image
+> is refused by name (issue #1055) — see the amendment at the end.
+
 OpenCode's tool output can carry a **File Content** — a `file` block (a `data:`
 URI plus mime and name) that `read` returns for an image or PDF, or that a user
 message's `files` list carries — and `tool_output` drops it, so the panel shows
@@ -293,6 +297,35 @@ land at the three existing seams — the mock Platform, the wire client's fake
 server, and the record line — with no live chain.
 
 The outbound Decision is otherwise unchanged.
+
+## Amendment (2026-11-18): Codex carries images inline and nothing else
+
+The inbound contract above names V1 and V2 because they were the two Agent
+Clients then. The Codex adapter (ADR-0090) is a third, and its `UserInput` is
+different: it has an `image` variant but **no document/file variant**, so a
+Prompt Attachment can only ride as an image (issue #1055).
+
+- **An image is an inline `image` input part.** `{type:"image",
+  url:"data:<mime>;base64,…"}`, after the prompt's text part and before any
+  `skill` part, on both `turn/start` and `turn/steer` (a Supplement carries the
+  same `input` array). The app-server rejects remote `http(s)` URLs itself and
+  says to use an inline data URL, so the bridge's decoded bytes are sent as-is —
+  no temp file, no `localImage`, no `thread/attachment/add`.
+- **A non-image is refused by name before submission.** PDF and text
+  attachments have no Codex input shape; the adapter returns a capability error
+  naming the file instead of dropping it or failing with a generic "not mapped"
+  message. The refusal is a pre-send validation failure, so it leaves no
+  authorship marker to reconcile.
+- **The vision check mirrors the Codex TUI's own gate.** Codex's catalog
+  declares `inputModalities`, and the TUI refuses an image pre-send when the
+  active model omits `image`, defaulting to supported when the catalog cannot
+  be read or does not name the model. The adapter does the same: a bounded
+  `model/list` lookup (2 s, entries matched by `id` or model slug) refuses the
+  image with the model's name before submission. An unknown model — a
+  custom-provider model absent from the catalog — or an unreadable catalog
+  stays supported, and the provider's own error is the surface. That default
+  matters: the TUI has the identical hole, and inventing a refusal the server
+  did not declare would block images on models that do accept them.
 
 ## Why
 

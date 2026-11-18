@@ -390,8 +390,12 @@ pub struct Location {
 /// `name` its display name — `None` for an image, which has none. Each
 /// generation serializes it into its own payload: V1 a `{type:"file", mime,
 /// filename?, url:"data:<mime>;base64,…"}` part, V2 a `{uri, name?}` `files[]`
-/// entry. An image requires a vision-capable model; an unsupported one surfaces
-/// an error.
+/// entry, and Codex an inline `{type:"image", url:"data:<mime>;base64,…"}`
+/// input part — its protocol has no document variant, so a non-image is a named
+/// refusal there (issue #1055). An image requires a vision-capable model; an
+/// unsupported one surfaces an error, and the Codex adapter refuses an image
+/// up front when its catalog says the model is text-only while treating an
+/// unknown (custom-provider) model as capable.
 #[derive(Debug, Clone)]
 pub struct PromptFile {
     pub mime: String,
