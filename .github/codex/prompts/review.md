@@ -33,7 +33,8 @@ A finding is **blocking** when it names a concrete input, state, or timing the
 diff newly fails; an acceptance criterion of a linked issue this PR closes
 (`Closes`, `Fixes` or `Resolves`, not `Refs`) that is unmet; a regression this PR
 introduces; or a silent contradiction of an accepted ADR (an ADR the PR adds or
-explicitly amends is not a contradiction). Nothing else blocks. Flag only
+explicitly amends is not a contradiction). Nothing else blocks, apart from an
+incomplete review (below). Flag only
 actionable issues introduced by this pull request: do not turn unchanged code
 into a blocking finding.
 
