@@ -46,7 +46,9 @@ Keep one PR to one thing (see *Before you start*) and the branch short-lived.
 
 This rule applies to agents too: **agents never merge a feature/task PR.**
 They run the loop up to the green PR — branch, work, commit, rebase, open the
-PR, get CI and review green — and then stop. The user verifies the change
+PR, get CI and review green — and then stop, or hand the PR over when the Codex
+gate's budget is spent and the user-approved round still FAILs (*Reviewing*). The
+user verifies the change
 themselves and gives the explicit go-ahead (or merges it themselves). The
 release cut is the one exception: `cargo xtask release` performs its own
 CI-gated merge after the user confirms the smoke test (ADR-0033). Do not stop

@@ -37,7 +37,8 @@ the picker and `/skill <id>` is its alias (ADR-0077).
 off it (`<type>/<slug>`), work in small Conventional Commits, rebase onto the
 latest `main`, open a PR — and **stop at a green PR: agents never merge a
 feature/task PR.** The user verifies and merges; the release cut, `cargo xtask
-release`, is the one exception (ADR-0033). Check `git branch --show-current`
+release`, is the one exception (ADR-0033). A spent Codex gate budget is the
+other stop: hand the PR over (`CONTRIBUTING.md` "Reviewing"). Check `git branch --show-current`
 before editing; the full contract is `CONTRIBUTING.md`.
 
 Every agent commit ends with one trailer naming the model —
