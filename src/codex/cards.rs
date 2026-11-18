@@ -2990,6 +2990,7 @@ async fn a_steered_supplement_is_never_an_external_message() {
             None,
             None,
             Some("msg_cola_supp"),
+            false,
         )
         .await
         .expect("the supplement steers");

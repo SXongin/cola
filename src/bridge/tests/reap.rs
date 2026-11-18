@@ -9230,7 +9230,11 @@ async fn a_turn_winning_the_collect_window_never_re_renders_the_delivered_tail()
     wait_for_record_card(&app, "ses_test", "om_late_adoption").await;
 
     // The message wins the collect window: the fresh Turn takes the chain over
-    // and seeds from the record's cursor.
+    // and seeds from the record's cursor. A routed message would be a
+    // Supplement while the projection's renderer holds the guard (ADR-0109);
+    // the direct start here models the same takeover in the loop-exit window,
+    // so the lease is released first.
+    app.inflight.lock().await.remove("ses_test");
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
     let turn = spawn_turn(&app, context);

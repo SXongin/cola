@@ -2459,6 +2459,9 @@ pub(crate) struct WaitsHandle {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards).
     pub(crate) inflight: Arc<Mutex<HashSet<String>>>,
+    /// Per-session out-of-turn renderer leases (ADR-0109): see
+    /// [`Self::acquire_render_lease`].
+    pub(crate) render_leases: Arc<Mutex<HashMap<String, RenderLease>>>,
     /// Session ids with an inbound user message being routed to them (#424):
     /// set at message admission — earlier than `inflight`, because the message
     /// is invisible to the Session Transcript until its Turn writes it — and
@@ -2486,7 +2489,71 @@ pub(crate) struct WaitsHandle {
 /// continuations for the process lifetime.
 const INBOUND_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// One Session's out-of-turn renderer lease (ADR-0109): how many renderers are
+/// in their window, and whether the FIRST of them claimed the inflight guard
+/// (a guard a Turn already held is not ours to release).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RenderLease {
+    pub(crate) count: usize,
+    pub(crate) owns_guard: bool,
+}
+
 impl WaitsHandle {
+    /// Take (or join) the renderer lease for `session_id` (ADR-0109): the
+    /// first holder claims the Session's inflight guard when no Turn/follow
+    /// already holds it, and the last release gives it back. A replacement
+    /// renderer that starts while a retiring one is still winding down joins
+    /// its count, so neither exit can remove the guard the other is rendering
+    /// under.
+    pub(crate) async fn acquire_render_lease(&self, session_id: &str) {
+        let mut leases = self.render_leases.lock().await;
+        let lease = leases.entry(session_id.to_string()).or_default();
+        if lease.count == 0 {
+            let mut inflight = self.inflight.lock().await;
+            // A Turn or follow already proves the writer; never release its
+            // claim on our exit.
+            lease.owns_guard = !inflight.contains(session_id);
+            if lease.owns_guard {
+                inflight.insert(session_id.to_string());
+            }
+        }
+        lease.count += 1;
+    }
+
+    /// Give the Session's inflight guard back, unless an out-of-turn renderer
+    /// still holds a lease (ADR-0109): the renderer keeps rendering, so the
+    /// guard transfers to it rather than disappearing. A Turn or follow that
+    /// releases while a replacement renderer is winding up keeps the chain live.
+    pub(crate) async fn release_guard(&self, session_id: &str) {
+        let mut leases = self.render_leases.lock().await;
+        if let Some(lease) = leases.get_mut(session_id) {
+            lease.owns_guard = true;
+            return;
+        }
+        self.inflight.lock().await.remove(session_id);
+    }
+
+    /// Release one renderer lease slot; the last one also releases the guard it
+    /// claimed. A session with no lease is a no-op (a caller that never
+    /// acquired must not release someone else's guard). The leases lock stays
+    /// held across the guard release, so a replacement acquire cannot see the
+    /// guard still present and then lose it to this exit.
+    pub(crate) async fn release_render_lease(&self, session_id: &str) {
+        let mut leases = self.render_leases.lock().await;
+        let Some(lease) = leases.get_mut(session_id) else {
+            return;
+        };
+        lease.count = lease.count.saturating_sub(1);
+        if lease.count > 0 {
+            return;
+        }
+        let owns_guard = lease.owns_guard;
+        leases.remove(session_id);
+        if owns_guard {
+            self.inflight.lock().await.remove(session_id);
+        }
+    }
+
     /// Whether this session's run was stopped with `/stop` — the sticky marker
     /// the drain rule (ADR-0043) and the stop terminal (#394) read. One
     /// accessor so the lock-and-check exists in one place, and every reader

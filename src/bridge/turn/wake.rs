@@ -1382,8 +1382,9 @@ impl Turn {
 /// Release a session's busy guard. A free function so the phases' error paths
 /// can release before any [`Turn`] state is settled; idempotent.
 pub(super) async fn release_inflight(handles: &TurnHandles, session_id: &str) {
-    let mut inflight = handles.waits.inflight.lock().await;
-    inflight.remove(session_id);
+    // Lease-aware (ADR-0109): an out-of-turn renderer still in its window keeps
+    // the guard; the release transfers it instead of removing it.
+    handles.waits.release_guard(session_id).await;
 }
 
 #[cfg(test)]

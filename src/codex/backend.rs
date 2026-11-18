@@ -38,7 +38,7 @@ use crate::backend::types::{
 };
 use crate::backend::{
     Backend, BackendDirectory, ChildEvidence, ModelIdentity, PromptSkill, SessionTranscript, SkillInfo,
-    TurnDiff,
+    SteerOutcome, TurnDiff,
 };
 use crate::bridge::tasks::TasksHandle;
 use crate::error::{BridgeError, Result};
@@ -3204,11 +3204,13 @@ impl Backend for CodexClient {
     }
 
     /// `turn/steer` merges the message into the active turn. Its protocol
-    /// precondition is the active turn's id; when this adapter has not observed
-    /// one (the `turn/started` notification has not been folded yet, or the
-    /// run already ended), a `turn/start` is the correct fallback — the server
-    /// folds it into the active turn or starts a fresh one, never a second
-    /// competing turn.
+    /// precondition is the active turn's id. When this adapter has not observed
+    /// one, the outcome depends on the caller's contract (ADR-0109): a caller
+    /// that permits a start falls back to `turn/start` (the server folds it into
+    /// the active turn or starts a fresh one, never a second competing turn) and
+    /// is told [`SteerOutcome::StartedTurn`]; a caller that must merge — the
+    /// bridge's Supplement, which owns no renderer for a fresh run — gets an
+    /// error instead, so a message never starts a run nobody renders.
     #[allow(clippy::too_many_arguments)]
     async fn steer(
         &self,
@@ -3220,11 +3222,19 @@ impl Backend for CodexClient {
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
-    ) -> Result<()> {
+        may_start_turn: bool,
+    ) -> Result<SteerOutcome> {
         let Some(turn_id) = self.projections.live_turn(session_id) else {
+            if !may_start_turn {
+                return Err(BridgeError::Client {
+                    client: "codex",
+                    detail: "no live turn to steer; the message was not submitted".into(),
+                });
+            }
             return self
                 .prompt(session_id, text, files, skills, model, variant, agent, message_id)
-                .await;
+                .await
+                .map(|()| SteerOutcome::StartedTurn);
         };
         // A steer adds input to a turn that already captured its model, so the
         // image gate reads the thread's own fact (never the per-prompt axis).
@@ -3270,7 +3280,7 @@ impl Backend for CodexClient {
         if let Some(message_id) = message_id {
             self.authored.resolve_steer(session_id, message_id);
         }
-        Ok(())
+        Ok(SteerOutcome::Merged)
     }
 
     async fn is_cola_authored(&self, message_id: &str) -> bool {
@@ -3835,7 +3845,8 @@ impl Backend for CodexLifecycle {
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
-    ) -> Result<()> {
+        may_start_turn: bool,
+    ) -> Result<SteerOutcome> {
         Backend::steer(
             &self.current().await?,
             session_id,
@@ -3846,6 +3857,7 @@ impl Backend for CodexLifecycle {
             variant,
             agent,
             message_id,
+            may_start_turn,
         )
         .await
     }
@@ -5937,6 +5949,7 @@ mod tests {
                 None,
                 None,
                 Some("msg_cola_2"),
+                false,
             )
             .await
             .expect("the image supplement steers");
@@ -6042,6 +6055,7 @@ mod tests {
                 None,
                 None,
                 Some("msg_cola_pdf"),
+                false,
             )
             .await
             .expect_err("a PDF has no codex input variant");
@@ -6160,6 +6174,7 @@ mod tests {
                 None,
                 None,
                 Some("msg_cola_img"),
+                false,
             )
             .await
             .expect_err("the live turn's text-only model cannot take the image");
@@ -6363,6 +6378,7 @@ mod tests {
                 None,
                 None,
                 Some("msg_cola_2"),
+                false,
             )
             .await
             .expect("the supplement steers");
@@ -6388,6 +6404,83 @@ mod tests {
             Some(live.as_str()),
             "the steer lands in the same turn"
         );
+    }
+
+    /// ADR-0109: a Supplement must merge. With no live turn to steer, a
+    /// merge-only steer is refused BEFORE anything is submitted — no
+    /// `turn/steer`, no fallback `turn/start`, so no run is started without a
+    /// renderer.
+    #[tokio::test]
+    async fn a_merge_only_steer_refuses_instead_of_starting_a_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        let error = client
+            .steer(
+                "thread-1",
+                "a supplement",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_1"),
+                false,
+            )
+            .await
+            .expect_err("no live turn: a merge-only steer is refused");
+
+        assert!(
+            error.to_string().contains("no live turn to steer"),
+            "the refusal names why: {error}"
+        );
+        assert!(server.steer_params().is_empty(), "nothing was steered");
+        assert_eq!(server.turn_starts(), 0, "no fallback turn/start was sent");
+    }
+
+    /// A caller that permits a start gets the fallback and is told the steer
+    /// did not merge ([`SteerOutcome::StartedTurn`]), so it can own the run.
+    #[tokio::test]
+    async fn a_steer_allowed_to_start_reports_started_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        let outcome = client
+            .steer(
+                "thread-1",
+                "a supplement",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_1"),
+                true,
+            )
+            .await
+            .expect("the fallback start is permitted");
+
+        assert_eq!(outcome, crate::backend::SteerOutcome::StartedTurn);
+        assert!(server.steer_params().is_empty(), "no live turn to steer");
+        assert_eq!(server.turn_starts(), 1, "the fallback started a turn");
     }
 
     /// Ticket #881 acceptance 2: `/stop` interrupts the turn the projection
@@ -7981,6 +8074,7 @@ mod tests {
             None,
             None,
             Some("msg_cola_supp"),
+            false,
         )
         .await
         .expect("the supplement steers");
@@ -8053,6 +8147,7 @@ mod tests {
                 None,
                 None,
                 Some("msg_cola_supp"),
+                false,
             )
             .await
             .expect("the supplement steers");
@@ -8595,6 +8690,7 @@ mod tests {
                 None,
                 None,
                 Some("msg_cola_steer"),
+                false,
             )
             .await
             .expect("the steer");

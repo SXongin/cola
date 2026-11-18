@@ -912,12 +912,28 @@ impl Turn {
     /// keeps its topic creation messages (ADR-0023) so the injection guard
     /// survives, and carries the turn's live state (card accumulator, inflight
     /// guard, cover title) across to the fresh session.
+    /// Settle the Session's card and give the guard back when a stale-mapping
+    /// recreate cannot finish (ADR-0109): a guard released over a non-terminal
+    /// card would let a Supplement split a chain with no writer left. The card
+    /// takes the ordinary failure ending, so the next prompt starts a clean
+    /// Turn.
+    async fn abandon_with_error(&self, handles: &TurnHandles, error: &crate::error::BridgeError) {
+        {
+            let mut cards = handles.cards.cards.lock().await;
+            if let Some(card) = cards.get_mut(&self.session_id) {
+                card.acc.apply_ending(&Disposition::Failed(error.to_string()));
+            }
+        }
+        Self::flush_card(&handles.cards, &self.session_id).await;
+        release_inflight(handles, &self.session_id).await;
+    }
+
     async fn recreate(&mut self, handles: &TurnHandles) -> crate::error::Result<()> {
         let flow = handles.flow();
         let old_entry = match flow.unmap(&self.session_id).await {
             Ok(entry) => entry,
             Err(e) => {
-                release_inflight(handles, &self.session_id).await;
+                self.abandon_with_error(handles, &e).await;
                 return Err(e);
             }
         };
@@ -937,8 +953,9 @@ impl Turn {
             Ok(id) => id,
             Err(e) => {
                 // The dead mapping is gone but the guard still names the old
-                // session: release it so the thread is not stuck busy.
-                release_inflight(handles, &self.session_id).await;
+                // session: settle the card, then release it so the thread is
+                // not stuck busy over a live-looking card (ADR-0109).
+                self.abandon_with_error(handles, &e).await;
                 return Err(e);
             }
         };
@@ -2170,6 +2187,11 @@ pub(crate) struct SettleTiming {
 pub(crate) enum SplitKind {
     /// A Supplement landed below the live card (ADR-0043).
     Supplement,
+    /// A Supplement the Backend refused (its steer failed) while an in-process
+    /// **Turn** still held the guard (#1056). The message never merged, so the
+    /// continuation may not claim it was received: it opens with the failure
+    /// line, and the live Turn keeps rendering into it.
+    SupplementFailed,
     /// The user explicitly pulled the live card down with `/card`
     /// (ADR-0043, 2026-09-22 amendment).
     Pull,
@@ -2189,6 +2211,15 @@ pub(crate) enum SplitKind {
 
 /// The receipt line a Supplement's continuation carries (ADR-0043).
 const SUPPLEMENT_RECEIPT: &str = "📨 已收到补充";
+
+/// The receipt a FAILED Supplement's continuation carries (#1056): the steer
+/// did not confirm a merge, so the card tells the truth instead of repeating
+/// the "received" line, while the live Turn keeps rendering into it. The copy
+/// says **unconfirmed**, not undelivered: Codex keeps an ambiguous steer's
+/// marker for reconciliation (a lost response may still have landed, ADR-0092),
+/// so cola must not tell the user to resend a message that may already be in
+/// the run.
+const SUPPLEMENT_FAILED_RECEIPT: &str = "⚠️ 补充消息未确认送达，请留意当前回复";
 
 /// The `/card` pull's continuation line (ADR-0043, 2026-09-22 amendment).
 const PULL_RECEIPT: &str = "⏬ 实时卡片已移到底部";
@@ -2236,6 +2267,7 @@ impl SplitKind {
     pub(crate) fn receipt(self) -> &'static str {
         match self {
             Self::Supplement => SUPPLEMENT_RECEIPT,
+            Self::SupplementFailed => SUPPLEMENT_FAILED_RECEIPT,
             Self::Pull => PULL_RECEIPT,
             Self::Wake => WAKE_RECEIPT,
             Self::Residual => RESIDUAL_RECEIPT,
@@ -2952,24 +2984,34 @@ impl Turn {
     /// queue in arrival order and the finalization reuses the size-split path (the
     /// live Interaction Blocks migrate to the continuation; the previous card's
     /// controls are settled). No-op when the session has no live card.
+    ///
+    /// Returns whether the split was admitted. A Supplement (or its failed
+    /// variant) is refused when the card has already reached an ending: the
+    /// ending is applied under this same cards lock, so a Turn that settles
+    /// between the caller's ownership read and this admission either stamps
+    /// the continuation (same chain) or is seen here as terminal — never a
+    /// continuation handed to nobody (#1056, ADR-0109).
     pub(crate) async fn split_card_chain(
         cards: &CardsHandle,
         session_id: &str,
         reply_to: &str,
         kind: SplitKind,
-    ) {
+    ) -> bool {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         {
             let mut live = cards.cards.lock().await;
             let Some(card) = live.get_mut(session_id) else {
-                return;
+                return false;
             };
             // An idle Session Card is a one-shot read (ADR-0100), never the
             // chain a pull splits. A pull whose admission raced the read's
             // commit becomes a no-op rather than queueing a split on the read.
             if !card.is_chain_card() {
-                return;
+                return false;
+            }
+            if matches!(kind, SplitKind::Supplement | SplitKind::SupplementFailed) && card.is_terminal() {
+                return false;
             }
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
@@ -2983,7 +3025,15 @@ impl Turn {
                 handover: false,
             });
         }
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+        let outcome = flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+        // A permanently refused continuation must reach the caller as a
+        // failure: the queued split may never produce a card, and the user must
+        // see either the card or the plain notice (#1056, ADR-0109). The flush
+        // already distinguishes a permanent refusal (`Refused`) from a write
+        // the delivery layer still owes (`Accepted`) and a split the loading
+        // window will serve later (`Unwritten`), so only the refusal is
+        // reported — a recoverable retry must not add a second failure.
+        !matches!(outcome, FlushOutcome::Refused)
     }
 
     /// Push the neutral waiting line ([`RECEIVE_HINT`]) onto `session_id`'s

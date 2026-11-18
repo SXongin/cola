@@ -118,6 +118,12 @@ pub struct SharedCore {
     /// per-session point ([`SessionGates`]), so a durable session switch never
     /// holds this set across an app-server call (issue #910).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// Per-session out-of-turn renderer leases (ADR-0109): the external render
+    /// loop and the Wake settle loop hold the inflight guard through this
+    /// count, so a replacement renderer joining a retiring one keeps the lease
+    /// with the retiring one's exit. See
+    /// [`crate::bridge::handles::WaitsHandle::acquire_render_lease`].
+    pub render_leases: Arc<Mutex<HashMap<String, crate::bridge::handles::RenderLease>>>,
     /// The per-session model/provider serialization points (issue #910). One
     /// async mutex per session; see [`crate::bridge::session_gates`] for the
     /// invariant it enforces.
@@ -381,6 +387,7 @@ impl SharedCore {
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             settling_requests: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            render_leases: Arc::new(Mutex::new(HashMap::new())),
             session_gates: crate::bridge::session_gates::SessionGates::default(),
             inbound: Arc::new(Mutex::new(HashMap::new())),
             stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
@@ -567,6 +574,7 @@ impl SharedCore {
     pub(crate) fn waits_handle(&self) -> crate::bridge::handles::WaitsHandle {
         crate::bridge::handles::WaitsHandle {
             inflight: Arc::clone(&self.inflight),
+            render_leases: Arc::clone(&self.render_leases),
             inbound: Arc::clone(&self.inbound),
             stopped_sessions: Arc::clone(&self.stopped_sessions),
             reminder: Arc::clone(&self.reminder),

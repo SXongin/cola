@@ -1829,6 +1829,9 @@ pub struct MockBackend {
     pub omitted_questions: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// When set, `prompt` fails with this message (simulates a provider 503).
     pub prompt_error: Option<String>,
+    /// One-shot: `steer` reports `SteerOutcome::StartedTurn` (an adapter
+    /// breaking the merge-only contract, ADR-0109) after submitting.
+    pub steer_started_turn: Arc<std::sync::atomic::AtomicBool>,
     /// Number of initial `prompt` calls to fail (for testing retry-after-error).
     pub fail_prompt_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Number of initial `interrupt` calls to fail with a genuine error (the
@@ -2275,6 +2278,7 @@ impl MockBackend {
             replied_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             omitted_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
+            steer_started_turn: std::sync::atomic::AtomicBool::new(false).into(),
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_interrupt_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_interrupt_message: None,
@@ -2507,6 +2511,15 @@ impl MockBackend {
         self.fail_prompt_count
             .store(count, std::sync::atomic::Ordering::SeqCst);
         self.fail_prompt_message = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: the next `steer` submits and reports
+    /// [`crate::backend::SteerOutcome::StartedTurn`] — an adapter breaking the
+    /// merge-only contract, which the bridge must treat as unconfirmed.
+    pub(crate) fn report_started_turn_once(&mut self) -> &mut Self {
+        self.steer_started_turn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3707,6 +3720,33 @@ impl crate::backend::Backend for MockBackend {
             *self.last_prompt_parts.lock().unwrap() = Some(parts.clone());
         }
         Ok(())
+    }
+
+    /// The mock's steer: submit (like the default) and report a merge, unless
+    /// the scenario arms [`Self::report_started_turn_once`].
+    #[allow(clippy::too_many_arguments)]
+    async fn steer(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[crate::backend::types::PromptFile],
+        skills: &[crate::backend::PromptSkill],
+        model: Option<&crate::backend::types::ModelInfo>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        message_id: Option<&str>,
+        _may_start_turn: bool,
+    ) -> crate::error::Result<crate::backend::SteerOutcome> {
+        let started = self
+            .steer_started_turn
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        self.prompt(session_id, text, files, skills, model, variant, agent, message_id)
+            .await?;
+        Ok(if started {
+            crate::backend::SteerOutcome::StartedTurn
+        } else {
+            crate::backend::SteerOutcome::Merged
+        })
     }
 
     /// Read one Session's neutral transcript (ADR-0053). A scripted transcript

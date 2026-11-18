@@ -1300,7 +1300,8 @@ async fn a_message_during_a_resumed_run_supplements_it() {
         "the resumed run is live on the request's card"
     );
 
-    // A message lands below it: the owned chain routes it as a Supplement.
+    // A message lands below it: the resumed run holds the guard, so the owned
+    // chain routes it as a Supplement.
     app.handle_message(incoming(
         "msg_sup".into(),
         "chat_1".into(),

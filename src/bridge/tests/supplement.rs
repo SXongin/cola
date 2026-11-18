@@ -949,10 +949,13 @@ async fn every_supplement_splits_the_chain() {
     assert!(!Turn::has_pending_split(&cards, "ses_test").await);
 }
 
-/// A failed supplement send still splits: the failure notice is sent FIRST and
-/// the continuation afterwards, so the live card remains the newest message.
+/// A failed supplement send while a Turn holds the guard still splits: the
+/// continuation is the chain's newest card, so the live Turn keeps rendering at
+/// the bottom, and it carries the FAILURE receipt — the steer never merged, so
+/// 「已收到补充」 would lie (#1056). The card is the one honest failure; no
+/// separate notice repeats it.
 #[tokio::test]
-async fn failed_supplement_send_splits_after_the_failure_notice() {
+async fn failed_supplement_send_splits_with_a_failure_receipt() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -973,26 +976,27 @@ async fn failed_supplement_send_splits_after_the_failure_notice() {
     .await;
 
     let calls = platform.calls.lock().await.clone();
-    let notice = calls
-        .iter()
-        .position(|c| matches!(c, PlatformCall::ReplyText { text, .. } if text.contains("补充消息发送失败")))
-        .expect("the failure notice must be sent");
-    let continuation_at = calls
-        .iter()
-        .position(|c| matches!(c, PlatformCall::ReplyCard { .. }))
-        .expect("the split must still happen");
     assert!(
-        notice < continuation_at,
-        "the failure notice goes first, the split still happens: {calls:?}"
-    );
-    assert!(
-        matches!(calls.last(), Some(PlatformCall::ReplyCard { .. })),
-        "the live card must remain the newest message: {calls:?}"
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyText { text, .. } if text.contains("未确认送达")
+        )),
+        "the continuation carries the failure; no separate notice: {calls:?}"
     );
     let (reply_to, card) = continuation(&platform).await;
     assert_eq!(reply_to, "msg_sup");
-    assert!(has(&card, "📨 已收到补充"), "the receipt still rides it: {card}");
-    assert!(app.inflight.lock().await.contains("ses_test"));
+    assert!(
+        has(&card, "⚠️ 补充消息未确认送达"),
+        "the failure rides the continuation: {card}"
+    );
+    assert!(
+        !has(&card, "📨 已收到补充"),
+        "nothing may claim a merge that failed: {card}"
+    );
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the live Turn still owns the chain it must render"
+    );
 }
 
 /// A continuation send that FAILS keeps the split queued: the next flush
@@ -1700,4 +1704,440 @@ async fn bound_exhaustion_does_not_overwrite_the_finalized_continuation() {
         Turn::card_is_live(&cards, "ses_test").await,
         "the new continuation is the live card"
     );
+}
+
+/// #1056: the stale shape a failed supplement can leave — a non-terminal chain
+/// card with no in-process guard and no live run — must not keep routing later
+/// prompts as Supplements. The backend reads idle, so the next message starts a
+/// Turn that owns and settles the card instead of being absorbed into a chain
+/// nobody renders.
+#[tokio::test]
+async fn a_stale_render_owned_chain_with_an_idle_backend_starts_a_new_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+
+    // The stale chain: a render-owned card and no guard — no Turn, follow or
+    // external renderer is in this process.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+
+    app.handle_message(incoming(
+        "msg_next".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "新问题".into(),
+        None,
+    ))
+    .await;
+
+    let delivered: String = platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        delivered.contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the message must start a Turn that renders its answer: {delivered}"
+    );
+    let all_calls = platform.calls.lock().await.clone();
+    assert!(
+        !all_calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyCard { card, .. } if has(card, "📨 已收到补充")
+        )),
+        "nothing may claim the message was merged: {all_calls:?}"
+    );
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Done),
+        "the Turn settles the card"
+    );
+}
+
+/// A Supplement whose steer fails AFTER its Turn released the guard must not
+/// split: the continuation would be handed to nobody. The chain keeps its card,
+/// the failure is a plain notice, and a later message starts a Turn (#1056).
+#[tokio::test]
+async fn failed_supplement_without_a_guard_after_the_steer_keeps_the_chain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let gate = backend.hold_prompts();
+    backend.fail_prompts(1, "provider 503");
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    seed_live_turn(&app, "ses_test", "第一段进度。").await;
+
+    let sup = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_sup".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "补充一下".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    // The steer is inside the gate (recorded before it parks), so the test can
+    // release the Turn's guard first: the settle then proves no writer.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if backend.prompt_calls.lock().await.iter().any(|t| t == "补充一下") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the supplement's steer must reach the Backend");
+    app.inflight.lock().await.remove("ses_test");
+    gate.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), sup)
+        .await
+        .expect("the handler must finish")
+        .unwrap();
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_sup"
+        )),
+        "no continuation may be handed to nobody: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyText { text, .. } if text.contains("补充消息未确认送达")
+        )),
+        "the failure is visible: {calls:?}"
+    );
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the chain did not move"
+    );
+
+    // No guard remains: the next message starts a Turn of its own.
+    gate.add_permits(1);
+    app.handle_message(incoming(
+        "msg_next".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "新问题".into(),
+        None,
+    ))
+    .await;
+
+    let delivered: String = platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        delivered.contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the next message must be answered by a Turn: {delivered}"
+    );
+}
+
+/// #1056's closed criterion: a card-only chain with no held guard starts a Turn
+/// EVEN when the advisory read still reports a live run — the stale
+/// `Busy`/`Retry` shape of ADR-0062's #428 limit. The card is a display state;
+/// the held guard is the only proof of a writer (ADR-0109).
+#[tokio::test]
+async fn a_card_only_chain_with_a_stale_live_status_starts_a_new_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    // The routing read sees a stale live run; every read after it serves the
+    // map (idle), so the Turn's own settle read can finish.
+    backend.busy_then_idle_once();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+
+    app.handle_message(incoming(
+        "msg_next".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "新问题".into(),
+        None,
+    ))
+    .await;
+
+    let delivered: String = platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        delivered.contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the message must start a Turn even on a stale live read: {delivered}"
+    );
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Done),
+        "the Turn settles the card"
+    );
+}
+
+/// A failed Supplement's split refuses an ENDED card: the ending is applied
+/// under the same cards lock, so a Turn that settles in the window between the
+/// ownership read and the split leaves the chain alone — the caller reports the
+/// failure instead of opening a continuation nobody renders (#1056, ADR-0109).
+#[tokio::test]
+async fn a_supplement_failed_split_refuses_an_ended_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Error).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+
+    let admitted = Turn::split_card_chain(
+        &cards,
+        "ses_test",
+        "msg_sup",
+        crate::bridge::turn::SplitKind::SupplementFailed,
+    )
+    .await;
+
+    assert!(!admitted, "an ended chain is not split");
+    assert_eq!(
+        Turn::card_message_id(&cards, "ses_test").await.as_deref(),
+        Some("om_live"),
+        "the chain keeps its card"
+    );
+    assert!(
+        !Turn::has_pending_split(&cards, "ses_test").await,
+        "no continuation is queued"
+    );
+    assert!(
+        !platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .any(|c| matches!(c, PlatformCall::ReplyCard { .. })),
+        "no card is sent"
+    );
+}
+
+/// ADR-0109 render leases: a replacement renderer joining a retiring one keeps
+/// the guard, the last release gives it back, and a guard a Turn already holds
+/// is never released by a lease's exit.
+#[tokio::test]
+async fn render_leases_share_the_guard_and_never_release_a_turns_claim() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let waits = app.waits_handle();
+
+    waits.acquire_render_lease("ses_test").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the first renderer claims the guard"
+    );
+    waits.acquire_render_lease("ses_test").await;
+    waits.release_render_lease("ses_test").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the surviving renderer keeps the lease"
+    );
+    waits.release_render_lease("ses_test").await;
+    assert!(
+        !app.inflight.lock().await.contains("ses_test"),
+        "the last release gives the guard back"
+    );
+
+    // A Turn's own guard is not the lease's to release.
+    app.inflight.lock().await.insert("ses_held".into());
+    waits.acquire_render_lease("ses_held").await;
+    waits.release_render_lease("ses_held").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_held"),
+        "a Turn's guard survives a lease's exit"
+    );
+
+    // A release with no lease is a no-op.
+    waits.release_render_lease("ses_none").await;
+    assert!(!app.inflight.lock().await.contains("ses_none"));
+
+    // A renderer that joined while a follow held the guard keeps it when the
+    // follow releases: the guard transfers instead of vanishing.
+    app.inflight.lock().await.insert("ses_follow".into());
+    waits.acquire_render_lease("ses_follow").await;
+    waits.release_guard("ses_follow").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_follow"),
+        "the renderer's lease keeps the guard after the follow releases"
+    );
+    waits.release_render_lease("ses_follow").await;
+    assert!(!app.inflight.lock().await.contains("ses_follow"));
+}
+
+/// A submitted Supplement whose chain has no card to continue on (the loading
+/// card never landed) is reported, not swallowed: the steer merged, but no
+/// continuation can carry the reply (#1056, ADR-0109).
+#[tokio::test]
+async fn a_submitted_supplement_with_no_card_to_continue_reports_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_test", "/work").await;
+    // The guard is held but no card exists: the split finds nothing to
+    // continue.
+    app.inflight.lock().await.insert("ses_test".into());
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下".into(),
+        None,
+    ))
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyText { text, .. } if text.contains("补充消息已提交")
+        )),
+        "the delivered message must not disappear without a word: {calls:?}"
+    );
+}
+
+/// #1056's reap criterion: the recorded card of a card-only chain is collected
+/// BEFORE the next prompt is classified, so the stale card cannot linger under
+/// the new Turn's card.
+#[tokio::test]
+async fn a_stale_card_is_collected_before_the_next_prompt_is_classified() {
+    use crate::bridge::tests::reap::realistic_card_view;
+
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let cfg = test_config(&session_file);
+    // The Chain Record a failed Supplement left behind, loaded at construction
+    // exactly like a restart.
+    let sidecar = crate::state::StateLayout::beside(&session_file, "chain_records.json");
+    crate::bridge::chain::ChainRecords::load(sidecar).track(
+        "ses_test",
+        "om_live",
+        crate::backend::MessageId::new("msg_cola_anchor"),
+        Some(1_000),
+        Some("/work"),
+        None,
+    );
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    platform.given_card_view("om_live", realistic_card_view());
+
+    app.handle_message(incoming(
+        "msg_next".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "新问题".into(),
+        None,
+    ))
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::UpdateMessage { message_id, card }
+                if message_id == "om_live" && card_text(card).contains("已由新卡片接管")
+        )),
+        "the orphan is collected before classification: {calls:?}"
+    );
+    let delivered: String = platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        delivered.contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the new Turn still answers: {delivered}"
+    );
+}
+
+/// An adapter that breaks the merge-only contract by reporting
+/// `StartedTurn` after submitting is treated as unconfirmed: the guard-held
+/// chain splits with the FAILURE receipt, never the "received" one (#1056,
+/// ADR-0109).
+#[tokio::test]
+async fn an_adapter_that_starts_a_turn_for_a_merge_only_steer_is_reported() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.report_started_turn_once();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+    seed_live_turn(&app, "ses_test", "第一段进度。").await;
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下".into(),
+        None,
+    ))
+    .await;
+
+    let (reply_to, card) = continuation(&platform).await;
+    assert_eq!(reply_to, "msg_sup");
+    assert!(
+        has(&card, "⚠️ 补充消息未确认送达"),
+        "the broken contract is reported as unconfirmed: {card}"
+    );
+    assert!(!has(&card, "📨 已收到补充"), "nothing may claim a merge: {card}");
 }
