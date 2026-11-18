@@ -492,8 +492,8 @@ finding is never deferred. Whenever the loop ends — green or handed
 over — a non-empty deferred list becomes a follow-up issue linked from the
 dossier, a round-3 PASS included. If the gate still FAILs after the user-approved
 round, stop and hand the PR to the user with the remaining findings: each further
-gate round needs their approval, and merging with the admin bypass or closing the
-PR is theirs to decide, never the agent's.
+gate round needs their approval, a critical finding excepted, and merging with
+the admin bypass or closing the PR is theirs to decide, never the agent's.
 The budget counts every gate run that posts a review — a non-draft push, the
 `ready_for_review` flip that spends a draft's first review, or an `edited` body
 re-run. A run that fails before the model (an unfetchable reference, a credential
