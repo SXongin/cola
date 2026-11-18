@@ -474,10 +474,8 @@ appended issues can decide) that the review could not check — is blocking too.
 the reviewed commit and `main: review` requires the last push to be approved,
 so a fix, a rebase, or any later commit needs its own PASS. Batch the blocking
 findings a round raised — and answer each non-blocking one and carry it to the
-PR's deferred list rather than fixing it — rehearse the batch's gate locally
-(`implement-spec`'s "Gate rehearsal"; trusted batch text, the gate's own lane;
-or record a lane skip when that lane cannot be reproduced locally), and push
-once. Once the gate passes, push again only for a real finding (yours or the
+PR's deferred list rather than fixing it — re-run the local pair at the same
+scope, and push once. Once the gate passes, push again only for a real finding (yours or the
 user's) or a required rebase, and wait for that round's PASS; never merge on a
 stale approval. That push is a round in the budget — past round 3 it needs the
 user's approval like any other.
@@ -504,8 +502,8 @@ The budget counts every gate run that posts a review — a non-draft push, a
 non-draft `opened`, the `ready_for_review` flip that spends a draft's first
 review, an `edited` body re-run, or a `reopened` run. A run that fails before the model (an unfetchable reference, a credential
 failure) posts none and is not a round, and the agent never re-runs the gate on
-an unchanged head to fish for a different verdict. The local pair and gate
-rehearsal still run until no blocking finding remains (`docs/agents/flow.md`).
+an unchanged head to fish for a different verdict. The local pair still
+runs until no blocking finding remains (`docs/agents/flow.md`).
 
 **The dossier is a PR comment, not the body.** A comment whose first line is
 `<!-- gate-dossier -->` records the rounds spent and the deferred findings; it is
