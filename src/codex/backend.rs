@@ -77,6 +77,11 @@ const ADOPTION_DRAIN_LIMIT: usize = 1024;
 /// feeds [`Projections`] without a subscription.
 const THREAD_STATUS_CHANGED: &str = "thread/status/changed";
 
+/// The image mimes Codex's own image pipeline decodes. `UserInput` has no
+/// document/file variant, so a prompt attachment outside this set is a named
+/// refusal, never a silently missing part (issue #1055).
+const CODEX_IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
 /// A live thread's one-shot next-turn selection (spec #922): the model and
 /// effort the next **new** `turn/start` should carry. Either half may be
 /// absent — a `/think` alone is a pending effort, a `/model` alone a pending
@@ -1506,11 +1511,12 @@ impl CodexClient {
     /// accepted. The direct arguments remain for adapter-level callers (and an
     /// effort a caller states explicitly), but a pending always wins so a
     /// consumed pick can never be re-sent from a stale mirror.
-    #[allow(clippy::too_many_arguments)] // session/text/skills/model/variant/id/pending
+    #[allow(clippy::too_many_arguments)] // session/text/files/skills/model/variant/id/pending
     fn turn_params(
         &self,
         session_id: &str,
         text: &str,
+        files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
         variant: Option<&str>,
@@ -1519,7 +1525,7 @@ impl CodexClient {
     ) -> Result<Value> {
         let mut params = json!({
             "threadId": session_id,
-            "input": self.input_items(session_id, text, skills)?,
+            "input": self.input_items(session_id, text, files, skills)?,
         });
         if let Some(message_id) = message_id {
             params["clientUserMessageId"] = json!(message_id);
@@ -1587,16 +1593,117 @@ impl CodexClient {
         }
     }
 
-    /// The protocol's `input` array: the prompt text, then one `skill` part per
-    /// attached skill. Codex's skill input needs the skill's path, so an id the
-    /// last `skills/list` did not name is a named error rather than a silently
+    /// Refuse an image prompt when the catalog says the model the submission
+    /// would run on is text-only (issue #1055). This mirrors the Codex TUI's
+    /// own `current_model_supports_images` gate, including its default: a model
+    /// the catalog does not name (a custom provider) or a catalog that cannot
+    /// be read is treated as image-capable, so cola never invents a capability
+    /// the server did not declare.
+    ///
+    /// `pending` is the one-shot next-turn pick: a `/model` selection is the
+    /// model a **new** turn would use, so it wins over the thread's current
+    /// fact. A non-image attachment is not this gate's business; [`Self::input_items`]
+    /// refuses it by name.
+    async fn ensure_images_supported(
+        &self,
+        session_id: &str,
+        files: &[PromptFile],
+        model: Option<&ModelInfo>,
+        pending: Option<&PendingSelection>,
+    ) -> Result<()> {
+        if files.is_empty()
+            || files
+                .iter()
+                .any(|file| !CODEX_IMAGE_MIMES.contains(&file.mime.as_str()))
+        {
+            return Ok(());
+        }
+        let model_id = if let Some(pending) = pending.and_then(|pending| pending.model.as_ref()) {
+            Some(pending.model_id.clone())
+        } else if let Some(model) = model {
+            Some(model.id.clone())
+        } else {
+            self.projections.model(session_id).map(|held| held.model_id)
+        };
+        let Some(model_id) = model_id else {
+            return Ok(());
+        };
+        if self.model_images_supported(&model_id).await != Some(false) {
+            return Ok(());
+        }
+        Err(BridgeError::Client {
+            client: "codex",
+            detail: format!(
+                "model `{model_id}` does not advertise image input; request rejected rather \
+                 than sending an image it would drop. Remove the image or switch models"
+            ),
+        })
+    }
+
+    /// Whether the `model/list` catalog advertises `image` input for
+    /// `model_id`. `None` is unknown — a custom-provider model absent from the
+    /// catalog, or a failed/expired read — and the caller treats it as
+    /// supported, matching the TUI's default-true gate.
+    async fn model_images_supported(&self, model_id: &str) -> Option<bool> {
+        let entries = self
+            .list_model_entries(
+                tokio::time::Instant::now() + IMAGE_MODEL_READ_TIMEOUT,
+                tokio::time::Instant::now,
+            )
+            .await;
+        entries
+            .iter()
+            .find(|entry| entry.id == model_id || (!entry.model.is_empty() && entry.model == model_id))
+            .map(|entry| {
+                entry
+                    .input_modalities
+                    .as_ref()
+                    .is_none_or(|modalities| modalities.iter().any(|modality| modality == "image"))
+            })
+    }
+
+    /// The protocol's `input` array: the prompt text, one inline `image` part
+    /// per attached image, then one `skill` part per attached skill.
+    ///
+    /// Codex's `UserInput` has no document/file variant, so only the four
+    /// image mimes its own pipeline decodes are carried; anything else is a
+    /// named refusal rather than a silently missing attachment (issue #1055).
+    /// The image is an **inline data URL**: the app-server rejects remote
+    /// `http(s)` URLs (`validate_user_input_image_urls`), and an inline URL
+    /// needs no file on disk, so the bridge's decoded base64 is the payload
+    /// as-is.
+    ///
+    /// Codex's skill input needs the skill's path, so an id the last
+    /// `skills/list` did not name is a named error rather than a silently
     /// dropped request (the model would otherwise answer without the skill).
     /// The session's own directory is tried first, so a same-named skill in
     /// another project can never be substituted for it.
-    fn input_items(&self, session_id: &str, text: &str, skills: &[PromptSkill]) -> Result<Value> {
+    fn input_items(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[PromptFile],
+        skills: &[PromptSkill],
+    ) -> Result<Value> {
         // `text_elements` is the protocol's spelling (`UserInput::Text` keeps
         // it snake_case, unlike the surrounding camelCase fields).
         let mut input = vec![json!({ "type": "text", "text": text, "text_elements": [] })];
+        for file in files {
+            if !CODEX_IMAGE_MIMES.contains(&file.mime.as_str()) {
+                return Err(BridgeError::Client {
+                    client: "codex",
+                    detail: format!(
+                        "the codex adapter carries image attachments only \
+                         (png/jpeg/gif/webp); `{}` was not sent",
+                        file.name.as_deref().unwrap_or(file.mime.as_str())
+                    ),
+                });
+            }
+            input.push(json!({
+                "type": "image",
+                "url": format!("data:{};base64,{}", file.mime, file.data_base64),
+            }));
+        }
         let directory = self.projections.cwd(session_id);
         for skill in skills {
             let Some(path) = self.skills.path_of(&skill.id, directory.as_deref()) else {
@@ -2088,6 +2195,16 @@ const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// The image-capability read before an image prompt (issue #1055). The Codex
+/// TUI answers it from its local catalog; cola has no local copy, so it asks
+/// `model/list` under this bound. An expired or failed read is "unknown",
+/// which treats the model as image-capable — exactly the TUI's own default
+/// (`current_model_supports_images`) when its catalog cannot be read.
+#[cfg(not(test))]
+const IMAGE_MODEL_READ_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const IMAGE_MODEL_READ_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Map Codex's flat `model/list` catalog onto the client-declared surface when
 /// there is no config read to enrich it (the cheap catalog-only read the
 /// `/think` variant lookup asks for). The real surface is
@@ -2215,10 +2332,19 @@ struct ModelListResponse {
 #[serde(rename_all = "camelCase")]
 struct ModelEntry {
     id: String,
+    /// The model slug the entry runs as. The TUI's image gate matches this
+    /// against the active model, while cola's picker uses [`Self::id`], so the
+    /// capability lookup accepts either.
+    #[serde(default)]
+    model: String,
     #[serde(default)]
     hidden: bool,
     #[serde(default)]
     supported_reasoning_efforts: Vec<EffortOption>,
+    /// `None` when the field is absent: the schema's own default is
+    /// `["text", "image"]`, so a missing list is not a text-only declaration.
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2387,6 +2513,34 @@ fn page_request_deadline(
     deadline.min(now + request_timeout)
 }
 
+/// Project the flat catalog entries onto the picker's one provider group,
+/// keeping the visible ones. An all-hidden catalog is the picker's "no models"
+/// answer, unchanged.
+fn models_from_entries(entries: Vec<ModelEntry>) -> Vec<ProviderModels> {
+    let models: Vec<ModelOption> = entries
+        .into_iter()
+        .filter(|entry| !entry.hidden)
+        .map(|entry| ModelOption {
+            id: entry.id,
+            // The server's own reasoning-effort set rides the model entry
+            // (ADR-0020: each model declares its own scale).
+            variants: entry
+                .supported_reasoning_efforts
+                .into_iter()
+                .map(|effort| effort.reasoning_effort)
+                .collect(),
+            ..ModelOption::default()
+        })
+        .collect();
+    if models.is_empty() {
+        return Vec::new();
+    }
+    vec![ProviderModels {
+        provider: MODEL_PROVIDER.to_string(),
+        models,
+    }]
+}
+
 impl CodexClient {
     /// `model/list` paged to exhaustion, or until `deadline` (a card
     /// callback's slice) leaves no time for the next page.
@@ -2417,9 +2571,20 @@ impl CodexClient {
         deadline: tokio::time::Instant,
         now: impl Fn() -> tokio::time::Instant,
     ) -> Vec<ProviderModels> {
+        models_from_entries(self.list_model_entries(deadline, now).await)
+    }
+
+    /// The `model/list` pages themselves, shared by the picker's projection and
+    /// the image-capability lookup. Stops at `deadline`, a repeated cursor, or
+    /// [`MAX_MODEL_PAGES`]; the entries read so far are the answer.
+    async fn list_model_entries(
+        &self,
+        deadline: tokio::time::Instant,
+        now: impl Fn() -> tokio::time::Instant,
+    ) -> Vec<ModelEntry> {
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::HashSet::new();
-        let mut models = Vec::new();
+        let mut entries = Vec::new();
         for page in 0..MAX_MODEL_PAGES {
             let at = now();
             if at >= deadline {
@@ -2458,22 +2623,7 @@ impl CodexClient {
                     break;
                 }
             };
-            for model in response.data {
-                if model.hidden {
-                    continue;
-                }
-                models.push(ModelOption {
-                    id: model.id,
-                    // The server's own reasoning-effort set rides the model
-                    // entry (ADR-0020: each model declares its own scale).
-                    variants: model
-                        .supported_reasoning_efforts
-                        .into_iter()
-                        .map(|effort| effort.reasoning_effort)
-                        .collect(),
-                    ..ModelOption::default()
-                });
-            }
+            entries.extend(response.data);
             match response.next_cursor {
                 None => break,
                 Some(next) => {
@@ -2491,13 +2641,7 @@ impl CodexClient {
                 tracing::warn!("codex model/list did not finish in {MAX_MODEL_PAGES} pages");
             }
         }
-        if models.is_empty() {
-            return Vec::new();
-        }
-        vec![ProviderModels {
-            provider: MODEL_PROVIDER.to_string(),
-            models,
-        }]
+        entries
     }
 
     /// [`Backend::model_surface`] with its catalog clock injected, so a test
@@ -2850,12 +2994,6 @@ impl Backend for CodexClient {
         _agent: Option<&str>,
         message_id: Option<&str>,
     ) -> Result<()> {
-        if !files.is_empty() {
-            return Err(BridgeError::Client {
-                client: "codex",
-                detail: "prompt attachments are not mapped onto this adapter yet".to_string(),
-            });
-        }
         // A skill resolves in the session's own directory only, and the prompt
         // axis carries no directory: learn the thread's `cwd` from the server
         // when this client has not seen it yet (a fresh restart can prompt
@@ -2890,6 +3028,11 @@ impl Backend for CodexClient {
         // is in flight belongs to the next turn, and the acceptance check below
         // must compare against the live turn this request saw.
         let pending = self.projections.pending_selection(session_id);
+        // The model this submission would run on must be able to read an image
+        // before the request leaves (issue #1055); the check mirrors the Codex
+        // TUI's own gate and defaults to supported when the model is unknown.
+        self.ensure_images_supported(session_id, files, model, pending.as_ref())
+            .await?;
         let live_before = self.projections.live_turn(session_id);
         // `turn/start` is the write half of this ticket's read model; a failed
         // submit is its own error, while the Turn's outcome is observed from
@@ -2901,6 +3044,7 @@ impl Backend for CodexClient {
         let params = self.turn_params(
             session_id,
             text,
+            files,
             skills,
             model,
             variant,
@@ -3082,13 +3226,11 @@ impl Backend for CodexClient {
                 .prompt(session_id, text, files, skills, model, variant, agent, message_id)
                 .await;
         };
-        if !files.is_empty() {
-            return Err(BridgeError::Client {
-                client: "codex",
-                detail: "prompt attachments are not mapped onto this adapter yet".to_string(),
-            });
-        }
-        let input = self.input_items(session_id, text, skills)?;
+        // A steer adds input to a turn that already captured its model, so the
+        // image gate reads the thread's own fact (never the per-prompt axis).
+        self.ensure_images_supported(session_id, files, None, None)
+            .await?;
+        let input = self.input_items(session_id, text, files, skills)?;
         let mut params = json!({
             "threadId": session_id,
             "expectedTurnId": turn_id,
@@ -5670,6 +5812,364 @@ mod tests {
         assert!(
             !client.is_cola_authored("item-not-ours").await,
             "a message outside cola's record is external"
+        );
+    }
+
+    /// Issue #1055: an image prompt attachment rides the turn as the protocol's
+    /// inline `image` part, the only form the app-server accepts (a remote URL
+    /// is rejected, and a `localImage` would need a file on disk). The text
+    /// keeps its place as the first part.
+    #[tokio::test]
+    async fn a_prompt_maps_images_into_inline_image_parts() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        server.set_skills(vec![json!({
+            "name": "caveman",
+            "description": "Ultra-compressed communication mode.",
+            "path": "/home/u/.codex/skills/caveman/SKILL.md",
+            "scope": "user",
+            "enabled": true,
+            "pluginId": null,
+        })]);
+        let client = connect(&url).await;
+        client
+            .list_skills(Some("/work/cola"))
+            .await
+            .into_iter()
+            .next()
+            .expect("the skill the prompt will attach");
+
+        let files = vec![
+            PromptFile {
+                mime: "image/png".into(),
+                data_base64: "aW1n".into(),
+                name: None,
+            },
+            PromptFile {
+                mime: "image/jpeg".into(),
+                data_base64: "anBlZw==".into(),
+                name: None,
+            },
+        ];
+        client
+            .prompt(
+                "thread-1",
+                "what is wrong here?",
+                &files,
+                &[PromptSkill {
+                    id: "caveman".into(),
+                    name: "caveman".into(),
+                }],
+                None,
+                None,
+                None,
+                Some("msg_cola_img"),
+            )
+            .await
+            .expect("the image prompt submits");
+
+        let params = server.turn_params("thread-1");
+        assert_eq!(params.len(), 1, "one turn/start");
+        assert_eq!(
+            params[0]["input"],
+            json!([
+                { "type": "text", "text": "what is wrong here?", "text_elements": [] },
+                { "type": "image", "url": "data:image/png;base64,aW1n" },
+                { "type": "image", "url": "data:image/jpeg;base64,anBlZw==" },
+                {
+                    "type": "skill",
+                    "name": "caveman",
+                    "path": "/home/u/.codex/skills/caveman/SKILL.md"
+                },
+            ]),
+            "text, then each image in attachment order, then the skills"
+        );
+    }
+
+    /// A supplement's image takes the same mapping: `turn/steer` carries the
+    /// `input` array too, so the in-flight case from issue #1055 works.
+    #[tokio::test]
+    async fn a_supplement_steers_images_as_inline_image_parts() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client
+            .prompt(
+                "thread-1",
+                "first message",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_1"),
+            )
+            .await
+            .expect("the first prompt");
+        wait_for_live_turn(&client, "thread-1").await;
+
+        client
+            .steer(
+                "thread-1",
+                "and this screenshot",
+                &[PromptFile {
+                    mime: "image/png".into(),
+                    data_base64: "aW1n".into(),
+                    name: None,
+                }],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_2"),
+            )
+            .await
+            .expect("the image supplement steers");
+
+        let steers = server.steer_params();
+        assert_eq!(steers.len(), 1, "turn/steer, not a second turn/start");
+        assert_eq!(
+            steers[0]["input"],
+            json!([
+                { "type": "text", "text": "and this screenshot", "text_elements": [] },
+                { "type": "image", "url": "data:image/png;base64,aW1n" },
+            ]),
+            "the steer carries the image the same way"
+        );
+        assert_eq!(server.turn_starts(), 1, "the supplement never starts a turn");
+    }
+
+    /// Codex's `UserInput` has no document/file variant, so a PDF (or text
+    /// file) is refused **by name before** the turn starts, rather than being
+    /// silently left out. The refusal is a pre-send validation failure, so no
+    /// authorship marker may be left behind.
+    #[tokio::test]
+    async fn a_non_image_attachment_is_refused_before_the_turn_starts() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+
+        let error = client
+            .prompt(
+                "thread-1",
+                "[文件: report.pdf]",
+                &[PromptFile {
+                    mime: "application/pdf".into(),
+                    data_base64: "JVBERi0=".into(),
+                    name: Some("report.pdf".into()),
+                }],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_pdf"),
+            )
+            .await
+            .expect_err("a PDF has no codex input variant");
+
+        let detail = error.to_string();
+        assert!(detail.contains("image attachments only"), "{detail}");
+        assert!(detail.contains("report.pdf"), "{detail}");
+        assert_eq!(server.turn_starts(), 0, "nothing was submitted");
+        assert!(
+            client.authored.pending_kind("thread-1", "msg_cola_pdf").is_none(),
+            "a pre-send refusal leaves no marker behind"
+        );
+    }
+
+    /// The supplement path refuses a non-image the same way, before
+    /// `turn/steer` — a failed supplement must cost no marker either.
+    #[tokio::test]
+    async fn a_supplement_refuses_a_non_image_attachment_before_the_steer() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client
+            .prompt(
+                "thread-1",
+                "first message",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_1"),
+            )
+            .await
+            .expect("the first prompt");
+        wait_for_live_turn(&client, "thread-1").await;
+
+        let error = client
+            .steer(
+                "thread-1",
+                "[文件: report.pdf]",
+                &[PromptFile {
+                    mime: "application/pdf".into(),
+                    data_base64: "JVBERi0=".into(),
+                    name: Some("report.pdf".into()),
+                }],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_pdf"),
+            )
+            .await
+            .expect_err("a PDF has no codex input variant");
+
+        assert!(error.to_string().contains("report.pdf"));
+        assert!(server.steer_params().is_empty(), "nothing was steered");
+        assert_eq!(server.turn_starts(), 1, "no new turn either");
+        assert!(
+            client.authored.pending_kind("thread-1", "msg_cola_pdf").is_none(),
+            "a pre-send refusal leaves no marker behind"
+        );
+    }
+
+    /// Issue #1055's other half, matching the Codex TUI's own gate: when the
+    /// `model/list` catalog says the model is text-only, the image is refused
+    /// **before** the turn starts — Codex would otherwise replace it with a
+    /// text fragment and the model would never see it.
+    #[tokio::test]
+    async fn an_image_prompt_is_refused_when_the_model_is_text_only() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a real thread");
+        thread.model = Some("text-only".into());
+        thread.model_provider = Some("custom".into());
+        server.seed_thread(thread);
+        server.set_models(vec![json!({
+            "id": "text-only",
+            "model": "text-only",
+            "hidden": false,
+            "inputModalities": ["text"],
+            "supportedReasoningEfforts": [],
+        })]);
+        let client = connect(&url).await;
+        settled(&client, "thread-1").await;
+        assert_eq!(
+            client.projections.model("thread-1").map(|held| held.model_id),
+            Some("text-only".to_string()),
+            "the gate has the thread's model fact to answer for"
+        );
+
+        let error = client
+            .prompt(
+                "thread-1",
+                "[图片]",
+                &[PromptFile {
+                    mime: "image/png".into(),
+                    data_base64: "aW1n".into(),
+                    name: None,
+                }],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_img"),
+            )
+            .await
+            .expect_err("a text-only model cannot take the image");
+
+        let detail = error.to_string();
+        assert!(detail.contains("does not advertise image input"), "{detail}");
+        assert!(detail.contains("text-only"), "{detail}");
+        assert_eq!(server.turn_starts(), 0, "nothing was submitted");
+        assert!(
+            client.authored.pending_kind("thread-1", "msg_cola_img").is_none(),
+            "a pre-send refusal leaves no marker behind"
+        );
+    }
+
+    /// A supplement applies the same gate against the live turn's model fact,
+    /// since a steer cannot change the model the running turn captured.
+    #[tokio::test]
+    async fn an_image_supplement_is_refused_when_the_model_is_text_only() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a real thread");
+        thread.model = Some("text-only".into());
+        thread.model_provider = Some("custom".into());
+        server.seed_thread(thread);
+        server.set_models(vec![json!({
+            "id": "text-only",
+            "model": "text-only",
+            "hidden": false,
+            "inputModalities": ["text"],
+            "supportedReasoningEfforts": [],
+        })]);
+        server.echo_prompts("thread-1");
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+        settled(&client, "thread-1").await;
+
+        client
+            .prompt(
+                "thread-1",
+                "first message",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_1"),
+            )
+            .await
+            .expect("a text-only turn still accepts text");
+        wait_for_live_turn(&client, "thread-1").await;
+
+        let error = client
+            .steer(
+                "thread-1",
+                "[图片]",
+                &[PromptFile {
+                    mime: "image/png".into(),
+                    data_base64: "aW1n".into(),
+                    name: None,
+                }],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_img"),
+            )
+            .await
+            .expect_err("the live turn's text-only model cannot take the image");
+
+        assert!(error.to_string().contains("does not advertise image input"));
+        assert!(server.steer_params().is_empty(), "nothing was steered");
+        assert_eq!(server.turn_starts(), 1, "no new turn either");
+        assert!(
+            client.authored.pending_kind("thread-1", "msg_cola_img").is_none(),
+            "a pre-send refusal leaves no marker behind"
         );
     }
 
