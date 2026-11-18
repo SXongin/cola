@@ -1,5 +1,12 @@
 # Supplement-triggered Card Chain splits and Instant Reminder pinning
 
+> **Amended by ADR-0109 (2026-11-18)**: "Every supplement splits" holds for a
+> supplement that merged, and for a failed one only while a held guard still
+> owns the chain. The failed continuation carries
+> 「⚠️ 补充消息未确认送达，请留意当前回复」 instead of the receipt, and no separate
+> notice repeats it; a failed supplement that lost the guard keeps the chain and
+> reports a plain notice (#1056).
+
 Feishu cannot move a message: a card update (PATCH) leaves the card where it
 was sent, and the conversation-list preview always shows the newest message.
 A user message sent while a Turn is in flight (a **Supplement**) therefore

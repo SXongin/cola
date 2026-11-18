@@ -672,20 +672,21 @@ async fn a_re_switch_confirmation_gather_carries_the_session() {
 }
 
 /// ADR-0062's routing log: exactly one INFO line per routing decision, naming
-/// the session and the ownership verdict (with the advisory status when there
-/// is no owned chain) — and never the message body. Ownership alone decides
-/// the route; a message with no owned chain logs the advisory read it made,
-/// an owned one does not need a read at all.
+/// the session and the ownership verdict — and never the message body. A held
+/// guard decides with no read at all; a card-only claim is logged with the
+/// advisory read it spends and still routes a new Turn (#1056, ADR-0109); a
+/// message with no owned chain logs the read it made.
 #[tokio::test]
 async fn prompt_routing_logs_the_ownership_verdict_without_the_message() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = MockBackend::new(realistic_parts());
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
     // The first (advisory) read says Busy; every read after it serves the map
     // (idle), so the new Turn settles instead of observing a live run forever.
     backend.busy_then_idle_once();
-    let (app, _platform) = build_app(cfg, backend).await;
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
     seed_session(&app, "ses_test", "/work").await;
 
     // No owned chain: the advisory read is recorded, and it routed nothing —
@@ -755,11 +756,15 @@ async fn prompt_routing_logs_the_ownership_verdict_without_the_message() {
         "the message body must never be logged:\n{logs}"
     );
 
-    // The other owned verdict: a render-owned card chain with a free guard
-    // (the busy-follow shape) is ownership too, and its name is its own.
+    // A render-owned card with a free guard is NOT ownership for routing
+    // (#1056, ADR-0109): the card is a display state, not proof of a writer, so
+    // even a live advisory read starts a Turn and the line names the claim it
+    // refused. (A live renderer holds the guard for its window, so production
+    // never reaches this shape while a run is actually being rendered.)
     app.inflight.lock().await.remove("ses_test");
     Turn::seed_card(&app.cards_handle(), "ses_test", Some("om_live")).await;
     Turn::set_card_state(&app.cards_handle(), "ses_test", CardState::Streaming).await;
+    backend.busy_then_idle_once();
     let text = "卡片链上的追问";
     let ((), logs) = capture_logs(async {
         app.handle_message(incoming(
@@ -775,12 +780,10 @@ async fn prompt_routing_logs_the_ownership_verdict_without_the_message() {
     .await;
     let line = line_with(&logs, "prompt routing:");
     assert!(
-        line.contains("ownership=card-chain") && line.contains("route=supplement"),
-        "a render-owned chain routes the Supplement without a guard: {line}"
-    );
-    assert!(
-        !line.contains("advisory="),
-        "a card-chain ownership needs no advisory read: {line}"
+        line.contains("ownership=card-chain")
+            && line.contains("advisory=live")
+            && line.contains("route=turn"),
+        "a card-only claim never routes a Supplement, even with a live read: {line}"
     );
     assert!(
         !logs.contains(text),

@@ -1,5 +1,10 @@
 # In-place Wake resumption: one card per request
 
+> **Amended by ADR-0109 (2026-11-18)**: the mid-resume message is a Supplement
+> because the Wake settle loop leases the Session's in-flight guard for its
+> window, not because the card is render-owned. When the loop has exited the
+> card has no guard and a message starts a Turn (#1056).
+
 > **Amended by ADR-0074**: the Wake-less late tail no longer keeps the split —
 > it resumes an open yielded card in place or lands on the one neutral residual
 > Card (「📄 还有更新」), never a 「已恢复执行」 receipt. The no-reopen-terminal

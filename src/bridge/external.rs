@@ -1514,9 +1514,16 @@ impl ExternalFlow {
         let span = crate::bridge::span::external(sid, Some(thread_key));
         tokio::spawn(
             async move {
-                let Some((disposition, card_id)) =
-                    Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await
-                else {
+                // The Wake continuation's **guard lease** (ADR-0109): the
+                // resumed run is a live renderer, so a message arriving during
+                // it is a Supplement (ADR-0066) and a card with no loop is not
+                // mistaken for one (#1056). Reference-counted, so a
+                // replacement renderer keeps the guard with the survivor.
+                flow.waits.acquire_render_lease(&session_id).await;
+                let ending =
+                    Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await;
+                flow.waits.release_render_lease(&session_id).await;
+                let Some((disposition, card_id)) = ending else {
                     // The loop stopped owning the card (a new Turn, another
                     // arm) or its accumulator vanished: nothing ended here, so
                     // nothing is announced.
@@ -1699,7 +1706,35 @@ pub(crate) async fn session_subtitle(
 /// EXTERNAL user message starts a new turn, or the idle bound elapses with no
 /// observable progress (#457) — a cola-authored Supplement merges into the
 /// run this loop is already streaming (#451).
+/// The external renderer's **guard lease** (ADR-0109): the loop holds the
+/// Session's in-flight guard for its whole window — as the out-of-turn follow
+/// already does — so a message arriving during the run is a Supplement
+/// (ADR-0062) and a card left behind with no loop is not mistaken for a
+/// renderer (#1056). The lease is reference-counted, so a replacement loop that
+/// starts while this one retires keeps the guard with the surviving renderer.
 async fn external_render_loop(
+    handles: &FlowHandles,
+    session_id: String,
+    anchor: TurnAnchor,
+    poll_ms: u64,
+    read_timeout_ms: u64,
+    idle_timeout_ms: u64,
+) {
+    handles.waits.acquire_render_lease(&session_id).await;
+    external_render_loop_inner(
+        handles,
+        session_id.clone(),
+        anchor,
+        poll_ms,
+        read_timeout_ms,
+        idle_timeout_ms,
+    )
+    .await;
+    handles.waits.release_render_lease(&session_id).await;
+}
+
+/// The renderer itself; [`external_render_loop`] owns its guard lease.
+async fn external_render_loop_inner(
     handles: &FlowHandles,
     session_id: String,
     anchor: TurnAnchor,

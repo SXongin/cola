@@ -185,6 +185,18 @@ impl DirectoryBackend for BackendDirectory {
     }
 }
 
+/// What a [`Backend::steer`] did with a Supplement (ADR-0109).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// The message merged into a run the adapter steered into.
+    Merged,
+    /// The adapter could not merge and the caller allowed a new turn; the
+    /// message may have started one. A caller that must merge passes
+    /// `may_start_turn = false` and receives an error instead, so no run is
+    /// left without a renderer.
+    StartedTurn,
+}
+
 /// The backend, abstracted so tests can drive the bridge with canned responses
 /// instead of a live server. The real implementation is the OpenCode adapter;
 /// mock implementations feed scripted transcripts/permissions and verify what
@@ -353,6 +365,13 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// overrides this — Codex's `turn/steer` — so the bridge never has to know
     /// which shape the attached client speaks.
     ///
+    /// `may_start_turn` is the caller's contract (ADR-0109): a Supplement is
+    /// only routed while an in-process guard proves a writer, and the bridge
+    /// passes `false` — the steer must merge and must not start a run nobody
+    /// renders. An adapter with a fallback start respects it; one whose plain
+    /// prompt merges-or-starts reports [`SteerOutcome::Merged`] because the
+    /// caller's Turn owns the submitted message either way.
+    ///
     /// The remaining arguments carry the same per-turn axes as [`Self::prompt`].
     #[allow(clippy::too_many_arguments)] // the prompt axes, unchanged
     async fn steer(
@@ -365,9 +384,27 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
-    ) -> Result<()> {
+        may_start_turn: bool,
+    ) -> Result<SteerOutcome> {
+        if !may_start_turn {
+            // This generation's prompt starts an Execution when the session is
+            // idle. A merge-only steer must not leave that run without a
+            // renderer (#1056, ADR-0109): refuse before submitting when the
+            // status read says no run is live.
+            let live = self
+                .session_status(session_id, None)
+                .await?
+                .is_some_and(|status| status.is_live());
+            if !live {
+                return Err(crate::error::BridgeError::Client {
+                    client: "steer",
+                    detail: "no live run to steer; the message was not submitted".into(),
+                });
+            }
+        }
         self.prompt(session_id, text, files, skills, model, variant, agent, message_id)
-            .await
+            .await?;
+        Ok(SteerOutcome::Merged)
     }
 
     /// Whether `message_id` names a message **cola itself** wrote into this

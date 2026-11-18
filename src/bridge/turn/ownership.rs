@@ -206,6 +206,15 @@ impl CardOwnership {
         self.card_class
     }
 
+    /// Whether an in-process Turn (or the follow that inherited its guard)
+    /// holds the Session's in-flight guard — the one claim that PROVES a live
+    /// renderer rather than inferring one from the card's display state
+    /// (#1056). The card-only class can be stale: a failed Supplement can leave
+    /// a non-terminal card whose run is gone.
+    pub(crate) fn holds_guard(&self) -> bool {
+        self.claim == Claim::Guard
+    }
+
     /// The card's message id, when a card exists — the identity the reap's
     /// record matching and the settle ticket's `covers` compare. Read by the
     /// reap's claim read (`gather_reads`), so the record match consumes the
@@ -238,13 +247,17 @@ impl CardOwnership {
         self.turn_anchor.as_ref()
     }
 
-    /// The Supplement routing key (ADR-0062): `Some(label)` when cola owns the
-    /// Session's live card chain — a guard held, or a render-owned card — with
-    /// the label the prompt router's INFO line logs (`guard` / `card-chain`),
-    /// so the decision and its name come from one value. `None` means a
-    /// Supplement would have no card to split: the message starts a new Turn.
-    /// A pending-inbound claim alone is deliberately not ownership (the #428
-    /// strand): the message is still being routed and owns no card yet.
+    /// The live-chain probe (ADR-0062, ADR-0070): `Some(label)` when cola
+    /// believes it owns the Session's live card chain — a guard held, or a
+    /// render-owned card — with the label callers log (`guard` / `card-chain`).
+    /// The Wake gate reads it to avoid double-rendering into a chain another
+    /// renderer drives; a pending-inbound claim alone is not ownership (the
+    /// #428 strand).
+    ///
+    /// NOT a Supplement routing key (ADR-0109): the prompt router requires a
+    /// held guard, because a `card-chain` claim is a display state, not proof
+    /// of a writer — a failed Supplement can leave one non-terminal with no run
+    /// behind it (#1056). [`Self::holds_guard`] is that stricter read.
     pub(crate) fn routing_label(&self) -> Option<&'static str> {
         if self.claim() == Claim::Guard {
             Some("guard")

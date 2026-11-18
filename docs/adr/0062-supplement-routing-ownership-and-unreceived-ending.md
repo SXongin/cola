@@ -1,5 +1,11 @@
 # Supplement routing: cola's own live ownership, and the Unreceived ending
 
+> **Amended by ADR-0109 (2026-11-18)**: the card-only arm is no longer a
+> Supplement routing key — a held guard is the one proof of a writer, and every
+> out-of-turn renderer (the external snapshot render, the Wake settle loop) now
+> leases the guard for its window. A card with no guard, including one with a
+> stale live read, starts a Turn (#1056).
+
 ## Context
 
 ADR-0059 made the Backend's own liveness the routing key: a user message

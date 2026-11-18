@@ -1178,8 +1178,8 @@ async fn a_supplement_split_hands_the_remaining_list_to_the_continuation() {
         "the resumed run is live on the request's card"
     );
 
-    // A message lands below it: the owned chain routes it as a Supplement and
-    // splits the chain at the message.
+    // A message lands below it: the resumed run holds the guard, so the owned
+    // chain routes it as a Supplement and splits the chain at the message.
     app.handle_message(incoming(
         "msg_sup".into(),
         "chat_1".into(),

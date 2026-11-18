@@ -629,3 +629,69 @@ async fn message_during_inflight_goes_to_supplement_path() {
     // The in-flight marker is preserved (still running).
     assert!(app.inflight.lock().await.contains("ses_test"));
 }
+
+/// ADR-0109: when the 404 recreate itself fails, the Turn settles its card as
+/// an Error BEFORE releasing the guard — a guard released over a live-looking
+/// card would let a Supplement split a chain with no writer left.
+#[tokio::test]
+async fn a_failed_recreate_settles_the_card_before_releasing_the_guard() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_session_id("ses_new");
+    backend.stale_session_mapping();
+    backend.fail_create_sessions(1);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let thread = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: thread,
+            session_id: "ses_old".into(),
+            directory: "/tmp/old".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let last = calls
+        .iter()
+        .rev()
+        .find_map(|call| match call {
+            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the failed recreate must still finalize its card");
+    assert!(
+        last.to_string().contains("❌"),
+        "the card settles as a failure: {last}"
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_old").await,
+        Some(crate::feishu::card::CardState::Error),
+        "the dead session's card is terminal before the guard is given back"
+    );
+    assert!(
+        !app.inflight.lock().await.contains("ses_old"),
+        "the guard is released"
+    );
+}

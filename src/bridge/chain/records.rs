@@ -1248,6 +1248,15 @@ impl ChainRecords {
         state.records.get(&client, session_id).cloned()
     }
 
+    /// Whether `session_id` has a durable record — the prompt router's
+    /// card-only pre-reap existence check (#1056). A cheap presence read; the
+    /// reap itself still reads the whole record.
+    pub(crate) fn has_record(&self, session_id: &str) -> bool {
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state.records.get(&client, session_id).is_some()
+    }
+
     /// Every record, as one snapshot — Session Sync's reap iterates this so a
     /// record whose session is no longer mapped is still reconciled.
     pub(crate) fn entries(&self) -> Vec<(String, ChainRecord)> {
