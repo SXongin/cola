@@ -465,7 +465,8 @@ non-blocking findings in full per review, lists any held-back blocking findings
 as one-line stubs (`file:line` and one clause), and exempts a security or
 data-loss finding the PR introduces or makes newly reachable, marking it
 `critical` and blocking. A missing or failed part of the review — an unreadable
-diff, or a claimed criterion that cannot be checked — is blocking too.
+diff, or an in-scope claimed criterion (one the diff, the PR metadata or the
+appended issues can decide) that the review could not check — is blocking too.
 
 **A push the gate reviews is a new review round.** The approval is pinned to
 the reviewed commit and `main: review` requires the last push to be approved,
