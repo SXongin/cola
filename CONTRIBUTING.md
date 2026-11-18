@@ -464,7 +464,8 @@ itself a non-blocking finding. The gate reports at most 3 blocking and 5
 non-blocking findings in full per review, lists any held-back blocking findings
 as one-line stubs (`file:line` and one clause), and exempts a security or
 data-loss finding the PR introduces or makes newly reachable, marking it
-`critical` and blocking.
+`critical` and blocking. A missing or failed part of the review — an unreadable
+diff, or a claimed criterion that cannot be checked — is blocking too.
 
 **A push the gate reviews is a new review round.** The approval is pinned to
 the reviewed commit and `main: review` requires the last push to be approved,
@@ -494,9 +495,9 @@ dossier, a round-3 PASS included. If the gate still FAILs after the user-approve
 round, stop and hand the PR to the user with the remaining findings: each further
 gate round needs their approval, a critical finding excepted, and merging with
 the admin bypass or closing the PR is theirs to decide, never the agent's.
-The budget counts every gate run that posts a review — a non-draft push, the
-`ready_for_review` flip that spends a draft's first review, or an `edited` body
-re-run. A run that fails before the model (an unfetchable reference, a credential
+The budget counts every gate run that posts a review — a non-draft push, a
+non-draft `opened`, the `ready_for_review` flip that spends a draft's first
+review, an `edited` body re-run, or a `reopened` run. A run that fails before the model (an unfetchable reference, a credential
 failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict. The local pair and gate
 rehearsal still run until no blocking finding remains (`docs/agents/flow.md`).

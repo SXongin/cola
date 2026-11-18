@@ -529,9 +529,9 @@ list becomes a follow-up issue linked from the dossier, a round-3 PASS included.
 If the gate still FAILs after that round,
 the agent stops and hands the PR to the user: further rounds need their
 approval, and the admin bypass or closing the PR is theirs to decide. The budget
-counts every gate run that posts a review — a non-draft push, the
-`ready_for_review` flip that spends a draft's first review, or an `edited` body
-re-run; a run that fails before the model (an unfetchable reference, a credential
+counts every gate run that posts a review — a non-draft push, a non-draft
+`opened`, the `ready_for_review` flip that spends a draft's first review, an
+`edited` body re-run, or a `reopened` run; a run that fails before the model (an unfetchable reference, a credential
 failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict; a push after a PASS for a real
 finding or a required rebase is a round like any other. The local pair and the gate
