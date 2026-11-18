@@ -521,7 +521,8 @@ remediation and the paths it directly touches, with the author assembling the
 fix and the gate re-reading the whole diff (it has no round history); when round
 3 still raises blocking findings, they are fixed in one push that needs the
 user's explicit approval; a `critical` security or data-loss finding is fixed
-and pushed first, without waiting for that approval. Only non-blocking and
+and pushed in its own round first, without waiting for that approval, and does
+not use up the approved verification round. Only non-blocking and
 out-of-scope findings, and pre-existing defects the diff neither creates nor
 makes newly reachable, may be deferred, into the dossier; a
 blocking finding is never deferred. Whenever the loop ends, a non-empty deferred

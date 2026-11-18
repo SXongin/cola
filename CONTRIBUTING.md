@@ -486,8 +486,9 @@ user's approval like any other.
 broad discovery; rounds 2–3 verify the remediation and the paths it directly
 touches, with the author assembling the fix and the gate re-reading the whole
 diff. A `critical` security or data-loss finding the diff introduces or makes
-newly reachable is fixed and pushed first, without waiting for the fourth-round
-approval — the one exception to that approval rule. When round 3 still raises
+newly reachable is fixed and pushed in its own round first, without waiting for
+that approval — the one exception to the approval rule, and it does not use up
+the approved verification round. When round 3 still raises
 other blocking findings, fix them in one batch and push once more; that
 verification round needs the user's explicit approval. Only non-blocking and
 out-of-scope findings, and pre-existing defects the diff neither creates nor
@@ -497,7 +498,8 @@ over — a non-empty deferred list becomes a follow-up issue linked from the
 dossier, a round-3 PASS included. If the gate still FAILs after the user-approved
 round, stop and hand the PR to the user with the remaining findings: each further
 gate round needs their approval, a critical finding excepted, and merging with
-the admin bypass or closing the PR is theirs to decide, never the agent's.
+the admin bypass or closing the PR is theirs to decide, never the agent's. If
+the user declines another round, hand the PR over as it stands.
 The budget counts every gate run that posts a review — a non-draft push, a
 non-draft `opened`, the `ready_for_review` flip that spends a draft's first
 review, an `edited` body re-run, or a `reopened` run. A run that fails before the model (an unfetchable reference, a credential
