@@ -2,6 +2,10 @@
 
 > **Amended by ADR-0034 (2026-11-17)**: the Codex gate's blocking definition,
 > finding cap and three-round budget — see the amendment at the end.
+>
+> **Amended by ADR-0034 (2026-11-18)**: the local gate rehearsal is removed; the
+> local pair and the CI gate's three-round budget stand — see the amendment at
+> the end.
 
 The repository runs OpenSSF Scorecard (weekly workflow, published results, README
 badge) and scored 6/10. The aggregate is a **risk-weighted** average
@@ -536,8 +540,10 @@ counts every gate run that posts a review — a non-draft push, a non-draft
 failure) posts none and is not a round, and the agent never re-runs the gate on
 an unchanged head to fish for a different verdict; a push after a PASS for a real
 finding or a required rebase is a round like any other. The local pair and the gate
-rehearsal keep their no-round-cap rule, and non-blocking findings are answered
-or deferred, not fixed. The dossier is a PR comment whose first line is
+rehearsal keep their no-round-cap rule **(superseded by ADR-0034 (2026-11-18):
+the local gate rehearsal is removed; the pair keeps its rule — see the
+amendment at the end.)**, and non-blocking findings are answered or deferred,
+not fixed. The dossier is a PR comment whose first line is
 `<!-- gate-dossier -->` — the rounds spent and the deferred findings — updated
 with `gh api --method PATCH` after each round. A comment does not trigger the
 gate, so the record never spends a round or re-reviews an approved or handed-over
@@ -550,3 +556,13 @@ Codex Action, the read-only posture, the line-final
 `CODEX_REVIEW_VERDICT: PASS|FAIL` contract, approval only on `PASS` pinned to
 the reviewed commit, and the skips. The verdict parser is unchanged, so this is
 a rubric and process amendment, not a contract change.
+
+## Amendment (2026-11-18): the local gate rehearsal is removed
+
+The local `codex exec` rehearsal added by #1053 did not reduce the CI gate's
+rounds: #1072, a docs-only PR with +245/−46 and 11 files, ran it repeatedly and still
+spent nine gate rounds and 32 commits. It is removed from `/implement-spec`, `flow.md`,
+`CONTRIBUTING`, `adversarial-review` and the Codex adapter
+(`.codex/skills/cola-implement-spec/SKILL.md`); the CI gate remains the single
+**approving** reviewer, and the three-round budget above still bounds it. The
+local pair keeps its no-round-cap rule.
