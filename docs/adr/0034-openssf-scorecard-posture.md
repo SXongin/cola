@@ -443,6 +443,21 @@ different lane. A lane that needs an extra request header — the Go lane's
 `x-opencode-session`, removed from the preflight with the 2026-11-06 move — is
 not covered by the switch and still requires a workflow change.
 
+## Amendment (2026-11-18): the gate returns to the Go lane on gpt-6-luna
+
+The Go lane's monthly allowance is available again, so the gate returns to
+`https://opencode.ai/zen/go/v1/responses` on `gpt-6-luna`, with the workspace's
+`OPENCODE_API_KEY` (the `GATE_KEY` secret still overrides). The 2026-11-07
+amendment's switch stays: the endpoint, model and key are repository settings,
+and the workflow's comment records the defaults.
+
+The move is a workflow change, as the 2026-11-07 amendment required: the
+credential preflight sends the Go lane's `x-opencode-session` header again
+(400 `MissingSessionID` without it), and an xtask guard asserts it. The gate
+shares the plan with the author-side `/code-review` pair, so both consume the
+same allowance — the reason the pair now runs on `glm-5.3-flash` instead of
+`gpt-6-luna`.
+
 ## Amendment (2026-10-17): a repo-local skill may shadow its upstream
 
 The 2026-10-09 amendment recorded that the upstream `/implement` and
