@@ -447,23 +447,24 @@ mod tests {
         // repository `vars` override the defaults, so the provider can be
         // switched from settings without editing the workflow.
         assert!(
-            workflow
-                .contains("GATE_ENDPOINT: ${{ vars.GATE_ENDPOINT || 'https://api.deepseek.com/responses' }}"),
-            "the gate's default endpoint must be DeepSeek's Responses API, overridable by vars.GATE_ENDPOINT"
+            workflow.contains(
+                "GATE_ENDPOINT: ${{ vars.GATE_ENDPOINT || 'https://opencode.ai/zen/go/v1/responses' }}"
+            ),
+            "the gate's default endpoint must be OpenCode Go's Responses lane, overridable by vars.GATE_ENDPOINT"
         );
         assert!(
-            workflow.contains("GATE_MODEL: ${{ vars.GATE_MODEL || 'deepseek-flash' }}"),
-            "the gate's default model must be deepseek-flash, overridable by vars.GATE_MODEL"
+            workflow.contains("GATE_MODEL: ${{ vars.GATE_MODEL || 'gpt-6-luna' }}"),
+            "the gate's default model must be gpt-6-luna, overridable by vars.GATE_MODEL"
         );
         let key_reads = workflow
-            .matches("secrets.GATE_KEY || secrets.DEEPSEEK_API_KEY")
+            .matches("secrets.GATE_KEY || secrets.OPENCODE_API_KEY")
             .count();
         assert_eq!(
             key_reads, 2,
-            "the preflight and the action must read the same key (GATE_KEY, else DEEPSEEK_API_KEY)"
+            "the preflight and the action must read the same key (GATE_KEY, else OPENCODE_API_KEY)"
         );
         assert!(
-            workflow.contains("GATE_KEY (or DEEPSEEK_API_KEY) is empty"),
+            workflow.contains("GATE_KEY (or OPENCODE_API_KEY) is empty"),
             "the empty-key message must name the secrets it wants"
         );
         // The action's `drop-sudo` fails on the ubuntu-26.04 image (2026-11-01),
@@ -510,12 +511,13 @@ mod tests {
             seen.contains("Authorization: Bearer test-key"),
             "the step must send the workflow's key"
         );
-        // The probe is a plain Responses call: no lane-specific header. The Go
-        // lane's `x-opencode-session` was dropped with the DeepSeek default,
-        // and a hard-coded lane header would break the next provider switch.
+        // The Go lane requires its session header (400 `MissingSessionID`
+        // without one), so the probe sends it; a lane that rejects an unknown
+        // header is a workflow change, not a repository-settings switch.
         assert!(
-            !seen.to_lowercase().contains("x-opencode-session"),
-            "the probe must send only what the endpoint needs: {seen}"
+            seen.to_lowercase()
+                .contains("x-opencode-session: cola-codex-gate-preflight"),
+            "the probe must send the Go lane's session header: {seen}"
         );
         for field in [
             r#""model":"test-model""#,
@@ -532,7 +534,7 @@ mod tests {
         let log = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "an empty key must fail the step");
         assert!(
-            log.contains("GATE_KEY (or DEEPSEEK_API_KEY) is empty"),
+            log.contains("GATE_KEY (or OPENCODE_API_KEY) is empty"),
             "the step must name the missing secret: {log}"
         );
     }
