@@ -5291,11 +5291,13 @@ impl StreamAccumulator {
                     );
                 }
                 TimelineKind::Text(t) => {
-                    // A text run that restarts here (a card split or a panel
-                    // between) re-establishes the construct this part's
-                    // previous text left open, so code stays code (#1096).
-                    if pending.is_empty()
-                        && item.lead().is_none()
+                    // A text run that restarts here (a card split, or another
+                    // part's text/panel between) re-establishes the construct
+                    // this part's previous text left open, so code stays code
+                    // (#1096). Skip when the pending blob already carries the
+                    // construct: the lead would only reopen it mid-blob.
+                    if item.lead().is_none()
+                        && crate::feishu::card::sanitize::neutralize_tail(&pending, t).is_none()
                         && let Some(lead) = self.part_continuation_lead(index)
                     {
                         pending.push_str(&lead);
@@ -7700,6 +7702,60 @@ mod tests {
         assert!(
             continuation.starts_with("```\nprint(<after>)"),
             "the interleaved continuation starts bare: {continuation:?}"
+        );
+        assert!(
+            continuation.contains("&#60;文字>"),
+            "prose swallowed into code: {continuation:?}"
+        );
+    }
+
+    /// Issue #1096, the preceding-text shape (Codex gate round 1): the
+    /// continuation card starts with ANOTHER part's text, so `pending` is
+    /// non-empty when the split part resumes. The pending blob is neutral, so
+    /// the part's own construct must still be re-opened at the junction.
+    #[test]
+    fn a_fence_reopens_after_another_parts_text_on_the_continuation_card() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Streaming;
+        let split = PartSource::at(MessageId::new("msg_1096"), 0);
+        let other = PartSource::at(MessageId::new("msg_1096"), 1);
+        acc.push_text_at_key(
+            Some(1_000),
+            Some(1_000),
+            Some(split.clone()),
+            "说明\n```python\nprint(<before>)\n",
+            None,
+        );
+        let boundary = acc.timeline().len();
+        acc.test_set_render_from(boundary);
+        // Another part's text reaches the live slice first; the split part
+        // resumes after it, in the same pending markdown run.
+        acc.push_text_at_key(
+            Some(2_000),
+            Some(2_000),
+            Some(other),
+            "另一个部分的说明。\n",
+            None,
+        );
+        acc.push_text_at_key(
+            Some(3_000),
+            Some(3_000),
+            Some(split),
+            "print(<after>)\n```\n后的 <文字>",
+            None,
+        );
+
+        let (card, _) = acc.build_card_with_split();
+        let continuation = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|element| element["content"].as_str())
+            .find(|content| content.contains("after"))
+            .expect("the continuation renders");
+        assert!(
+            continuation.contains("```\nprint(<after>)"),
+            "the continuation lost its re-opened fence: {continuation:?}"
         );
         assert!(
             continuation.contains("&#60;文字>"),
