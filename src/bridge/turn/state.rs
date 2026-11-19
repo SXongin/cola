@@ -5279,10 +5279,12 @@ impl StreamAccumulator {
                     }
                     // A seeded reasoning entry carries the lead its cut needs
                     // (spec #561): the construct the delivered prefix left
-                    // open is closed inside this panel.
+                    // open is closed inside this panel. The whole-card fenced
+                    // fallback renders this content as code, where a synthetic
+                    // markdown line would only appear literally (#1096).
                     let r = match item.lead() {
-                        Some(lead) => format!("{lead}{r}"),
-                        None => r.clone(),
+                        Some(lead) if !self.card_fallback.fenced() => format!("{lead}{r}"),
+                        _ => r.clone(),
                     };
                     builder = builder.with_reasoning_at(
                         &r,
@@ -5295,15 +5297,18 @@ impl StreamAccumulator {
                     // part's text/panel between) re-establishes the construct
                     // this part's previous text left open, so code stays code
                     // (#1096). Skip when the pending blob already carries the
-                    // construct: the lead would only reopen it mid-blob.
-                    if item.lead().is_none()
-                        && crate::feishu::card::sanitize::neutralize_tail(&pending, t).is_none()
-                        && let Some(lead) = self.part_continuation_lead(index)
-                    {
-                        pending.push_str(&lead);
-                    }
-                    if let Some(lead) = item.lead() {
-                        pending.push_str(lead);
+                    // construct: the lead would only reopen it mid-blob. The
+                    // fenced fallback renders the text as code, so no lead.
+                    if !self.card_fallback.fenced() {
+                        if item.lead().is_none()
+                            && crate::feishu::card::sanitize::neutralize_tail(&pending, t).is_none()
+                            && let Some(lead) = self.part_continuation_lead(index)
+                        {
+                            pending.push_str(&lead);
+                        }
+                        if let Some(lead) = item.lead() {
+                            pending.push_str(lead);
+                        }
                     }
                     pending.push_str(t);
                 }
@@ -7760,6 +7765,35 @@ mod tests {
         assert!(
             continuation.contains("&#60;文字>"),
             "prose swallowed into code: {continuation:?}"
+        );
+    }
+
+    /// Issue #1096: the whole-card fenced fallback (#886) renders every
+    /// markdown element as code, so a synthetic lead must not ride it — the
+    /// opener would show up literally inside the fallback block.
+    #[test]
+    fn the_fenced_fallback_renders_no_synthetic_lead() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Streaming;
+        acc.push_text_at_key(
+            Some(1_000),
+            Some(1_000),
+            None,
+            "print(1)\n",
+            Some("```\n".to_string()),
+        );
+        assert!(acc.advance_card_fallback(), "the card falls back to fenced");
+        let card = acc.build_card();
+        let content = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|element| element["content"].as_str())
+            .find(|content| content.contains("print(1)"))
+            .expect("the text renders");
+        assert_eq!(
+            content, "```\nprint(1)\n\n```",
+            "the lead must not ride the fallback: {content:?}"
         );
     }
 

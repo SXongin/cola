@@ -159,7 +159,18 @@ fn open_construct(prefix: &str) -> Option<OpenConstruct<'_>> {
     // back to the TABLE's own start — a line belonging to no table (no `|`)
     // ends the block, so a paragraph sitting directly above the header is
     // never crossed — and require the header/delimiter shape (a header alone
-    // counts — the cut landed between it and the delimiter).
+    // counts — the cut landed between it and the delimiter). A blank line
+    // after the last row CLOSES the table: the tail then starts a construct of
+    // its own (a separate table must not inherit this one's header, #1096).
+    let body = prefix.strip_suffix('\n').unwrap_or(prefix);
+    if body.contains('\n')
+        && body
+            .rsplit('\n')
+            .next()
+            .is_some_and(|line| line.trim().is_empty())
+    {
+        return None;
+    }
     let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
     if !lines[last].contains('|') {
         return None;
@@ -915,6 +926,22 @@ mod tests {
         assert!(
             before.trim_end().ends_with("```"),
             "the long table renders as code: {long_chunk:?}"
+        );
+    }
+
+    /// A table closed by a blank line is NOT open (issue #1096): a separate
+    /// table that follows on the tail must not inherit the previous header.
+    #[test]
+    fn a_table_closed_by_a_blank_line_is_not_reopened() {
+        let prefix = "| 名称 | 值 |\n|---|---|\n| 一 | 1 |\n\n";
+        assert_eq!(
+            neutralize_tail(prefix, "| 其他 | 值 |\n|---|---|\n| 二 | 2 |"),
+            None
+        );
+        // The same prefix without the blank line is a cut inside the table.
+        assert_eq!(
+            neutralize_tail(prefix.trim_end_matches('\n'), "| 一 | 2 |"),
+            Some("| 名称 | 值 |\n|---|---|\n".to_string())
         );
     }
 
