@@ -1185,6 +1185,10 @@ impl Timeline {
     }
 
     /// The merge/chunk walk shared by transcript text and a synthetic lead.
+    /// Each entry's text is the delivered characters alone; the markdown a
+    /// continuation needs (a fence opener, a table header) rides its `lead`,
+    /// so a construct crossing the per-entry budget stays one construct on the
+    /// card (issue #1096).
     fn push_text_at_slot(
         &mut self,
         slot: Slot,
@@ -1201,6 +1205,12 @@ impl Timeline {
         let mut remaining = chunk;
         let mut lead = lead;
         let mut first = Some(slot);
+        // The markdown already delivered for this part, as the card would
+        // render it (the last entry's lead included). Computed only when a new
+        // entry is needed: a fence or table crossing the per-card budget must
+        // be re-established on the continuation entry (issue #1096), exactly as
+        // a seeded cut's tail is.
+        let mut prefix: Option<String> = None;
         while !remaining.is_empty() {
             let space = match target.and_then(|idx| self.items.get(idx)) {
                 Some(item) => match item.kind() {
@@ -1209,8 +1219,32 @@ impl Timeline {
                 },
                 None => 0,
             };
-            if space == 0 {
-                let take: String = remaining.chars().take(max).collect();
+            // Fill the entry's leftover only when the next line fits whole: a
+            // cut through a line can split a fence opener or closer mid-token
+            // (issue #1096), so a line that does not fit starts the next entry
+            // instead. A line longer than one entry still has to be cut.
+            let next_line = remaining.split_inclusive('\n').next().unwrap_or(remaining);
+            let line = next_line.chars().count();
+            if space == 0 || (line > space && line <= max) {
+                let prefix = prefix.get_or_insert_with(|| match target.and_then(|idx| self.items.get(idx)) {
+                    Some(item) => match item.kind() {
+                        TimelineKind::Text(text) => {
+                            let mut markdown = item.lead().unwrap_or_default().to_string();
+                            markdown.push_str(text);
+                            markdown
+                        }
+                        _ => item.lead().unwrap_or_default().to_string(),
+                    },
+                    // No live entry of this part yet: the caller's lead already
+                    // names the construct the previous card left open.
+                    None => lead.clone().unwrap_or_default(),
+                });
+                let chunk_lead = crate::feishu::card::sanitize::neutralize_tail(prefix.as_str(), remaining);
+                let room = max
+                    .saturating_sub(chunk_lead.as_ref().map_or(0, |l| l.chars().count()))
+                    .max(1);
+                let take = crate::feishu::card::sanitize::take_line_bounded(remaining, room).to_string();
+                *prefix = format!("{}{}", chunk_lead.as_deref().unwrap_or_default(), take);
                 let pushed = source.clone();
                 target = Some(match target {
                     // Beside its own run: another part's equal-key entry may
@@ -1224,27 +1258,19 @@ impl Timeline {
                             shown_at,
                             pushed,
                             take.clone(),
-                            lead.take(),
+                            chunk_lead,
                             position,
                         )
                     }
                     None => {
                         let slot = first.take().unwrap_or_else(|| self.slot_for_new(key, position));
-                        self.seat_text_chunk(
-                            slot,
-                            None,
-                            shown_at,
-                            pushed,
-                            take.clone(),
-                            lead.take(),
-                            position,
-                        )
+                        self.seat_text_chunk(slot, None, shown_at, pushed, take.clone(), chunk_lead, position)
                     }
                 });
                 remaining = &remaining[take.len()..];
                 continue;
             }
-            let take: String = remaining.chars().take(space).collect();
+            let take = crate::feishu::card::sanitize::take_line_bounded(remaining, space).to_string();
             let idx = target.expect("space came from it");
             // `space` came from this exact entry a moment ago and nothing ran
             // in between, so the index is live.
@@ -1253,6 +1279,9 @@ impl Timeline {
                 last.push_str(&take);
             }
             Self::merge_part_metadata(item, source.as_ref(), &mut lead);
+            // The entry grew (and may have taken the caller's lead): the cached
+            // prefix is stale, and the next chunk boundary recomputes it.
+            prefix = None;
             remaining = &remaining[take.len()..];
         }
     }
@@ -2148,6 +2177,48 @@ mod tests {
         }
         let joined: String = text_items.iter().map(|t| t.as_str()).collect();
         assert_eq!(joined, long, "all text must be preserved across chunks");
+    }
+
+    /// Issue #1096: a fence crossing `MAX_CARD_TEXT_CHARS` must be re-opened on
+    /// the continuation entry. The entry's own text is the part's delivered
+    /// characters (never padded with markdown), so the opener rides the entry's
+    /// `lead` — rendered, never counted — exactly like a seeded cut's tail.
+    #[test]
+    fn a_part_split_across_cards_reopens_a_fence_on_the_continuation() {
+        let code: String = (0..400).map(|i| format!("print(<{i}>)  # 一行代码\n")).collect();
+        let text = format!("说明\n```python\n{code}```\n后的 <文字>");
+        assert!(text.chars().count() > MAX_CARD_TEXT_CHARS);
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text(&text);
+        let entries: Vec<&TimelineItem> = acc
+            .timeline()
+            .iter()
+            .filter(|item| matches!(item.kind(), TimelineKind::Text(_)))
+            .collect();
+        assert!(entries.len() > 1, "the fixture must cross the per-card budget");
+        let text_of = |item: &TimelineItem| match item.kind() {
+            TimelineKind::Text(text) => text.clone(),
+            _ => panic!("a text entry"),
+        };
+        let joined: String = entries.iter().map(|item| text_of(item)).collect();
+        assert_eq!(joined, text, "the delivered text is preserved across chunks");
+        // The first card ends inside the fence; the continuation re-opens it.
+        let first = text_of(entries[0]);
+        assert_eq!(
+            crate::feishu::card::sanitize::neutralize_tail(&first, "尾"),
+            Some("```\n".to_string())
+        );
+        assert_eq!(entries[1].lead(), Some("```\n"));
+        // Rendered as the card renders it (lead included), the continuation is
+        // code — and once the original closer lands, the prose after it is
+        // escaped as prose instead of being swallowed.
+        let effective = format!("{}{}", entries[1].lead().unwrap(), text_of(entries[1]));
+        let rendered = crate::feishu::card::sanitize::CardMarkdown::new().clean(&effective);
+        assert!(
+            rendered.starts_with("```\nprint(<") && rendered.contains("print(<"),
+            "the continuation lost its code: {:?}",
+            rendered.chars().take(40).collect::<String>()
+        );
     }
 
     /// #243 / ADR-0045: a pending tool first sighted before the server

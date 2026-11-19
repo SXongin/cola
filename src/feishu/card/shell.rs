@@ -199,7 +199,9 @@ impl CardBuilder {
         // per-element budget (MAX_ELEMENT_TEXT_CHARS), while the card splitter
         // bounds how much text one card carries. The split is a size budget,
         // not a workaround for a Feishu truncation. The text is sanitized as
-        // one blob (per-card table budget), then chunked.
+        // one blob (per-card table budget), then chunked self-containedly: a
+        // construct the cut crosses is closed on one element and re-opened on
+        // the next, since Feishu parses each element on its own (#1096).
         if self.markdown.is_fenced() {
             // Fallback mode: fence each chunk separately, so no element holds
             // an unclosed fence.
@@ -210,7 +212,7 @@ impl CardBuilder {
             return self;
         }
         let text = self.markdown.clean(text);
-        for chunk in chunk_text(&text, MAX_ELEMENT_TEXT_CHARS) {
+        for chunk in super::sanitize::chunk_markdown(&text, MAX_ELEMENT_TEXT_CHARS) {
             self.body.push(json!({ "tag": "markdown", "content": chunk }));
         }
         self
@@ -687,6 +689,40 @@ mod tests {
         assert!(
             content.contains("`<at id=x></at>`"),
             "inline code untouched: {content}"
+        );
+    }
+
+    /// Issue #1096: a fence crossing the per-element budget must be closed on
+    /// one element and re-opened on the next. The platform parses each element
+    /// on its own, so an opener left open on element N renders element N+1's
+    /// code as prose and turns the original closer into a new opener, swallowing
+    /// what follows.
+    #[test]
+    fn a_fence_crossing_the_element_budget_reopens_on_the_next_element() {
+        let code: String = (0..200).map(|i| format!("print(<{i}>)  # 一行代码\n")).collect();
+        let text = format!("说明\n```python\n{code}```\n后的 <文字>");
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_text(&text)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(elements.len() > 1, "the fixture must cross the element budget");
+        for element in elements {
+            let content = element["content"].as_str().unwrap();
+            assert_eq!(
+                crate::feishu::card::sanitize::neutralize_tail(content, "尾"),
+                None,
+                "an element ends inside a fence: {content:?}"
+            );
+        }
+        let joined: String = elements
+            .iter()
+            .map(|element| element["content"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("&#60;文字>"),
+            "prose swallowed into code: {joined}"
         );
     }
 

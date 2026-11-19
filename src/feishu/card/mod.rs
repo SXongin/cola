@@ -301,7 +301,10 @@ pub const MAX_CARD_JSON_CHARS: usize = FEISHU_CARD_LIMIT_BYTES - 5_000;
 pub const MAX_ELEMENT_TEXT_CHARS: usize = 3000;
 
 /// Split `text` into chunks of at most `max` chars (character-aware), keeping
-/// the full content. Used to bound single card elements and timeline items.
+/// the full content. This is the plain-text splitter — the whole-card fenced
+/// fallback fences each chunk itself — and is fence-blind; a markdown blob
+/// whose fences or tables must survive the cut goes through
+/// `sanitize::chunk_markdown` instead (issue #1096).
 pub(crate) fn chunk_text(text: &str, max: usize) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();

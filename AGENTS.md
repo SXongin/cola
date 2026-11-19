@@ -138,6 +138,14 @@ and the map from the old numbers.
   (`src/feishu/card/mod.rs`) are **cola's own** budgets, not Feishu limits, and
   the doc comment there holds the evidence. A tool panel deliberately exceeds
   3000 chars, so its size is not a bug and splitting it buys nothing.
+  **A markdown split must stay construct-aware** (#1096): Feishu parses each
+  card element on its own, so a fence or table crossing a budget goes through
+  `sanitize::chunk_markdown` (element splits) or the timeline entry's `lead`
+  plus `card_boundary_lead` (card splits), which close the construct on one
+  side and re-open it on the other. A bare continuation renders code as prose
+  and turns the original closer into a new opener, swallowing the prose after
+  it. A table can resume from a repeated header; a fence can only resume from
+  its own opener line.
 - **`card-repaints`** — every card PATCH rebuilds `body.elements`, and a form
   input's unsubmitted text lives only in the client, so **any** repaint wipes
   what the Host is typing (issue #917). Two rules follow.
