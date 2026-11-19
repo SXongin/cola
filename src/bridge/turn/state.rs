@@ -5025,6 +5025,41 @@ impl StreamAccumulator {
         !state.is_render_owned() && self.seeded_calls.contains(call_id)
     }
 
+    /// The markdown lead a card's first text entry needs because the card
+    /// boundary cut ONE part's text in two (issue #1096): the part grew after
+    /// its previous card was finalized, so it starts a fresh entry on the
+    /// continuation and no push-time lead rides it. Only a same-part neighbour
+    /// counts — a different part's text starts its own markdown.
+    fn card_boundary_lead(&self, start: usize) -> Option<String> {
+        if start == 0 {
+            return None;
+        }
+        let current = self.timeline.iter().nth(start)?;
+        let TimelineKind::Text(text) = current.kind() else {
+            return None;
+        };
+        // The entry already carries a lead when the split happened inside one
+        // push (the timeline chunker), so the boundary owes none.
+        if current.lead().is_some() {
+            return None;
+        }
+        let previous = self.timeline.iter().nth(start - 1)?;
+        let TimelineKind::Text(previous_text) = previous.kind() else {
+            return None;
+        };
+        let same_part = match (previous.source(), current.source()) {
+            // Source-less text runs merge like `source_entry` treats them.
+            (None, None) => true,
+            (Some(previous), Some(current)) => previous.same_part(current),
+            _ => false,
+        };
+        if !same_part {
+            return None;
+        }
+        let prefix = format!("{}{}", previous.lead().unwrap_or_default(), previous_text);
+        crate::feishu::card::sanitize::neutralize_tail(&prefix, text)
+    }
+
     /// First timeline index whose items would push the estimated component
     /// count over `MAX_CARD_COMPONENTS`, the estimated JSON size over
     /// `MAX_CARD_JSON_CHARS`, or the accumulated text over
@@ -5246,6 +5281,11 @@ impl StreamAccumulator {
         // so everything in [start..end) renders in full — no preview
         // truncation, no separate plain-text message.
         let mut pending = String::new();
+        // A card boundary inside one part's text re-establishes the construct
+        // the previous card's tail left open (#1096).
+        if let Some(lead) = self.card_boundary_lead(start) {
+            pending.push_str(&lead);
+        }
         for item in self.timeline.iter().take(end).skip(start) {
             match item.kind() {
                 TimelineKind::Reasoning(r) => {
@@ -7589,6 +7629,38 @@ mod tests {
             rest_text.contains("很长的回答。"),
             "tail text must appear on the continuation: {}",
             rest_text
+        );
+    }
+
+    /// Issue #1096: a part that grows AFTER its card was finalized starts a
+    /// fresh entry on the continuation, with no push-time lead. The card
+    /// boundary itself must re-open the fence the previous card's tail left
+    /// open, or the continuation renders its code as prose.
+    #[test]
+    fn a_fence_reopens_when_a_part_grows_after_its_card_was_finalized() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Streaming;
+        acc.push_text("说明\n```python\nprint(<before>)\n");
+        // The card holding the part finalized and handed every entry off; the
+        // part then keeps streaming onto the continuation.
+        let boundary = acc.timeline().len();
+        acc.test_set_render_from(boundary);
+        acc.push_text("print(<after>)\n```\n后的 <文字>");
+
+        let (card, _) = acc.build_card_with_split();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let continuation = elements
+            .iter()
+            .filter_map(|element| element["content"].as_str())
+            .find(|content| content.contains("after"))
+            .expect("the continuation renders");
+        assert!(
+            continuation.starts_with("```\nprint(<after>)"),
+            "the continuation starts bare: {continuation:?}"
+        );
+        assert!(
+            continuation.contains("&#60;文字>"),
+            "prose swallowed into code: {continuation:?}"
         );
     }
 

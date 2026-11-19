@@ -1847,7 +1847,13 @@ impl SessionCardBody<'_> {
                 format!("{role} {preview}…")
             };
             let body = tail_body(message);
-            let chunks = crate::feishu::card::chunk_text(&body, crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
+            // Chunked self-containedly: a fence crossing the element budget is
+            // closed and re-opened, so each fold body renders as the content it
+            // is (#1096).
+            let chunks = crate::feishu::card::sanitize::chunk_markdown(
+                &body,
+                crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
+            );
             let chunks: Vec<String> = chunks.iter().map(|c| md.clean(c)).collect();
             panels.push(super::shell::collapsible_panel_chunks(
                 &title,
@@ -3637,6 +3643,46 @@ mod tests {
         assert_eq!(
             body.lead_text(),
             "✅ 空闲\n\n**最近对话**\n👤 问题一\n🤖 回答一\n🗜 已压缩上下文（自动）\n保留了结论。\n👤 问题二\n🤖 回答二"
+        );
+    }
+
+    /// Issue #1096, tail surface: a long tail message is chunked into fold-body
+    /// elements, so a fence crossing the element budget must be closed and
+    /// re-opened there too — otherwise the same code-rendered-as-prose mangling
+    /// shows up in 最近对话.
+    #[test]
+    fn a_tail_message_fence_crossing_the_element_budget_reopens_on_the_next_element() {
+        let code: String = (0..200).map(|i| format!("print(<{i}>)  # 一行代码\n")).collect();
+        let text = format!("说明\n```python\n{code}```\n后的 <文字>");
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![body_message(MessageRole::Assistant, 1_000, &text)],
+        );
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let elements = body.tail_elements(&mut CardMarkdown::new());
+        let panel = elements
+            .iter()
+            .find(|element| element["tag"] == "collapsible_panel")
+            .expect("the tail renders one panel");
+        let chunks = panel["elements"].as_array().unwrap();
+        assert!(chunks.len() > 1, "the fixture must cross the element budget");
+        for chunk in chunks {
+            let content = chunk["content"].as_str().unwrap();
+            assert_eq!(
+                crate::feishu::card::sanitize::neutralize_tail(content, "尾"),
+                None,
+                "a fold-body chunk ends inside a fence: {content:?}"
+            );
+        }
+        let joined: String = chunks
+            .iter()
+            .map(|chunk| chunk["content"].as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("&#60;文字>"),
+            "prose swallowed into code: {joined}"
         );
     }
 

@@ -208,6 +208,86 @@ pub(crate) fn neutralize_tail(prefix: &str, suffix: &str) -> Option<String> {
     }
 }
 
+/// Split `text` into chunks of at most `max` characters for separate card
+/// elements (issue #1096), each **self-contained** as markdown: a chunk that
+/// starts inside a construct the previous chunk left open re-establishes it
+/// with the lead [`neutralize_tail`] gives a cut tail, and a chunk that ends
+/// inside a fenced block closes it. The platform parses every element on its
+/// own, so a bare continuation would render the code it carries as prose and
+/// turn the original closer into a new opener, swallowing what follows.
+///
+/// Cuts prefer line boundaries (so an opener or closer is never split
+/// mid-token); a line longer than the budget falls back to a character cut.
+/// The added lines are markdown, not content: callers that account for the
+/// text's own characters must use the timeline's `lead` mechanism instead.
+pub(crate) fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut chunks = Vec::new();
+    // The ORIGINAL text delivered so far (never the added markers): the
+    // prefix whose open construct the next chunk must re-establish.
+    let mut consumed = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let lead = neutralize_tail(&consumed, rest).unwrap_or_default();
+        let mut budget = max.saturating_sub(lead.chars().count()).max(1);
+        let mut raw = take_line_bounded(rest, budget);
+        // A fence still open at the cut costs a newline plus the opener's own
+        // run; shrink the take until the chunk plus its closer fits.
+        let mut ticks = open_fence_ticks(&format!("{consumed}{raw}"));
+        while let Some(open) = ticks {
+            let overhead = lead.chars().count() + open + 1;
+            if raw.chars().count() + overhead <= max {
+                break;
+            }
+            let over = raw.chars().count() + overhead - max;
+            let next = budget.saturating_sub(over).max(1);
+            if next >= budget {
+                break;
+            }
+            budget = next;
+            raw = take_line_bounded(rest, budget);
+            ticks = open_fence_ticks(&format!("{consumed}{raw}"));
+        }
+        let mut chunk = String::with_capacity(lead.len() + raw.len() + 8);
+        chunk.push_str(&lead);
+        chunk.push_str(raw);
+        if let Some(ticks) = ticks {
+            if !chunk.ends_with('\n') {
+                chunk.push('\n');
+            }
+            chunk.push_str(&"`".repeat(ticks));
+        }
+        chunks.push(chunk);
+        consumed.push_str(raw);
+        rest = &rest[raw.len()..];
+    }
+    chunks
+}
+
+/// The tick count of the fence `prefix` leaves open, if it leaves one.
+fn open_fence_ticks(prefix: &str) -> Option<usize> {
+    match open_construct(prefix)? {
+        OpenConstruct::Fence { ticks } => Some(ticks),
+        OpenConstruct::Table { .. } => None,
+    }
+}
+
+/// The longest prefix of `text` within `max` chars ending at a line boundary,
+/// falling back to the character cut when the line itself is longer than the
+/// budget (or the text carries no newline).
+pub(crate) fn take_line_bounded(text: &str, max: usize) -> &str {
+    let max = max.max(1);
+    // The whole text fits: take it all, newlines and all.
+    let Some((end, _)) = text.char_indices().nth(max) else {
+        return text;
+    };
+    let head = &text[..end];
+    match head.rfind('\n') {
+        Some(pos) => &text[..=pos],
+        None => head,
+    }
+}
+
 /// Per-card markdown hygiene state.
 pub(crate) struct CardMarkdown {
     /// Tables this card may still render natively; later ones become code.
@@ -635,6 +715,73 @@ mod tests {
             CardMarkdown::new().clean(&format!("{lead}| 二 | 2 |")),
             "| 名称 | 值 |\n|---|---|\n| 二 | 2 |"
         );
+    }
+
+    /// A blob split across elements (issue #1096): a fence crossing the
+    /// budget must leave no chunk starting inside code and none ending inside
+    /// a fence. Every chunk is self-contained, so the code lines render
+    /// verbatim (the sanitizer leaves them alone inside the fence) and the
+    /// prose after the original closer is escaped as prose (outside it).
+    #[test]
+    fn a_fence_crossing_the_element_budget_stays_self_contained() {
+        let code: String = (0..200).map(|i| format!("print(<{i}>)  # 一行代码\n")).collect();
+        let text = format!("说明\n```python\n{code}```\n后的 <文字>");
+        let chunks = chunk_markdown(&text, 3000);
+        assert!(chunks.len() > 1, "the fixture must cross the budget");
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= 3000,
+                "chunk over the element budget: {} chars",
+                chunk.chars().count()
+            );
+            assert_eq!(neutralize_tail(chunk, "尾"), None, "a chunk ends inside a fence");
+        }
+        let rendered: String = chunks
+            .iter()
+            .map(|chunk| CardMarkdown::new().clean(chunk))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("print(<199>)"),
+            "a code line rendered as prose (its `<` escaped): {rendered}"
+        );
+        assert!(
+            rendered.contains("&#60;文字>"),
+            "prose swallowed into a code block: {rendered}"
+        );
+    }
+
+    /// A chunk boundary is a line boundary whenever the budget allows one, so
+    /// an opener or closer is never cut mid-token (issue #1096). Only a line
+    /// longer than the budget itself falls back to a character cut.
+    #[test]
+    fn chunking_prefers_line_boundaries() {
+        let text = format!("第一行\n第二行\n{}", "长".repeat(30));
+        let chunks = chunk_markdown(&text, 6);
+        assert_eq!(
+            chunks[0], "第一行\n",
+            "a cut lands on the line end, not mid-token"
+        );
+        assert_eq!(chunks[1], "第二行\n");
+        assert_eq!(chunks[2], "长".repeat(6), "a long line falls back to a char cut");
+    }
+
+    /// A table crossing the element budget keeps its header on every chunk
+    /// (the same lead [`neutralize_tail`] gives a cut tail).
+    #[test]
+    fn a_table_crossing_the_element_budget_repeats_its_header() {
+        let rows: String = (0..40).map(|i| format!("| 行 {i} | 值 {i} |\n")).collect();
+        let text = format!("| 名称 | 值 |\n|---|---|\n{rows}尾注");
+        let chunks = chunk_markdown(&text, 60);
+        assert!(chunks.len() > 1);
+        for chunk in chunks.iter().skip(1) {
+            if chunk.contains('|') {
+                assert!(
+                    chunk.starts_with("| 名称 | 值 |\n|---|---|\n"),
+                    "a continued chunk lost the table header: {chunk:?}"
+                );
+            }
+        }
     }
 
     /// A table directly under a paragraph (no blank line between them) is
