@@ -141,11 +141,12 @@ and the map from the old numbers.
   **A markdown split must stay construct-aware** (#1096): Feishu parses each
   card element on its own, so a fence or table crossing a budget goes through
   `sanitize::chunk_markdown` (element splits) or the timeline entry's `lead`
-  plus `card_boundary_lead` (card splits), which close the construct on one
+  plus `part_continuation_lead` (card splits), which close the construct on one
   side and re-open it on the other. A bare continuation renders code as prose
   and turns the original closer into a new opener, swallowing the prose after
-  it. A table can resume from a repeated header; a fence can only resume from
-  its own opener line.
+  it. A fence resumes from its own opener line; a table that fits is moved
+  whole to the next element, and one that outgrows an element is fenced (a
+  repeated header would count as another table against the per-card cap).
 - **`card-repaints`** — every card PATCH rebuilds `body.elements`, and a form
   input's unsubmitted text lives only in the client, so **any** repaint wipes
   what the Host is typing (issue #917). Two rules follow.

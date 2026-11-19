@@ -37,7 +37,7 @@
 //! One instance is one card build: the table budget is per card, shared by
 //! every element and panel the build emits.
 
-use super::fenced_code;
+use super::{MAX_ELEMENT_TEXT_CHARS, fenced_code};
 
 /// Markdown tables Feishu accepts on one card, counted across the whole card
 /// (elements and panels alike): a 6th table fails with `230099/11310 card
@@ -216,6 +216,11 @@ pub(crate) fn neutralize_tail(prefix: &str, suffix: &str) -> Option<String> {
 /// own, so a bare continuation would render the code it carries as prose and
 /// turn the original closer into a new opener, swallowing what follows.
 ///
+/// A table that fits is moved whole to the next element instead of being cut —
+/// a repeated header is a second table, and the platform caps tables per card —
+/// so the table lead only appears for a table already started in an earlier
+/// chunk (a caller that cleans per chunk, or one too long for the budget).
+///
 /// Cuts prefer line boundaries (so an opener or closer is never split
 /// mid-token); a line longer than the budget falls back to a character cut.
 /// The added lines are markdown, not content: callers that account for the
@@ -231,6 +236,21 @@ pub(crate) fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
         let lead = neutralize_tail(&consumed, rest).unwrap_or_default();
         let mut budget = max.saturating_sub(lead.chars().count()).max(1);
         let mut raw = take_line_bounded(rest, budget);
+        // Keep a native table whole on one element: a cut inside one repeats
+        // its header as a SECOND table, and the platform caps tables per card.
+        // When the table started inside this take, end the chunk before it and
+        // let the next take carry it whole (a table too long for one element
+        // was already fenced by `clean`).
+        if !matches!(open_construct(&consumed), Some(OpenConstruct::Table { .. }))
+            && matches!(
+                open_construct(&format!("{consumed}{raw}")),
+                Some(OpenConstruct::Table { .. })
+            )
+            && let Some(offset) = open_table_start(raw)
+            && offset > 0
+        {
+            raw = &raw[..offset];
+        }
         // A fence still open at the cut costs a newline plus the opener's own
         // run; shrink the take until the chunk plus its closer fits.
         let mut ticks = open_fence_ticks(&format!("{consumed}{raw}"));
@@ -270,6 +290,35 @@ fn open_fence_ticks(prefix: &str) -> Option<usize> {
         OpenConstruct::Fence { ticks } => Some(ticks),
         OpenConstruct::Table { .. } => None,
     }
+}
+
+/// The byte offset at which the table `prefix` ends inside starts (its header
+/// line), when the prefix's last non-blank line is a row of one. Mirrors
+/// [`open_construct`]'s shape test.
+fn open_table_start(prefix: &str) -> Option<usize> {
+    let lines: Vec<&str> = prefix.split('\n').collect();
+    let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
+    if !lines[last].contains('|') {
+        return None;
+    }
+    let mut start = last;
+    while start > 0 && lines[start - 1].trim().contains('|') {
+        start -= 1;
+    }
+    if last > start && !is_delimiter_row(lines[start + 1]) {
+        return None;
+    }
+    Some(lines[..start].iter().map(|line| line.len() + 1).sum())
+}
+
+/// The characters a native table costs its element once every row is escaped
+/// (a row's `<` expands), newlines included: the element chunker measures the
+/// escaped text, so a table that fits before escaping may not fit after.
+fn native_table_len(region: &str) -> usize {
+    region
+        .split('\n')
+        .map(|line| escape_line(line).chars().count() + 1)
+        .sum()
 }
 
 /// The longest prefix of `text` within `max` chars ending at a line boundary,
@@ -358,7 +407,15 @@ impl CardMarkdown {
             }
             if let Some(end) = table_end(&lines, i) {
                 let region = lines[i..end].join("\n");
-                if self.tables_left == 0 || end - i - 2 > MAX_TABLE_ROWS {
+                if self.tables_left == 0
+                    || end - i - 2 > MAX_TABLE_ROWS
+                    // A table that outgrows one element would be cut into a
+                    // second table by the element chunker (its header is
+                    // repeated), and the platform caps tables per card — so
+                    // such a table is code here, exactly like an over-budget
+                    // one (issue #1096).
+                    || native_table_len(&region) > MAX_ELEMENT_TEXT_CHARS
+                {
                     out.push(fenced_code(&region, None));
                 } else {
                     self.tables_left -= 1;
@@ -782,6 +839,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A table that outgrows one element is fenced as code (issue #1096): the
+    /// element chunker would otherwise repeat its header on the next element,
+    /// and the platform caps native tables per card.
+    #[test]
+    fn a_table_too_long_for_one_element_is_fenced() {
+        let row = format!("| {} | 值 |\n", "长".repeat(100));
+        let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(30));
+        assert!(table.chars().count() > MAX_ELEMENT_TEXT_CHARS);
+        let cleaned = CardMarkdown::new().clean(&table);
+        assert!(
+            cleaned.starts_with("```\n"),
+            "the long table is one code block: {cleaned:?}"
+        );
+        assert!(cleaned.contains("| 名称 | 值 |"), "the rows survive: {cleaned:?}");
+    }
+
+    /// A table that fits one element is moved whole to the next element rather
+    /// than cut (issue #1096): a cut would repeat its header as a second table.
+    #[test]
+    fn a_fitting_table_moves_whole_to_the_next_element() {
+        let prose = "说明。\n".repeat(400);
+        let row = format!("| {} | 值 |\n", "x".repeat(50));
+        let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(10));
+        let text = format!("{prose}{table}尾注");
+        let chunks = chunk_markdown(&text, 1500);
+        assert!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.contains("| 名称 | 值 |"))
+                .count()
+                == 1,
+            "the table must stay on one element: {chunks:?}"
+        );
+        for chunk in &chunks {
+            assert_eq!(
+                neutralize_tail(chunk, "| 尾 | 值 |"),
+                None,
+                "a chunk ends inside a table"
+            );
+        }
+    }
+
+    /// The gate's shape (issue #1096): four native tables and a fifth longer
+    /// than the element budget. The fifth is code, so the card never carries a
+    /// sixth native table.
+    #[test]
+    fn a_long_fifth_table_does_not_become_a_sixth_native_table() {
+        let small = "| a | b |\n|---|---|\n| 1 | 2 |";
+        let row = format!("| {} | 值 |\n", "x".repeat(120));
+        let long = format!("| 长表 | 值 |\n|---|---|\n{}", row.repeat(30));
+        let text = format!("{small}\n\n{small}\n\n{small}\n\n{small}\n\n{long}\n\n尾注");
+        let cleaned = CardMarkdown::new().clean(&text);
+        let chunks = chunk_markdown(&cleaned, MAX_ELEMENT_TEXT_CHARS);
+        let native: usize = chunks
+            .iter()
+            .map(|chunk| chunk.lines().filter(|line| *line == "| a | b |").count())
+            .sum();
+        assert_eq!(native, 4, "four native tables: {chunks:?}");
+        let long_headers: usize = chunks
+            .iter()
+            .map(|chunk| chunk.matches("| 长表 | 值 |").count())
+            .sum();
+        assert_eq!(long_headers, 1, "the long table appears once: {chunks:?}");
+        let long_chunk = chunks
+            .iter()
+            .find(|chunk| chunk.contains("| 长表 | 值 |"))
+            .expect("the long table renders");
+        let before = long_chunk
+            .rsplit_once("| 长表 | 值 |")
+            .map(|(before, _)| before)
+            .unwrap();
+        assert!(
+            before.trim_end().ends_with("```"),
+            "the long table renders as code: {long_chunk:?}"
+        );
     }
 
     /// A table directly under a paragraph (no blank line between them) is
