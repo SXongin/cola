@@ -1846,15 +1846,16 @@ impl SessionCardBody<'_> {
             } else {
                 format!("{role} {preview}…")
             };
-            let body = tail_body(message);
-            // Chunked self-containedly: a fence crossing the element budget is
+            // Sanitized as one body (the per-card table budget counts each
+            // table once — a long one is fenced, not split into several), then
+            // chunked self-containedly: a fence crossing the element budget is
             // closed and re-opened, so each fold body renders as the content it
             // is (#1096).
+            let body = md.clean(&tail_body(message));
             let chunks = crate::feishu::card::sanitize::chunk_markdown(
                 &body,
                 crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
             );
-            let chunks: Vec<String> = chunks.iter().map(|c| md.clean(c)).collect();
             panels.push(super::shell::collapsible_panel_chunks(
                 &title,
                 &chunks,
@@ -3683,6 +3684,69 @@ mod tests {
         assert!(
             joined.contains("&#60;文字>"),
             "prose swallowed into code: {joined}"
+        );
+    }
+
+    /// A table header that renders outside a code fence, across a fold body's
+    /// chunked elements (each chunk is self-contained, so the fence state
+    /// resets at every element).
+    fn table_header_is_native(chunks: &[&str], header: &str) -> bool {
+        for chunk in chunks {
+            let mut fence = false;
+            for line in chunk.lines() {
+                if line.trim_start().starts_with("```") {
+                    fence = !fence;
+                    continue;
+                }
+                if !fence && line == header {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Issue #1096, tail tables: the body is sanitized as one body, so a long
+    /// table is fenced instead of being split into chunks whose repeated
+    /// headers each consume a per-card table slot. A later table stays native.
+    #[test]
+    fn a_long_table_in_a_tail_message_is_fenced_and_the_next_one_stays_native() {
+        let small = |name: &str| format!("| {name} | 值 |\n|---|---|\n| 1 | 2 |");
+        let row = format!("| {} | 值 |\n", "x".repeat(120));
+        let long = format!("| long | 值 |\n|---|---|\n{}", row.repeat(30));
+        let text = format!(
+            "{}\n\n{}\n\n{}\n\n{long}\n\n{}",
+            small("t1"),
+            small("t2"),
+            small("t3"),
+            small("t4")
+        );
+        let read = body_read(
+            Some(crate::backend::types::SessionStatus::Idle),
+            false,
+            vec![body_message(MessageRole::Assistant, 1_000, &text)],
+        );
+        let body = session_card_body(&read, &read.tail, 0, facts(&read));
+        let elements = body.tail_elements(&mut CardMarkdown::new());
+        let panel = elements
+            .iter()
+            .find(|element| element["tag"] == "collapsible_panel")
+            .expect("the tail renders one panel");
+        let chunks: Vec<&str> = panel["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|element| element["content"].as_str())
+            .collect();
+        for header in ["| t1 | 值 |", "| t2 | 值 |", "| t3 | 值 |", "| t4 | 值 |"] {
+            assert!(
+                table_header_is_native(&chunks, header),
+                "a fitting table must stay native ({header}): {chunks:?}"
+            );
+        }
+        assert!(
+            !table_header_is_native(&chunks, "| long | 值 |"),
+            "the long table renders as code: {chunks:?}"
         );
     }
 
