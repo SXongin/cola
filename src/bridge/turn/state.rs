@@ -5025,37 +5025,24 @@ impl StreamAccumulator {
         !state.is_render_owned() && self.seeded_calls.contains(call_id)
     }
 
-    /// The markdown lead a card's first text entry needs because the card
-    /// boundary cut ONE part's text in two (issue #1096): the part grew after
-    /// its previous card was finalized, so it starts a fresh entry on the
-    /// continuation and no push-time lead rides it. Only a same-part neighbour
-    /// counts — a different part's text starts its own markdown.
-    fn card_boundary_lead(&self, start: usize) -> Option<String> {
-        if start == 0 {
-            return None;
-        }
-        let current = self.timeline.iter().nth(start)?;
+    /// The markdown lead a text entry needs when it restarts a part's text
+    /// after a card split or a panel (issue #1096): its previous text entry —
+    /// the nearest earlier one of the same part — may have ended inside a
+    /// fence or table, and the new element must re-establish that construct.
+    /// The entry's own `lead` covers the split inside one push; this covers a
+    /// part that grew after its card was finalized.
+    fn part_continuation_lead(&self, index: usize) -> Option<String> {
+        let current = self.timeline.iter().nth(index)?;
         let TimelineKind::Text(text) = current.kind() else {
             return None;
         };
-        // The entry already carries a lead when the split happened inside one
-        // push (the timeline chunker), so the boundary owes none.
-        if current.lead().is_some() {
-            return None;
-        }
-        let previous = self.timeline.iter().nth(start - 1)?;
+        let previous = self.timeline.iter().take(index).rev().find(|item| {
+            matches!(item.kind(), TimelineKind::Text(_))
+                && crate::bridge::turn::timeline::same_source(item.source(), current.source())
+        })?;
         let TimelineKind::Text(previous_text) = previous.kind() else {
             return None;
         };
-        let same_part = match (previous.source(), current.source()) {
-            // Source-less text runs merge like `source_entry` treats them.
-            (None, None) => true,
-            (Some(previous), Some(current)) => previous.same_part(current),
-            _ => false,
-        };
-        if !same_part {
-            return None;
-        }
         let prefix = format!("{}{}", previous.lead().unwrap_or_default(), previous_text);
         crate::feishu::card::sanitize::neutralize_tail(&prefix, text)
     }
@@ -5179,8 +5166,10 @@ impl StreamAccumulator {
                 // Text is chunked to ≤ MAX_CARD_TEXT_CHARS per item, so a
                 // single item never exceeds the per-card budget; the budget
                 // accumulates across items and splits at the boundary. The
-                // component estimate mirrors `with_text`, which splits each
-                // element at MAX_ELEMENT_TEXT_CHARS.
+                // component estimate is a LOWER bound: `with_text` chunks at
+                // MAX_ELEMENT_TEXT_CHARS but a construct lead or line-boundary
+                // slack can add an element, and the budget's own margin
+                // absorbs it.
                 TimelineKind::Text(t) => {
                     let chars = t.chars().count();
                     let elements = chars.div_ceil(crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
@@ -5281,12 +5270,7 @@ impl StreamAccumulator {
         // so everything in [start..end) renders in full — no preview
         // truncation, no separate plain-text message.
         let mut pending = String::new();
-        // A card boundary inside one part's text re-establishes the construct
-        // the previous card's tail left open (#1096).
-        if let Some(lead) = self.card_boundary_lead(start) {
-            pending.push_str(&lead);
-        }
-        for item in self.timeline.iter().take(end).skip(start) {
+        for (index, item) in self.timeline.iter().take(end).enumerate().skip(start) {
             match item.kind() {
                 TimelineKind::Reasoning(r) => {
                     if !pending.is_empty() {
@@ -5307,6 +5291,15 @@ impl StreamAccumulator {
                     );
                 }
                 TimelineKind::Text(t) => {
+                    // A text run that restarts here (a card split or a panel
+                    // between) re-establishes the construct this part's
+                    // previous text left open, so code stays code (#1096).
+                    if pending.is_empty()
+                        && item.lead().is_none()
+                        && let Some(lead) = self.part_continuation_lead(index)
+                    {
+                        pending.push_str(&lead);
+                    }
                     if let Some(lead) = item.lead() {
                         pending.push_str(lead);
                     }
@@ -7657,6 +7650,56 @@ mod tests {
         assert!(
             continuation.starts_with("```\nprint(<after>)"),
             "the continuation starts bare: {continuation:?}"
+        );
+        assert!(
+            continuation.contains("&#60;文字>"),
+            "prose swallowed into code: {continuation:?}"
+        );
+    }
+
+    /// Issue #1096, the interleaved shape: the continuation card can begin
+    /// with another part's panel (a clamped later arrival), so the part's
+    /// reopened text is not the card's first item. The lead is derived from the
+    /// part's own previous text, not from the adjacent item.
+    #[test]
+    fn a_fence_reopens_when_a_panel_sits_between_the_parts_split_text() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Streaming;
+        let source = PartSource::at(MessageId::new("msg_1096"), 0);
+        acc.push_text_at_key(
+            Some(1_000),
+            Some(1_000),
+            Some(source.clone()),
+            "说明\n```python\nprint(<before>)\n",
+            None,
+        );
+        let boundary = acc.timeline().len();
+        acc.test_set_render_from(boundary);
+        // The panel reaches the live slice first; the part then continues after
+        // it, so the card starts with the panel.
+        acc.push_reasoning_at_key(Some(2_000), Some(2_000), None, "想一想", None);
+        acc.push_text_at_key(
+            Some(3_000),
+            Some(3_000),
+            Some(source),
+            "print(<after>)\n```\n后的 <文字>",
+            None,
+        );
+
+        let (card, _) = acc.build_card_with_split();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements[0]["tag"], "collapsible_panel",
+            "the arrangement the test pins: the panel is the card's first item"
+        );
+        let continuation = elements
+            .iter()
+            .filter_map(|element| element["content"].as_str())
+            .find(|content| content.contains("after"))
+            .expect("the continuation renders");
+        assert!(
+            continuation.starts_with("```\nprint(<after>)"),
+            "the interleaved continuation starts bare: {continuation:?}"
         );
         assert!(
             continuation.contains("&#60;文字>"),
