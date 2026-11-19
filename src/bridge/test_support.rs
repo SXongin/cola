@@ -184,6 +184,23 @@ pub(crate) fn shell_wake(created_ms: i64) -> Wake {
     }
 }
 
+/// The synthetic message [`shell_wake`] is decoded from: the real read carries
+/// the Wake's own message (V2's `synthetic` type, never a User role, so it
+/// cannot become a Turn anchor), between the work that backgrounded the task
+/// and the work the Wake resumed. A card's "does it already show this Wake's
+/// work" answer is read from the read's message positions (issue #1087), so a
+/// fixture that models the absorbed Wake must carry the message.
+pub(crate) fn wake_message(created_ms: i64) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_wake_{created_ms}"),
+        MessageRole::Other("synthetic".into()),
+        Some(created_ms),
+        vec![text_part(&format!(
+            "<shell shellID=\"sh_bg\" command=\"gh run watch\" state=\"completed\">{created_ms}</shell>"
+        ))],
+    )
+}
+
 /// A subagent completion Wake with the task description its text names, for
 /// the completion entry's title (`🔔 subagent 完成：…`).
 pub(crate) fn subagent_wake(created_ms: i64, description: &str) -> Wake {

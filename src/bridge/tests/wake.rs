@@ -44,8 +44,8 @@ use super::drain::{
 use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, ReasoningPart, SessionTranscript,
-    StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
-    WakeSource,
+    ShellEnd, ShellRuntime, StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    TranscriptMessage, Wake, WakeSource,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{CardOwnership, ContinuationFacts, Turn};
@@ -879,6 +879,140 @@ async fn a_wake_after_a_done_card_continues_on_a_new_card() {
         platform.sent_cards().await.iter().any(is_continuation),
         "a terminal card has no live reply target: the continuation lands top-level"
     );
+}
+
+/// Issue #1087: a completion Wake that lands WHILE its Turn is still running is
+/// absorbed by that Turn — its work renders on the Turn's card, which then ends
+/// ✅. The card showed the work, so the Wake was handed over: Session Sync's
+/// Wake step owes nothing after the ending and must not re-post the work as a
+/// Fresh 「🔔 已恢复执行」 card.
+///
+/// The runtime reports the shell ended mid-run, so the run's EVIDENCE ending is
+/// recorded here and the Wake's own completion entry is the same fact twice
+/// (#659) — suppressed, and with it the durable Wake Watermark (rendering the
+/// work is a separate handoff, ADR-0066). That is the shape the live report
+/// carries: nothing durable says "this Wake was shown", so the Wake step must
+/// read the CARD's rendered scope.
+#[tokio::test]
+async fn a_wake_absorbed_by_a_live_turn_is_not_re_posted_after_the_card_ends() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let started = now - 5_000;
+    // The shell this Wake completes, launched in the Turn's own run and still
+    // listed live by the read (the runtime verdict is what ends it).
+    let task = BackgroundTask {
+        tool: ToolIdentity {
+            name: "shell".into(),
+            call_id: "call_bg".into(),
+        },
+        shell_id: Some("sh_call_bg".into()),
+        child_id: None,
+        started_at: Some(started),
+    };
+    let mut wake = shell_wake(2_900);
+    wake.shell_id = Some("sh_call_bg".into());
+    wake.job_id = Some("sh_call_bg".into());
+    // The Turn's own read: the shell completed mid-run and the same run
+    // answered it before going idle.
+    let absorbed = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        background_shell_launch(1_500, "call_bg", "sh_call_bg", "gh run watch"),
+        assistant(2_000, "已经交给后台了。"),
+        wake_message(2_900),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(4_000)])
+    .with_wakes(vec![wake])
+    .with_background_tasks(vec![task]);
+    let (_dir, app, backend, platform) = scripted_app(vec![absorbed], Some(SessionStatus::Idle)).await;
+    backend.task_runtime.lock().unwrap().shells = vec![(
+        "sh_call_bg".into(),
+        ShellRuntime::Ended {
+            end: ShellEnd::Exited,
+            completed_at: Some(now - 1_000),
+        },
+    )];
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the Turn absorbed the Wake's work and ended ✅"
+    );
+    let text = card_text(platform.updated_cards().await.last().expect("the Turn's card"));
+    assert_eq!(
+        text.matches("CI 通过了。").count(),
+        1,
+        "the absorbed work renders once on the Turn's own card: {text}"
+    );
+    // The render that placed the work is what records the handoff — before any
+    // Session Sync pass could take the floor below it. Asserting it here (not
+    // only the absence of a card) pins the render walk itself: the floor in
+    // `wake_continuation` re-asks the same diff, so a mark reverted from the
+    // render would still leave the sync pass quiet.
+    assert!(
+        Turn::has_handed_over_wake(&app.cards_handle(), "ses_test", "msg_wake_2900").await,
+        "the render that placed the Wake's work hands it over to the card"
+    );
+    let posts = card_posts(&platform).await;
+
+    spawn_sync(&app);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        card_posts(&platform).await,
+        posts,
+        "an absorbed Wake owes no continuation after the ending: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        !platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains(WAKE_LEAD)),
+        "no 承接 card replays the work the finished card already showed: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// Issue #1087 is completion-scoped: a restart or interrupt Wake whose work a
+/// live Turn renders is NOT handed over. ADR-0066 keeps its 承接 split, and a
+/// render-walk mark would silently skip that split — the live session renders
+/// the resumed work on the same card in this shape, which is exactly the case
+/// the existing `restart_like_wake_on_a_waiting_card_still_splits` never
+/// exercises.
+#[tokio::test]
+async fn a_restart_or_interrupt_wake_absorbed_by_a_live_turn_keeps_its_split() {
+    for source in [WakeSource::Restart, WakeSource::Interrupt] {
+        let _wd = test_work_dir();
+        let mut wake = shell_wake(2_900);
+        wake.source = source.clone();
+        wake.label = None;
+        let absorbed = SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "跑一下 CI"),
+            assistant(2_000, "已经交给后台了。"),
+            wake_message(2_900),
+            assistant(3_100, "重启后继续。"),
+        ])
+        .with_executions(vec![execution(4_000)])
+        .with_wakes(vec![wake]);
+        let (_dir, app, _backend, _platform) = scripted_app(vec![absorbed], Some(SessionStatus::Idle)).await;
+
+        Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+            .await
+            .unwrap();
+        assert_eq!(
+            Turn::card_state(&app.cards_handle(), "ses_test").await,
+            Some(CardState::Done)
+        );
+        assert!(
+            !Turn::has_handed_over_wake(&app.cards_handle(), "ses_test", "msg_wake_2900").await,
+            "a {source:?} Wake keeps its 承接 split: the render walk must not hand it over"
+        );
+    }
 }
 
 /// A `/card` read replaces the terminal chain card (ADR-0100) but joins no
@@ -4274,6 +4408,58 @@ async fn the_wake_render_probe_consults_the_attachment_axes() {
             .await
             .is_none(),
         "a client with no compaction surface has no new content, so no Wake card arms"
+    );
+}
+
+/// Issue #1087's floor: a card that already SHOWS the Wake's resumed work has
+/// handed it over, so the Wake step owes nothing — a Fresh card would re-render
+/// work the card carries. The card here rendered that work on a read that
+/// carried no Wake record at all (the Wake reached a later read), so nothing
+/// marked it at render time: the gate's own content diff must, and must say
+/// "nothing owed" rather than Fresh.
+#[tokio::test]
+async fn a_terminal_card_that_already_shows_the_wakes_work_owes_no_continuation() {
+    let _wd = test_work_dir();
+    let worked = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(4_000)]);
+    let (_dir, app, _backend, _platform) = scripted_app(vec![worked], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
+        .await
+        .unwrap();
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Done),
+        "the control: the Turn's card ended ✅ over the same work"
+    );
+
+    let with_wake = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, "已经交给后台了。"),
+        wake_message(2_900),
+        assistant(3_100, "CI 通过了。"),
+    ])
+    .with_executions(vec![execution(4_000)])
+    .with_wakes(vec![shell_wake(2_900)]);
+    assert!(
+        Turn::wake_continuation(
+            &cards,
+            "ses_test",
+            &with_wake,
+            &turn_anchor(1_000),
+            crate::backend::AgentCapabilities::full(),
+        )
+        .await
+        .is_none(),
+        "a card that already shows the Wake's work owes no continuation"
+    );
+    assert!(
+        Turn::has_handed_over_wake(&cards, "ses_test", "msg_wake_2900").await,
+        "the floor records the handoff, so every later pass reads the card as having taken the Wake over"
     );
 }
 

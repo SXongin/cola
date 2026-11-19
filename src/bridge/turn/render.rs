@@ -1815,7 +1815,7 @@ pub(super) fn render_new_turn_parts_committing(
 
 /// The read's message positions, keyed by message id (spec #1040): the
 /// equal-key tie-break and each message scope's read floor order by them.
-fn read_position_map(transcript: &SessionTranscript) -> std::collections::HashMap<&str, usize> {
+pub(super) fn read_position_map(transcript: &SessionTranscript) -> std::collections::HashMap<&str, usize> {
     transcript
         .messages
         .iter()
@@ -2032,7 +2032,84 @@ pub(super) fn render_turn_parts(
         // cap sees every later same-message entry.
         scope.finish(acc.timeline_mut(), &following);
     }
+    hand_over_absorbed_wakes(acc, transcript, &read_positions, bound, &anchor);
     rendered_any
+}
+
+/// Hand every Wake whose resumed work this card has now SHOWN over to it (issue
+/// #1087): a COMPLETION that landed while the run was still going was absorbed
+/// by that run, its work placed on the same card, and the card owes no
+/// continuation for it once it ends. Without this mark a card's ending left the
+/// Wake reading as an un-handed-over genuine resumption, and Session Sync's Wake
+/// step opened a Fresh 「🔔 已恢复执行」 card that re-rendered the tail the
+/// finished card already showed.
+///
+/// Completion sources only ([`WakeSource::is_completion`]): a restart or
+/// interrupt Wake is a resumption, not a task completing where it lived, and
+/// ADR-0066 keeps its 承接 split however much of the run the card rendered —
+/// marking one would silently skip that split.
+///
+/// The mark belongs HERE, where the parts land, and not at the completion
+/// entry's commit: a yielded card's ledger refresh places a Wake's entry while
+/// its work is still unrendered (live 2026-10-01), and that entry is not a
+/// handoff (ADR-0066, [`StreamAccumulator::hand_over_wake`]). A mark is
+/// idempotent, so every later pass over the same card re-asks and writes
+/// nothing — and a card whose work arrived in a read that placed no part (a
+/// venue this walk never reached) is still judged by
+/// [`wake_work_covered`]'s own content diff in the Wake step.
+fn hand_over_absorbed_wakes(
+    acc: &mut StreamAccumulator,
+    transcript: &SessionTranscript,
+    read_positions: &std::collections::HashMap<&str, usize>,
+    bound: Option<usize>,
+    anchor: &TurnAnchor,
+) {
+    let mut absorbed = Vec::new();
+    for wake in &transcript.wakes {
+        // Only this card's own window: a Wake older than the anchor belongs to
+        // a card that has already dealt with it, and its work is not here.
+        if !wake.source.is_completion()
+            || !wake
+                .created_ms
+                .is_some_and(|created| created >= anchor.created_ms)
+            || acc.has_handed_over_wake(wake.id.as_str())
+        {
+            continue;
+        }
+        if wake_work_covered(acc, transcript, read_positions, wake, bound) {
+            absorbed.push(wake.id.as_str().to_string());
+        }
+    }
+    for wake_id in absorbed {
+        acc.hand_over_wake(&wake_id);
+    }
+}
+
+/// Whether this card already SHOWS the work the Wake's resumption produced
+/// (issue #1087, ADR-0066): the Fresh probe's own content diff
+/// ([`renders_new_content`]) run against THIS card's rendered state instead of
+/// an empty accumulator, plus the fact that a part from a message the read
+/// places after the Wake's own message is actually on the card. A Wake with no
+/// rendered content after it is never covered — its work may still arrive, and
+/// the continuation that renders it is exactly what stays owed. A read that no
+/// longer carries the Wake's message (a page cap) or one that carried no usable
+/// server time answers `false`: coverage is never inferred.
+pub(super) fn wake_work_covered(
+    acc: &StreamAccumulator,
+    transcript: &SessionTranscript,
+    read_positions: &std::collections::HashMap<&str, usize>,
+    wake: &Wake,
+    bound: Option<usize>,
+) -> bool {
+    let (Some(anchor), Some(wake_at)) = (wake.anchor(), read_positions.get(wake.id.as_str())) else {
+        return false;
+    };
+    let shows_later = acc.timeline().iter().any(|item| {
+        item.source()
+            .and_then(|source| read_positions.get(source.message_id().as_str()))
+            .is_some_and(|position| position > wake_at)
+    });
+    shows_later && !renders_new_content(acc, transcript, &anchor, bound)
 }
 
 /// Render the orphan gap this accumulator owes, once (spec #561, review #569):

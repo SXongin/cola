@@ -637,7 +637,11 @@ impl Turn {
     ///   (spec #561, ticket #566). Only a recordless post reaches the Fresh
     ///   gate: the newest placeable Wake's own work may be rendered, scoped at
     ///   the Wake's anchor — the whole Turn is never replayed. A Wake-less read
-    ///   owes nothing.
+    ///   owes nothing. A TERMINAL chain card is no chain for a Wake either, but
+    ///   it is not a restart: when its rendered scope already carries the Wake's
+    ///   work, the card took that work over when it showed it (a completion
+    ///   absorbed mid-run), so the handoff is recorded and the Fresh arm posts
+    ///   nothing (issue #1087) — only genuinely unrendered work opens a card.
     pub(crate) async fn wake_continuation(
         cards: &CardsHandle,
         session_id: &str,
@@ -661,8 +665,33 @@ impl Turn {
         // residual tails still take the chain's residual arms, on the card
         // that holds the chain's own reply target.
         let not_live;
+        // The read's content positions and the chain's durable delivered
+        // frontier, both read once: the Fresh floor below and the chain arms
+        // judge the same read, and the bound is a sync read of the store.
+        let positions = render::read_position_map(transcript);
+        let bound = render::rendered_bound(cards, session_id, transcript);
         {
-            let live = cards.cards.lock().await;
+            let mut live = cards.cards.lock().await;
+            // Issue #1087's floor: a terminal chain card that already SHOWS the
+            // newest COMPLETION Wake's work was handed it over when that work
+            // rendered ([`render::hand_over_absorbed_wakes`]); re-asking the
+            // same content diff here records the handoff for any card the
+            // render walk never marked (one written before that mark existed,
+            // or whose work reached it through a venue that placed no part).
+            // Without it the card would read as a genuine un-handed-over
+            // resumption and the Fresh arm would re-post work the card already
+            // carries. A restart/interrupt Wake is deliberately outside this
+            // floor: ADR-0066 keeps its 承接 split, rendered work or not.
+            if let Some(card) = live.get_mut(session_id)
+                && card.is_chain_card()
+                && !card.is_running()
+                && let Some(wake) = newest_wake
+                && wake.source.is_completion()
+                && !card.acc.has_handed_over_wake(wake.id.as_str())
+                && render::wake_work_covered(&card.acc, transcript, &positions, wake, bound)
+            {
+                card.acc.hand_over_wake(wake.id.as_str());
+            }
             let entry = live.get(session_id);
             not_live = entry.is_some_and(|card| !card.is_running());
             // A terminal card with a genuine un-handed-over Wake is not the
@@ -686,7 +715,6 @@ impl Turn {
                 // same-life card's anchor is the user message's, so the common
                 // path is unchanged.
                 let anchor = card.acc.turn_anchor().unwrap_or(turn_anchor);
-                let bound = render::rendered_bound(cards, session_id, transcript);
                 if !render::renders_new_content(&card.acc, transcript, anchor, bound) {
                     return None;
                 }
@@ -847,6 +875,19 @@ impl Turn {
             crate::bridge::chain::FreshDisposition::Keep
             | crate::bridge::chain::FreshDisposition::NoDecision => None,
         }
+    }
+
+    /// Whether the Session's card already HANDED `wake_id`'s resumed work over
+    /// (ADR-0066): the render walk's mark, or the Wake step's own floor. A test
+    /// surface only — production reads it where the decision is taken.
+    #[cfg(test)]
+    pub(crate) async fn has_handed_over_wake(cards: &CardsHandle, session_id: &str, wake_id: &str) -> bool {
+        cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.has_handed_over_wake(wake_id))
     }
 
     /// The submitted user message's cola id on `session_id`'s card (ADR-0026),

@@ -38,18 +38,20 @@ pub(crate) struct TaskState {
     /// read by [`Self::wake_announced`].
     announced_wakes: HashSet<String>,
     /// The Wakes whose resumed work this chain has HANDED OVER to a card
-    /// (ADR-0066): a 承接 line's split (a continuation card takes it) or the
-    /// in-place resume (the same card takes it). The Wake step's in-place gate
-    /// keys on THIS, never on `announced_wakes`: a yielded card's ledger
-    /// refresh places a completion entry while the Wake's work is still
-    /// unrendered (live 2026-10-01 — the resumed message's text part was empty
-    /// at the read that placed it), and that entry must not read as a handoff,
-    /// or the work would split into a 承接 card when it arrives. Once a Wake IS
-    /// handed over, a later tail past it is a Wake-less content diff: it
-    /// renders in place on the chain's open yielded card, never a second
-    /// continuation (spec #602). Like the announcement set, one mark per Wake
-    /// id, kept across `continue_on_new_card`. Written by
-    /// [`Self::hand_over_wake`]; read through [`Self::has_handed_over_wake`].
+    /// (ADR-0066): a 承接 line's split (a continuation card takes it), the
+    /// in-place resume (the same card takes it), or the live render that
+    /// absorbs a completion landing mid-run and places its work on the card it
+    /// already owns (issue #1087). The Wake step's in-place gate keys on THIS,
+    /// never on `announced_wakes`: a yielded card's ledger refresh places a
+    /// completion entry while the Wake's work is still unrendered (live
+    /// 2026-10-01 — the resumed message's text part was empty at the read that
+    /// placed it), and that entry must not read as a handoff, or the work would
+    /// split into a 承接 card when it arrives. Once a Wake IS handed over, a
+    /// later tail past it is a Wake-less content diff: it renders in place on
+    /// the chain's open yielded card, never a second continuation (spec #602).
+    /// Like the announcement set, one mark per Wake id, kept across
+    /// `continue_on_new_card`. Written by [`Self::hand_over_wake`]; read
+    /// through [`Self::has_handed_over_wake`].
     handed_over_wakes: HashSet<String>,
     /// The chain's durable Wake Watermark as a floor (spec #561, review #569):
     /// every Wake at or below this `created_ms` was announced by an earlier

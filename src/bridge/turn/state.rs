@@ -3303,11 +3303,13 @@ impl StreamAccumulator {
     }
 
     /// Mark `wake_id`'s resumed work as handed to a card: the handoff a 承接
-    /// line's split or the in-place resume performs (ADR-0059, ADR-0066).
+    /// line's split, the in-place resume, or the live render that absorbed the
+    /// completion mid-run performs (ADR-0059, ADR-0066; issue #1087).
     /// Idempotent, and independent of [`Self::announce_wake`] — the in-place
     /// resume marks a Wake whose entry a yielded ledger refresh may already
-    /// have placed, so the mark must not disturb the announcement set (the
-    /// entry stays single).
+    /// have placed, and a mid-run absorption marks one whose entry the same
+    /// run's evidence retirement suppressed, so the mark must not disturb the
+    /// announcement set (the entry stays single, and nothing durable moves).
     pub(super) fn hand_over_wake(&mut self, wake_id: &str) {
         self.tasks.hand_over_wake(wake_id);
     }
