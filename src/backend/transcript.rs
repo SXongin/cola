@@ -1683,6 +1683,16 @@ impl WakeSource {
             Self::Shell | Self::Subagent | Self::Restart | Self::Interrupt
         )
     }
+
+    /// Whether this Wake reports a Background Task's **completion**: the one
+    /// source class whose resumed work a card takes over by rendering it where
+    /// the task lived (ADR-0066, issue #1087). Restart and interrupt Wakes are
+    /// resumptions too, but they keep their own 承接 split — a server restart
+    /// and an interrupted response are not a task completing on the card that
+    /// hosted it.
+    pub fn is_completion(&self) -> bool {
+        matches!(self, Self::Shell | Self::Subagent)
+    }
 }
 
 /// Work the agent left running in the background: derived from the assistant

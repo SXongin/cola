@@ -220,3 +220,33 @@ See ADR-0074 for the three invariants (one unbounded post-prompt path, exactly
 one Card per resumption, the notice gated on delivery).
 
 Source: #602, #604, #605, #606.
+
+## Amendment (2026-11-19, #1087): the card that rendered the work took the Wake over
+
+The Decision's "Only a 承接 line's split or an earlier in-place resume takes a
+Wake over" gains a third taker: **the card that renders the Wake's resumed
+work**. A shell/subagent completion that lands while its Turn is still running
+is absorbed by that run — the completion entry and the resumed parts land on the
+card the Turn already owns — and the render pass marks the Wake handed over, so
+that card's ending owes no continuation for it.
+
+The taker is the COMPLETION class only (`WakeSource::is_completion`). A restart
+or interrupt Wake is a resumption, not a task completing where it lived, and
+keeps its 承接 split exactly as the Decision says, however much of that run the
+card rendered; marking one would silently skip the split.
+
+The terminal exception above is narrowed the same way. A completion Wake on a
+terminal card is the fresh continuation it is described as *only while the card
+does not already show that Wake's work*: a card that shows it records the
+handoff and posts nothing, and the Wake step re-asks the same content diff as a
+floor, so a card rendered by a venue that placed no part still answers
+honestly. The reason is that the durable Wake Watermark cannot answer this
+question: a run the runtime retires with an EVIDENCE ending suppresses the
+Wake's own completion entry (issue #659), and with it the Watermark, while the
+work still renders.
+
+Without the mark, an absorbed completion was re-posted after the card's ending
+as a Fresh 「🔔 已恢复执行」 card whose empty probe re-rendered the tail the
+finished card already showed.
+
+Source: #1087.
