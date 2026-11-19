@@ -279,6 +279,17 @@ impl PartSource {
     }
 }
 
+/// Whether two optional part sources name the same transcript part: `None`
+/// matches `None` (a synthetic push renders as one stream, so its chunks merge
+/// and continue each other), and a one-sided `None` never matches.
+pub(super) fn same_source(left: Option<&PartSource>, right: Option<&PartSource>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.same_part(right),
+        _ => false,
+    }
+}
+
 /// The transcript part class a [`Placement`] expects (spec #1040): what kind
 /// of content the part will push. A push whose [`TranscriptKind`] disagrees is
 /// refused before it inserts anything.
@@ -1124,12 +1135,7 @@ impl Timeline {
             if !accepts(&item.kind) {
                 continue;
             }
-            let same = match (item.source.as_ref(), source) {
-                (None, None) => true,
-                (Some(item_source), Some(source)) => item_source.same_part(source),
-                _ => false,
-            };
-            if same {
+            if same_source(item.source.as_ref(), source) {
                 return Some(idx);
             }
         }
