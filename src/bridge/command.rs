@@ -962,7 +962,6 @@ use std::sync::Arc;
 /// launching shell reaps it). The current process then calls
 /// `std::process::exit(0)` right after.
 pub(crate) fn restart_process() -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
     // Resolve the LIVE binary path. `/proc/self/exe` renders as
     // "<path> (deleted)" once the file was replaced by a rebuild or an upgrade
     // while we're running, and spawning that fails with ENOENT; the NEW binary
@@ -978,17 +977,51 @@ pub(crate) fn restart_process() -> std::io::Result<()> {
     }
     // argv[0] is the exe path; pass the rest through unchanged, plus `--replace`
     // so the restarted cola is allowed to take the singleton lock from us.
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.iter().any(|a| a == "--replace") {
-        args.push("--replace".to_string());
-    }
-    Command::new(&exe)
-        .args(args)
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    restart_spawn_command(&exe, &args).spawn()?;
+    Ok(())
+}
+
+/// The spawn shape of a non-supervised restart's successor (`/restart` and
+/// `/update`): the live binary, this process's own argv plus `--replace`, and
+/// **inherited stdio** — the documented "keeps the log redirect" behaviour, so
+/// `./cola > test.log` still writes to `test.log` after a restart.
+///
+/// Split out of [`restart_process`] so the shape is testable without re-execing
+/// the real binary (issue #1081).
+fn restart_spawn_command(exe: &std::path::Path, args: &[String]) -> std::process::Command {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(exe);
+    command
+        .args(crate::restart_args(args))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
-    Ok(())
+        .stderr(Stdio::inherit());
+    // Unix: lead its OWN process group. A predecessor started from a foreground
+    // terminal belongs to that terminal's job/process group, and the terminal
+    // (or the job runner around it) signals that group when the job ends — so
+    // without this the successor is killed between the predecessor's exit and
+    // its lock takeover, leaving cola down (#1081). Same isolation, same
+    // reasoning as ADR-0085's detached service; no `setsid` is needed because
+    // the successor never reads the terminal and a hangup only reaches the
+    // foreground group.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    // Windows: a new process group keeps the console's Ctrl-C from reaching the
+    // successor. `DETACHED_PROCESS` is deliberately NOT set (unlike
+    // `spawn_detached`, which nulls stdio): it would take the console away from
+    // a successor that keeps the inherited handles, i.e. the log redirect this
+    // path promises.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    command
 }
 
 /// The file the restart flow uses to tell the new process which chat to
@@ -3887,6 +3920,151 @@ mod tests {
         assert_eq!(notify.thread_id, None);
         assert_eq!(notify.kind, RestartKind::Restart);
         assert_eq!(notify.version, None);
+    }
+
+    /// Poll `done` every 20 ms until it returns true, bounded at 5 s (the
+    /// repo's usual test deadline).
+    #[cfg(unix)]
+    fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if done() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Wait (bounded) for `child` to exit; kill it and fail on the deadline so
+    /// a wedged spawn can never hang the test run.
+    #[cfg(unix)]
+    fn wait_bounded(child: &mut std::process::Child) {
+        if !wait_until(|| child.try_wait().expect("wait for the child").is_some()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child did not exit within the deadline");
+        }
+    }
+
+    /// `/restart`'s successor must leave the predecessor's process group
+    /// (issue #1081). A foreground terminal tears its job's process group down
+    /// when the predecessor exits; a successor still in that group dies before
+    /// it can take the lock, and nothing starts it again. Mirrors
+    /// `spawn_detached_runs_in_the_given_directory` (`src/main.rs`).
+    #[cfg(unix)]
+    #[test]
+    fn restart_spawns_the_successor_in_its_own_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("pid");
+        let pgrp = dir.path().join("pgrp");
+        let arg0 = dir.path().join("arg0");
+        // `$0` is the first word after the `-c` script, i.e. the `--replace`
+        // the spawn appends, which also pins the argv passthrough. `$$` and its
+        // pgid prove the successor leads its OWN group.
+        let script = format!(
+            "printf '%s' \"$$\" > {}; \
+             printf '%s' \"$(ps -o pgid= -p $$ | tr -d ' ')\" > {}; \
+             printf '%s' \"$0\" > {}",
+            pid.display(),
+            pgrp.display(),
+            arg0.display()
+        );
+        let args = vec!["-c".to_string(), script];
+        let mut child = restart_spawn_command(std::path::Path::new("sh"), &args)
+            .spawn()
+            .expect("the successor spawns");
+        assert!(wait_until(|| pid.exists() && pgrp.exists()));
+        wait_bounded(&mut child);
+        assert_eq!(
+            std::fs::read_to_string(&arg0).unwrap(),
+            "--replace",
+            "the restart successor must carry --replace"
+        );
+        let child_pid = std::fs::read_to_string(&pid).unwrap();
+        let child_group = std::fs::read_to_string(&pgrp).unwrap();
+        assert_eq!(
+            child_group, child_pid,
+            "the successor must lead its own process group \
+             (pid {child_pid}, pgid {child_group})"
+        );
+    }
+
+    /// The successor must survive the predecessor's terminal job teardown — the
+    /// actual #1081 failure, not just its process-group id. The predecessor is
+    /// this test binary re-executed in its own process group (as a foreground
+    /// terminal job is); it spawns the successor through the real restart spawn
+    /// shape and exits. Tearing that group down afterwards (what a job runner
+    /// does when the foreground job ends) must not reach the successor.
+    #[cfg(unix)]
+    #[test]
+    // The successor is deliberately NOT waited on: outliving this predecessor
+    // process is the property under test. It is reparented and reaped by init.
+    #[allow(clippy::zombie_processes)]
+    fn a_restart_successor_survives_the_predecessors_process_group_teardown() {
+        const ROLE: &str = "COLA_TEST_RESTART_PREDECESSOR";
+        const DIR: &str = "COLA_TEST_RESTART_DIR";
+        if std::env::var_os(ROLE).is_some() {
+            // Predecessor role: the outer test started us in our own process
+            // group. Spawn the successor exactly as `/restart` does, publish
+            // its pid, and exit — the handover's shape.
+            let dir = std::path::PathBuf::from(std::env::var_os(DIR).expect("a test dir"));
+            let alive = dir.join("alive");
+            // The stdout line also pins the DOCUMENTED log redirect: the
+            // successor inherits this process's stdout, i.e. the file the
+            // outer test redirected the predecessor into.
+            let script = format!(
+                "sleep 1; printf alive > {}; printf 'successor-alive\\n'",
+                alive.display()
+            );
+            let args = vec!["-c".to_string(), script];
+            let child = restart_spawn_command(std::path::Path::new("sh"), &args)
+                .spawn()
+                .expect("the successor spawns");
+            std::fs::write(dir.join("successor.pid"), child.id().to_string()).unwrap();
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // A shell redirect around the predecessor, the way an operator starts
+        // cola in a terminal; the successor must keep writing to it.
+        let log = dir.path().join("successor.log");
+        let log_file = std::fs::File::create(&log).unwrap();
+        let mut predecessor = std::process::Command::new(std::env::current_exe().unwrap());
+        predecessor
+            .arg("a_restart_successor_survives_the_predecessors_process_group_teardown")
+            .env(ROLE, "1")
+            .env(DIR, dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(log_file)
+            .stderr(std::process::Stdio::null());
+        use std::os::unix::process::CommandExt;
+        predecessor.process_group(0);
+        let mut predecessor = predecessor.spawn().expect("the predecessor starts");
+        let group = predecessor.id();
+        let pid_file = dir.path().join("successor.pid");
+        assert!(
+            wait_until(|| pid_file.exists()),
+            "the predecessor must publish the successor's pid"
+        );
+        wait_bounded(&mut predecessor);
+        // Tear the old job's group down, as a terminal/job runner does once
+        // its foreground job is gone.
+        let _ = std::process::Command::new("kill")
+            .args(["-HUP", &format!("-{group}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let alive = dir.path().join("alive");
+        assert!(
+            wait_until(|| alive.exists()),
+            "the successor must outlive the predecessor's process group"
+        );
+        assert!(
+            wait_until(|| std::fs::read_to_string(&log).is_ok_and(|text| text.contains("successor-alive"))),
+            "the successor must keep the inherited stdout (the documented log redirect)"
+        );
     }
 
     #[test]
