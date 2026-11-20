@@ -7,8 +7,9 @@
 //! local tree only — no service and no token beyond the `gh` login the repo
 //! already uses — and it writes nothing.
 //!
-//! Sources: a gate round is a comment whose last non-blank line carries the
-//! gate's `CODEX_REVIEW_VERDICT` marker (the same completeness rule as
+//! Sources: a gate round is a comment the review workflow
+//! (`github-actions[bot]`) posted whose last non-blank line carries the gate's
+//! `CODEX_REVIEW_VERDICT` marker (the same completeness rule as
 //! `.github/workflows/codex-review.yml`'s `codex_verdict_of_line`), and a
 //! `FAIL` is a blocking round. The PR's `<!-- gate-dossier -->` comment is the
 //! human record that count should agree with; its free-form shape is not
@@ -52,6 +53,10 @@ const VERDICT_MARKER: &str = "CODEX_REVIEW_VERDICT:";
 /// The first line of the human-maintained record, which may quote a verdict
 /// without being one.
 const DOSSIER_MARKER: &str = "<!-- gate-dossier -->";
+
+/// The account the review workflow posts as: a discussion comment that quotes a
+/// verdict is not a gate round, and the gate is what this metric measures.
+const GATE_AUTHOR: &str = "github-actions[bot]";
 
 const USAGE: &str = "\
 usage: cargo xtask metrics [--prs N] [--runs N] [--since DATE]
@@ -141,11 +146,11 @@ struct PrRow {
     head_ref: String,
     #[serde(rename = "mergedAt")]
     merged_at: String,
-    author: PrAuthor,
+    author: Author,
 }
 
 #[derive(Deserialize)]
-struct PrAuthor {
+struct Author {
     login: String,
 }
 
@@ -157,6 +162,7 @@ struct PrComments {
 #[derive(Deserialize)]
 struct CommentBody {
     body: String,
+    author: Author,
 }
 
 pub(crate) fn cli() {
@@ -266,8 +272,8 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
         let bodies = pr_comment_bodies(pr.number)?;
         let mut rounds = 0;
         let mut blocking_rounds = 0;
-        for body in bodies {
-            let Some(verdict) = gate_round(&body) else {
+        for comment in bodies {
+            let Some(verdict) = gate_round(&comment.body, &comment.author.login) else {
                 continue;
             };
             rounds += 1;
@@ -297,7 +303,7 @@ fn newest_merged(mut prs: Vec<PrRow>, limit: usize) -> Vec<PrRow> {
     prs
 }
 
-fn pr_comment_bodies(number: u64) -> Result<Vec<String>, String> {
+fn pr_comment_bodies(number: u64) -> Result<Vec<CommentBody>, String> {
     let args = [
         "pr".to_string(),
         "view".to_string(),
@@ -306,13 +312,14 @@ fn pr_comment_bodies(number: u64) -> Result<Vec<String>, String> {
         "comments".to_string(),
     ];
     let comments: PrComments = parse_json(&gh(&args)?, "the PR comments")?;
-    Ok(comments.comments.into_iter().map(|c| c.body).collect())
+    Ok(comments.comments)
 }
 
-/// A gate review round's verdict; the dossier is not a round even when it
-/// quotes one.
-fn gate_round(body: &str) -> Option<Verdict> {
-    if body.trim_start().starts_with(DOSSIER_MARKER) {
+/// A gate review round's verdict. Only the review workflow's comments count —
+/// a person or another bot quoting a verdict is not a round — and the dossier
+/// is not a round even when it quotes one.
+fn gate_round(body: &str, author: &str) -> Option<Verdict> {
+    if author != GATE_AUTHOR || body.trim_start().starts_with(DOSSIER_MARKER) {
         return None;
     }
     verdict(body)
@@ -701,8 +708,21 @@ mod tests {
     #[test]
     fn a_dossier_quoting_a_verdict_is_not_a_gate_round() {
         assert_eq!(
-            gate_round("<!-- gate-dossier -->\nCODEX_REVIEW_VERDICT: PASS"),
+            gate_round("<!-- gate-dossier -->\nCODEX_REVIEW_VERDICT: PASS", GATE_AUTHOR),
             None
+        );
+    }
+
+    #[test]
+    fn a_person_quoting_a_verdict_is_not_a_gate_round() {
+        assert_eq!(gate_round("> CODEX_REVIEW_VERDICT: FAIL", "SXongin"), None);
+    }
+
+    #[test]
+    fn a_complete_gate_comment_is_a_round() {
+        assert_eq!(
+            gate_round("## Codex review\n\nCODEX_REVIEW_VERDICT: FAIL", GATE_AUTHOR),
+            Some(Verdict::Fail)
         );
     }
 
@@ -809,7 +829,7 @@ mod tests {
             deletions: 0,
             head_ref: String::new(),
             merged_at: merged_at.to_string(),
-            author: PrAuthor { login: String::new() },
+            author: Author { login: String::new() },
         }
     }
 

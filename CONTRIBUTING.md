@@ -163,9 +163,11 @@ It reads `gh` and the local tree only — no new service, no token beyond the `g
 login the repo already uses — and it writes nothing:
 
 1. **Gate blocking rounds** — the last N merged PRs filtered to diffs of at most
-   300 changed lines, each PR's complete gate review comments (the verdict is
-   the last non-blank line's `CODEX_REVIEW_VERDICT: PASS|FAIL`; a `FAIL` is a
-   blocking round) and their median. The PR's `<!-- gate-dossier -->` comment is
+   300 changed lines, each PR's gate review comments (posted by
+   `github-actions[bot]`; the verdict is the last non-blank line's
+   `CODEX_REVIEW_VERDICT: PASS|FAIL`; a `FAIL` is a blocking round) and their
+   median. A person or other bot quoting a verdict is not a round. The PR's
+   `<!-- gate-dossier -->` comment is
    the human record that count should agree with; its free-form prose is not
    parsed, and a dossier that quotes a verdict is not counted as a round. PRs
    over the cap, release cuts, and Dependabot PRs are reported as excluded,
