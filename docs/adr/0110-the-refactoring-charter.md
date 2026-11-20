@@ -2,14 +2,13 @@
 
 The four contracts a refactor here is settled by — code (#1109), tests (#1111),
 docs (#1112), flow (#1110) — and the segment that applies them first (#1115),
-assembled into one decision. Evidence lives in #1105–#1108 and is cited, not
-re-derived.
+in one decision. Evidence lives in #1105–#1108, cited and not re-derived.
 
 ## Context
 
-`src` doubled in six weeks, 163.6k → 362k lines, while `#[test]` functions stayed
-flat (~2,011 → 1,990), so coverage per line roughly halved; files over 2,000
-lines went 27 → 64, and C1/C2's extraction re-bloated `render.rs` 6.1k → 14.2k
+`src` doubled in six weeks, 163.6k → 362k lines, while `#[test]` functions
+stayed flat (~2,011 → 1,990) — coverage per line roughly halved — and files over
+2,000 lines went 27 → 64; C1/C2's extraction re-bloated `render.rs` 6.1k → 14.2k
 and `handler.rs` 2.5k → 7.6k (#1108). The gate is not the strictness problem: 206
 of 257 blocking findings were real defects, 0 defensive, 0 pre-existing, and
 rounds track shared mutable ordering/lifecycle state, not diff size — +9,329
@@ -93,15 +92,16 @@ What a guard decides, and what only a reviewer can:
 | Conventional Commits subject | `check-commit-msg` |
 | dependencies and advisories | `cargo deny` |
 
-`check-doc-links` (#1131) will report a broken doc link and an ADR's banner
-count — a warning, never a failure, so it stays a review rule until something
-enforces it.
+`check-doc-links` (#1131) will fail a dangling reference and warn on an ADR's
+banner count; the banner rule stays reviewable until something enforces it.
 
 Review-only, because a predicate cannot decide them: the one-behaviour test
-rule and its exceptions; the comment rule; the 150-line ADR cap; the fold
-conditions; over-defense against guards for impossible inputs (a finding, never
-a block); the gate budget; the no-diff-cap rule; measure-don't-assert; a feature
-cut waiting on user evidence; boy-scout lowering; the triage criterion rule.
+rule and its exceptions; a new `Option<&Gate>` or `*_for_test` production
+branch (the counter sees only `#[cfg(test)]`); the comment rule; the 150-line
+ADR cap; the fold conditions; over-defense against guards for impossible inputs
+(a finding, never a block); the gate budget; the no-diff-cap rule;
+measure-don't-assert; a feature cut waiting on user evidence; boy-scout
+lowering; the triage criterion rule.
 
 A review-only rule becomes a guard only when a measurement ticket shows it being
 missed — then it lands with its baseline, never a blanket threshold.
@@ -109,10 +109,10 @@ missed — then it lands with its baseline, never a blanket threshold.
 ## Unchanged, with evidence
 
 **No diff-size cap or split rule** (#1015's +9,329 lines passed in one round;
-#1047's +157 took forty-seven), **one Test job with no Linux leg**, **no PR
-template or out-of-scope section**, and **the 3-round gate budget** stay the rule:
-the cost is the round, and the budget is what makes the local pair spend the
-second one (#1105, #1106, #1110, #1111).
+#1047's +157 took forty-seven — #1105), **one Test job with no Linux leg**
+(#1106), **no PR template or out-of-scope section** and **the 3-round gate
+budget** (#1110) stay: the cost is the round, and the budget is what makes the
+local pair spend the second one.
 
 ## The measure
 
@@ -137,13 +137,14 @@ Tracked in the issues; the order is the leverage order of #1108 and #1115.
    calendar cap and verb-at-a-time rollback, the dispatch staying alive (#1115);
    the tickets own those bounds.
 3. **Then the missing seams** — C12, one run-lifecycle owner, starts with the
-   design (#1140, also the map's open "Turn state machine's target shape") and
-   lands as #1141; then C5 (#1135), C3 (#1136), C10 (#1137), C4 (#1138) and C7
-   (#1139).
+   design (#1140) and lands as #1141; then C5 (#1135), C3 (#1136), C10 (#1137),
+   C4 (#1138) and C7 (#1139).
 4. **Docs, in parallel, after this lands** — archive (#1126), merge chains
    (#1127), fold in place (#1128), split 0034/0092 (#1129), single-home (#1130),
    then the doc-link and banner guard (#1131). #1130 re-homes facts this ADR
    writes, so it goes last.
-5. **Held** — C8 (`ServerIdentity`) stays HOLD, and feature freezing/deletion
-   waits on the ROI table (#1113). #1132 rides the C9/C6 split of the
+5. **Held** — C8 (`ServerIdentity`) stays HOLD, feature freezing/deletion waits
+   on the ROI table (#1113), and the map's open "Turn state machine's target
+   shape" stays fog: no ticket here claims it, and it needs its own decision
+   when work next touches `bridge/turn`. #1132 rides the C9/C6 split of the
    `async_trait` impls.
