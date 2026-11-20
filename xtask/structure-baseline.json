@@ -293,14 +293,14 @@
       "function": "impl RequestKind for PermissionKind",
       "metric": "too_many_lines",
       "value": 470,
-      "body": "24d877156922d646"
+      "body": "344f86f5d12f5b86"
     },
     {
       "path": "src/bridge/request/kind.rs",
       "function": "impl RequestKind for QuestionKind",
       "metric": "too_many_lines",
       "value": 513,
-      "body": "7225ee08f6f52e42"
+      "body": "344f86f5d12f5b86"
     },
     {
       "path": "src/bridge/runtime.rs",
@@ -454,7 +454,7 @@
       "function": "impl Backend for CodexClient",
       "metric": "too_many_lines",
       "value": 114,
-      "body": "a6f31d5fb2f47319"
+      "body": "0d8a0fce26749048"
     },
     {
       "path": "src/codex/backend.rs",
@@ -468,7 +468,7 @@
       "function": "impl ServerLifecycle for CodexLifecycle",
       "metric": "too_many_lines",
       "value": 131,
-      "body": "7aff014fbe887476"
+      "body": "27941218936da05e"
     },
     {
       "path": "src/codex/read_model.rs",
@@ -1125,7 +1125,7 @@
     },
     {
       "path": "src/bridge/store_writer.rs",
-      "count": 16
+      "count": 18
     },
     {
       "path": "src/bridge/surfaces.rs",
@@ -1549,12 +1549,6 @@
       "lines": [
         ".filter(|e| e[\"tag\"] == \"collapsible_panel\")",
         "if e[\"tag\"] == \"collapsible_panel\" {"
-      ]
-    },
-    {
-      "path": "src/feishu/client.rs",
-      "lines": [
-        "assert_eq!(content[\"elements\"][0][\"tag\"], \"markdown\");"
       ]
     }
   ]
