@@ -7,7 +7,10 @@ role's label is the role name, unchanged:
 
 - `needs-triage` — the maintainer evaluates it.
 - `needs-info` — waiting on the reporter.
-- `ready-for-agent` — fully specified, ready for an AFK agent.
+- `ready-for-agent` — fully specified, ready for an AFK agent. Every acceptance
+  criterion names what decides it — a predicate, a symbol, or a shape in words,
+  never a lifecycle word alone. A criterion nothing can check is not ready
+  (`docs/adr/0110-the-refactoring-charter.md`).
 - `ready-for-human` — requires human implementation.
 - `wontfix` — will not be actioned.
 

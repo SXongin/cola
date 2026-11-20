@@ -177,7 +177,9 @@ same-score replacement is still new growth. `--bless` lowers the baseline (a
 removal, a rename that keeps its body), and refuses to raise a value — the only
 way up is a reviewable edit of the JSON in a diff. `clippy.toml` pins the two thresholds so a toolchain bump cannot move
 the bar. It costs ~35 s of clippy on an edited tree, about a second when the
-target directory is warm.
+target directory is warm. Which rules a guard enforces and which only a
+reviewer can, and how a review-only rule earns a guard, is ADR-0110's ratchet
+table.
 
 `cargo xtask check-fixture-format` is the fixture format gate: the Codex proxy
 fixture (`src/codex/fixtures/proxy_fixture.rs`) is compiled by `rustc` from an
@@ -325,6 +327,16 @@ the marker after the process exits.
    `> **Superseded by ADR-NNNN**: …` and `Status: superseded by ADR-NNNN`, and
    the new one opens with `> **Supersedes ADR-XXXX**: …` (a forward rule;
    existing edges stated in prose are historical).
+
+   **Folding is the one exception to append-only, and it is a change with a
+   reason, not tidying.** It deletes superseded text while keeping the decision,
+   and it lands only when (a) the surviving body is a minority of the file or a
+   whole section has died, and (b) the change is docs-only and its diff *is* the
+   deleted text. An ADR carrying 3+ banners is a mandatory read before editing,
+   not an automatic fold. A superseded or retired ADR folds, whole, to a
+   **5-line pointer**: title, `Status:` line, the replacing banner, and one line
+   of why the pointer exists. A new ADR is soft-capped at 150 lines — a longer
+   one is usually two decisions (ADR-0110 counts this as a review nit).
 
    There is no central index: every forward banner names its ADR, and a new ADR
    names what it supersedes.
