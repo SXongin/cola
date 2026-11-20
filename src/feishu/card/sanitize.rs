@@ -155,13 +155,14 @@ fn open_construct(prefix: &str) -> Option<OpenConstruct<'_>> {
     if let Some(ticks) = fence {
         return Some(OpenConstruct::Fence { ticks });
     }
-    // A table is "open" when its last non-blank line is a row of one: walk
-    // back to the TABLE's own start — a line belonging to no table (no `|`)
-    // ends the block, so a paragraph sitting directly above the header is
-    // never crossed — and require the header/delimiter shape (a header alone
-    // counts — the cut landed between it and the delimiter). A blank line
-    // after the last row CLOSES the table: the tail then starts a construct of
-    // its own (a separate table must not inherit this one's header, #1096).
+    // A table is "open" when its last non-blank line is a row of one. The
+    // run of pipe lines is located, then the DELIMITER row inside it names the
+    // header (the line above it) — a prose line that merely contains a pipe
+    // directly above the table must not be taken for its header. A run with no
+    // delimiter is a cut between the header and it, where the last pipe line is
+    // the only line that can be the header. A blank line after the last row
+    // CLOSES the table: the tail then starts a construct of its own (a separate
+    // table must not inherit this one's header, #1096).
     let body = prefix.strip_suffix('\n').unwrap_or(prefix);
     if body.contains('\n')
         && body
@@ -175,23 +176,34 @@ fn open_construct(prefix: &str) -> Option<OpenConstruct<'_>> {
     if !lines[last].contains('|') {
         return None;
     }
+    let header = table_header_index(&lines, last)?;
+    let delimiter = lines
+        .get(header + 1)
+        .filter(|line| is_delimiter_row(line))
+        .copied();
+    Some(OpenConstruct::Table {
+        header: lines[header],
+        delimiter,
+    })
+}
+
+/// The line index of the table header whose last row is `last`, when the run
+/// of pipe lines ending there has a header shape: a delimiter row in the run
+/// names the header as the line above it (so a prose line containing a pipe
+/// just above the table is not mistaken for it); with no delimiter the cut sits
+/// between the header and it, and the last pipe line is the header.
+fn table_header_index(lines: &[&str], last: usize) -> Option<usize> {
     let mut start = last;
     while start > 0 && lines[start - 1].trim().contains('|') {
         start -= 1;
     }
-    let delimiter = if last > start {
-        let candidate = lines[start + 1];
-        if !is_delimiter_row(candidate) {
-            return None;
-        }
-        Some(candidate)
-    } else {
-        None
-    };
-    Some(OpenConstruct::Table {
-        header: lines[start],
-        delimiter,
-    })
+    match (start..=last).find(|&index| is_delimiter_row(lines[index])) {
+        // The delimiter is the table's second line, so the header is above it;
+        // a run that begins with a delimiter has no header in this prefix.
+        Some(delimiter) if delimiter > start => Some(delimiter - 1),
+        Some(_) => None,
+        None => Some(last),
+    }
 }
 
 /// The markdown lead a projection's cut tail needs before its own text so the
@@ -312,14 +324,8 @@ fn open_table_start(prefix: &str) -> Option<usize> {
     if !lines[last].contains('|') {
         return None;
     }
-    let mut start = last;
-    while start > 0 && lines[start - 1].trim().contains('|') {
-        start -= 1;
-    }
-    if last > start && !is_delimiter_row(lines[start + 1]) {
-        return None;
-    }
-    Some(lines[..start].iter().map(|line| line.len() + 1).sum())
+    let header = table_header_index(&lines, last)?;
+    Some(lines[..header].iter().map(|line| line.len() + 1).sum())
 }
 
 /// The characters a native table costs its element once every row is escaped
@@ -927,6 +933,43 @@ mod tests {
             before.trim_end().ends_with("```"),
             "the long table renders as code: {long_chunk:?}"
         );
+    }
+
+    /// A prose line that merely contains a pipe directly above a table is not
+    /// its header: the delimiter row names the real header, so a cut inside
+    /// the table still repeats the right one (issue #1096).
+    #[test]
+    fn a_pipe_prose_line_does_not_hide_the_table_header() {
+        let prefix = "参见 a | b 的说明\n| 名称 | 值 |\n|---|---|\n| 一 | 1 |\n";
+        assert_eq!(
+            neutralize_tail(prefix, "| 二 | 2 |\n").as_deref(),
+            Some("| 名称 | 值 |\n|---|---|\n")
+        );
+        // The same prose line and table through the element chunker: the table
+        // is moved whole, so its header is not split off.
+        let prose = format!("{}参见 a | b 的说明\n", "说明。\n".repeat(300));
+        let row = format!("| {} | 值 |\n", "x".repeat(50));
+        let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(10));
+        let chunks = chunk_markdown(&format!("{prose}{table}尾注"), 1500);
+        assert!(
+            chunks.iter().any(|chunk| chunk.contains("| 名称 | 值 |")),
+            "the table must render: {chunks:?}"
+        );
+        let header = "| 名称 | 值 |";
+        let row = format!("| {} | 值 |", "x".repeat(50));
+        assert_eq!(
+            chunks.iter().filter(|chunk| chunk.contains(header)).count(),
+            1,
+            "the table header appears once: {chunks:?}"
+        );
+        for chunk in &chunks {
+            if chunk.contains(&row) {
+                assert!(
+                    chunk.contains(header),
+                    "table rows split off their header: {chunk:?}"
+                );
+            }
+        }
     }
 
     /// A table closed by a blank line is NOT open (issue #1096): a separate
