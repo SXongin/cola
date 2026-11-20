@@ -91,6 +91,8 @@ jobs:
         run: cargo xtask check-generation
       - name: Client seam guard (no adapter path outside src/opencode)
         run: cargo xtask check-client-seam
+      - name: Structure ratchet (new offenders fail; the rest is baselined)
+        run: cargo xtask check-structure
       - name: Codex proxy fixture format
         run: cargo xtask check-fixture-format
       - name: Build (release)
