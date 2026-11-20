@@ -8,12 +8,14 @@
 //! already uses — and it writes nothing.
 //!
 //! Sources: a gate round is a comment the review workflow
-//! (`github-actions[bot]`) posted whose last non-blank line carries the gate's
+//! (`github-actions`) posted whose last non-blank line carries the gate's
 //! `CODEX_REVIEW_VERDICT` marker (the same completeness rule as
 //! `.github/workflows/codex-review.yml`'s `codex_verdict_of_line`), and a
 //! `FAIL` is a blocking round. The PR's `<!-- gate-dossier -->` comment is the
-//! human record that count should agree with; its free-form shape is not
-//! parsed, and a dossier that quotes a verdict is not counted as a round. CI
+//! human record that count should agree with: an explicit gate round count is
+//! read and any disagreement with the verdict comments is surfaced, no other
+//! prose is parsed, and a dossier that quotes a verdict is not counted as a
+//! round. CI
 //! times are the Actions API's per-job `started_at`/`completed_at`; commit
 //! types come from `git log`; module sizes are the ratchet's own
 //! production-line count, so this report and `check-structure` measure the same
@@ -56,7 +58,8 @@ const DOSSIER_MARKER: &str = "<!-- gate-dossier -->";
 
 /// The account the review workflow posts as: a discussion comment that quotes a
 /// verdict is not a gate round, and the gate is what this metric measures.
-const GATE_AUTHOR: &str = "github-actions[bot]";
+/// `gh pr view --json` renders the bot suffix off, the REST API keeps it.
+const GATE_AUTHOR: &str = "github-actions";
 
 const USAGE: &str = "\
 usage: cargo xtask metrics [--prs N] [--runs N] [--since DATE]
@@ -88,6 +91,8 @@ struct GateSample {
     lines: u64,
     rounds: usize,
     blocking_rounds: usize,
+    /// The gate round count the PR's dossier states, when it states one.
+    dossier: Option<usize>,
 }
 
 /// The gate-round metric over the sampled window.
@@ -270,6 +275,10 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
             continue;
         }
         let bodies = pr_comment_bodies(pr.number)?;
+        let dossier = bodies
+            .iter()
+            .find(|comment| comment.body.trim_start().starts_with(DOSSIER_MARKER))
+            .and_then(|comment| dossier_rounds(&comment.body));
         let mut rounds = 0;
         let mut blocking_rounds = 0;
         for comment in bodies {
@@ -291,6 +300,7 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
             lines,
             rounds,
             blocking_rounds,
+            dossier,
         });
     }
     Ok(report)
@@ -319,10 +329,55 @@ fn pr_comment_bodies(number: u64) -> Result<Vec<CommentBody>, String> {
 /// a person or another bot quoting a verdict is not a round — and the dossier
 /// is not a round even when it quotes one.
 fn gate_round(body: &str, author: &str) -> Option<Verdict> {
+    let author = author.strip_suffix("[bot]").unwrap_or(author);
     if author != GATE_AUTHOR || body.trim_start().starts_with(DOSSIER_MARKER) {
         return None;
     }
     verdict(body)
+}
+
+/// One line per sampled PR whose dossier count differs from its verdict
+/// comments, so a missing or edited gate comment is surfaced, never hidden.
+fn dossier_disagreements(samples: &[GateSample]) -> Vec<String> {
+    samples
+        .iter()
+        .filter(|sample| sample.dossier.is_some() && sample.dossier != Some(sample.rounds))
+        .map(|sample| {
+            format!(
+                "#{} (dossier {}, verdicts {})",
+                sample.number,
+                sample.dossier.unwrap_or_default(),
+                sample.rounds
+            )
+        })
+        .collect()
+}
+
+/// A gate-scoped round count from a dossier, when it states one explicitly.
+///
+/// Dossiers are free-form, so only an explicit total is read: a line naming
+/// "gate rounds", "rounds spent" or "N verdicts". A per-round line ("Round 1 —
+/// FAIL"), a local-pair count and a "3-round budget" story are not totals, and
+/// a word count ("four rounds") is left unread rather than guessed.
+fn dossier_rounds(body: &str) -> Option<usize> {
+    for line in body.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("local pair") || lower.contains("rehearsal") || lower.contains("pre-pr") {
+            continue;
+        }
+        let total_named =
+            lower.contains("gate rounds") || lower.contains("rounds spent") || lower.contains("verdicts");
+        if total_named && let Some(count) = first_number(line) {
+            return Some(count);
+        }
+    }
+    None
+}
+
+fn first_number(text: &str) -> Option<usize> {
+    let start = text.find(|c: char| c.is_ascii_digit())?;
+    let digits: String = text[start..].chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// The verdict a gate review comment posts, if it posts one.
@@ -361,14 +416,21 @@ fn print_gates(report: &GateReport, requested: usize) {
     if report.samples.is_empty() {
         println!("  no sampled PR carries a gate verdict");
     } else {
-        println!("  {:<7} {:>6} {:>7} {:>10}", "PR", "lines", "rounds", "blocking");
+        println!(
+            "  {:<7} {:>6} {:>7} {:>10} {:>8}",
+            "PR", "lines", "rounds", "blocking", "dossier"
+        );
         for sample in &report.samples {
+            let dossier = sample
+                .dossier
+                .map_or_else(|| "—".to_string(), |rounds| rounds.to_string());
             println!(
-                "  {:<7} {:>6} {:>7} {:>10}   {}",
+                "  {:<7} {:>6} {:>7} {:>10} {:>8}   {}",
                 format!("#{}", sample.number),
                 sample.lines,
                 sample.rounds,
                 sample.blocking_rounds,
+                dossier,
                 sample.title
             );
         }
@@ -382,6 +444,24 @@ fn print_gates(report: &GateReport, requested: usize) {
                 "  median blocking rounds: {median:.1} over {} PR(s) — target ≤ 1",
                 report.samples.len()
             );
+        }
+        let counted = report
+            .samples
+            .iter()
+            .filter(|sample| sample.dossier.is_some())
+            .count();
+        if counted > 0 {
+            let disagreements = dossier_disagreements(&report.samples);
+            println!(
+                "  dossier cross-check: {counted} PR(s) state a gate round count; {} disagree",
+                disagreements.len()
+            );
+            if !disagreements.is_empty() {
+                println!(
+                    "  dossier disagrees with the verdict comments: {}",
+                    disagreements.join(", ")
+                );
+            }
         }
     }
     println!(
@@ -719,11 +799,14 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_gate_comment_is_a_round() {
-        assert_eq!(
-            gate_round("## Codex review\n\nCODEX_REVIEW_VERDICT: FAIL", GATE_AUTHOR),
-            Some(Verdict::Fail)
-        );
+    fn a_complete_gate_comment_is_a_round_under_either_bot_spelling() {
+        for author in ["github-actions", "github-actions[bot]"] {
+            assert_eq!(
+                gate_round("## Codex review\n\nCODEX_REVIEW_VERDICT: FAIL", author),
+                Some(Verdict::Fail),
+                "author: {author}"
+            );
+        }
     }
 
     #[test]
@@ -792,6 +875,66 @@ mod tests {
             }],
         };
         assert!(executed_test_leg(&[job]));
+    }
+
+    #[test]
+    fn an_explicit_gate_round_count_is_read_from_a_dossier() {
+        for (body, want) in [
+            (
+                "<!-- gate-dossier -->\nGate rounds: 2.\n\n- Round 1 — FAIL",
+                Some(2),
+            ),
+            (
+                "<!-- gate-dossier -->\n- CI gate rounds: 9 (rounds 4-9 approved)",
+                Some(9),
+            ),
+            (
+                "<!-- gate-dossier -->\n**CI Codex gate** (6 verdicts; retries excluded)",
+                Some(6),
+            ),
+            (
+                "<!-- gate-dossier -->\n**Rounds spent: 4** (the 3-round budget is spent)",
+                Some(4),
+            ),
+        ] {
+            assert_eq!(dossier_rounds(body), want, "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_local_pair_count_is_not_a_gate_round_count() {
+        assert_eq!(
+            dossier_rounds("<!-- gate-dossier -->\n**Local pair (pre-PR):** 3 rounds, all PASS"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_per_round_line_is_not_a_total() {
+        assert_eq!(
+            dossier_rounds("<!-- gate-dossier -->\n**Round 1** — FAIL\n**Round 2** — FAIL"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_dossier_count_that_differs_from_the_verdicts_is_surfaced() {
+        let samples = vec![sample(1, 1, Some(2)), sample(2, 2, Some(2)), sample(3, 1, None)];
+        assert_eq!(
+            dossier_disagreements(&samples),
+            vec!["#1 (dossier 2, verdicts 1)".to_string()]
+        );
+    }
+
+    fn sample(number: u64, rounds: usize, dossier: Option<usize>) -> GateSample {
+        GateSample {
+            number,
+            title: String::new(),
+            lines: 1,
+            rounds,
+            blocking_rounds: 0,
+            dossier,
+        }
     }
 
     #[test]
