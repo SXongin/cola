@@ -276,8 +276,9 @@ impl Scan {
                 function: site.function.clone(),
             })
             .collect();
+        // No dedup: two sites may share a key, and the key's count is its
+        // allowance — collapsing them would bless a baseline that fails itself.
         entries.sort();
-        entries.dedup();
         entries
     }
 
@@ -1749,6 +1750,18 @@ mod tests {
             check(&scan, &base).is_empty(),
             "a baselined allow is grandfathered"
         );
+    }
+
+    /// Blessing a tree with two same-key sites records two slots, not one.
+    #[test]
+    fn blessing_keeps_a_duplicate_key_as_two_slots() {
+        let scan = Scan {
+            allows: vec![allow_site(10, false), allow_site(20, false)],
+            ..Scan::default()
+        };
+        let next = Baseline::next(&scan, None).expect("a missing baseline seeds");
+        assert_eq!(next.too_many_arguments.len(), 2);
+        assert!(check(&scan, &next).is_empty(), "{:?}", check(&scan, &next));
     }
 
     /// A second untracked site under an already-used key is still new: the
