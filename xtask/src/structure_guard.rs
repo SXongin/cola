@@ -24,9 +24,9 @@
 //!    allow-list; no new line may appear.
 //!
 //! `--bless` rewrites the baseline from the tree and refuses to raise a value:
-//! its first job is to record a removal (or a same-score rename) as a *lower*
-//! baseline.
-//! Seeding a missing baseline is the one mode that takes the tree as it is.
+//! its first job is to record a removal (or a rename that keeps its body) as a
+//! *lower* baseline. Seeding a missing baseline is the one mode that takes the
+//! tree as it is.
 //! The only way up is a reviewable edit of the JSON in a diff.
 //!
 //! Thresholds live in `clippy.toml`, so a toolchain bump cannot silently move
@@ -88,6 +88,9 @@ pub(crate) struct FunctionEntry {
     pub(crate) function: String,
     pub(crate) metric: Metric,
     pub(crate) value: u64,
+    /// [`body_fingerprint`] of the item: what makes a rename a move and a
+    /// delete-and-add new growth.
+    pub(crate) body: String,
 }
 
 /// One production file's recorded line count (only files over the cap).
@@ -97,20 +100,16 @@ pub(crate) struct FileEntry {
     pub(crate) lines: usize,
 }
 
-/// The `#[allow(clippy::too_many_arguments)]` sites on one file + function.
+/// One grandfathered `#[allow(clippy::too_many_arguments)]`.
 ///
-/// The counter is a count, never a named site: a line number moves with every
-/// edit above it, and a suffix handed out by line order lets a new allow steal
-/// a grandfathered slot. `untracked` is what the rule polices — a site without
-/// a reason and a tracking issue — so a route has to be tracked to grow.
+/// The key is the file plus the owning `impl`/`trait` and the function name
+/// (`impl Handles::new`), so it survives a line shift and an insertion
+/// elsewhere in the file. Two same-named methods live in different owners, so
+/// the identity is unique; a new allow therefore has no key to inherit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct AllowEntry {
     pub(crate) path: String,
     pub(crate) function: String,
-    /// Every site on this function.
-    pub(crate) count: usize,
-    /// The sites among them with no reason + tracking issue.
-    pub(crate) untracked: usize,
 }
 
 /// One file's `#[cfg(test)]` count.
@@ -208,6 +207,8 @@ pub(crate) struct FunctionScore {
     pub(crate) value: u64,
     /// 1-based, for the violation message only.
     pub(crate) line: usize,
+    /// See [`FunctionEntry::body`].
+    pub(crate) body: String,
 }
 
 /// A production file's production-line count.
@@ -261,28 +262,23 @@ impl Scan {
                 function: score.function.clone(),
                 metric: score.metric,
                 value: score.value,
+                body: score.body.clone(),
             })
             .collect()
     }
 
     fn allow_entries(&self) -> Vec<AllowEntry> {
-        let mut groups: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
-        for site in &self.allows {
-            let group = groups
-                .entry((site.path.clone(), site.function.clone()))
-                .or_default();
-            group.0 += 1;
-            group.1 += usize::from(!site.tracked);
-        }
-        groups
-            .into_iter()
-            .map(|((path, function), (count, untracked))| AllowEntry {
-                path,
-                function,
-                count,
-                untracked,
+        let mut entries: Vec<AllowEntry> = self
+            .allows
+            .iter()
+            .map(|site| AllowEntry {
+                path: site.path.clone(),
+                function: site.function.clone(),
             })
-            .collect()
+            .collect();
+        entries.sort();
+        entries.dedup();
+        entries
     }
 
     fn cfg_test_entries(&self) -> Vec<CfgTestEntry> {
@@ -357,15 +353,16 @@ fn function_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
         }
     }
 
-    // A rename keeps the body in the same file; a file move keeps the name.
-    // Either way the score is unchanged, so an appeared entry may pair with one
-    // vanished entry of the *same* file or the *same* name — never an
-    // unrelated equal score, which would launder a delete-and-add.
+    // A rename keeps the body and a file move keeps the body: either way the
+    // fingerprint is unchanged. An equal score alone is not enough — that is
+    // exactly what a same-file delete-and-add scores — so an appeared entry
+    // pairs only with a vanished one whose body it reproduces.
     for score in appeared {
         let vanished = existing.iter().position(|entry| {
             entry.metric == score.metric
                 && entry.value == score.value
-                && (entry.path == score.path || entry.function == score.function)
+                && !score.body.is_empty()
+                && entry.body == score.body
         });
         if let Some(index) = vanished {
             existing.remove(index);
@@ -391,7 +388,7 @@ fn file_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
                 let ceiling = entry.lines + entry.lines * FILE_GROWTH_PERCENT / 100;
                 if file.lines > ceiling {
                     violations.push(format!(
-                        "{} (file_lines): {} production lines exceeds the baselined {} by more \
+                        "{}:1: file_lines — {} production lines exceeds the baselined {} by more \
                          than {}%",
                         file.path, file.lines, entry.lines, FILE_GROWTH_PERCENT
                     ));
@@ -399,7 +396,7 @@ fn file_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
             }
             None if file.lines > FILE_LINES_LIMIT => {
                 violations.push(format!(
-                    "{} (file_lines): {} production lines crosses the {}-line cap for a new file",
+                    "{}:1: file_lines — {} production lines crosses the {}-line cap for a new file",
                     file.path, file.lines, FILE_LINES_LIMIT
                 ));
             }
@@ -410,7 +407,15 @@ fn file_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
 }
 
 fn allow_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
-    let mut violations = Vec::new();
+    // One key may carry more than one site — two `impl Foo` blocks in one file,
+    // or two attributes on one function — so the baseline's count for the key
+    // is the allowance, and any site past it has to be tracked.
+    let mut allowed: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for entry in &baseline.too_many_arguments {
+        *allowed
+            .entry((entry.path.as_str(), entry.function.as_str()))
+            .or_default() += 1;
+    }
     let mut groups: BTreeMap<(&str, &str), Vec<&AllowSite>> = BTreeMap::new();
     for site in &scan.allows {
         groups
@@ -418,19 +423,17 @@ fn allow_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
             .or_default()
             .push(site);
     }
-    for ((path, function), sites) in groups {
-        let allowed = baseline
-            .too_many_arguments
-            .iter()
-            .find(|entry| entry.path == path && entry.function == function)
-            .map_or(0, |entry| entry.untracked);
+
+    let mut violations = Vec::new();
+    for (key, sites) in groups {
+        let capacity = allowed.get(&key).copied().unwrap_or(0);
         let untracked: Vec<&&AllowSite> = sites.iter().filter(|site| !site.tracked).collect();
-        for site in untracked.iter().skip(allowed) {
+        for site in untracked.iter().skip(capacity) {
             violations.push(format!(
-                "{}:{}: new #[allow(clippy::too_many_arguments)] on `{function}` without a reason \
-                 and a tracking issue — write `reason = \"… #NNN\"` in the attribute or a \
-                 `// … #NNN` comment beside it",
-                site.path, site.line
+                "{}:{}: new #[allow(clippy::too_many_arguments)] on `{}` without a reason and a \
+                 tracking issue — write `reason = \"… #NNN\"` in the attribute or a `// … #NNN` \
+                 comment beside it",
+                site.path, site.line, key.1
             ));
         }
     }
@@ -550,10 +553,7 @@ pub(crate) fn cli() {
                      {} allow(s), {} cfg(test) site(s), {} tag probe(s)",
                     next.functions.len(),
                     next.files.len(),
-                    next.too_many_arguments
-                        .iter()
-                        .map(|entry| entry.count)
-                        .sum::<usize>(),
+                    next.too_many_arguments.len(),
                     next.cfg_test.iter().map(|entry| entry.count).sum::<usize>(),
                     next.tag_probes
                         .iter()
@@ -636,16 +636,21 @@ fn scan_functions(root: &Path) -> Result<Vec<FunctionScore>, String> {
     }
     let json = String::from_utf8_lossy(&output.stdout);
     let diagnostics = parse_clippy(&json)?;
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
     let mut scores = Vec::with_capacity(diagnostics.len());
     for diagnostic in diagnostics {
-        let content = std::fs::read_to_string(root.join(&diagnostic.path)).map_err(|error| {
-            format!(
-                "error: cannot read {} to name a clippy finding: {error}",
-                diagnostic.path
-            )
-        })?;
+        let content = sources.entry(diagnostic.path.clone()).or_default();
+        if content.is_empty() {
+            *content = std::fs::read_to_string(root.join(&diagnostic.path)).map_err(|error| {
+                format!(
+                    "error: cannot read {} to name a clippy finding: {error}",
+                    diagnostic.path
+                )
+            })?;
+        }
         scores.push(FunctionScore {
-            function: function_name_at(&content, diagnostic.line),
+            function: function_name_at(content, diagnostic.line),
+            body: body_fingerprint(content, diagnostic.line),
             path: diagnostic.path,
             metric: diagnostic.metric,
             value: diagnostic.value,
@@ -653,6 +658,84 @@ fn scan_functions(root: &Path) -> Result<Vec<FunctionScore>, String> {
         });
     }
     Ok(scores)
+}
+
+/// A stable 64-bit fingerprint of the item at `line`: its masked body with all
+/// whitespace removed. Comments and literals are already blanked, so a
+/// reformat or a comment edit keeps the fingerprint while a semantic edit
+/// changes it. Empty when the item has no body (a trait method declaration).
+pub(crate) fn body_fingerprint(content: &str, line: usize) -> String {
+    let masked = masked(content);
+    let starts = line_starts(&masked);
+    let start = starts.get(line.saturating_sub(1)).copied().unwrap_or_default();
+    let Some(open) = item_body_open(&masked, start) else {
+        return String::new();
+    };
+    let end = brace_end(&masked, open);
+    let body: Vec<u8> = masked[open..end]
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    format!("{:016x}", fnv1a(&body))
+}
+
+/// The offset of the opening brace of the item starting at `start`, skipping
+/// its attributes. `None` when the item has no block (a `;` terminator).
+fn item_body_open(masked: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    loop {
+        while index < masked.len() && masked[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if masked.get(index) != Some(&b'#') {
+            break;
+        }
+        let mut open = index + 1;
+        if masked.get(open) == Some(&b'!') {
+            open += 1;
+        }
+        if masked.get(open) != Some(&b'[') {
+            break;
+        }
+        let mut depth = 0usize;
+        while open < masked.len() {
+            match masked[open] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        open += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            open += 1;
+        }
+        index = open;
+    }
+    let mut depth = 0usize;
+    while index < masked.len() {
+        match masked[index] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'{' if depth == 0 => return Some(index),
+            b';' if depth == 0 => return None,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// One complexity finding, before its function name is resolved against the
@@ -969,14 +1052,114 @@ fn allow_sites(path: &str, content: &str, masked: &[u8]) -> Vec<AllowSite> {
         let trailing = trailing.strip_prefix("//").unwrap_or_default();
         let above = preceding_comments(content, open);
         let tracked = rationale_is_tracked(&format!("{} {trailing} {above}", attribute_reason(attribute)));
+        let name = annotated_function_at(content, line).unwrap_or_else(|| function_name_at(content, line));
+        let function = match enclosing_owner(masked, content, open) {
+            Some(owner) => format!("{owner}::{name}"),
+            None => name,
+        };
         sites.push(AllowSite {
             path: path.to_string(),
             line,
-            function: function_name_at(content, line),
+            function,
             tracked,
         });
     }
     sites
+}
+
+/// The function an attribute at `line` decorates: the first `fn` after it.
+///
+/// [`function_name_at`] resolves a clippy span, whose `async_trait` attribute
+/// names the enclosing `impl` instead; an allow always sits directly above its
+/// item, so the declaration comes first.
+fn annotated_function_at(content: &str, line: usize) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    lines
+        .iter()
+        .skip(line.saturating_sub(1))
+        .take(20)
+        .find_map(|text| fn_name(text))
+        .map(str::to_string)
+}
+
+/// The `impl` / `trait` header enclosing `at`, normalised to one line.
+///
+/// An item keyword must start its line, so a return-position `impl Trait` is
+/// not mistaken for a block. The innermost (smallest-span) enclosing header
+/// wins — a nested `impl` inside a macro body belongs to the inner one.
+fn enclosing_owner(masked: &[u8], content: &str, at: usize) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for keyword in [b"impl ".as_slice(), b"trait ".as_slice()] {
+        let mut search = 0usize;
+        while let Some(found) = find(&masked[search..], keyword) {
+            let start = search + found;
+            search = start + keyword.len();
+            if start > 0 && is_identifier_byte(masked[start - 1]) {
+                continue;
+            }
+            if !item_keyword_starts_line(masked, start) {
+                continue;
+            }
+            let Some(brace) = find(&masked[start..], b"{").map(|offset| start + offset) else {
+                continue;
+            };
+            let end = brace_end(masked, brace);
+            if start < at && at < end {
+                let span = end - start;
+                let header = content[start..brace]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if best.as_ref().is_none_or(|(width, _)| span < *width) {
+                    best = Some((span, header));
+                }
+            }
+        }
+    }
+    best.map(|(_, header)| header)
+}
+
+/// Whether only an item's own qualifiers (`pub`, `pub(crate)`, `unsafe`)
+/// precede the keyword on its line.
+fn item_keyword_starts_line(masked: &[u8], start: usize) -> bool {
+    let line_start = masked[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let Ok(mut rest) = std::str::from_utf8(trim(&masked[line_start..start])) else {
+        return false;
+    };
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return true;
+        }
+        if let Some(after) = strip_word(rest, "pub") {
+            if let Some(inner) = after.strip_prefix('(') {
+                let Some(close) = inner.find(')') else {
+                    return false;
+                };
+                rest = &inner[close + 1..];
+            } else {
+                rest = after;
+            }
+        } else if let Some(after) = strip_word(rest, "unsafe") {
+            rest = after;
+        } else if let Some(after) = strip_word(rest, "default") {
+            rest = after;
+        } else {
+            return false;
+        }
+    }
+}
+
+fn strip_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(word)?;
+    if rest.chars().next().is_some_and(is_identifier_continue) {
+        None
+    } else {
+        Some(rest)
+    }
 }
 
 /// The contiguous `//` comment lines immediately above `at`, if any.
@@ -1339,22 +1522,24 @@ mod tests {
         }
     }
 
-    fn score(path: &str, function: &str, metric: Metric, value: u64) -> FunctionScore {
+    fn score(path: &str, function: &str, metric: Metric, value: u64, body: &str) -> FunctionScore {
         FunctionScore {
             path: path.to_string(),
             function: function.to_string(),
             metric,
             value,
             line: 7,
+            body: body.to_string(),
         }
     }
 
-    fn fn_entry(path: &str, function: &str, metric: Metric, value: u64) -> FunctionEntry {
+    fn fn_entry(path: &str, function: &str, metric: Metric, value: u64, body: &str) -> FunctionEntry {
         FunctionEntry {
             path: path.to_string(),
             function: function.to_string(),
             metric,
             value,
+            body: body.to_string(),
         }
     }
 
@@ -1364,7 +1549,7 @@ mod tests {
     fn a_new_offender_fails_the_check() {
         let mut scan = Scan::default();
         scan.functions
-            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 120));
+            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 120, "big"));
         let violations = check(&scan, &baseline());
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("src/bridge/x.rs:7: big"));
@@ -1376,12 +1561,17 @@ mod tests {
     #[test]
     fn a_worse_score_fails_the_check() {
         let mut base = baseline();
-        base.functions
-            .push(fn_entry("src/bridge/x.rs", "big", Metric::TooManyLines, 120));
+        base.functions.push(fn_entry(
+            "src/bridge/x.rs",
+            "big",
+            Metric::TooManyLines,
+            120,
+            "big",
+        ));
 
         let mut scan = Scan::default();
         scan.functions
-            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 121));
+            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 121, "big"));
         let violations = check(&scan, &base);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(
@@ -1400,12 +1590,22 @@ mod tests {
     #[test]
     fn a_rename_is_a_move_not_a_new_offender() {
         let mut base = baseline();
-        base.functions
-            .push(fn_entry("src/bridge/x.rs", "old_name", Metric::TooManyLines, 120));
+        base.functions.push(fn_entry(
+            "src/bridge/x.rs",
+            "old_name",
+            Metric::TooManyLines,
+            120,
+            "same-body",
+        ));
 
         let mut scan = Scan::default();
-        scan.functions
-            .push(score("src/bridge/x.rs", "new_name", Metric::TooManyLines, 120));
+        scan.functions.push(score(
+            "src/bridge/x.rs",
+            "new_name",
+            Metric::TooManyLines,
+            120,
+            "same-body",
+        ));
         assert!(check(&scan, &base).is_empty(), "{:?}", check(&scan, &base));
 
         scan.functions[0].value = 140;
@@ -1416,12 +1616,101 @@ mod tests {
     #[test]
     fn a_file_move_is_a_move_not_a_new_offender() {
         let mut base = baseline();
-        base.functions
-            .push(fn_entry("src/bridge/x.rs", "big", Metric::TooManyLines, 120));
+        base.functions.push(fn_entry(
+            "src/bridge/x.rs",
+            "big",
+            Metric::TooManyLines,
+            120,
+            "big",
+        ));
         let mut scan = Scan::default();
         scan.functions
-            .push(score("src/bridge/y.rs", "big", Metric::TooManyLines, 120));
+            .push(score("src/bridge/y.rs", "big", Metric::TooManyLines, 120, "big"));
         assert!(check(&scan, &base).is_empty());
+    }
+
+    /// An equal score is not a move: deleting an offender in one file and
+    /// adding an unrelated one in another is new growth, not a rename.
+    #[test]
+    fn an_equal_score_elsewhere_does_not_launder_a_new_offender() {
+        let mut base = baseline();
+        base.functions.push(fn_entry(
+            "src/bridge/x.rs",
+            "old",
+            Metric::TooManyLines,
+            120,
+            "old-body",
+        ));
+        let mut scan = Scan::default();
+        scan.functions.push(score(
+            "src/bridge/y.rs",
+            "new",
+            Metric::TooManyLines,
+            120,
+            "new-body",
+        ));
+        assert_eq!(
+            check(&scan, &base).len(),
+            1,
+            "unrelated equal scores do not pair: {:?}",
+            check(&scan, &base)
+        );
+    }
+
+    /// The same replacement inside one file is still new growth: only the body
+    /// makes a rename a move.
+    #[test]
+    fn a_same_file_equal_score_replacement_is_a_new_offender() {
+        let mut base = baseline();
+        base.functions.push(fn_entry(
+            "src/bridge/x.rs",
+            "old",
+            Metric::TooManyLines,
+            120,
+            "old-body",
+        ));
+        let mut scan = Scan::default();
+        scan.functions.push(score(
+            "src/bridge/x.rs",
+            "new",
+            Metric::TooManyLines,
+            120,
+            "new-body",
+        ));
+        assert_eq!(check(&scan, &base).len(), 1, "{:?}", check(&scan, &base));
+    }
+
+    /// Two equal-scored renames each pair with their own body.
+    #[test]
+    fn sibling_renames_with_equal_scores_each_pair() {
+        let mut base = baseline();
+        for (name, body) in [("a", "body-a"), ("b", "body-b")] {
+            base.functions
+                .push(fn_entry("src/bridge/x.rs", name, Metric::TooManyLines, 120, body));
+        }
+        let mut scan = Scan::default();
+        for (name, body) in [("a2", "body-a"), ("b2", "body-b")] {
+            scan.functions
+                .push(score("src/bridge/x.rs", name, Metric::TooManyLines, 120, body));
+        }
+        assert!(check(&scan, &base).is_empty(), "{:?}", check(&scan, &base));
+    }
+
+    /// A body-less entry (a trait method declaration) never pairs: there is no
+    /// fingerprint to prove the function is the same one.
+    #[test]
+    fn a_body_less_entry_does_not_pair() {
+        let mut base = baseline();
+        base.functions
+            .push(fn_entry("src/bridge/x.rs", "old", Metric::TooManyLines, 120, ""));
+        let mut scan = Scan::default();
+        scan.functions
+            .push(score("src/bridge/x.rs", "new", Metric::TooManyLines, 120, ""));
+        assert_eq!(
+            check(&scan, &base).len(),
+            1,
+            "an empty fingerprint proves nothing"
+        );
     }
 
     fn allow_site(line: usize, tracked: bool) -> AllowSite {
@@ -1433,12 +1722,10 @@ mod tests {
         }
     }
 
-    fn allow_entry(count: usize, untracked: usize) -> AllowEntry {
+    fn allow_entry(function: &str) -> AllowEntry {
         AllowEntry {
             path: "src/bridge/x.rs".to_string(),
-            function: "wide".to_string(),
-            count,
-            untracked,
+            function: function.to_string(),
         }
     }
 
@@ -1456,7 +1743,7 @@ mod tests {
         assert!(check(&scan, &baseline()).is_empty());
 
         let mut base = baseline();
-        base.too_many_arguments.push(allow_entry(1, 1));
+        base.too_many_arguments.push(allow_entry("wide"));
         scan.allows[0].tracked = false;
         assert!(
             check(&scan, &base).is_empty(),
@@ -1464,32 +1751,84 @@ mod tests {
         );
     }
 
-    /// The counter is order-free: two grandfathered allows on the same
-    /// function leave room for no third untracked one, wherever it is inserted.
+    /// A second untracked site under an already-used key is still new: the
+    /// key's baseline count, not the key alone, is the allowance.
     #[test]
-    fn a_third_untracked_allow_fails_wherever_it_is_inserted() {
+    fn a_duplicate_key_still_has_no_free_slot() {
         let mut base = baseline();
-        base.too_many_arguments.push(allow_entry(2, 2));
+        base.too_many_arguments.push(allow_entry("impl A::wide"));
 
-        for inserted in [0, 1, 2] {
-            let mut scan = Scan::default();
-            let mut sites = vec![allow_site(10, false), allow_site(20, false)];
-            sites.insert(inserted, allow_site(inserted + 5, false));
-            scan.allows = sites;
-            let violations = check(&scan, &base);
-            assert_eq!(violations.len(), 1, "inserted at {inserted}: {violations:?}");
-            assert!(
-                violations[0].contains("without a reason and a tracking issue"),
-                "{violations:?}"
-            );
-        }
+        let mut scan = Scan::default();
+        scan.allows.push(AllowSite {
+            path: "src/bridge/x.rs".to_string(),
+            line: 10,
+            function: "impl A::wide".to_string(),
+            tracked: false,
+        });
+        assert!(check(&scan, &base).is_empty(), "the grandfathered site passes");
 
-        // A tracked new allow may grow the group; a grandfathered site that
-        // later gains a reason frees its slot.
-        let scan = Scan {
-            allows: vec![allow_site(10, false), allow_site(20, false), allow_site(30, true)],
+        scan.allows.push(AllowSite {
+            path: "src/bridge/x.rs".to_string(),
+            line: 20,
+            function: "impl A::wide".to_string(),
+            tracked: false,
+        });
+        assert_eq!(
+            check(&scan, &base).len(),
+            1,
+            "a second untracked site under one key is new"
+        );
+    }
+
+    /// The key is the site's identity, so a new allow cannot inherit a
+    /// grandfathered slot — not by insertion order, and not by sharing the bare
+    /// function name. Giving a grandfathered allow a reason frees nothing.
+    #[test]
+    fn a_new_allow_cannot_inherit_a_grandfathered_key() {
+        let mut base = baseline();
+        base.too_many_arguments.push(allow_entry("impl A::wide"));
+        base.too_many_arguments.push(allow_entry("impl B::wide"));
+
+        // A third site on the same bare name, a different owner.
+        let mut scan = Scan::default();
+        scan.allows.push(AllowSite {
+            path: "src/bridge/x.rs".to_string(),
+            line: 30,
+            function: "impl C::wide".to_string(),
+            tracked: false,
+        });
+        assert_eq!(check(&scan, &base).len(), 1, "a new owner is a new key");
+
+        // Giving a baselined site a reason does not let a new untracked one in.
+        let mut scan = Scan {
+            allows: vec![
+                AllowSite {
+                    path: "src/bridge/x.rs".to_string(),
+                    line: 10,
+                    function: "impl A::wide".to_string(),
+                    tracked: true,
+                },
+                AllowSite {
+                    path: "src/bridge/x.rs".to_string(),
+                    line: 20,
+                    function: "impl B::wide".to_string(),
+                    tracked: false,
+                },
+                AllowSite {
+                    path: "src/bridge/x.rs".to_string(),
+                    line: 30,
+                    function: "impl C::wide".to_string(),
+                    tracked: false,
+                },
+            ],
             ..Scan::default()
         };
+        let violations = check(&scan, &base);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("impl C::wide"), "{violations:?}");
+
+        // A tracked new allow is allowed.
+        scan.allows[2].tracked = true;
         assert!(check(&scan, &base).is_empty(), "{:?}", check(&scan, &base));
     }
 
@@ -1502,6 +1841,28 @@ mod tests {
         assert!(!rationale_is_tracked("the trait's whole context"));
         assert!(!rationale_is_tracked("#1013"));
         assert!(!rationale_is_tracked("fix #1013"));
+    }
+
+    /// Two same-named methods in one file are distinct sites: the key carries
+    /// the owner, so neither can stand in for the other.
+    #[test]
+    fn allow_sites_are_keyed_by_their_owner() {
+        let content = "\
+impl Handles {
+    #[allow(clippy::too_many_arguments)]
+    fn new(a: u8) {}
+}
+
+impl Other {
+    #[allow(clippy::too_many_arguments)] // the click context #1234
+    fn new(a: u8) {}
+}
+";
+        let masked = masked(content);
+        let sites = allow_sites("src/bridge/x.rs", content, &masked);
+        let keys: Vec<&str> = sites.iter().map(|site| site.function.as_str()).collect();
+        assert_eq!(keys, ["impl Handles::new", "impl Other::new"], "{sites:?}");
+        assert!(sites[1].tracked);
     }
 
     /// Both spellings of the rationale are read: the trailing comment and
@@ -1618,12 +1979,17 @@ fn c(x: u8) {}
     #[test]
     fn blessing_lowers_the_baseline_and_refuses_a_worse_one() {
         let mut base = baseline();
-        base.functions
-            .push(fn_entry("src/bridge/x.rs", "big", Metric::TooManyLines, 120));
+        base.functions.push(fn_entry(
+            "src/bridge/x.rs",
+            "big",
+            Metric::TooManyLines,
+            120,
+            "big",
+        ));
 
         let mut scan = Scan::default();
         scan.functions
-            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 118));
+            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 118, "big"));
         let next = Baseline::next(&scan, Some(&base)).expect("a lower score blesses");
         assert_eq!(next.functions[0].value, 118);
 
@@ -1632,7 +1998,7 @@ fn c(x: u8) {}
         assert!(next.functions.is_empty(), "the fixed entry is dropped");
 
         scan.functions
-            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 130));
+            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 130, "big"));
         let refused = Baseline::next(&scan, Some(&base)).expect_err("a worse score is refused");
         assert_eq!(refused.len(), 1);
         assert!(refused[0].contains("is worse"));
@@ -1667,7 +2033,7 @@ fn c(x: u8) {}
     fn seeding_writes_the_tree_as_it_is() {
         let mut scan = Scan::default();
         scan.functions
-            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 140));
+            .push(score("src/bridge/x.rs", "big", Metric::TooManyLines, 140, "big"));
         scan.allows.push(AllowSite {
             path: "src/bridge/x.rs".to_string(),
             line: 1,
@@ -1708,6 +2074,34 @@ not json at all
                 },
             ]
         );
+    }
+
+    /// The body fingerprint is whitespace- and comment-insensitive, and changes
+    /// with the code; a body-less item has none.
+    #[test]
+    fn the_body_fingerprint_tracks_the_code_not_the_format() {
+        let base = "fn big() -> u8 {\n    // a comment\n    let x = helper(1);\n    x\n}\n";
+        let reflowed = "fn big() -> u8 { let x = helper(1); /* another note */ x }\n";
+        let edited = "fn big() -> u8 { let x = helper(2); x }\n";
+        assert_eq!(body_fingerprint(base, 1), body_fingerprint(reflowed, 1));
+        assert_ne!(body_fingerprint(base, 1), body_fingerprint(edited, 1));
+        assert_eq!(body_fingerprint(base, 1).len(), 16);
+
+        let declaration = "trait T {\n    fn wide(a: u8, b: u8);\n}\n";
+        assert!(body_fingerprint(declaration, 2).is_empty());
+    }
+
+    /// The guard is only a guard if CI and the pre-push hook run it.
+    #[test]
+    fn the_guard_is_wired_into_ci_and_the_hook() {
+        let root = crate::repo_root();
+        for file in [".github/workflows/ci.yml", "lefthook.yml"] {
+            let text = std::fs::read_to_string(root.join(file)).expect("the wiring file exists");
+            assert!(
+                text.contains("cargo xtask check-structure"),
+                "{file} must run `cargo xtask check-structure`"
+            );
+        }
     }
 
     /// The function name comes from the declaration line, and `async_trait`
@@ -1825,6 +2219,25 @@ struct Turn {
         }];
         assert!(!is_production_path("src/test_http.rs", &crate_root));
         assert!(is_production_path("src/logging.rs", &crate_root));
+    }
+
+    /// `pub`/`unsafe` qualifiers do not hide the owner.
+    #[test]
+    fn a_qualified_trait_or_impl_still_owns_its_method() {
+        let content = "\
+pub trait Strategy {
+    #[allow(clippy::too_many_arguments)]
+    fn prompt(a: u8) {}
+}
+unsafe impl Send for Thing {
+    #[allow(clippy::too_many_arguments)]
+    fn send(a: u8) {}
+}
+";
+        let masked = masked(content);
+        let sites = allow_sites("src/opencode/strategy.rs", content, &masked);
+        let keys: Vec<&str> = sites.iter().map(|site| site.function.as_str()).collect();
+        assert_eq!(keys, ["trait Strategy::prompt", "impl Send for Thing::send"]);
     }
 
     /// The scan reports a cfg(test) site only for the attribute itself.

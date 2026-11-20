@@ -171,9 +171,11 @@ landed by #1117): five counters — clippy's `cognitive_complexity` (25) and
 tracking issue), new `#[cfg(test)]` production sites, and `["tag"]` card-JSON
 probes outside `src/feishu/card`. It fails only on a **new** offender or a
 **worse** score against the committed `xtask/structure-baseline.json`; a rename
-is a move, not a new entry. `--bless` lowers the baseline (a removal, a rename
-that keeps its score), and refuses to raise a value — the only way up is a
-reviewable edit of the JSON in a diff. `clippy.toml` pins the two thresholds so a toolchain bump cannot move
+is a move, not a new entry — the entry records a fingerprint of the function's
+body, so a rename or a move is recognised by the body it keeps, and an unrelated
+same-score replacement is still new growth. `--bless` lowers the baseline (a
+removal, a rename that keeps its body), and refuses to raise a value — the only
+way up is a reviewable edit of the JSON in a diff. `clippy.toml` pins the two thresholds so a toolchain bump cannot move
 the bar. It costs ~35 s of clippy on an edited tree, about a second when the
 target directory is warm.
 
