@@ -15,7 +15,16 @@ their commands, and what each `xtask` guard protects. Run that loop before
 pushing. Linting here means zero warnings (`-D warnings`), and the
 git hooks (lefthook) run the cheap subset automatically (`pre-commit`: fmt +
 `clippy` on the bin target for staged `*.rs`; `pre-push`: the full
-`clippy --all-targets` + audit).
+`clippy --all-targets` + the structure ratchet + audit).
+
+`cargo xtask check-structure` is the growth ratchet (the code contract, #1109):
+a function over cognitive complexity 25 or over 100 lines, a production file over
+2,000 lines, a new `#[allow(clippy::too_many_arguments)]` without a reason and a
+tracking issue, a new `#[cfg(test)]` production site, and a `["tag"]` probe
+outside `src/feishu/card` all fail the build unless they are already in
+`xtask/structure-baseline.json`. It only ratchets down: fix the offender and
+re-bless to record a lower baseline, never edit a value up except in a reviewed
+diff.
 
 ## Commits
 
@@ -48,6 +57,10 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
   attached to one can therefore be dropped without ever being written. Derive it
   from the body's own build (the slice the body really rendered), or keep it
   outside the stage; the stage may *carry* it, never *own* it.
+- **A guard or a fallback for an input that cannot occur is a defect, not
+  diligence** (#1109): it reads as robustness but is untested code on a path
+  production never takes, and a test written to exercise it is not coverage.
+  (Judgement-only; the gate may flag it, never block on it.)
 - **Use the glossary's vocabulary** (`GLOSSARY.md`): say *Bridge*, *Platform*,
   *Backend*, *Shared Store*, *Owned Server*, *Coexistent Server*, *Session*,
   *Card* — not synonyms the glossary explicitly avoids.

@@ -119,13 +119,15 @@ hardcode it.
 Git hooks (lefthook) enforce the cheap ones automatically — `pre-commit` runs
 `fmt` + `clippy` on the bin target when Rust files are staged, `commit-msg`
 checks Conventional Commits, `pre-push` runs the full `clippy --all-targets`
-(which also lints test code) and the dependency audit. The full loop CI runs:
+(which also lints test code), the structure ratchet and the dependency audit.
+The full loop CI runs:
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask check-generation
 cargo xtask check-client-seam
+cargo xtask check-structure
 cargo xtask check-fixture-format
 cargo xtask check-doc-drift
 cargo test --workspace --locked
@@ -160,6 +162,20 @@ bridge reaches the active client through `SharedCore::client`, so a second
 adapter does not have to edit the bridge to exist (ADR-0090). The only
 exemptions are the adapter's own modules and, until #875, its attach/lifecycle
 plumbing (`generation`, `strategy`, `transport`), listed one item at a time.
+
+`cargo xtask check-structure` is the structure ratchet (decided in #1109,
+landed by #1117): five counters — clippy's `cognitive_complexity` (25) and
+`too_many_lines` (100) on the production bin target, production-file size
+(2,000 lines for a new file, 10% headroom over a baselined one), new
+`#[allow(clippy::too_many_arguments)]` sites (a new one needs a reason and a
+tracking issue), new `#[cfg(test)]` production sites, and `["tag"]` card-JSON
+probes outside `src/feishu/card`. It fails only on a **new** offender or a
+**worse** score against the committed `xtask/structure-baseline.json`; a rename
+is a move, not a new entry. `--bless` lowers the baseline (a removal, a rename),
+and refuses to raise a value — the only way up is a reviewable edit of the JSON
+in a diff. `clippy.toml` pins the two thresholds so a toolchain bump cannot move
+the bar. It costs ~35 s of clippy on an edited tree, about a second when the
+target directory is warm.
 
 `cargo xtask check-fixture-format` is the fixture format gate: the Codex proxy
 fixture (`src/codex/fixtures/proxy_fixture.rs`) is compiled by `rustc` from an
