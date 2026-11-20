@@ -14,6 +14,9 @@ disagree, the owner wins.
   `CONTRIBUTING.md`
 - **Code conventions**, the source of the `/code-review` skill's Standards axis —
   `CODING_STANDARDS.md`
+- **The refactoring charter** — the growth ratchet, the test and docs contracts,
+  and which rules CI enforces versus which stay review-only —
+  `docs/adr/0110-the-refactoring-charter.md`
 - **Which skill runs when** — the main flow, the bug/issue on-ramps, the local
   bindings — `docs/agents/flow.md`
 - **Repo-local skills** — shadowing, where a skill lives, compose-vs-fork, the

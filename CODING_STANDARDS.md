@@ -24,7 +24,29 @@ tracking issue, a new `#[cfg(test)]` production site, and a `["tag"]` probe
 outside `src/feishu/card` all fail the build unless they are already in
 `xtask/structure-baseline.json`. It only ratchets down: fix the offender and
 re-bless to record a lower baseline, never edit a value up except in a reviewed
-diff.
+diff. The charter's ratchet table (`docs/adr/0110-the-refactoring-charter.md`)
+says which rules a guard decides and which stay review-only.
+
+## Tests
+
+The test contract is ADR-0110's second decision; the cost evidence is #1106.
+
+- **One observable behaviour per test.** Many assertions may assert that one
+  behaviour; a test pinning two independent behaviours is two tests. Ordering
+  and race tests, golden tests and wire-shape tests (a fake server) are the
+  enumerated exceptions — their one behaviour is the order or the shape.
+- **An absence assertion names its counterpart**: `assert!(!…)` says what would
+  have made it true, or a rename turns a real check vacuous.
+- **A new test-only production twin is banned** — a `#[cfg(test)]` seam that
+  exists only so a test can reach a path. `check-structure` counts the sites;
+  the existing twins are C9's deletion target.
+- **Delete the cheapest duplicate first**: repeated negatives, then test-only
+  twins, then duplicate helpers, then same-shape merges. A deletion keeps a
+  surviving test that fails when the behaviour breaks; a deleted test with no
+  such survivor is coverage removed, not redundancy.
+- **CI targets hotspots, not the count.** The Test job's budget is 6 minutes; the
+  module whose tests dominate the wall time is the one to fix. Nightly sampled
+  mutation is the value signal; coverage ratio and `nextest` are not adopted.
 
 ## Commits
 
@@ -61,6 +83,19 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
   diligence** (#1109): it reads as robustness but is untested code on a path
   production never takes, and a test written to exercise it is not coverage.
   (Judgement-only; the gate may flag it, never block on it.)
+- **A module's size is budgeted**: a new production file may not cross 2,000
+  lines, a baselined one may not grow 10%, a function over cognitive complexity
+  25 or 100 lines is an offender, and a new
+  `#[allow(clippy::too_many_arguments)]` needs a reason and a tracking issue
+  (ADR-0110). `check-structure` fails only on new or worse, so touching a
+  function that can fit is the moment to cut it — not a separate ticket.
+- **Card JSON lives in `feishu/card`**: a `["tag"]` probe elsewhere needs an
+  allowlist entry, and the `CardElement` type layer is the segment that will own
+  the schema. Run lifecycle has one owner, not four homes.
+- **A comment carries an invariant, a wire/why trap, or an API contract the
+  signature cannot express.** A bare pointer (an issue, an ADR) is fine; a
+  retelling of the code is not — the docs contract found ~38% pure restatement
+  in the largest modules (#1112).
 - **Use the glossary's vocabulary** (`GLOSSARY.md`): say *Bridge*, *Platform*,
   *Backend*, *Shared Store*, *Owned Server*, *Coexistent Server*, *Session*,
   *Card* — not synonyms the glossary explicitly avoids.
