@@ -31,6 +31,18 @@ use crate::structure_guard;
 /// The charter's diff size bound for the round metric, in changed lines.
 const DIFF_CAP: u64 = 300;
 
+/// How many merged PRs to fetch before ordering them by merge date. The report
+/// samples `--prs` *after* that ordering, so a long-lived PR that merged late
+/// is not skipped because newer-created PRs filled the API page. Hitting the
+/// ceiling is an error, never a silently truncated window.
+const MERGED_FETCH_LIMIT: usize = 2_000;
+
+/// The `Test` matrix job and the step that proves its work actually ran: a
+/// docs-only/draft/release run dispatches the job with every step skipped, so
+/// a job's timestamps alone do not make it a code run.
+const TEST_JOB_PREFIX: &str = "Test (";
+const TEST_STEP: &str = "cargo test --workspace --locked";
+
 /// A module over this many production lines is the growth metric's target.
 const MODULE_CAP: usize = 2_000;
 
@@ -92,12 +104,21 @@ struct RunRow {
     seconds: i64,
 }
 
-/// One executed job of a CI run.
+/// One job of a CI run; `steps` tells an executed job from a dispatched one
+/// whose steps were all skipped.
 #[derive(Deserialize)]
 struct JobRow {
     name: String,
     conclusion: Option<String>,
     seconds: i64,
+    #[serde(default)]
+    steps: Vec<StepRow>,
+}
+
+#[derive(Deserialize)]
+struct StepRow {
+    name: String,
+    conclusion: Option<String>,
 }
 
 /// The CI wall-time metric over the sampled window.
@@ -207,12 +228,18 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
         "--state".to_string(),
         "merged".to_string(),
         "--limit".to_string(),
-        limit.to_string(),
+        MERGED_FETCH_LIMIT.to_string(),
         "--json".to_string(),
         "number,title,additions,deletions,headRefName,mergedAt,author".to_string(),
     ];
-    let mut merged: Vec<PrRow> = parse_json(&gh(&args)?, "the merged PR list")?;
-    merged.sort_by(|left, right| right.merged_at.cmp(&left.merged_at));
+    let fetched: Vec<PrRow> = parse_json(&gh(&args)?, "the merged PR list")?;
+    if fetched.len() >= MERGED_FETCH_LIMIT {
+        return Err(format!(
+            "error: the merged-PR fetch hit its {MERGED_FETCH_LIMIT}-PR ceiling — raise \
+             MERGED_FETCH_LIMIT so the window is not silently truncated"
+        ));
+    }
+    let merged = newest_merged(fetched, limit);
     let window = merged
         .first()
         .zip(merged.last())
@@ -261,6 +288,13 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
         });
     }
     Ok(report)
+}
+
+/// The most recently merged `limit` PRs, newest first.
+fn newest_merged(mut prs: Vec<PrRow>, limit: usize) -> Vec<PrRow> {
+    prs.sort_by(|left, right| right.merged_at.cmp(&left.merged_at));
+    prs.truncate(limit);
+    prs
 }
 
 fn pr_comment_bodies(number: u64) -> Result<Vec<String>, String> {
@@ -381,9 +415,10 @@ fn ci_wall(limit: usize) -> Result<WallReport, String> {
             continue;
         }
         let jobs = run_jobs(run.id)?;
-        // A docs-only/draft/release run never expands the `Test` matrix, and
-        // its wall time is not what the charter's 6-minute target measures.
-        if !jobs.iter().any(|job| job.name.starts_with("Test (")) {
+        // A docs-only/draft/release run still dispatches the `Test` matrix with
+        // every step skipped; only an executed test step makes it a code run
+        // whose wall the charter's 6-minute target measures.
+        if !executed_test_leg(&jobs) {
             report.no_code += 1;
             continue;
         }
@@ -399,10 +434,20 @@ fn ci_wall(limit: usize) -> Result<WallReport, String> {
     Ok(report)
 }
 
+fn executed_test_leg(jobs: &[JobRow]) -> bool {
+    jobs.iter().any(|job| {
+        job.name.starts_with(TEST_JOB_PREFIX)
+            && job.steps.iter().any(|step| {
+                step.name.strip_prefix("Run ") == Some(TEST_STEP)
+                    && step.conclusion.as_deref() != Some("skipped")
+            })
+    })
+}
+
 fn run_jobs(run: u64) -> Result<Vec<JobRow>, String> {
     let jq = "[.jobs[] | select(.started_at != null and .completed_at != null \
               and .conclusion != \"skipped\") \
-              | {name, conclusion, \
+              | {name, conclusion, steps: [.steps[] | {name, conclusion}], \
                  seconds: ((.completed_at|fromdateiso8601) - (.started_at|fromdateiso8601))}]";
     let endpoint = format!("repos/{{owner}}/{{repo}}/actions/runs/{run}/jobs?per_page=100");
     let args = ["api".to_string(), endpoint, "--jq".to_string(), jq.to_string()];
@@ -425,7 +470,7 @@ fn print_wall(report: &WallReport, requested: usize) {
     let test_legs: Vec<String> = report
         .jobs
         .iter()
-        .filter(|(name, _)| name.starts_with("Test ("))
+        .filter(|(name, _)| name.starts_with(TEST_JOB_PREFIX))
         .filter_map(|(name, samples)| {
             median(&samples.iter().map(|s| *s as f64).collect::<Vec<_>>())
                 .map(|median| format!("{name} {}", duration(median)))
@@ -681,13 +726,87 @@ mod tests {
     }
 
     #[test]
-    fn the_code_run_prefix_matches_the_ci_workflow() {
+    fn the_code_run_detector_matches_the_ci_workflow() {
         let workflow = std::fs::read_to_string(crate::repo_root().join(".github/workflows/ci.yml"))
             .expect("ci.yml exists");
         assert!(
-            workflow.contains("name: Test (${{ matrix.os }})"),
-            "the code-run detector keys on the `Test (` job prefix"
+            workflow.contains("name: Test (${{ matrix.os }})")
+                && workflow.contains(&format!("run: {TEST_STEP}")),
+            "the code-run detector keys on the `Test (` job and its `{TEST_STEP}` step"
         );
+    }
+
+    #[test]
+    fn a_dispatched_test_job_with_every_step_skipped_is_not_a_code_run() {
+        let job = JobRow {
+            name: "Test (macos-latest)".to_string(),
+            conclusion: Some("success".to_string()),
+            seconds: 5,
+            steps: vec![
+                StepRow {
+                    name: "Set up job".to_string(),
+                    conclusion: Some("success".to_string()),
+                },
+                StepRow {
+                    name: format!("Run {TEST_STEP}"),
+                    conclusion: Some("skipped".to_string()),
+                },
+            ],
+        };
+        assert!(!executed_test_leg(&[job]));
+    }
+
+    #[test]
+    fn an_executed_test_step_makes_the_run_a_code_run() {
+        let job = JobRow {
+            name: "Test (macos-latest)".to_string(),
+            conclusion: Some("failure".to_string()),
+            seconds: 300,
+            steps: vec![StepRow {
+                name: format!("Run {TEST_STEP}"),
+                conclusion: Some("failure".to_string()),
+            }],
+        };
+        assert!(executed_test_leg(&[job]));
+    }
+
+    #[test]
+    fn the_newest_merged_prs_are_selected_by_merge_date() {
+        let prs = vec![
+            pr(1, "2026-11-01T00:00:00Z"),
+            pr(3, "2026-11-20T00:00:00Z"),
+            pr(2, "2026-11-10T00:00:00Z"),
+        ];
+        let selected: Vec<u64> = newest_merged(prs, 2).iter().map(|pr| pr.number).collect();
+        assert_eq!(selected, vec![3, 2]);
+    }
+
+    #[test]
+    fn module_sizes_counts_production_lines_only() {
+        let root = std::env::temp_dir().join(format!("cola-metrics-{}", std::process::id()));
+        let src = root.join("src");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&src).expect("temp src");
+        std::fs::write(
+            src.join("main.rs"),
+            "fn main() {}\nlet a = 1;\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n}\n",
+        )
+        .expect("temp source");
+        let sizes = structure_guard::module_sizes(&root).expect("scan");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(sizes.iter().map(|file| file.lines).sum::<usize>(), 2, "{sizes:?}");
+    }
+
+    fn pr(number: u64, merged_at: &str) -> PrRow {
+        PrRow {
+            number,
+            title: String::new(),
+            additions: 0,
+            deletions: 0,
+            head_ref: String::new(),
+            merged_at: merged_at.to_string(),
+            author: PrAuthor { login: String::new() },
+        }
     }
 
     #[test]
