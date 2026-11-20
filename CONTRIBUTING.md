@@ -149,6 +149,40 @@ The hook split assumes the same boundary: `pre-commit` deliberately stops at the
 bin target (32 s, not 101 s), so a lint in `#[cfg(test)]` code is caught by
 `pre-push` and CI — not by the commit that introduced it.
 
+## Measuring the charter
+
+The refactoring charter (`docs/adr/0110-the-refactoring-charter.md`) is judged by
+three numbers, and one read-only command prints them:
+
+```bash
+cargo xtask metrics
+cargo xtask metrics --prs 60 --runs 40 --since 2026-09-01
+```
+
+It reads `gh` and the local tree only — no new service, no token beyond the `gh`
+login the repo already uses — and it writes nothing:
+
+1. **Gate blocking rounds** — the last N merged PRs filtered to diffs of at most
+   300 changed lines, each PR's complete gate review comments (the verdict is
+   the last non-blank line's `CODEX_REVIEW_VERDICT: PASS|FAIL`; a `FAIL` is a
+   blocking round) and their median. The PR's `<!-- gate-dossier -->` comment is
+   the human record that count should agree with; its free-form prose is not
+   parsed, and a dossier that quotes a verdict is not counted as a round. PRs
+   over the cap, release cuts, and Dependabot PRs are reported as excluded,
+   never silently dropped.
+2. **CI wall time** — the last N completed `CI` runs, per job (median and max
+   from each job's `started_at`/`completed_at`), with the `Test` matrix legs
+   called out against their 6-minute target. The overall wall is the run's
+   `createdAt`→`updatedAt` span, so it includes GitHub's queue time. Cancelled
+   runs and runs without an executed `Test` leg (docs-only, draft,
+   `release/*`) are excluded, so the wall reported is the one a code PR pays.
+3. **Commit mix and module growth** — the `fix` and `feat` shares of the commits
+   since the window start, and every production module over 2,000 lines as
+   `check-structure` counts them.
+
+The baseline the charter is measured against is the report recorded in #1114;
+compare against it rather than re-deriving the numbers.
+
 `cargo xtask check-generation` is the V1 coupling guard (spec #364): V1 route
 literals and wire field names may live only in the V1 generation strategy
 (`src/opencode/v1/`) or the explicitly allow-listed tool-render surface, so V1

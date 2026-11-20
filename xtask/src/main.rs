@@ -5,6 +5,7 @@ mod client_seam_guard;
 mod codex_gate;
 mod doc_drift;
 mod generation_guard;
+mod metrics;
 mod release;
 mod source_scan;
 mod structure_guard;
@@ -14,7 +15,8 @@ fn main() {
         eprintln!("Usage: cargo xtask <task>");
         eprintln!(
             "Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, \
-             check-client-seam, check-fixture-format, check-doc-drift, check-structure, release"
+             check-client-seam, check-fixture-format, check-doc-drift, check-structure, metrics, \
+             release"
         );
         exit(1);
     });
@@ -31,12 +33,13 @@ fn main() {
         "check-fixture-format" => check_fixture_format(),
         "check-doc-drift" => doc_drift::run(),
         "check-structure" => structure_guard::cli(),
+        "metrics" => metrics::cli(),
         "release" => release::cli(),
         other => {
             eprintln!(
                 "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, \
                  check-generation, check-client-seam, check-fixture-format, check-doc-drift, \
-                 check-structure, release"
+                 check-structure, metrics, release"
             );
             exit(1);
         }
@@ -73,7 +76,7 @@ fn run_check_commit_msg() {
     }
 }
 
-const TYPES: &[&str] = &[
+pub(crate) const TYPES: &[&str] = &[
     "feat", "fix", "docs", "style", "refactor", "test", "chore", "ci", "build", "perf", "revert",
 ];
 
