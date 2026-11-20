@@ -721,18 +721,24 @@ pub(crate) fn body_fingerprint(content: &str, line: usize) -> String {
     if trim(&masked[start..line_end]).starts_with(b"#")
         && let Some(header) = impl_header_after(&masked, start)
     {
-        return impl_members_fingerprint(&masked, header);
+        return impl_members_fingerprint(&masked, &comment_masked(content), header);
     }
     let Some(open) = item_body_open(&masked, start) else {
         return String::new();
     };
     let end = brace_end(&masked, open);
-    let body: Vec<u8> = masked[open..end]
+    let plain = comment_masked(content);
+    format!("{:016x}", hash_span(&plain, open, end))
+}
+
+/// The whitespace-free, comment-free hash of `[start, end)`.
+fn hash_span(masked: &[u8], start: usize, end: usize) -> u64 {
+    let body: Vec<u8> = masked[start..end]
         .iter()
         .copied()
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect();
-    format!("{:016x}", fnv1a(&body))
+    fnv1a(&body)
 }
 
 /// The `impl` header on or within the few lines after `start`.
@@ -758,13 +764,13 @@ fn impl_header_after(masked: &[u8], start: usize) -> Option<usize> {
 }
 
 /// The impl's members whose bodies exceed clippy's line threshold, hashed.
-fn impl_members_fingerprint(masked: &[u8], header: usize) -> String {
+fn impl_members_fingerprint(masked: &[u8], plain: &[u8], header: usize) -> String {
     let Some(brace) = find(&masked[header..], b"{").map(|offset| header + offset) else {
         return String::new();
     };
     let end = brace_end(masked, brace);
     let starts = line_starts(masked);
-    let mut members = Vec::new();
+    let mut members: Vec<u64> = Vec::new();
     let mut depth = 0usize;
     let mut index = brace;
     while index < end {
@@ -772,10 +778,12 @@ fn impl_members_fingerprint(masked: &[u8], header: usize) -> String {
             b'{' => depth += 1,
             b'}' => depth = depth.saturating_sub(1),
             b'f' if depth == 1 => {
-                if let Some((name, open, close)) = fn_member(masked, index, end) {
+                if let Some((_, open, close)) = fn_member(masked, index, end) {
                     let lines = line_index(&starts, close).saturating_sub(line_index(&starts, open) + 1);
                     if lines > IMPL_MEMBER_FLOOR {
-                        members.push(name);
+                        // The body, not the name: a rename keeps it, a
+                        // replacement changes it.
+                        members.push(hash_span(plain, open, close));
                     }
                     index = close;
                     continue;
@@ -785,8 +793,9 @@ fn impl_members_fingerprint(masked: &[u8], header: usize) -> String {
         }
         index += 1;
     }
-    members.sort();
-    format!("{:016x}", fnv1a(members.join("\n").as_bytes()))
+    members.sort_unstable();
+    let joined: Vec<String> = members.iter().map(|hash| format!("{hash:016x}")).collect();
+    format!("{:016x}", fnv1a(joined.join("\n").as_bytes()))
 }
 
 /// A `fn` member at `at`: its name and the offsets of its body's braces.
@@ -1192,7 +1201,14 @@ fn allow_sites(path: &str, content: &str, masked: &[u8]) -> Vec<AllowSite> {
         let tracked = rationale_is_tracked(&format!("{} {trailing} {above}", attribute_reason(attribute)));
         let name = annotated_function_at(content, line).unwrap_or_else(|| function_name_at(content, line));
         let function = match enclosing_owner(masked, content, open) {
-            Some(owner) => format!("{owner}::{name}"),
+            Some((start, owner)) => {
+                let ordinal = impl_ordinal(masked, start);
+                if ordinal > 1 {
+                    format!("{owner}#{ordinal}::{name}")
+                } else {
+                    format!("{owner}::{name}")
+                }
+            }
             None => name,
         };
         sites.push(AllowSite {
@@ -1225,8 +1241,8 @@ fn annotated_function_at(content: &str, line: usize) -> Option<String> {
 /// An item keyword must start its line, so a return-position `impl Trait` is
 /// not mistaken for a block. The innermost (smallest-span) enclosing header
 /// wins — a nested `impl` inside a macro body belongs to the inner one.
-fn enclosing_owner(masked: &[u8], content: &str, at: usize) -> Option<String> {
-    let mut best: Option<(usize, String)> = None;
+fn enclosing_owner(masked: &[u8], content: &str, at: usize) -> Option<(usize, String)> {
+    let mut best: Option<(usize, usize, String)> = None;
     for keyword in [b"impl ".as_slice(), b"trait ".as_slice()] {
         let mut search = 0usize;
         while let Some(found) = find(&masked[search..], keyword) {
@@ -1248,13 +1264,43 @@ fn enclosing_owner(masked: &[u8], content: &str, at: usize) -> Option<String> {
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                if best.as_ref().is_none_or(|(width, _)| span < *width) {
-                    best = Some((span, header));
+                if best.as_ref().is_none_or(|(width, _, _)| span < *width) {
+                    best = Some((span, start, header));
                 }
             }
         }
     }
-    best.map(|(_, header)| header)
+    best.map(|(_, start, header)| (start, header))
+}
+
+/// This header's ordinal among the identical headers in the file, 1-based.
+///
+/// Two `impl Foo` blocks in one file are two owners; without the ordinal, an
+/// allow moved from one to the other would keep the same key.
+fn impl_ordinal(masked: &[u8], header_start: usize) -> usize {
+    let Some(brace) = find(&masked[header_start..], b"{").map(|offset| header_start + offset) else {
+        return 1;
+    };
+    let header = trim(&masked[header_start..brace]);
+    if header.is_empty() {
+        return 1;
+    }
+    let mut ordinal = 1usize;
+    let mut search = 0usize;
+    while let Some(found) = find(&masked[search..], header) {
+        let at = search + found;
+        search = at + header.len();
+        if at >= header_start {
+            break;
+        }
+        if at > 0 && is_identifier_byte(masked[at - 1]) {
+            continue;
+        }
+        if item_keyword_starts_line(masked, at) {
+            ordinal += 1;
+        }
+    }
+    ordinal
 }
 
 /// Whether only an item's own qualifiers (`pub`, `pub(crate)`, `unsafe`)
@@ -1408,6 +1454,53 @@ fn tag_probes(path: &str, content: &str, masked: &[u8]) -> Vec<TagProbe> {
 // ---------------------------------------------------------------------------
 // Structural scanning helpers
 // ---------------------------------------------------------------------------
+
+/// `source` with comment text blanked and literal contents **kept**: the
+/// fingerprint input. A comment or a reflow is not a semantic edit, but a
+/// literal's content is.
+fn comment_masked(source: &str) -> Vec<u8> {
+    let src = source.as_bytes();
+    let mut out = src.to_vec();
+    let mut index = 0usize;
+    while index < src.len() {
+        match src[index] {
+            b'/' if src.get(index + 1) == Some(&b'/') => {
+                let start = index;
+                while index < src.len() && src[index] != b'\n' {
+                    index += 1;
+                }
+                blank(&mut out, start, index);
+            }
+            b'/' if src.get(index + 1) == Some(&b'*') => {
+                let start = index;
+                let mut depth = 1usize;
+                index += 2;
+                while index < src.len() && depth > 0 {
+                    if src[index] == b'/' && src.get(index + 1) == Some(&b'*') {
+                        depth += 1;
+                        index += 2;
+                    } else if src[index] == b'*' && src.get(index + 1) == Some(&b'/') {
+                        depth -= 1;
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+                blank(&mut out, start, index);
+            }
+            b'"' => index = string_end(src, index),
+            b'\'' => index = char_literal_end(src, index).unwrap_or(index + 1),
+            _ => {
+                if let Some((_, _, end)) = raw_string(src, index) {
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+    out
+}
 
 /// The byte offsets at which each line starts.
 fn line_starts(text: &[u8]) -> Vec<usize> {
@@ -2077,6 +2170,42 @@ mod tests {
         assert!(!rationale_is_tracked("fix #1013"));
     }
 
+    /// Two `impl Foo` blocks in one file are two owners: moving an allow from
+    /// one to the other is a different key, so it cannot inherit a slot.
+    #[test]
+    fn two_impl_blocks_are_distinct_allow_owners() {
+        let content = "\
+impl Foo {
+    #[allow(clippy::too_many_arguments)]
+    fn wide(a: u8) {}
+}
+impl Foo {
+    #[allow(clippy::too_many_arguments)]
+    fn wide(a: u8) {}
+}
+";
+        let masked = masked(content);
+        let sites = allow_sites("src/bridge/x.rs", content, &masked);
+        let keys: Vec<&str> = sites.iter().map(|site| site.function.as_str()).collect();
+        assert_eq!(keys, ["impl Foo::wide", "impl Foo#2::wide"]);
+
+        let mut base = baseline();
+        base.too_many_arguments.push(allow_entry("impl Foo::wide"));
+        let mut scan = Scan::default();
+        scan.allows.push(AllowSite {
+            path: "src/bridge/x.rs".to_string(),
+            line: 6,
+            function: "impl Foo#2::wide".to_string(),
+            tracked: false,
+        });
+        assert_eq!(
+            check(&scan, &base).len(),
+            1,
+            "a moved allow is a new key: {:?}",
+            check(&scan, &base)
+        );
+    }
+
     /// Two same-named methods in one file are distinct sites: the key carries
     /// the owner, so neither can stand in for the other.
     #[test]
@@ -2311,7 +2440,7 @@ not json at all
     }
 
     /// The body fingerprint is whitespace- and comment-insensitive, and changes
-    /// with the code; a body-less item has none.
+    /// with the code — a literal's content is code, so changing it counts.
     #[test]
     fn the_body_fingerprint_tracks_the_code_not_the_format() {
         let base = "fn big() -> u8 {\n    // a comment\n    let x = helper(1);\n    x\n}\n";
@@ -2320,6 +2449,12 @@ not json at all
         assert_eq!(body_fingerprint(base, 1), body_fingerprint(reflowed, 1));
         assert_ne!(body_fingerprint(base, 1), body_fingerprint(edited, 1));
         assert_eq!(body_fingerprint(base, 1).len(), 16);
+
+        // A literal is not blanked for the fingerprint, so a same-shape
+        // function that only changes its string is a different function.
+        let hello = "fn big() { let s = \"hello\"; }\n";
+        let world = "fn big() { let s = \"world\"; }\n";
+        assert_ne!(body_fingerprint(hello, 1), body_fingerprint(world, 1));
 
         let declaration = "trait T {\n    fn wide(a: u8, b: u8);\n}\n";
         assert!(body_fingerprint(declaration, 2).is_empty());
@@ -2502,16 +2637,16 @@ unsafe impl Send for Thing {
         assert!(rationale_is_tracked(attribute_reason(attribute)));
     }
 
-    /// An impl-attributed entry is fingerprinted by its long members: editing
-    /// one keeps the fingerprint, replacing one changes it, and a short member
-    /// does not move it.
+    /// An impl-attributed entry is fingerprinted by its long members' *bodies*:
+    /// a rename keeps it, a replacement changes it, and a short member does not
+    /// move it.
     #[test]
     fn an_impl_entry_is_fingerprinted_by_its_long_members() {
-        fn impl_source(name: &str, extra: &str, lines: usize) -> String {
+        fn impl_source(name: &str, line: &str, extra: &str) -> String {
             let mut text = String::from("#[async_trait]\nimpl T for S {\n");
             text.push_str(&format!("    async fn {name}(&self) {{\n"));
-            for _ in 0..lines {
-                text.push_str("        x += 1;\n");
+            for _ in 0..110 {
+                text.push_str(&format!("        {line}\n"));
             }
             text.push_str("    }\n");
             text.push_str(extra);
@@ -2519,22 +2654,22 @@ unsafe impl Send for Thing {
             text
         }
 
-        let base = body_fingerprint(&impl_source("first", "", 110), 1);
+        let base = body_fingerprint(&impl_source("first", "x += 1;", ""), 1);
         assert_eq!(base.len(), 16);
         assert_eq!(
-            body_fingerprint(&impl_source("first", "", 111), 1),
+            body_fingerprint(&impl_source("renamed", "x += 1;", ""), 1),
             base,
-            "a body edit keeps the member set"
-        );
-        assert_eq!(
-            body_fingerprint(&impl_source("first", "    fn short(&self) {}\n", 110), 1),
-            base,
-            "a short member does not join the set"
+            "a rename keeps the body's fingerprint"
         );
         assert_ne!(
-            body_fingerprint(&impl_source("other", "", 110), 1),
+            body_fingerprint(&impl_source("other", "y += 2;", ""), 1),
             base,
             "a replacement member is a different entry"
+        );
+        assert_eq!(
+            body_fingerprint(&impl_source("first", "x += 1;", "    fn short(&self) {}\n"), 1),
+            base,
+            "a short member does not join the set"
         );
     }
 
