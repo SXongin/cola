@@ -7,13 +7,14 @@ mod doc_drift;
 mod generation_guard;
 mod release;
 mod source_scan;
+mod structure_guard;
 
 fn main() {
     let task = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("Usage: cargo xtask <task>");
         eprintln!(
             "Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, \
-             check-client-seam, check-fixture-format, check-doc-drift, release"
+             check-client-seam, check-fixture-format, check-doc-drift, check-structure, release"
         );
         exit(1);
     });
@@ -29,11 +30,13 @@ fn main() {
         "check-client-seam" => client_seam_guard::run(),
         "check-fixture-format" => check_fixture_format(),
         "check-doc-drift" => doc_drift::run(),
+        "check-structure" => structure_guard::cli(),
         "release" => release::cli(),
         other => {
             eprintln!(
                 "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, \
-                 check-generation, check-client-seam, check-fixture-format, check-doc-drift, release"
+                 check-generation, check-client-seam, check-fixture-format, check-doc-drift, \
+                 check-structure, release"
             );
             exit(1);
         }
