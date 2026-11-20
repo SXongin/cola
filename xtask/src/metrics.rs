@@ -328,8 +328,11 @@ fn gate_round(body: &str) -> Option<Verdict> {
 fn verdict(body: &str) -> Option<Verdict> {
     let line = body.lines().rev().find(|line| !line.trim().is_empty())?;
     for (index, _) in line.rmatch_indices(VERDICT_MARKER) {
+        // The gate's sed spells `CODEX_REVIEW_VERDICT: (PASS|FAIL)` — the one
+        // space is literal, so `CODEX_REVIEW_VERDICT:PASS` is not a verdict.
         let value = line[index + VERDICT_MARKER.len()..]
-            .trim_start()
+            .strip_prefix(' ')
+            .unwrap_or_default()
             .trim_end_matches(|c: char| matches!(c, '*' | '`') || c.is_whitespace());
         match value {
             "PASS" => return Some(Verdict::Pass),
@@ -688,6 +691,7 @@ mod tests {
             "CODEX_REVIEW_VERDICT: MAYBE",
             "CODEX_REVIEW_VERDICT: PASS and then prose",
             "CODEX_REVIEW_VERDICT: PASS.",
+            "CODEX_REVIEW_VERDICT:PASS",
             "",
         ] {
             assert_eq!(verdict(body), None, "body: {body:?}");
