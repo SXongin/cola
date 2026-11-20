@@ -37,6 +37,8 @@
 //! One instance is one card build: the table budget is per card, shared by
 //! every element and panel the build emits.
 
+use std::borrow::Cow;
+
 use super::{MAX_ELEMENT_TEXT_CHARS, fenced_code};
 
 /// Markdown tables Feishu accepts on one card, counted across the whole card
@@ -231,6 +233,58 @@ pub(crate) fn neutralize_tail(prefix: &str, suffix: &str) -> Option<String> {
     }
 }
 
+/// Fence every native table `text` carries that cannot fit one element (issue
+/// #1098): the element chunker has no cleaner to fence such a table first, and a
+/// cut inside it would repeat its header on the next element — counted as
+/// another native table against the platform's per-card cap. A table that fits
+/// is left alone (the chunker moves it whole); a table already inside a fence
+/// is code already and is not wrapped twice.
+fn fence_oversized_tables(text: &str, max: usize) -> Cow<'_, str> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<Cow<'_, str>> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut fence: Option<usize> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(open) = fence {
+            if closes_fence(line, open) {
+                fence = None;
+            }
+            out.push(Cow::Borrowed(line));
+            i += 1;
+            continue;
+        }
+        if let Some(open) = opens_fence(line) {
+            fence = Some(open);
+            out.push(Cow::Borrowed(line));
+            i += 1;
+            continue;
+        }
+        match table_end(&lines, i) {
+            Some(end) => {
+                let region = lines[i..end].join("\n");
+                if native_table_len(&region) > max {
+                    out.push(Cow::Owned(fenced_code(&region, None)));
+                    changed = true;
+                } else {
+                    out.extend(lines[i..end].iter().map(|line| Cow::Borrowed(*line)));
+                }
+                i = end;
+            }
+            None => {
+                out.push(Cow::Borrowed(line));
+                i += 1;
+            }
+        }
+    }
+    if changed {
+        Cow::Owned(out.join("\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// Split `text` into chunks of at most `max` characters for separate card
 /// elements (issue #1096), each **self-contained** as markdown: a chunk that
 /// starts inside a construct the previous chunk left open re-establishes it
@@ -241,8 +295,9 @@ pub(crate) fn neutralize_tail(prefix: &str, suffix: &str) -> Option<String> {
 ///
 /// A table that fits is moved whole to the next element instead of being cut —
 /// a repeated header is a second table, and the platform caps tables per card —
-/// so the table lead only appears for a table already started in an earlier
-/// chunk (a caller that cleans per chunk, or one too long for the budget).
+/// and one too long for an element is fenced whole by
+/// [`fence_oversized_tables`], so the table lead only appears for a table
+/// already started in an earlier chunk (a caller that cleans per chunk).
 ///
 /// Cuts prefer line boundaries (so an opener or closer is never split
 /// mid-token); a line longer than the budget falls back to a character cut.
@@ -250,11 +305,12 @@ pub(crate) fn neutralize_tail(prefix: &str, suffix: &str) -> Option<String> {
 /// text's own characters must use the timeline's `lead` mechanism instead.
 pub(crate) fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
     let max = max.max(1);
+    let text = fence_oversized_tables(text, max);
     let mut chunks = Vec::new();
     // The ORIGINAL text delivered so far (never the added markers): the
     // prefix whose open construct the next chunk must re-establish.
     let mut consumed = String::new();
-    let mut rest = text;
+    let mut rest = text.as_ref();
     while !rest.is_empty() {
         let lead = neutralize_tail(&consumed, rest).unwrap_or_default();
         let mut budget = max.saturating_sub(lead.chars().count()).max(1);
@@ -263,7 +319,7 @@ pub(crate) fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
         // its header as a SECOND table, and the platform caps tables per card.
         // When the table started inside this take, end the chunk before it and
         // let the next take carry it whole (a table too long for one element
-        // was already fenced by `clean`).
+        // was already fenced by [`fence_oversized_tables`]).
         if !matches!(open_construct(&consumed), Some(OpenConstruct::Table { .. }))
             && matches!(
                 open_construct(&format!("{consumed}{raw}")),
@@ -840,21 +896,57 @@ mod tests {
         assert_eq!(chunks[2], "长".repeat(6), "a long line falls back to a char cut");
     }
 
-    /// A table crossing the element budget keeps its header on every chunk
-    /// (the same lead [`neutralize_tail`] gives a cut tail).
+    /// A table too long for one element is fenced by the chunker itself (issue
+    /// #1098): a raw-markdown caller (the compaction fold body) has no cleaner
+    /// to fence it first, and repeating the header on every chunk would count
+    /// each repeat as another native table — the platform caps tables per card.
     #[test]
-    fn a_table_crossing_the_element_budget_repeats_its_header() {
-        let rows: String = (0..40).map(|i| format!("| 行 {i} | 值 {i} |\n")).collect();
-        let text = format!("| 名称 | 值 |\n|---|---|\n{rows}尾注");
-        let chunks = chunk_markdown(&text, 60);
-        assert!(chunks.len() > 1);
-        for chunk in chunks.iter().skip(1) {
-            if chunk.contains('|') {
-                assert!(
-                    chunk.starts_with("| 名称 | 值 |\n|---|---|\n"),
-                    "a continued chunk lost the table header: {chunk:?}"
-                );
-            }
+    fn a_table_too_long_for_one_element_is_fenced_by_the_chunker() {
+        let row = format!("| {} | 值 |\n", "长".repeat(100));
+        let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(30));
+        assert!(
+            native_table_len(&table) > MAX_ELEMENT_TEXT_CHARS,
+            "the fixture must be too long for one element"
+        );
+        let chunks = chunk_markdown(&table, MAX_ELEMENT_TEXT_CHARS);
+        assert!(chunks.len() > 1, "the fixture must cross the budget");
+        assert!(
+            chunks[0].starts_with("```\n| 名称 | 值 |"),
+            "the long table is one code block: {chunks:?}"
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.contains("| 名称 | 值 |"))
+                .count(),
+            1,
+            "the header must appear once, not once per element: {chunks:?}"
+        );
+        for chunk in &chunks {
+            assert_eq!(
+                neutralize_tail(chunk, "| 尾 | 值 |"),
+                None,
+                "a chunk ends inside a table"
+            );
+        }
+    }
+
+    /// A table the caller already fenced (the reply path cleans before it
+    /// chunks) is not fenced a second time: the pre-pass leaves code alone.
+    #[test]
+    fn a_table_already_fenced_is_not_fenced_again() {
+        let row = format!("| {} | 值 |\n", "长".repeat(100));
+        let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(30));
+        let fenced = fenced_code(&table, None);
+        let chunks = chunk_markdown(&fenced, MAX_ELEMENT_TEXT_CHARS);
+        assert!(chunks.len() > 1, "the fixture must cross the budget");
+        for chunk in &chunks {
+            assert!(
+                !chunk
+                    .lines()
+                    .any(|line| line.len() > 3 && line.chars().all(|c| c == '`')),
+                "the block was fenced twice: {chunk:?}"
+            );
         }
     }
 
