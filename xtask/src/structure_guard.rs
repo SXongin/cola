@@ -52,6 +52,15 @@ pub(crate) const FILE_LINES_LIMIT: usize = 2_000;
 /// How far a baselined file may grow above its recorded size, in percent.
 pub(crate) const FILE_GROWTH_PERCENT: usize = 10;
 
+/// clippy's `too_many_lines` threshold, mirrored from `clippy.toml`. The
+/// scores themselves come from clippy; this mirrors the pinned file.
+pub(crate) const TOO_MANY_LINES_THRESHOLD: usize = 100;
+
+/// The floor for a member to enter an impl-attributed entry's fingerprint: a
+/// superset of clippy's threshold, so the member clippy scores is always in
+/// the set even where the two line counts disagree by a few lines.
+const IMPL_MEMBER_FLOOR: usize = TOO_MANY_LINES_THRESHOLD / 2;
+
 /// The literal counted by counter 4 and policed by counter 5.
 const CFG_TEST: &str = "#[cfg(test)]";
 const TAG_PROBE: &str = "[\"tag\"]";
@@ -348,6 +357,20 @@ fn function_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
                         score.value,
                         entry.value
                     ));
+                } else if impl_attributed(&score.function)
+                    && !score.body.is_empty()
+                    && !entry.body.is_empty()
+                    && score.body != entry.body
+                {
+                    // The entry is named after its impl because clippy's span
+                    // is the `async_trait` attribute; it cannot tell which
+                    // member it scores, so a replacement member at the same
+                    // score must not inherit the entry.
+                    violations.push(format!(
+                        "{}:{}: {} — the impl's long members changed, and an impl-attributed \
+                         entry cannot tell which method it scores",
+                        score.path, score.line, score.function
+                    ));
                 }
             }
             None => appeared.push(score),
@@ -379,6 +402,12 @@ fn function_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
         }
     }
     violations
+}
+
+/// Whether an entry is named after its `impl`/`trait` (an `async_trait` span
+/// that names no function).
+fn impl_attributed(function: &str) -> bool {
+    function.starts_with("impl ")
 }
 
 fn file_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
@@ -428,14 +457,25 @@ fn allow_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
     let mut violations = Vec::new();
     for (key, sites) in groups {
         let capacity = allowed.get(&key).copied().unwrap_or(0);
-        let untracked: Vec<&&AllowSite> = sites.iter().filter(|site| !site.tracked).collect();
-        for site in untracked.iter().skip(capacity) {
-            violations.push(format!(
-                "{}:{}: new #[allow(clippy::too_many_arguments)] on `{}` without a reason and a \
-                 tracking issue — write `reason = \"… #NNN\"` in the attribute or a `// … #NNN` \
-                 comment beside it",
-                site.path, site.line, key.1
-            ));
+        if capacity == 0 {
+            // A key the baseline does not have is a new allow, tracked or not.
+            for site in sites.iter().filter(|site| !site.tracked) {
+                violations.push(format!(
+                    "{}:{}: new #[allow(clippy::too_many_arguments)] on `{}` without a reason and                      a tracking issue — write `reason = \"… #NNN\"` in the attribute or a \
+                     `// … #NNN` comment beside it",
+                    site.path, site.line, key.1
+                ));
+            }
+        } else if sites.len() > capacity {
+            // The key is taken; a duplicate is not a new allow with a reason,
+            // it is the same annotation twice.
+            for site in sites.iter().skip(capacity) {
+                violations.push(format!(
+                    "{}:{}: duplicate #[allow(clippy::too_many_arguments)] on `{}` — the key is \
+                     already in the baseline, and one function keeps one allow",
+                    site.path, site.line, key.1
+                ));
+            }
         }
     }
     violations
@@ -669,6 +709,20 @@ pub(crate) fn body_fingerprint(content: &str, line: usize) -> String {
     let masked = masked(content);
     let starts = line_starts(&masked);
     let start = starts.get(line.saturating_sub(1)).copied().unwrap_or_default();
+    // An `async_trait` re-parented span points at the impl's attribute, so the
+    // entry is named after the impl and cannot name the member it scores. Its
+    // fingerprint is the impl's long members: editing one keeps it, replacing
+    // one changes it, and adding or removing a short member does not.
+    let line_end = masked[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| start + offset)
+        .unwrap_or(masked.len());
+    if trim(&masked[start..line_end]).starts_with(b"#")
+        && let Some(header) = impl_header_after(&masked, start)
+    {
+        return impl_members_fingerprint(&masked, header);
+    }
     let Some(open) = item_body_open(&masked, start) else {
         return String::new();
     };
@@ -679,6 +733,90 @@ pub(crate) fn body_fingerprint(content: &str, line: usize) -> String {
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect();
     format!("{:016x}", fnv1a(&body))
+}
+
+/// The `impl` header on or within the few lines after `start`.
+fn impl_header_after(masked: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    for _ in 0..8 {
+        let line_end = masked[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(masked.len());
+        if let Some(found) = find(&masked[cursor..line_end], b"impl ")
+            && item_keyword_starts_line(masked, cursor + found)
+        {
+            return Some(cursor + found);
+        }
+        if line_end >= masked.len() {
+            return None;
+        }
+        cursor = line_end + 1;
+    }
+    None
+}
+
+/// The impl's members whose bodies exceed clippy's line threshold, hashed.
+fn impl_members_fingerprint(masked: &[u8], header: usize) -> String {
+    let Some(brace) = find(&masked[header..], b"{").map(|offset| header + offset) else {
+        return String::new();
+    };
+    let end = brace_end(masked, brace);
+    let starts = line_starts(masked);
+    let mut members = Vec::new();
+    let mut depth = 0usize;
+    let mut index = brace;
+    while index < end {
+        match masked[index] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'f' if depth == 1 => {
+                if let Some((name, open, close)) = fn_member(masked, index, end) {
+                    let lines = line_index(&starts, close).saturating_sub(line_index(&starts, open) + 1);
+                    if lines > IMPL_MEMBER_FLOOR {
+                        members.push(name);
+                    }
+                    index = close;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    members.sort();
+    format!("{:016x}", fnv1a(members.join("\n").as_bytes()))
+}
+
+/// A `fn` member at `at`: its name and the offsets of its body's braces.
+fn fn_member(masked: &[u8], at: usize, end: usize) -> Option<(String, usize, usize)> {
+    if at > 0 && is_identifier_byte(masked[at - 1]) {
+        return None;
+    }
+    let rest = masked.get(at..end)?;
+    if !rest.starts_with(b"fn") {
+        return None;
+    }
+    let mut index = 2;
+    let whitespace = index;
+    while index < rest.len() && rest[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index == whitespace {
+        return None;
+    }
+    let name_start = index;
+    while index < rest.len() && is_identifier_byte(rest[index]) {
+        index += 1;
+    }
+    if index == name_start {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&rest[name_start..index]).into_owned();
+    let open = find(&rest[index..], b"{").map(|offset| at + index + offset)?;
+    let close = brace_end(masked, open);
+    Some((name, open, close))
 }
 
 /// The offset of the opening brace of the item starting at `start`, skipping
@@ -878,7 +1016,8 @@ fn scan_sources(root: &Path) -> Result<Scan, String> {
         // the whole tree, test surface included.
         scan.allows
             .extend(allow_sites(&file.path, &file.content, &masked));
-        scan.tag_probes.extend(tag_probes(&file.path, &file.content));
+        scan.tag_probes
+            .extend(tag_probes(&file.path, &file.content, &masked));
         if !is_production_path(&file.path, &files) {
             continue;
         }
@@ -996,34 +1135,32 @@ fn production_lines_masked(content: &str, masked: &[u8]) -> usize {
     let total = content.lines().count();
     let starts = line_starts(masked);
     let mut excluded = 0usize;
-    let mut index = 0usize;
-    while index < starts.len() {
-        let start = starts[index];
-        let end_of_line = starts.get(index + 1).copied().unwrap_or(masked.len());
-        let text = trim(&masked[start..end_of_line]);
-        if text != CFG_TEST.as_bytes() {
-            index += 1;
-            continue;
-        }
-        let end = item_end(masked, end_of_line);
-        let after = line_index(&starts, end);
-        excluded += after.saturating_sub(index);
-        index = after.max(index + 1);
+    let mut search = 0usize;
+    while let Some(found) = find(&masked[search..], CFG_TEST.as_bytes()) {
+        let at = search + found;
+        // The item lives after the attribute, which may share its line
+        // (`#[cfg(test)] fn helper() {}`), and the whole item is test-only.
+        let end = item_end(masked, at + CFG_TEST.len());
+        let index = line_index(&starts, at) - 1;
+        excluded += line_index(&starts, end).saturating_sub(index);
+        search = end.max(at + CFG_TEST.len());
     }
     total.saturating_sub(excluded)
 }
 
 /// The `#[cfg(test)]` lines of one production file, 1-based.
+///
+/// The attribute may share its line with the item, so the search is over the
+/// masked bytes, not over whole lines.
 fn cfg_test_sites(path: &str, masked: &[u8]) -> Option<CfgTestSites> {
     let starts = line_starts(masked);
-    let lines: Vec<usize> = starts
-        .iter()
-        .enumerate()
-        .filter_map(|(index, start)| {
-            let end_of_line = starts.get(index + 1).copied().unwrap_or(masked.len());
-            (trim(&masked[*start..end_of_line]) == CFG_TEST.as_bytes()).then_some(index + 1)
-        })
-        .collect();
+    let mut lines = Vec::new();
+    let mut search = 0usize;
+    while let Some(found) = find(&masked[search..], CFG_TEST.as_bytes()) {
+        let at = search + found;
+        search = at + CFG_TEST.len();
+        lines.push(line_index(&starts, at));
+    }
     (!lines.is_empty()).then(|| CfgTestSites {
         path: path.to_string(),
         lines,
@@ -1187,11 +1324,31 @@ fn attribute_reason(attribute: &str) -> &str {
     let rest = &attribute[start + "reason".len()..];
     let rest = rest.trim_start().strip_prefix('=').unwrap_or(rest);
     let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix('"') else {
+    if let Some(raw) = rest.strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        let Some(body) = raw[hashes..].strip_prefix('"') else {
+            return "";
+        };
+        let closing = format!("\"{}", "#".repeat(hashes));
+        return body.find(&closing).map(|end| &body[..end]).unwrap_or(body);
+    }
+    let Some(body) = rest.strip_prefix('"') else {
         return "";
     };
-    let end = rest.find('"').unwrap_or(rest.len());
-    &rest[..end]
+    // An escaped quote belongs to the reason, not to its end.
+    let mut escaped = false;
+    for (index, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return &body[..index],
+            _ => {}
+        }
+    }
+    body
 }
 
 /// A rationale names a tracking issue (`#123`, `#1013`) and says why in
@@ -1220,21 +1377,32 @@ pub(crate) fn rationale_is_tracked(text: &str) -> bool {
 /// A probe is code: a doc line spelling `["tag"]` in prose is not one. (A
 /// probe assembled inside a string literal still counts — the guard is a text
 /// guard and errs toward the allow-list, never toward silence.)
-fn tag_probes(path: &str, content: &str) -> Vec<TagProbe> {
+fn tag_probes(path: &str, content: &str, masked: &[u8]) -> Vec<TagProbe> {
     if path.starts_with(CARD_PREFIX) {
         return Vec::new();
     }
-    content
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim_start().starts_with("//"))
-        .filter(|(_, line)| line.contains(TAG_PROBE))
-        .map(|(index, line)| TagProbe {
-            path: path.to_string(),
-            line: index + 1,
-            text: line.trim().to_string(),
-        })
-        .collect()
+    let starts = line_starts(content.as_bytes());
+    let mut probes = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let base = starts.get(index).copied().unwrap_or_default();
+        let mut search = 0usize;
+        while let Some(found) = line[search..].find(TAG_PROBE) {
+            let at = base + search + found;
+            search += found + TAG_PROBE.len();
+            // The opening bracket must be code: a comment or a string literal
+            // is blanked in the masked copy, so prose never becomes a probe.
+            if masked.get(at) != Some(&b'[') {
+                continue;
+            }
+            probes.push(TagProbe {
+                path: path.to_string(),
+                line: index + 1,
+                text: line.trim().to_string(),
+            });
+            break;
+        }
+    }
+    probes
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,6 +1798,37 @@ mod tests {
         assert!(check(&scan, &base).is_empty());
     }
 
+    /// An impl-attributed entry cannot tell which member it scores, so a
+    /// replacement member at the same or a lower score must not inherit it.
+    #[test]
+    fn an_impl_entry_does_not_accept_a_replacement_member() {
+        let mut base = baseline();
+        base.functions.push(fn_entry(
+            "src/bridge/x.rs",
+            "impl T for S",
+            Metric::TooManyLines,
+            470,
+            "old-members",
+        ));
+
+        let mut scan = Scan::default();
+        scan.functions.push(score(
+            "src/bridge/x.rs",
+            "impl T for S",
+            Metric::TooManyLines,
+            400,
+            "new-members",
+        ));
+        let violations = check(&scan, &base);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("impl-attributed entry"), "{violations:?}");
+
+        // The same entry, same members, at or below the recorded score.
+        scan.functions[0].value = 470;
+        scan.functions[0].body = "old-members".to_string();
+        assert!(check(&scan, &base).is_empty(), "{:?}", check(&scan, &base));
+    }
+
     /// An equal score is not a move: deleting an offender in one file and
     /// adding an unrelated one in another is new growth, not a rename.
     #[test]
@@ -1791,6 +1990,28 @@ mod tests {
             1,
             "a second untracked site under one key is new"
         );
+
+        // The gate's case: the baselined site is tracked, the new one is not —
+        // the key is still taken, so the duplicate fails either way.
+        let mut tracked_base = baseline();
+        tracked_base.too_many_arguments.push(allow_entry("impl A::wide"));
+        let mut scan = Scan::default();
+        scan.allows.push(AllowSite {
+            path: "src/bridge/x.rs".to_string(),
+            line: 10,
+            function: "impl A::wide".to_string(),
+            tracked: true,
+        });
+        assert!(check(&scan, &tracked_base).is_empty());
+        scan.allows.push(AllowSite {
+            path: "src/bridge/x.rs".to_string(),
+            line: 20,
+            function: "impl A::wide".to_string(),
+            tracked: false,
+        });
+        let violations = check(&scan, &tracked_base);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("duplicate"), "{violations:?}");
     }
 
     /// The key is the site's identity, so a new allow cannot inherit a
@@ -1928,15 +2149,15 @@ fn c(x: u8) {}
     #[test]
     fn tag_probes_inside_the_card_module_are_free() {
         let content = "assert_eq!(element[\"tag\"], \"markdown\");\n";
-        assert!(tag_probes("src/feishu/card/session.rs", content).is_empty());
-        assert_eq!(tag_probes("src/bridge/x.rs", content).len(), 1);
+        assert!(tag_probes("src/feishu/card/session.rs", content, &masked(content)).is_empty());
+        assert_eq!(tag_probes("src/bridge/x.rs", content, &masked(content)).len(), 1);
     }
 
     /// Prose is not a probe.
     #[test]
     fn a_doc_comment_spelling_a_tag_probe_is_not_a_probe() {
         let content = "/// Probes `element[\"tag\"]` indirectly.\nlet tag = element[\"tag\"];\n";
-        assert_eq!(tag_probes("src/bridge/x.rs", content).len(), 1);
+        assert_eq!(tag_probes("src/bridge/x.rs", content, &masked(content)).len(), 1);
     }
 
     /// File size: a new file may not cross the cap, and a baselined file gets
@@ -2251,6 +2472,82 @@ unsafe impl Send for Thing {
         let sites = allow_sites("src/opencode/strategy.rs", content, &masked);
         let keys: Vec<&str> = sites.iter().map(|site| site.function.as_str()).collect();
         assert_eq!(keys, ["trait Strategy::prompt", "impl Send for Thing::send"]);
+    }
+
+    /// A one-line `#[cfg(test)] fn helper()` is a site too, and the item it
+    /// guards is test-only.
+    #[test]
+    fn a_one_line_cfg_test_item_is_counted_and_excluded() {
+        let content = "fn production() -> u8 {\n    1\n}\n\n#[cfg(test)] fn helper() -> u8 { 1 }\n";
+        let masked = masked(content);
+        let sites = cfg_test_sites("src/bridge/x.rs", &masked).expect("one site");
+        assert_eq!(sites.lines, vec![5]);
+        assert_eq!(production_lines(content), 4);
+    }
+
+    /// A probe in a comment is prose; only code counts.
+    #[test]
+    fn a_probe_in_a_comment_is_not_a_probe() {
+        let content = "let tag = element[\"tag\"];\nlet x = 1; // probes [\"tag\"] elsewhere\n";
+        let probes = tag_probes("src/bridge/x.rs", content, &masked(content));
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert_eq!(probes[0].line, 1);
+    }
+
+    /// A reason may escape a quote; the parser cannot stop at it.
+    #[test]
+    fn a_reason_may_escape_a_quote() {
+        let attribute = r#"#[allow(clippy::too_many_arguments, reason = "the \"click\" context #1013")]"#;
+        assert_eq!(attribute_reason(attribute), r#"the \"click\" context #1013"#);
+        assert!(rationale_is_tracked(attribute_reason(attribute)));
+    }
+
+    /// An impl-attributed entry is fingerprinted by its long members: editing
+    /// one keeps the fingerprint, replacing one changes it, and a short member
+    /// does not move it.
+    #[test]
+    fn an_impl_entry_is_fingerprinted_by_its_long_members() {
+        fn impl_source(name: &str, extra: &str, lines: usize) -> String {
+            let mut text = String::from("#[async_trait]\nimpl T for S {\n");
+            text.push_str(&format!("    async fn {name}(&self) {{\n"));
+            for _ in 0..lines {
+                text.push_str("        x += 1;\n");
+            }
+            text.push_str("    }\n");
+            text.push_str(extra);
+            text.push_str("}\n");
+            text
+        }
+
+        let base = body_fingerprint(&impl_source("first", "", 110), 1);
+        assert_eq!(base.len(), 16);
+        assert_eq!(
+            body_fingerprint(&impl_source("first", "", 111), 1),
+            base,
+            "a body edit keeps the member set"
+        );
+        assert_eq!(
+            body_fingerprint(&impl_source("first", "    fn short(&self) {}\n", 110), 1),
+            base,
+            "a short member does not join the set"
+        );
+        assert_ne!(
+            body_fingerprint(&impl_source("other", "", 110), 1),
+            base,
+            "a replacement member is a different entry"
+        );
+    }
+
+    /// The thresholds the baseline was measured with are pinned.
+    #[test]
+    fn the_clippy_thresholds_are_pinned() {
+        let text =
+            std::fs::read_to_string(crate::repo_root().join("clippy.toml")).expect("clippy.toml exists");
+        assert!(text.contains("cognitive-complexity-threshold = 25"), "{text}");
+        assert!(
+            text.contains(&format!("too-many-lines-threshold = {TOO_MANY_LINES_THRESHOLD}")),
+            "{text}"
+        );
     }
 
     /// The scan reports a cfg(test) site only for the attribute itself.

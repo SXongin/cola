@@ -1987,10 +1987,13 @@ mod tests {
         assert_eq!(body_json(&request)["msg_type"], "interactive");
         let content = send_content(&request);
         assert_eq!(content["config"]["wide_screen_mode"], true);
-        assert_eq!(content["elements"][0]["tag"], "markdown");
-        // Card markdown is sanitized for Feishu's dialect at this one choke
-        // point (see `sanitize_markdown`).
-        assert_eq!(content["elements"][0]["content"], "hello &#60;world>");
+        // The whole element, so the transport test does not probe card JSON
+        // field by field; card markdown is sanitized for Feishu's dialect at
+        // this one choke point (see `sanitize_markdown`).
+        assert_eq!(
+            content["elements"][0],
+            serde_json::json!({"tag": "markdown", "content": "hello &#60;world>"}),
+        );
     }
 
     #[tokio::test]
