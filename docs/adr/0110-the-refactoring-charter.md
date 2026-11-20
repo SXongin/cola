@@ -2,21 +2,22 @@
 
 The four contracts a refactor here is settled by — code (#1109), tests (#1111),
 docs (#1112), flow (#1110) — and the segment that applies them first (#1115),
-in one decision. Evidence lives in #1105–#1108, cited and not re-derived.
+one decision, on evidence cited from #1105–#1108.
 
 ## Context
 
 `src` doubled in six weeks, 163.6k → 362k lines, while `#[test]` functions
 stayed flat (~2,011 → 1,990) — coverage per line roughly halved — and files over
 2,000 lines went 27 → 64; C1/C2's extraction re-bloated `render.rs` 6.1k → 14.2k
-and `handler.rs` 2.5k → 7.6k (#1108). The gate is not the strictness problem: 206
-of 257 blocking findings were real defects, 0 defensive, 0 pre-existing, and
-rounds track shared mutable ordering/lifecycle state, not diff size — +9,329
-lines passed in one round, +157 took forty-seven (#1105). CI is execution- and
-hotspot-bound: 208 tests (4.7%) own 77% of the 693 s serial wall time, and three
-`feishu::card::compaction` tests are 45% of the top-50 (#1106). The docs are
-about half load-bearing: ~20% of the 109 ADRs folds away with no live decision
-lost, and the largest modules' comments are ~38% pure restatement (#1107).
+and `handler.rs` 2.5k → 7.6k (#1108). The gate is not the strictness problem:
+206 of 210 findings across 257 gate reviews were real defects (98%), 3 spec gaps
+and 1 style, 0 defensive, 0 pre-existing; rounds track shared mutable
+ordering/lifecycle state, not diff size — +9,329 lines passed in one round, +157
+took forty-seven (#1105). CI is execution- and hotspot-bound: 208 tests (4.7%)
+own 77% of the 693 s serial wall time, and three `feishu::card::compaction` tests
+are 45% of the top-50 (#1106). The docs are about half load-bearing: ~20% of the
+109 ADRs folds away with no live decision lost, and the largest modules'
+comments are ~38% pure restatement (#1107).
 
 ## Decision
 
@@ -123,27 +124,25 @@ baseline before the first segment; no rule changes on an assertion.
 
 ## The backlog
 
-Tracked in the issues; the order is the leverage order of #1108 and #1115.
-
-1. **Measure first** — #1114's baseline (the three numbers) plus the test-cost
-   tickets its report names — the hotspot tests and the repeated negatives no
-   other ticket owns — so the effect is measurable before the first segment.
-2. **Segment 1: C9 then C6** — C9 deletes the named test-only twins and gates
-   (#1118); C6 puts the card-action dispatch behind one seam (#1119) and moves
-   its five verb groups (#1120–#1124). `feat` work is frozen from #1118's
-   branch until the segment's four observable criteria hold — no per-verb body
-   in the dispatch, characterization-pinned payloads and `CardActionResult`, no
-   `Option<&Gate>` in production, lowered `check-structure` entries — with no
-   calendar cap and verb-at-a-time rollback, the dispatch staying alive (#1115);
-   the tickets own those bounds.
-3. **Then the missing seams** — C12, one run-lifecycle owner, starts with the
+1. **The first construction segment heads this backlog (#1115)** — its baseline
+   is #1114's report (the three numbers, plus the test-cost tickets it names:
+   the hotspot tests and the repeated negatives no other ticket owns), measured
+   before the first branch opens. Then C9 deletes the named test-only twins and
+   gates (#1118), and C6 puts the card-action dispatch behind one seam (#1119)
+   and moves its five verb groups (#1120–#1124). `feat` work is frozen from
+   #1118's branch until the segment's four observable criteria hold — no
+   per-verb body in the dispatch, characterization-pinned payloads and
+   `CardActionResult`, no `Option<&Gate>` in production, lowered
+   `check-structure` entries — with no calendar cap and verb-at-a-time rollback,
+   the dispatch staying alive; the tickets own those bounds.
+2. **Then the missing seams** — C12, one run-lifecycle owner, starts with the
    design (#1140) and lands as #1141; then C5 (#1135), C3 (#1136), C10 (#1137),
    C4 (#1138) and C7 (#1139).
-4. **Docs, in parallel, after this lands** — archive (#1126), merge chains
+3. **Docs, in parallel, after this lands** — archive (#1126), merge chains
    (#1127), fold in place (#1128), split 0034/0092 (#1129), single-home (#1130),
    then the doc-link and banner guard (#1131). #1130 re-homes facts this ADR
    writes, so it goes last.
-5. **Held** — C8 (`ServerIdentity`) stays HOLD, feature freezing/deletion waits
+4. **Held** — C8 (`ServerIdentity`) stays HOLD, feature freezing/deletion waits
    on the ROI table (#1113), and the map's open "Turn state machine's target
    shape" stays fog: no ticket here claims it, and it needs its own decision
    when work next touches `bridge/turn`. #1132 rides the C9/C6 split of the
