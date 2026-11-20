@@ -2693,6 +2693,8 @@ name = "xtask"
 version = "0.6.0"
 dependencies = [
  "semver",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

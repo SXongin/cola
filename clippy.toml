@@ -1,0 +1,9 @@
+# clippy's thresholds for the repo's two complexity lints (#1109).
+#
+# The lints are off by default: enabling them everywhere would fail on today's
+# 88 offenders. They are turned on only by `cargo xtask check-structure`, which
+# reads the findings through clippy's JSON output and compares them with
+# `xtask/structure-baseline.json`. The thresholds live here so a toolchain bump
+# cannot silently move the bar the baseline was measured against.
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100

@@ -1,0 +1,1517 @@
+{
+  "version": 1,
+  "functions": [
+    {
+      "path": "src/bridge/chain/reconcile.rs",
+      "function": "send_projected_successor",
+      "metric": "too_many_lines",
+      "value": 168
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "function": "load_for",
+      "metric": "too_many_lines",
+      "value": 105
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "handle_command",
+      "metric": "cognitive_complexity",
+      "value": 162
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "handle_command",
+      "metric": "too_many_lines",
+      "value": 934
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "handle_sub_attach",
+      "metric": "too_many_lines",
+      "value": 122
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "parse_command",
+      "metric": "cognitive_complexity",
+      "value": 35
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "parse_command",
+      "metric": "too_many_lines",
+      "value": 183
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "post_idle_card",
+      "metric": "cognitive_complexity",
+      "value": 40
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "post_idle_card",
+      "metric": "too_many_lines",
+      "value": 173
+    },
+    {
+      "path": "src/bridge/core.rs",
+      "function": "new",
+      "metric": "too_many_lines",
+      "value": 118
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "external_render_loop_inner",
+      "metric": "cognitive_complexity",
+      "value": 39
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "external_render_loop_inner",
+      "metric": "too_many_lines",
+      "value": 159
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "poll_session",
+      "metric": "cognitive_complexity",
+      "value": 32
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "poll_session",
+      "metric": "too_many_lines",
+      "value": 151
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "render_wake_continuation",
+      "metric": "cognitive_complexity",
+      "value": 33
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "render_wake_continuation",
+      "metric": "too_many_lines",
+      "value": 176
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "handle_dir_browse_action",
+      "metric": "too_many_lines",
+      "value": 116
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "handle_file_card_action",
+      "metric": "too_many_lines",
+      "value": 251
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "handle_switch_card_action",
+      "metric": "cognitive_complexity",
+      "value": 28
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "handle_switch_card_action",
+      "metric": "too_many_lines",
+      "value": 204
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "materialise_pending",
+      "metric": "cognitive_complexity",
+      "value": 27
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "materialise_pending",
+      "metric": "too_many_lines",
+      "value": 171
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "run_viewer_file_transfer",
+      "metric": "too_many_lines",
+      "value": 126
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "run_viewer_open",
+      "metric": "too_many_lines",
+      "value": 166
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "run_viewer_reread",
+      "metric": "too_many_lines",
+      "value": 101
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "submit_prompt",
+      "metric": "cognitive_complexity",
+      "value": 46
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "submit_prompt",
+      "metric": "too_many_lines",
+      "value": 228
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "function": "pick_model_expecting",
+      "metric": "cognitive_complexity",
+      "value": 26
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "function": "pick_model_expecting",
+      "metric": "too_many_lines",
+      "value": 200
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "function": "pick_think",
+      "metric": "too_many_lines",
+      "value": 139
+    },
+    {
+      "path": "src/bridge/request/companion.rs",
+      "function": "ensure_permission_companion",
+      "metric": "too_many_lines",
+      "value": 195
+    },
+    {
+      "path": "src/bridge/request/delivery.rs",
+      "function": "resolve_blocks",
+      "metric": "cognitive_complexity",
+      "value": 31
+    },
+    {
+      "path": "src/bridge/request/delivery.rs",
+      "function": "resolve_blocks",
+      "metric": "too_many_lines",
+      "value": 114
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "patch_stored_surfaces",
+      "metric": "cognitive_complexity",
+      "value": 32
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "patch_stored_surfaces",
+      "metric": "too_many_lines",
+      "value": 125
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "readopt_surface",
+      "metric": "too_many_lines",
+      "value": 113
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "surface",
+      "metric": "cognitive_complexity",
+      "value": 72
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "surface",
+      "metric": "too_many_lines",
+      "value": 295
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "sweep",
+      "metric": "cognitive_complexity",
+      "value": 72
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "sweep",
+      "metric": "too_many_lines",
+      "value": 312
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "withdraw_block_for_fallback",
+      "metric": "too_many_lines",
+      "value": 112
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "impl RequestKind for PermissionKind",
+      "metric": "too_many_lines",
+      "value": 470
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "impl RequestKind for QuestionKind",
+      "metric": "too_many_lines",
+      "value": 513
+    },
+    {
+      "path": "src/bridge/runtime.rs",
+      "function": "reconcile_now",
+      "metric": "too_many_lines",
+      "value": 121
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "run_claimed",
+      "metric": "cognitive_complexity",
+      "value": 37
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "run_claimed",
+      "metric": "too_many_lines",
+      "value": 365
+    },
+    {
+      "path": "src/bridge/topic.rs",
+      "function": "open_topic_inner",
+      "metric": "too_many_lines",
+      "value": 110
+    },
+    {
+      "path": "src/bridge/turn/flush.rs",
+      "function": "flush_card_locked",
+      "metric": "cognitive_complexity",
+      "value": 120
+    },
+    {
+      "path": "src/bridge/turn/flush.rs",
+      "function": "flush_card_locked",
+      "metric": "too_many_lines",
+      "value": 512
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "drain_state",
+      "metric": "too_many_lines",
+      "value": 121
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "finish",
+      "metric": "cognitive_complexity",
+      "value": 53
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "finish",
+      "metric": "too_many_lines",
+      "value": 221
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "refresh_yielded_ledger",
+      "metric": "too_many_lines",
+      "value": 113
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "start",
+      "metric": "cognitive_complexity",
+      "value": 33
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "start",
+      "metric": "too_many_lines",
+      "value": 147
+    },
+    {
+      "path": "src/bridge/turn/render.rs",
+      "function": "render_and_flush_inner",
+      "metric": "cognitive_complexity",
+      "value": 31
+    },
+    {
+      "path": "src/bridge/turn/render.rs",
+      "function": "render_and_flush_inner",
+      "metric": "too_many_lines",
+      "value": 164
+    },
+    {
+      "path": "src/bridge/turn/settle.rs",
+      "function": "run",
+      "metric": "cognitive_complexity",
+      "value": 29
+    },
+    {
+      "path": "src/bridge/turn/settle.rs",
+      "function": "run",
+      "metric": "too_many_lines",
+      "value": 139
+    },
+    {
+      "path": "src/bridge/turn/state.rs",
+      "function": "build_card_inner",
+      "metric": "cognitive_complexity",
+      "value": 45
+    },
+    {
+      "path": "src/bridge/turn/state.rs",
+      "function": "build_card_inner",
+      "metric": "too_many_lines",
+      "value": 247
+    },
+    {
+      "path": "src/bridge/turn/state.rs",
+      "function": "ledger_rows",
+      "metric": "too_many_lines",
+      "value": 101
+    },
+    {
+      "path": "src/bridge/turn/state.rs",
+      "function": "resolve",
+      "metric": "too_many_lines",
+      "value": 112
+    },
+    {
+      "path": "src/bridge/turn/wake.rs",
+      "function": "wake_continuation",
+      "metric": "too_many_lines",
+      "value": 106
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "function": "impl Backend for CodexClient",
+      "metric": "too_many_lines",
+      "value": 114
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "function": "run_thread",
+      "metric": "too_many_lines",
+      "value": 104
+    },
+    {
+      "path": "src/codex/lifecycle.rs",
+      "function": "impl ServerLifecycle for CodexLifecycle",
+      "metric": "too_many_lines",
+      "value": 131
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "function": "apply_completed",
+      "metric": "cognitive_complexity",
+      "value": 32
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "function": "apply_completed",
+      "metric": "too_many_lines",
+      "value": 177
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "function": "from_wire",
+      "metric": "too_many_lines",
+      "value": 131
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "function": "merge_start",
+      "metric": "too_many_lines",
+      "value": 131
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "function": "parts",
+      "metric": "too_many_lines",
+      "value": 248
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "function": "transcript",
+      "metric": "too_many_lines",
+      "value": 104
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "function": "question_elements_with",
+      "metric": "cognitive_complexity",
+      "value": 29
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "function": "question_elements_with",
+      "metric": "too_many_lines",
+      "value": 234
+    },
+    {
+      "path": "src/feishu/card/session.rs",
+      "function": "build_switch_card",
+      "metric": "too_many_lines",
+      "value": 121
+    },
+    {
+      "path": "src/feishu/card/terminal.rs",
+      "function": "build_terminal_card",
+      "metric": "too_many_lines",
+      "value": 163
+    },
+    {
+      "path": "src/feishu/card/tool_render.rs",
+      "function": "tool_panel_element",
+      "metric": "too_many_lines",
+      "value": 103
+    },
+    {
+      "path": "src/feishu/card/viewer.rs",
+      "function": "build_viewer_card_with_budget",
+      "metric": "too_many_lines",
+      "value": 143
+    },
+    {
+      "path": "src/feishu/delivery.rs",
+      "function": "admit",
+      "metric": "too_many_lines",
+      "value": 105
+    },
+    {
+      "path": "src/feishu/delivery.rs",
+      "function": "drive_keyed",
+      "metric": "too_many_lines",
+      "value": 137
+    },
+    {
+      "path": "src/feishu/ws.rs",
+      "function": "extract_card_action_value",
+      "metric": "cognitive_complexity",
+      "value": 37
+    },
+    {
+      "path": "src/feishu/ws.rs",
+      "function": "extract_card_action_value",
+      "metric": "too_many_lines",
+      "value": 166
+    },
+    {
+      "path": "src/feishu/ws.rs",
+      "function": "handle_binary_frame",
+      "metric": "too_many_lines",
+      "value": 166
+    },
+    {
+      "path": "src/main.rs",
+      "function": "main",
+      "metric": "too_many_lines",
+      "value": 148
+    },
+    {
+      "path": "src/opencode/lifecycle.rs",
+      "function": "reconcile",
+      "metric": "too_many_lines",
+      "value": 131
+    },
+    {
+      "path": "src/opencode/tool_semantics.rs",
+      "function": "patch_text_edits",
+      "metric": "too_many_lines",
+      "value": 103
+    },
+    {
+      "path": "src/opencode/v2/wire.rs",
+      "function": "into_neutral",
+      "metric": "too_many_lines",
+      "value": 114
+    }
+  ],
+  "files": [
+    {
+      "path": "src/backend/transcript.rs",
+      "lines": 2877
+    },
+    {
+      "path": "src/bridge/chain/reconcile.rs",
+      "lines": 2199
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "lines": 2267
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "lines": 3628
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "lines": 2066
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "lines": 7302
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "lines": 3133
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "lines": 3919
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "lines": 3223
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "lines": 2993
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "lines": 4884
+    },
+    {
+      "path": "src/bridge/turn/render.rs",
+      "lines": 3561
+    },
+    {
+      "path": "src/bridge/turn/state.rs",
+      "lines": 5837
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "lines": 3968
+    },
+    {
+      "path": "src/codex/cards.rs",
+      "lines": 4317
+    },
+    {
+      "path": "src/codex/discovery.rs",
+      "lines": 2235
+    },
+    {
+      "path": "src/codex/lifecycle.rs",
+      "lines": 3440
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "lines": 3268
+    },
+    {
+      "path": "src/codex/test_server.rs",
+      "lines": 2749
+    },
+    {
+      "path": "src/feishu/card/tool_render.rs",
+      "lines": 3959
+    },
+    {
+      "path": "src/feishu/delivery.rs",
+      "lines": 2001
+    },
+    {
+      "path": "src/opencode/live/mod.rs",
+      "lines": 2424
+    },
+    {
+      "path": "src/opencode/v2/tests.rs",
+      "lines": 2818
+    }
+  ],
+  "too_many_arguments": [
+    {
+      "path": "src/backend/mod.rs",
+      "function": "prompt"
+    },
+    {
+      "path": "src/backend/mod.rs",
+      "function": "steer"
+    },
+    {
+      "path": "src/bridge/chain/reconcile.rs",
+      "function": "ending_pipeline"
+    },
+    {
+      "path": "src/bridge/chain/reconcile.rs",
+      "function": "send_projected_chain"
+    },
+    {
+      "path": "src/bridge/chain/reconcile.rs",
+      "function": "send_projected_successor"
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "function": "track_carrying_cursor"
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "function": "track_carrying_cursor_landing"
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "function": "track_carrying_cursor_with"
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "function": "track_carrying_rendered"
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "function": "track_landing"
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "function": "track_with"
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "function": "handle_command"
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "render_wake_continuation"
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "spawn_wake_render"
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "function": "split_wake_continuation"
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "function": "topic_adopt_target"
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "function": "new"
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "function": "new#2"
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "function": "pick_model_expecting"
+    },
+    {
+      "path": "src/bridge/request/delivery.rs",
+      "function": "refresh_question_block"
+    },
+    {
+      "path": "src/bridge/request/delivery.rs",
+      "function": "resolve_blocks"
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "function": "surface"
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "fallback_confirmation_card"
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "handle_action"
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "label"
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "rebuild_fallback_from_server"
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "recover_from_risk_mismatch"
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "function": "settle_question_reply"
+    },
+    {
+      "path": "src/bridge/session.rs",
+      "function": "set_mirror_pending"
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "finish_run"
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "patch_live"
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "repoint_card"
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "settle"
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "settle_run"
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "function": "settled_card"
+    },
+    {
+      "path": "src/bridge/test_support.rs",
+      "function": "steer"
+    },
+    {
+      "path": "src/bridge/tests/reap.rs",
+      "function": "seed_cursor_record_reply_to"
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "push_tool_at"
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "function": "refresh_yielded_ledger"
+    },
+    {
+      "path": "src/bridge/turn/render.rs",
+      "function": "apply_ledger_read"
+    },
+    {
+      "path": "src/bridge/turn/timeline.rs",
+      "function": "seat_text_chunk"
+    },
+    {
+      "path": "src/bridge/turn/wake.rs",
+      "function": "arm_external_render"
+    },
+    {
+      "path": "src/bridge/turn/wake.rs",
+      "function": "arm_projected_card"
+    },
+    {
+      "path": "src/bridge/turn/wake.rs",
+      "function": "attach_and_repoint"
+    },
+    {
+      "path": "src/bridge/turn/wake.rs",
+      "function": "take_over_armed_card"
+    },
+    {
+      "path": "src/bridge/turn/wake.rs",
+      "function": "track_projected_continuation"
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "function": "prompt"
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "function": "steer"
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "function": "steer#2"
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "function": "turn_params"
+    },
+    {
+      "path": "src/feishu/card/picker.rs",
+      "function": "build_skill_card"
+    },
+    {
+      "path": "src/feishu/card/picker.rs",
+      "function": "chunk_picker_cards"
+    },
+    {
+      "path": "src/feishu/card/picker.rs",
+      "function": "grouped_picker_card"
+    },
+    {
+      "path": "src/feishu/card/picker.rs",
+      "function": "picker_card"
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "function": "build_fallback_permission_confirm_card"
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "function": "build_location_form_card"
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "function": "build_question_card"
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "function": "question_elements"
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "function": "question_elements_with"
+    },
+    {
+      "path": "src/feishu/card/session.rs",
+      "function": "build_force_confirm_card"
+    },
+    {
+      "path": "src/feishu/card/session.rs",
+      "function": "build_switch_card"
+    },
+    {
+      "path": "src/feishu/card/session.rs",
+      "function": "pager_element"
+    },
+    {
+      "path": "src/feishu/card/session.rs",
+      "function": "search_form"
+    },
+    {
+      "path": "src/opencode/client.rs",
+      "function": "prompt"
+    },
+    {
+      "path": "src/opencode/client.rs",
+      "function": "with_tasks_and_generation"
+    },
+    {
+      "path": "src/opencode/strategy.rs",
+      "function": "prompt"
+    },
+    {
+      "path": "src/opencode/v1/mod.rs",
+      "function": "prompt"
+    },
+    {
+      "path": "src/opencode/v2/mod.rs",
+      "function": "prompt"
+    }
+  ],
+  "cfg_test": [
+    {
+      "path": "src/autostart.rs",
+      "count": 2
+    },
+    {
+      "path": "src/backend/diff_html.rs",
+      "count": 1
+    },
+    {
+      "path": "src/backend/file_content.rs",
+      "count": 1
+    },
+    {
+      "path": "src/backend/lifecycle.rs",
+      "count": 1
+    },
+    {
+      "path": "src/backend/mod.rs",
+      "count": 1
+    },
+    {
+      "path": "src/backend/parsing.rs",
+      "count": 1
+    },
+    {
+      "path": "src/backend/runs.rs",
+      "count": 1
+    },
+    {
+      "path": "src/backend/transcript.rs",
+      "count": 6
+    },
+    {
+      "path": "src/backend/turn_diff.rs",
+      "count": 1
+    },
+    {
+      "path": "src/backend/types.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/access.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/card_handles.rs",
+      "count": 3
+    },
+    {
+      "path": "src/bridge/chain/decision.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/chain/reconcile.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/chain/records.rs",
+      "count": 9
+    },
+    {
+      "path": "src/bridge/command.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/core.rs",
+      "count": 13
+    },
+    {
+      "path": "src/bridge/display.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/external.rs",
+      "count": 8
+    },
+    {
+      "path": "src/bridge/failure_latch.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/handler.rs",
+      "count": 16
+    },
+    {
+      "path": "src/bridge/handles.rs",
+      "count": 4
+    },
+    {
+      "path": "src/bridge/mcp.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/message_pins.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/mod.rs",
+      "count": 2
+    },
+    {
+      "path": "src/bridge/poll.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/pollers.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/question.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/reminder.rs",
+      "count": 3
+    },
+    {
+      "path": "src/bridge/repo_diff.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/request/companion.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/request/flow.rs",
+      "count": 10
+    },
+    {
+      "path": "src/bridge/request/kind.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/runtime.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/session.rs",
+      "count": 16
+    },
+    {
+      "path": "src/bridge/session_gates.rs",
+      "count": 12
+    },
+    {
+      "path": "src/bridge/sidecar.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/snapshot.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/store_writer.rs",
+      "count": 16
+    },
+    {
+      "path": "src/bridge/surfaces.rs",
+      "count": 3
+    },
+    {
+      "path": "src/bridge/tasks/handle.rs",
+      "count": 4
+    },
+    {
+      "path": "src/bridge/tasks/mod.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/tasks/model.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/terminal.rs",
+      "count": 16
+    },
+    {
+      "path": "src/bridge/terminal_record.rs",
+      "count": 12
+    },
+    {
+      "path": "src/bridge/turn/disposition.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/turn/flush.rs",
+      "count": 3
+    },
+    {
+      "path": "src/bridge/turn/interaction.rs",
+      "count": 2
+    },
+    {
+      "path": "src/bridge/turn/mod.rs",
+      "count": 12
+    },
+    {
+      "path": "src/bridge/turn/ownership.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/turn/render.rs",
+      "count": 11
+    },
+    {
+      "path": "src/bridge/turn/state.rs",
+      "count": 45
+    },
+    {
+      "path": "src/bridge/turn/timeline.rs",
+      "count": 31
+    },
+    {
+      "path": "src/bridge/turn/wake.rs",
+      "count": 2
+    },
+    {
+      "path": "src/bridge/turn_diff.rs",
+      "count": 1
+    },
+    {
+      "path": "src/bridge/viewer.rs",
+      "count": 5
+    },
+    {
+      "path": "src/codex/approvals.rs",
+      "count": 2
+    },
+    {
+      "path": "src/codex/authorship.rs",
+      "count": 3
+    },
+    {
+      "path": "src/codex/backend.rs",
+      "count": 17
+    },
+    {
+      "path": "src/codex/client.rs",
+      "count": 1
+    },
+    {
+      "path": "src/codex/discovery.rs",
+      "count": 4
+    },
+    {
+      "path": "src/codex/error.rs",
+      "count": 1
+    },
+    {
+      "path": "src/codex/lifecycle.rs",
+      "count": 8
+    },
+    {
+      "path": "src/codex/live/server.rs",
+      "count": 2
+    },
+    {
+      "path": "src/codex/mod.rs",
+      "count": 3
+    },
+    {
+      "path": "src/codex/model_surface.rs",
+      "count": 6
+    },
+    {
+      "path": "src/codex/preconditions.rs",
+      "count": 1
+    },
+    {
+      "path": "src/codex/read_model.rs",
+      "count": 9
+    },
+    {
+      "path": "src/codex/schema.rs",
+      "count": 3
+    },
+    {
+      "path": "src/codex/test_server.rs",
+      "count": 1
+    },
+    {
+      "path": "src/codex/threads.rs",
+      "count": 4
+    },
+    {
+      "path": "src/codex/transport.rs",
+      "count": 7
+    },
+    {
+      "path": "src/completions.rs",
+      "count": 1
+    },
+    {
+      "path": "src/config.rs",
+      "count": 1
+    },
+    {
+      "path": "src/error.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/command.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/compaction.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/help.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/lang.rs",
+      "count": 2
+    },
+    {
+      "path": "src/feishu/card/ledger.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/mcp.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/mod.rs",
+      "count": 2
+    },
+    {
+      "path": "src/feishu/card/notify.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/picker.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/question.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/sanitize.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/session.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/shell.rs",
+      "count": 4
+    },
+    {
+      "path": "src/feishu/card/skill.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/terminal.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/tool_render.rs",
+      "count": 2
+    },
+    {
+      "path": "src/feishu/card/turn_diff.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/card/viewer.rs",
+      "count": 6
+    },
+    {
+      "path": "src/feishu/card/vocab.rs",
+      "count": 2
+    },
+    {
+      "path": "src/feishu/client.rs",
+      "count": 2
+    },
+    {
+      "path": "src/feishu/delivery.rs",
+      "count": 5
+    },
+    {
+      "path": "src/feishu/event.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/file.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/image.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/message.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/pbbp2.rs",
+      "count": 1
+    },
+    {
+      "path": "src/feishu/ws.rs",
+      "count": 7
+    },
+    {
+      "path": "src/git.rs",
+      "count": 1
+    },
+    {
+      "path": "src/logging.rs",
+      "count": 1
+    },
+    {
+      "path": "src/main.rs",
+      "count": 3
+    },
+    {
+      "path": "src/opencode/attach.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/client.rs",
+      "count": 3
+    },
+    {
+      "path": "src/opencode/discovery.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/generation.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/lifecycle.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/live/mod.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/live/provider.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/live/server.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/mod.rs",
+      "count": 6
+    },
+    {
+      "path": "src/opencode/tool_semantics.rs",
+      "count": 2
+    },
+    {
+      "path": "src/opencode/transport.rs",
+      "count": 1
+    },
+    {
+      "path": "src/opencode/v1/mod.rs",
+      "count": 4
+    },
+    {
+      "path": "src/opencode/v1/wire/legacy.rs",
+      "count": 2
+    },
+    {
+      "path": "src/opencode/v2/mod.rs",
+      "count": 3
+    },
+    {
+      "path": "src/opencode/v2/progress.rs",
+      "count": 2
+    },
+    {
+      "path": "src/opencode/v2/wire.rs",
+      "count": 2
+    },
+    {
+      "path": "src/opencode/wire/mod.rs",
+      "count": 1
+    },
+    {
+      "path": "src/process.rs",
+      "count": 1
+    },
+    {
+      "path": "src/review.rs",
+      "count": 1
+    },
+    {
+      "path": "src/state.rs",
+      "count": 2
+    },
+    {
+      "path": "src/status.rs",
+      "count": 1
+    },
+    {
+      "path": "src/test_http.rs",
+      "count": 1
+    },
+    {
+      "path": "src/update.rs",
+      "count": 1
+    },
+    {
+      "path": "src/version.rs",
+      "count": 1
+    }
+  ],
+  "tag_probes": [
+    {
+      "path": "src/bridge/chain/reconcile.rs",
+      "lines": [
+        "&& element[\"header\"][\"title\"][\"tag\"] == \"plain_text\"",
+        ".all(|element| element[\"tag\"] != \"button\"),",
+        "assert_eq!(panel[\"tag\"], \"collapsible_panel\", \"{card}\");",
+        "element[\"tag\"] == \"collapsible_panel\"",
+        "elements[2][\"tag\"], \"collapsible_panel\",",
+        "elements[3][\"tag\"], \"hr\","
+      ]
+    },
+    {
+      "path": "src/bridge/tests/card_pull.rs",
+      "lines": [
+        "match element[\"tag\"].as_str() {"
+      ]
+    },
+    {
+      "path": "src/bridge/tests/ledger.rs",
+      "lines": [
+        "assert_eq!(panel[\"tag\"], \"collapsible_panel\", \"the live list folds: {panel}\");"
+      ]
+    },
+    {
+      "path": "src/bridge/tests/skill.rs",
+      "lines": [
+        "(e[\"tag\"] == \"column_set\"",
+        ".filter(|element| element[\"tag\"] == \"button\")",
+        ".filter(|element| element[\"tag\"] == \"collapsible_panel\")",
+        ".filter(|e| e[\"tag\"] == \"button\" && e[\"value\"].get(\"op\").is_none())",
+        ".find(|element| element[\"tag\"] == \"button\")",
+        ".find(|element| element[\"tag\"] == \"button\")",
+        ".find(|e| e[\"tag\"] == \"button\")",
+        ".find(|e| e[\"tag\"] == \"form\")"
+      ]
+    },
+    {
+      "path": "src/bridge/tests/subtask.rs",
+      "lines": [
+        ".find(|e| e[\"tag\"] == \"button\")",
+        ".find(|e| e[\"tag\"] == \"button\")"
+      ]
+    },
+    {
+      "path": "src/bridge/tests/viewer.rs",
+      "lines": [
+        "assert_eq!(content[\"zh_cn\"][\"content\"][0][0][\"tag\"], \"md\");"
+      ]
+    },
+    {
+      "path": "src/bridge/tests/wake.rs",
+      "lines": [
+        "element[\"tag\"], \"collapsible_panel\",",
+        "element[\"tag\"], \"collapsible_panel\","
+      ]
+    },
+    {
+      "path": "src/bridge/turn/render.rs",
+      "lines": [
+        ".all(|e| e[\"tag\"] != \"img\"),",
+        ".all(|e| e[\"tag\"] != \"img\"),",
+        ".all(|e| e[\"tag\"] != \"img\"),",
+        ".filter(|e| e[\"tag\"] == \"collapsible_panel\")",
+        ".filter(|e| e[\"tag\"] == \"collapsible_panel\")",
+        ".filter(|e| e[\"tag\"] == \"img\")",
+        ".filter(|e| e[\"tag\"] == \"img\")",
+        ".filter(|e| e[\"tag\"] == \"img\")",
+        ".filter(|e| e[\"tag\"] == \"img\")",
+        ".filter(|e| e[\"tag\"] == \"img\")",
+        ".find(|element| element[\"tag\"] == \"button\" && element[\"value\"][\"op\"] == \"turn_diff\")",
+        ".position(|e| e[\"tag\"] == \"collapsible_panel\")",
+        "assert_eq!(elements[footer_pos - 1][\"tag\"], \"hr\");",
+        "assert_eq!(image[\"tag\"], \"img\", \"the image follows the panel: {card}\");"
+      ]
+    },
+    {
+      "path": "src/bridge/turn/state.rs",
+      "lines": [
+        "elements[0][\"tag\"], \"collapsible_panel\",",
+        "if e[\"tag\"] == \"collapsible_panel\" {",
+        "let hr = position(&|element| element[\"tag\"] == \"hr\");"
+      ]
+    },
+    {
+      "path": "src/bridge/turn/timeline.rs",
+      "lines": [
+        ".filter(|e| e[\"tag\"] == \"collapsible_panel\")",
+        "if e[\"tag\"] == \"collapsible_panel\" {"
+      ]
+    },
+    {
+      "path": "src/feishu/client.rs",
+      "lines": [
+        "assert_eq!(content[\"elements\"][0][\"tag\"], \"markdown\");"
+      ]
+    }
+  ]
+}
