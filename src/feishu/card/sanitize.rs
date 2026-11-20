@@ -264,7 +264,10 @@ fn fence_oversized_tables(text: &str, max: usize) -> Cow<'_, str> {
         match table_end(&lines, i) {
             Some(end) => {
                 let region = lines[i..end].join("\n");
-                if native_table_len(&region) > max {
+                // The chunker's budget is in RAW characters, so a table whose
+                // raw length outgrows it cannot be kept whole even when the
+                // escaped measure fits (image rows shrink when escaped).
+                if native_table_len(&region) > max || region.chars().count() > max {
                     out.push(Cow::Owned(fenced_code(&region, None)));
                     changed = true;
                 } else {
@@ -296,8 +299,8 @@ fn fence_oversized_tables(text: &str, max: usize) -> Cow<'_, str> {
 /// A table that fits is moved whole to the next element instead of being cut —
 /// a repeated header is a second table, and the platform caps tables per card —
 /// and one too long for an element is fenced whole by
-/// [`fence_oversized_tables`], so the table lead only appears for a table
-/// already started in an earlier chunk (a caller that cleans per chunk).
+/// [`fence_oversized_tables`], so no chunk starts inside a table and its header
+/// is never repeated. The lead machinery still handles a fence.
 ///
 /// Cuts prefer line boundaries (so an opener or closer is never split
 /// mid-token); a line longer than the budget falls back to a character cut.
@@ -482,11 +485,12 @@ impl CardMarkdown {
                 let region = lines[i..end].join("\n");
                 if self.tables_left == 0
                     || end - i - 2 > MAX_TABLE_ROWS
-                    // A table that outgrows one element would be cut into a
-                    // second table by the element chunker (its header is
-                    // repeated), and the platform caps tables per card — so
-                    // such a table is code here, exactly like an over-budget
-                    // one (issue #1096).
+                    // A table that outgrows one element is code here too, like
+                    // an over-budget one: the card must not count it as a native
+                    // table and then split it across elements, where a repeated
+                    // header is another table against the per-card cap (#1096).
+                    // The chunker fences such a table itself for raw callers
+                    // (#1098); this keeps the cleaner's own budget in step.
                     || native_table_len(&region) > MAX_ELEMENT_TEXT_CHARS
                 {
                     out.push(fenced_code(&region, None));
@@ -929,6 +933,29 @@ mod tests {
                 "a chunk ends inside a table"
             );
         }
+    }
+
+    /// A table the RAW length cannot keep whole is fenced even when the escaped
+    /// measure fits: escaping downgrades an image (`![a](b)` → `[a](b)`), which
+    /// shortens a row. Only the raw measure says the chunker must cut this one.
+    #[test]
+    fn a_table_the_raw_measure_cannot_keep_whole_is_fenced() {
+        let table = "|a|\n|-|\n|![a](b)![a](b)![a](b)|";
+        assert!(
+            table.chars().count() > 30,
+            "the raw table must outgrow the budget"
+        );
+        assert!(
+            native_table_len(table) <= 30,
+            "the escaped measure must still fit"
+        );
+        let chunks = chunk_markdown(table, 30);
+        assert!(chunks[0].starts_with("```\n"), "the table is fenced: {chunks:?}");
+        assert_eq!(
+            chunks.iter().filter(|chunk| chunk.contains("|a|")).count(),
+            1,
+            "the header must not be repeated: {chunks:?}"
+        );
     }
 
     /// A table the caller already fenced (the reply path cleans before it

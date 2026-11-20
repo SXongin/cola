@@ -201,8 +201,10 @@ fn clipped_summary(summary: &str) -> (String, bool) {
     }
     // The body IS cut, so the marker rides in the same budget: search the longest
     // prefix whose body — the prefix plus the marker the card will show, fence
-    // and split markers included — fits. The cost is monotone enough for the
-    // search, and the character cap bounds it.
+    // and split markers included — fits. The search only ever keeps a prefix it
+    // measured as fitting, so a cost that dips as the prefix grows (a fence that
+    // closes) can only leave the clip shorter than it could be, never over the
+    // cap; the character cap bounds the search.
     let (mut keep, mut too_long) = (0usize, at_char_cap);
     while keep < too_long {
         let mid = keep + (too_long - keep).div_ceil(2);
@@ -228,11 +230,10 @@ fn body_bytes(text: &str) -> usize {
 
 /// What one text costs the body budget once the element chunker has split it:
 /// every element's own [`body_bytes`] summed, so the construct markers the split
-/// adds — a re-opened fence opener, a closer, a repeated table header, the fence
-/// [`chunk_markdown`] wraps an oversized table in, AND each element's own
-/// fallback fence (a marker line is itself a backtick run) all count. The cap
-/// therefore bounds what the card actually writes, not just the text before the
-/// chunker touches it.
+/// adds — a re-opened fence opener, a closer, the fence [`chunk_markdown`] wraps
+/// an oversized table in, AND each element's own fallback fence (a marker line is
+/// itself a backtick run) all count. The cap therefore bounds what the card
+/// actually writes, not just the text before the chunker touches it.
 fn fold_body_bytes(text: &str) -> usize {
     chunk_markdown(text, MAX_ELEMENT_TEXT_CHARS)
         .iter()
@@ -771,10 +772,10 @@ mod tests {
             body.iter().any(|chunk| chunk.contains("```\n| 长表 | 值 |")),
             "the long table is one code block: {body:?}"
         );
-        let body_bytes = body_bytes_len(&body);
+        let cost = body_bytes_len(&body);
         assert!(
-            body_bytes <= MAX_COMPACTION_BODY_BYTES,
-            "the body must fit its own byte budget, got {body_bytes} bytes"
+            cost <= MAX_COMPACTION_BODY_BYTES,
+            "the body must fit its own byte budget, got {cost} bytes"
         );
 
         // Four of the card's five tables are already spent: the fenced long
@@ -815,10 +816,10 @@ mod tests {
             "the markers come out of the byte budget, so the body is cut: {} chunks",
             body.len()
         );
-        let body_bytes = body_bytes_len(&body);
+        let cost = body_bytes_len(&body);
         assert!(
-            body_bytes <= MAX_COMPACTION_BODY_BYTES,
-            "the body — markers included — must fit, got {body_bytes} bytes"
+            cost <= MAX_COMPACTION_BODY_BYTES,
+            "the body — markers included — must fit, got {cost} bytes"
         );
         for chunk in &body {
             assert!(
