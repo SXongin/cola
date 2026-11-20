@@ -636,6 +636,24 @@ pub(crate) fn cli() {
     std::process::exit(1);
 }
 
+/// Every production module's line count — the number counter 2 ratchets —
+/// without running clippy. `cargo xtask metrics` reads module growth from here
+/// so the report and the guard cannot measure two different things.
+pub(crate) fn module_sizes(root: &Path) -> Result<Vec<FileSize>, String> {
+    let files = source_scan::read_sources(&root.join("src"), "metrics")?;
+    let mut sizes = Vec::new();
+    for file in &files {
+        if !is_production_path(&file.path, &files) {
+            continue;
+        }
+        sizes.push(FileSize {
+            path: file.path.clone(),
+            lines: production_lines_masked(&file.content, &masked(&file.content)),
+        });
+    }
+    Ok(sizes)
+}
+
 /// Every counter on one tree: clippy for the functions, the sources for the
 /// rest.
 pub(crate) fn scan_tree(root: &Path) -> Result<Scan, String> {
