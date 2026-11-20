@@ -6,63 +6,63 @@
       "function": "send_projected_successor",
       "metric": "too_many_lines",
       "value": 168,
-      "body": "98e30ccb70b33564"
+      "body": "131c3c46c379698d"
     },
     {
       "path": "src/bridge/chain/records.rs",
       "function": "load_for",
       "metric": "too_many_lines",
       "value": 105,
-      "body": "d72dc6ff5501587b"
+      "body": "f5ecef37f34cc3e1"
     },
     {
       "path": "src/bridge/command.rs",
       "function": "handle_command",
       "metric": "cognitive_complexity",
       "value": 162,
-      "body": "d4244ac6086bc82c"
+      "body": "51a61e97bbf15fdd"
     },
     {
       "path": "src/bridge/command.rs",
       "function": "handle_command",
       "metric": "too_many_lines",
       "value": 934,
-      "body": "d4244ac6086bc82c"
+      "body": "51a61e97bbf15fdd"
     },
     {
       "path": "src/bridge/command.rs",
       "function": "handle_sub_attach",
       "metric": "too_many_lines",
       "value": 122,
-      "body": "e8f75c956bc62106"
+      "body": "b6bd0d8d177b1b4a"
     },
     {
       "path": "src/bridge/command.rs",
       "function": "parse_command",
       "metric": "cognitive_complexity",
       "value": 35,
-      "body": "4a3a04959a026366"
+      "body": "e36bc731d22d6852"
     },
     {
       "path": "src/bridge/command.rs",
       "function": "parse_command",
       "metric": "too_many_lines",
       "value": 183,
-      "body": "4a3a04959a026366"
+      "body": "e36bc731d22d6852"
     },
     {
       "path": "src/bridge/command.rs",
       "function": "post_idle_card",
       "metric": "cognitive_complexity",
       "value": 40,
-      "body": "1f7200739937e29e"
+      "body": "57c1a814c9169bbe"
     },
     {
       "path": "src/bridge/command.rs",
       "function": "post_idle_card",
       "metric": "too_many_lines",
       "value": 173,
-      "body": "1f7200739937e29e"
+      "body": "57c1a814c9169bbe"
     },
     {
       "path": "src/bridge/core.rs",
@@ -76,315 +76,315 @@
       "function": "external_render_loop_inner",
       "metric": "cognitive_complexity",
       "value": 39,
-      "body": "87513120515f5d89"
+      "body": "9593ebe6b720dd56"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "external_render_loop_inner",
       "metric": "too_many_lines",
       "value": 159,
-      "body": "87513120515f5d89"
+      "body": "9593ebe6b720dd56"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "poll_session",
       "metric": "cognitive_complexity",
       "value": 32,
-      "body": "fd7010eeb0b128c4"
+      "body": "1dc4d57bfe93967c"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "poll_session",
       "metric": "too_many_lines",
       "value": 151,
-      "body": "fd7010eeb0b128c4"
+      "body": "1dc4d57bfe93967c"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "render_wake_continuation",
       "metric": "cognitive_complexity",
       "value": 33,
-      "body": "bbaf8e667af93bd0"
+      "body": "73e257fa6be07608"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "render_wake_continuation",
       "metric": "too_many_lines",
       "value": 176,
-      "body": "bbaf8e667af93bd0"
+      "body": "73e257fa6be07608"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "handle_dir_browse_action",
       "metric": "too_many_lines",
       "value": 116,
-      "body": "815d5c57c520584d"
+      "body": "0206a01450ced91e"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "handle_file_card_action",
       "metric": "too_many_lines",
       "value": 251,
-      "body": "b7dcd19c00a02d23"
+      "body": "89705ccd7514a28f"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "handle_switch_card_action",
       "metric": "cognitive_complexity",
       "value": 28,
-      "body": "5885a3ee41f99356"
+      "body": "383d7f5a890f7a8c"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "handle_switch_card_action",
       "metric": "too_many_lines",
       "value": 204,
-      "body": "5885a3ee41f99356"
+      "body": "383d7f5a890f7a8c"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "materialise_pending",
       "metric": "cognitive_complexity",
       "value": 27,
-      "body": "dc6a6c9cafbdb69e"
+      "body": "f650a007ea6976a7"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "materialise_pending",
       "metric": "too_many_lines",
       "value": 171,
-      "body": "dc6a6c9cafbdb69e"
+      "body": "f650a007ea6976a7"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "run_viewer_file_transfer",
       "metric": "too_many_lines",
       "value": 126,
-      "body": "ce5fd586c3eea7d6"
+      "body": "9f3847116f09e9c5"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "run_viewer_open",
       "metric": "too_many_lines",
       "value": 166,
-      "body": "d3c69cd338055a7c"
+      "body": "d26a06c2a39ba4f0"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "run_viewer_reread",
       "metric": "too_many_lines",
       "value": 101,
-      "body": "dd25860a6d4b7c78"
+      "body": "37a154d74b0a2ff0"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "submit_prompt",
       "metric": "cognitive_complexity",
       "value": 46,
-      "body": "9547f0b4b0fc0455"
+      "body": "6232fb6ef7e37e6d"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "submit_prompt",
       "metric": "too_many_lines",
       "value": 228,
-      "body": "9547f0b4b0fc0455"
+      "body": "6232fb6ef7e37e6d"
     },
     {
       "path": "src/bridge/handles.rs",
       "function": "pick_model_expecting",
       "metric": "cognitive_complexity",
       "value": 26,
-      "body": "6e19eefb45bdf96d"
+      "body": "b6e62921237840eb"
     },
     {
       "path": "src/bridge/handles.rs",
       "function": "pick_model_expecting",
       "metric": "too_many_lines",
       "value": 200,
-      "body": "6e19eefb45bdf96d"
+      "body": "b6e62921237840eb"
     },
     {
       "path": "src/bridge/handles.rs",
       "function": "pick_think",
       "metric": "too_many_lines",
       "value": 139,
-      "body": "80cde129175d208d"
+      "body": "cb282fd7a1a0a78f"
     },
     {
       "path": "src/bridge/request/companion.rs",
       "function": "ensure_permission_companion",
       "metric": "too_many_lines",
       "value": 195,
-      "body": "b188052fdfdc4fb5"
+      "body": "193efdeff317897e"
     },
     {
       "path": "src/bridge/request/delivery.rs",
       "function": "resolve_blocks",
       "metric": "cognitive_complexity",
       "value": 31,
-      "body": "82a54933165a8c67"
+      "body": "9e02d15ed2edaef5"
     },
     {
       "path": "src/bridge/request/delivery.rs",
       "function": "resolve_blocks",
       "metric": "too_many_lines",
       "value": 114,
-      "body": "82a54933165a8c67"
+      "body": "9e02d15ed2edaef5"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "patch_stored_surfaces",
       "metric": "cognitive_complexity",
       "value": 32,
-      "body": "f7b2302d48003124"
+      "body": "89332648b286ae5d"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "patch_stored_surfaces",
       "metric": "too_many_lines",
       "value": 125,
-      "body": "f7b2302d48003124"
+      "body": "89332648b286ae5d"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "readopt_surface",
       "metric": "too_many_lines",
       "value": 113,
-      "body": "7cc9faf05a9a722e"
+      "body": "b569a91beea77e46"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "surface",
       "metric": "cognitive_complexity",
       "value": 72,
-      "body": "0cc5ff44f6659bbb"
+      "body": "e6be17d7e9c7ae2e"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "surface",
       "metric": "too_many_lines",
       "value": 295,
-      "body": "0cc5ff44f6659bbb"
+      "body": "e6be17d7e9c7ae2e"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "sweep",
       "metric": "cognitive_complexity",
       "value": 72,
-      "body": "d7c3de6f7bbd6342"
+      "body": "2116e5aee92360f0"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "sweep",
       "metric": "too_many_lines",
       "value": 312,
-      "body": "d7c3de6f7bbd6342"
+      "body": "2116e5aee92360f0"
     },
     {
       "path": "src/bridge/request/flow.rs",
       "function": "withdraw_block_for_fallback",
       "metric": "too_many_lines",
       "value": 112,
-      "body": "d008c48036bba22d"
+      "body": "3d23285fcc021265"
     },
     {
       "path": "src/bridge/request/kind.rs",
       "function": "impl RequestKind for PermissionKind",
       "metric": "too_many_lines",
       "value": 470,
-      "body": "344f86f5d12f5b86"
+      "body": "6d37d32c5559cd6e"
     },
     {
       "path": "src/bridge/request/kind.rs",
       "function": "impl RequestKind for QuestionKind",
       "metric": "too_many_lines",
       "value": 513,
-      "body": "344f86f5d12f5b86"
+      "body": "4a0c1c0a7793ba62"
     },
     {
       "path": "src/bridge/runtime.rs",
       "function": "reconcile_now",
       "metric": "too_many_lines",
       "value": 121,
-      "body": "37f9c8ee30e3f362"
+      "body": "72f169b023967f33"
     },
     {
       "path": "src/bridge/terminal.rs",
       "function": "run_claimed",
       "metric": "cognitive_complexity",
       "value": 37,
-      "body": "e11998dfdd37f8a6"
+      "body": "e47bf994b9d52ef4"
     },
     {
       "path": "src/bridge/terminal.rs",
       "function": "run_claimed",
       "metric": "too_many_lines",
       "value": 365,
-      "body": "e11998dfdd37f8a6"
+      "body": "e47bf994b9d52ef4"
     },
     {
       "path": "src/bridge/topic.rs",
       "function": "open_topic_inner",
       "metric": "too_many_lines",
       "value": 110,
-      "body": "f6cac9774dfa7a35"
+      "body": "82267b477e76dd78"
     },
     {
       "path": "src/bridge/turn/flush.rs",
       "function": "flush_card_locked",
       "metric": "cognitive_complexity",
       "value": 120,
-      "body": "11b78e4538452a99"
+      "body": "fb6622a3aa4cc665"
     },
     {
       "path": "src/bridge/turn/flush.rs",
       "function": "flush_card_locked",
       "metric": "too_many_lines",
       "value": 512,
-      "body": "11b78e4538452a99"
+      "body": "fb6622a3aa4cc665"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "drain_state",
       "metric": "too_many_lines",
       "value": 121,
-      "body": "d26ef77fb655eb86"
+      "body": "108c5a7690074fe1"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "finish",
       "metric": "cognitive_complexity",
       "value": 53,
-      "body": "c4422945ccfee7cb"
+      "body": "9563e90d73778c21"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "finish",
       "metric": "too_many_lines",
       "value": 221,
-      "body": "c4422945ccfee7cb"
+      "body": "9563e90d73778c21"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "refresh_yielded_ledger",
       "metric": "too_many_lines",
       "value": 113,
-      "body": "686767db208c784d"
+      "body": "4463333416f5907d"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "start",
       "metric": "cognitive_complexity",
       "value": 33,
-      "body": "2977e82fc13c0adb"
+      "body": "a93e2040eee27269"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "start",
       "metric": "too_many_lines",
       "value": 147,
-      "body": "2977e82fc13c0adb"
+      "body": "a93e2040eee27269"
     },
     {
       "path": "src/bridge/turn/render.rs",
@@ -405,28 +405,28 @@
       "function": "run",
       "metric": "cognitive_complexity",
       "value": 29,
-      "body": "ad17f9904c98807a"
+      "body": "0fb99dfa183ce674"
     },
     {
       "path": "src/bridge/turn/settle.rs",
       "function": "run",
       "metric": "too_many_lines",
       "value": 139,
-      "body": "ad17f9904c98807a"
+      "body": "0fb99dfa183ce674"
     },
     {
       "path": "src/bridge/turn/state.rs",
       "function": "build_card_inner",
       "metric": "cognitive_complexity",
       "value": 45,
-      "body": "ec72b606355f50df"
+      "body": "6ebb733032478bc3"
     },
     {
       "path": "src/bridge/turn/state.rs",
       "function": "build_card_inner",
       "metric": "too_many_lines",
       "value": 247,
-      "body": "ec72b606355f50df"
+      "body": "6ebb733032478bc3"
     },
     {
       "path": "src/bridge/turn/state.rs",
@@ -454,168 +454,168 @@
       "function": "impl Backend for CodexClient",
       "metric": "too_many_lines",
       "value": 114,
-      "body": "0d8a0fce26749048"
+      "body": "7348432e35d92188"
     },
     {
       "path": "src/codex/backend.rs",
       "function": "run_thread",
       "metric": "too_many_lines",
       "value": 104,
-      "body": "0c4305bfd1b85d40"
+      "body": "dd8e4bfbc83ee0f9"
     },
     {
       "path": "src/codex/lifecycle.rs",
       "function": "impl ServerLifecycle for CodexLifecycle",
       "metric": "too_many_lines",
       "value": 131,
-      "body": "27941218936da05e"
+      "body": "624f7e9ffa918bd2"
     },
     {
       "path": "src/codex/read_model.rs",
       "function": "apply_completed",
       "metric": "cognitive_complexity",
       "value": 32,
-      "body": "fd10e0e0a1ab93fd"
+      "body": "9ed0970d8ce06033"
     },
     {
       "path": "src/codex/read_model.rs",
       "function": "apply_completed",
       "metric": "too_many_lines",
       "value": 177,
-      "body": "fd10e0e0a1ab93fd"
+      "body": "9ed0970d8ce06033"
     },
     {
       "path": "src/codex/read_model.rs",
       "function": "from_wire",
       "metric": "too_many_lines",
       "value": 131,
-      "body": "52a4ffa09adc7be1"
+      "body": "d9513e441d2031ea"
     },
     {
       "path": "src/codex/read_model.rs",
       "function": "merge_start",
       "metric": "too_many_lines",
       "value": 131,
-      "body": "53f960fed0c14677"
+      "body": "fbe33f918f9febfc"
     },
     {
       "path": "src/codex/read_model.rs",
       "function": "parts",
       "metric": "too_many_lines",
       "value": 248,
-      "body": "c11151d097f638ef"
+      "body": "6794a6381b44560a"
     },
     {
       "path": "src/codex/read_model.rs",
       "function": "transcript",
       "metric": "too_many_lines",
       "value": 104,
-      "body": "db94f8a30b0b79c3"
+      "body": "adc9ac1e8be69938"
     },
     {
       "path": "src/feishu/card/question.rs",
       "function": "question_elements_with",
       "metric": "cognitive_complexity",
       "value": 29,
-      "body": "df5cee3c88873180"
+      "body": "ad00a0c01f3eecc0"
     },
     {
       "path": "src/feishu/card/question.rs",
       "function": "question_elements_with",
       "metric": "too_many_lines",
       "value": 234,
-      "body": "df5cee3c88873180"
+      "body": "ad00a0c01f3eecc0"
     },
     {
       "path": "src/feishu/card/session.rs",
       "function": "build_switch_card",
       "metric": "too_many_lines",
       "value": 121,
-      "body": "0ad79781d73aff00"
+      "body": "34a119c9f8dde975"
     },
     {
       "path": "src/feishu/card/terminal.rs",
       "function": "build_terminal_card",
       "metric": "too_many_lines",
       "value": 163,
-      "body": "99ae169907c104b1"
+      "body": "5fccd117f1cb35e2"
     },
     {
       "path": "src/feishu/card/tool_render.rs",
       "function": "tool_panel_element",
       "metric": "too_many_lines",
       "value": 103,
-      "body": "6a2716f8c4e55852"
+      "body": "3846e04996a3fa40"
     },
     {
       "path": "src/feishu/card/viewer.rs",
       "function": "build_viewer_card_with_budget",
       "metric": "too_many_lines",
       "value": 143,
-      "body": "585afc6be2bdac19"
+      "body": "34bc9ce7c898a999"
     },
     {
       "path": "src/feishu/delivery.rs",
       "function": "admit",
       "metric": "too_many_lines",
       "value": 105,
-      "body": "17d2ecc98508cd6e"
+      "body": "cf0dddaaac82caea"
     },
     {
       "path": "src/feishu/delivery.rs",
       "function": "drive_keyed",
       "metric": "too_many_lines",
       "value": 137,
-      "body": "284ebe6867aac340"
+      "body": "9fe404fc33a503c4"
     },
     {
       "path": "src/feishu/ws.rs",
       "function": "extract_card_action_value",
       "metric": "cognitive_complexity",
       "value": 37,
-      "body": "d9e9f74e61be1822"
+      "body": "596dfa20d352aa52"
     },
     {
       "path": "src/feishu/ws.rs",
       "function": "extract_card_action_value",
       "metric": "too_many_lines",
       "value": 166,
-      "body": "d9e9f74e61be1822"
+      "body": "596dfa20d352aa52"
     },
     {
       "path": "src/feishu/ws.rs",
       "function": "handle_binary_frame",
       "metric": "too_many_lines",
       "value": 166,
-      "body": "3a3bcbb7ddc5dcd5"
+      "body": "ec6f5fd07a474d5d"
     },
     {
       "path": "src/main.rs",
       "function": "main",
       "metric": "too_many_lines",
       "value": 148,
-      "body": "ade914aeeff26685"
+      "body": "361152b6943fe7c0"
     },
     {
       "path": "src/opencode/lifecycle.rs",
       "function": "reconcile",
       "metric": "too_many_lines",
       "value": 131,
-      "body": "92d32a86d9caa806"
+      "body": "9ceb2707a62936cd"
     },
     {
       "path": "src/opencode/tool_semantics.rs",
       "function": "patch_text_edits",
       "metric": "too_many_lines",
       "value": 103,
-      "body": "2a0d079b569873a5"
+      "body": "623f45cd121322a8"
     },
     {
       "path": "src/opencode/v2/wire.rs",
       "function": "into_neutral",
       "metric": "too_many_lines",
       "value": 114,
-      "body": "fb4e16f58aea5f99"
+      "body": "426f4e8dd96ac84c"
     }
   ],
   "files": [
@@ -847,11 +847,11 @@
     },
     {
       "path": "src/bridge/turn/mod.rs",
-      "function": "impl Turn::push_tool_at"
+      "function": "impl Turn#2::refresh_yielded_ledger"
     },
     {
       "path": "src/bridge/turn/mod.rs",
-      "function": "impl Turn::refresh_yielded_ledger"
+      "function": "impl Turn#8::push_tool_at"
     },
     {
       "path": "src/bridge/turn/render.rs",
@@ -859,7 +859,7 @@
     },
     {
       "path": "src/bridge/turn/timeline.rs",
-      "function": "impl Timeline::seat_text_chunk"
+      "function": "impl Timeline#2::seat_text_chunk"
     },
     {
       "path": "src/bridge/turn/wake.rs",
