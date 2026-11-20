@@ -12,11 +12,9 @@
 //! is never rendered: it is history the reader already has.
 
 use crate::backend::{Compaction, CompactionReason, CompactionStatus};
-use crate::feishu::card::sanitize::{CardMarkdown, serialized_len};
+use crate::feishu::card::sanitize::{CardMarkdown, chunk_markdown, serialized_len};
 use crate::feishu::card::shell::collapsible_panel_chunks;
-use crate::feishu::card::{
-    MAX_CARD_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, fenced_overhead, format_tokens,
-};
+use crate::feishu::card::{MAX_CARD_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS, fenced_overhead, format_tokens};
 use serde_json::json;
 
 /// The card elements one Compaction row is made of (ADR-0082), shared by every
@@ -162,10 +160,14 @@ pub(crate) const ERROR_TRUNCATED_MARKER: &str = "…（错误已截断）";
 
 /// The fold body one Compaction row renders, chunked at the card's per-element
 /// budget: the summary clipped to [`MAX_COMPACTION_SUMMARY_CHARS`] with an
-/// explicit [`SUMMARY_TRUNCATED_MARKER`] element when it was cut. `None` when
-/// there is nothing to fold — a running or failed compaction, and a completed one
-/// the Backend never gave a text (an orphaned V1 part, say): the row is then its
-/// title alone, rather than a fold holding nothing.
+/// explicit [`SUMMARY_TRUNCATED_MARKER`] element when it was cut. The chunks are
+/// [`chunk_markdown`]'s, so a construct crossing the budget is closed on one
+/// element and re-opened on the next — this is a RAW-markdown caller, with no
+/// card cleaner in front of it, so the chunker fences an oversized table itself
+/// (issue #1098). `None` when there is nothing to fold — a running or failed
+/// compaction, and a completed one the Backend never gave a text (an orphaned V1
+/// part, say): the row is then its title alone, rather than a fold holding
+/// nothing.
 ///
 /// The ONE source the render, [`compaction_components`] and
 /// [`compaction_estimate`] read, so the three cannot drift: the caps, the chunking
@@ -176,7 +178,7 @@ pub(crate) fn compaction_fold_body(compaction: &Compaction) -> Option<Vec<String
         return None;
     }
     let (clipped, truncated) = clipped_summary(summary);
-    let mut chunks = chunk_text(&clipped, MAX_ELEMENT_TEXT_CHARS);
+    let mut chunks = chunk_markdown(&clipped, MAX_ELEMENT_TEXT_CHARS);
     if truncated {
         chunks.push(SUMMARY_TRUNCATED_MARKER.to_string());
     }
@@ -185,26 +187,27 @@ pub(crate) fn compaction_fold_body(compaction: &Compaction) -> Option<Vec<String
 
 /// The summary text one row's fold shows, and whether it was cut: at most
 /// [`MAX_COMPACTION_SUMMARY_CHARS`] CHARACTERS and — the clip's marker included,
-/// and the rejection fallback's fence too — at most
-/// [`MAX_COMPACTION_BODY_BYTES`] SERIALIZED bytes ([`body_bytes`]) — the
-/// character cap for an ordinary summary, the byte cap for text the card encodes
-/// or fences larger, so neither extreme can outgrow one card on either attempt.
+/// the rejection fallback's fence too, and the construct markers the element
+/// chunker adds — at most [`MAX_COMPACTION_BODY_BYTES`] SERIALIZED bytes
+/// ([`fold_body_bytes`]) — the character cap for an ordinary summary, the byte
+/// cap for text the card encodes, fences or splits larger, so neither extreme can
+/// outgrow one card on either attempt.
 fn clipped_summary(summary: &str) -> (String, bool) {
     let chars = summary.chars().count();
     let at_char_cap = chars.min(MAX_COMPACTION_SUMMARY_CHARS);
     let head: String = summary.chars().take(at_char_cap).collect();
-    if chars <= MAX_COMPACTION_SUMMARY_CHARS && body_bytes(&head) <= MAX_COMPACTION_BODY_BYTES {
+    if chars <= MAX_COMPACTION_SUMMARY_CHARS && fold_body_bytes(&head) <= MAX_COMPACTION_BODY_BYTES {
         return (head, false);
     }
     // The body IS cut, so the marker rides in the same budget: search the longest
     // prefix whose body — the prefix plus the marker the card will show, fence
-    // included — fits. The cost is monotone in the prefix's length, and the
-    // character cap bounds the search.
+    // and split markers included — fits. The cost is monotone enough for the
+    // search, and the character cap bounds it.
     let (mut keep, mut too_long) = (0usize, at_char_cap);
     while keep < too_long {
         let mid = keep + (too_long - keep).div_ceil(2);
         let candidate: String = summary.chars().take(mid).collect();
-        if body_bytes(&candidate) + body_bytes(SUMMARY_TRUNCATED_MARKER) <= MAX_COMPACTION_BODY_BYTES {
+        if fold_body_bytes(&candidate) + body_bytes(SUMMARY_TRUNCATED_MARKER) <= MAX_COMPACTION_BODY_BYTES {
             keep = mid;
         } else {
             too_long = mid - 1;
@@ -221,6 +224,20 @@ fn clipped_summary(summary: &str) -> (String, bool) {
 /// [`charged_bytes`] bounds the splitter's decision.
 fn body_bytes(text: &str) -> usize {
     serialized_len(text) + fenced_overhead(text)
+}
+
+/// What one text costs the body budget once the element chunker has split it:
+/// every element's own [`body_bytes`] summed, so the construct markers the split
+/// adds — a re-opened fence opener, a closer, a repeated table header, the fence
+/// [`chunk_markdown`] wraps an oversized table in, AND each element's own
+/// fallback fence (a marker line is itself a backtick run) all count. The cap
+/// therefore bounds what the card actually writes, not just the text before the
+/// chunker touches it.
+fn fold_body_bytes(text: &str) -> usize {
+    chunk_markdown(text, MAX_ELEMENT_TEXT_CHARS)
+        .iter()
+        .map(|chunk| body_bytes(chunk))
+        .sum()
 }
 
 /// The safety factor every rendered element's charge is multiplied by. A row's
@@ -304,7 +321,7 @@ pub(crate) fn compaction_estimate(compaction: &Compaction) -> usize {
 mod tests {
     use super::*;
     use crate::feishu::card::MAX_CARD_JSON_CHARS;
-    use crate::feishu::card::sanitize::MAX_CARD_TABLES;
+    use crate::feishu::card::sanitize::{MAX_CARD_TABLES, neutralize_tail};
     use crate::feishu::card::shell::CardBuilder;
 
     fn compaction(summary: &str) -> Compaction {
@@ -685,6 +702,142 @@ mod tests {
         }
     }
 
+    /// Issue #1098: the fold body is a raw-markdown caller, so the chunker must
+    /// keep a fence self-contained across the element split. A fenced block
+    /// crossing `MAX_ELEMENT_TEXT_CHARS` renders as code in every element, and
+    /// the prose after the original closer is rendered as prose — never
+    /// swallowed by a fence left open.
+    #[test]
+    fn a_fence_crossing_the_element_budget_renders_self_contained_elements() {
+        let code: String = (0..200).map(|i| format!("print(<{i}>)  # 一行代码\n")).collect();
+        let summary = format!("说明\n```python\n{code}```\n后的 <文字>");
+        let fact = compaction(&summary);
+        let body = compaction_fold_body(&fact).expect("a folded body");
+        assert!(
+            body.len() > 1,
+            "the fixture must cross the element budget: {} chunks",
+            body.len()
+        );
+        for chunk in &body {
+            assert!(
+                chunk.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                "chunk over the element budget: {} chars",
+                chunk.chars().count()
+            );
+            assert_eq!(
+                neutralize_tail(chunk, "尾"),
+                None,
+                "a chunk ends inside a fence: {chunk:?}"
+            );
+        }
+        let mut md = CardMarkdown::new();
+        let elements = compaction_elements(&fact, Some("compaction_1"), &mut md);
+        let rendered = elements[0]["elements"].to_string();
+        assert!(
+            rendered.contains("print(<199>)"),
+            "a code line rendered as prose (its `<` escaped): {rendered}"
+        );
+        assert!(
+            rendered.contains("&#60;文字>"),
+            "prose swallowed into a code block: {rendered}"
+        );
+    }
+
+    /// Issue #1098: a long table in a summary is one fenced block, not a header
+    /// repeated on every element — each repeat counts as another native table
+    /// against the card's five-table allowance, which fences the tables after
+    /// it.
+    #[test]
+    fn a_long_table_in_a_summary_is_fenced_once_and_costs_no_table_slot() {
+        let row = format!("| {} | 值 |\n", "长".repeat(100));
+        let long = format!("| 长表 | 值 |\n|---|---|\n{}", row.repeat(30));
+        let small = "| 短表 | 值 |\n|---|---|\n| 一 | 1 |";
+        let summary = format!("前面的话。\n\n{long}\n\n后面的话。\n\n{small}\n\n结尾。");
+        let fact = compaction(&summary);
+        let body = compaction_fold_body(&fact).expect("a folded body");
+        assert!(
+            body.len() > 1,
+            "the fixture must cross the element budget: {} chunks",
+            body.len()
+        );
+        assert_eq!(
+            body.iter()
+                .filter(|chunk| chunk.contains("| 长表 | 值 |"))
+                .count(),
+            1,
+            "the long table's header must appear once: {body:?}"
+        );
+        assert!(
+            body.iter().any(|chunk| chunk.contains("```\n| 长表 | 值 |")),
+            "the long table is one code block: {body:?}"
+        );
+        let body_bytes = body_bytes_len(&body);
+        assert!(
+            body_bytes <= MAX_COMPACTION_BODY_BYTES,
+            "the body must fit its own byte budget, got {body_bytes} bytes"
+        );
+
+        // Four of the card's five tables are already spent: the fenced long
+        // table costs no slot, so the short one still renders natively. A
+        // repeated header would have fenced it.
+        let mut md = CardMarkdown::new();
+        for _ in 0..MAX_CARD_TABLES - 1 {
+            md.clean("| a | b |\n|---|---|\n| 1 | 2 |");
+        }
+        let elements = compaction_elements(&fact, Some("compaction_1"), &mut md);
+        let rendered = elements[0]["elements"].to_string();
+        let at = rendered.find("| 短表 | 值 |").expect("the short table renders");
+        assert!(
+            !rendered[..at].trim_end().ends_with("```"),
+            "the short table was fenced after the long table took a slot: {rendered}"
+        );
+    }
+
+    /// Issue #1098: the clip's byte budget covers the construct markers the
+    /// chunker adds — a re-opened opener and a closer per split. A body at the
+    /// character cap that a fence forces to split would grow past
+    /// `MAX_COMPACTION_BODY_BYTES` without them counted, so the clip stops
+    /// earlier instead.
+    #[test]
+    fn the_clip_reserves_the_chunkers_construct_markers() {
+        // Exactly at the character cap, with a fence left open at the end: no
+        // markers are needed until the body is split, and the split adds them.
+        let summary = format!(
+            "```\n{}",
+            "摘".repeat(MAX_COMPACTION_SUMMARY_CHARS - "```\n".chars().count())
+        );
+        assert_eq!(summary.chars().count(), MAX_COMPACTION_SUMMARY_CHARS);
+        let fact = compaction(&summary);
+        let body = compaction_fold_body(&fact).expect("a folded body");
+        assert_eq!(
+            body.last().map(String::as_str),
+            Some(SUMMARY_TRUNCATED_MARKER),
+            "the markers come out of the byte budget, so the body is cut: {} chunks",
+            body.len()
+        );
+        let body_bytes = body_bytes_len(&body);
+        assert!(
+            body_bytes <= MAX_COMPACTION_BODY_BYTES,
+            "the body — markers included — must fit, got {body_bytes} bytes"
+        );
+        for chunk in &body {
+            assert!(
+                chunk.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                "chunk over the element budget: {} chars",
+                chunk.chars().count()
+            );
+            assert_eq!(
+                neutralize_tail(chunk, "尾"),
+                None,
+                "a chunk ends inside a fence: {chunk:?}"
+            );
+        }
+        assert!(
+            card_json(&summary).len() < MAX_CARD_JSON_CHARS,
+            "the card must stay inside the whole-card JSON budget"
+        );
+    }
+
     /// The clipped failure title keeps the head of the error and names the
     /// truncation — the marker INSIDE the element budget, never on top of it —
     /// leaves a short error (the ordinary case) exactly as the Backend wrote it,
@@ -757,13 +910,14 @@ mod tests {
         ] {
             let fact = compaction(&summary);
             let body = compaction_fold_body(&fact).expect("a folded body");
-            let visible: String = match body.last().map(String::as_str) {
-                Some(SUMMARY_TRUNCATED_MARKER) => body[..body.len() - 1].concat(),
-                _ => body.concat(),
-            };
+            // The first chunk carries no lead (only a continuation gets one), so
+            // it still opens with the head of the summary; the split's markers
+            // are closers and later leads, never content.
+            let head: String = summary.trim().chars().take(100).collect();
             assert!(
-                summary.trim().starts_with(&visible),
-                "{label}: the body is the head of the summary"
+                body[0].starts_with(&head),
+                "{label}: the body keeps the head of the summary: {:?}",
+                body[0].chars().take(100).collect::<String>()
             );
             assert!(
                 body_bytes_len(&body) <= MAX_COMPACTION_BODY_BYTES,
