@@ -37,16 +37,19 @@ The test contract is ADR-0110's second decision; the cost evidence is #1106.
   enumerated exceptions — their one behaviour is the order or the shape.
 - **An absence assertion names its counterpart**: `assert!(!…)` says what would
   have made it true, or a rename turns a real check vacuous.
-- **A new test-only production twin is banned** — a `#[cfg(test)]` seam that
-  exists only so a test can reach a path. `check-structure` counts the sites;
-  the existing twins are C9's deletion target.
+- **A new test-only production twin is banned** — `Option<&Gate>`, `*_for_test`
+  and `#[cfg(test)]` production branches alike. `check-structure` counts the
+  `#[cfg(test)]` sites; the existing twins are the C9 segment's deletion target
+  (#1118).
 - **Delete the cheapest duplicate first**: repeated negatives, then test-only
   twins, then duplicate helpers, then same-shape merges. A deletion keeps a
   surviving test that fails when the behaviour breaks; a deleted test with no
   such survivor is coverage removed, not redundancy.
-- **CI targets hotspots, not the count.** The Test job's budget is 6 minutes; the
+- **CI targets hotspots, not the count.** The Test job targets 6 minutes; the
   module whose tests dominate the wall time is the one to fix. Nightly sampled
-  mutation is the value signal; coverage ratio and `nextest` are not adopted.
+  mutation is where the value signal goes (#1114 measures the baseline); until
+  it lands the Coverage job keeps its advisory statuses, and no coverage ratio
+  becomes a gate. No `nextest`.
 
 ## Commits
 
@@ -95,7 +98,7 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
 - **A comment carries an invariant, a wire/why trap, or an API contract the
   signature cannot express.** A bare pointer (an issue, an ADR) is fine; a
   retelling of the code is not — the docs contract found ~38% pure restatement
-  in the largest modules (#1112).
+  in the largest modules (#1107).
 - **Use the glossary's vocabulary** (`GLOSSARY.md`): say *Bridge*, *Platform*,
   *Backend*, *Shared Store*, *Owned Server*, *Coexistent Server*, *Session*,
   *Card* — not synonyms the glossary explicitly avoids.
