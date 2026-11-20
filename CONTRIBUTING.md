@@ -330,13 +330,15 @@ the marker after the process exits.
 
    **Folding is the one exception to append-only, and it is a change with a
    reason, not tidying.** It deletes superseded text while keeping the decision,
-   and it lands only when (a) the surviving body is a minority of the file or a
-   whole section has died, and (b) the change is docs-only and its diff *is* the
-   deleted text. An ADR carrying 3+ banners is a mandatory read before editing,
-   not an automatic fold. A superseded or retired ADR folds, whole, to a
-   **5-line pointer**: title, `Status:` line, the replacing banner, and one line
-   of why the pointer exists. A new ADR is soft-capped at 150 lines — a longer
-   one is usually two decisions (ADR-0110 counts this as a review nit).
+   and it lands only when (a) the surviving body is mostly dead — a minority of
+   the file, or a whole section has died — and (b) the change is docs-only and
+   its diff *is* the deleted text. An ADR carrying 3+ banners is a mandatory
+   read at review, not an automatic fold. A superseded or retired ADR folds,
+   whole, to a **5-line pointer**: title, `Status:` line, the one-line decision,
+   `Superseded/Retired by ADR-NNNN`, and the originating issue — within one
+   release of the decision, git being the record. A new ADR is soft-capped at
+   150 lines: a longer one is usually two decisions (ADR-0110 counts this as a
+   review nit).
 
    There is no central index: every forward banner names its ADR, and a new ADR
    names what it supersedes.
