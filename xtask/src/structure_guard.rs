@@ -15,14 +15,17 @@
 //!    grandfathered. A new one must carry a reason and a tracking issue
 //!    (`#NNN`) on the attribute itself, or in the comment beside it.
 //! 4. **`#[cfg(test)]` production sites** — counted per file; a new one fails.
-//!    The test surface (`src/**/tests/**`, `src/bridge/test_support.rs`,
-//!    fixtures) is out of scope: it is the test contract's.
+//!    The test surface is out of scope — it is the test contract's: a `tests/`
+//!    directory, `fixtures/`, and any module a parent declares `#[cfg(test)]`
+//!    (`main.rs` / `lib.rs` included), whether it lives in a `mod.rs`, a
+//!    `tests.rs` or a `test_server.rs`.
 //! 5. **`["tag"]` probes** — card JSON may be built and probed only inside
 //!    `src/feishu/card`. Outside it, every line is on the baseline's
 //!    allow-list; no new line may appear.
 //!
 //! `--bless` rewrites the baseline from the tree and refuses to raise a value:
-//! its first job is to record a removal (or a rename) as a *lower* baseline.
+//! its first job is to record a removal (or a same-score rename) as a *lower*
+//! baseline.
 //! Seeding a missing baseline is the one mode that takes the tree as it is.
 //! The only way up is a reviewable edit of the JSON in a diff.
 //!
@@ -94,11 +97,20 @@ pub(crate) struct FileEntry {
     pub(crate) lines: usize,
 }
 
-/// One grandfathered `#[allow(clippy::too_many_arguments)]`.
+/// The `#[allow(clippy::too_many_arguments)]` sites on one file + function.
+///
+/// The counter is a count, never a named site: a line number moves with every
+/// edit above it, and a suffix handed out by line order lets a new allow steal
+/// a grandfathered slot. `untracked` is what the rule polices — a site without
+/// a reason and a tracking issue — so a route has to be tracked to grow.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct AllowEntry {
     pub(crate) path: String,
     pub(crate) function: String,
+    /// Every site on this function.
+    pub(crate) count: usize,
+    /// The sites among them with no reason + tracking issue.
+    pub(crate) untracked: usize,
 }
 
 /// One file's `#[cfg(test)]` count.
@@ -254,17 +266,23 @@ impl Scan {
     }
 
     fn allow_entries(&self) -> Vec<AllowEntry> {
-        let mut entries: Vec<AllowEntry> = self
-            .allows
-            .iter()
-            .map(|site| AllowEntry {
-                path: site.path.clone(),
-                function: site.function.clone(),
+        let mut groups: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
+        for site in &self.allows {
+            let group = groups
+                .entry((site.path.clone(), site.function.clone()))
+                .or_default();
+            group.0 += 1;
+            group.1 += usize::from(!site.tracked);
+        }
+        groups
+            .into_iter()
+            .map(|((path, function), (count, untracked))| AllowEntry {
+                path,
+                function,
+                count,
+                untracked,
             })
-            .collect();
-        entries.sort();
-        entries.dedup();
-        entries
+            .collect()
     }
 
     fn cfg_test_entries(&self) -> Vec<CfgTestEntry> {
@@ -339,18 +357,18 @@ fn function_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
         }
     }
 
-    // A rename or a file move keeps the function's body, so its score is
-    // unchanged: pair an appeared entry with exactly one vanished entry of the
-    // same metric and value and record it as a move, not a new offender.
+    // A rename keeps the body in the same file; a file move keeps the name.
+    // Either way the score is unchanged, so an appeared entry may pair with one
+    // vanished entry of the *same* file or the *same* name — never an
+    // unrelated equal score, which would launder a delete-and-add.
     for score in appeared {
-        let candidates: Vec<usize> = existing
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.metric == score.metric && entry.value == score.value)
-            .map(|(index, _)| index)
-            .collect();
-        if candidates.len() == 1 {
-            existing.remove(candidates[0]);
+        let vanished = existing.iter().position(|entry| {
+            entry.metric == score.metric
+                && entry.value == score.value
+                && (entry.path == score.path || entry.function == score.function)
+        });
+        if let Some(index) = vanished {
+            existing.remove(index);
         } else {
             violations.push(format!(
                 "{}:{}: {} — {} {} is a new offender",
@@ -393,16 +411,25 @@ fn file_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
 
 fn allow_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
     let mut violations = Vec::new();
+    let mut groups: BTreeMap<(&str, &str), Vec<&AllowSite>> = BTreeMap::new();
     for site in &scan.allows {
-        let known = baseline
+        groups
+            .entry((site.path.as_str(), site.function.as_str()))
+            .or_default()
+            .push(site);
+    }
+    for ((path, function), sites) in groups {
+        let allowed = baseline
             .too_many_arguments
             .iter()
-            .any(|entry| entry.path == site.path && entry.function == site.function);
-        if !known && !site.tracked {
+            .find(|entry| entry.path == path && entry.function == function)
+            .map_or(0, |entry| entry.untracked);
+        let untracked: Vec<&&AllowSite> = sites.iter().filter(|site| !site.tracked).collect();
+        for site in untracked.iter().skip(allowed) {
             violations.push(format!(
-                "{}:{}: new #[allow(clippy::too_many_arguments)] without a reason and a tracking \
-                 issue — write `reason = \"… #NNN\"` in the attribute or a `// … #NNN` comment \
-                 beside it",
+                "{}:{}: new #[allow(clippy::too_many_arguments)] on `{function}` without a reason \
+                 and a tracking issue — write `reason = \"… #NNN\"` in the attribute or a \
+                 `// … #NNN` comment beside it",
                 site.path, site.line
             ));
         }
@@ -431,6 +458,9 @@ fn cfg_test_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
     violations
 }
 
+/// A probe is matched as a multiset per file, not by line: the allow-list is
+/// the source *text* (a reflow keeps its slot) and the Nth occurrence of a
+/// repeated line is consumed by the Nth probe, in line order.
 fn tag_probe_violations(scan: &Scan, baseline: &Baseline) -> Vec<String> {
     let mut violations = Vec::new();
     for probe in &scan.tag_probes {
@@ -520,7 +550,10 @@ pub(crate) fn cli() {
                      {} allow(s), {} cfg(test) site(s), {} tag probe(s)",
                     next.functions.len(),
                     next.files.len(),
-                    next.too_many_arguments.len(),
+                    next.too_many_arguments
+                        .iter()
+                        .map(|entry| entry.count)
+                        .sum::<usize>(),
                     next.cfg_test.iter().map(|entry| entry.count).sum::<usize>(),
                     next.tag_probes
                         .iter()
@@ -762,7 +795,7 @@ fn scan_sources(root: &Path) -> Result<Scan, String> {
         scan.allows
             .extend(allow_sites(&file.path, &file.content, &masked));
         scan.tag_probes.extend(tag_probes(&file.path, &file.content));
-        if !is_production_path(&file.path) {
+        if !is_production_path(&file.path, &files) {
             continue;
         }
         scan.files.push(FileSize {
@@ -773,35 +806,96 @@ fn scan_sources(root: &Path) -> Result<Scan, String> {
             scan.cfg_test.push(sites);
         }
     }
-    disambiguate_allows(&mut scan.allows);
+    scan.allows
+        .sort_by(|left, right| (&left.path, left.line).cmp(&(&right.path, right.line)));
     scan.files.sort_by(|left, right| left.path.cmp(&right.path));
-    scan.functions.sort_by(|left, right| {
-        (&left.path, &left.function, left.metric).cmp(&(&right.path, &right.function, right.metric))
-    });
     Ok(scan)
 }
 
-/// Two allows can annotate same-named functions in one file (two `impl` blocks'
-/// `new`). The baseline keys an allow by file + function, so the second one
-/// keeps a stable `#2` suffix instead of vanishing into the first.
-fn disambiguate_allows(sites: &mut [AllowSite]) {
-    sites.sort_by(|left, right| (&left.path, left.line).cmp(&(&right.path, right.line)));
-    let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for site in sites.iter_mut() {
-        let count = seen
-            .entry((site.path.clone(), site.function.clone()))
-            .or_insert(0);
-        *count += 1;
-        if *count > 1 {
-            site.function = format!("{}#{}", site.function, count);
+/// The test surface is the test contract's: integration-test modules, the
+/// fixtures a `rustc` invocation compiles, and any module a parent declares
+/// `#[cfg(test)]` — `src/opencode/v2/tests.rs` and `src/codex/test_server.rs`
+/// are test code even though they do not sit under a `tests/` directory.
+fn is_production_path(path: &str, sources: &[source_scan::SourceFile]) -> bool {
+    !(path.contains("/tests/") || path.contains("/fixtures/") || declared_cfg_test(path, sources))
+}
+
+/// Whether the file — or any module enclosing it — is declared `#[cfg(test)]`.
+///
+/// The parent module (`<dir>/mod.rs`, or `<dir>.rs` beside it) owns each
+/// declaration, so the walk climbs from the file's own module up through every
+/// ancestor directory: `src/opencode/live/provider.rs` is test code because
+/// `src/opencode/mod.rs` says `#[cfg(test)] mod live;`.
+fn declared_cfg_test(path: &str, sources: &[source_scan::SourceFile]) -> bool {
+    let Some((mut dir, file)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let mut stem = if file == "mod.rs" {
+        // `src/a/b/mod.rs` is the module `b`, declared in `src/a`.
+        let Some((parent, module)) = dir.rsplit_once('/') else {
+            return false;
+        };
+        dir = parent;
+        module
+    } else {
+        let Some(stem) = file.strip_suffix(".rs") else {
+            return false;
+        };
+        stem
+    };
+    loop {
+        if !matches!(stem, "mod" | "lib" | "main") && declares_cfg_test_module_at(dir, stem, sources) {
+            return true;
         }
+        let Some((parent, module)) = dir.rsplit_once('/') else {
+            return false;
+        };
+        dir = parent;
+        stem = module;
     }
 }
 
-/// The test surface is the test contract's: integration-test modules, the
-/// shared harness, and the fixtures a `rustc` invocation compiles.
-fn is_production_path(path: &str) -> bool {
-    !(path.contains("/tests/") || path.ends_with("/test_support.rs") || path.contains("/fixtures/"))
+fn declares_cfg_test_module_at(dir: &str, stem: &str, sources: &[source_scan::SourceFile]) -> bool {
+    // A directory module's declaration lives in its `mod.rs` (or the `x.rs`
+    // beside it); a crate-root module's lives in `main.rs` / `lib.rs`.
+    [
+        format!("{dir}/mod.rs"),
+        format!("{dir}.rs"),
+        format!("{dir}/main.rs"),
+        format!("{dir}/lib.rs"),
+    ]
+    .iter()
+    .filter_map(|parent| sources.iter().find(|source| source.path == *parent))
+    .any(|parent| declares_cfg_test_module(&parent.content, stem))
+}
+
+fn declares_cfg_test_module(content: &str, stem: &str) -> bool {
+    let masked = masked(content);
+    let lines: Vec<&[u8]> = masked.split(|byte| *byte == b'\n').collect();
+    let declaration = format!("mod {stem};");
+    for (index, line) in lines.iter().enumerate() {
+        let text = trim(line);
+        if !text.ends_with(declaration.as_bytes()) {
+            continue;
+        }
+        if text
+            .windows(CFG_TEST.len())
+            .any(|window| window == CFG_TEST.as_bytes())
+        {
+            return true;
+        }
+        for above in lines[..index].iter().rev().take(6) {
+            let above = trim(above);
+            if above == CFG_TEST.as_bytes() {
+                return true;
+            }
+            if above.is_empty() || above.starts_with(b"#") || above.starts_with(b"//") {
+                continue;
+            }
+            break;
+        }
+    }
+    false
 }
 
 /// A file's production lines: everything outside a `#[cfg(test)]` item.
@@ -1330,18 +1424,30 @@ mod tests {
         assert!(check(&scan, &base).is_empty());
     }
 
+    fn allow_site(line: usize, tracked: bool) -> AllowSite {
+        AllowSite {
+            path: "src/bridge/x.rs".to_string(),
+            line,
+            function: "wide".to_string(),
+            tracked,
+        }
+    }
+
+    fn allow_entry(count: usize, untracked: usize) -> AllowEntry {
+        AllowEntry {
+            path: "src/bridge/x.rs".to_string(),
+            function: "wide".to_string(),
+            count,
+            untracked,
+        }
+    }
+
     /// A new `too_many_arguments` allow needs a reason and a tracking issue;
     /// a grandfathered one does not, and removing one is never a violation.
     #[test]
     fn a_new_allow_must_carry_a_reason_and_a_tracking_issue() {
-        let site = |tracked| AllowSite {
-            path: "src/bridge/x.rs".to_string(),
-            line: 42,
-            function: "wide".to_string(),
-            tracked,
-        };
         let mut scan = Scan::default();
-        scan.allows.push(site(false));
+        scan.allows.push(allow_site(42, false));
         let violations = check(&scan, &baseline());
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("src/bridge/x.rs:42"), "{violations:?}");
@@ -1350,15 +1456,41 @@ mod tests {
         assert!(check(&scan, &baseline()).is_empty());
 
         let mut base = baseline();
-        base.too_many_arguments.push(AllowEntry {
-            path: "src/bridge/x.rs".to_string(),
-            function: "wide".to_string(),
-        });
+        base.too_many_arguments.push(allow_entry(1, 1));
         scan.allows[0].tracked = false;
         assert!(
             check(&scan, &base).is_empty(),
             "a baselined allow is grandfathered"
         );
+    }
+
+    /// The counter is order-free: two grandfathered allows on the same
+    /// function leave room for no third untracked one, wherever it is inserted.
+    #[test]
+    fn a_third_untracked_allow_fails_wherever_it_is_inserted() {
+        let mut base = baseline();
+        base.too_many_arguments.push(allow_entry(2, 2));
+
+        for inserted in [0, 1, 2] {
+            let mut scan = Scan::default();
+            let mut sites = vec![allow_site(10, false), allow_site(20, false)];
+            sites.insert(inserted, allow_site(inserted + 5, false));
+            scan.allows = sites;
+            let violations = check(&scan, &base);
+            assert_eq!(violations.len(), 1, "inserted at {inserted}: {violations:?}");
+            assert!(
+                violations[0].contains("without a reason and a tracking issue"),
+                "{violations:?}"
+            );
+        }
+
+        // A tracked new allow may grow the group; a grandfathered site that
+        // later gains a reason frees its slot.
+        let scan = Scan {
+            allows: vec![allow_site(10, false), allow_site(20, false), allow_site(30, true)],
+            ..Scan::default()
+        };
+        assert!(check(&scan, &base).is_empty(), "{:?}", check(&scan, &base));
     }
 
     /// The rationale check is the rule's phrasing, not a vibe: an issue ref on
@@ -1657,6 +1789,42 @@ struct Turn {
 }
 ";
         assert_eq!(production_lines(content), 3);
+    }
+
+    /// A module a parent declares `#[cfg(test)]` is test surface, wherever it
+    /// lives: a test module file is not a production file.
+    #[test]
+    fn a_cfg_test_module_file_is_test_surface() {
+        assert!(declares_cfg_test_module("#[cfg(test)]\nmod live;\n", "live"));
+        assert!(declares_cfg_test_module(
+            "pub(crate) mod threads;\n#[cfg(test)]\npub(crate) mod test_server;\n",
+            "test_server"
+        ));
+        // The attribute may ride the declaration line.
+        assert!(declares_cfg_test_module("#[cfg(test)] mod inline;\n", "inline"));
+        assert!(!declares_cfg_test_module("mod live;\n", "live"));
+        assert!(!declares_cfg_test_module("#[cfg(test)]\nmod live;\n", "lively"));
+        assert!(!declares_cfg_test_module("// #[cfg(test)]\nmod live;\n", "live"));
+
+        let sources = vec![source_scan::SourceFile {
+            path: "src/x/mod.rs".to_string(),
+            content: "#[cfg(test)]\nmod tests;\nmod real;\n#[cfg(test)]\nmod live;\n".to_string(),
+        }];
+        assert!(!is_production_path("src/x/tests.rs", &sources));
+        assert!(is_production_path("src/x/real.rs", &sources));
+        assert!(!is_production_path("src/x/tests/one.rs", &sources));
+        // A directory module (`x/live/mod.rs`) is declared as `mod live;` in
+        // its parent, and its children inherit the gate.
+        assert!(!is_production_path("src/x/live/mod.rs", &sources));
+        assert!(!is_production_path("src/x/live/provider.rs", &sources));
+
+        // A crate-root module is declared in `main.rs`, not in a `mod.rs`.
+        let crate_root = vec![source_scan::SourceFile {
+            path: "src/main.rs".to_string(),
+            content: "mod logging;\n#[cfg(test)]\nmod test_http;\n".to_string(),
+        }];
+        assert!(!is_production_path("src/test_http.rs", &crate_root));
+        assert!(is_production_path("src/logging.rs", &crate_root));
     }
 
     /// The scan reports a cfg(test) site only for the attribute itself.

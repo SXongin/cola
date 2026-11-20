@@ -588,10 +588,6 @@
       "lines": 3968
     },
     {
-      "path": "src/codex/cards.rs",
-      "lines": 4317
-    },
-    {
       "path": "src/codex/discovery.rs",
       "lines": 2235
     },
@@ -604,298 +600,410 @@
       "lines": 3268
     },
     {
-      "path": "src/codex/test_server.rs",
-      "lines": 2749
-    },
-    {
       "path": "src/feishu/card/tool_render.rs",
       "lines": 3959
     },
     {
       "path": "src/feishu/delivery.rs",
       "lines": 2001
-    },
-    {
-      "path": "src/opencode/live/mod.rs",
-      "lines": 2424
-    },
-    {
-      "path": "src/opencode/v2/tests.rs",
-      "lines": 2818
     }
   ],
   "too_many_arguments": [
     {
       "path": "src/backend/mod.rs",
-      "function": "prompt"
+      "function": "prompt",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/backend/mod.rs",
-      "function": "steer"
+      "function": "steer",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/chain/reconcile.rs",
-      "function": "ending_pipeline"
+      "function": "ending_pipeline",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/bridge/chain/reconcile.rs",
-      "function": "send_projected_chain"
+      "function": "send_projected_chain",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/bridge/chain/reconcile.rs",
-      "function": "send_projected_successor"
+      "function": "send_projected_successor",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "function": "track_carrying_cursor"
+      "function": "track_carrying_cursor",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "function": "track_carrying_cursor_landing"
+      "function": "track_carrying_cursor_landing",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "function": "track_carrying_cursor_with"
+      "function": "track_carrying_cursor_with",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "function": "track_carrying_rendered"
+      "function": "track_carrying_rendered",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "function": "track_landing"
+      "function": "track_landing",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "function": "track_with"
+      "function": "track_with",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/command.rs",
-      "function": "handle_command"
+      "function": "handle_command",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/external.rs",
-      "function": "render_wake_continuation"
+      "function": "render_wake_continuation",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/external.rs",
-      "function": "spawn_wake_render"
+      "function": "spawn_wake_render",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/external.rs",
-      "function": "split_wake_continuation"
+      "function": "split_wake_continuation",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/handler.rs",
-      "function": "topic_adopt_target"
+      "function": "topic_adopt_target",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/handles.rs",
-      "function": "new"
+      "function": "new",
+      "count": 2,
+      "untracked": 2
     },
     {
       "path": "src/bridge/handles.rs",
-      "function": "new#2"
-    },
-    {
-      "path": "src/bridge/handles.rs",
-      "function": "pick_model_expecting"
+      "function": "pick_model_expecting",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/delivery.rs",
-      "function": "refresh_question_block"
+      "function": "refresh_question_block",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/delivery.rs",
-      "function": "resolve_blocks"
+      "function": "resolve_blocks",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/flow.rs",
-      "function": "surface"
+      "function": "surface",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/kind.rs",
-      "function": "fallback_confirmation_card"
+      "function": "fallback_confirmation_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/kind.rs",
-      "function": "handle_action"
+      "function": "handle_action",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/kind.rs",
-      "function": "label"
+      "function": "label",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/kind.rs",
-      "function": "rebuild_fallback_from_server"
+      "function": "rebuild_fallback_from_server",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/request/kind.rs",
-      "function": "recover_from_risk_mismatch"
+      "function": "recover_from_risk_mismatch",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/bridge/request/kind.rs",
-      "function": "settle_question_reply"
+      "function": "settle_question_reply",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/session.rs",
-      "function": "set_mirror_pending"
+      "function": "set_mirror_pending",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/terminal.rs",
-      "function": "finish_run"
+      "function": "finish_run",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/terminal.rs",
-      "function": "patch_live"
+      "function": "patch_live",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/terminal.rs",
-      "function": "repoint_card"
+      "function": "repoint_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/terminal.rs",
-      "function": "settle"
+      "function": "settle",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/terminal.rs",
-      "function": "settle_run"
+      "function": "settle_run",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/terminal.rs",
-      "function": "settled_card"
+      "function": "settled_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/test_support.rs",
-      "function": "steer"
+      "function": "steer",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/tests/reap.rs",
-      "function": "seed_cursor_record_reply_to"
+      "function": "seed_cursor_record_reply_to",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/bridge/turn/mod.rs",
-      "function": "push_tool_at"
+      "function": "push_tool_at",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/turn/mod.rs",
-      "function": "refresh_yielded_ledger"
+      "function": "refresh_yielded_ledger",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/turn/render.rs",
-      "function": "apply_ledger_read"
+      "function": "apply_ledger_read",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/bridge/turn/timeline.rs",
-      "function": "seat_text_chunk"
+      "function": "seat_text_chunk",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/turn/wake.rs",
-      "function": "arm_external_render"
+      "function": "arm_external_render",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/turn/wake.rs",
-      "function": "arm_projected_card"
+      "function": "arm_projected_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/turn/wake.rs",
-      "function": "attach_and_repoint"
+      "function": "attach_and_repoint",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/turn/wake.rs",
-      "function": "take_over_armed_card"
+      "function": "take_over_armed_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/bridge/turn/wake.rs",
-      "function": "track_projected_continuation"
+      "function": "track_projected_continuation",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/codex/backend.rs",
-      "function": "prompt"
+      "function": "prompt",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/codex/backend.rs",
-      "function": "steer"
+      "function": "steer",
+      "count": 2,
+      "untracked": 2
     },
     {
       "path": "src/codex/backend.rs",
-      "function": "steer#2"
-    },
-    {
-      "path": "src/codex/backend.rs",
-      "function": "turn_params"
-    },
-    {
-      "path": "src/feishu/card/picker.rs",
-      "function": "build_skill_card"
+      "function": "turn_params",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/picker.rs",
-      "function": "chunk_picker_cards"
+      "function": "build_skill_card",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/feishu/card/picker.rs",
-      "function": "grouped_picker_card"
+      "function": "chunk_picker_cards",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/picker.rs",
-      "function": "picker_card"
+      "function": "grouped_picker_card",
+      "count": 1,
+      "untracked": 1
+    },
+    {
+      "path": "src/feishu/card/picker.rs",
+      "function": "picker_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/question.rs",
-      "function": "build_fallback_permission_confirm_card"
+      "function": "build_fallback_permission_confirm_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/question.rs",
-      "function": "build_location_form_card"
+      "function": "build_location_form_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/question.rs",
-      "function": "build_question_card"
+      "function": "build_question_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/question.rs",
-      "function": "question_elements"
+      "function": "question_elements",
+      "count": 1,
+      "untracked": 0
     },
     {
       "path": "src/feishu/card/question.rs",
-      "function": "question_elements_with"
+      "function": "question_elements_with",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/session.rs",
-      "function": "build_force_confirm_card"
+      "function": "build_force_confirm_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/session.rs",
-      "function": "build_switch_card"
+      "function": "build_switch_card",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/session.rs",
-      "function": "pager_element"
+      "function": "pager_element",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/feishu/card/session.rs",
-      "function": "search_form"
+      "function": "search_form",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/opencode/client.rs",
-      "function": "prompt"
+      "function": "prompt",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/opencode/client.rs",
-      "function": "with_tasks_and_generation"
+      "function": "with_tasks_and_generation",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/opencode/strategy.rs",
-      "function": "prompt"
+      "function": "prompt",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/opencode/v1/mod.rs",
-      "function": "prompt"
+      "function": "prompt",
+      "count": 1,
+      "untracked": 1
     },
     {
       "path": "src/opencode/v2/mod.rs",
-      "function": "prompt"
+      "function": "prompt",
+      "count": 1,
+      "untracked": 1
     }
   ],
   "cfg_test": [
@@ -1152,10 +1260,6 @@
       "count": 8
     },
     {
-      "path": "src/codex/live/server.rs",
-      "count": 2
-    },
-    {
       "path": "src/codex/mod.rs",
       "count": 3
     },
@@ -1174,10 +1278,6 @@
     {
       "path": "src/codex/schema.rs",
       "count": 3
-    },
-    {
-      "path": "src/codex/test_server.rs",
-      "count": 1
     },
     {
       "path": "src/codex/threads.rs",
@@ -1340,18 +1440,6 @@
       "count": 1
     },
     {
-      "path": "src/opencode/live/mod.rs",
-      "count": 1
-    },
-    {
-      "path": "src/opencode/live/provider.rs",
-      "count": 1
-    },
-    {
-      "path": "src/opencode/live/server.rs",
-      "count": 1
-    },
-    {
       "path": "src/opencode/mod.rs",
       "count": 6
     },
@@ -1384,10 +1472,6 @@
       "count": 2
     },
     {
-      "path": "src/opencode/wire/mod.rs",
-      "count": 1
-    },
-    {
       "path": "src/process.rs",
       "count": 1
     },
@@ -1401,10 +1485,6 @@
     },
     {
       "path": "src/status.rs",
-      "count": 1
-    },
-    {
-      "path": "src/test_http.rs",
       "count": 1
     },
     {
