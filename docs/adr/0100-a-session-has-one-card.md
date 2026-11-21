@@ -200,9 +200,13 @@ a context-token update — while the per-second header timer and a rendered
 number's own cadence do not renew it. A run whose card shows nothing new for the
 whole window ends under that rule: partial content finalises Done, and a message
 that never produced is left untouched (#457). Every read in a poll is bounded,
-a failed or timed-out poll counts as no progress, and the ending paths are
-anchor-guarded, so a renderer whose bound fired after a successor replaced the
-accumulator never finalises the successor's card.
+and the renewal reads the accumulator's own progress mark — advanced as each
+render stage produces — so content a pass had already rendered before its
+timeout abandoned it still counts. A poll that rendered nothing counts as no
+progress, whether it found nothing or failed or timed out, so a wedged Backend
+cannot hold the card live forever. The ending paths are anchor-guarded, so a
+renderer whose bound fired after a successor replaced the accumulator never
+finalises the successor's card.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and
