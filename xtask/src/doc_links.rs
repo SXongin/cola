@@ -139,8 +139,8 @@ fn adr_targets(line: &str, out: &mut Vec<Target>) {
     }
 }
 
-/// `docs/research/…` and `docs/reference/…` paths, with their Markdown
-/// punctuation and any `#anchor` stripped.
+/// `docs/research/…` and `docs/reference/…` paths, with a sentence's full stop
+/// and any `#anchor` stripped.
 fn doc_path_targets(line: &str, out: &mut Vec<Target>) {
     for prefix in ["docs/research/", "docs/reference/"] {
         for (start, _) in line.match_indices(prefix) {
@@ -152,8 +152,9 @@ fn doc_path_targets(line: &str, out: &mut Vec<Target>) {
             if length == 0 {
                 continue;
             }
-            let path = line[start..start + prefix.len() + length]
-                .trim_end_matches(['.', ',', ';', ')', ']', '>', '"', '\'', '`']);
+            // The slice already ends at the first non-path character, so only
+            // a sentence's full stop can still be attached to it.
+            let path = line[start..start + prefix.len() + length].trim_end_matches('.');
             if path.len() > prefix.len() {
                 out.push(Target::DocPath(path.to_string()));
             }
@@ -524,6 +525,19 @@ mod tests {
     #[test]
     fn a_host_repository_path_is_not_a_cola_pin() {
         assert!(targets("packages/core/src/session.ts:75-82").is_empty());
+    }
+
+    #[test]
+    fn a_degenerate_src_prefix_is_not_a_pin() {
+        assert!(targets("`src/:12`").is_empty());
+    }
+
+    #[test]
+    fn a_non_adr_continuation_ends_the_shorthand_run() {
+        for line in ["ADR-0105/x", "ADR-0105/01062"] {
+            let targets: Vec<Target> = targets(line).into_iter().map(|(_, target)| target).collect();
+            assert_eq!(targets, vec![Target::Adr("0105".to_string())], "{line}");
+        }
     }
 
     #[test]
