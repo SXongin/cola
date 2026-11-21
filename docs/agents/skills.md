@@ -1,6 +1,6 @@
 # Local skills
 
-Where cola's agent workflow diverges from an upstream skill, the **mechanism** — *how* a step runs — lives in a **repo-local skill** under `.opencode/skill/`, not restated in `AGENTS.md` prose or a sub-agent prompt. The **policy** — *when* a step runs and *who* calls it — stays in `docs/agents/flow.md`. This file is the convention; the skills are the mechanism. (ADR-0034's 2026-10-17 amendment supersedes that ADR's earlier "never forked" clause and records the decision.)
+Where cola's agent workflow diverges from an upstream skill, the **mechanism** — *how* a step runs — lives in a **repo-local skill** under `.opencode/skill/`, not restated in `AGENTS.md` prose or a sub-agent prompt. The **policy** — *when* a step runs and *who* calls it — stays in `docs/agents/flow.md`. This file is the convention; the skills are the mechanism.
 
 ## Why a skill, not prose
 

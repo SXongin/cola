@@ -7,7 +7,7 @@ description: Repo-local companion to the two-axis `/code-review`. Run the Codex 
 
 The binding — its pairing with `/code-review`, which review points, who runs it, how findings route — is `docs/agents/flow.md`; this skill adds only the pass below.
 
-CI deliberately kept this pass out of `/code-review` (`ADR-0034`, 2026-10-04 amendment), which left the author-side review blind to exactly the class the gate blocks on: a negative path the new test never walks, a test that still passes with the change reverted, an unhandled error/cleanup/ordering path, a lost tail under a size split. Running it locally is the deliberate trade recorded in `ADR-0034`'s 2026-10-09 amendment — fewer review round-trips.
+CI kept this pass out of `/code-review` at first, which left the author-side review blind to exactly the class the gate blocks on: a negative path the new test never walks, a test that still passes with the change reverted, an unhandled error/cleanup/ordering path, a lost tail under a size split. Running it locally is the deliberate trade — the author-side pass shares the gate's lens in exchange for fewer review round-trips (`docs/agents/flow.md`); the gate stays the independent final run, in a fresh sandbox under its own execution.
 
 ## The rubric is not written here
 

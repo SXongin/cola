@@ -1,9 +1,9 @@
 # Growth is budgeted, tests are behaviours: the refactoring charter
 
 > **Amended (2026-11-21)**: the gate's round policy is autonomous rounds plus
-> stop predicates, recorded in ADR-0034's 2026-11-21 amendment. §4 and
-> "Unchanged, with evidence" point at `CONTRIBUTING.md` "Reviewing" instead of
-> restating the three-round budget.
+> stop predicates, recorded in `CONTRIBUTING.md` "Reviewing". §4 and
+> "Unchanged, with evidence" point there instead of restating the three-round
+> budget.
 
 The four contracts a refactor here is settled by — code (#1109), tests (#1111),
 docs (#1112), flow (#1110) — and the segment that applies them first (#1115),
@@ -77,8 +77,8 @@ below (#1126–#1131) move the existing restatements there.
 The branch loop, the local pair, deferral and commit granularity stay: wall time
 tracks rounds, and a 36-commit PR has passed in one (#1110). The gate keeps its
 cap of 3 blocking findings in full (plus 5 non-blocking); its round policy is
-the stop-predicate rule in `CONTRIBUTING.md` "Reviewing" (ADR-0034,
-2026-11-21), which replaced the three-round budget this charter inherited. A
+the stop-predicate rule in `CONTRIBUTING.md` "Reviewing" (#1145), which replaced
+the three-round budget this charter inherited. A
 `ready-for-agent` ticket's every acceptance criterion names what decides it — a
 code symbol, a wire field, a recorded fixture, or a command the reviewer can
 run — enforced at triage, not by a template. The review prompt is unchanged
