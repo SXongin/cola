@@ -4,6 +4,5 @@
 `seq`, never from a body position, and `seq` is never reused or renumbered — so
 fold state survives a settle.
 
-Superseded by [ADR-0104](0104-the-timeline-module.md); the snapshot example
-retired by [ADR-0100](0100-a-session-has-one-card.md). Originated in PR #209,
-out of a review discussion — no originating issue.
+Superseded by [ADR-0104](0104-the-timeline-module.md), from PR #209; the
+decision came out of a review discussion and has no originating issue.
