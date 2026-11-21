@@ -133,7 +133,7 @@ drops stale intents, collapses duplicates and retries failures.
   place, not a mark on any record.
 
 - **The release gate waits for the keyed ending.** A terminal card's record is
-  released only once its ending write is confirmed (ADR-0063's amendment).
+  released only once its ending write is confirmed (ADR-0063).
   The gate (`has_pending_card_update`, via `release_spent`) now counts a keyed
   `Settle` the queue still owes or is writing, not only the keyless Pending
   Card Update; the reap's own settle releases the record it wrote for as soon

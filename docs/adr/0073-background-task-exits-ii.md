@@ -46,7 +46,7 @@ gaps remained, and the ledger itself stayed opaque (spec #588):
   the strongest "it is actually alive" signal — and what whoever picks the work
   up wants at the ending — was invisible (#465).
 
-After #583 (ADR-0071's amendment) a restart's wait lives on a projected
+After #583 (ADR-0071) a restart's wait lives on a projected
 successor card carrying the ledger; the residue, cleanup and output experience
 had to fit that home. Spec #588 landed the second exit cut (tickets #589–#593).
 
