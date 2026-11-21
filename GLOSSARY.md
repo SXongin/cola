@@ -672,7 +672,7 @@ _Avoid_: Notification, message, signal
 - A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
 - A **Compaction** is a **Session**-scoped fact on the **Session Transcript** — it may run between **Turns** and is never a Turn anchor — rendered on the live card body's **Timeline** and in the **Session Snapshot** read's recent tail (ADR-0082)
 - A **Wake Watermark** persists which **Wake**s a card chain has already announced, while the **Sync Watermark** stays user-message-scoped (ADR-0061)
-- A **Background Task** run's endings are durable **Task Ending**s under one **Task Run Id** — at most one per class (an evidence ending, the user's **Cleanup**, a **Wake** completion) — rendered on whichever card **Background Task State**'s `apply` shows it to (ADR-0080)
+- A **Background Task** run's endings are durable **Task Ending**s under one **Task Run Id** (ADR-0080)
 - A **Card Chain**'s **Rendered Cursor** records how far its card has confirmed rendered; a restart's projection resumes from it (ADR-0071)
 - A **Keyed Submission** carries the **Chain Generation** its writer decided under (ADR-0072)
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
@@ -681,8 +681,8 @@ _Avoid_: Notification, message, signal
 - A **Turn** with live runs (Background Tasks or child agents) yields its card as 等待后台任务, and the Session's live runs ride the newest card as one **Background Task Ledger** (ADR-0059, ADR-0060)
 - One **Runtime Reconciliation** step corroborates every **Session**'s live **Background Tasks**, shared by Session Sync, the Turn's drain and the follow/settle loop, and the user's **Cleanup** ends the residue no positive evidence can conclude (ADR-0065, ADR-0073)
 - An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending and clears when the wait resolves; a **Completion Notice** announces a long p2p **Turn**'s end (ADR-0059, ADR-0109)
-- A **Turn** renders one **Tool Panel** per tool call; an unfinished panel rides the newest card of its **Card Chain** as a tail section and joins the card body's **Timeline** when the tool settles; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering
-- A **File Content** is a file payload a transcript part carries; within Feishu's caps an image is embedded in the card immediately after its **Tool Panel**, while anything else becomes a **File Message** and is marked `未发送` when it cannot be sent; a user message's File Content is recorded but never re-delivered
+- A **Turn** renders one **Tool Panel** per tool call; an unfinished panel rides the newest card of its **Card Chain** as a tail section and joins the card body's **Timeline** when the tool settles
+- A **File Content** is a file payload a transcript part carries; within Feishu's caps an image is embedded in the card immediately after its **Tool Panel** and anything else becomes a **File Message**, while a file past the 30 MB cap or a failed send leaves only its `未发送` tracking line (ADR-0076, ADR-0083); a user message's File Content is recorded but never re-delivered
 - A **Directory Browser** lists children and a file row opens a **File Viewer** on the **Path Scope** (ADR-0083)
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Card** is the one card a **Session** renders into; `/card` pulls a render-owned one to the newest position, and posts an idle one from a **Session Snapshot** read when nothing owns it (ADR-0100)
