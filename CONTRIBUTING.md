@@ -571,11 +571,10 @@ holds:
   over-defensive code, a guard for an input that cannot occur, a test for an
   unreachable state, or deleting or replacing a real design. Record the finding
   and why the fix would do more harm than the defect.
-- **Backstop** — six gate rounds have been spent. A round that fixes a
-  `critical` security or data-loss finding does not count toward this number.
-
-The backstop's sixth round still gets its fix: push once more, and that
-verification round is the last — a PASS ends the loop, a FAIL hands the PR over.
+- **Backstop** — six gate rounds have been spent. Fix the sixth round's blocking
+  findings in one final push; that verification round is the last — a PASS ends
+  the loop, a FAIL hands the PR over. A round that fixes a `critical` security
+  or data-loss finding does not count toward this number.
 
 A `critical` security or data-loss finding the diff introduces or makes newly
 reachable is fixed and pushed in its own round first; it is never deferred and
