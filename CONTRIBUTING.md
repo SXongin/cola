@@ -561,16 +561,21 @@ holds:
   public contract, an accepted ADR, a schema, or behaviour beyond the linked
   issue's acceptance criteria.
 - **Oscillation** — a finding the PR has already fixed reappears, or the same
-  finding class appears in two consecutive rounds.
+  failure mode (the same rule, not merely the same category) appears at a new
+  site in two consecutive rounds.
 - **Non-convergence** — the blocking count has not fallen across two
-  consecutive rounds. A regression the fix itself introduced is exempt as
-  evidence for one round: fix it, then measure again.
-- **Harm** — the only way to satisfy the gate is over-defensive code, a guard
-  for an input that cannot occur, a test for an unreachable state, or deleting
-  or replacing a real design. Record the finding and why fixing it would leave
-  the code worse than the defect.
-- **Backstop** — six gate rounds have been spent. A `critical` security or
-  data-loss round does not count toward this number.
+  consecutive rounds, counting only findings the previous fix did not itself
+  introduce; a fix-introduced regression is fixed and does not count as
+  evidence for that round.
+- **Harm** — fixing the finding would leave the code worse than the defect:
+  over-defensive code, a guard for an input that cannot occur, a test for an
+  unreachable state, or deleting or replacing a real design. Record the finding
+  and why the fix would do more harm than the defect.
+- **Backstop** — six gate rounds have been spent. A round that fixes a
+  `critical` security or data-loss finding does not count toward this number.
+
+The backstop's sixth round still gets its fix: push once more, and that
+verification round is the last — a PASS ends the loop, a FAIL hands the PR over.
 
 A `critical` security or data-loss finding the diff introduces or makes newly
 reachable is fixed and pushed in its own round first; it is never deferred and
@@ -583,14 +588,14 @@ becomes a follow-up issue linked from the dossier, a PASS included.
 On a stop, write the matched predicate and the remaining findings into the
 dossier, leave the PR at its last head, and notify the user; each further gate
 round, merging with the admin bypass, or closing the PR is theirs to decide,
-never the agent's. If the user declines another round, hand the PR over as it
-stands. The backstop counts every gate run that posts a review — a non-draft
-push, a non-draft `opened`, the `ready_for_review` flip that spends a draft's
-first review, an `edited` body re-run, or a `reopened` run. A run that fails
-before the model (an unfetchable reference, a credential failure) posts none and
-is not a round, and the agent never re-runs the gate on an unchanged head to
-fish for a different verdict. The local pair still runs until no blocking
-finding remains (`docs/agents/flow.md`).
+never the agent's, and a further round needs a change to the head — an unchanged
+head is never re-reviewed. The backstop counts every gate run that posts a
+review — a non-draft push, a non-draft `opened`, the `ready_for_review` flip
+that spends a draft's first review, an `edited` body re-run, or a `reopened`
+run. A run that fails before the model (an unfetchable reference, a credential
+failure) posts none and is not a round, and the agent never re-runs the gate on
+an unchanged head to fish for a different verdict. The local pair still runs
+until no blocking finding remains (`docs/agents/flow.md`).
 
 **The dossier is a PR comment, not the body.** A comment whose first line is
 `<!-- gate-dossier -->` records the rounds spent and the deferred findings; it is

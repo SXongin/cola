@@ -595,20 +595,22 @@ unbounded, so an absent maintainer turned a bounded review into an hours-long
 stall — worse total wall time than simply continuing. The round count was also a
 poor proxy for a bad gate: #1105 found 206 of 210 findings (98%) across 257 gate
 reviews were real defects, and rounds do not track diff size (#1047: 47 rounds
-on a 157-line diff; #1072: 8 rounds on a 291-line docs-only diff).
+on a 157-line diff; #1072: 9 gate rounds, 8 FAIL, on a 291-line docs-only
+diff).
 
 The round-3 approval is replaced, in #1145, by autonomous rounds plus five stop
 predicates whose home is `CONTRIBUTING.md` "Reviewing": a design-level finding;
-oscillation (a fixed finding reappears, or the same class appears in two
-consecutive rounds); non-convergence (the blocking count does not fall across
-two rounds, a regression the fix introduced being exempt as evidence for one
-round); harm (the only fix would leave the code worse than the defect —
+oscillation (a fixed finding reappears, or the same failure mode appears at a
+new site in two consecutive rounds); non-convergence (the blocking count does
+not fall across two rounds, counting only findings the previous fix did not
+introduce); harm (the fix would leave the code worse than the defect —
 over-defensive code, an impossible-input guard, an unreachable-state test, or
-deleting a real design); and a six-round backstop (a critical security/data-loss
-round does not count). A round never waits for the user. On a stop the agent
-writes the matched predicate and the remaining findings into the dossier, leaves
-the PR at its head and hands it over; further rounds are the user's decision,
-and merging stays human.
+deleting or replacing a real design); and a six-round backstop (a round that
+fixes a critical security/data-loss finding does not count, and the sixth
+round's fix gets one final verification push). A round never
+waits for the user. On a stop the agent writes the matched predicate and the
+remaining findings into the dossier, leaves the PR at its head and hands it
+over; further rounds are the user's decision, and merging stays human.
 
 The blocking definition, the 3 blocking / 5 non-blocking finding cap, the
 line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` parser and the per-commit approval
