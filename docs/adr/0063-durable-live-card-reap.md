@@ -51,8 +51,9 @@ pass reconciles the card against the Session's own reads:
 
 - the transcript's real ending settles it in place — ✅ / Error / Waiting on
   Background Tasks — so a run that finished while cola was down gets its true
-  ending, never an invented interruption (a cursor-carrying record projects the
-  same tail onto a successor instead, below);
+  ending, never an invented interruption (a cursor-carrying record follows
+  ADR-0071's projection ladder instead, below: it projects a tail that is owed
+  and settles in place when the delta is empty);
 - an idle Session whose Turn message never landed ends Unreceived (ADR-0062),
   never ✅ — the same ending, without the 重新发起 action: the click's fixture
   died with the process, so the reaped card tells the user to re-send;
