@@ -170,7 +170,7 @@ and the map from the old numbers.
   settlement are not the render pass and still land.
 
   One user-initiated repaint is allowed while a box holds text: switching to
-  another question (ADR-0094). It is a form **submit**, so the text arrives with
+  another question (ADR-0100). It is a form **submit**, so the text arrives with
   it (keyed `custom_<i>`), the handler records it as that question's draft
   before painting, and the repaint seeds the new box with `default_value` — the
   one moment Feishu hands the text to the server at all. It writes through
@@ -195,9 +195,9 @@ and the map from the old numbers.
   **folded** panel below the input costs only its header. Hence one open
   question at a time (`question_elements`) — the reader picks which, and the
   switch is a form **submit** so the open question's draft travels with it
-  (ADR-0094) — search forms after the rows and pager (`search_form` call
+  (ADR-0100) — search forms after the rows and pager (`search_form` call
   sites), and a folded tail beyond a Session Card's one-shot **read** (#917,
-  ADR-0093); a render-owned follow's seeded question still keeps its input at
+  ADR-0100); a render-owned follow's seeded question still keeps its input at
   the card's end.
   One form per question block, at the body's top level: a `form` inside a
   `collapsible_panel` is rejected (200621), a panel inside the form is legal.

@@ -84,6 +84,19 @@ derivation — see the 2026-10-14 amendment below.
   its slices (#680–#682, spec #687) have landed the **Background Task State**
   module that will own the new facts, so this ADR changes semantics on top of an
   owned state, not a move.
+- **The owning module, as ADR-0079 installed it.** A per-Session **Background
+  Task State** module owns the lifecycle across all three tiers — the volatile
+  liveness memoization, the per-chain delivery exactly-once sets and the durable
+  facts — keeping the volatile/durable split exactly as it was. Its interface is
+  a read model: the ledger rows a read yields and the completion entries it
+  owes, card-agnostic, with the **Chain Record** as its durable adapter through
+  a narrow task-scoped interface (never a second sidecar). It never owns the
+  Turn's ending, the liveness resolution or the render. The seam is an internal
+  module, not a trait — one adapter is not a seam — and the lock order is
+  `write_lock` → `cards` → task state, the task-state lock synchronous and never
+  held across an await. A carrier write's **acceptance** records the volatile
+  liveness; its **delivery** advances the durable facts. One `restore` at chain
+  install re-derives the durable tier, so no caller seeds it by hand.
 
 ## Decision
 

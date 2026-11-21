@@ -63,6 +63,37 @@ block on this card to rebuild, claim, or protect from a repaint. Its header is a
 static 「📄 会话」 (grey, no phase timer), because it is a read with no run to
 describe; #1003 renders its body under that header.
 
+**A typed input sits at the card's end.** Feishu's `input` is its only free-text
+component and must live inside a `form`; on Android, focusing one scrolls the
+message's **bottom** to the keyboard's top, so more than about half a screen of
+card below the box hides the caret and the typed text (#917). It is layout, not
+a repaint race — a static, never-patched card reproduces it — and the threshold
+is a rendered height: a folded panel contributes only its header. Every card
+that collects text keeps its input at the card's end or within a couple of
+elements of it. A question card opens **one question at a time** — the open one
+carries the card's only input and the rest are folded headers — and the list
+cards (`/switch`, `/dir`, `/sub`, the `/skill` picker) render their search form
+**after** the rows and the pager. The Session Card's one-shot read carries no
+input; the rule reaches it only through its folded 最近对话 tail, while a
+render-owned follow that seeds a live question keeps that question's box at the
+card's end (pitfall `card-inputs`).
+
+**A question switch keeps the draft, and the block is one form.** The whole
+question block is one root-level `form` — Feishu rejects a `form` nested inside
+a `collapsible_panel` (ErrCode 200621), while a form wrapping panels is legal —
+and switching the open question is a form **submit**, not a button: a submit
+carries every input's text (including one inside a panel) and no `value`, so
+routing rides the button `name`, and the handler files the text under the
+input's own name (`custom_<i>`) before repainting the new box with
+`default_value` — the one moment the client hands the text to the server
+(#917). Option, confirm, skip and reject buttons stay non-submit. A draft is
+dropped when its question is finalized and cleared when a submit consumes it; a
+question with no typed control opens without a box; and of two racing switches
+on one pre-switch card the first to land wins. A dropped switch does not repaint
+while a typed box is open — that would erase what the client alone holds. The
+render pass writes nothing while an unanswered typed answer renders (ADR-0038's
+2026-10-31 update, pitfall `card-repaints`).
+
 **Taking a session over no longer posts a card.** A first adoption confirms in
 one text line carrying the same status summary, and that line is the Topic
 Anchor. Only `/card` produces a Session Card. The switch-list op is not a post: it
@@ -263,12 +294,13 @@ standing.
   Session's own for the standalone fallback — never both, and never nested. The
   lock stays per-session, and the sweep's non-live-card patches stay lock-free.
 - ADR-0094 — several pending blocks on one snapshot, and its no-repaint
-  carve-out. **Retired** with the claimed block.
+  carve-out. **Retired** with the claimed block; its **draft** rule moved into
+  this ADR's "A question switch keeps the draft".
 - ADR-0040 — the Session Snapshot tail's fold ids. **Retired** with the rebuild
-  path.
+  path; the `seq`-derived panel ids are **ADR-0104's** now.
 - ADR-0093 — the Session Snapshot's folded receipt log. **Retired** with the
-  snapshot card; the Session Card's folded tail and list forms keep that
-  layout rule.
+  snapshot card; its **layout** rule moved into this ADR's "A typed input sits
+  at the card's end".
 - ADR-0082 §3 — session-scoped exactly-once. **Narrowed** (2026-11-07): the
   live timeline still renders a compaction once, but the busy follow's static
   lead keeps the read tail's markers for #1002's equal-body contract, so a

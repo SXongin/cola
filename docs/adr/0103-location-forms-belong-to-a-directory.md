@@ -288,7 +288,7 @@ permits, not for a case in the current wire.
 - **Treat 「稍后」 as a decline, or auto-decline on a timeout.** Rejected: both
   turn "not now" into a failed MCP call.
 - **Aggregate every pending Location Form into one card.** Rejected: it breaks
-  the per-request surface and settlement machinery, and ADR-0093 allows only one
+  the per-request surface and settlement machinery, and ADR-0100 allows only one
   open typed input per card anyway.
 
 ## Update (2026-11-09): the secret-input refusal applies to every elicitation form
