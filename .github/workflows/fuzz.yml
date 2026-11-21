@@ -4,11 +4,10 @@ name: Fuzz
 # repo: the Feishu WS frame codec (`src/feishu/pbbp2.rs`, driven through
 # `fuzz/fuzz_targets/pbbp2.rs`). The corpus rides the Actions cache so every
 # run continues where the last one stopped; a crash fails the run and its
-# reproducer lands in the uploaded artifacts. Plain scheduled job by decision:
-# ClusterFuzzLite/OSS-Fuzz are rejected, and Scorecard's `Fuzzing` check
-# already detects this target (`libfuzzer_sys` -> `RustCargoFuzzer`) and scores
-# 10, so the schedule exists for the bug-finding value only — see ADR-0034's
-# 2026-09-22 amendment.
+# reproducer lands in the uploaded artifacts. Plain scheduled job by decision,
+# for the bug-finding value only: ClusterFuzzLite/OSS-Fuzz are rejected and
+# Scorecard's `Fuzzing` check already scores this target 10 — see ADR-0034
+# item 5.
 
 on:
   schedule:

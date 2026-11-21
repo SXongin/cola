@@ -29,7 +29,7 @@ that had never once changed a line of code.
 Retire CodeQL: delete `.github/workflows/codeql.yml` and its configuration
 (`.github/codeql/codeql-config.yml`, the test-tree `paths-ignore` list), and the
 README badge. `CONTRIBUTING.md` ("Security scanning") and the `AGENTS.md` check
-gates record the posture; ADR-0033 and ADR-0034 carry amendments because their
+gates record the posture; ADR-0033 and ADR-0034 were amended because their
 texts assumed CodeQL stays.
 
 Nothing else moves: `cargo xtask release`'s `watch_checks` is a generic
@@ -58,8 +58,8 @@ pbbp2 fuzz job, and review remain.
 
 - The Security tab loses first-party code scanning; Scorecard's supply-chain
   SARIF uploads remain, and the dismissed CodeQL alerts stay as history.
-- Scorecard's `SAST` check returns to 0; the ADR-0034 amendment records it as a
-  deliberate no, superseding the "heals on its own" expectation.
+- Scorecard's `SAST` check returns to 0; ADR-0034 records it as a deliberate
+  no.
 - The release cut no longer has a CodeQL check to gate on (ADR-0033
   amendment); it still waits on every check that reports.
 - Re-adding a scanner is one workflow file away. The bar it must clear next

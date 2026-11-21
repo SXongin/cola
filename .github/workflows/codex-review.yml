@@ -5,9 +5,8 @@
 # review workflow (trial: issue #516 / PR #517).
 #
 # The gate's provider, endpoint, model and secret are repository configuration,
-# not an ADR pin (ADR-0034, 2026-11-07 amendment; it supersedes the 2026-10-17
-# amendment's workflow-diff rule) — this comment is the record of the defaults,
-# and the switch lives in repository settings rather than in this file:
+# not an ADR pin — this comment is the record of the defaults, and the switch
+# lives in repository settings rather than in this file:
 #
 #   vars.GATE_ENDPOINT   overrides the Responses endpoint
 #   vars.GATE_MODEL      overrides the model
@@ -48,11 +47,9 @@
 #
 # Approval contract: this workflow posts the review itself and records the new
 # comment's ID as a step output; the approve step fetches exactly that comment
-# and approves only when its final line is `CODEX_REVIEW_VERDICT: PASS`. The
-# OpenCode gate read the *last* bot comment, which forced a first-line marker
-# filter so the advisory trial's comments could not shadow the verdict
-# (ADR-0034, 2026-10-04 amendment); comment-ID anchoring removes the scan, so
-# the marker rule died with the trial workflow.
+# and approves only when its final line is `CODEX_REVIEW_VERDICT: PASS`.
+# Comment-ID anchoring replaces the OpenCode gate's last-comment scan, so no
+# other comment can shadow or forge the verdict.
 #
 # Linked issues (#555): the prompt carries every issue the PR references — the
 # body's closing/ref keywords and the commits' `Refs:` trailers, deduplicated,
@@ -98,8 +95,7 @@
 # the verdict is published, while approval requires the marker to stand on its
 # own line, so a quoted marker can never approve a change. A same-job retry is
 # impossible: the action's drop-sudo safety strategy removes
-# passwordless sudo, so a second invocation in the job cannot start. The
-# v1.11 pin is retired by ADR-0034's 2026-10-16 amendment.
+# passwordless sudo, so a second invocation in the job cannot start.
 #
 # Trust model: like the OpenCode gate before it, this is a `pull_request`
 # workflow, so a same-repo PR runs the workflow definition from its merge ref.

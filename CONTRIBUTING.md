@@ -352,7 +352,7 @@ the marker after the process exits.
    (which may accompany the banner, never replace it); and a `Status:` line
    immediately after the title, used only when the whole ADR is superseded (a
    scoped supersession is stated in the banner). The heading-only amendments
-   already in the tree — ADR-0034/0056/0076/0103 among them — are grandfathered.
+   already in the tree — ADR-0056/0076/0103 among them — are grandfathered.
 
    Allowed body edits: a **factual** typo, link or number fix, and that `Status:`
    line. Nothing that changes the decision; a number the decision rests on is not
