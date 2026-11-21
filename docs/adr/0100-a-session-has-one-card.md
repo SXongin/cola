@@ -71,12 +71,15 @@ a repaint race — a static, never-patched card reproduces it — and the thresh
 is a rendered height: a folded panel contributes only its header. Every card
 that collects text keeps its input at the card's end or within a couple of
 elements of it. A question card opens **one question at a time** — the open one
-carries the card's only input and the rest are folded headers — and the list
-cards (`/switch`, `/dir`, `/sub`, the `/skill` picker) render their search form
-**after** the rows and the pager. The Session Card's one-shot read carries no
-input; the rule reaches it only through its folded 最近对话 tail, while a
-render-owned follow that seeds a live question keeps that question's box at the
-card's end (pitfall `card-inputs`).
+carries the card's only input and the rest are folded headers — and one
+predicate (`question::open_index`) resolves it for both the renderer and the
+typed-answer freeze, so the freeze never guards an input the card does not
+render. The list cards (`/switch`, `/dir`, `/sub`, the `/skill` picker) render
+their search form **after** the rows and the pager; `/switch` keeps only its
+＋新建会话 footer below. The Session Card's one-shot read carries no input; the
+rule reaches it only through its folded 最近对话 tail, while a render-owned
+follow that seeds a live question keeps that question's box at the card's end
+(pitfall `card-inputs`).
 
 **A question switch keeps the draft, and the block is one form.** The whole
 question block is one root-level `form` — Feishu rejects a `form` nested inside
@@ -86,13 +89,17 @@ carries every input's text (including one inside a panel) and no `value`, so
 routing rides the button `name`, and the handler files the text under the
 input's own name (`custom_<i>`) before repainting the new box with
 `default_value` — the one moment the client hands the text to the server
-(#917). Option, confirm, skip and reject buttons stay non-submit. A draft is
-dropped when its question is finalized and cleared when a submit consumes it; a
-question with no typed control opens without a box; and of two racing switches
-on one pre-switch card the first to land wins. A dropped switch does not repaint
-while a typed box is open — that would erase what the client alone holds. The
-render pass writes nothing while an unanswered typed answer renders (ADR-0038's
-2026-10-31 update, pitfall `card-repaints`).
+(#917). Option, confirm, skip and reject buttons stay non-submit. A switch is
+honoured only while it still carries the box of the question that is open (the
+name's last segment, repeated in the button's `value`); a client that sends only
+a `value` falls back to the payload's input name. A draft is dropped when its
+question is finalized and cleared when a submit consumes it; a question with no
+typed control opens without a box; and of two racing switches on one pre-switch
+card the first to land wins. A dropped switch does not repaint while a typed box
+is open — that would erase what the client alone holds — and it does repaint on
+the standalone and inline surfaces when none is, so a card whose ack Feishu
+discarded can catch up. The render pass writes nothing while an unanswered typed
+answer renders (ADR-0038's 2026-10-31 update, pitfall `card-repaints`).
 
 **Taking a session over no longer posts a card.** A first adoption confirms in
 one text line carrying the same status summary, and that line is the Topic
@@ -177,6 +184,17 @@ send error takes the existing failure path. Because the create holds the
 Session's card write lock, a half-open Feishu response blocks that Session's
 flush, sweep, install and next `/card` until it returns — accepted, because a
 timeout could orphan a create that did land and the retry would duplicate it.
+
+An armed follow ends on an **idle bound**, not a total budget: every poll that
+makes observable progress resets the deadline — a new text or reasoning part, a
+tool-panel revision, a live task's child activity, a ledger row's visible facts,
+a context-token update — while the per-second header timer and a rendered
+number's own cadence do not renew it. A run whose card shows nothing new for the
+whole window ends under that rule: partial content finalises Done, and a message
+that never produced is left untouched (#457). Every read in a poll is bounded,
+a failed or timed-out poll counts as no progress, and the ending paths are
+anchor-guarded, so a renderer whose bound fired after a successor replaced the
+accumulator never finalises the successor's card.
 
 One composition function turns the read into the body — the status line, the
 pending pointer and the tail. Both drivers call it: the idle card renders it, and

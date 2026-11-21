@@ -96,7 +96,10 @@ derivation — see the 2026-10-14 amendment below.
   `write_lock` → `cards` → task state, the task-state lock synchronous and never
   held across an await. A carrier write's **acceptance** records the volatile
   liveness; its **delivery** advances the durable facts. One `restore` at chain
-  install re-derives the durable tier, so no caller seeds it by hand.
+  install re-derives the durable tier, so no caller seeds it by hand. The
+  staging mechanics (staged cursors, the owed mirror, the capacity bounds) stay
+  in the flush, and the liveness overlay is still applied at the read seam, so
+  every reader sees the corrected read without calling anything.
 
 ## Decision
 

@@ -159,7 +159,10 @@ content: it renders in call order after the Todo Panel and before the
 Interaction Blocks, rides every split onto the new live card, and a finalized
 card never carries it. When the tool reaches any other status it joins the
 timeline at its key — clamped to the top of the live slice, or the read
-position's key for an untimed part — and stops rendering in the tail. The
+position's key for an untimed part — and stops rendering in the tail. A clean
+abort settles: OpenCode writes an aborted running tool as `status: "error"`, so
+it takes this path, while a hard crash leaves the part `running` with nothing to
+settle. The
 tail's size reserve covers it: a card that fits without its tail but not with
 it finalizes without the tail and the continuation carries it, and a split with
 nothing but a live tail may finalize an otherwise empty card, as ADR-0043's
