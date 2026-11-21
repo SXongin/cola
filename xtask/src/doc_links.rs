@@ -17,7 +17,7 @@
 //! the pins would falsify the record. It remains a valid link target when a live
 //! doc cites it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -292,7 +292,7 @@ fn read_adrs(root: &Path) -> Result<BTreeMap<String, String>, String> {
 /// skipped as a source; the root documents are always read.
 fn scan_sources(root: &Path) -> Result<Vec<SourceDoc>, String> {
     let mut paths = Vec::new();
-    collect_markdown(&root.join("docs"), &mut paths)?;
+    collect_markdown(&root.join("docs"), &mut paths, &mut BTreeSet::new())?;
     for relative in ROOT_DOCS {
         let path = root.join(relative);
         if !path.is_file() {
@@ -315,14 +315,27 @@ fn scan_sources(root: &Path) -> Result<Vec<SourceDoc>, String> {
         .collect()
 }
 
-fn collect_markdown(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_markdown(
+    dir: &Path,
+    paths: &mut Vec<PathBuf>,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    // Canonicalising before the visited check keeps a directory symlink (the
+    // repo has none under `docs/`, but a future one must not loop) from
+    // walking the same tree through ever-longer paths.
+    let canonical = dir
+        .canonicalize()
+        .map_err(|e| format!("error: cannot resolve doc-links directory {}: {e}", dir.display()))?;
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("error: cannot scan doc-links directory {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("error: cannot read an entry of {}: {e}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            collect_markdown(&path, paths)?;
+            collect_markdown(&path, paths, visited)?;
         } else if path.extension().is_some_and(|ext| ext == "md") {
             paths.push(path);
         }
@@ -706,6 +719,19 @@ mod tests {
             "{}",
             findings[0]
         );
+    }
+
+    /// A directory symlink back into the scanned tree must be visited once, not
+    /// followed through ever-longer paths. The property is termination: a
+    /// regression hangs this test rather than failing it.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_cycle_is_scanned_once() {
+        let tree = Tree::new("symlink-cycle");
+        std::os::unix::fs::symlink(tree.root.join("docs"), tree.root.join("docs/loop"))
+            .expect("create the directory symlink");
+        let report = tree.check();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
     #[test]
