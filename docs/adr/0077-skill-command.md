@@ -9,7 +9,7 @@
 >
 > **Amended 2026-10-11 (#664)**: the picker is now ONE paged, searchable card —
 > a keyword search over the skill's id/name/description plus a pager, the shape
-> ADR-0051/ADR-0052 gave `/switch`, `/dir` and `/sub`. It no longer splits a long
+> ADR-0052 gave `/switch`, `/dir` and `/sub`. It no longer splits a long
 > catalog across several card messages.
 
 Feishu gets its own way to load an OpenCode **skill**: the slash command
@@ -188,7 +188,7 @@ Related: #651, #652.
 The picker was a single list chunked across several card *messages* past the
 button/size budget (`（第 x / y 页）`), with no way to filter. It is now ONE card
 that windows the list into pages and carries a keyword search box — the shape
-ADR-0051 gave `/dir`'s search and ADR-0052 gave every list card's pager.
+ADR-0052 gave `/dir`'s search and every list card's pager.
 
 - **Pages of 20, byte-bounded.** A page holds up to `SKILL_PAGE_ROWS` (20) rows —
   skill rows are one short line, so more fit per page than the session cards'
@@ -196,7 +196,7 @@ ADR-0051 gave `/dir`'s search and ADR-0052 gave every list card's pager.
   A single oversized id (spec #652/#655) still takes its own page rather than
   building an over-limit card, and a stale page clamps to the last (ADR-0052).
 - **Search over id / name / description.** The box renders once the list
-  outgrows a page, or a keyword is active (ADR-0051's conditional visibility);
+  outgrows a page, or a keyword is active (ADR-0052's conditional visibility);
   the keyword matches the skill's id, name or description, case-insensitively,
   whitespace-token AND — the list cards' rule. The submit is named
   `skillsearch|<chat>|<thread>` and the typed keyword arrives as
@@ -223,7 +223,7 @@ structured V2 injection and V1 text fallback, the loaded-skill card, and the
 picker's unfiltered default (hidden and description-less skills are still
 listed).
 
-Related: #664, ADR-0051, ADR-0052.
+Related: #664, ADR-0052.
 
 ## Amendment (2026-10-11, #662): the `#<id>` grammar hardens, and its coverage is bounded
 

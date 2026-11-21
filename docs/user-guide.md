@@ -1082,7 +1082,7 @@ Notes:
   attach` for the already-active child changes nothing. This is cola's only
   sanctioned way to take over a child; no message is ever injected into a
   running one (ADR-0054).
-- The `/dir` card's rows are a **union** (ADR-0046): the shared store's session
+- The `/dir` card's rows are a **union** (ADR-0052): the shared store's session
   directories, the directories cola has mapped — they survive another client
   deleting their sessions — and the conversation's current directory, so 当前
   is always markable and a pending-only directory is never missing. "Recent"

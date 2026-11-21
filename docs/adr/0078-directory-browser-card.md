@@ -5,7 +5,7 @@
 > version's; ADR-0083 governs the listing now.
 
 The `/dir` Recent Directories card could only pick from the directories cola
-already knew — the ADR-0046 union of the shared store's session directories,
+already knew — the ADR-0052 union of the shared store's session directories,
 cola's mappings and the conversation's current directory. A directory the user
 had never worked in, or had just created, was unreachable from the card: the
 only way to it was to type `/dir <path>` as a text command. A new **Directory
@@ -72,7 +72,7 @@ same 切换到这里 / 建话题 node actions the Recent Directories rows carry.
 - **The form** carries a path `input` with 前往 (navigate) and 选择 (declare a
   Pending Session there) and, when the directory holds more children than a page
   or a filter is active, a filter `input` with 过滤. The submit routing rides the
-  button `name` (`browsego` / `browsepick` / `browsefilter`, the ADR-0051
+  button `name` (`browsego` / `browsepick` / `browsefilter`, the ADR-0052
   form-submit convention) with the typed value read from `form_value`; the
   browsed dir/hidden/page ride the button `value` and degrade on a name-only
   submit (the handler falls back to the current project).
