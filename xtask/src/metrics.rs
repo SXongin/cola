@@ -333,16 +333,7 @@ fn newest_merged(mut prs: Vec<PrRow>, limit: usize) -> Vec<PrRow> {
 }
 
 fn pr_comment_bodies(number: u64) -> Result<Vec<CommentBody>, String> {
-    // The REST endpoint paginates; `gh pr view --json comments` fetches one
-    // page, so a PR with more than 100 comments would lose its later rounds.
-    let endpoint = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments?per_page=100");
-    let args = [
-        "api".to_string(),
-        endpoint,
-        "--paginate".to_string(),
-        "--slurp".to_string(),
-    ];
-    let pages: Vec<Vec<RestComment>> = parse_json(&gh(&args)?, "the PR comments")?;
+    let pages: Vec<Vec<RestComment>> = parse_json(&gh(&comment_args(number))?, "the PR comments")?;
     Ok(pages
         .into_iter()
         .flatten()
@@ -351,6 +342,19 @@ fn pr_comment_bodies(number: u64) -> Result<Vec<CommentBody>, String> {
             author: comment.user,
         })
         .collect())
+}
+
+/// The comments fetch. The REST endpoint paginates; `gh pr view --json
+/// comments` fetches one page, so a PR with more than 100 comments would lose
+/// its later rounds.
+fn comment_args(number: u64) -> Vec<String> {
+    let endpoint = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments?per_page=100");
+    vec![
+        "api".to_string(),
+        endpoint,
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+    ]
 }
 
 /// A gate review round's verdict. Only the review workflow's comments count —
@@ -398,9 +402,9 @@ fn dossier_rounds(body: &str) -> Option<usize> {
                 continue;
             };
             // The count follows the phrase ("Gate rounds: 2") or immediately
-            // precedes it ("2 gate rounds"); a PR number elsewhere on the line
-            // is not a count.
-            if let Some(count) = first_number(&lower[at + phrase.len()..]) {
+            // precedes it ("2 gate rounds"). A number anywhere else on the
+            // line ("Gate rounds are documented in #1114") is not a count.
+            if let Some(count) = count_after(&lower[at + phrase.len()..]) {
                 return Some(count);
             }
             if let Some(count) = trailing_number(&lower[..at]) {
@@ -416,9 +420,18 @@ fn dossier_rounds(body: &str) -> Option<usize> {
     None
 }
 
-fn first_number(text: &str) -> Option<usize> {
-    let start = text.find(|c: char| c.is_ascii_digit())?;
-    let digits: String = text[start..].chars().take_while(char::is_ascii_digit).collect();
+/// The count that starts `text` after a separator (`": 2."`, `": **4**"`).
+fn count_after(text: &str) -> Option<usize> {
+    let rest = text
+        .trim_start()
+        .trim_start_matches([':', '=', '-'])
+        .trim_start()
+        .trim_start_matches('*')
+        .trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
     digits.parse().ok()
 }
 
@@ -1031,6 +1044,23 @@ mod tests {
         assert_eq!(
             dossier_rounds("<!-- gate-dossier -->\n#1114: 2 gate rounds"),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn a_number_later_on_the_line_is_not_the_round_count() {
+        assert_eq!(
+            dossier_rounds("<!-- gate-dossier -->\nGate rounds are documented in #1114"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_comment_fetch_is_paginated() {
+        let args = comment_args(7);
+        assert!(
+            args.contains(&"--paginate".to_string()) && args.contains(&"--slurp".to_string()),
+            "{args:?}"
         );
     }
 
