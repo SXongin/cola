@@ -53,7 +53,8 @@ many are running, and a stable `element_id` (`task_ledger`) keeps the reader's
 fold state across re-renders — whose body is one row per run. A run is a
 Background Task or a Turn-scoped child agent; the section gates on
 `reports_live_runs()` (ADR-0106), so an Agent Client with no live-run facts
-renders nothing rather than an empty list (the ADR-0059 degradation).
+renders nothing rather than an empty list (the ADR-0059 degradation), and a
+live-run set that is momentarily empty renders nothing at all — no empty panel.
 
 The row copy: the type word is the run's tool token — `shell` / `subagent`
 (ADR-0107: a token names a concept, never a vendor id), plain — then the label

@@ -176,11 +176,16 @@ in-place settle; a live one is not adopted.
   nothing replayed — and collects the recorded card as taken over; its create is
   the restart notification, and the completion Wake's `ResumeInPlace` decision
   (ADR-0066) then resumes that successor in place, so one card carries the chain
-  from the restart through the resumed run to its true end (issue #583). The
-  ended cases are unchanged: a terminal settle with an empty delta drops the
-  successor and settles in place; a terminal settle with a missed tail still
-  projects — content delivery, not future. A live adoption is always sent: the
-  run may produce next, and the follow is what keeps it live.
+  from the restart through the resumed run to its true end (issue #583). Each
+  restart during the same wait sends one successor — the same per-restart card
+  the live adoption already costs — and collects the previous one; no durable
+  "already projected" mark is added for it. A stranded task (#454, no completion
+  Wake) leaves the empty waiting successor as the newest card with the content
+  card collected, and the pinned ledger on the successor is where its cleanup
+  surfaces. The ended cases are unchanged: a terminal settle with an empty delta
+  drops the successor and settles in place; a terminal settle with a missed tail
+  still projects — content delivery, not future. A live adoption is always sent:
+  the run may produce next, and the follow is what keeps it live.
 - **The collect keeps what it cannot repair.** Both outcomes collect the recorded
   card as taken over — dropping the Background Task Ledger and, per call, each
   running `⏳` marker the successor actually resolved (ADR-0068's rule,
