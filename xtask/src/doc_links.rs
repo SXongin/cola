@@ -10,9 +10,12 @@
 //! expected and is not a finding (ADR-0110); matching the statement at the line
 //! would turn every reformat into a doc edit.
 //!
-//! `docs/research/` is dated evidence about the tree at the commit it records,
-//! so it is not a scan *source*: rewriting its pins would falsify the record.
-//! It remains a valid link target when a live doc cites it.
+//! `docs/research/` is dated evidence about the tree at the commit it records.
+//! Its `ADR-NNNN` and doc-path citations are still checked — those name things
+//! that outlive the commit — but its `src/…:line` pins are not: the files they
+//! name have since moved or been deleted by ordinary refactoring, and rewriting
+//! the pins would falsify the record. It remains a valid link target when a live
+//! doc cites it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,8 +29,9 @@ pub(crate) const ROOT_DOCS: &[&str] = &[
     "CODING_STANDARDS.md",
 ];
 
-/// Dated research records are excluded as scan sources (see the module doc).
-pub(crate) const EXCLUDED_PREFIX: &str = "docs/research/";
+/// Dated research records keep their source pins as written (see the module
+/// doc); their ADR and doc-path citations are still checked.
+pub(crate) const HISTORICAL_PINS_PREFIX: &str = "docs/research/";
 
 /// An ADR carrying this many amendment banners is a mandatory read at review
 /// (ADR-0110 §3); the count is a warning, never a failure.
@@ -45,6 +49,9 @@ pub(crate) enum Target {
     DocPath(String),
     /// An `src/…:start-end` pin (`end` equals `start` for a single line).
     SourcePin { path: String, start: usize, end: usize },
+    /// A pin whose line number does not fit the platform's `usize`; carried as
+    /// written so the finding quotes the citation.
+    InvalidPin { text: String },
 }
 
 impl Target {
@@ -54,7 +61,12 @@ impl Target {
             Self::DocPath(path) => path.clone(),
             Self::SourcePin { path, start, end } if end == start => format!("{path}:{start}"),
             Self::SourcePin { path, start, end } => format!("{path}:{start}-{end}"),
+            Self::InvalidPin { text } => text.clone(),
         }
+    }
+
+    fn is_source_pin(&self) -> bool {
+        matches!(self, Self::SourcePin { .. } | Self::InvalidPin { .. })
     }
 }
 
@@ -176,16 +188,31 @@ fn source_pin_targets(line: &str, out: &mut Vec<Target>) {
         }
         let after = &rest[end + 1..];
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            // `src/x.rs:` with no number is not a pin.
+            continue;
+        }
         let Ok(start_line) = digits.parse::<usize>() else {
+            out.push(Target::InvalidPin {
+                text: format!("{path}:{digits}"),
+            });
             continue;
         };
         let mut end_line = start_line;
         let tail = &after[digits.len()..];
         if let Some(rest) = tail.strip_prefix('-') {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let end_digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
             // `src/x.rs:12-` is not a range; the single-line pin still is.
-            if let Ok(range_end) = digits.parse::<usize>() {
-                end_line = range_end;
+            if !end_digits.is_empty() {
+                match end_digits.parse::<usize>() {
+                    Ok(range_end) => end_line = range_end,
+                    Err(_) => {
+                        out.push(Target::InvalidPin {
+                            text: format!("{path}:{digits}-{end_digits}"),
+                        });
+                        continue;
+                    }
+                }
             }
         }
         out.push(Target::SourcePin {
@@ -265,7 +292,7 @@ fn read_adrs(root: &Path) -> Result<BTreeMap<String, String>, String> {
 /// skipped as a source; the root documents are always read.
 fn scan_sources(root: &Path) -> Result<Vec<SourceDoc>, String> {
     let mut paths = Vec::new();
-    collect_markdown(&root.join("docs"), root, &mut paths)?;
+    collect_markdown(&root.join("docs"), &mut paths)?;
     for relative in ROOT_DOCS {
         let path = root.join(relative);
         if !path.is_file() {
@@ -288,18 +315,14 @@ fn scan_sources(root: &Path) -> Result<Vec<SourceDoc>, String> {
         .collect()
 }
 
-fn collect_markdown(dir: &Path, root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_markdown(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("error: cannot scan doc-links directory {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("error: cannot read an entry of {}: {e}", dir.display()))?;
         let path = entry.path();
-        let relative = relative_path(root, &path);
-        if relative == EXCLUDED_PREFIX.trim_end_matches('/') || relative.starts_with(EXCLUDED_PREFIX) {
-            continue;
-        }
         if path.is_dir() {
-            collect_markdown(&path, root, paths)?;
+            collect_markdown(&path, paths)?;
         } else if path.extension().is_some_and(|ext| ext == "md") {
             paths.push(path);
         }
@@ -325,6 +348,7 @@ fn dangling(
     let mut line_counts: BTreeMap<String, Option<usize>> = BTreeMap::new();
     for (line, target) in targets {
         let reason = match target {
+            Target::InvalidPin { .. } => Some("invalid line number".to_string()),
             Target::Adr(number) if !adrs.contains_key(number) => Some("no such ADR".to_string()),
             Target::Adr(_) => None,
             Target::DocPath(doc) if !root.join(doc).is_file() => Some("no such file".to_string()),
@@ -382,7 +406,11 @@ pub(crate) fn check_tree(root: &Path) -> Result<Report, String> {
         ..Report::default()
     };
     for source in &sources {
-        let targets = targets(&source.content);
+        let historical = source.path.starts_with(HISTORICAL_PINS_PREFIX);
+        let targets: Vec<(usize, Target)> = targets(&source.content)
+            .into_iter()
+            .filter(|(_, target)| !(historical && target.is_source_pin()))
+            .collect();
         report.checked += targets.len();
         report
             .findings
@@ -647,6 +675,34 @@ mod tests {
     }
 
     #[test]
+    fn a_line_number_too_large_to_parse_fails() {
+        let tree = Tree::new("pin-start-overflow");
+        tree.file("src/small.rs", "one\n");
+        tree.file("docs/note.md", "`src/small.rs:99999999999999999999999999`\n");
+        let findings = tree.check().findings;
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].to_string().contains("invalid line number"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
+    fn a_range_end_too_large_to_parse_fails() {
+        let tree = Tree::new("pin-end-overflow");
+        tree.file("src/small.rs", "one\n");
+        tree.file("docs/note.md", "`src/small.rs:1-99999999999999999999999999`\n");
+        let findings = tree.check().findings;
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].to_string().contains("invalid line number"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
     fn a_non_ascii_adr_filename_is_ignored_without_panicking() {
         let tree = Tree::new("non-ascii-adr");
         tree.file("docs/adr/é-notes.md", "# notes\n");
@@ -680,17 +736,57 @@ mod tests {
         assert!(warnings[0].contains("3 amendment banners"), "{warnings:?}");
     }
 
-    /// The research snapshot is dated evidence, so a dangling pin inside it is
-    /// not a source finding — while the same citation in a live doc is.
+    /// A research snapshot's ADR and doc-path citations name things that
+    /// outlive the commit, so they are checked like a live doc's.
     #[test]
-    fn research_is_not_scanned_as_a_source_but_live_docs_are() {
-        let tree = Tree::new("research-skip");
-        tree.file("docs/research/snapshot.md", "See ADR-9999.\n");
-        assert!(!tree.check().findings.iter().any(|f| f.path.contains("research")));
-        tree.file("docs/note.md", "See ADR-9999.\n");
+    fn research_adr_and_path_citations_are_checked() {
+        let tree = Tree::new("research-citations");
+        tree.file(
+            "docs/research/snapshot.md",
+            "See ADR-9999 and `docs/research/gone.md`.\n",
+        );
         let findings = tree.check().findings;
-        assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(findings[0].path == "docs/note.md");
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.path == "docs/research/snapshot.md")
+        );
+    }
+
+    /// Its source pins are dated evidence about a past tree: skipped there,
+    /// checked in a live doc.
+    #[test]
+    fn research_source_pins_are_not_checked_but_live_pins_are() {
+        let tree = Tree::new("research-pins");
+        tree.file("docs/research/snapshot.md", "`src/bridge/gone.rs:12`\n");
+        assert!(tree.check().findings.is_empty());
+        tree.file("docs/note.md", "`src/bridge/gone.rs:12`\n");
+        assert_eq!(tree.check().findings.len(), 1);
+    }
+
+    #[test]
+    fn the_command_is_registered_and_listed_in_help() {
+        let main = std::fs::read_to_string(crate::repo_root().join("xtask/src/main.rs"))
+            .expect("the xtask entry point must be readable");
+        assert!(
+            main.contains("\"check-doc-links\" => doc_links::run()"),
+            "the dispatch arm must exist"
+        );
+        assert!(
+            main.matches("check-doc-links").count() >= 3,
+            "both help strings and the dispatch arm must name the task"
+        );
+    }
+
+    #[test]
+    fn the_command_is_wired_into_ci_and_the_verification_loop() {
+        let root = crate::repo_root();
+        for path in [".github/workflows/ci.yml", "CONTRIBUTING.md"] {
+            let text = std::fs::read_to_string(root.join(path))
+                .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
+            assert!(text.contains("cargo xtask check-doc-links"), "{path}");
+        }
     }
 
     /// The acceptance criterion's "passes on the tree", with a plausibility
