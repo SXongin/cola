@@ -13,9 +13,9 @@
 //! `.github/workflows/codex-review.yml`'s `codex_verdict_of_line`), and a
 //! `FAIL` is a blocking round. The PR's `<!-- gate-dossier -->` comment is the
 //! human record that count should agree with: an explicit gate round count is
-//! read and any disagreement with the verdict comments is surfaced, no other
-//! prose is parsed, and a dossier that quotes a verdict is not counted as a
-//! round. CI
+//! read, any disagreement with the verdict comments is surfaced, and a count
+//! whose PR has no verdict comment is named. No other prose is parsed, and a
+//! dossier that quotes a verdict is not counted as a round. CI
 //! times are the Actions API's per-job `started_at`/`completed_at`; commit
 //! types come from `git log`; module sizes are the ratchet's own
 //! production-line count, so this report and `check-structure` measure the same
@@ -101,6 +101,9 @@ struct GateReport {
     oversized: usize,
     ungated: usize,
     skipped: usize,
+    /// PRs with no verdict comment whose dossier states a round count, so the
+    /// missing gate comment is named rather than silently dropped.
+    dossier_only: Vec<(u64, usize)>,
     /// The merge dates of the sampled window, as `YYYY-MM-DD`.
     window: Option<(String, String)>,
 }
@@ -251,6 +254,15 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
         ));
     }
     let merged = newest_merged(fetched, limit);
+    collect_gate_report(merged, pr_comment_bodies)
+}
+
+/// Classify the window's PRs against their comments. The fetch is a parameter
+/// so the classification — including the early exits — is testable.
+fn collect_gate_report(
+    merged: Vec<PrRow>,
+    comments: impl Fn(u64) -> Result<Vec<CommentBody>, String>,
+) -> Result<GateReport, String> {
     let window = merged
         .first()
         .zip(merged.last())
@@ -261,6 +273,7 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
         oversized: 0,
         ungated: 0,
         skipped: 0,
+        dossier_only: Vec::new(),
         window,
     };
     for pr in merged {
@@ -274,7 +287,7 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
             report.oversized += 1;
             continue;
         }
-        let bodies = pr_comment_bodies(pr.number)?;
+        let bodies = comments(pr.number)?;
         let dossier = bodies
             .iter()
             .find(|comment| comment.body.trim_start().starts_with(DOSSIER_MARKER))
@@ -292,6 +305,9 @@ fn gate_report(limit: usize) -> Result<GateReport, String> {
         }
         if rounds == 0 {
             report.ungated += 1;
+            if let Some(count) = dossier {
+                report.dossier_only.push((pr.number, count));
+            }
             continue;
         }
         report.samples.push(GateSample {
@@ -365,9 +381,23 @@ fn dossier_rounds(body: &str) -> Option<usize> {
         if lower.contains("local pair") || lower.contains("rehearsal") || lower.contains("pre-pr") {
             continue;
         }
-        let total_named =
-            lower.contains("gate rounds") || lower.contains("rounds spent") || lower.contains("verdicts");
-        if total_named && let Some(count) = first_number(line) {
+        for phrase in ["gate rounds", "rounds spent"] {
+            let Some(at) = lower.find(phrase) else {
+                continue;
+            };
+            // The count follows the phrase ("Gate rounds: 2") or immediately
+            // precedes it ("2 gate rounds"); a PR number elsewhere on the line
+            // is not a count.
+            if let Some(count) = first_number(&lower[at + phrase.len()..]) {
+                return Some(count);
+            }
+            if let Some(count) = trailing_number(&lower[..at]) {
+                return Some(count);
+            }
+        }
+        if let Some(at) = lower.find("verdicts")
+            && let Some(count) = last_number(&lower[..at])
+        {
             return Some(count);
         }
     }
@@ -378,6 +408,33 @@ fn first_number(text: &str) -> Option<usize> {
     let start = text.find(|c: char| c.is_ascii_digit())?;
     let digits: String = text[start..].chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// The number that ends `text`, if one does (`"#1114: 2 "` → `2`).
+fn trailing_number(text: &str) -> Option<usize> {
+    let trimmed = text.trim_end();
+    let start = trimmed
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+    trimmed[start..].parse().ok()
+}
+
+/// The last number anywhere in `text` (`"(6 "` → `6`).
+fn last_number(text: &str) -> Option<usize> {
+    let mut last = None;
+    let mut current = String::new();
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            current.push(character);
+        } else if !current.is_empty() {
+            last = current.parse().ok().or(last);
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        last = current.parse().ok().or(last);
+    }
+    last
 }
 
 /// The verdict a gate review comment posts, if it posts one.
@@ -468,6 +525,17 @@ fn print_gates(report: &GateReport, requested: usize) {
         "  excluded: {} over the cap, {} without a gate verdict, {} release/dependabot",
         report.oversized, report.ungated, report.skipped
     );
+    if !report.dossier_only.is_empty() {
+        let named: Vec<String> = report
+            .dossier_only
+            .iter()
+            .map(|(number, count)| format!("#{number} (dossier {count})"))
+            .collect();
+        println!(
+            "  dossier states a gate round count but no verdict comment was found: {}",
+            named.join(", ")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +966,50 @@ mod tests {
             ),
         ] {
             assert_eq!(dossier_rounds(body), want, "body: {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_pr_number_on_the_line_is_not_the_round_count() {
+        assert_eq!(
+            dossier_rounds("<!-- gate-dossier -->\n#1114: 2 gate rounds"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_dossier_count_without_verdict_comments_is_named() {
+        let prs = vec![pr(7, "2026-11-20T00:00:00Z")];
+        let report = collect_gate_report(prs, |_| {
+            Ok(vec![comment("SXongin", "<!-- gate-dossier -->\nGate rounds: 2.")])
+        })
+        .expect("the report is assembled");
+        assert!(report.samples.is_empty());
+        assert_eq!(report.ungated, 1);
+        assert_eq!(report.dossier_only, vec![(7, 2)]);
+    }
+
+    #[test]
+    fn a_gate_verdict_comment_becomes_a_sample() {
+        let prs = vec![pr(8, "2026-11-20T00:00:00Z")];
+        let report = collect_gate_report(prs, |_| {
+            Ok(vec![comment(
+                "github-actions",
+                "## Codex review\n\nCODEX_REVIEW_VERDICT: FAIL",
+            )])
+        })
+        .expect("the report is assembled");
+        assert_eq!(report.samples.len(), 1);
+        assert_eq!(report.samples[0].blocking_rounds, 1);
+        assert_eq!(report.samples[0].dossier, None);
+    }
+
+    fn comment(author: &str, body: &str) -> CommentBody {
+        CommentBody {
+            body: body.to_string(),
+            author: Author {
+                login: author.to_string(),
+            },
         }
     }
 
