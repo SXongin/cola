@@ -1,5 +1,10 @@
 # Growth is budgeted, tests are behaviours: the refactoring charter
 
+> **Amended (2026-11-21)**: the gate's round policy is autonomous rounds plus
+> stop predicates, recorded in ADR-0034's 2026-11-21 amendment. §4 and
+> "Unchanged, with evidence" point at `CONTRIBUTING.md` "Reviewing" instead of
+> restating the three-round budget.
+
 The four contracts a refactor here is settled by — code (#1109), tests (#1111),
 docs (#1112), flow (#1110) — and the segment that applies them first (#1115),
 one decision, on evidence cited from #1105–#1108.
