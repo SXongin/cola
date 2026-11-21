@@ -58,7 +58,7 @@ in the Turn layer, answers the ownership question for every site.**
   both occur, and the reap's race needs "no card but claimed" to be
   expressible. `yielded` carries the card's write-readiness — still the live
   card (`live`) and owing no split (`handoff_owed`) — which is exactly the
-  admission ADR-0060/ADR-0066 grant.
+  admission ADR-0060/ADR-0109 grant.
 - **The identities travel with the verdict.** The card's message id, the
   accumulator's Turn anchor and the card's chain identity are read once, in
   the same card-map pass, so the rules that compare identities (the reap's
