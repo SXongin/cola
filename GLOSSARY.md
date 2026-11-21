@@ -682,7 +682,7 @@ _Avoid_: Notification, message, signal
 - One **Runtime Reconciliation** step corroborates every **Session**'s live **Background Tasks**, shared by Session Sync, the Turn's drain and the follow/settle loop, and the user's **Cleanup** ends the residue no positive evidence can conclude (ADR-0065, ADR-0073)
 - An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending and clears when the wait resolves; a **Completion Notice** announces a long p2p **Turn**'s end (ADR-0059, ADR-0109)
 - A **Turn** renders one **Tool Panel** per tool call; an unfinished panel rides the newest card of its **Card Chain** as a tail section and joins the card body's **Timeline** when the tool settles; only **Built-in Tool**s (and tools cola itself injects) may get tailored rendering
-- A **File Content** is a file payload a transcript part carries; within Feishu's caps it becomes an embedded image after its **Tool Panel** or a **File Message**; a user message's File Content is recorded but never re-delivered
+- A **File Content** is a file payload a transcript part carries; within Feishu's caps an image is embedded in the card immediately after its **Tool Panel**, while anything else becomes a **File Message** and is marked `未发送` when it cannot be sent; a user message's File Content is recorded but never re-delivered
 - A **Directory Browser** lists children and a file row opens a **File Viewer** on the **Path Scope** (ADR-0083)
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Card** is the one card a **Session** renders into; `/card` pulls a render-owned one to the newest position, and posts an idle one from a **Session Snapshot** read when nothing owns it (ADR-0100)
@@ -703,7 +703,7 @@ _Avoid_: Notification, message, signal
 > **Domain expert:** "None. `/new` records a Pending Session; the Session itself appears when the conversation's first prompt arrives."
 >
 > **Dev:** "What happens when a Permission request arrives mid-run?"
-> **Domain expert:** "The Bridge's next poll sees it and renders a Permission card with action buttons. The click is answered at once, and once the Backend has recorded the reply the click's own ack repaints the resolved state on the card; cola polls for everything else, so there is no stream to pause or resume."
+> **Domain expert:** "The Bridge's next poll sees it and renders a Permission card with action buttons. The click is answered immediately; the card then shows the resolved state — from the click's own reply when it lands inside the ack budget, otherwise on the next poll. cola polls, so there is no stream to pause or resume."
 >
 > **Dev:** "Does the Bridge forward `/compact` to the Backend?"
 > **Domain expert:** "No — the Bridge recognizes `/compact` as a Command and calls the Backend's REST endpoint directly. Only unrecognized slash commands are forwarded as prompt text."
