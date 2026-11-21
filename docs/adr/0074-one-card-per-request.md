@@ -49,10 +49,12 @@ gone) and no budget-derived per-read timeout.
   `turn_follow_grace_ms` (10 min default) is the single grace, bounding only the
   failure modes where nobody can act — lost contact (no full read pair
   answered), an unreconcilable live panel on an idle Session (a crash orphan),
-  and the delay before an unreceived submit shows its neutral waiting line. A
-  readable, merely-long run is never clocked: a clock turns a correct long wait
-  (a permission, a healthy subagent chain, a provider retry) into a wrong error,
-  which ADR-0043 had already shown.
+  and the delay before an unreceived submit shows its neutral waiting line. The
+  grace is sliding: any fully-answered tick resets it, so a flap costs nothing.
+  At expiry the card finalizes Error — never Done over a running panel, never an
+  eternal spinner — and a readable, merely-long run is never clocked: a clock
+  turns a correct long wait (a permission, a healthy subagent chain, a provider
+  retry) into a wrong error, which ADR-0043 had already shown.
 - **The inflight guard is held for the whole path.** With no ownership hand-off
   there is no gap by construction, so the server-yield's busy read never sees a
   mid-request Session as idle. The pre-stamp ownership recheck stays: a new Turn

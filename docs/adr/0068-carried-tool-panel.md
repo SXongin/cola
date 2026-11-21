@@ -16,8 +16,7 @@ when the tool settles. A cola restart kills the accumulator, so the tail has no
 carrier: the card that was live stays frozen (ADR-0063's reap settles its
 *state*; the #443 stamp names the restart while the Session still reads live),
 and a user message arriving afterwards starts a new Turn (ADR-0062) whose card
-collects the old one — but the in-flight tool panel moves to neither card
-(#434's acceptance round, PR #442; issue #444).
+collects the old one — but the in-flight tool panel moves to neither card (#434, #444).
 
 A running call inside the membership rule's in-flight window (ten minutes)
 already renders onto the successor through the normal transcript render.

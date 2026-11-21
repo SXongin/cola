@@ -210,7 +210,7 @@ onto the V1-shaped one.**
   watermark stays user-message-scoped — a Wake never moves it.
 - ADR-0043's supplement split and receipt machinery is reused for Wake
   continuations, anchored on the user message when no Supplement exists; its
-  guard-release rule is superseded (ADR-0043, ADR-0074).
+  guard-release rule is superseded (ADR-0043's current rule, ADR-0074).
 - ADR-0058's retry matrix is unchanged in mechanism: its settled/unfinished
   read stays the transcript projection of whether the submission was answered
   (`turn_for_user(..).complete`), and this ADR does not alter that projection.
