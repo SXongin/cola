@@ -1,12 +1,12 @@
 # Supplement-triggered Card Chain splits and Instant Reminder pinning
 
-> **Amended by ADR-0059, ADR-0074 and ADR-0109**: the inflight guard covers the
-> Turn's whole post-prompt path — a message arriving during the now-merged
-> follow is a Supplement, and the Turn's own task owns the unbounded path — and
-> a failed Supplement splits only while a held guard still owns the chain. The
-> earlier hand-off that passed the card to an out-of-turn follow at a bound is
-> gone (ADR-0074): the no-total-budget conclusion stands, and the Turn owns the
-> whole path.
+> **Amended by ADR-0059, ADR-0074 and ADR-0109 (2026-11-18)**: the inflight
+> guard covers the Turn's whole post-prompt path — a message arriving during the
+> now-merged follow is a Supplement, and the Turn's own task owns the unbounded
+> path — and a failed Supplement splits only while a held guard still owns the
+> chain. The earlier hand-off that passed the card to an out-of-turn follow at
+> a bound is gone (ADR-0074): the no-total-budget conclusion stands, and the
+> Turn owns the whole path.
 >
 > **Amended by ADR-0100 (2026-11-06)**: `/card` always answers — with no renderer
 > owning the card it reads the session once and posts a read-only Session Card —
@@ -64,7 +64,8 @@ keep the conversation and the waiting card in view.
   is the exception (ADR-0109): a merge attempt that fails
   is unconfirmed, so if a held guard still owns the chain it splits and the
   continuation carries 「⚠️ 补充消息未确认送达，请留意当前回复」
-  (`SplitKind::SupplementFailed`); a race that lost the guard keeps the chain and
+  (`SplitKind::SupplementFailed`) **instead of** the receipt, and no separate
+  notice repeats it; a race that lost the guard keeps the chain and
   reports a plain notice — a continuation would be a live card handed to nobody.
   The split's admission re-checks the card's state under the same lock an ending
   is applied with, so a Turn that settles between the ownership read and the
@@ -187,10 +188,11 @@ terminal, neither 完成 nor 出错.
   orphaned by a crash stays until the user removes it — its message id is
   unknowable after a restart.
 - **Naming**: `bridge/pin.rs` only ever implemented `time_sensitive`, so it is
-  renamed `bridge/reminder.rs` (`ReminderState`/`ReminderReason`/`ReminderTarget`),
-  and the message registry is `bridge/message_pins.rs` (`MessagePins`) —
-  "reminder" means the conversation-level state, "message pin" the platform's
-  pinned-message list.
+  renamed `bridge/reminder.rs` (`ReminderState`/`ReminderTarget`), and the
+  message registry is `bridge/message_pins.rs` (`MessagePins`) — "reminder"
+  means the conversation-level state, "message pin" the platform's
+  pinned-message list. The `ReminderReason` set died with the long-turn class,
+  so a pin carries no reason.
 
 ### `/card` pulls the live card, or reads the session
 

@@ -106,9 +106,10 @@ has no age to tick.
 **The freeze's one carve-out, widened.** ADR-0059's "the card stops updating" is
 narrowed to allow the host card to be re-rendered in place for the ledger:
 membership and elapsed stay fresh while the card is otherwise yielded. The
-carve-out covers the handover removal, the quiet true end and the in-place Wake
-resume (ADR-0066: a yielded card also receives its resumed content), and nothing
-else. It serves **any active Session's yielded card chain cola holds** — an
+carve-out covers the periodic ledger refresh itself, the handover removal, the
+quiet true end and the in-place Wake resume (ADR-0066: a yielded card also
+receives its resumed content), and nothing else. It serves **any active
+Session's yielded card chain cola holds** — an
 External Message follow's waiting card included (#568) — because Session Sync
 runs its Wake and ledger steps for that chain too; the write admission is
 unchanged (only a yielded card admits the ledger write), so widening the caller
@@ -180,4 +181,4 @@ alone.
   superseded.
 
 Origins: #403, #405, #412, #415, #416, #419, #423, #501, #502, #503, #504, #568,
-#917; ADR-0054, ADR-0059, ADR-0066, ADR-0071.
+#917; ADR-0054, ADR-0059, ADR-0066, ADR-0071, ADR-0106, ADR-0107.

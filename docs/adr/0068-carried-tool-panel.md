@@ -2,8 +2,9 @@
 
 > **Amended 2026-10-05 (#527), by ADR-0071 and ADR-0072**: the carry's bounded
 > newest-first read and its page cap retired into the **Rendered Cursor**'s
-> seed, and the scan's stop rule is the membership rule itself — exactly, under
-> both arms. The predecessor keep rule the takeover collect once recorded on the
+> seed, and the cursorless fallback now resolves the orphaned Turn's still-live
+> calls from the render's own transcript read, scoped by the membership rule
+> itself. The predecessor keep rule the takeover collect once recorded on the
 > successor's record retired with the keyed ordering; the collect's strip rule
 > is its own payload composition. The panel semantics — display-only, settles
 > exactly once, the collect's strip — stand.
@@ -16,7 +17,8 @@ when the tool settles. A cola restart kills the accumulator, so the tail has no
 carrier: the card that was live stays frozen (ADR-0063's reap settles its
 *state*; the #443 stamp names the restart while the Session still reads live),
 and a user message arriving afterwards starts a new Turn (ADR-0062) whose card
-collects the old one — but the in-flight tool panel moves to neither card (#434, #444).
+collects the old one — but the in-flight tool panel moves to neither card
+(#434, #444).
 
 A running call inside the membership rule's in-flight window (ten minutes)
 already renders onto the successor through the normal transcript render.
@@ -43,35 +45,32 @@ record with no cursor keeps the carry's fallback semantics: the orphaned Turn's
 still-live calls, nothing replayed.
 
 **The seed is scoped to the orphan Turn's projection.** Membership is the
-`belongs_to_turn` rule anchored on the record's anchor
-(`TurnAnchor::may_still_belong`, the single rule the scan below reads):
+`belongs_to_turn` rule anchored on the record's anchor (its `time.is_some()`
+guard plus `TurnAnchor::may_still_belong`):
 
 - a message created at/after the anchor's `created_ms` always may belong;
 - a **completed** message may belong iff its completion is at/after the anchor;
 - an **unfinished** message may belong while its newest activity is at/after the
   anchor's in-flight boundary;
-- a message with **no server time** cannot be placed, so it never belongs — and a
-  scan keeps going past it rather than stopping on an unknown.
+- a message with **no server time** cannot be placed, so it never belongs to the
+  projection — but it is no evidence about older messages either, so the
+  membership rule answers "may still belong" for it.
 
 A record with no anchor carries nothing. This is what keeps an older card's
 stale running part from being resurrected as live on an unrelated successor: a
 killed run leaves its `running` part behind (#378 verified), so a carry scoped
 to "every running call in the transcript" would misreport it.
 
-**The cursorless fallback's read is bounded and newest-first, and happens before
-the prompt is submitted.** It pages messages descending (`desc` order, following
-`cursor.next` for older pages) and stops only at the first page whose OLDEST
-message cannot belong to the orphan Turn under either arm above; the crossing
-page is kept whole, and the older messages are filtered by the membership rule,
-not by the scan. A page with no unfinished message does **not** end the scan:
-another client can queue messages above the orphan's unfinished call, so the
-window boundary — not the page's shape — is the stop. A small hard page cap and
-the existing read timeout bound the worst case; the common case is one request.
-A read stopped by the cap before reaching the boundary reports `complete: false`
-and carries nothing rather than guessing. V1's session read has no wire
-pagination (one request decoding the whole message array) but is the read class
-V1's render polls already perform every tick; the wire-level page bound is a V2
-commitment, and on both generations a timed-out read carries nothing.
+**The cursorless fallback resolves the orphaned Turn's still-live calls from
+the same transcript read the render polls.** The carry's own newest-first
+keyhole read, its descending scan and its page cap retired into ADR-0071's seed,
+so no second read happens: `CursorSeed::live_calls_only` reads the standard
+transcript and scopes `turn_running_tools` by the membership rule above,
+excluding the plan carrier (the successor's own reads rebuild the plan from its
+neutral fact). A read truncated at the V2 page cap still carries the live calls
+it sees — nothing about a cursor is resolved — while a failed or timed-out read
+carries nothing, and the common case is one standard read rather than a history
+walk of its own.
 
 **The carried calls reconcile against the transcript, not the Turn window.**
 Every render read resolves each carried call identity against the transcript and
@@ -90,11 +89,10 @@ to an in-process supersede. The **running tool panels** (`collapsible_panel`s
 whose plain-text title begins `⏳`) go only for the calls the seed actually
 resolved — carried still-running, or settled while cola was down and joined once
 — so no frozen marker remains on a collected card, while a call the read did not
-carry keeps its panel as a frozen witness. A failed, timed-out, cap-stopped or
-truncated read resolves nothing and strips no tool panel, leaving today's
-collected body for them. This is ADR-0063's body-preservation rule narrowed for
-this one collect, and a failed old-card PATCH is the same best-effort degrade as
-every collect.
+carry keeps its panel as a frozen witness. A failed or timed-out read resolves
+nothing and strips no tool panel, leaving today's collected body for them. This
+is ADR-0063's body-preservation rule narrowed for this one collect, and a failed
+old-card PATCH is the same best-effort degrade as every collect.
 
 **Only the fresh-Turn takeover carries.** A Wake continuation keeps ADR-0061's
 no-replay scope at the newest Wake, and the reap's endings keep preserving the
@@ -116,10 +114,10 @@ the content, and the durable fact is the Rendered Cursor on the Chain Record
 - A generation whose transcript read cannot surface running calls carries
   whatever it reports — possibly nothing — and keeps today's behavior; no
   generation-specific branch is added.
-- Boundaries: an older card's stale running part is never carried; a queued
-  message above the unfinished call does not hide it; a failed carry read
-  degrades to today, the ledger still dropped; the already-working in-window
+- Boundaries: an older card's stale running part is never carried; a call
+  outside a truncated read keeps its panel as a frozen witness; a failed carry
+  read degrades to today, the ledger still dropped; the already-working in-window
   case stays a regression test, and the settled-while-down probe is #505's.
 
-Origins: #428, #434, #443, #444, #505, #527; ADR-0045, ADR-0061, ADR-0062,
-ADR-0063, ADR-0071, ADR-0072.
+Origins: #428, #434, #443, #444, #505, #527; ADR-0045, ADR-0060, ADR-0061,
+ADR-0062, ADR-0063, ADR-0071, ADR-0072.
