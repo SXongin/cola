@@ -100,7 +100,10 @@ window reports 「补充消息已提交，但当前卡片无法继续」, never 
 that frees the guard settles the card first, so no guard loss leaves a
 live-looking card behind. Both messages say **unconfirmed**, never undelivered:
 an ambiguous Codex response may still have landed and keeps its marker for
-reconciliation (ADR-0092), so cola must not invite a resend.
+reconciliation (ADR-0092), so cola must not invite a resend. The split's admission reports a permanently
+refused flush as a failure — the same plain notice follows — while the loading
+window's queued split (no card id yet) and a write owed to the delivery layer
+stay admitted.
 
 ### An unanswered submit ends Unreceived, never Done
 
@@ -200,7 +203,9 @@ card.
   marks the Wake handed over. The taker is the completion class only; a restart
   or interrupt Wake keeps its 承接 split. The terminal exception narrows the same
   way: a completion Wake on a terminal card is a fresh continuation only while
-  the card does not already show that Wake's work. The durable Wake Watermark
+  the card does not already show that Wake's work, and the Wake step re-asks the
+same content diff as a floor, so a card rendered by a venue that placed no part
+still answers honestly. The durable Wake Watermark
   cannot answer this — an evidence ending suppresses the Wake's own completion
   entry (#659) and with it the Watermark, while the work still renders — so the
   handoff mark is the fact.
@@ -236,7 +241,7 @@ card.
 - The instant between the router's final ownership read and `Turn::start` is not
   atomic; a renderer retiring or acquiring its lease in that instant is not
   re-routed. Closing it needs a route/admission handshake, deferred to #1086.
-- CONTEXT.md's Supplement, Unreceived Message, Wake, Card, Card Chain, Waiting on
+- GLOSSARY.md's Supplement, Unreceived Message, Wake, Card, Card Chain, Waiting on
   Background Work and Background Task Ledger entries record the guard key, the
   Unreceived ending and the in-place resumption.
 

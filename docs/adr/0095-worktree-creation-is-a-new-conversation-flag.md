@@ -1,5 +1,9 @@
 # Worktree creation is a flag on the new-conversation flow
 
+> **Supersedes** ADR-0088 (the `/worktree new` shape). The rules ADR-0088 still
+> contributed — cola runs git, the root setting, the collision and warning
+> rules, create-never-remove — are restated below.
+
 cola **follows** a Session that has already moved into a linked worktree (issue
 #433: the mapping follows the server's location and the **Turn Footer** marks
 the checkout, `📁 zh-user-guide 🌲 · docs/zh-user-guide`). Starting work in one
@@ -189,5 +193,5 @@ restated here; ADR-0088 is a pointer.
   Chinese titles, auto-editing `.gitignore`, and removal in the same change.
 
 Origins: #449 (the command), #890 (this shape), #433 (the follow), #428 (the move
-that must not happen). ADR-0088 is a pointer here; CONTEXT.md's Worktree entry
+that must not happen). ADR-0088 is a pointer here; GLOSSARY.md's Worktree entry
 records the flag, the lazy checkout and the base ladder.

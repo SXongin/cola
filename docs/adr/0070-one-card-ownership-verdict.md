@@ -67,8 +67,8 @@ in the Turn layer, answers the ownership question for every site.**
 
   | site | rule | deliberate difference |
   | --- | --- | --- |
-  | prompt router / Wake gate | owned when a guard is held or the card is render-owned; the label is `guard` / `card-chain` (ADR-0062) | the pending-inbound claim is **ignored**: a message still being routed owns no card to split (the #428 strand) |
-  | yielded write admission (ledger refresh, runtime observation, in-place Wake resume) | yielded ∧ live ∧ no handoff owed (ADR-0060, ADR-0066) | render-owned is a card *class*; the admission is that class's write-readiness |
+  | prompt router / Wake gate | owned when a guard is held; the Wake gate also admits a render-owned chain, the prompt router does not (`holds_guard`, ADR-0109) | the pending-inbound claim is **ignored**: a message still being routed owns no card to split (the #428 strand) |
+  | yielded write admission (ledger refresh, runtime observation, in-place Wake resume) | yielded ∧ live ∧ no handoff owed (ADR-0060, ADR-0109) | render-owned is a card *class*; the admission is that class's write-readiness |
   | durable reap claim (ADR-0063) | guard ∨ **inbound** | the reap must count the pending message or it races the admission; it keeps its record-relative probe (record match, terminality, pending ending write, successor anchor) in the Chain Record module and consumes the claim |
   | settle ticket `covers` (ADR-0059, #539) | the ticket's identity variant (a landed Turn's anchor / a Wake continuation's chain / the unlanded watch's chain) | which loop owns the card is the ticket's own kind |
   | `/stop` disposition (#394) | render-owned → the owner stamps; yielded → the quiet-end ack; else nothing | the ack exists only where a stamp cannot land promptly |
