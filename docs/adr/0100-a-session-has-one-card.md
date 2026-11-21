@@ -96,7 +96,11 @@ a `value` falls back to the payload's input name; with no box at all, the switch
 is dropped only when the question open now renders a typed box. A draft is dropped when its
 question is finalized and cleared when a submit consumes it; a question with no
 typed control opens without a box; and of two racing switches on one pre-switch
-card the first to land wins. A dropped switch does not repaint while a typed box
+card the first to land wins. The paint a callback applies is read under the card
+write lock at **apply** time, never carried from the moment it mutated the state:
+an answer that commits while a switch waits for the lock would otherwise be
+overwritten by the switch's older view, leaving the accumulator — and the
+freeze's idea of which box is open — behind the state. A dropped switch does not repaint while a typed box
 is open — that would erase what the client alone holds — and it does repaint on
 the standalone and inline surfaces when none is, so a card whose ack Feishu
 discarded can catch up. A stored draft is capped at its box's own `max_length`
