@@ -5,11 +5,12 @@
 "Who owns this Session's Card Chain right now, and may I touch its card?" is
 asked in four places, and each one answers it by reading raw state itself:
 
-- the prompt router decides Supplement vs new Turn from the in-flight guard or
-  a render-owned card chain (ADR-0062's routing key);
-- the Wake step asks the same pair before rendering a continuation, and asks a
-  third question — the yielded-card write admission (a Waiting card, live, with
-  no handoff owed) — before resuming a card in place (ADR-0066);
+- the prompt router decides Supplement vs new Turn from a **held in-flight
+  guard** alone (ADR-0109's routing key);
+- the Wake step asks the guard **or** a render-owned card chain before rendering
+  a continuation, and asks a third question — the yielded-card write admission
+  (a Waiting card, live, with no handoff owed) — before resuming a card in place
+  (ADR-0109);
 - the same admission gates the Background Task Ledger refresh and the runtime
   reconciliation (ADR-0060);
 - the out-of-turn settle loop carries its own ownership ticket — the

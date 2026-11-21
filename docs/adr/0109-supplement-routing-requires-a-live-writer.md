@@ -11,8 +11,8 @@ while a held in-flight guard proves an in-process writer; anything else starts a
 Turn that owns and settles the message. And a shell/subagent completion **Wake**
 resumes a yielded (⏳) card in place, so one user request keeps one card. It
 merges ADR-0062 (a stale live read must never absorb a message; the Unreceived
-ending), ADR-0066 (in-place Wake resumption) and ADR-0109 (the card-only arm is
-not a routing key); the earlier ADRs are pointers here.
+ending), ADR-0066 (in-place Wake resumption) and this ADR's own guard-key
+decision; the earlier ADRs are pointers here.
 
 ## Context
 
