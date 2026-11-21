@@ -444,7 +444,13 @@ pub(crate) fn run() {
          `cargo xtask check-doc-links`",
         report.findings.len()
     );
-    exit(1);
+    exit(exit_code(&report));
+}
+
+/// The command's exit status: a dangling citation is a failure, a banner
+/// warning is not.
+fn exit_code(report: &Report) -> i32 {
+    i32::from(!report.findings.is_empty())
 }
 
 #[cfg(test)]
@@ -765,28 +771,57 @@ mod tests {
         assert_eq!(tree.check().findings.len(), 1);
     }
 
+    fn main_source() -> String {
+        std::fs::read_to_string(crate::repo_root().join("xtask/src/main.rs"))
+            .expect("the xtask entry point must be readable")
+    }
+
     #[test]
-    fn the_command_is_registered_and_listed_in_help() {
-        let main = std::fs::read_to_string(crate::repo_root().join("xtask/src/main.rs"))
-            .expect("the xtask entry point must be readable");
+    fn the_command_is_registered() {
         assert!(
-            main.contains("\"check-doc-links\" => doc_links::run()"),
+            main_source().contains("\"check-doc-links\" => doc_links::run()"),
             "the dispatch arm must exist"
         );
+    }
+
+    /// The usage line and the unknown-task line are the two help strings; the
+    /// third occurrence is the dispatch arm itself.
+    #[test]
+    fn the_help_texts_list_the_command() {
         assert!(
-            main.matches("check-doc-links").count() >= 3,
-            "both help strings and the dispatch arm must name the task"
+            main_source().matches("check-doc-links").count() >= 3,
+            "both help texts must name the task"
         );
     }
 
     #[test]
-    fn the_command_is_wired_into_ci_and_the_verification_loop() {
-        let root = crate::repo_root();
-        for path in [".github/workflows/ci.yml", "CONTRIBUTING.md"] {
-            let text = std::fs::read_to_string(root.join(path))
-                .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
-            assert!(text.contains("cargo xtask check-doc-links"), "{path}");
-        }
+    fn ci_runs_the_command() {
+        let ci = std::fs::read_to_string(crate::repo_root().join(".github/workflows/ci.yml"))
+            .expect("CI must be readable");
+        assert!(ci.contains("cargo xtask check-doc-links"));
+    }
+
+    #[test]
+    fn the_verification_loop_runs_the_command() {
+        let contributing = std::fs::read_to_string(crate::repo_root().join("CONTRIBUTING.md"))
+            .expect("CONTRIBUTING.md must be readable");
+        assert!(contributing.contains("cargo xtask check-doc-links"));
+    }
+
+    #[test]
+    fn a_clean_report_exits_successfully() {
+        let tree = Tree::new("exit-clean");
+        tree.file("docs/note.md", "ADR-0001\n");
+        let report = tree.check();
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        assert_eq!(exit_code(&report), 0);
+    }
+
+    #[test]
+    fn a_report_with_a_dangling_citation_exits_unsuccessfully() {
+        let tree = Tree::new("exit-failure");
+        tree.file("docs/note.md", "ADR-9999\n");
+        assert_eq!(exit_code(&tree.check()), 1);
     }
 
     /// The acceptance criterion's "passes on the tree", with a plausibility
