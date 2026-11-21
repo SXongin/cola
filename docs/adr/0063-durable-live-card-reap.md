@@ -1,63 +1,67 @@
 # A durable Live Card record: a restart reaps the card it orphaned
 
-> **Amended by ADR-0069**: the record is the `records` section of the
-> **Chain Record** (`chain_records.json`, one module owning a Card Chain's
-> durable facts) and the reap lives in that module. Its semantics — written
-> when a card becomes the Session's live card, removed only after a confirmed
-> ending, fail-open load — are unchanged.
-
-> **Amended by ADR-0071**: the reap gains the projection disposition — a
-> record carrying a **Rendered Cursor** whose run is unowned is projected onto
-> a successor (and a still-live one adopted and followed) instead of being
-> settled in place — and the #443 stamp below narrows to the cursorless
-> fallback. See the amendment at the end.
-
-> **Amended by ADR-0072**: the #443 stamp is now a **keyed submission** the
-> card-delivery queue orders by **chain generation** — the detached
+> **Amended by ADR-0069**: the record is the `records` section of the **Chain
+> Record** (`chain_records.json`, one module owning a Card Chain's durable
+> facts), and the reap lives in that module. The semantics below — written when
+> a card becomes the Session's live card, removed only after a confirmed ending,
+> fail-open load — are unchanged.
+>
+> **Amended by ADR-0071**: the reap gained the projection disposition — a record
+> carrying a **Rendered Cursor** whose run is unowned is projected onto a
+> successor (or adopted and followed) instead of being settled in place — and
+> the #443 stamp narrowed to the cursorless fallback.
+>
+> **Amended by ADR-0072**: the #443 stamp is a **keyed submission** the
+> card-delivery queue orders by **chain generation**. The detached
 > never-cancelled write task, the in-flight claim and its decision gates, the
-> post-read pre-check, the post-PATCH repair collect and the #522 give-up mark
-> all retired, and the record-release gate now counts the queue's keyed ending
-> state. The 2026-10-02 amendment's mechanism prose and the 2026-10-05 #522
-> amendment below are read under this amendment; see the amendment at the end.
+> post-read pre-check, the post-PATCH repair collect and the `restarted_reaped` /
+> `restart_stamp_rejected` marks all retired, and the record-release gate counts
+> the queue's keyed ending state.
 
 ## Context
 
 ADR-0059 decided that card state stays in memory — "a cola restart loses live
-cards, as today: a waiting card goes stale, but the Wake path is
-card-independent". ADR-0061 narrowed that for exactly one fact: what a card has
-already announced. #428's other live defect (2026-09-29) is the complementary
-half. The card that was live when the process restarted stays frozen forever:
-nothing knows its Feishu message id, and Session Sync's Wake pass only renders
-*new* Wakes onto continuation cards — it never settles the orphan. In the
-incident the card sat frozen for ~1h43m while the server's stale active entry
-kept the session "live", and stayed frozen after the session idled. The
-acceptance is explicit: "a card whose owner died with a cola restart is
-reaped/settled rather than staying frozen forever".
+cards: a waiting card goes stale, but the Wake path is card-independent".
+ADR-0061 narrowed that for exactly one fact: what a card has already announced.
+#428's other live defect (2026-09-29) is the complementary half: the card that
+was live when the process restarted stays frozen forever — nothing knows its
+Feishu message id, and Session Sync's Wake pass only renders *new* Wakes onto
+continuation cards, never settling the orphan. In the incident the card sat
+frozen for ~1h43m while the server's stale active entry kept the session "live",
+and stayed frozen after the session idled. The acceptance is explicit: "a card
+whose owner died with a cola restart is reaped/settled rather than staying frozen
+forever".
 
 ## Decision
 
-**Persist a per-session Live Card record.** `(message id, Turn anchor)` per
-session, in its own sidecar (`live_cards.json`, the wake_watermarks pattern:
-atomic tmp+rename, best-effort, absent or corrupt reads as empty). It is
-written when a card becomes a Session's live card, and removed when that card
-reaches a terminal (Done / Error / Stopped) or is collected by a successor. The
-anchor is the settle decision's scope — without it the transcript cannot be
-asked what happened to the run. The record also carries the Session's directory
-at track time: the reap's reads route by it, so an orphan whose mapping is gone
-still asks the instance the card belongs to — never the process's cwd, which on
-a generation with per-directory reads (V1) could be another instance's run.
+**Persist a per-Session Live Card record.** `(message id, Turn anchor)` per
+Session, now the `records` section of the **Chain Record** (ADR-0069; formerly
+`live_cards.json`; atomic tmp+rename, best-effort, absent or corrupt reads as
+empty). It is written when a card becomes a Session's live card, and removed
+when that card reaches a terminal (Done / Error / Stopped) or is collected by a
+successor. The anchor is the settle decision's scope — without it the transcript
+cannot be asked what happened to the run. The record also carries the Session's
+directory at track time: the reap's reads route by it, so an orphan whose
+mapping is gone still asks the instance the card belongs to — never the
+process's cwd, which on a per-directory read generation (V1) could be another
+instance's run.
 
 **Reap in Session Sync, every pass, not just at startup.** For each record the
 pass reconciles the card against the Session's own reads:
 
 - the transcript's real ending settles it in place — ✅ / Error / Waiting on
   Background Tasks — so a run that finished while cola was down gets its true
-  ending, never an invented interruption;
+  ending, never an invented interruption (a cursor-carrying record projects the
+  same tail onto a successor instead, below);
 - an idle Session whose Turn message never landed ends Unreceived (ADR-0062),
   never ✅ — the same ending, without the 重新发起 action: the click's fixture
-  died with the process, so the reaped card tells the user to re-send (the
-  amendment in ADR-0062);
-- a live Session keeps the card: the run may still be answering it;
+  died with the process, so the reaped card tells the user to re-send;
+- a live Session keeps the card, unless the record carries a Rendered Cursor
+  whose run this process does not own: then the run is projected onto a
+  successor — `Project` for an ended-while-down chain, `ProjectLive` for a
+  still-live one — the recorded card is collected as taken over, and the record
+  re-points to the successor with the cursor carried (ADR-0071 owns that ladder
+  and the atomicity);
 - a continuation that took the chain over collects the old card in place, so no
   card is left looking live;
 - every ending is stamped over the card's own view, read best-effort: the body
@@ -68,198 +72,71 @@ pass reconciles the card against the Session's own reads:
 The same pass covers a Waiting card orphaned by a restart: its Session's true
 end settles it (ADR-0060's quiet true end), instead of leaving it frozen.
 
-**Missed content is not rebuilt onto the old card.** The record reaps the
-card's *state*; content that landed while cola was down is rendered by the
-existing paths — a Wake's continuation card is exactly that message — or simply
-left in the transcript. Replaying a whole turn onto a stale card is the
-re-render the Fresh path deliberately avoids.
+**The #443 stamp is the cursorless fallback.** A still-live orphan whose record
+carries no cursor is stamped **once per process life** with the header
+「⏳ 已重启，等待运行结束」: the card's own view is read back and only the header
+changes — body kept, controls stripped, like every ending — except that a failed
+view read leaves the card untouched rather than settling bare, because the
+stamp's whole value is the body it preserves. The view read and composition run
+on a small pre-submission task (the pass must not await a stuck Feishu call);
+the write is a **keyed submission** to the card-delivery queue (ADR-0072) under
+`(chain generation, Stamp)`, the generation of the record snapshot the decision
+read. A collect submitted later at a newer generation supersedes it; a stamp
+whose generation the queue's floor has passed is dropped without a Feishu call;
+and re-deciding every tick costs no card read and no Feishu call once the key
+settled or is being written (the apply asks the queue's `keyed_write_covered`
+before composing), while an owed recoverable failure is not covered and the
+next tick's re-composition replaces it.
 
-## Considered options
+A record carrying a cursor is never stamped — an unresolved cursor, a missing
+read, no scope to arm against, a frontier the read cannot place, or no
+deliverable target claims nothing and leaves the record for a later pass the
+projection can seed, because a stamp would freeze the run the projection is
+supposed to follow. The first confirmed card write gives a record its cursor, so
+the fallback window closes by itself. A PATCH Feishu permanently refuses as card
+content (`CardContentRejected`) settles its `(generation, Stamp)` key: it is
+deterministic — the same preserved payload can never land — so every later
+re-submission is dropped without a card read and without a Feishu call; the card
+simply stays without its stamp and the record with it. Every transient failure —
+transport, timeout, auth, server — keeps the retry. No timer refresh, no
+recurring PATCHes, no adoption: re-following a cursorless run is #505's faithful
+restore, not the stamp.
 
-- **Status quo, in-memory only.** Rejected: leaves the orphan frozen forever —
-  the reported defect.
-- **Persist the message id alone, no anchor.** Rejected: no anchor, no settle
-  decision; the reap could only guess an ending.
-- **Rebuild the card from the transcript at startup.** Rejected: a full card
-  renderer on the restart path for a rare case; the continuation machinery
-  already publishes missed content as a new message, which is also the
-  notification.
-- **Settle every orphan as "interrupted".** Rejected: it lies about runs that
-  finished while cola was down; the transcript-truth rule of ADR-0062 applies
-  here too.
+**The record lives until its ending is confirmed.** A terminal card's record is
+dropped only once its ending write is **confirmed** — delivered, or permanently
+refused; a final PATCH that fails (or is still pending in ADR-0067's Pending Card
+Update outbox) leaves the record in place, so Session Sync's reap still finds the
+card and re-settles it from transcript truth, and the reap doubles as the
+record's cleaner. The release gate (`release_spent`, via
+`has_pending_card_update`) counts a keyed `Settle` the queue still owes or is
+writing, not only the keyless outbox entry. Without this, a failed final PATCH
+plus a cola restart froze the card forever: the record was gone and nothing knew
+the card existed.
+
+**Missed content is not rebuilt onto the old card.** The record reaps the card's
+*state*; content that landed while cola was down is rendered by the existing
+paths — a Wake's continuation card is exactly that message — or left in the
+transcript. The projection (ADR-0071) renders only the delta after the confirmed
+frontier onto the successor, and the old card keeps its body (minus the running
+markers the successor resolved, ADR-0068's rule) and is collected as taken over.
+Replaying a whole turn onto a stale card is the re-render the Fresh path
+deliberately avoids; Interaction Receipts stay in ADR-0038's request-flow domain,
+re-hosted onto the successor by the existing sweeps and never rebuilt.
 
 ## Consequences
 
 - ADR-0059's "Card state stays in memory" is narrowed twice over: with
   ADR-0061, the announced-Wake fact; here, the live card's identity and anchor.
 - A restart no longer leaves a frozen card: every non-terminal card either gets
-  its true ending or is collected, and a still-live Session's card is settled
-  by the same reconcile later.
+  its true ending, is projected onto a successor, or is collected, and a
+  still-live Session's card is settled by the same reconcile later.
 - Every reap PATCH keeps the card's already-rendered body best-effort (#434
-  acceptance feedback): the card's own view is read and the ending restamped
-  over it with its controls stripped, while a failed read still settles the
-  bare ending and content the card never showed is still never rebuilt.
-- The Chain Record's records section (ADR-0069; formerly `live_cards.json`)
-  holds at most one record per Session and sheds it at every terminal or
-  collection — the file itself stays as the migration marker; no separate
-  pruning pass is needed.
-- Tests pin: a persisted live card over a restart settles in place by the
-  transcript's ending; a never-promoted one ends Unreceived; a continuation
-  collects the old card; a still-live Session leaves the record in place.
+  acceptance feedback), while a failed read still settles the bare ending and
+  content the card never showed is still never rebuilt.
+- The Chain Record's records section holds at most one record per Session and
+  sheds it at every terminal or collection — the file itself stays as the
+  migration marker; no separate pruning pass is needed.
+- #505's deferral lifts: the projection is that faithful restore.
 
-Related: #428, #424, ADR-0059, ADR-0060, ADR-0061, ADR-0062.
-
-## Amendment (2026-10-02): a still-live restart orphan is stamped once (#443)
-
-Between a cola restart and the run's true end — or a successor's takeover —
-nothing updated the orphaned card: the reap keeps its record while the
-Session reads live, and no in-process accumulator owns the card, so it sat
-frozen at its pre-restart state (observed during #434's acceptance round; the
-batch promised "not frozen forever", not "keeps ticking"). The reap now
-stamps such a card **once per process life** with the header
-「⏳ 已重启，等待运行结束」: the card's own view is read back and only the
-header changes — body kept, controls stripped, like every ending, except
-that a failed view read leaves the card untouched rather than settling bare,
-because the stamp's whole value is the body it preserves. The in-memory mark
-is set only when the PATCH lands, so a failed attempt retries on the next
-pass; the transcript-truth settle (or a successor's collect) supersedes the
-stamp as today. No timer refresh, no recurring PATCHes, no adoption:
-re-following the run is deferred until a faithful no-duplicate/no-omission
-restore exists (#505).
-
-The stamp's attempt is handed to a **detached task** and its write is
-**never cancelled**. The pass must not await the write — a stuck Feishu call
-would otherwise freeze Session Sync behind one orphan — while the write,
-once issued, must run to its own result: the card-delivery lock is held
-until it resolves, and that lock is what orders a successor's later collect
-after the stamp, so the ordering no longer rests on timing. An in-memory
-in-flight claim holds every other reap decision for the record until the
-attempt resolves — a second attempt, or a settle decided meanwhile, could be
-overtaken by the write still owed. The attempt marks the record when the
-PATCH lands (a failed read or PATCH claims nothing and releases the claim
-for the next pass), and a takeover admitted while it was in flight is
-repaired by the post-PATCH re-collect. A hung write therefore holds the old
-card's delivery lock until it resolves — exactly like every normal card
-write (the flush, a settle, a collect); the pass and the pending-update
-drain are never blocked by it. The view read stays bounded: nothing has been
-sent yet, so a timed-out read is safe to abandon.
-
-## Amendment (2026-10-02): the record is removed after delivery, not before (ADR-0067)
-
-The removal rule above ("removed when that card reaches a terminal") is
-narrowed: a terminal card's record is dropped only once its ending write is
-**confirmed** — delivered, or permanently refused; a final PATCH that fails
-(or is still pending in ADR-0067's Pending Card Update outbox) leaves the
-record in place, so Session Sync's reap still finds the card and re-settles
-it from transcript truth, and the reap doubles as the record's cleaner once
-the write is confirmed. Without this, a failed final PATCH plus a cola
-restart froze the card forever: the record was already gone and nothing knew
-the card existed.
-
-## Amendment (2026-10-05): the takeover collect drops carried running markers (ADR-0068)
-
-The body-preservation rule above ("every ending is stamped over the card's own
-view... the body the card already rendered stays") covers the takeover collect
-too. ADR-0068 narrows it for one collect: the takeover's preserved body drops
-the **Background Task Ledger** element always — the successor's own reads
-rebuild the live list, so ADR-0060's one-card handover rule applies to the
-restart collect exactly as it does to an in-process supersede — and drops the
-orphaned Turn's **running tool panels** (the `⏳` foldables) when the takeover
-carried them onto the successor; they are live there now, and keeping them
-would leave the collected card looking busy. Every other preserved body — the
-reap's settle / Unreceived / Waiting endings and the #443 restart stamp — is
-unchanged, and a takeover that carried no running call keeps those panels (the
-ledger still goes).
-
-## Amendment (2026-10-05): a permanently refused stamp is given up (#522)
-
-The #443 retry rule above ("a failed attempt retries on the next pass") is
-narrowed for one failure class: a stamp PATCH Feishu **permanently** refuses
-as card content (`CardContentRejected`, e.g. `230099`) is deterministic — the
-same preserved payload can never land — so the reap marks the record "stamp
-given up" for this process life and stops retrying it on every Session Sync
-tick; a fresh life starts unmarked. The card simply stays without its stamp,
-the record stays with it, and the transcript-truth ending (or a successor's
-collect) still supersedes it. Every transient failure — transport, timeout,
-auth, server — keeps the retry. The carve-out lands with the Chain Record
-module's decision seam (ADR-0069), which maps the marked record to `Keep`.
-
-## Amendment (2026-10-06): the reap gains the projection disposition, and the #443 stamp demotes to the cursorless fallback (ADR-0071)
-
-The reconcile's decision vocabulary (ADR-0069) gains two outcomes for a
-record carrying a **Rendered Cursor** whose run this process does not own.
-`Project` renders the missed tail plus the transcript's true ending onto a
-successor card — reply to the Turn anchor, then the recorded card, then the
-chain's top-level Chat — and settles it by transcript truth; `ProjectLive`
-arms a successor seeded at the cursor, whose create is the restart
-notification, and follows the still-live run through the existing
-external-render arm. The recorded card is collected as taken over (its body
-kept minus the running markers the successor resolved, ADR-0068's rule), and
-the record re-points to the successor with the cursor carried, so a split or
-a later Turn recovers the chain as one.
-
-The #443 restart stamp is now the **cursorless fallback alone**: a still-live
-orphan whose record carries no cursor is stamped once per process life,
-exactly as amended above. A cursor-carrying record is never stamped — a
-missing transcript read, a record with no scope to arm against, a frontier the
-read cannot place, or no deliverable target claims nothing and leaves the
-record for a later pass the projection can seed, because the stamp would
-freeze the run the projection is supposed to follow. The first confirmed card
-write on a record gives it a cursor, so the fallback window closes by itself.
-
-The Decision's "missed content is not rebuilt onto the old card" stands and
-extends: only the delta after the confirmed frontier renders, and it renders
-onto the successor — the old card keeps its body (minus the resolved live
-markers) and is collected as taken over. The 2026-10-02 amendment's deferral
-("re-following the run is deferred until a faithful no-duplicate/no-omission
-restore exists (#505)") is lifted: the projection is that restore.
-
-The reap's scope is otherwise unchanged — every record, every Session Sync
-pass, the same fail-open store and per-pass read bounds — and Interaction
-Receipts stay in ADR-0038's request-flow domain, re-hosted onto the successor
-by the existing sweeps and never rebuilt.
-
-## Amendment (2026-10-07): the #443 stamp is a keyed submission — the guard cluster retires (ADR-0072)
-
-The stamp is no longer a write whose ordering had to be derived from locks and
-guards. The view read and the composition still run on a small pre-submission
-task — the pass must not await a stuck Feishu call — but the write is submitted
-to the card-delivery queue (ADR-0072) as a **keyed submission** under
-`(chain generation, Stamp)`, the generation of the record snapshot the stamp's
-decision read. The queue owns it, so cancelling that task before the submission
-is safe and an admitted submission always settles. A collect submitted later at
-a newer generation supersedes it; a stamp submitted first lands first; a stamp
-whose generation the queue's floor has passed is dropped without a Feishu call.
-Nothing about the stamp's own behaviour changes: the card's view is read back,
-only the header changes, a failed read claims nothing and the next tick
-re-decides, and a payload Feishu refuses as card content never falls back to a
-bare stamp.
-
-Retired with the guards (spec #571, ticket #575): the detached task's
-never-cancelled write, the `restart_stamping` in-flight claim and every gate it
-fed (no status or transcript read while it held, no successor collect, the
-ladder's first guard), the post-read ownership pre-check, the post-PATCH repair
-collect, the predecessor keep rule recorded for it (ADR-0068's amendment), and
-the `restarted_reaped` / `restart_stamp_rejected` marks. The ordering they
-derived is now a property of the queue: a stamp decided under generation G but
-submitted after a takeover bumped the chain is dropped by the generation rule,
-and a stamp that passed its pre-check can no longer land after a collect —
-both are keyed submissions to the same queue. Re-deciding every tick is free
-once the key settled or is being written: the apply asks the queue's
-covered-key query (`keyed_write_covered`) before composing, so an
-already-stamped orphan costs no card read and no Feishu call; an owed
-recoverable failure is not covered, and the next tick's re-composition
-replaces it.
-
-#522's give-up is the queue's permanent-refusal outcome, not a mark on the
-record: a stamp PATCH Feishu permanently refuses as card content settles its
-`(generation, Stamp)` key, and every later re-submission of that key is dropped
-without a card read and without a Feishu call. The card simply stays without
-its stamp, the record stays with it, and the transcript-truth ending — itself a
-keyed `Settle` now — or a successor's collect still supersedes it.
-
-The record-release rule above ("removed after delivery, not before") is
-unchanged in intent and wider in fact: a terminal card's record is dropped only
-once its ending write is confirmed, and the gate (`release_spent`, via
-`has_pending_card_update`) now counts a keyed `Settle` the queue still owes or
-is writing, not only the keyless Pending Card Update.
+Origins: #424, #428, #434, #443, #522, #575 (spec #571); ADR-0038, ADR-0059,
+ADR-0060, ADR-0061, ADR-0062, ADR-0067, ADR-0069, ADR-0071, ADR-0072.
