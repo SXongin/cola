@@ -204,7 +204,10 @@ and the renewal reads the accumulator's own progress mark — advanced as each
 render stage produces — so content a pass had already rendered before its
 timeout abandoned it still counts. A poll that rendered nothing counts as no
 progress, whether it found nothing or failed or timed out, so a wedged Backend
-cannot hold the card live forever. The ending paths are anchor-guarded, so a
+cannot hold the card live forever. The Wake continuation's settle grace (the
+shared loop's lost-contact / stuck-panel bound) is its own field, separate from
+the renderer's idle bound, so retuning one cannot move the other. The ending
+paths are anchor-guarded, so a
 renderer whose bound fired after a successor replaced the accumulator never
 finalises the successor's card.
 
