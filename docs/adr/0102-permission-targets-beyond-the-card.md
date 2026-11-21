@@ -89,7 +89,21 @@ is allowed only when the full content was delivered for that request.
   surfacing path before the inline block or standalone card is created, so there
   is no window in which a button approves text the user never saw. It is sent
   once per request, whichever surface hosts it. Auto-Accept returns before this
-  step: it renders no card and sends no companion (ADR-0101 unchanged).
+  step: it renders no card and sends no companion (the decision below).
+- **Auto-Accept's flag is settled before it approves, and an unreadable flag is
+  not "off".** Every enable path — the permission card's toggle,
+  `/autoaccept on` and the toggle card — persists the flag **before** the
+  approval pass, so a sweep landing inside it reads the session as auto-accept
+  instead of surfacing a card for the request the call is about to approve. A
+  persist that did not take effect approves nothing: the toggle releases its
+  click claim and reports the failure, and the other two refuse to run the pass;
+  the store rolls a failed blocking write back before returning its error. A flag
+  the parent chain cannot finish reading (a failed or timed-out `session_info`
+  hop) is **unknown**, not "off": the request stays pending and unmarked and the
+  next sweep retries, while the 8-hop cap is a structural bound and takes the
+  ordinary surface. A failed approval reply keeps the request pending and
+  unmarked (`Prepared::Retry`) for the next sweep, at ADR-0048's warn-once
+  cadence (WARN, then DEBUG for identical repeats, INFO on recovery).
 - **Delivery is persisted; uncertainty is only a marker.** A client-scoped
   `request_id → CompanionDelivery { message_id, lane, target digest }` record
   rides beside the existing surface records (ADR-0038). A **confirmed** send
@@ -163,9 +177,9 @@ is allowed only when the full content was delivered for that request.
 
 - A huge command is readable in the chat, stays inside the card's JSON budget,
   and can be approved where it was seen. The transcript keeps the full content.
-- Auto-Accept keeps ADR-0101's decision unchanged: it answers every pending
-  permission unseen, renders no card, sends no companion, and logs the request
-  id, the crossed bound, the target length and a bounded first line. The
+- Auto-Accept keeps its decision, now stated above: it answers every
+  pending permission unseen, renders no card, sends no companion, and logs the
+  request id, the crossed bound, the target length and a bounded first line. The
   completeness proof never applies there because no approval surface exists to
   guard.
 - The proof depends on persisted state, which is why the record is client-scoped

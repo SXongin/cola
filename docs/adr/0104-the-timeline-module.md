@@ -4,11 +4,12 @@
 > finished mechanism, the accumulator split as built, the rules as landed and
 > the tickets that landed them.
 >
-> **Amends**: ADR-0038 (synthetic keying, the read floor and the equal-key rule),
-> ADR-0040 (`seq` assignment), ADR-0045 (a tail panel's settle rule), ADR-0050
-> (the entry types' home) and ADR-0082 (a compaction row's receipt cut). The
-> exact ordering rules and their invariants are #1040's acceptance criteria; this
-> ADR records the module boundary and the ownership move.
+> **Amends**: ADR-0038 (synthetic keying, the read floor and the equal-key rule)
+> and ADR-0082 (a compaction row's receipt cut). **Supersedes** ADR-0040 (the
+> `seq`-derived fold ids), ADR-0045 (the live tail's lifecycle) and ADR-0050
+> (the Turn boundary), whose surviving rules are below. The exact ordering rules
+> and their invariants are #1040's acceptance criteria; this ADR records the
+> module boundary and the ownership move.
 
 Where a card entry lands has no owner. The rule is written three times, its
 protocol is re-armed by hand in four walks, and its inputs cross the seam as
@@ -47,9 +48,9 @@ bare `i64`s.
 
 ## Decision
 
-**A Timeline module (`src/bridge/turn/timeline.rs`, private to the Turn module
-per ADR-0050) owns the ordered entries of a card body and the rule that places
-content into them.**
+**A Timeline module (`src/bridge/turn/timeline.rs`, private to the Turn module —
+the boundary below) owns the ordered entries of a card body and the rule that
+places content into them.**
 
 - **One walk interface.** `Timeline::walk(&read_order)` yields a walk carrying
   the read's message positions; `walk.message(timeline, created, id,
@@ -107,8 +108,8 @@ content into them.**
 ## Landing amendment
 
 **Landed** in the Timeline batch, tickets #1041–#1046, spec #1040. The module is
-`src/bridge/turn/timeline.rs`, `pub(super)` to the Turn; the Turn boundary
-ADR-0050 records is unchanged.
+`src/bridge/turn/timeline.rs`, `pub(super)` to the Turn; the Turn boundary below
+is unchanged.
 
 ### The module as built
 
@@ -151,6 +152,38 @@ ADR-0050 records is unchanged.
   `render_from`, `sealed_entries`, merge-by-part lookup, key minting and `seq`;
   the walk owns the read floor and the message scope the message floor.
 
+### The live tail and the client's fold state
+
+An **unfinished Tool Panel** — its tool `running` or `pending` — is tail
+content: it renders in call order after the Todo Panel and before the
+Interaction Blocks, rides every split onto the new live card, and a finalized
+card never carries it. When the tool reaches any other status it joins the
+timeline at its key — clamped to the top of the live slice, or the read
+position's key for an untimed part — and stops rendering in the tail. The
+tail's size reserve covers it: a card that fits without its tail but not with
+it finalizes without the tail and the continuation carries it, and a split with
+nothing but a live tail may finalize an otherwise empty card, as ADR-0043's
+Todo Panel always did. Its `element_id` is allocated when it first appears and
+reused at settle, so the client's fold state survives the move: an id derives
+from `seq` (`tool_{seq}` / `reason_{seq}`), never from a body position, and the
+todo tail's fixed `todo` id is the one panel that is not a timeline entry. `seq`
+is never reused or renumbered. A Card Chain split's continuation starts folded —
+a new message inherits no client state — and a retry begins with no inherited
+state either (ADR-0058).
+
+### The Turn boundary this move preserves
+
+The Turn stays a deep module (`src/bridge/turn/`): `Turn::run(handles, ctx)` is
+its lifecycle entry, and cancel, pull-card and follow-external are the
+operations other flows drive. Card delivery is reachable only through
+`Turn::flush_card` / `Turn::split_card_chain` / `Turn::render_and_flush` /
+`Turn::session_subtitle`; the slice split, the continuation send, the
+card-handle record and the accumulator edit all sit behind them, and the
+Timeline is `pub(super)` to the Turn. The render poll, the flush/split state
+machine and the accumulator stay internal to it; a render poll outside the Turn
+is the rejected shape. The Turn receives narrow handles (`TurnHandles`), never
+`SharedCore` (ADR-0049).
+
 ### Rules as landed
 
 - `place` applies the message's `receipt_cut_floor(created)`, the walk's read
@@ -179,7 +212,7 @@ ADR-0050 records is unchanged.
   message's, or the panel's own) — seats at `max(current, floor)`, caps at the
   minimum key among the entries that follow it in read order at or above the
   floor, and seats through the normal insert path (clamp included) with its
-  pinned `seq` — never renumbered (ADR-0040). Pinned by
+  pinned `seq` — never renumbered (the live tail's fold-state rule below). Pinned by
   `a_settled_panel_keeps_the_identity_it_was_pinned_with` and
   `a_settle_is_floored_by_the_pinned_tails_that_precede_it`.
 

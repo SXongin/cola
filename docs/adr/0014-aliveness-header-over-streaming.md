@@ -91,8 +91,8 @@ Two corrections to the options list above:
   increments. Their real payoff is not the animation but that a write touches
   one element instead of rebuilding `body.elements`, so the reading position is
   not reset and — **asserted by #972, not verified here** — a live `form` input
-  keeps what the Host typed. That is the same problem ADR-0093's freeze exists
-  to dodge, and it is the reason this ADR's decision is dated rather than
+  keeps what the Host typed. That is the same problem ADR-0038's 2026-10-31
+  freeze exists to dodge, and it is the reason this ADR's decision is dated rather than
   eternal: the freeze could go if an element write really leaves an input
   alone, which a live check would have to establish.
 
