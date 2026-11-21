@@ -390,11 +390,12 @@ jobs:
 
   docs-drift:
     # The zh-CN user guide must stay structurally in step with its English
-    # source (docs/user-guide.md). Deliberately NOT gated by `classify`: a
-    # docs-only PR is classified `heavy=false` and skips every code job — and
-    # is exactly the PR that edits the guide pair, so this guard must still
-    # run there. Required by the `main: CI` ruleset; it needs only a checkout
-    # and the toolchain.
+    # source (docs/user-guide.md), and every doc citation must resolve. Both
+    # guards are deliberately NOT gated by `classify`: a docs-only PR is
+    # classified `heavy=false` and skips every code job — and is exactly the
+    # PR that edits the guide pair and the citations, so these guards must
+    # still run there. Required by the `main: CI` ruleset; they need only a
+    # checkout and the toolchain.
     name: Docs drift
     runs-on: ubuntu-latest
     steps:
@@ -405,6 +406,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Docs drift (zh-CN vs English)
         run: cargo xtask check-doc-drift
+      - name: Docs links (ADR, path and source pins)
+        run: cargo xtask check-doc-links
 
   audit:
     name: Dependency audit
