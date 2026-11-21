@@ -125,7 +125,7 @@ pub(crate) fn targets(content: &str) -> Vec<(usize, Target)> {
 /// (`ADR-0105/0106/0107` cites three ADRs).
 fn adr_targets(line: &str, out: &mut Vec<Target>) {
     for (start, _) in line.match_indices("ADR-") {
-        if start > 0 && is_path_char(previous_char(line, start)) {
+        if start > 0 && is_preceding_path_char(previous_char(line, start)) {
             continue;
         }
         let rest = &line[start + 4..];
@@ -156,7 +156,7 @@ fn adr_targets(line: &str, out: &mut Vec<Target>) {
 fn doc_path_targets(line: &str, out: &mut Vec<Target>) {
     for prefix in ["docs/research/", "docs/reference/"] {
         for (start, _) in line.match_indices(prefix) {
-            if start > 0 && is_path_char(previous_char(line, start)) {
+            if start > 0 && is_preceding_path_char(previous_char(line, start)) {
                 continue;
             }
             let rest = &line[start + prefix.len()..];
@@ -177,7 +177,7 @@ fn doc_path_targets(line: &str, out: &mut Vec<Target>) {
 /// `src/…:line` and `src/…:start-end` pins. A bare `src/…` path is not a pin.
 fn source_pin_targets(line: &str, out: &mut Vec<Target>) {
     for (start, _) in line.match_indices("src/") {
-        if start > 0 && is_path_char(previous_char(line, start)) {
+        if start > 0 && is_preceding_path_char(previous_char(line, start)) {
             continue;
         }
         let rest = &line[start..];
@@ -228,8 +228,16 @@ fn previous_char(line: &str, index: usize) -> char {
 }
 
 /// Characters that continue a repository path. `#` is excluded so an anchor is
-/// not part of the path.
+/// not part of the path, and a non-ASCII alphanumeric is allowed so a file with
+/// a Chinese name is still a citation.
 fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '/' | '_' | '.' | '-')
+}
+
+/// Characters that, immediately before `src/`, `docs/…` or `ADR-`, mean the
+/// token is part of a longer path or word. Deliberately ASCII-only: Chinese
+/// prose has no spaces, so `见ADR-0042` must still be a citation.
+fn is_preceding_path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-')
 }
 
@@ -435,19 +443,24 @@ pub(crate) fn check_tree(root: &Path) -> Result<Report, String> {
 /// `cargo xtask check-doc-links`: fail on a dangling doc citation, or when the
 /// tree cannot be scanned. Banner counts are printed as warnings only.
 pub(crate) fn run() {
-    let root = crate::repo_root();
-    let report = match check_tree(&root) {
+    exit(run_on(&crate::repo_root()));
+}
+
+/// The command body and its exit status, without the process exit: a dangling
+/// citation is a failure, a banner warning is not.
+fn run_on(root: &Path) -> i32 {
+    let report = match check_tree(root) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("{error}");
-            exit(1);
+            return 1;
         }
     };
     for warning in &report.warnings {
         eprintln!("{warning}");
     }
     if report.findings.is_empty() {
-        return;
+        return 0;
     }
     for finding in &report.findings {
         eprintln!("{finding}");
@@ -457,13 +470,7 @@ pub(crate) fn run() {
          `cargo xtask check-doc-links`",
         report.findings.len()
     );
-    exit(exit_code(&report));
-}
-
-/// The command's exit status: a dangling citation is a failure, a banner
-/// warning is not.
-fn exit_code(report: &Report) -> i32 {
-    i32::from(!report.findings.is_empty())
+    1
 }
 
 #[cfg(test)]
@@ -735,6 +742,33 @@ mod tests {
     }
 
     #[test]
+    fn a_citation_with_a_non_ascii_path_component_resolves() {
+        let tree = Tree::new("unicode-path");
+        tree.file("docs/reference/接口.md", "# api\n");
+        tree.file("src/路径.rs", "one\n");
+        tree.file("docs/note.md", "`docs/reference/接口.md`, `src/路径.rs:1`\n");
+        assert_eq!(tree.check().findings.len(), 0);
+    }
+
+    #[test]
+    fn a_missing_non_ascii_reference_fails() {
+        let tree = Tree::new("unicode-missing");
+        tree.file("docs/note.md", "`docs/reference/接口.md`\n");
+        assert_eq!(tree.check().findings.len(), 1);
+    }
+
+    /// Chinese prose has no spaces, so a citation directly after it must still
+    /// be extracted.
+    #[test]
+    fn a_citation_after_chinese_prose_is_extracted() {
+        let targets: Vec<Target> = targets("见ADR-0042")
+            .into_iter()
+            .map(|(_, target)| target)
+            .collect();
+        assert_eq!(targets, vec![Target::Adr("0042".to_string())]);
+    }
+
+    #[test]
     fn a_non_ascii_adr_filename_is_ignored_without_panicking() {
         let tree = Tree::new("non-ascii-adr");
         tree.file("docs/adr/é-notes.md", "# notes\n");
@@ -820,11 +854,18 @@ mod tests {
         );
     }
 
+    /// The command must live in the ungated `docs-drift` job, not `Check`:
+    /// `Check` is `classify`-gated, so a docs-only PR would never run it.
     #[test]
-    fn ci_runs_the_command() {
+    fn ci_runs_the_command_in_the_docs_job() {
         let ci = std::fs::read_to_string(crate::repo_root().join(".github/workflows/ci.yml"))
             .expect("CI must be readable");
-        assert!(ci.contains("cargo xtask check-doc-links"));
+        let job = ci
+            .split("\n  docs-drift:")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  audit:").next())
+            .expect("the docs-drift job must exist");
+        assert!(job.contains("cargo xtask check-doc-links"));
     }
 
     #[test]
@@ -835,19 +876,17 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_report_exits_successfully() {
+    fn a_clean_tree_runs_to_success() {
         let tree = Tree::new("exit-clean");
         tree.file("docs/note.md", "ADR-0001\n");
-        let report = tree.check();
-        assert!(report.findings.is_empty(), "{:?}", report.findings);
-        assert_eq!(exit_code(&report), 0);
+        assert_eq!(run_on(&tree.root), 0);
     }
 
     #[test]
-    fn a_report_with_a_dangling_citation_exits_unsuccessfully() {
+    fn a_dangling_citation_runs_to_failure() {
         let tree = Tree::new("exit-failure");
         tree.file("docs/note.md", "ADR-9999\n");
-        assert_eq!(exit_code(&tree.check()), 1);
+        assert_eq!(run_on(&tree.root), 1);
     }
 
     /// The acceptance criterion's "passes on the tree", with a plausibility
