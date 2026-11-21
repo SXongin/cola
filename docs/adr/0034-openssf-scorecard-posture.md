@@ -1,24 +1,19 @@
 # OpenSSF Scorecard: fix what is cheap and real, record the rest as deliberate no-s
 
-> **Amended by ADR-0034 (2026-11-17)**: the Codex gate's blocking definition,
-> finding cap and three-round budget — see the amendment at the end.
->
-> **Amended by ADR-0034 (2026-11-18)**: the local gate rehearsal is removed; the
-> local pair and the CI gate's three-round budget stand (the budget is superseded
-> on 2026-11-21) — see the amendments at the end.
->
-> **Amended by ADR-0034 (2026-11-21)**: the three-round budget and its round-3
-> approval are replaced by autonomous rounds plus stop predicates — see the
-> amendment at the end.
+> **The review gate's policy is `CONTRIBUTING.md` "Reviewing"** — the blocking
+> definition, the finding cap, the round policy and the dossier; the gate's
+> provider, endpoint, model and secret are repository settings, and its action
+> pin a workflow commit, both recorded in `.github/workflows/codex-review.yml`.
+> This ADR owns the Scorecard posture only (#1129).
 
 The repository runs OpenSSF Scorecard (weekly workflow, published results, README
 badge) and scored 6/10. The aggregate is a **risk-weighted** average
 (Critical 10, High 7.5, Medium 5, Low 2.5), not a plain mean, so the zeros are
-not equally valuable: of the seven zero-scoring checks, `Maintained` and `SAST`
-heal on their own (the repo is under 90 days old; CodeQL was added after the
-sampled commits), `Code-Review` needs a second human and `Contributors` needs a
-second organization, and only `Pinned-Dependencies`, `Signed-Releases` and
-`Fuzzing` are both actionable and genuinely security-relevant.
+not equally valuable: of the seven zero-scoring checks, `Maintained` heals on
+its own (the repo is under 90 days old), `Code-Review` needs a second human,
+`Contributors` needs a second organization, `SAST` is a deliberate no (below),
+and only `Pinned-Dependencies`, `Signed-Releases` and `Fuzzing` are both
+actionable and genuinely security-relevant.
 
 We decided the target is **real supply-chain risk, with the score as a
 byproduct**. Concretely:
@@ -35,22 +30,27 @@ byproduct**. Concretely:
    - `taiki-e/install-action` stays on a `v2` SHA (never the tool-name ref
      hashed) with `tool: cargo-llvm-cov` (its README calls hashing tool-name
      refs an impostor-commit hazard).
+
+   The gate's action pin is asserted by `cargo test -p xtask codex_gate`, so a
+   Dependabot group bump moves that expectation deliberately instead of
+   silently reverting it.
 2. **Publish build provenance as release assets.** The release already creates
    `actions/attest-build-provenance` attestations, but Scorecard v5.5.0 only
    reads *release assets* named `*.intoto.jsonl`, not the GitHub attestation
-   store. The publish job now downloads each artifact's bundle and attaches it
-   as `<artifact>.intoto.jsonl`. This matters beyond the score: the release
-   assets are cola's self-update channel (ADR-0015, ADR-0030), and users can
-   verify a download offline. The check looks at the last five releases, so the
-   score climbs one fifth per cut.
-3. **Scope write tokens to the job that needs them.** `codeql.yml`'s
-   `security-events: write` moves from the top level to the `analyze` job;
-   `release.yml`'s job-level `contents: write` (required to publish a release)
-   stays, and costs nothing because a job-level write under a declared
-   top-level read is not penalized.
+   store. The publish job downloads each artifact's bundle and attaches it as
+   `<artifact>.intoto.jsonl`. This matters beyond the score: the release assets
+   are cola's self-update channel (ADR-0015, ADR-0030), and users can verify a
+   download offline. The check looks at the last five releases, so the score
+   climbs one fifth per cut.
+3. **Scope write tokens to the job that needs them.** A workflow declares
+   `contents: read` at the top, and only the job that needs more raises it: the
+   release's build job takes `id-token: write` and `attestations: write` to sign
+   provenance, and its publish job takes `contents: write` (required to publish
+   a release) and `attestations: read`. A job-level write under a declared
+   top-level read is not penalized, so it costs nothing.
 4. **Add `require_last_push_approval` to the `main: review` ruleset.** It is
-   free, it is the only real setting missing before the score stops at 8, and
-   it protects a future non-admin collaborator. We deliberately do **not** set
+   free, it is the only real setting missing before the score stops at 8, and it
+   protects a future non-admin collaborator. We deliberately do **not** set
    2 required reviewers, code-owner review, or apply-to-admins: on a solo
    repository those settings would be fiction (every merge is an admin bypass,
    and apply-to-admins would make merging impossible). 8 is the honest ceiling
@@ -59,42 +59,48 @@ byproduct**. Concretely:
    parses untrusted WS bytes by hand, so panics/DoS there are real; everything
    else is serde JSON, whose upstream is already fuzzed far beyond what we
    would add. `fuzz/fuzz_targets/pbbp2.rs` decodes arbitrary bytes and checks
-   the `decode(encode(frame))` round-trip. It is not wired into CI: continuous
-   fuzzing (ClusterFuzzLite, OSS-Fuzz) is recurring infrastructure this project
-   does not need. The target immediately justified itself — see the overflow
-   fix it forced in `read_len_delimited`.
+   the `decode(encode(frame))` round-trip. The target immediately justified
+   itself — see the overflow fix it forced in `read_len_delimited`.
 
-   > **Amended 2026-09-22**: it now runs weekly in CI as a plain scheduled
-   > job; see the amendment at the end of this ADR.
-6. **AI review is the review gate until a human co-maintainer exists.**
-   CodeRabbit (free for public repositories) reviews a PR on request; with
-   `request_changes_workflow: true` it approves once its unresolved comments
-   are resolved and the latest commit is reviewed. Public repositories under
-   10 stars never receive automatic reviews (CodeRabbit's documented anti-spam
-   threshold), so each PR is triggered with `@coderabbitai review` — one
-   command, not a review by hand. Scorecard counts the approval, closing the
-   last solvable gap. This is a deliberate trade: for a solo project an AI
-   second pass is better than no gate at all, and GitHub itself now sanctions
-   bot approvals. The admin bypass still exists, so the bot can never lock the
-   maintainer out.
+   It runs weekly in CI (issue #264), as `.github/workflows/fuzz.yml` — a
+   scheduled run plus `workflow_dispatch` that fuzzes for 300 s on a nightly
+   toolchain (cargo-fuzz requires nightly), restores and saves the corpus
+   through the Actions cache (a per-run key plus a shared `restore-keys` prefix,
+   since cache entries are immutable), and uploads crash reproducers as an
+   artifact. The target itself is unchanged.
 
-   > **Amended 2026-09-15**: the gate is now the OpenCode review workflow; see
-   > the amendment at the end of this ADR.
-   >
-   > **Amended 2026-10-04**: the gate is now the Codex Action review; see the
-   > amendment at the end of this ADR.
+   ClusterFuzzLite and OSS-Fuzz stay rejected: continuous fuzzing is recurring
+   infrastructure this one small parser does not need, and neither option buys
+   it anything the plain job does not, at a much higher cost. The Scorecard
+   argument runs the other way: the `Fuzzing` check detects the target itself
+   (it matches `libfuzzer_sys` in any `*.rs` file, `RustCargoFuzzer`), so it
+   flipped to 10 when the target landed (`a3003fa`, 2026-09-14) and reads the
+   same whether or not anything ever runs it (the published 2026-09-22 result
+   at `c83eedf` shows `Fuzzing` 10). Wiring the weekly job therefore changes no
+   score; it exists for the bug-finding value only. Do not adopt ClusterFuzzLite
+   to "fix" a check that the fuzz target already satisfies.
+6. **AI review is the review gate until a human co-maintainer exists.** For a
+   solo project an AI second pass is better than no gate at all, and GitHub
+   itself now sanctions bot approvals. The gate is the Codex Action; its policy
+   is `CONTRIBUTING.md` "Reviewing". This ADR owns the Scorecard consequence
+   only: that approval is what satisfies `main: review` for solo work, and it
+   closes the last solvable `Code-Review` gap. The admin bypass still exists, so
+   the bot can never lock the maintainer out.
 
 **Explicit no-s.** We are not pursuing the CII Best Practices badge (hours of
 self-attestation for at most +0.2), multi-organization `Contributors` (not
 something a project can honestly fix), human `Code-Review` before a second
 maintainer exists, or paid review tools. We also do not chase 9/10 with
 settings that misrepresent how the project is maintained. Expected trajectory:
-6 → ~8 once the changes and the two auto-healing checks land (the published
-result on 2026-09-14 was 7.5, with `Maintained` still 0 until the repository
-turns 90 days old); 10 is unreachable for a single-person, single-organization
-project without gaming the checks. The review-gate approval does count toward
+6 → ~8 once the changes land and `Maintained` heals (the published result on
+2026-09-14 was 7.5, with `Maintained` still 0 until the repository turns 90 days
+old); `SAST` stays 0 by design, and 10 is unreachable for a single-person,
+single-organization project without gaming the checks. The review-gate approval does count toward
 `Code-Review` today, but only because that check's implementation does not
-filter bot reviewers — see the 2026-09-15 amendment.
+filter bot reviewers — see Consequences.
+
+`SAST` is a deliberate no. CodeQL was retired (ADR-0064), so the check returns
+to 0 (no SAST tool detected); do not re-add a scanner for this check alone.
 
 ## Consequences
 
@@ -105,514 +111,18 @@ filter bot reviewers — see the 2026-09-15 amendment.
 - The provenance attachment depends on the attestation store read permission
   (`attestations: read`) and `gh attestation download` naming bundles by digest;
   the release workflow renames them per artifact.
-- CodeRabbit was removed on 2026-09-15 (see the amendments). Its repository
-  read access and approval voice are replaced by the review gate — OpenCode
-  until 2026-10-04, Codex Action since — which holds the workflow permissions
-  needed to publish the review and its approval.
 - The Scorecard number will be lower than its theoretical maximum by design.
   Do not "fix" the remaining zeros without revisiting this ADR.
-
-## Amendment (2026-09-15): the OpenCode review workflow replaces CodeRabbit
-
-The gate in item 6 is now `.github/workflows/opencode-review.yml` (PR #164,
-issue #163):
-
-- It reviews every non-draft in-repo PR on `opened`, `synchronize`, `reopened`
-  and `ready_for_review` with the OpenCode Go subscription and, on a clean
-  review, approves through `github-actions[bot]` — same approval, no manual
-  trigger.
-- The approval is deterministic: the model ends its PR comment with a
-  `PASS`/`FAIL` verdict line, and a separate step approves only on `PASS`, only
-  for the reviewed commit. A failed, missing or malformed review never approves.
-- The CLI is installed from a version-pinned release tarball and verified
-  against its SHA-256 digest (the composite action installs `releases/latest`,
-  so pinning the action would not pin the executed code), and the model runs
-  sandboxed: edits denied, bash limited to read-only `git`/`gh` verbs, and
-  `gh pr review` denied so the approval stays with the workflow's own step.
-- Fork PRs are skipped (they never see secrets). Dependabot PRs are skipped
-  too: `opencode github run` asserts the triggering actor is a collaborator,
-  and a bot actor fails that check before the model runs.
-
-Why CodeRabbit went away:
-
-- Its automatic reviews skip public repositories under 10 stars, so every PR
-  needed a manual `@coderabbitai review`.
-- Its free tier rate limits reviews (observed: `Next included review available
-  in 15 minutes` on PR #162), and a rate-limited attempt still consumes the
-  PR's slot.
-- Its `request_changes_workflow` veto blocked merges after the new gate had
-  approved (PR #164: `CHANGES_REQUESTED` at 01:34 and 01:45 against an approval
-  at 02:10, unblocked only when it re-reviewed at 02:18 — ~44 minutes of
-  waiting), and with `require_last_push_approval` every push makes both bots
-  re-review.
-
-Two Scorecard facts recorded while doing this:
-
 - `Code-Review` counts a bot approval because the check's implementation
   (`probes/codeApproved`) filters only *bot-authored changesets*, never bot
   reviewers, despite its documentation saying bot reviews do not count. The
-  published v5.5.0 result already shows this: 3/11 approved changesets with
-  CodeRabbit as the only non-author approver in the repository's history. Treat
+  published v5.5.0 result already shows this: 3/11 approved changesets with the
+  review gate as the only non-author approver in the repository's history. Treat
   that score as fragile: if the implementation ever matches the docs, the check
   returns to 0.
 - Merged Dependabot changesets that never receive an approval count against
   `Code-Review` (approved bot changesets are skipped entirely), so skipping
   Dependabot PRs in the gate has a small score cost. Worth revisiting only if
   the score matters more than the automation.
-
-## Amendment (2026-09-20): release PRs skip the review
-
-The gate also skips `release/*` PRs: the diff is a generated version-bump
-commit, the code it bumps was already reviewed on `main`, and the release cut
-merges with the admin bypass — so the missing approval changes nothing. Every
-other non-draft in-repo PR still gets the review the 2026-09-15 amendment
-describes.
-
-## Amendment (2026-09-22): the pbbp2 fuzzer runs weekly as a plain scheduled job
-
-Item 5 is amended: the `pbbp2` target is now wired into CI (issue #264), as
-`.github/workflows/fuzz.yml` — a weekly scheduled run plus `workflow_dispatch`
-that fuzzes for 300 s on a nightly toolchain (cargo-fuzz requires nightly),
-restores and saves `fuzz/corpus` through the Actions cache (a per-run key plus
-a shared `restore-keys` prefix, since cache entries are immutable), and uploads
-crash reproducers as an artifact. The target itself is unchanged.
-
-ClusterFuzzLite and OSS-Fuzz stay rejected: this is one small hand-written
-parser, and neither option buys it anything the plain job does not, at a much
-higher infrastructure cost. The Scorecard argument runs the other way, and is
-recorded here because this ADR originally listed `Fuzzing` as an open,
-actionable zero: the check detects the target itself — it matches
-`libfuzzer_sys` in any `*.rs` file (`RustCargoFuzzer`) — so it flipped to 10
-when item 5's target landed (`a3003fa`, 2026-09-14) and reads the same whether
-or not anything ever runs it (the published 2026-09-22 result at `c83eedf`
-shows `Fuzzing` 10). Wiring the weekly job therefore changes no score; it
-exists for the bug-finding value only. Do not adopt ClusterFuzzLite to "fix" a
-check that the fuzz target already satisfies.
-
-## Amendment (2026-09-30): the `SAST` check is a deliberate no
-
-CodeQL was retired (ADR-0064), so the `SAST` check — expected above to "heal on
-its own" once CodeQL's runs covered the sampled commits — returns to 0 (no SAST
-tool detected). That is now deliberate: the tool produced no true positive in
-~640 runs, and the credential class it kept flagging is covered by secret
-scanning with push protection. Add `SAST` to the "Explicit no-s" list; do not
-re-add a scanner for this check alone.
-
-## Amendment (2026-10-04): the verdict readback ignores the Codex trial's first-line marker
-
-The advisory Codex review trial (`.github/workflows/codex-review-trial.yml`,
-issue #516) posts under `github-actions[bot]` — the same identity the gate uses
-— while the gate approves by reading the *last* bot comment. Polling from the
-trial side cannot serialize against a gate already past its review post and
-before its verdict readback, so the gate now skips bot comments whose **first
-line** is `<!-- codex-review-trial -->`.
-
-The anchor is the first line deliberately. A substring match was tried first
-and failed in the trial's own reviews: the gate's free-form review quotes the
-marker when reviewing the trial workflow, so `contains` filtered out the
-gate's own comments too — no verdict was found and the gate stopped approving
-(and had a stale PASS comment matched instead, it would have approved a commit
-whose review said FAIL). First-line anchoring cannot be tripped by a quoted
-marker, because the trial always posts the marker as line one.
-
-The verdict contract is unchanged: the model ends its comment with a
-line-final `OPENCODE_REVIEW_VERDICT: PASS|FAIL`, and the step approves only on
-`PASS`, only for the reviewed commit. The filter only narrows which comments
-the readback may see. The trial is advisory and never approves; whether Codex
-replaces the OpenCode gate remains an open decision (issue #516).
-
-## Amendment (2026-10-04, superseding the marker filter): the Codex Action review is the gate
-
-The gate in item 6 is now `.github/workflows/codex-review.yml` (PR #518),
-replacing `.github/workflows/opencode-review.yml`: `openai/codex-action`
-(v1.12) runs Codex read-only on `gpt-6-luna` through the OpenCode Go
-subscription's Responses-compatible inference endpoint, with the two axes plus
-an adversarial pass rubric at `.github/codex/prompts/review.md`. The approval contract is
-carried over: a line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` in the review
-comment, approval only on `PASS`, pinned to the reviewed commit. This
-supersedes the 2026-09-15 amendment's OpenCode specifics (model, prompt
-injection, permission allowlist); the skips (fork, Dependabot, `release/*`)
-carry over. The local `/code-review` skill stays the author-side OpenCode
-two-axis pass — the CI gate is deliberately a different agent and model
-family, so the two are independent review signals.
-
-The advisory trial (issue #516, PR #517) is the evidence: nine review rounds
-at ~1.5 minutes per run, including a FAIL that caught a real defect in the
-gate's own comment filter. The trial-only plumbing is deleted with it:
-`.github/workflows/codex-review-trial.yml` and the `codex-trial` label.
-
-The approval readback no longer scans comments at all. The workflow posts the
-review via `gh api` and records the new comment's ID as a step output; the
-approve step fetches exactly that comment and approves only when its final
-line is `PASS`. That removes the last-comment scan whose interference the
-previous amendment's first-line trial-marker filter guarded against: with
-comment-ID anchoring no other comment can shadow or forge the verdict, so the
-marker rule dies with the trial workflow.
-
-The trial header recorded `pull_request_target` as the hardening to evaluate
-if Codex became the gate; this replacement keeps the `pull_request` + fork-skip
-trust model instead. Endpoint, key and read-only posture are unchanged from the
-trial: the Console inference API round-trips `gpt-6-luna` with the
-`OPENCODE_API_KEY` Go key, which stays inside the action's Responses proxy and
-never reaches the Codex step's environment. As before, a FAIL is a comment
-without an approval, never a `request-changes`.
-
-## Amendment (2026-10-05): the gate is pinned to codex-action v1.11 and salvages a completed review
-
-The v1.12 wrapper can hang **after** Codex has written its complete output — a
-surviving descendant keeps the runner's stdio open, so the action never returns
-and the job dies on its timeout with the result already on disk (upstream
-`openai/codex-action` #150/#169; the wrapper fix, #151, is unreleased). On a
-heavy PR (spec #523's batch, ~236k tokens) the gate failed three times that
-way; one run had already written a complete `CODEX_REVIEW_VERDICT: PASS` that
-the hang discarded.
-
-`.github/workflows/codex-review.yml` therefore pins the action to **v1.11**
-(from the 2026-10-04 amendment's v1.12), whose wrapper handled the same heavy
-workload cleanly, and bounds the Codex step (12 minutes, `continue-on-error`)
-so a stall cannot burn the job. Its output is published only when complete —
-the last non-blank line must end with the verdict marker, markdown emphasis
-tolerated — through the shared parser the workflow writes from its own text
-into `$RUNNER_TEMP` (never sourced from the reviewed tree, which may predate
-it — #527 discarded a completed review that way), which `cargo test -p xtask
-codex_gate` extracts and exercises; trailing blank lines (a CRLF tail
-included) are trimmed so the verdict stays the comment's final line. Approval
-is stricter than publication: the marker must stand on its own line (emphasis
-tolerated), so a review that merely quotes the marker while blocking the
-change is published but never approved. A same-job retry was considered
-and rejected: the action's drop-sudo safety strategy removes passwordless sudo,
-so a second invocation in the job cannot start. Revisit the pin when the
-wrapper fix (#151) ships; the salvage stays useful against stream drops
-regardless (#530).
-
-## Amendment (2026-10-07): the review prompt carries its linked issues, and the check mirrors the verdict (#555)
-
-The gate's spec discovery was body-only and silent: the prompt fetched the PR
-body's *first* `(Closes|Fixes|Resolves|Refs|Part of) #N` reference, and a body
-that had lost its keyword produced an issue-less prompt with no marker that
-anything was missing. PR #554's first review then had to infer the spec's
-number from an ADR and failed with "spec review incomplete" — a FAIL about the
-handoff, not about the code.
-
-The workflow now collects references from the PR body **and** the commits'
-`Refs:` trailers (`git log <base>..<head>`), deduplicated, body references
-first, capped at `CODEX_MAX_LINKED_ISSUES` (8; overflow is listed by number
-without its body), and fetches each one before the Codex step runs. Zero
-references, or a reference that cannot be fetched, fails the workflow with an
-`::error::` annotation: the sandboxed reviewer has no network and no token, so
-what the prompt does not carry does not exist — and a review that never saw a
-spec must not look complete. `edited` joins the trigger types so a body
-correction that adds the missing reference re-runs the gate by itself. The
-collector is written from the workflow into `$RUNNER_TEMP` like the verdict
-parser, and `cargo test -p xtask codex_gate` extracts and exercises both.
-Giving the sandbox the token back (the OpenCode gate's posture, where the
-reviewer ran `gh issue view` itself) was rejected: it re-opens the
-prompt-injection surface the Codex migration closed; the prefetch is the seam.
-
-The approve step now fails when the readback verdict is not `PASS` (the
-head-moved case still exits clean): `gh pr checks`'s green/red mirrors the
-verdict instead of always reading green, while the no-`request-changes`
-contract is untouched — a FAIL is still a comment without an approval, and the
-approval remains the merge gate (`review` is not a required check; the
-approval is).
-
-## Amendment (2026-10-09): the author-side review gains the gate's adversarial pass
-
-The 2026-10-04 amendment kept the adversarial pass in CI alone so the two
-signals stayed independent. The measured cost of that split is the review
-round-trip: every push re-runs the gate's full-base adversarial review
-(`.github/workflows/codex-review.yml`, `git diff <base>...<head>`), a fix grows
-the diff, and the next run finds the new surface. Across the gate's first five
-days the merged PRs carried ~3.8 FAIL rounds each against ~0.4 under the
-OpenCode gate, and PR #609's eight rounds each named a genuinely *different*
-missed requirement (#603/#606/#607) — while several of its tests still passed
-with the change reverted. The size hypothesis does not hold: a 76-line
-agents-only PR drew six rounds where an 8.5k-line feature had drawn none.
-
-The repo therefore adds a local companion, `/adversarial-review`
-(`.opencode/skill/adversarial-review/SKILL.md`), run *alongside* `/code-review`
-before the PR — the pair invoked together at **every** review point
-(`docs/agents/flow.md`): a ticket window, the whole branch, a fix round,
-never the adversarial pass alone. The upstream `/implement` and
-`/implement-spec` skills are never forked (PR #601's policy); the binding in
-`AGENTS.md` and `flow.md` supersedes their single `/code-review` step. It
-authors no rubric of its own: it lifts the pass and its rules verbatim from
-`.github/codex/prompts/review.md`, so the local pass and the gate cannot drift.
-This deliberately spends the independence the 2026-10-04 amendment bought —
-the author-side review now shares the gate's lens (and, with `code-reviewer` on
-`gpt-6-luna`, its model family) — in exchange for far fewer review round-trips.
-The gate stays the independent final run (a fresh sandbox, its own execution),
-and the two axes stay a separate report from the adversarial pass, exactly as CI
-keeps them.
-
-Who runs it is fixed by the agent permissions, not preference: `implementer` and
-`merger` deny `subagent`, so only the orchestrating session can dispatch the
-read-only `code-reviewer`, and the reviewer is never the author. Fixes return to
-an implementer (`docs/agents/flow.md`): the originating session for a
-ticket-local finding, a fresh one for a cross-ticket finding, with the merger
-landing the result and the pass re-run at that same scope.
-
-## Amendment (2026-10-14): the gate reaches Go through the Go provider endpoint
-
-The 2026-10-04 amendment pointed the Codex action's Responses proxy at Console's
-inference endpoint (`https://opencode.ai/inference/openai/v1/responses`). That
-surface is served under the `opencode` provider slug, so the gate's own usage
-was reported as `opencode/gpt-6-luna` in the OpenCode Go usage report — beside
-the author-side `/code-review` pair's `opencode-go/gpt-6-luna` — even though the
-same Go key paid for both. The endpoint moves to the Go provider's own
-Responses-compatible path, `https://opencode.ai/zen/go/v1/responses`, so the
-gate's usage is attributed to `opencode-go`.
-
-Nothing else about the model changes: `gpt-6-luna` is the same model on both
-paths, and the action's Responses proxy (`codex-responses-api-proxy`) forwards
-every request header except `Authorization` and `Host`, so Codex's native
-session header — which Go recognizes — reaches the endpoint. Verified locally
-end-to-end: Codex 0.160.0 through the action's proxy against
-`/zen/go/v1/responses` completes a review request. `CONTRIBUTING.md`'s
-"Reviewing" section and the workflow header name the new endpoint.
-
-## Amendment (2026-10-16): the gate moves to codex-action v1.13
-
-The 2026-10-05 amendment pinned the gate to **v1.11** and said to revisit the
-pin when the wrapper fix shipped. The community wrapper fix
-(`openai/codex-action#151`) is still open upstream, but OpenAI shipped its own
-equivalent in **v1.13** (2026-10-05): the post-exit output drain is bounded to
-five seconds and the action tears down its own pipes, so a descendant that
-outlives the direct Codex child can no longer keep the runner's stdio open —
-the exact #150/#169 failure. v1.13 also restores the runner's service sockets
-under Linux `drop-sudo` (v1.12's rewrite chmodded root-owned `/run` sockets,
-the community's #160, independently sufficient to kill a run), and its
-`drop-sudo` now requires `setfacl`; GitHub's `ubuntu-latest` image ships the
-`acl` package (`setfacl` 2.3.2 on `ubuntu-24.04`).
-
-`.github/workflows/codex-review.yml` therefore pins **v1.13**
-(`bdf19a4a223ec2549a3e2274a0cf61556bc07675`), and the `xtask` guard
-(`codex_gate::tests::the_workflow_uses_the_shared_scripts`, which asserts the
-step's `uses:` SHA so a group bump cannot silently revert the pin) moves its
-expected SHA with it. Everything the previous amendment installed stays: the
-Codex step's 12-minute bound with `continue-on-error`, and publication only
-through the parser the workflow writes into `$RUNNER_TEMP`. The bump does not
-widen the hang's blast radius — a recurrence still costs one bounded run and
-salvages a completed review through that parser.
-
-The frozen v1.11 SHA had also become a standing red: `.github/dependabot.yml`
-proposes every action in one `github-actions` group, so each group PR carried
-the pinned SHA's bump and failed `cargo test -p xtask` until the guard's
-expected SHA moved with it (PR #713, the bump to v1.13 this amendment lands).
-The guard's job is to make that move deliberate — this is that deliberation —
-not to freeze the pin against every future release.
-
-## Amendment (2026-10-17): the gate's provider is workflow configuration, not an ADR pin
-
-The 2026-10-04 and 2026-10-14 amendments named the gate's provider, endpoint and
-model, and that specificity aged badly: the metered allowance behind it ran out,
-so a gate whose provider was an ADR decision produced no review at all until the
-record itself was rewritten.
-
-The gate's **provider, endpoint, model and secret** are therefore workflow
-configuration, recorded in `.github/workflows/codex-review.yml` (the step's own
-comment carries the current choice) and deliberately not pinned here or in
-`CONTRIBUTING.md`; both describe the gate generically. This supersedes the
-provider specifics of the 2026-10-04 and 2026-10-14 amendments, which stay in
-place as the historical record of what the gate ran on.
-
-What this ADR pins is unchanged: the Codex Action, the two axes plus adversarial
-rubric, the read-only posture, the line-final `CODEX_REVIEW_VERDICT: PASS|FAIL`
-contract, approval only on `PASS` and pinned to the reviewed commit, and the
-skips (fork, Dependabot, `release/*`). Swapping the provider is a workflow change
-that CI has to prove, not a decision-record change.
-
-## Amendment (2026-11-07): the gate's provider is repository configuration
-
-The 2026-10-17 amendment left the provider, endpoint, model and secret as
-workflow configuration and required a workflow diff to swap them. The
-2026-11-06 forced move showed the cost: the Go lane's monthly allowance was
-spent, and a gate whose provider could only change by a commit left every PR
-un-reviewable until that commit landed.
-
-The gate's effective provider is therefore **repository configuration**:
-`vars.GATE_ENDPOINT` and `vars.GATE_MODEL`, with the provider key in the
-`GATE_KEY` secret (falling back to `DEEPSEEK_API_KEY`). The workflow records the
-defaults — DeepSeek's native Responses API and `deepseek-flash` — and the xtask
-gate tests pin them, so the checked-in policy stays visible and testable. This
-supersedes the 2026-10-17 amendment's "swapping the provider is a workflow
-change" sentence only; its other rules (the provider is not an ADR pin, and the
-workflow's comment is the record) stand.
-
-A swap **among Responses providers that accept a bearer token** is now a
-repository-settings change with no workflow diff, and it still fails loudly: the
-credential preflight names the endpoint and the HTTP status, and the review step
-reads the same values, so a bad switch cannot silently produce a review from a
-different lane. A lane that needs an extra request header — the Go lane's
-`x-opencode-session`, removed from the preflight with the 2026-11-06 move — is
-not covered by the switch and still requires a workflow change.
-
-## Amendment (2026-11-18): the gate returns to the Go lane on gpt-6-luna
-
-The Go lane's monthly allowance is available again, so the gate returns to
-`https://opencode.ai/zen/go/v1/responses` on `gpt-6-luna`, with the workspace's
-`OPENCODE_API_KEY` (the `GATE_KEY` secret still overrides). The 2026-11-07
-amendment's switch stays: the endpoint, model and key are repository settings,
-and the workflow's comment records the defaults.
-
-The move is a workflow change, as the 2026-11-07 amendment required: the
-credential preflight sends the Go lane's `x-opencode-session` header again
-(400 `MissingSessionID` without it), and an xtask guard asserts it. The gate
-shares the plan with the author-side `/code-review` pair, so both consume the
-same allowance — the reason the pair now runs on `glm-5.3-flash` instead of
-`gpt-6-luna`.
-
-## Amendment (2026-10-17): a repo-local skill may shadow its upstream
-
-The 2026-10-09 amendment recorded that the upstream `/implement` and
-`/implement-spec` skills "are never forked" (PR #601's policy), and held cola's
-divergences in `AGENTS.md` / `docs/agents/flow.md` prose. That clause is
-**superseded**. A divergence whose home is prose is *ambient* — it sits in every
-context window and is diluted — where a skill is *invoked*, loading exactly when
-the flow reaches it.
-
-A repo-local skill under `.opencode/skill/<id>/SKILL.md` therefore **shadows**
-the global `~/.agents/skills/<id>/SKILL.md`: OpenCode loads both into one map
-keyed by id, project sources after global ones, so the later write wins (verified
-live 2026-10-17 on `caveman` — the project file replaced the global one, and
-removing it restored the global one). The rule for *which* skills may shadow, and
-how a shadow is maintained, is `docs/agents/skills.md`:
-
-- **compose** — a *pure addition* shadows with a thin skill that reads the
-  upstream file at runtime and adds the delta. `/code-review` composes upstream's
-  two axes with `/adversarial-review`, so a review point cannot run one axis
-  alone, and leaves upstream's internals to flow through.
-- **fork** — a change to upstream's *own steps* owns the text. `/implement-spec`
-  lands linearly, never by a merge commit. Every shadow carries a pin: a verbatim
-  snapshot of the upstream `SKILL.md` at `docs/agents/upstream/<id>.md`, which
-  `/upgrade-skills` diffs against upstream and a fold refreshes.
-
-Because a shadow hides `~/.agents/skills`, an upstream update is invisible until
-diffed deliberately — so the layer ships its own fold, `/upgrade-skills`, and a
-stale shadow is a review finding rather than silent drift.
-
-What this ADR pins is unchanged: the Codex Action, the two axes plus adversarial
-rubric, the read-only posture, the line-final `CODEX_REVIEW_VERDICT: PASS|FAIL`
-contract, approval only on `PASS` pinned to the reviewed commit, and the skips.
-The pair stays the repo's review pass — `/code-review` now *carries* both the axes
-and the adversarial pass in one skill, still never one alone — and the author-side
-model sharing the gate's lens (the 2026-10-09 trade) stands.
-
-## Amendment (2026-11-17): the gate has a blocking definition and a three-round budget
-
-The 2026-10-09 amendment bought fewer round-trips by sharing the gate's
-adversarial pass with the author-side pair, but the gate's own prompt still
-asked for every finding and defined nothing as blocking. PR #1067 (spec #1057)
-spent **39 gate rounds** on a 20k-line, 100-commit diff — 37 FAIL against 2 PASS
-— and 76 of its last 100 commits are `fix`; nothing stopped the loop but the
-model running out of findings. That is the convergence failure reported upstream
-(`openai/codex#51247`, `#42130`, `#38375`), and OpenAI's own GitHub review is
-narrower by design: it flags only P0/P1.
-
-`.github/codex/prompts/review.md` now carries the definition ("What blocks the
-merge"): blocking is a concrete input, state, or timing the diff newly fails; an
-unmet acceptance criterion of a linked issue the PR closes (`Closes`/`Fixes`/
-`Resolves`, not `Refs`); a regression the PR introduces; or a silent
-contradiction of an accepted ADR. A failure on a changed path is blocking unless
-the diff is shown neither to create nor make it newly reachable — it is not moved
-to the backlog — while unchanged code never becomes a blocking finding.
-Pre-existing defects that the diff neither creates nor makes newly reachable,
-out-of-scope suggestions, naming and style, speculative edge cases, "could add a
-guard", and tests for impossible inputs are non-blocking, listed under `Backlog
-(non-blocking)`, and never decide the verdict. Adding a guard for an input that
-cannot occur is itself a non-blocking finding. The gate reports at most 3
-blocking and 5 non-blocking findings in full, marks a security or data-loss
-finding the diff introduces or makes newly reachable `critical` (exempt from the
-limits, and blocking — a pre-existing security finding is non-blocking like any
-other pre-existing defect), and lists any held-back blocking findings as
-one-line stubs (`file:line` and one clause) so the cap loses no blocking
-finding. The issue's "always allowed" is read as "always allowed to exceed the
-cap": a security finding the diff does not introduce or make newly reachable is
-non-blocking like any other pre-existing defect. The completeness rule keeps "a
-missing or failed part of the review is a blocking finding" and defines the parts as reading the diff and the PR
-metadata and checking each claimed criterion the diff, the metadata or the
-appended issues can decide: an unreadable diff fails the review, an issue named
-only by number or a criterion about an artifact outside them (a comment, a
-tracker entry, a later measurement) is not one the review can check, an absent
-optional tool does not fail it, and the host-tree exemption stands. A criterion
-the linked issue itself defers to later work is satisfied by the PR body's
-`## Deferred findings`, not treated as uncheckable.
-
-`CONTRIBUTING.md` ("Reviewing"), `docs/agents/flow.md` and `/implement-spec`
-carry the **three-round gate budget**: round 1 discovers; rounds 2–3 verify the
-remediation and the paths it directly touches, with the author assembling the
-fix and the gate re-reading the whole diff (it has no round history); when round
-3 still raises blocking findings, they are fixed in one push that needs the
-user's explicit approval; a `critical` security or data-loss finding is fixed
-and pushed in its own round first, without waiting for that approval, and does
-not use up the approved verification round. Only non-blocking and
-out-of-scope findings, and pre-existing defects the diff neither creates nor
-makes newly reachable, may be deferred, into the dossier; a
-blocking finding is never deferred. Whenever the loop ends, a non-empty deferred
-list becomes a follow-up issue linked from the dossier, a round-3 PASS included.
-If the gate still FAILs after that round,
-the agent stops and hands the PR to the user: further rounds need their
-approval, and the admin bypass or closing the PR is theirs to decide. The budget
-counts every gate run that posts a review — a non-draft push, a non-draft
-`opened`, the `ready_for_review` flip that spends a draft's first review, an
-`edited` body re-run, or a `reopened` run; a run that fails before the model (an unfetchable reference, a credential
-failure) posts none and is not a round, and the agent never re-runs the gate on
-an unchanged head to fish for a different verdict; a push after a PASS for a real
-finding or a required rebase is a round like any other. The local pair and the gate
-rehearsal keep their no-round-cap rule **(superseded by ADR-0034 (2026-11-18):
-the local gate rehearsal is removed; the pair keeps its rule — see the
-amendment at the end.)**, and non-blocking findings are answered or deferred,
-not fixed. The dossier is a PR comment whose first line is
-`<!-- gate-dossier -->` — the rounds spent and the deferred findings — updated
-with `gh api --method PATCH` after each round. A comment does not trigger the
-gate, so the record never spends a round or re-reviews an approved or handed-over
-head. A deferral of an acceptance criterion the issue itself names goes in the
-body's `## Deferred findings` when the PR opens, so the gate can see it.
-
-The two axes and the adversarial pass are unchanged; the amendment adds a
-severity policy to the rubric. What this ADR pins is otherwise untouched: the
-Codex Action, the read-only posture, the line-final
-`CODEX_REVIEW_VERDICT: PASS|FAIL` contract, approval only on `PASS` pinned to
-the reviewed commit, and the skips. The verdict parser is unchanged, so this is
-a rubric and process amendment, not a contract change.
-
-## Amendment (2026-11-18): the local gate rehearsal is removed
-
-The local `codex exec` rehearsal added by #1053 did not reduce the CI gate's
-rounds: #1072, a docs-only PR with +245/−46 and 11 files, ran it repeatedly and still
-spent nine gate rounds and 32 commits. It is removed from `/implement-spec`, `flow.md`,
-`CONTRIBUTING`, `adversarial-review` and the Codex adapter
-(`.codex/skills/cola-implement-spec/SKILL.md`); the CI gate remains the single
-**approving** reviewer, and the three-round budget above still bounds it. The
-local pair keeps its no-round-cap rule.
-
-## Amendment (2026-11-21): gate rounds run autonomously until a stop predicate
-
-The 2026-11-17 amendment's three-round budget ended in a synchronous approval
-from round 4. That assumed the maintainer is at the keyboard: a gate round costs
-~10–15 minutes (#1110 measured a 10–12-minute floor), while the approval wait is
-unbounded, so an absent maintainer turned a bounded review into an hours-long
-stall — worse total wall time than simply continuing. The round count was also a
-poor proxy for a bad gate: #1105 found 206 of 210 findings (98%) across 257 gate
-reviews were real defects, and rounds do not track diff size (#1047: 47 rounds
-on a 157-line diff; #1072: 9 gate rounds, 8 FAIL, on a 291-line docs-only
-diff).
-
-The round-3 approval is replaced, in #1145, by autonomous rounds plus five stop
-predicates whose home is `CONTRIBUTING.md` "Reviewing": a design-level finding;
-oscillation (a fixed finding reappears, or the same failure mode — the same
-rule, not merely the same category — appears at a new site in two consecutive
-rounds); non-convergence (the blocking count does not fall across two rounds,
-counting only findings the previous fix did not introduce); harm (the fix would
-leave the code worse than the defect — over-defensive code, an impossible-input
-guard, an unreachable-state test, or deleting or replacing a real design); and
-a six-round backstop (a round that fixes a critical security/data-loss finding
-does not count, and the sixth round's fix gets one final verification push). A
-round never waits for the user. On a stop the agent writes the matched predicate
-and the remaining findings into the dossier, leaves the PR at its head and hands
-it over; further rounds are the user's decision, and merging stays human.
-
-The blocking definition, the 3 blocking / 5 non-blocking finding cap, the
-line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` parser and the per-commit approval
-are unchanged. This amendment supersedes the three-round budget and the round-3
-approval in the 2026-11-17 amendment; the rest of that amendment stands.
+- CodeQL's retirement (ADR-0064) returns `SAST` to 0: that is the deliberate no
+  above, not a regression to fix.
