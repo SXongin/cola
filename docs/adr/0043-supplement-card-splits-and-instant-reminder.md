@@ -1,609 +1,276 @@
 # Supplement-triggered Card Chain splits and Instant Reminder pinning
 
-> **Amended by ADR-0109 (2026-11-18)**: "Every supplement splits" holds for a
-> supplement that merged, and for a failed one only while a held guard still
-> owns the chain. The failed continuation carries
-> 「⚠️ 补充消息未确认送达，请留意当前回复」 instead of the receipt, and no separate
-> notice repeats it; a failed supplement that lost the guard keeps the chain and
-> reports a plain notice (#1056).
-
-Feishu cannot move a message: a card update (PATCH) leaves the card where it
-was sent, and the conversation-list preview always shows the newest message.
-A user message sent while a Turn is in flight (a **Supplement**) therefore
-lands *below* the live card, and the old text acknowledgement
-(「📨 已收到补充…」) only added a second message below it — the reader's
-viewport drifts away from the streaming card with nothing they can do. This
-ADR reuses the existing **Card Chain** for position as well as size (a
-Supplement forces a split, so the continuation card is the newest message),
-keeps the render loop alive across a supplement that starts a new Turn (today
-that reply is rendered nowhere), and adds Feishu's **Instant Reminder** to pin
-the conversation while a Turn needs attention.
-
-> **Amended by ADR-0059**: the inflight guard now covers the out-of-turn
-> follow — a message arriving during a follow is a Supplement that continues
-> the chain, not a normal new Turn. This supersedes the 2026-09-24 amendment's
-> "the inflight guard is released, so the next message is a normal new Turn"
-> and its rejected alternative "not releasing the guard while busy": that
-> rejection assumed the 10-minute bound owned the turn's ending, but with no
-> total budget the follow owns it, and holding the guard is what keeps a long
-> run one coherent story (ADR-0059). ADR-0059 also gives a Turn whose
-> Background Tasks are live the waiting disposition (等待后台任务) and renders
-> Wakes as continuation cards.
+> **Amended by ADR-0059, ADR-0074 and ADR-0109**: the inflight guard covers the
+> Turn's whole post-prompt path — a message arriving during the now-merged
+> follow is a Supplement, and the Turn's own task owns the unbounded path — and
+> a failed Supplement splits only while a held guard still owns the chain. The
+> earlier hand-off that passed the card to an out-of-turn follow at a bound is
+> gone (ADR-0074): the no-total-budget conclusion stands, and the Turn owns the
+> whole path.
 >
-> **Amended by ADR-0074**: the post-prompt drain is one unbounded path owned by
-> the Turn's own task. The 2026-09-24 "the drain bound hands the card to an
-> out-of-turn follow" and the 2026-09-28 grace amendment below describe a
-> follow that no longer continues the post-prompt path; the no-total-budget
-> conclusion stands, but the Turn owns the whole path. See the amendment at the
-> end.
+> **Amended by ADR-0100 (2026-11-06)**: `/card` always answers — with no renderer
+> owning the card it reads the session once and posts a read-only Session Card —
+> and a pending request's Message Pin loses its claimed-snapshot host arm.
 
 ## Context
 
-- **Updates don't move, sends do.** The only way to put the live card back at
-  the bottom is to send it again as a new message. The Card Chain already does
-  exactly that when a card overflows: the filled card is finalized with a
-  「部分完成，继续中」 header and a continuation card takes over.
+Feishu cannot move a message: a card update (PATCH) leaves the card where it was
+sent, and the conversation-list preview always shows the newest message. A user
+message sent while a Turn is in flight (a **Supplement**) therefore lands *below*
+the live card, and the old text acknowledgement (「📨 已收到补充…」) only added a
+second message below it — the reader's viewport drifts away from the streaming
+card with nothing they can do. This ADR reuses the existing **Card Chain** for
+position as well as size (a Supplement forces a split, so the continuation card
+is the newest message), keeps the render loop alive across a supplement that
+starts a new Turn, and adds Feishu's **Instant Reminder** and **Message Pin** to
+keep the conversation and the waiting card in view.
+
 - **A Supplement is not a Turn.** `handler.rs` intercepts a message whose
   session has a Turn in flight and forwards it via `prompt_async`; the Backend
   merges it into the running Turn if that loop is still alive, or starts a new
   Turn if it has already exited. Cola cannot tell which at send time, and the
   answer does not change what the user should do.
-- **The new-Turn case renders nowhere today.** The turn's render loop has
-  exited by then, and external-message sync skips Cola-Authored Messages
-  (ADR-0026) — so a supplement that starts a new Turn silently loses its
-  reply. Observed by the Host before this design.
-- **Commands land below the card too.** Commands are dispatched before the
-  busy check (`handler.rs:328`) and answer with their own message/card. They
-  are the interaction the user is performing right now; displacing them with a
-  re-sent live card would fight the user.
+- **The new-Turn case rendered nowhere before this ADR.** The turn's render loop
+  had exited, and external-message sync skips Cola-Authored Messages
+  (ADR-0026), so a supplement that started a new Turn silently lost its reply.
+- **Commands land below the card too.** They are dispatched before the busy
+  check and answer with their own message/card; they are the interaction the
+  user is performing right now, so displacing them with a re-sent live card
+  would fight the user.
 - **Feishu's list layer offers two things.** An app feed card
   (`im:app_feed_card:write`) is a *separate* list entry whose only link is a
-  plain https URL; the chat-open AppLink takes `openChatId` only — there is no
-  message parameter, and no OpenAPI yields a message-specific link. Instant
-  Reminder (`time_sensitive`) instead pins an existing conversation (group
-  `feed_cards/:chat_id`, bot p2p `feed_cards/bot_time_sentive`) but carries no
-  reason text.
+  plain https URL (the chat-open AppLink takes `openChatId` only, so no
+  message-specific link exists), and Instant Reminder (`time_sensitive`) pins an
+  existing conversation but carries no reason text.
 
 ## Decision
 
-- **A Supplement splits the Card Chain.** The continuation card is the reply
-  to the supplement message, carries the accumulated card, and becomes the
-  live card; the previous card is finalized with the standard split header.
-  No new concept, no new card type, no recall.
-  **Superseded by the 2026-09-19 amendment below: the continuation carries
-  only the delta, not the accumulated card.**
-- **No text acknowledgement.** The continuation card records the supplement
-  with a receipt line (「📨 已收到补充」). The wording is neutral: merge vs.
-  new Turn is only observable after the fact, and both outcomes end with the
-  reply rendered on the continuation card, so the receipt is always true.
-  Every supplement splits — no coalescing window.
-- **Commands never split the chain.** Their replies are what the user is
-  looking at; inserting the live card below them would push them away.
-- **Keep rendering after the prompt call returns.** The render loop stays
-  alive while the session is still running or an unanswered Cola-Authored
-  supplement is newer than the turn anchor, and renders into the live
-  (continuation) card. This closes the new-Turn gap for both merged and
-  split cases.
-- **Pin the conversation while attention is needed.** Instant Reminder is
-  enabled while a Permission/Question is pending, and for a Turn running past
-  a threshold (60 s default); it is cleared when the wait resolves. A
-  completed long Turn stays pinned for a short TTL (2 min default) so someone
-  waiting elsewhere still catches the end — unless a new Turn starts first: a
-  new Turn means the user is active again, so its `begin_turn` releases the
-  previous turn's TTL hold immediately (a Pending hold survives; the user
-  still owes an answer). Pinning is best-effort: failures log only, a missing
-  scope disables nothing else, and p2p/group share the logic.
-- **Pins are generation-scoped and in-memory.** Every pin carries the turn
+### A Supplement splits the chain
+
+- **A Supplement splits the Card Chain.** The continuation card is the reply to
+  the supplement message, carries the delta, and becomes the live card; the
+  previous card is finalized with the standard split header. No
+  new concept, no new card type, no recall. The split is a **delta handoff**,
+  exactly like a size split: the previous card is finalized with everything
+  before the split, and the continuation carries its receipt line plus only the
+  content that arrives after it. The newest card is therefore not
+  self-contained — accepted, because the cards are adjacent messages and reading
+  them in order is the normal path.
+- **No text acknowledgement.** The continuation records the supplement with a
+  receipt line (「📨 已收到补充」). The wording is neutral: merge vs. new Turn is
+  only observable after the fact, and both outcomes end with the reply rendered
+  on the continuation card, so the receipt is always true.
+- **A merged supplement always splits** — no coalescing window. A failed steer
+  is the exception (ADR-0109): a merge attempt that fails
+  is unconfirmed, so if a held guard still owns the chain it splits and the
+  continuation carries 「⚠️ 补充消息未确认送达，请留意当前回复」
+  (`SplitKind::SupplementFailed`); a race that lost the guard keeps the chain and
+  reports a plain notice — a continuation would be a live card handed to nobody.
+  The split's admission re-checks the card's state under the same lock an ending
+  is applied with, so a Turn that settles between the ownership read and the
+  split either stamps the continuation or is seen as terminal and refuses it. A
+  merged steer whose chain ends in that window reports 「补充消息已提交，但当前卡片
+  无法继续」, never silently. Both messages say **unconfirmed**, never
+  undelivered: an ambiguous Codex response may still have landed and keeps its
+  marker for reconciliation (ADR-0092), so cola must not invite a resend.
+- **Commands never split the chain.** Their replies are what the user is looking
+  at; inserting the live card below them would push them away.
+- **Keep rendering after the prompt call returns.** The render loop stays alive
+  while the session is still running or an unanswered Cola-Authored supplement
+  is newer than the turn anchor, and renders into the live (continuation) card.
+  This closes the new-Turn gap for both merged and split cases. The post-prompt
+  path is one unbounded loop owned by the Turn's own task (ADR-0074): there is no
+  hand-off and no total budget, the inflight guard is held for the whole path,
+  and the one grace bounds only the states where nobody can act — lost contact,
+  an unreconcilable live panel on an idle Session, and the unreceived waiting
+  line. A readable, merely-long run is never clocked: a bound reached with the
+  session still running is not completion. A wait is unbounded by construction —
+  the accumulator's awaiting state keeps naming it and the follow never consults
+  the pending records — and `/stop` rejects the requests it leaves behind
+  (ADR-0038 rule 7). The follow remains only for the paths
+  with no Turn task of their own (the recovery re-attach and the Wake
+  continuation); it lives in the Turn (`turn/follow.rs`), not the
+  external-renderer arming path, because the card, its chain and its accumulator
+  are the Turn's own state (ADR-0050) and a fresh accumulator would drop the
+  continuation card. A new Turn (or an external arming) replaces the accumulator
+  and the follow exits on its next tick, the same replacement guard the external
+  render loop uses. The render loop keeps the **topic cover** current, syncing
+  it whenever the server title changes.
+
+### The stop terminal
+
+`CardState::Stopped` (header 「⏹ 已停止」, grey) is the deliberate stop's own
+terminal, neither 完成 nor 出错.
+
+- **It is terminal everywhere.** It is terminal for every running/probe check
+  (`is_running`, the `/card` pull, the header phase timer), so a stopped card is
+  never treated as live; it is excluded from the awaiting override (a
+  still-pending block cannot restyle it) and renders no retry button.
+- **A terminal header wins over the awaiting override.** Error / Done / Stopped
+  take precedence over the header's 「等待你的授权/回答」, so a dead card never
+  reads as waiting for anyone.
+- **The abort is not a failure.** The server records the interrupt as an error on
+  the turn's transcript; a turn whose session carries the stopped marker
+  (`waits.stopped_sessions`) is classified `Stopped` and that error text is never
+  written to the card. A stopped turn rejects its leftover pending
+  Permission/Question requests (ADR-0038 rule 7) even when the stop recorded no
+  error text, because the abort strands whatever was pending.
+- **Both finalization paths classify by the marker**: `finish` for the in-turn
+  path — which also never hands a stopped card to the follow — and the
+  out-of-turn follow's stop branch, which closes the card promptly after one last
+  render of the abort's settled tool states. Each re-reads the marker at its last
+  await boundary, so a stop that lands while a tick or a finalization is in
+  flight still wins. The stop command records the marker BEFORE the interrupt
+  round-trip (rolling back only a marker that call itself inserted, when the
+  interrupt fails), so the abort's own server-side settling cannot beat the
+  marker.
+- **The completion notice follows the card's real terminal**: 「⏹ 已停止。」,
+  never 完成 or 出错. Both fallback endings take the Error notice, and a run
+  still going server-side is never announced as complete.
+
+### Reminders and pins
+
+- **Pin the conversation while attention is needed.** Instant Reminder
+  (`time_sensitive`) is enabled while a Permission/Question is pending and
+  cleared when the wait resolves. Pin surfaces are for **waiting**, not for
+  running turns: a blocked request must stay pinned until a human acts — that is
+  a state and cannot be missed the way a message can. A long Turn needs no
+  attention while it runs, and its end is an **event**, delivered as a new
+  message: the **Completion Notice**, a reply to the prompt (p2p: only when the
+  turn ran at least 5 minutes, `LONG_TASK_NOTICE_MS`, opt-in
+  `[bridge] long_task_notice`, no @ mention; groups: every turn, `[bridge]
+  group_completion_notice`, @-mentioning the requester), sent under ADR-0074's
+  delivery gate and repaint delay. The long-turn class — the silence threshold
+  and clock (`note_interaction`), the completion TTL, `CompletionPin`, the
+  card's 「取消置顶」 button and the `ReminderReason` set — is removed with it: a
+  live pin now always means a pending wait.
+- **Pinning is best-effort**: failures log only, a missing scope disables nothing
+  else, and p2p/group share the logic.
+- **Pins are generation-scoped** (in memory): every pin carries the turn
   generation that owns it, and a clear from an older generation is a no-op
-  against a newer turn's pin — so a stale clear (the long-turn TTL timer) can
-  never unpin the turn that superseded it. The threshold timer and the turn's
-  completion are decided under the pin lock: whichever runs first wins, so a
-  completion racing the threshold either makes the timer a no-op (a short turn
-  never pins) or keeps the live pin for the TTL — never both, never a leaked
-  pin. The release a new Turn issues passes the live pin's own generation, so
-  the guard protects against stale timers, not against the newer turn itself.
-  The state is not reconciled at startup: a pin orphaned by a crash or
-  restart is cleared on the Chat or Topic's next turn (self-healing), never a
-  permanent pin.
+  against a newer pin, so a stale clear can never unpin the wait that superseded
+  it.
+- **Pins are persisted.** Each live pin is mirrored to a small file beside
+  `sessions.json` as `{chat_id, is_group, user_ids}` — `user_ids` because
+  clearing an app reminder needs the target user (p2p clears
+  `feed_cards/bot_time_sentive`), not just the chat — written atomically when a
+  pin lands and removed when the clear is confirmed. On startup cola best-effort
+  clears every recorded pin, then drops only the entries whose clear succeeded; a
+  failed clear stays for the next startup, and the next-turn self-heal remains
+  the second net. A pin cola never sees again (app uninstalled, tenant gone)
+  stays — that is app-controlled platform state, and the user guide documents
+  the client-side 完成 workaround.
+- **One deterministic owner per chat.** The newest pending wins; when the owning
+  pending resolves, the next sweep hands the pin to the next pending immediately
+  (no pause), and with no pending left the sweep clears it. A new pending may
+  retarget a live pin away from an older pending — the newest wait is the one
+  needing the user now. Rejected: FIFO (an older unanswered wait would hide a
+  newer one), delayed handover, and map insertion order (nondeterministic across
+  sweeps).
+- **Waiting cards are message-pinned.** Feishu's Pin message API
+  (`POST /im/v1/pins`) pins a specific message into the chat's pinned-message
+  list, so a wait in an older topic has an in-list surface (the
+  conversation-level reminder previews the chat's newest message, which may be
+  anything). A pending Permission/Question's **host card** — the live card
+  carrying its Interaction Block, or the standalone card it was sent as (ADR-0028's
+  claim registry is deleted, ADR-0100) — is pinned while the request waits and
+  unpinned once it leaves the pending list. A card rendering both kinds is
+  pinned once (reference-counted by message); the last wait off it unpins it. A
+  card replaced by a re-host or a split moves its pin. Only waiting requests pin
+  a message: a long Turn pins none. Cola pins each (request → card) transition
+  once: an unchanged wait is never re-asserted, so a card the user unpins by hand
+  is not fought. A failed pin retries while the wait lasts; a failed unpin stays
+  tracked; a failed pin never fabricates a later unpin. A directory whose list
+  call failed is unknown, never resolved (#130). No read-back reconciliation: the
+  pin list's consistency lags writes (measured 2026-09-19: a `DELETE` still
+  listed ~20 s later), so cola tracks its own transitions in memory; a pin
+  orphaned by a crash stays until the user removes it — its message id is
+  unknowable after a restart.
+- **Naming**: `bridge/pin.rs` only ever implemented `time_sensitive`, so it is
+  renamed `bridge/reminder.rs` (`ReminderState`/`ReminderReason`/`ReminderTarget`),
+  and the message registry is `bridge/message_pins.rs` (`MessagePins`) —
+  "reminder" means the conversation-level state, "message pin" the platform's
+  pinned-message list.
+
+### `/card` pulls the live card, or reads the session
+
+- **With a renderer owning the card**, `/card` splits the Card Chain at the
+  command message: the previous card is finalized with the standard split
+  header, and a continuation card — replied to the command message — becomes the
+  tracked live card and the newest message, carrying
+  「⏬ 实时卡片已移到底部」 as its receipt. It reuses
+  `split_card_chain` / `PendingSplit` exactly as a Supplement does, and the
+  continuation stays a delta handoff. A pending Permission/Question hosted on the
+  pulled card migrates to the continuation and its **Message Pin** follows on
+  the next sweep — the Supplement split's existing path, no special case. Each
+  pull costs one finalization plus one continuation message.
+- **With no renderer owning the card**, `/card` reads the session once and posts
+  a read-only **Session Card** in `CardState::Idle`, which joins no Card Chain
+  (ADR-0100; the 「当前没有正在运行的实时卡片」 notice is retired — `/card`
+  always answers). A second `/card` with nothing in between stamps the previous
+  idle card `TakenOver` while it is still the session's current card; a Turn that
+  ran in between has superseded it and is left alone. When the read reports busy
+  or a Waiting turn, `/card` posts the same card and hands it to the existing
+  external renderer instead of freezing it, so the continuation streams into the
+  card the reader just asked for. A **cola-authored** newest message is the
+  exception: that run is cola's own, so the card stays static and the hand-off
+  stays with the Chain Record and Session Sync (ADR-0063, ADR-0071).
+- Rejected: a 「回到实时卡片」 button on every command reply card (the text
+  replies cannot carry a button, so the scenario that buries the card most often
+  would lose it, and every reply path would need it) and an automatic split after
+  every command (the reply must stay where the user just acted).
+
+### Configuration
+
 - **One config switch, off by default:** `[bridge] instant_reminder = true`
   turns Instant Reminder on. Absent or `false` means off — an upgrade never
-  changes notification behavior without consent. The split behavior itself is
-  not configurable for now.
+  changes notification behavior without consent. The split behavior itself is not
+  configurable.
+- **Not adopted:** message-scoped **urgent** (`PATCH …/urgent_app`; it needs the
+  `im:message.urgent` app permission, has no cancel API and per-recipient quotas,
+  and its behavior on an interactive card is unverified), the feed-card quick
+  actions (their callback path is unverified, and one chat hosting several
+  topics makes a list-level action ambiguous), and a "no-progress" (stuck)
+  trigger for the reminder — a silent long-running tool and a truly stuck turn
+  are indistinguishable from the card's parts, so it would false-positive on
+  builds and test suites.
 
 ## Why
 
-- Reusing the Card Chain keeps one mental model for both split causes: "the
-  live card is always the newest card of the chain", whether it grew too big
-  or was overtaken by a user message.
+- Reusing the Card Chain keeps one mental model for both split causes: "the live
+  card is always the newest card of the chain", whether it grew too big or was
+  overtaken by a user message.
 - The receipt-on-the-card replaces a second message with zero extra sends and
   keeps the acknowledgement where the reader is already looking.
-- Keeping the render loop alive costs nothing when nothing is pending (the
-  loop exits on idle) and rescues the one path where a supplement currently
-  disappears into the store.
-
-## Alternatives considered
-
-- **One card per Turn, no splits** — rejected: progress becomes invisible
-  exactly when the user is talking to cola.
-- **Recall + resend the old card** — rejected: recall failure modes, a
-  recall hint in history, and the old card's content vanishes.
-- **App feed card as a status bar** — rejected: its click cannot reach the
-  live message (AppLink has no message parameter), it adds a second list
-  entry, and it needs another scope.
-- **Split on every message, commands included** — rejected: pushes the user's
-  current interaction away.
-- **Unpin the moment a Turn completes** — rejected as the TTL default: the
-  completion signal would disappear with it for someone waiting elsewhere.
-  A read-event-driven unpin was deferred (p2p-only signal, new event
-  subscription) in favor of the fixed TTL.
-- **Configurable thresholds/TTL now** — deferred: one on/off switch first;
-  revisit if the defaults annoy.
+- A pin is state, a completion is an event: the pin cannot be missed, and the
+  event needs a new message because a card PATCH pushes nothing and does not
+  reset unread (Feishu gives bots no read-receipt signal to cancel a pin on).
+- Keeping the render loop alive costs nothing when nothing is pending (the loop
+  exits on idle) and rescues the one path where a supplement would disappear
+  into the store.
 
 ## Consequences
 
 - A supplement produces one extra message (the continuation card) plus a
-  finalized prior card; the chain's earlier cards stay as
-  「部分完成，继续中」 history.
-- The list preview is the status surface. While the live card is newest it
-  shows the card title (等待你的授权/回答 · 运行中 · ✅ 完成); when the newest
-  message is a command reply, it shows that reply — accepted, it is what the
-  user just did. The pin carries no reason; the preview does.
+  finalized prior card; the chain's earlier cards stay as 「部分完成，继续中」
+  history.
+- The list preview is the status surface: while the live card is newest it shows
+  the card title (等待你的授权/回答 · 运行中 · ✅ 完成); when the newest message
+  is a command reply, it shows that reply — accepted, it is what the user just
+  did. A permission-only wait previews 等待你的授权, a question-only wait
+  等待你的回答, and only both pending at once keep 等待你的授权/回答 (ADR-0014).
+  The pin carries no reason; the preview does.
 - Pin disappears meaning "no longer needs you", not "just completed".
-- The long-turn threshold (60 s), the completion TTL (2 min) and the render
-  poll cadence are internal constants; the bridge tests inject tiny values
-  through the pin state's / external flow's atomics, so the whole lifecycle
-  runs in milliseconds without a real Feishu tenant.
+- The grace, the read timeout and the notice delay are internal constants; the
+  bridge tests inject tiny values through the pin state's / external flow's
+  atomics, so the whole lifecycle runs in milliseconds without a real Feishu
+  tenant.
 - Group chats can only split on messages cola receives (@-mentions) until the
   sensitive `im:message.group_msg` scope is ever granted; group behavior is
   untested in the current private model.
+- GLOSSARY: **Card Chain** is broadened to cover position-driven splits, and
+  **Supplement**, **Instant Reminder** and **Message Pin** are its vocabulary.
 
-## Domain note
-
-**Card Chain** is broadened to cover position-driven splits. **Supplement** and
-**Instant Reminder** enter the glossary.
-
-## Amendment (2026-09-19): the continuation carries only the delta
-
-The Decision above says the continuation "carries the accumulated card" — it
-re-renders everything the previous card already shows. The acceptance smoke
-test showed that duplicating the whole Turn on every Supplement is worse than
-a non-self-contained newest card: the chain already reads contiguously
-top-down, and the reader's viewport is at the bottom where the delta lands.
-
-- The split is now a **delta handoff**, exactly like a size split: the
-  previous card is finalized with everything before the split, and the
-  continuation — the reply to the supplement message — carries its receipt
-  line plus only the content that arrives after it.
-- Consequence: the newest card is not self-contained. A reader who jumps
-  straight to the bottom sees the newest content and the receipts, not the
-  whole Turn; the earlier cards above carry the rest of the chain. Accepted,
-  because the cards are adjacent messages and reading them in order is the
-  normal path.
-
-Source: product-owner smoke test of the accumulated-card behavior and
-approval of the delta revision.
-
-## Amendment (2026-09-19): waiting cards are message-pinned
-
-The Decision above pins only the conversation, and the pinned entry previews
-the chat's newest message. Once a chat holds several topics (several sessions
-share one `chat_id`), a wait in an older topic has no in-list surface: tapping
-the reminder lands on the newest message, which may be anything — a resolved
-card, another topic's completion, the user's own message. Feishu's **Pin
-message** API (`POST /im/v1/pins`; satisfied by the already-held `im:message`
-scope, or `im:message.pins:write_only`) pins a specific message into the
-chat's pinned-message list, so entering the chat shows exactly what waits.
-
-- A pending Permission/Question's **host card** — the streaming card carrying
-  its Interaction Block, the standalone card it was sent as, or the Session
-  Snapshot card hosting a claimed block (ADR-0028) — is pinned while the
-  request waits and unpinned once it leaves the pending list. A card rendering
-  both kinds is pinned once (reference-counted by message); the last wait off
-  it unpins it. A card replaced by a re-host, a split, or a snapshot claim
-  moves its pin.
-- Only waiting requests pin a message. A long Turn pins none: a running card
-  is not an item to answer, and its content changes; the conversation-level
-  reminder keeps the long-turn lifecycle above unchanged.
-- Cola pins each (request → card) transition once: an unchanged wait is never
-  re-asserted, so a card the user unpins by hand is not fought. A failed pin
-  retries while the wait lasts; a failed unpin stays tracked; a failed pin
-  never fabricates a later unpin. A directory whose list call failed is
-  unknown, never resolved (#130), exactly as in the reminder's sweep.
-- No read-back reconciliation: the pin list's consistency lags writes
-  (measured 2026-09-19: a `DELETE` still listed around 20 s later), so cola
-  tracks its own transitions in memory. A pin orphaned by a crash stays until
-  the user removes it — its message id is unknowable after a restart. Accepted
-  for now, like the reminder's startup self-heal exception.
-- Naming: the pre-existing `bridge/pin.rs` only ever implemented
-  `time_sensitive`, so it is renamed `bridge/reminder.rs`
-  (`ReminderState`/`ReminderReason`/`ReminderTarget`), and the new registry is
-  `bridge/message_pins.rs` (`MessagePins`) — "reminder" means the
-  conversation-level `time_sensitive` state, "message pin" the platform's
-  pinned-message list.
-
-Source: #247 grilling of multi-session precedence and the live API probe that
-confirmed message pinning works on the existing scope.
-
-## Amendment (2026-09-19): the long-turn threshold measures user silence
-
-> **Superseded** by the 2026-09-21 amendment "the long-turn reminder is
-> removed": the whole long-turn class is gone, so this silence semantics no
-> longer applies. Kept as the record of what was tried.
-
-The Decision above says a Turn running past 60 s pins the conversation. Live
-testing showed a one-shot timer from turn start firing even when the user had
-just acted — clicked a permission, answered a question, or sent a supplement —
-which is the opposite of the reminder's intent: the pin exists to say
-something needs the user, and a user who is already acting does not need
-telling.
-
-- The threshold is now measured from the Chat/Topic's last **inbound user
-  activity**: any Feishu message (a Supplement, a recognized command such as
-  `/new`, an unknown slash command) or card action (permission reply, question
-  answer/handoff), plus turn start. External/non-Feishu activity never counts.
-- Any interaction also releases a live `LongTurn` hold and restarts the clock;
-  a new Turn expresses its release through the same path. A `Pending` hold
-  survives — the user still owes an answer.
-- Firing is idempotent but not once-only: while the Turn keeps running,
-  renewed silence pins again, still generation-scoped and never after
-  completion.
-- The one-shot timer is replaced by a per-turn checker that re-evaluates the
-  silence under the pin lock every injected tick, and exits once the turn
-  completed or a newer generation armed the Chat/Topic. The tick, threshold
-  and TTL remain injectable atomics, so the tests run the lifecycle in
-  milliseconds.
-
-Source: product-owner live-testing observation of a pin firing right after a
-permission click, and approval of the silence semantics.
-
-## Update (2026-09-19)
-
-The preview example in Consequences tracks the kind split above: a
-permission-only wait previews 等待你的授权, a question-only wait 等待你的回答,
-and only both pending at once keep 等待你的授权/回答 (ADR-0014, 2026-09-19
-update).
-
-## Amendment (2026-09-21): pins are persisted, and one pending owns the chat
-
-> **Partially superseded** by the 2026-09-21 amendment "the long-turn reminder
-> is removed": the persistence and the pending-only owner rule stand; every
-> mention of the long-turn class below no longer applies.
-
-The Decision above says the pin state is in-memory and "not reconciled at
-startup". Live use showed the hole (#249): the Feishu client gives the user
-**no way to cancel an app's Instant Reminder**, so a pin orphaned by a crash
-stays until the chat's next Turn — and if cola never runs again in that chat,
-forever. The multi-pending sweep was also nondeterministic (#247): one slot
-per chat, last insertion wins, and a long-turn `ensure` could retarget away a
-waiting `Pending`.
-
-- **Pins are persisted.** Each live pin is mirrored to a small file beside
-  `sessions.json` as `{chat_id, is_group, user_ids}` — `user_ids` because
-  clearing an app reminder needs the target user (p2p clears
-  `feed_cards/bot_time_sentive`), not just the chat. The file is written
-  atomically when a pin lands, and the entry is removed when the clear is
-  confirmed.
-- **Startup clears the orphan set.** On startup cola best-effort clears every
-  recorded pin, then drops only the entries whose clear succeeded; a failed
-  clear stays for the next startup. The existing next-turn self-heal remains
-  the second net. A pin cola never sees again (app uninstalled, tenant gone)
-  stays — that is app-controlled platform state, and the user guide documents
-  the client-side 完成 workaround.
-- **One deterministic owner per chat.** `Pending` outranks `LongTurn`; within a
-  class the newest turn wins. When the owning pending resolves, the next sweep
-  hands the pin to the next pending in the chat immediately (no pause); with
-  no pending left the sweep clears it. A new pending may retarget a live pin
-  away from an older pending — the newest wait is the one needing the user
-  now. A `LongTurn` `ensure` never retargets or releases a live `Pending`
-  hold. Presence stays chat-wide: any interaction resets the silence clock
-  for the whole chat, whichever topic it happened in.
-- Rejected: FIFO (an older unanswered wait would hide a newer one), delayed
-  handover (the second wait still needs the user now), and leaving map
-  insertion order as the de-facto rule (nondeterministic across sweeps).
-
-Source: #247 grilling of multi-pending precedence and #249's platform finding.
-
-## Amendment (2026-09-21): the completed card offers 「取消置顶」
-
-> **Superseded** by the 2026-09-21 amendment "the long-turn reminder is
-> removed": with no completion TTL there is no pin to release, so the button
-> (and #246) is dropped.
-
-The Decision above leaves a completed long Turn pinned for a TTL. A user who
-already came back and read the card had no way to release it (#246) — typing
-anything already releases the hold, so only the silent reader was stuck.
-
-- The final card of a completed long Turn carries a small 「取消置顶」 button
-  **while its completion TTL hold is live**. It is not rendered while the turn
-  is running and not rendered while a `Pending` hold exists: there the
-  conversation still needs the user, and the button would imply a wait is
-  dismissible.
-- The click releases the `LongTurn` hold through the same generation-guarded
-  path any interaction uses. If the hold is already gone (activity, a new
-  turn, TTL expiry) the click is a no-op, and the next repaint no longer shows
-  the button.
-
-## Amendment (2026-09-21): message-scoped urgent and feed-card buttons deferred
-
-Feishu's message **urgent** (`PATCH /im/v1/messages/{message_id}/urgent_app`)
-is the only platform capability found that alerts a *specific* message: it
-buzzes named users about a message the app itself sent. It is not adopted now;
-if ever, it is a separate, explicit opt-in switch — a buzz is a far stronger
-interruption than a quiet pin, and `im:message.urgent` is an app permission
-release, not just a config flag.
-
-- Probe result (live, 2026-09-21): the app has no `im:message.urgent` scope
-  (`99991672`); the probe stopped there. Still unverified, and to be answered
-  before any adoption: urgent on an `interactive` card, where the popup click
-  lands, and p2p-specific constraints. Quotas to respect: 200 unread urgents
-  per recipient (`230023`), no cancel API, and group chats require "all
-  members may urgent" or the bot is an admin.
-- Neither feed-card mode can address a message. The chat-entry mode's
-  quick-action buttons (`im/v2/chat_button`) are deferred to an issue: their
-  callback path over cola's WS connection is unverified, and one chat hosting
-  several topics makes a list-level action ambiguous. The separate
-  app-entry mode stays rejected (this ADR's original alternative).
-- Persistent state keeps its job: urgent is a transient event;
-  `time_sensitive` and **Message Pin** are the state.
-
-## Amendment (2026-09-21): the long-turn reminder is removed; completion is a notice
-
-The long-turn reminder — the 2026-09-19 silence threshold, its completion TTL,
-and the completed card's 「取消置顶」 button — is removed. The pin surfaces are
-for **waiting**, not for running turns. A Permission/Question blocks the AI
-until a human acts, so the conversation must stay pinned until then: that is a
-**state**, and it cannot be missed the way a message can. A long Turn is
-different: it needs no attention while it runs, and its end is an **event**.
-Feishu's card PATCH pushes no notification and does not bump the conversation
-(only a new message does), so the event is delivered as a new message: the
-**Completion Notice**, a reply to the prompt.
-
-- p2p: notify only when the turn ran at least 5 minutes
-  (`LONG_TASK_NOTICE_MS`), opt-in `[bridge] long_task_notice`, no @ mention —
-  the reply itself is the notification. A short turn stays silent.
-- groups: unchanged — every turn notifies (`[bridge]
-  group_completion_notice`) and @-mentions the requester.
-- Removed with the long-turn class: the silence clock (`note_interaction`),
-  the threshold checker, the completion TTL, `CompletionPin`, the card's
-  「取消置顶」 button, and the `ReminderReason` set — a live pin now always
-  means a pending wait. The persistence and owner rules of the 2026-09-21
-  amendments stay, scoped to pending waits.
-
-Why not a "no-progress" (stuck) trigger: a silent long-running tool and a
-truly stuck turn are indistinguishable from the card's parts, so the trigger
-would false-positive on builds and test suites. The reliable "needs a human"
-signals are the pending Permission/Question — and a message-scoped urgent
-(the deferred capability above) would be the right event channel for a stuck
-turn, not a pin.
-
-Rejected alternatives: keeping the pin as a pure state and adding a notice
-(duplicates the surfaces for no gain), and a "read receipt cancels the pin"
-rule (Feishu gives bots no read receipts, and a card PATCH does not reset
-unread).
-
-## Amendment (2026-09-22): `/card` pulls the live card back to the newest position
-
-A user who runs several commands during a long Turn ends up with the live card
-buried above their replies, and the removal of the long-turn reminder
-(2026-09-21 amendment) left a running Turn with no attention surface at all
-(#244). The command replies themselves must still not split the chain — they
-are the interaction the user is performing — so the fix is an explicit
-request.
-
-- `/card` splits the Card Chain at the command message: the previous card is
-  finalized with the standard split header, and a continuation card — replied
-  to the command message — becomes the tracked live card and the newest
-  message. It reuses `split_card_chain` / `PendingSplit` exactly as a
-  Supplement does.
-- `PendingSplit` gains a kind: a Supplement's continuation carries its
-  「📨 已收到补充」 receipt, a pull's carries 「⏬ 实时卡片已移到底部」. The
-  continuation stays a delta handoff (2026-09-19 amendment): the status line
-  plus only the content that arrives after the split.
-- No separate acknowledgement message. When the conversation has no live card
-  (the Turn ended, or no Session exists), cola replies one text line
-  「当前没有正在运行的实时卡片」 and creates nothing.
-- A pending Permission/Question hosted on the pulled card migrates to the
-  continuation and its **Message Pin** follows on the next sweep — the
-  Supplement split's existing path, no special case.
-- Each pull costs one finalization plus one continuation message: Feishu
-  cannot move a message, so re-sending the card is the only way to put it at
-  the bottom.
-
-Rejected: a 「回到实时卡片」 button on every command reply card (the text
-replies — `/dir`, `/new`, `/model <name>` — cannot carry a button, so the
-scenario that buries the card most often would lose it, and every reply path
-would need the button), and an automatic split after every command (the
-command reply must stay where the user just acted — the rule this ADR already
-settled).
-
-Source: #244 cost/benefit evaluation with the product owner; approval of the
-minimal explicit-command form.
-
-## Amendment (2026-09-24): the drain bound hands the card to an out-of-turn follow
-
-The Decision above says the render loop stays alive while the session is still
-running, and the drain's fixed bound (10 min, `turn_drain_timeout_ms`) was read
-as completion: at the bound `finish` finalized the card Done from a snapshot
-that could still show running tools, freezing every `⏳` panel under a `✅`
-header and losing all work after the bound (#284; observed live on a Supplement
-whose `task` subagents outlived the budget by 1.6 s).
-
-- **A bound reached with the session still running is not completion.** The
-  turn ends exactly as before — the inflight guard is released, so the next
-  message is a normal new Turn **(superseded by ADR-0059: the guard now covers
-  the follow window; a message during a follow is a Supplement)** — but the
-  card is not finalized. It is handed to
-  an out-of-turn follow that keeps the SAME accumulator and Card Chain, renders
-  on the same injected poll cadence, and finalizes Done only when the session
-  reports a non-busy status.
-- **The follow is bounded by its own ceiling** (`turn_follow_timeout_ms`,
-  default 10 min, injectable). A session still running — or a Backend still
-  unreadable — at that ceiling finalizes Error: never Done under a running
-  panel, never an eternal spinner. `/stop` ends the follow promptly through the
-  same sticky stopped-session marker the drain observes, with the same final
-  reconcile before the Done card. **(Superseded by the 2026-09-28 stop-terminal
-  amendment below: the card finalizes `Stopped`, not Done.)**
-- **The completion notice belongs to the follow's end** when it owns the card,
-  so 「✅ 已完成」 is only ever sent for a run that actually ended. The topic
-  cover is synced once at the hand-off (starting its title-retry window there)
-  and kept current by the follow's render ticks, which already sync it whenever
-  the server title changes. A new Turn (or an external arming) replaces the
-  accumulator and the follow exits on its next tick — the replacement guard the
-  external render loop already uses.
-- **Done waits for the panels, not just the status.** A non-busy session whose
-  accumulator still carries a `running`/`pending` panel (a crash-orphaned tool)
-  keeps the follow watching instead of stamping `✅ 完成` over a `⏳`; the
-  ceiling then ends it Error. `/stop` is the deliberate exception: it closes the
-  card promptly, after one last render of the abort's settled tool states.
-- The external-renderer arming path is NOT reused: it builds a fresh
-  accumulator, which would drop the Supplement's continuation card. The follow
-  lives in the Turn (`turn/follow.rs`) because the card, its chain and its
-  accumulator are the Turn's own state (ADR-0050).
-
-Rejected: raising the bound (moves the threshold, same failure mode one budget
-later); not releasing the guard while busy (the bound exists precisely so a
-merely-busy session cannot hold the guard) — **(superseded by ADR-0059: the
-guard now covers the follow; the follow, not a timer, owns the ending)**.
-
-Source: #284.
-
-## Amendment (2026-09-28): no total budget — the bound is a lost-contact / stuck-panel grace
-
-The 2026-09-24 amendment above bounded the follow with a total ceiling: a
-session still running at the ceiling finalized Error. Live experience showed
-the ceiling firing where nothing was wrong — a Permission/Question wait (the
-card read 「⏳ 等待你的授权/回答」 right up to the moment it flipped to
-「❌ 出错」, and its retry affordance contradicted the pending block the
-operator still had to answer) and healthy long runs (subagent chains,
-provider retries). The wait is already discoverable — the Instant Reminder /
-Message Pin owns the nudge — so a clock could only turn a correct wait into a
-wrong error. The follow's real job is to bound the states where NOBODY can
-act (#386).
-
-- **No total budget.** A readable run may take as long as it takes; the
-  follow keeps rendering until the session reports non-busy, then finalizes
-  Done (or the settled failure's Error, unchanged). `/stop` remains the
-  operator's escape hatch — **(superseded by the 2026-09-28 stop-terminal
-  amendment below: `/stop` finalizes `Stopped`, not Done)** — and a new Turn
-  still replaces the accumulator and ends the follow silently.
-- **The grace bounds only the two unobservable failure modes.** The injected
-  bound (`turn_follow_grace_ms`, default 10 min) is now a grace for:
-  - **lost contact** — no tick in the grace produced a full read pair (BOTH
-    the transcript and the status answered). A wedged read cannot be rendered
-    and cannot be ended; at the grace the card finalizes Error. Any
-    fully-answered tick resets the grace, so a flap costs nothing;
-  - **an unreconcilable live panel** — a readable, non-busy session carries a
-    `running`/`pending` panel past the grace (a crash-orphaned call). Done is
-    forbidden over a `⏳`, so the card finalizes Error.
-- **Waits are not special-cased.** With no total clock, a wait is unbounded by
-  construction: the accumulator's awaiting state keeps naming it and the
-  follow never consults the pending records. `/stop` still rejects the
-  requests it leaves behind (ADR-0038 rule 7).
-- **A terminal header wins over the awaiting override.** The header's
-  「等待你的授权/回答」 names an ACTIVE turn; a fallback Error under a
-  still-pending block previously stayed hidden behind it. Error/Done take
-  precedence now, so a dead card never reads as waiting for anyone.
-- **The completion notice stays tied to the card's real end** — both fallback
-  endings take the Error notice; a run still going server-side is never
-  announced as complete.
-
-Rejected: keeping a longer total budget (it only moves the false error
-later); pausing the ceiling while a wait is pending (the grace's whole point
-is bounding the unobservable, and a readable wait is the opposite — and a
-stale pending record must never suspend the fallback).
-
-Source: #386.
-
-## Amendment (2026-09-28): `/stop` finalizes `Stopped`, not Done
-
-The #386 amendment above kept the stop rule it inherited from the 2026-09-24
-amendment: 「`/stop` — prompt Done」 — the follow's stop branch finalized Done
-after one last reconcile render. That line is superseded by the stop terminal
-(#394): a deliberate stop is a third ending, neither 完成 nor 出错.
-
-- **`CardState::Stopped`** (header 「⏹ 已停止」, grey) is the deliberate
-  stop's own terminal. It is terminal for every running/probe check
-  (`is_running`, the `/card` pull, the header phase timer), so a stopped card
-  is never treated as live; it is excluded from the awaiting override (a
-  still-pending block cannot restyle it) and renders no retry button.
-- **The abort is not a failure.** The server records the interrupt as an error
-  on the turn's transcript; a turn whose session carries the stopped marker
-  (`waits.stopped_sessions`) is classified `Stopped` and that error text is
-  never written to the card. The turn's cleanup of the pending
-  Permission/Question requests the abort strands (ADR-0038 rule 7) keeps the
-  same mechanism, with its trigger widened to deliberate stops: a stopped turn
-  rejects its leftovers even when the stop recorded no error text, because the
-  abort strands whatever was pending.
-- **Both finalization paths classify by the marker**: `finish` for the in-turn
-  path — which also never hands a stopped card to the follow — and the
-  out-of-turn follow's stop branch, which finalized Done before. Each re-reads
-  the marker at its last await boundary (after `finish`'s transcript read and
-  the leftover rejection; at the follow's settled-run classification), so a
-  stop that lands while a tick or a finalization is already in flight still
-  wins. The stop command records the marker BEFORE the interrupt round-trip
-  (rolling back only a marker that call itself inserted, when the interrupt
-  fails), so the abort's own server-side settling cannot beat the marker.
-- **The completion notice follows the card's real terminal**: 「⏹ 已停止。」,
-  never 完成 or 出错.
-
-Source: #394 (spec #391).
-
-## Amendment (2026-10-09, #602): the post-prompt path is one unbounded loop; there is no hand-off
-
-The 2026-09-24 amendment bounded the drain with a fixed clock (10 min,
-`turn_drain_timeout_ms`) and, at the bound, handed the still-running Turn to an
-out-of-turn follow that kept the same accumulator and Card Chain. The
-2026-09-28 amendment removed the total budget but kept that hand-off as the
-drain's exit: the follow owned the running Turn from the bound onward.
-
-Spec #602 removed the hand-off itself. The inline drain and the out-of-turn
-follow are now one loop owned by the Turn's own task (`Turn::finish` →
-`drain_after_prompt`), rendering a submitted prompt to its true end with no
-seam, no total budget and no guard-release window:
-
-- **The drain is unbounded.** The `turn_drain_timeout_ms` knob and the
-  budget-derived per-read timeout are removed. The per-read timeout unifies on
-  the follow's fixed read timeout (`turn_follow_read_timeout_ms`); the
-  `turn_follow_grace_ms` grace is the single clock, bounding only lost contact,
-  an unreconcilable live panel on an idle Session, and the unreceived hint —
-  never a healthy, merely-long run.
-- **The guard is held for the whole path.** There is no ownership hand-off, so
-  a message arriving mid-request is a Supplement and the server-yield's busy
-  read never sees the Session as idle. The follow remains, but only for the
-  paths with no Turn task of their own: the recovery re-attach and the Wake
-  continuation.
-- **The 2026-09-24 stop-terminal and 2026-09-28 grace amendments stand**: the
-  graces still end a run nobody can act on, and `/stop` still finalizes
-  `Stopped`.
-
-See ADR-0074 for the three one-card-per-request invariants this concluded (one
-unbounded path, exactly one Card per resumption, the notice gated on delivery).
-
-Source: #602, #603.
-
-## Amendment (2026-11-06): `/card` reads a session no renderer owns
-
-The 2026-09-22 amendment gave `/card` one meaning: pull the live card down, and
-answer a text notice when no Turn is rendering. ADR-0100 adds the second state
-that notice was covering for: with no renderer owning the card, `/card` reads the
-session once and posts a read-only **Session Card** in `CardState::Idle`, which
-joins no Card Chain. **The 「当前没有正在运行的实时卡片」 notice is retired** —
-the 2026-09-22 rule that answered one text line and created nothing: `/card`
-always answers now, by pulling a render-owned card or by reading the session. The
-pull itself is unchanged — same `split_card_chain`, same `PendingSplit`, same
-`⏬ 实时卡片已移到底部` receipt, same migration of a live Interaction Block to the
-continuation.
-
-A second `/card` with nothing in between stamps the previous idle card
-`TakenOver` while it is still the session's current card; a Turn that ran in
-between has superseded it and is left alone. When the read reports busy or a
-Waiting turn, `/card` posts the same card and hands it to the existing external
-renderer instead of freezing it, so the continuation streams into the card the
-reader just asked for. A **cola-authored** newest message is the exception: that
-run is cola's own, so the card stays static and the hand-off stays with the Chain
-Record and Session Sync (ADR-0063, ADR-0071). A pending request's **Message Pin**
-loses its
-claimed-snapshot host arm — ADR-0028's claim registry is deleted — and follows
-the live card or the standalone card like every other pending request.
-
-Source: #945, #999.
+Origins: #244, #246, #247, #249, #284, #386, #391 (spec), #394, #602, #945, #999,
+#1056; ADR-0014, ADR-0026, ADR-0038, ADR-0050, ADR-0059, ADR-0063, ADR-0071,
+ADR-0074, ADR-0092, ADR-0100, ADR-0109.

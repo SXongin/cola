@@ -1,363 +1,182 @@
 # The background-task ledger: one live list on the newest card, entries where they lived
 
 > **Amended by ADR-0106**: the ledger lists a Session's **live runs** — a
-> Background Task or a Turn-scoped child agent — gates on
-> `reports_live_runs()`, and each row's type word is the run's tool token
-> (`shell`/`subagent`), not the vendor id.
+> Background Task or a Turn-scoped child agent — gates on `reports_live_runs()`,
+> and each row's type word is the run's tool token (`shell`/`subagent`), not the
+> vendor id.
 >
 > **Amended by ADR-0107**: the liveness vocabulary is `waiting`/`reasoning`/
 > `responding`, and the tool token is `shell` (not `bash`).
-> The body below is the historical record and is not rewritten; this banner is
-> authoritative (convention: #1065).
-
+>
 > **Amended by ADR-0066**: the freeze's carve-out widens — a yielded card also
-> receives its Wake's resumed content (ADR-0066 resumes shell/subagent
-> completion Wakes in place), so the live list and the completion entries stay
-> on the card the tasks lived on, and the handover to a newer card now only
-> runs for the splits that remain (size, supplement, terminal-card
-> continuation, restart Fresh).
+> receives its Wake's resumed content (ADR-0066 resumes shell/subagent completion
+> Wakes in place), so the live list and the completion entries stay on the card
+> the tasks lived on, and the handover to a newer card runs only for the splits
+> that remain (size, supplement, terminal-card continuation, restart Fresh).
+>
+> **Amended 2026-10-31 (#917)**: a card rendering an unanswered typed answer
+> field stops refreshing its ledger, so the repaint cannot wipe the text.
 
 ## Context
 
 ADR-0059 made a Turn's Background Tasks gate its card (`⏳ 等待后台任务`) and
 gave their completions a Wake continuation, but never showed the tasks as
 tasks. The tool part that launches one settles at launch — the call returns the
-handle, so the panel reads ✅ — and while any task is live the header is the
-only trace: no list, no per-task state, no readable set of "these are the
-things still running". Completion renders ad hoc: a Wake continuation card, or
-one merged receipt line (`🔔 后台任务完成：<命令>`) when the Wake's work landed
-in an already-live card. Issue #412 (raised during #405's acceptance) asked for
-a pinned live list, fixed completed entries, and a decision between Policy W
-(ADR-0059: not complete while tasks are live) and Policy C (`✅` = the turn's
-answer is done).
+handle, so the panel reads ✅ — and while any task is live the header is the only
+trace: no list, no per-task state. Completion rendered ad hoc: a Wake
+continuation card, or one merged receipt line (`🔔 后台任务完成：<命令>`) when the
+Wake's work landed in an already-live card. #412 asked for a pinned live list,
+fixed completed entries, and a decision between Policy W (ADR-0059: not complete
+while tasks are live) and Policy C (`✅` = the turn's answer is done).
 
-The design round (2026-09-29) established the mechanics this builds on: Session
-Sync keeps polling a yielded session every 8 s (the inflight guard is released
-at the yield) but PATCHes only when its content diff owes content; the request
-sweeps (3 s) can already PATCH a waiting card in place; Wake continuations are
-content-gated (`wake_continuation` returns `None` when the resumed run renders
-nothing, so a quiet completion posts nothing today); the receipt is a plain
-timeline line with no folding; and the read model's `BackgroundTask` carries
-identity and timing but no label — the originating tool part's `input` (same
-`call_id`) does.
+The mechanics it builds on: Session Sync keeps polling a yielded session every
+8 s (the inflight guard is released at the yield) but PATCHes only when its
+content diff owes content; the request sweeps can already PATCH a waiting card in
+place; Wake continuations are content-gated; the receipt is a plain timeline line
+with no folding; and the read model carries a task's identity and timing but no
+label — the originating tool part's `input` (same `call_id`) does.
 
 ## Decision
 
 **Policy W stands** (ADR-0059's terminal semantics are unchanged): ✅ and the
-Completion Notice still fire only at a Turn's true end — idle with no live
-Background Task. Policy C was rejected: every completion already opens a Wake
-continuation, so W's chain reads ⏳ → … → ✅ for one request, while C would
-stamp ✅ on each interim card (✅ → ✅ → ✅) and force CONTEXT.md to re-narrow
-what ✅ promises. The ledger supplies the visibility C was meant to buy, with
-one meaning for ✅.
+Completion Notice fire only at a Turn's true end — idle with no live run. Policy
+C was rejected: every completion already opens a continuation, so W's chain reads
+⏳ → … → ✅ for one request, while C would stamp ✅ on each interim card and force
+the glossary to re-narrow what ✅ promises. The ledger supplies the visibility C
+was meant to buy, with one meaning for ✅.
 
-**One ledger, following the newest card.** Every live Background Task of the
+**One ledger of live runs, following the newest card.** Every live run of the
 Session — across Turns — renders in a card-tail section like the Todo Panel and
 live Tool Panels (ADR-0045): a folded-by-default collapsible panel titled
-`⏳ 后台任务（N）` — the title is the count, so the folded panel still answers
-how many tasks are running, and a stable `element_id` keeps the reader's fold
-state across re-renders — whose body is one row per task, the pinned copy
-`· shell：**npm run build** · 14:02 · 3m12s` / `· 子代理：**review the diff** ·
-14:04 · 1m05s` *(the subagent type word and its total elapsed were later
-superseded — see the 2026-10-02 amendments below)*: the type word plain, the label
-bolded and clipped, then the task's server `started_at` as local `HH:MM` and
-the bare elapsed. The label is
-joined from the tool part's input by `call_id` (shell: `command`/`description`;
-`subagent` needs its own rendering arm), clipped like the receipt; elapsed is
-rendered second-granular and driven by the existing reads (the 8 s Session Sync
-pass) — no new polling cadence. Exactly one card carries the live list: when a
-Wake continues the chain or a new Turn takes over, the handover removes it from
-the old card.
+`⏳ 后台任务（N）` — the title is the count, so the folded panel still answers how
+many are running, and a stable `element_id` (`task_ledger`) keeps the reader's
+fold state across re-renders — whose body is one row per run. A run is a
+Background Task or a Turn-scoped child agent; the section gates on
+`reports_live_runs()` (ADR-0106), so an Agent Client with no live-run facts
+renders nothing rather than an empty list (the ADR-0059 degradation).
 
-**The yielded ledger ticks at the read cadence.** A Waiting card has no render
-loop of its own, so the existing 8 s Session Sync reads are its only clock: the
-in-place refresh owes a PATCH whenever the ledger it would render differs from
-the one the card last rendered — membership, or any row's rendered elapsed at
-**second** granularity (≈0.125 QPS per waiting card at the 8 s cadence, far
-below Feishu's per-message cap). Repeated reads inside one rendered second owe
-nothing. The live render keeps whole-minute gating: its flushes are
-content-driven, and a per-render second clock would be clock churn. *(A
-subagent row renders no elapsed since the 2026-10-02 amendment below; its
-fragment's age is the rendered number there.)*
+The row copy: the type word is the run's tool token — `shell` / `subagent`
+(ADR-0107: a token names a concept, never a vendor id), plain — then the label
+bolded and clipped (`TASK_LABEL_CHARS` plus `…`; its own `&`, `*` and `_` become
+numeric entities before the bold wrap, `&` first, so a command cannot close the
+span or bleed formatting), then the run's server `started_at` as local `HH:MM`
+and, for a shell row, the bare elapsed (`3m12s` / `1h05m`). A subagent row
+renders no total elapsed: its start is its clock and its child-activity fragment
+is its liveness (below). The label is joined from the tool part's input by
+`call_id` (shell: `command`/`description`; subagent has its own rendering arm),
+and elapsed is second-granular and driven by the existing reads (the 8 s Session
+Sync pass) — no new polling cadence. No label or no start omits its part whole.
+Identity and icons stay out of the live row: Feishu cards have no hover
+tooltips, and future task types have no recognizable glyphs. Exactly one card
+carries the live list: when a Wake continues the chain or a new Turn takes over,
+the handover removes it from the old card.
 
-**A completion leaves a fixed entry where the task lived.** The task leaves the
+**A subagent row carries its child's liveness.** The row appends the same child
+activity the live task panel shows — `· subagent：**review the diff** · 14:04 ·
+shell 5s`, or `· waiting 30s · 等待你的授权` for a phase and its wait — through the
+front's own fragment vocabulary, so one child state reads the same wherever cola
+renders it. It sits after the start clock and before `· ⚠️ 状态待确认`; a row the
+runtime reconciliation could not confirm renders no activity, and a shell row is
+unchanged. Both surfaces gather through **one shared batch**: the union of the
+children the card's live panels and the read's live runs name — one transcript
+light read and one pending-wait query per distinct child, keyed back by call id —
+so a child named by both is read once per pass, and a session with no live
+subagent spends no child request. The live render and the yielded refresh both
+gather. Failure keeps the last successful fragment: a failed child read (or a
+timestampless transcript) never refreshes the stored times, so the rendered age
+keeps counting truthfully and a failed read never ends the wait (ADR-0054's
+rule).
+
+**The render gate compares what the row renders.** The live path owes a PATCH
+when a whole minute of the elapsed (or the fragment's age) turns, or when a typed
+liveness change arrives — a tool switch, a wait entering or leaving, the gather
+establishing or losing the child; the yielded path owes one when a whole
+**second** of a visible clock turns (≈0.125 QPS per waiting card at the 8 s
+cadence, far below Feishu's per-message cap). Repeated reads inside one rendered
+second owe nothing. The comparison is on the rendered row — its type, its folded
+and clipped label, its local `HH:MM`, the fragment's label and wait — never raw
+values that render identically (text past the clip, a start moving inside the
+shown minute) nor the gathered liveness's stored timestamps: a child part landing
+inside the second the card already shows owes nothing. The read is still stored
+whatever the decision, so the next age counts from the freshest timestamps; an
+unconfirmed row's stored age never ticks (it renders none), and an untimed tool
+has no age to tick.
+
+**The freeze's one carve-out, widened.** ADR-0059's "the card stops updating" is
+narrowed to allow the host card to be re-rendered in place for the ledger:
+membership and elapsed stay fresh while the card is otherwise yielded. The
+carve-out covers the handover removal, the quiet true end and the in-place Wake
+resume (ADR-0066: a yielded card also receives its resumed content), and nothing
+else. It serves **any active Session's yielded card chain cola holds** — an
+External Message follow's waiting card included (#568) — because Session Sync
+runs its Wake and ledger steps for that chain too; the write admission is
+unchanged (only a yielded card admits the ledger write), so widening the caller
+adds no new write path. A chain cola did not start owes no Completion Notice: its
+有新消息 send was the notification (ADR-0059).
+
+**A card holding an unanswered typed answer does not refresh.** The yielded read
+exists to prove the wait is alive; it stops when the card renders a free-text
+answer field nobody has submitted yet (`StreamAccumulator::awaits_typed_answer`),
+because Feishu rebuilds `body.elements` on every update and the text lives only
+in the client. The freeze covers the **whole ledger read** — rows, a completion
+entry, the clock — and the read is **not consumed while frozen**:
+`refresh_yielded_ledger` returns before planning its entries, before its child
+reads and before `apply_ledger_read`, so nothing is marked shown and nothing
+advances, and the first pass after the answer finds the same delta and lands it.
+The check is made twice — early, to spend no read at all, and again under the
+card-write lock before the apply, so a question surfaced while those reads ran
+still keeps its form out of this pass. The settlement that ends the wait is not
+ledger progress and still lands (`YieldedUpdate::Settled`).
+
+**A completion leaves a fixed entry where the task lived.** The run leaves the
 live list and becomes a collapsible entry on the card that hosted it — the
 handover PATCH carries both — with the mechanical receipt line as its collapsed
-title (`🔔 后台任务完成：<命令>` / `🔔 子代理完成：<描述>`, bare when the Wake
-names no label) and identity and timing inside (`shell sh_abc · 14:02 · 12m`).
-The receipt line and the entry are one mechanism, not two renderings; the
+title (`🔔 shell 完成：<label>` / `🔔 subagent 完成：<label>`, the ending phrases
+`已取消` / `失败` / `结束` / `已失联` only on their own evidence, bare when the
+Wake names no label) and identity and timing inside (`shell sh_abc · 14:02 ·
+12m`). The receipt line and the entry are one mechanism, not two renderings; the
 completion still never depends on the model narrating it. A continuation card
 carries only its 承接 line and the remaining live list — the entry does not
-migrate.
-
-**The ledger is the freeze's one carve-out.** ADR-0059's "the card stops
-updating" (Waiting on Background Work) is narrowed to allow the host card to be
-re-rendered in place for the ledger: membership and elapsed stay fresh while
-the card is otherwise yielded. The carve-out covers the handover removal above
-and the case below, nothing else.
-
-**A quiet true end settles the waiting card in place.** When the last
-Background Task retires and the Wake's resumed run renders nothing, nothing
-posts today — the waiting card would be left saying ⏳ forever. With the ledger
-updating it anyway, that read is also the true end: the host waiting card
-settles ✅ in place and the Completion Notice fires per its existing rules
-(groups per `[bridge] group_completion_notice`, p2p per the long-task
-threshold). This supersedes drain.rs's
-`a_retirement_after_the_yield_leaves_the_waiting_card_alone` expectation.
+migrate, so a continuation never accumulates history (ADR-0043's 承接 rule: a
+continuation carries only new work).
 
 **The launch panel stops reading as done.** The settled `shell`/`subagent` call
-whose metadata says the run is still going keeps its place in the timeline as
-the record of the request, but renders 🌙 in its status slot instead of ✅ — the
-rest of the title is a normal panel's (`🌙 shell · <label>`); the ledger, not
-the panel, owns the run's liveness.
+whose metadata says the run is still going keeps its place in the timeline as the
+record of the request, but renders 🌙 in its status slot instead of ✅ — the rest
+of the title is a normal panel's (`🌙 shell · <label>`); it never claims
+completion, persists after the run retires, and the ledger, not the panel, owns
+the run's liveness.
 
-V1 carries none of these facts: there the section is empty and behavior is
-today's (the ADR-0059 degradation).
-
-## Considered options
-
-- **Policy C (`✅` = the turn's answer is done).** Rejected — with every
-  completion already continuing the chain, C makes one user request produce a
-  row of ✅s and requires re-narrowing ✅ in the glossary; W plus the ledger
-  keeps ✅ single-meaning and still shows the running set.
-- **No ledger; keep the opaque header.** Rejected — the header says something
-  is running without saying what or for how long, which is #412's whole point.
-- **The completed entry follows the newest card** (the spec's first wording).
-  Rejected — an entry that migrates accumulates history onto every continuation
-  card, contradicting the 承接 rule that a continuation carries only new work
-  (ADR-0043); the entry is the audit residue of the card the task lived on.
-- **A separate receipt line plus a ledger entry.** Rejected — one fact, one
-  rendering.
-- **Only refresh the ledger at card handovers.** Rejected — the ledger would
-  read as a snapshot the moment the card yields, which is exactly when a user
-  checks it.
-- **Keep the waiting card frozen until superseded (today's quiet-end
-  behavior).** Rejected — the card would show a completed entry under a header
-  claiming ⏳, and the Turn's ✅ would never render for a quiet completion.
+**A quiet true end settles the waiting card in place.** When the last run retires
+and the Wake's resumed run renders nothing, the read that keeps the ledger fresh
+is also the true end: the host waiting card settles in place — ✅, or ❌ on a
+settled failure, per its existing rules — and the Completion Notice fires per its
+existing rules (groups per `[bridge] group_completion_notice`, p2p per the
+long-task threshold and ADR-0074's delivery gate and delay). This supersedes the
+drain's expectation that a retirement after the yield leaves the waiting card
+alone.
 
 ## Consequences
 
-- CONTEXT.md gains **Background Task Ledger**; **Wake**, **Card**, **Tool
-  Panel** and **Waiting on Background Work** record the entry copy, the launch
-  panel's 🌙 marker, and the carve-out.
-- New rendering work: a third card-tail section; a fold element for the live
-  list and the entries; a `subagent` arm in the input formatter; the `call_id`
-  label join.
-- The ledger must fit the card budget like the existing tail sections — many
-  live tasks are still one section, rows clipped like the receipt.
-- Tests pin: the exact copy, one and several live tasks, out-of-order
-  completions, a completion while the card is live vs waiting, the list
-  surviving a split/continuation, the handover removal, the second-granular
-  yielded refresh (and the live path's whole-minute gating), and the quiet true
-  end (✅ + notice, no new card).
-- A cola restart still loses live cards; the next Wake pass rebuilds the
-  ledger on a new card exactly as it rebuilds any continuation.
-
-Related: #412, #405, #403, ADR-0059, ADR-0045, ADR-0043, ADR-0040, ADR-0054.
-
-## Amendment (2026-09-29): the launch marker, the folded live list, and the yielded second
-
-The #412 batch's acceptance review (#423) changed three presentation decisions
-recorded above; the mechanics — one ledger, following the newest card, entries
-where the task lived, Policy W, the freeze's one carve-out, the quiet true end —
-are unchanged.
-
-- The launch marker is the 🌙 icon in the panel's status slot, not the text
-  「已转后台」 (#416 superseded): the title reads `🌙 shell · <label>`, the
-  semantics are the same — it never claims completion, it persists after the
-  run retires, and the ledger owns the run's liveness.
-- The live list is a folded-by-default `collapsible_panel` titled
-  `⏳ 后台任务（N）` — the title is the count, the rows are its markdown body,
-  and a stable `element_id` (`task_ledger`) keeps the reader's fold state
-  across re-renders (#415's flat markdown section superseded). An empty ledger
-  still renders nothing.
-- The yielded refresh compares the ledger it would render against the one the
-  card last rendered at **second** granularity, superseding #419's
-  whole-minute rule on that path: a rendered second moving owes the PATCH,
-  repeated reads inside it owe nothing. The live render and its Wake handover
-  keep whole-minute gating.
-
-## Amendment (2026-09-29, the live row's copy): the start clock and the bold label
-
-The live row gains the task's own start clock and a bolded label (the same
-review round as the amendment above):
-
-- `· shell：**npm run build** · 14:02 · 3m12s`, `· shell · 14:02 · 0m05s`,
-  `· shell：**npm run build**`, `· shell`. The type word stays plain, the label
-  is bolded, the start clock is the task's server `started_at` in local
-  `HH:MM` (the completion entry body's clock), and the elapsed format is
-  unchanged (`3m12s` / `1h05m`). No label or no start omits its part whole.
-- A label's own `&`, `*` and `_` become their numeric entities before the
-  `**…**` wrap (`&` first, so a label carrying entity text of its own stays
-  literal), so a command cannot close the span or bleed formatting into the
-  next row (Feishu decodes the entities back to the literal characters — the
-  same mechanism as the `<` escape). The clip is unchanged: `TASK_LABEL_CHARS`
-  characters plus the `…` marker, inside the bold.
-- Identity and icons stay out of the live row: Feishu cards have no hover
-  tooltips, and future task types have no recognizable glyphs. The completion
-  entry's fold body keeps the identity.
-
-## Amendment (2026-10-02): the type words are the tools' own names
-
-The ledger's type words are the tool's own name everywhere it names one (#502,
-spec #501): the ledger and the Tool Panel call one task the same thing.
-
-- The live row reads `· shell：**npm run build** · 14:02 · 3m12s` /
-  `· subagent：**review the diff** · 14:04 · 1m05s` *(the subagent row's
-  total elapsed was later dropped — see the amendment below)* — the subagent no
-  longer reads 「子代理」; the omissions, bold escaping and clip are unchanged.
-- The completion entry's collapsed title reads `🔔 shell 完成：<label>` /
-  `🔔 subagent 完成：<label>`, with the same ending phrases as before (`已取消` /
-  `失败` / `结束` / `已失联`, only on their own evidence) and the same bare form
-  when the Wake names no label; the fold body's identity line reads
-  `shell sh_abc · 14:02 · 12m` / `subagent ses_child · 14:02 · 1m`.
-- Unchanged: the live list's title `⏳ 后台任务（N）`, the unconfirmed marker
-  `⚠️ 状态待确认`, the resumption header `🔄 后台任务完成，继续处理中…`, and the
+- GLOSSARY gains **Background Task Ledger**; **Wake**, **Card**, **Tool Panel**
+  and **Waiting on Background Work** record the entry copy, the launch panel's 🌙
+  marker, and the carve-out.
+- The ledger must fit the card budget like the existing tail sections — many live
+  runs are still one section, rows clipped like the receipt — and the size reserve
+  keeps its shell-sized per-row constant, so a subagent row's missing elapsed is
+  over-reserve (safe).
+- Unchanged copy stays: the live list's `⏳ 后台任务（N）` title,
+  `⚠️ 状态待确认`, the resumption header `🔄 后台任务完成，继续处理中…` and the
   permission card's 「调用子代理」.
+- A cola restart still loses live cards; the next Wake pass rebuilds the ledger
+  on a new card exactly as it rebuilds any continuation, and a restart's
+  projection seeds it (ADR-0071).
+- Rejected: Policy C; no ledger (the opaque header says something runs without
+  saying what); the completed entry following the newest card (history would
+  accumulate on every continuation); a separate receipt line plus an entry (one
+  fact, one rendering); refreshing only at handovers (the ledger would snapshot
+  exactly when a user checks it); keeping the waiting card frozen until
+  superseded.
 
-## Amendment (2026-10-02, the yielded row's child activity): live subagent liveness on the ledger row
-
-A background `subagent`'s live row carries the same child-session liveness the
-live task panel shows (spec #501, ticket #503): appended after the row's start
-clock — `· subagent：**review the diff** · 14:04 · bash 5s`, or
-`· 思考中 30s · 等待你的授权` for a phase and its wait — through the front's own
-fragment vocabulary, so one child state reads the same wherever cola renders
-it. The fragment sits after the start clock and before `· ⚠️ 状态待确认`; a row
-the runtime reconciliation could not confirm renders no activity, and a `shell`
-row is unchanged (no fragment). A subagent row renders no total elapsed at all
-(see the amendment below): its clock is its start and its liveness is the
-fragment.
-
-- **One shared gather.** The front task panel's per-child read loop becomes a
-  batch — a set of `(call_id, child)` pairs, one transcript light read per
-  distinct child plus its one pending-wait query, keyed back by call id — and
-  the yielded ledger refresh reuses it. A pass reads each distinct child at
-  most once; a session with no live background subagent (shell-only, V1) names
-  no child and spends no new request, and a pass whose card cannot receive the
-  refresh gathers nothing.
-- **This cut wires Session Sync.** The live render path gathers no liveness for
-  the ledger *(superseded by the ticket #504 amendment below: the live render
-  gathers too)*: the fragment first appears on the yielding card's ~8 s Session
-  Sync reads (a waiting card's only clock). A path that does not gather keeps
-  whatever fragment is already stored — its age keeps counting — so the
-  handover, the in-place resume and a live re-render never drop it.
-- **Failure keeps the last successful fragment.** The gather carries only
-  successes; a call whose child read fails (or whose transcript carries no
-  timestamp) keeps the fragment of the last read that succeeded, whose stored
-  times are never refreshed, so the rendered age keeps growing truthfully and a
-  failed read never ends the wait (ADR-0054's rule).
-- **The ledger clock covers the fragment's age, and the flush reads the
-  rendered row.** A shell row's clock now holds its elapsed, and every row's
-  holds its activity age; the live path still compares whole minutes and the
-  yielded refresh whole seconds, so a yielded card PATCHes when its visible
-  second turns and never once per read, while the live card gains no per-second
-  churn. The comparison is on
-  what the row RENDERS — its type, its label folded and clipped, its local
-  `HH:MM` start clock, the fragment's label and wait — never the raw values
-  that render identically (text past the clip, an empty label, a start moving
-  inside the shown minute and second) nor the gathered liveness's stored
-  timestamps: a child part landing inside the second the card already shows
-  owes nothing. The read is still stored whatever the decision, so the next
-  age counts from the freshest timestamps rather than from a stale accepted
-  read. An unconfirmed row's stored age never ticks (it renders none), and an
-  untimed tool has no age to tick.
-
-GLOSSARY's **Background Task Ledger** entry follows. The child retirement read
-of #464 will reuse the same gather.
-
-## Amendment (2026-10-02, the live render's own gather): the live path reads the same liveness
-
-Ticket #504 supersedes the "This cut wires Session Sync" bullet above: the live
-render path gathers the ledger's child liveness too, so a background `subagent`
-row is as fresh as the card while the parent turn still runs. Each render poll
-runs ONE shared batch over the union of the children both surfaces name — the
-card's live task panels and the read's live background subagents — and hands it
-to both: one transcript light read and one pending-wait query per distinct
-child, so a child named by a panel and a ledger row is read once per render.
-The fragment's age is measured at the card's build clock, so it stays true, and
-a later read of the same row renders the child's new typed activity (a phase
-gives way to a running tool, a wait joins, a failed gather heals).
-
-- **The whole-minute gate stands.** The live path's clock comparison is
-  unchanged: the activity age's seconds never owe a PATCH by themselves, only
-  its whole minute turning (the same gate a shell row's elapsed has), while a
-  typed liveness change — a tool switch, a wait entering or leaving, the gather
-  establishing or losing the child — owes one immediately, inside the same
-  minute.
-- **The yield still has no gather of its own.** The live render has usually
-  established the fragment before the card yields, and the ~8 s Session Sync
-  reads keep it fresh while the card waits; the yield's own rendering keeps
-  whatever fragment is stored. A handover, an in-place resume or any path that
-  gathers nothing still never drops it.
-- **The zero-read rule is unchanged.** A read that names no live background
-  subagent — shell-only, or V1 with no Background Task facts — spends no child
-  request; only a live subagent row's child is read.
-
-Related: #501, #503, #504, ADR-0054, ADR-0066.
-
-## Amendment (2026-10-02, the subagent row's clock): no total elapsed
-
-A `subagent` row never renders the task's total runtime. Its start clock and its
-child's activity fragment already say what the row needs to: the fragment
-carries the live age (`shell 26s`), and the total beside it (`0m34s`) is
-redundant and long. The rule is kind-scoped: a `shell` row keeps its elapsed —
-the elapsed is its only liveness, since it has no fragment — while a subagent
-row's clock is its start `HH:MM` and its liveness is the fragment.
-
-- The row copy: `· subagent：**review the diff** · 14:04 · shell 26s` (was
-  `· … · 14:04 · 1m05s · shell 26s`); a fragment-less subagent row stops at its
-  clock, `· subagent：**review the diff** · 14:04`; a shell row is unchanged
-  (`· shell：**npm run build** · 14:02 · 3m12s`). Completion entries and their
-  identity lines (`subagent ses_child · 22:46 · 1m`) keep their timing — a
-  completion is history, not liveness.
-- The render clock follows the render: a subagent row's `elapsed` clock is
-  always `None`, so its total runtime can never owe a flush; only its fragment's
-  age ticks (whole seconds on the yielded path, whole minutes on the live one),
-  and the shell row's elapsed keeps the two-tier gate exactly as before.
-- The size reserve keeps its shell-sized per-row constant; a subagent row's
-  missing elapsed is over-reserve, which is safe.
-
-This supersedes the subagent total elapsed in the earlier amendments: the #501
-amendment's example is updated above, and the #502 amendment's example is marked
-superseded.
-
-Related: #501, #503, #504, ADR-0054, ADR-0060.
-
-## Amendment (2026-10-08, #568): the ledger and the quiet true end serve any yielded chain cola holds
-
-The freeze's carve-out was reachable for a cola-authored Session only, because
-Session Sync ran its Wake and ledger steps behind that gate. #568 widens the
-pass to any active Session's **yielded card chain cola holds** — an
-**External Message** follow's waiting card included — so that card's ledger
-stays fresh through the wait and its last task retiring with nothing to
-render settles it in place (✅, or ❌ on a settled failure) exactly as for a
-cola request. The write admission is unchanged (only a yielded card admits
-the ledger write), so widening the caller adds no new write path.
-
-The Completion Notice keeps the rule that a chain cola did not start owes
-none: an external follow's card carries no Turn clock, and its 有新消息 send
-was its notification (ADR-0059's 2026-10-08 amendment).
-
-## Amendment (2026-10-31, #917): a card with an unanswered typed answer stops refreshing
-
-The yielded read exists to prove the wait is alive — "cola is still waiting,
-and here is how long". It stops when the card renders a free-text answer field
-nobody has submitted yet (`StreamAccumulator::awaits_typed_answer`): Feishu
-rebuilds `body.elements` on every card update, so the read's PATCH wipes the
-text the Host is typing, and that text lives only in the client. A clock
-that kept repainting a card holding a half-typed answer is the observable "it
-refreshes by itself" of issue #917.
-
-The freeze covers the **whole ledger read**, not only its clock: rows
-(membership, a row's words, an activity's fragment) and a completion entry
-repaint the card just as surely as a rendered second does. And the read is
-**not consumed while frozen**: `refresh_yielded_ledger` returns before planning
-its entries, before its child reads and before `apply_ledger_read`, so nothing
-is marked shown and nothing is advanced — the first pass after the answer finds
-the same delta and lands it (the "deferred, then landed on the very next read"
-half is pinned by a test). The check is made twice: early, to spend no read at
-all, and again under the card-write lock before the apply, so a question
-surfaced while those reads ran still keeps its form out of this pass. The settlement that ends the wait is not ledger
-progress and still lands (`YieldedUpdate::Settled`). A click-only question
-renders no input and keeps its second; so does every card that carries no
-unanswered form at all, which is the aliveness contract unchanged.
+Origins: #403, #405, #412, #415, #416, #419, #423, #501, #502, #503, #504, #568,
+#917; ADR-0054, ADR-0059, ADR-0066, ADR-0071.
