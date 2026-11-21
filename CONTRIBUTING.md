@@ -167,10 +167,10 @@ login the repo already uses — and it writes nothing:
    `github-actions` bot; the verdict is the last non-blank line's
    `CODEX_REVIEW_VERDICT: PASS|FAIL`; a `FAIL` is a blocking round) and their
    median. A person or other bot quoting a verdict is not a round. The PR's
-   `<!-- gate-dossier -->` comment is the human record that count should agree
-   with; its free-form prose is not parsed, and a dossier that quotes a verdict
-   is not counted as a round. PRs over the cap, release cuts, and Dependabot
-   PRs are reported as excluded, never silently dropped.
+   `<!-- gate-dossier -->` comment remains the human record of rounds spent and
+   deferred findings; the command does not read it, and a dossier that quotes a
+   verdict is not counted as a round. PRs over the cap, release cuts, and
+   Dependabot PRs are reported as excluded, never silently dropped.
 2. **CI wall time** — the last N completed `CI` runs, per job (median and max
    from each job's `started_at`/`completed_at`), with the `Test` matrix legs
    called out against their 6-minute target. The overall wall is the latest

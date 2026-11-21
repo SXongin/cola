@@ -12,8 +12,8 @@
 //! `CODEX_REVIEW_VERDICT` marker (the same completeness rule as
 //! `.github/workflows/codex-review.yml`'s `codex_verdict_of_line`), and a
 //! `FAIL` is a blocking round. The PR's `<!-- gate-dossier -->` comment is the
-//! human record that count should agree with; its free-form prose is not
-//! parsed, and a dossier that quotes a verdict is not counted as a round. CI
+//! human record of rounds spent; the command does not read it, and a dossier
+//! that quotes a verdict is not counted as a round. CI
 //! times are the Actions API's per-job `started_at`/`completed_at`; commit
 //! types come from `git log`; module sizes are the ratchet's own
 //! production-line count, so this report and `check-structure` measure the same
