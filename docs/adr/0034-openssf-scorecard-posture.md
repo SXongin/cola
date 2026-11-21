@@ -83,9 +83,8 @@ byproduct**. Concretely:
    solo project an AI second pass is better than no gate at all, and GitHub
    itself now sanctions bot approvals. The gate is the Codex Action; its policy
    is `CONTRIBUTING.md` "Reviewing". This ADR owns the Scorecard consequence
-   only: that approval is what satisfies `main: review` for solo work, and it
-   closes the last solvable `Code-Review` gap. The admin bypass still exists, so
-   the bot can never lock the maintainer out.
+   only: that approval is the one non-author approval, so it closes the last
+   solvable `Code-Review` gap (fragile — see Consequences).
 
 **Explicit no-s.** We are not pursuing the CII Best Practices badge (hours of
 self-attestation for at most +0.2), multi-organization `Contributors` (not
@@ -124,5 +123,3 @@ to 0 (no SAST tool detected); do not re-add a scanner for this check alone.
   `Code-Review` (approved bot changesets are skipped entirely), so skipping
   Dependabot PRs in the gate has a small score cost. Worth revisiting only if
   the score matters more than the automation.
-- CodeQL's retirement (ADR-0064) returns `SAST` to 0: that is the deliberate no
-  above, not a regression to fix.
