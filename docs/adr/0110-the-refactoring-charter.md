@@ -96,13 +96,14 @@ What a guard decides, and what only a reviewer can:
 | `crate::opencode` outside the adapter | `check-client-seam` |
 | fixture formatting | `check-fixture-format` |
 | user-guide translation shape | `check-doc-drift` |
-| dangling doc citations; an ADR's 3+ banner count (warning) | `check-doc-links` |
+| dangling doc citations; an ADR's 3+ `by ADR-NNNN` banners (warning) | `check-doc-links` |
 | Conventional Commits subject | `check-commit-msg` |
 | dependencies and advisories | `cargo deny` |
 
 `check-doc-links` (#1131) fails a dangling `ADR-NNNN`, doc path or `src/…:line`
-pin and warns on an ADR carrying 3+ amendment banners; the count is reported,
-not enforced — whether the banners demand a read stays a review act.
+pin and warns on an ADR carrying 3+ `… by ADR-NNNN` amendment banners; the
+count is reported, not enforced — whether the banners demand a read stays a
+review act.
 
 Review-only, because a predicate cannot decide them: the one-behaviour test
 rule and its exceptions; a new `Option<&Gate>` or `*_for_test` production

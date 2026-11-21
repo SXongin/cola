@@ -235,8 +235,8 @@ cited from `docs/`, `AGENTS.md`, `GLOSSARY.md`, `CONTRIBUTING.md` and
 `CODING_STANDARDS.md`, and fails with the citing file and line on a dead one. A
 pin is checked for existence and range, never for the statement at the line.
 `docs/research/` is dated evidence and is not scanned as a source; it stays a
-valid link target. It also warns (never fails) on an ADR carrying 3+ amendment
-banners — the mandatory read at review (ADR-0110 §3).
+valid link target. It also warns (never fails) on an ADR carrying 3+
+`… by ADR-NNNN` amendment banners — the mandatory read at review (ADR-0110 §3).
 
 Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 **not** check formatting, so a clean clippy does not mean a clean fmt.
