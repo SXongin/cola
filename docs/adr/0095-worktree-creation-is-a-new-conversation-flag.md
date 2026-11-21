@@ -157,7 +157,10 @@ restated here; ADR-0088 is a pointer.
 ## Consequences
 
 - `sessions.json` gains an optional `worktree` intent on a pending; an older
-  binary ignores the unknown field, and an abandoned intent creates nothing.
+  binary ignores the unknown field and would materialise in the source
+  directory, and an abandoned intent creates nothing. The feature has never
+  shipped (decision 13), so that downgrade is not supported: the format is
+  forward-compatible only.
   The pending's directory is the **source**, not the target; materialisation
   points the session entry at the created checkout before the session is
   created; the stored pending keeps its source until activation clears it.
