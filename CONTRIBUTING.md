@@ -46,9 +46,8 @@ Keep one PR to one thing (see *Before you start*) and the branch short-lived.
 
 This rule applies to agents too: **agents never merge a feature/task PR.**
 They run the loop up to the green PR — branch, work, commit, rebase, open the
-PR, get CI and review green — and then stop, or hand the PR over when the Codex
-gate's budget is spent and the user-approved round still FAILs (*Reviewing*). The
-user verifies the change
+PR, get CI and review green — and then stop, or hand the PR over when a gate
+stop predicate fires (*Reviewing*). The user verifies the change
 themselves and gives the explicit go-ahead (or merges it themselves). The
 release cut is the one exception: `cargo xtask release` performs its own
 CI-gated merge after the user confirms the smoke test (ADR-0033). Do not stop
@@ -543,35 +542,55 @@ the reviewed commit and `main: review` requires the last push to be approved,
 so a fix, a rebase, or any later commit needs its own PASS. Batch the blocking
 findings a round raised — and answer each non-blocking one and carry it to the
 PR's deferred list rather than fixing it — re-run the local pair at the same
-scope, and push once. Once the gate passes, push again only for a real finding (yours or the
-user's) or a required rebase, and wait for that round's PASS; never merge on a
-stale approval. That push is a round in the budget — past round 3 it needs the
-user's approval like any other.
+scope, and push once. Once the gate passes, push again only for a real finding
+(yours or the user's) or a required rebase, and wait for that round's PASS;
+never merge on a stale approval. That push is a new round like any other.
 
-**Three gate rounds, then ask.** A PR gets 3 automatic gate rounds. Round 1 is
-broad discovery; rounds 2–3 verify the remediation and the paths it directly
+**Gate rounds run autonomously until a stop predicate.** Round 1 is broad
+discovery; every later round verifies the remediation and the paths it directly
 touches, with the author assembling the fix and the gate re-reading the whole
-diff. A `critical` security or data-loss finding the diff introduces or makes
-newly reachable is fixed and pushed in its own round first, without waiting for
-that approval — the one exception to the approval rule, and it does not use up
-the approved verification round. When round 3 still raises
-other blocking findings, fix them in one batch and push once more; that
-verification round needs the user's explicit approval. Only non-blocking and
-out-of-scope findings, and pre-existing defects the diff neither creates nor
-makes newly reachable, may be deferred, into the PR's dossier — a blocking
-finding is never deferred. Whenever the loop ends — green or handed
-over — a non-empty deferred list becomes a follow-up issue linked from the
-dossier, a round-3 PASS included. If the gate still FAILs after the user-approved
-round, stop and hand the PR to the user with the remaining findings: each further
-gate round needs their approval, a critical finding excepted, and merging with
-the admin bypass or closing the PR is theirs to decide, never the agent's. If
-the user declines another round, hand the PR over as it stands.
-The budget counts every gate run that posts a review — a non-draft push, a
-non-draft `opened`, the `ready_for_review` flip that spends a draft's first
-review, an `edited` body re-run, or a `reopened` run. A run that fails before the model (an unfetchable reference, a credential
-failure) posts none and is not a round, and the agent never re-runs the gate on
-an unchanged head to fish for a different verdict. The local pair still
-runs until no blocking finding remains (`docs/agents/flow.md`).
+diff. A round never waits for the user: fix every blocking finding it raised,
+answer every non-blocking one into the dossier, re-run the local pair at the
+same scope, and push once. Continue while the work is converging — that is the
+default, not an exception.
+
+Stop and hand the PR over — without waiting — only when one of these predicates
+holds:
+
+- **Design-level** — the finding needs a decision the diff cannot make: a
+  public contract, an accepted ADR, a schema, or behaviour beyond the linked
+  issue's acceptance criteria.
+- **Oscillation** — a finding the PR has already fixed reappears, or the same
+  finding class appears in two consecutive rounds.
+- **Non-convergence** — the blocking count has not fallen across two
+  consecutive rounds. A regression the fix itself introduced is exempt as
+  evidence for one round: fix it, then measure again.
+- **Harm** — the only way to satisfy the gate is over-defensive code, a guard
+  for an input that cannot occur, a test for an unreachable state, or deleting
+  or replacing a real design. Record the finding and why fixing it would leave
+  the code worse than the defect.
+- **Backstop** — six gate rounds have been spent. A `critical` security or
+  data-loss round does not count toward this number.
+
+A `critical` security or data-loss finding the diff introduces or makes newly
+reachable is fixed and pushed in its own round first; it is never deferred and
+never waived by a stop predicate. Only non-blocking and out-of-scope findings,
+and pre-existing defects the diff neither creates nor makes newly reachable, may
+be deferred, into the PR's dossier — a blocking finding is never deferred.
+Whenever the loop ends — green or handed over — a non-empty deferred list
+becomes a follow-up issue linked from the dossier, a PASS included.
+
+On a stop, write the matched predicate and the remaining findings into the
+dossier, leave the PR at its last head, and notify the user; each further gate
+round, merging with the admin bypass, or closing the PR is theirs to decide,
+never the agent's. If the user declines another round, hand the PR over as it
+stands. The backstop counts every gate run that posts a review — a non-draft
+push, a non-draft `opened`, the `ready_for_review` flip that spends a draft's
+first review, an `edited` body re-run, or a `reopened` run. A run that fails
+before the model (an unfetchable reference, a credential failure) posts none and
+is not a round, and the agent never re-runs the gate on an unchanged head to
+fish for a different verdict. The local pair still runs until no blocking
+finding remains (`docs/agents/flow.md`).
 
 **The dossier is a PR comment, not the body.** A comment whose first line is
 `<!-- gate-dossier -->` records the rounds spent and the deferred findings; it is

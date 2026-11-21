@@ -71,12 +71,13 @@ below (#1126–#1131) move the existing restatements there.
 
 The branch loop, the local pair, deferral and commit granularity stay: wall time
 tracks rounds, and a 36-commit PR has passed in one (#1110). The gate keeps its
-3-round budget and its cap of 3 blocking findings in full (plus 5 non-blocking)
-until #1114 measures them. A `ready-for-agent` ticket's every acceptance
-criterion names what decides it — a code symbol, a wire field, a recorded
-fixture, or a command the reviewer can run — enforced at triage, not by a
-template. The review prompt is unchanged except to skip what tooling now
-decides.
+cap of 3 blocking findings in full (plus 5 non-blocking); its round policy is
+the stop-predicate rule in `CONTRIBUTING.md` "Reviewing" (ADR-0034,
+2026-11-21), which replaced the three-round budget this charter inherited. A
+`ready-for-agent` ticket's every acceptance criterion names what decides it — a
+code symbol, a wire field, a recorded fixture, or a command the reviewer can
+run — enforced at triage, not by a template. The review prompt is unchanged
+except to skip what tooling now decides.
 
 ## The ratchet
 
@@ -100,7 +101,7 @@ Review-only, because a predicate cannot decide them: the one-behaviour test
 rule and its exceptions; a new `Option<&Gate>` or `*_for_test` production
 branch (the counter sees only `#[cfg(test)]`); the comment rule; the 150-line
 ADR cap; the fold conditions; over-defense against guards for impossible inputs
-(a finding, never a block); the gate budget; the no-diff-cap rule;
+(a finding, never a block); the gate's round policy; the no-diff-cap rule;
 measure-don't-assert; a feature cut waiting on user evidence; boy-scout
 lowering; the triage criterion rule.
 
@@ -111,9 +112,10 @@ missed — then it lands with its baseline, never a blanket threshold.
 
 **No diff-size cap or split rule** (#1015's +9,329 lines passed in one round;
 #1047's +157 took forty-seven — #1105), **one Test job with no Linux leg**
-(#1106), **no PR template or out-of-scope section** and **the 3-round gate
-budget** (#1110) stay: the cost is the round, and the budget is what makes the
-local pair spend the second one.
+(#1106), **no PR template or out-of-scope section**, and **a bounded round
+policy** (now the stop-predicate rule, `CONTRIBUTING.md` "Reviewing") stay: the
+cost is the round, and the bound is what makes the local pair spend the second
+one.
 
 ## The measure
 

@@ -6,6 +6,10 @@
 > **Amended by ADR-0034 (2026-11-18)**: the local gate rehearsal is removed; the
 > local pair and the CI gate's three-round budget stand — see the amendment at
 > the end.
+>
+> **Amended by ADR-0034 (2026-11-21)**: the three-round budget and its round-3
+> approval are replaced by autonomous rounds plus stop predicates — see the
+> amendment at the end.
 
 The repository runs OpenSSF Scorecard (weekly workflow, published results, README
 badge) and scored 6/10. The aggregate is a **risk-weighted** average
@@ -581,3 +585,32 @@ spent nine gate rounds and 32 commits. It is removed from `/implement-spec`, `fl
 (`.codex/skills/cola-implement-spec/SKILL.md`); the CI gate remains the single
 **approving** reviewer, and the three-round budget above still bounds it. The
 local pair keeps its no-round-cap rule.
+
+## Amendment (2026-11-21): gate rounds run autonomously until a stop predicate
+
+The 2026-11-17 amendment's three-round budget ended in a synchronous approval
+from round 4. That assumed the maintainer is at the keyboard: a gate round costs
+~10–15 minutes (#1110 measured a 10–12-minute floor), while the approval wait is
+unbounded, so an absent maintainer turned a bounded review into an hours-long
+stall — worse total wall time than simply continuing. The round count was also a
+poor proxy for a bad gate: #1105 found 206 of 210 findings (98%) across 257 gate
+reviews were real defects, and rounds do not track diff size (#1047: 47 rounds
+on a 157-line diff; #1072: 8 rounds on a 291-line docs-only diff).
+
+The round-3 approval is replaced, in #1145, by autonomous rounds plus five stop
+predicates whose home is `CONTRIBUTING.md` "Reviewing": a design-level finding;
+oscillation (a fixed finding reappears, or the same class appears in two
+consecutive rounds); non-convergence (the blocking count does not fall across
+two rounds, a regression the fix introduced being exempt as evidence for one
+round); harm (the only fix would leave the code worse than the defect —
+over-defensive code, an impossible-input guard, an unreachable-state test, or
+deleting a real design); and a six-round backstop (a critical security/data-loss
+round does not count). A round never waits for the user. On a stop the agent
+writes the matched predicate and the remaining findings into the dossier, leaves
+the PR at its head and hands it over; further rounds are the user's decision,
+and merging stays human.
+
+The blocking definition, the 3 blocking / 5 non-blocking finding cap, the
+line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` parser and the per-commit approval
+are unchanged. This amendment supersedes the three-round budget and the round-3
+approval in the 2026-11-17 amendment; the rest of that amendment stands.
