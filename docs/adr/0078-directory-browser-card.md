@@ -38,7 +38,7 @@ same 切换到这里 / 建话题 node actions the Recent Directories rows carry.
   `value` and no `form_value`; and a form may wrap a `collapsible_panel`. The
   layout above stands on the other two facts: a form cannot wrap the rows
   usefully when a `form` may not nest in a panel, and the drill-down needs the
-  card's own structure. ADR-0100 states both facts.)
+  card's own structure. ADR-0100 states the nesting half.)
 - **The cards are stateless** (ADR-0052): the browsed directory, the hidden
   toggle, the child filter and the page all round-trip in the button payload,
   and nothing is persisted per thread.
