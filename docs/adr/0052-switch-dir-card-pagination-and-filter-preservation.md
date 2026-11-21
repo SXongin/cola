@@ -1,6 +1,9 @@
 # Switch and dir cards: union, search, pagination, and a filter that survives
 # every rebuild
 
+> **Supersedes** ADR-0046 (the union) and ADR-0051 (the search); amends
+> ADR-0100's 返回列表 rule (2026-11-06).
+
 The `/switch` and `/dir` cards cap their rows at six (`MAX_SWITCH_ROWS`). Both
 now paginate six rows per page, and the active filter — keyword, scope, page —
 rides every button on the card, so any rebuild (page flip, row action, scope
@@ -45,6 +48,10 @@ pointers here.
 3. the conversation's current directory, inserted at the FRONT only when neither
    source above already carries it (the pending-only case).
 
+The current directory is marked 当前 on its row, and it is in the list
+precisely so that row can exist: the card marks 当前 only on a row it renders,
+so the pending-only directory no longer shows the empty-state hint. The union
+only needs to be plausible, not canonical — a missing row costs one typed path.
 The union is read-only: nothing new is persisted, and no directory is recorded
 that cola did not already know through a mapping, a server session or the
 current pending. `SessionStore::directories()`'s meaning — "unique mapped
@@ -100,7 +107,7 @@ the search submit (keyword only; page resets). `/dir`'s `pick` (including the
 ### Adopt's list
 
 The compact 已切换 state card that replaces an adopted list card gains an
-optional 返回列表 button carrying keyword/scope/page (ADR-0052's 2026-11-06
+optional 返回列表 button carrying keyword/scope/page (this ADR's 2026-11-06
 amendment, after ADR-0100 deleted the Session Snapshot card). The switch-list op
 patches the clicked list card **in place**, button included, and sends no new
 message; a text adoption has no list card to return to and carries no button.
@@ -142,9 +149,9 @@ The one-card rule is unchanged.
   with its own retention), raising the row cap or "load more" (unbounded growth
   against Feishu's limits), basename-only matching, a page-number input, and
   always showing `/dir`'s search box (short-list noise). Raising the cap was
-  rejected here and in ADR-0051; validating paths against the filesystem stays
+  already rejected; validating paths against the filesystem stays
   out (the card build does no I/O).
 
 Origins: the union #273; the search #319; pagination and filter preservation
-#326, closing #318. CONTEXT.md's Recent Directories entry records the union,
+#326, closing #318. GLOSSARY.md's Recent Directories entry records the union,
 search and pagination.
