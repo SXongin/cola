@@ -5,4 +5,5 @@
 fold state survives a settle.
 
 Superseded by [ADR-0104](0104-the-timeline-module.md); the snapshot example
-retired by [ADR-0100](0100-a-session-has-one-card.md). From PR #209 (no issue).
+retired by [ADR-0100](0100-a-session-has-one-card.md). Originated in PR #209,
+out of a review discussion — no originating issue.
