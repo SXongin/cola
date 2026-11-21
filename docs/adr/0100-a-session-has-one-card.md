@@ -92,14 +92,18 @@ input's own name (`custom_<i>`) before repainting the new box with
 (#917). Option, confirm, skip and reject buttons stay non-submit. A switch is
 honoured only while it still carries the box of the question that is open (the
 name's last segment, repeated in the button's `value`); a client that sends only
-a `value` falls back to the payload's input name. A draft is dropped when its
+a `value` falls back to the payload's input name; with no box at all, the switch
+is dropped only when the question open now renders a typed box. A draft is dropped when its
 question is finalized and cleared when a submit consumes it; a question with no
 typed control opens without a box; and of two racing switches on one pre-switch
 card the first to land wins. A dropped switch does not repaint while a typed box
 is open — that would erase what the client alone holds — and it does repaint on
 the standalone and inline surfaces when none is, so a card whose ack Feishu
-discarded can catch up. The render pass writes nothing while an unanswered typed
-answer renders (ADR-0038's 2026-10-31 update, pitfall `card-repaints`).
+discarded can catch up. A stored draft is capped at its box's own `max_length`
+(500 for free text, 40 for a number) because the client alone enforces that
+limit, and a numeric answer is parsed after trimming surrounding whitespace.
+The render pass writes nothing while an unanswered typed answer
+renders (ADR-0038's 2026-10-31 update, pitfall `card-repaints`).
 
 **Taking a session over no longer posts a card.** A first adoption confirms in
 one text line carrying the same status summary, and that line is the Topic

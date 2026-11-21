@@ -110,8 +110,10 @@ is allowed only when the full content was delivered for that request.
   a sweep that read the flag just before the persist can still surface a card for
   the request, and the approval then finds it gone (`NotFound`) — the window is
   one list-to-reply round trip, or two backend reads wide for a toggle flipped
-  between the persist and its pass. Closing either needs a serialization between
-  an enable path and the sweep, which this decision does not take on.
+  between the persist and its pass. In that second window the click-time guard
+  still refuses the surfaced card's Allow, so no unseen target is approved.
+  Closing either needs a serialization between an enable path and the sweep,
+  which this decision does not take on.
 - **Delivery is persisted; uncertainty is only a marker.** A client-scoped
   `request_id → CompanionDelivery { message_id, lane, target digest }` record
   rides beside the existing surface records (ADR-0038). A **confirmed** send

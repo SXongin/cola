@@ -181,7 +181,8 @@ its lifecycle entry, and cancel, pull-card and follow-external are the
 operations other flows drive. Card delivery is reachable only through
 `Turn::flush_card` / `Turn::split_card_chain` / `Turn::render_and_flush` /
 `Turn::session_subtitle`; the slice split, the continuation send, the
-card-handle record and the accumulator edit all sit behind them, and the
+card-handle record and the accumulator edit all sit behind them, and any card
+delivery those operations trigger still lands on the four calls above. The
 Timeline is `pub(super)` to the Turn. The render poll, the flush/split state
 machine and the accumulator stay internal to it; a render poll outside the Turn
 is the rejected shape. The Turn receives narrow handles (`TurnHandles`), never
