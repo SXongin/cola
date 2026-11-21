@@ -4,6 +4,7 @@ use std::process::{Command, exit};
 mod client_seam_guard;
 mod codex_gate;
 mod doc_drift;
+mod doc_links;
 mod generation_guard;
 mod metrics;
 mod release;
@@ -15,8 +16,8 @@ fn main() {
         eprintln!("Usage: cargo xtask <task>");
         eprintln!(
             "Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, \
-             check-client-seam, check-fixture-format, check-doc-drift, check-structure, metrics, \
-             release"
+             check-client-seam, check-fixture-format, check-doc-drift, check-doc-links, \
+             check-structure, metrics, release"
         );
         exit(1);
     });
@@ -32,6 +33,7 @@ fn main() {
         "check-client-seam" => client_seam_guard::run(),
         "check-fixture-format" => check_fixture_format(),
         "check-doc-drift" => doc_drift::run(),
+        "check-doc-links" => doc_links::run(),
         "check-structure" => structure_guard::cli(),
         "metrics" => metrics::cli(),
         "release" => release::cli(),
@@ -39,7 +41,7 @@ fn main() {
             eprintln!(
                 "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, \
                  check-generation, check-client-seam, check-fixture-format, check-doc-drift, \
-                 check-structure, metrics, release"
+                 check-doc-links, check-structure, metrics, release"
             );
             exit(1);
         }

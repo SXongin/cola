@@ -129,6 +129,7 @@ cargo xtask check-client-seam
 cargo xtask check-structure
 cargo xtask check-fixture-format
 cargo xtask check-doc-drift
+cargo xtask check-doc-links
 cargo test --workspace --locked
 cargo build --release --locked
 ```
@@ -227,6 +228,15 @@ source (`docs/user-guide.md`) structurally — heading levels, fenced code
 blocks, table shapes, indented code blocks, links and in-page anchors. Prose is
 translated and never compared; a source edit that adds or removes structure
 fails CI until the translation follows.
+
+`cargo xtask check-doc-links` is the doc-link guard: it resolves every
+`ADR-NNNN`, `docs/research/…` / `docs/reference/…` path and `src/…:line` pin
+cited from `docs/`, `AGENTS.md`, `GLOSSARY.md`, `CONTRIBUTING.md` and
+`CODING_STANDARDS.md`, and fails with the citing file and line on a dead one. A
+pin is checked for existence and range, never for the statement at the line.
+`docs/research/` is dated evidence and is not scanned as a source; it stays a
+valid link target. It also warns (never fails) on an ADR carrying 3+ amendment
+banners — the mandatory read at review (ADR-0110 §3).
 
 Note: CI's Format job is `cargo fmt --all -- --check` — clippy and rustc do
 **not** check formatting, so a clean clippy does not mean a clean fmt.
@@ -421,9 +431,9 @@ The Test job and all four live jobs still dispatch (idling for a few
 seconds) — a job-level skip leaves the matrix unexpanded or the required
 `Live V1`/`Live V2` checks unreported, and the advisory Codex checks
 missing, so only their steps are gated.
-`Dependency audit` and `Docs drift` always run: the drift guard is not gated by
-`classify` precisely because a docs-only PR, which skips every code gate, is
-where the guide pair can drift.
+`Dependency audit` and `Docs drift` always run: the two doc guards are not gated
+by `classify` precisely because a docs-only PR, which skips every code gate, is
+where the guide pair can drift and a citation can dangle.
 
 ### Security scanning
 
