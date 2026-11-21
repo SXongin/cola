@@ -103,7 +103,15 @@ is allowed only when the full content was delivered for that request.
   next sweep retries, while the 8-hop cap is a structural bound and takes the
   ordinary surface. A failed approval reply keeps the request pending and
   unmarked (`Prepared::Retry`) for the next sweep, at ADR-0048's warn-once
-  cadence (WARN, then DEBUG for identical repeats, INFO on recovery).
+  cadence (WARN, then DEBUG for identical repeats, INFO on recovery). The
+  approval pass takes its own request span, so the INFO line carries `session=`
+  even under `/autoaccept on`, whose ambient span is the inbound message's.
+  Persisting before approving narrows but does not close the read/surface race:
+  a sweep that read the flag just before the persist can still surface a card for
+  the request, and the approval then finds it gone (`NotFound`) — the window is
+  one list-to-reply round trip, or two backend reads wide for a toggle flipped
+  between the persist and its pass. Closing either needs a serialization between
+  an enable path and the sweep, which this decision does not take on.
 - **Delivery is persisted; uncertainty is only a marker.** A client-scoped
   `request_id → CompanionDelivery { message_id, lane, target digest }` record
   rides beside the existing surface records (ADR-0038). A **confirmed** send
@@ -179,7 +187,8 @@ is allowed only when the full content was delivered for that request.
   and can be approved where it was seen. The transcript keeps the full content.
 - Auto-Accept keeps its decision, now stated above: it answers every
   pending permission unseen, renders no card, sends no companion, and logs the
-  request id, the crossed bound, the target length and a bounded first line. The
+  request id, the crossed bound, the summed target length, the rendered content
+  length and a bounded first line. The
   completeness proof never applies there because no approval surface exists to
   guard.
 - The proof depends on persisted state, which is why the record is client-scoped
