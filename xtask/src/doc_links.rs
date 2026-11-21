@@ -109,23 +109,33 @@ pub(crate) fn targets(content: &str) -> Vec<(usize, Target)> {
     found
 }
 
-/// `ADR-NNNN` citations, including one inside a list such as `ADR-0105/0106`
-/// (only the prefixed one is a citation).
+/// `ADR-NNNN` citations, including the slash-separated shorthand the docs use
+/// (`ADR-0105/0106/0107` cites three ADRs).
 fn adr_targets(line: &str, out: &mut Vec<Target>) {
     for (start, _) in line.match_indices("ADR-") {
         if start > 0 && is_path_char(previous_char(line, start)) {
             continue;
         }
         let rest = &line[start + 4..];
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if digits.len() != 4 {
-            continue;
+        let mut offset = 0;
+        loop {
+            let candidate = &rest[offset..];
+            let digits: String = candidate.chars().take_while(char::is_ascii_digit).collect();
+            // `ADR-00012` is not a four-digit citation.
+            if digits.len() != 4 || candidate[4..].starts_with(|c: char| c.is_ascii_digit()) {
+                break;
+            }
+            out.push(Target::Adr(digits));
+            offset += 4;
+            // `ADR-0105/0106` continues after the slash; anything else ends the run.
+            let Some(next) = rest[offset..].strip_prefix('/') else {
+                break;
+            };
+            if !next.starts_with(|c: char| c.is_ascii_digit()) {
+                break;
+            }
+            offset += 1;
         }
-        // `ADR-00012` is not a four-digit citation.
-        if rest[4..].starts_with(|c: char| c.is_ascii_digit()) {
-            continue;
-        }
-        out.push(Target::Adr(digits));
     }
 }
 
@@ -160,7 +170,7 @@ fn source_pin_targets(line: &str, out: &mut Vec<Target>) {
         let rest = &line[start..];
         let end = rest.find(|c: char| !is_path_char(c)).unwrap_or(rest.len());
         let path = &rest[..end];
-        if !path.ends_with(".rs") || !rest[end..].starts_with(':') {
+        if path == "src/" || !rest[end..].starts_with(':') {
             continue;
         }
         let after = &rest[end + 1..];
@@ -228,13 +238,16 @@ fn read_adrs(root: &Path) -> Result<BTreeMap<String, String>, String> {
     for entry in entries {
         let entry = entry.map_err(|e| format!("error: cannot read an entry of {}: {e}", dir.display()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".md") || name.len() < 6 {
+        let bytes = name.as_bytes();
+        if bytes.len() < 6
+            || !name.ends_with(".md")
+            || !bytes[..4].iter().all(u8::is_ascii_digit)
+            || bytes[4] != b'-'
+        {
             continue;
         }
+        // The first four bytes are ASCII digits, so the slice is a char boundary.
         let number = &name[..4];
-        if !number.chars().all(|c| c.is_ascii_digit()) || !name[4..].starts_with('-') {
-            continue;
-        }
         if let Some(previous) = adrs.insert(number.to_string(), format!("docs/adr/{name}")) {
             return Err(format!(
                 "error: ADR number {number} is claimed by both {previous} and {name}"
@@ -300,12 +313,17 @@ fn relative_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// The dangling citations in one document.
-fn dangling(root: &Path, adrs: &BTreeMap<String, String>, path: &str, content: &str) -> Vec<Finding> {
+/// The dangling citations in one document, from its already-extracted targets.
+fn dangling(
+    root: &Path,
+    adrs: &BTreeMap<String, String>,
+    path: &str,
+    targets: &[(usize, Target)],
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut line_counts: BTreeMap<String, Option<usize>> = BTreeMap::new();
-    for (line, target) in targets(content) {
-        let reason = match &target {
+    for (line, target) in targets {
+        let reason = match target {
             Target::Adr(number) if !adrs.contains_key(number) => Some("no such ADR".to_string()),
             Target::Adr(_) => None,
             Target::DocPath(doc) if !root.join(doc).is_file() => Some("no such file".to_string()),
@@ -329,7 +347,7 @@ fn dangling(root: &Path, adrs: &BTreeMap<String, String>, path: &str, content: &
         if let Some(reason) = reason {
             findings.push(Finding {
                 path: path.to_string(),
-                line,
+                line: *line,
                 target: target.text(),
                 reason,
             });
@@ -363,10 +381,11 @@ pub(crate) fn check_tree(root: &Path) -> Result<Report, String> {
         ..Report::default()
     };
     for source in &sources {
-        report.checked += targets(&source.content).len();
+        let targets = targets(&source.content);
+        report.checked += targets.len();
         report
             .findings
-            .extend(dangling(root, &adrs, &source.path, &source.content));
+            .extend(dangling(root, &adrs, &source.path, &targets));
     }
     Ok(report)
 }
@@ -482,6 +501,48 @@ mod tests {
     }
 
     #[test]
+    fn a_shorthand_adr_list_resolves_every_number() {
+        let targets: Vec<Target> = targets("ADR-0105/0106/0107")
+            .into_iter()
+            .map(|(_, target)| target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                Target::Adr("0105".to_string()),
+                Target::Adr("0106".to_string()),
+                Target::Adr("0107".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_five_digit_number_is_not_an_adr_citation() {
+        assert!(targets("ADR-00012").is_empty());
+    }
+
+    #[test]
+    fn a_host_repository_path_is_not_a_cola_pin() {
+        assert!(targets("packages/core/src/session.ts:75-82").is_empty());
+    }
+
+    #[test]
+    fn a_trailing_hyphen_without_a_range_end_is_a_single_line_pin() {
+        let targets: Vec<Target> = targets("`src/a.rs:12-`")
+            .into_iter()
+            .map(|(_, target)| target)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![Target::SourcePin {
+                path: "src/a.rs".to_string(),
+                start: 12,
+                end: 12,
+            }]
+        );
+    }
+
+    #[test]
     fn an_existing_reference_resolves() {
         let tree = Tree::new("resolves");
         tree.file("docs/research/a/b.md", "# b\n");
@@ -531,20 +592,51 @@ mod tests {
         );
     }
 
-    /// One observable behaviour per case: the line past the end, the range past
-    /// the end, and an inverted range each fail; a range that fits resolves.
     #[test]
-    fn a_pin_must_stay_within_the_file() {
-        let tree = Tree::new("pin-range");
+    fn a_pin_that_fits_the_file_resolves() {
+        let tree = Tree::new("pin-fits");
         tree.file("src/small.rs", "one\ntwo\nthree\n");
         tree.file("docs/note.md", "`src/small.rs:3-3`\n");
         assert_eq!(tree.check().findings.len(), 0);
+    }
+
+    #[test]
+    fn a_pin_may_name_any_file_under_src() {
+        let tree = Tree::new("pin-non-rs");
+        tree.file("src/feishu/fixtures/card.json", "one\ntwo\n");
+        tree.file("docs/note.md", "`src/feishu/fixtures/card.json:2`\n");
+        assert_eq!(tree.check().findings.len(), 0);
+    }
+
+    #[test]
+    fn a_line_past_the_end_fails() {
+        let tree = Tree::new("pin-past-end");
+        tree.file("src/small.rs", "one\ntwo\nthree\n");
         tree.file("docs/note.md", "`src/small.rs:4`\n");
         assert_eq!(tree.check().findings.len(), 1);
+    }
+
+    #[test]
+    fn a_range_past_the_end_fails() {
+        let tree = Tree::new("pin-range-past-end");
+        tree.file("src/small.rs", "one\ntwo\nthree\n");
         tree.file("docs/note.md", "`src/small.rs:2-4`\n");
         assert_eq!(tree.check().findings.len(), 1);
+    }
+
+    #[test]
+    fn an_inverted_range_fails() {
+        let tree = Tree::new("pin-inverted");
+        tree.file("src/small.rs", "one\ntwo\nthree\n");
         tree.file("docs/note.md", "`src/small.rs:3-2`\n");
         assert_eq!(tree.check().findings.len(), 1);
+    }
+
+    #[test]
+    fn a_non_ascii_adr_filename_is_ignored_without_panicking() {
+        let tree = Tree::new("non-ascii-adr");
+        tree.file("docs/adr/é-notes.md", "# notes\n");
+        assert_eq!(tree.check().findings.len(), 0);
     }
 
     #[test]
