@@ -148,8 +148,9 @@ renderer and one delivery rule. An ended-while-down (or run-lost) chain
 successor is armed seeded at the cursor, its create is the restart notification,
 and the existing external-render arm streams the run's later content and settles
 it by transcript truth, never an invented interruption. Only the live case adds
-the follow phase. An ended run with no deliverable target at all takes today's
-in-place settle; a live one is not adopted.
+the follow phase. An ended run with no deliverable target claims nothing — it
+keeps its record for a later pass rather than taking an in-place settle — and a
+live one is not adopted.
 
 - **The reply target is durable.** The successor replies to `reply_to` — the
   Feishu message the chain's cards reply under (the accumulator's reply target at
@@ -464,5 +465,5 @@ interlock is added).
   carry, `release`'s drop and the legacy cursorless read.
 
 Origins: #424, #426, #443, #444, #454, #505, #522, #527, #528, #529, #561 (spec),
-#562–#566, #569, #580, #583, #721, #886, #1025; ADR-0038, ADR-0061, ADR-0063,
-ADR-0066, ADR-0068, ADR-0069, ADR-0072, ADR-0082.
+#562–#566, #569, #580, #583, #721, #886, #1025; ADR-0038, ADR-0060, ADR-0061,
+ADR-0063, ADR-0066, ADR-0068, ADR-0069, ADR-0072, ADR-0082.
