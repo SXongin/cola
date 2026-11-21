@@ -250,5 +250,5 @@ still answers honestly. The durable Wake Watermark
   Unreceived ending and the in-place resumption.
 
 Origins: #1056 and #1055 (the guard key), #1083 (the steer contract), #428 and
-#409 (routing at all), #426 (in-place resumption), #568 (external follows), #602
+#409 (routing at all), #434 (the Unreceived ending), #426 (in-place resumption), #568 (external follows), #602
 (the residual card and the same-snapshot ending), #1087 (the third taker).
