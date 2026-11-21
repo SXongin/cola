@@ -702,8 +702,8 @@ _Avoid_: Notification, message, signal
 > **Dev:** "I ran `/new` — which session did that create?"
 > **Domain expert:** "None. `/new` records a Pending Session; the Session itself appears when the conversation's first prompt arrives."
 >
-> **Dev:** "What happens when a Permission request arrives mid-stream?"
-> **Domain expert:** "The Bridge pauses the Card stream, renders a Permission card with action buttons, and waits for the user to reply. Once resolved, streaming resumes."
+> **Dev:** "What happens when a Permission request arrives mid-run?"
+> **Domain expert:** "The Bridge's next poll sees it and renders a Permission card with action buttons. The click is answered at once; the click's own reply carries the resolved state when the handler fits the ack budget, and otherwise the next render pass repaints the session's current card. cola polls, so there is no stream to pause or resume."
 >
 > **Dev:** "Does the Bridge forward `/compact` to the Backend?"
 > **Domain expert:** "No — the Bridge recognizes `/compact` as a Command and calls the Backend's REST endpoint directly. Only unrecognized slash commands are forwarded as prompt text."
