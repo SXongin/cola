@@ -4,8 +4,8 @@
 > finding cap and three-round budget — see the amendment at the end.
 >
 > **Amended by ADR-0034 (2026-11-18)**: the local gate rehearsal is removed; the
-> local pair and the CI gate's three-round budget stand — see the amendment at
-> the end.
+> local pair and the CI gate's three-round budget stand (the budget is superseded
+> on 2026-11-21) — see the amendments at the end.
 >
 > **Amended by ADR-0034 (2026-11-21)**: the three-round budget and its round-3
 > approval are replaced by autonomous rounds plus stop predicates — see the
@@ -600,17 +600,17 @@ diff).
 
 The round-3 approval is replaced, in #1145, by autonomous rounds plus five stop
 predicates whose home is `CONTRIBUTING.md` "Reviewing": a design-level finding;
-oscillation (a fixed finding reappears, or the same failure mode appears at a
-new site in two consecutive rounds); non-convergence (the blocking count does
-not fall across two rounds, counting only findings the previous fix did not
-introduce); harm (the fix would leave the code worse than the defect —
-over-defensive code, an impossible-input guard, an unreachable-state test, or
-deleting or replacing a real design); and a six-round backstop (a round that
-fixes a critical security/data-loss finding does not count, and the sixth
-round's fix gets one final verification push). A round never
-waits for the user. On a stop the agent writes the matched predicate and the
-remaining findings into the dossier, leaves the PR at its head and hands it
-over; further rounds are the user's decision, and merging stays human.
+oscillation (a fixed finding reappears, or the same failure mode — the same
+rule, not merely the same category — appears at a new site in two consecutive
+rounds); non-convergence (the blocking count does not fall across two rounds,
+counting only findings the previous fix did not introduce); harm (the fix would
+leave the code worse than the defect — over-defensive code, an impossible-input
+guard, an unreachable-state test, or deleting or replacing a real design); and
+a six-round backstop (a round that fixes a critical security/data-loss finding
+does not count, and the sixth round's fix gets one final verification push). A
+round never waits for the user. On a stop the agent writes the matched predicate
+and the remaining findings into the dossier, leaves the PR at its head and hands
+it over; further rounds are the user's decision, and merging stays human.
 
 The blocking definition, the 3 blocking / 5 non-blocking finding cap, the
 line-final `CODEX_REVIEW_VERDICT: PASS|FAIL` parser and the per-commit approval
