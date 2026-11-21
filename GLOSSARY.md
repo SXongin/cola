@@ -676,13 +676,13 @@ _Avoid_: Notification, message, signal
 - A **Card Chain**'s **Rendered Cursor** records how far its card has confirmed rendered (ADR-0071)
 - A **Keyed Submission** carries the **Chain Generation** its writer decided under (ADR-0072)
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
-- A **Session**'s card chain has one **Card Ownership** verdict at a time — the in-process claim (none / inbound / guard) × the current card's class (absent / render-owned / yielded with its write-readiness / restart-stamped / ended) (ADR-0060, ADR-0063, ADR-0070, ADR-0109)
+- A **Session**'s card chain has one **Card Ownership** verdict at a time — its in-process claim against the current card's class (ADR-0060, ADR-0063, ADR-0070, ADR-0109)
 - A **Supplement** splits its **Turn**'s **Card Chain**, so the continuation card is the newest message (ADR-0043, ADR-0109)
 - A **Turn** with live runs (Background Tasks or child agents) yields its card as 等待后台任务, and the Session's live runs ride the newest card as one **Background Task Ledger** (ADR-0059, ADR-0060)
 - One **Runtime Reconciliation** step corroborates every **Session**'s live **Background Tasks**, shared by Session Sync, the Turn's drain and the follow/settle loop (ADR-0065, ADR-0073)
 - An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending; a **Completion Notice** announces a long p2p **Turn**'s end (ADR-0059, ADR-0109)
 - A **Turn**'s **Tool Panel**s render on the newest card of its **Card Chain** and in the card body's **Timeline** (ADR-0042, ADR-0044)
-- A **File Content** is a file payload a transcript part carries, delivered to the user as an embedded card image or a **File Message**, or past the 30 MB cap or a failed send as a `未发送` tracking line only; a user message's File Content is record-only and never re-delivered (ADR-0076, ADR-0083)
+- A **File Content** is a file payload a transcript part carries, reaching the user as an embedded card image, a **File Message**, or a `未发送` tracking line; a user message's File Content is record-only and never re-delivered (ADR-0076, ADR-0083)
 - A **Directory Browser** lists children and a file row opens a **File Viewer** on the **Path Scope** (ADR-0083)
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Card** is the one card a **Session** renders into (ADR-0100)
