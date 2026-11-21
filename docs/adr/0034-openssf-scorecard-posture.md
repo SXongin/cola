@@ -1,10 +1,10 @@
 # OpenSSF Scorecard: fix what is cheap and real, record the rest as deliberate no-s
 
 > **The review gate's policy is `CONTRIBUTING.md` "Reviewing"** — the blocking
-> definition, the finding cap, the round policy and the dossier; the gate's
-> provider, endpoint, model and secret are repository settings, and its action
-> pin a workflow commit, both recorded in `.github/workflows/codex-review.yml`.
-> This ADR owns the Scorecard posture only (#1129).
+> definition, the finding cap, the round policy and the dossier; its provider
+> and action pin are the workflow's to record
+> (`.github/workflows/codex-review.yml`). This ADR owns the Scorecard posture
+> only (#1129).
 
 The repository runs OpenSSF Scorecard (weekly workflow, published results, README
 badge) and scored 6/10. The aggregate is a **risk-weighted** average
@@ -43,11 +43,12 @@ byproduct**. Concretely:
    download offline. The check looks at the last five releases, so the score
    climbs one fifth per cut.
 3. **Scope write tokens to the job that needs them.** A workflow declares
-   `contents: read` at the top, and only the job that needs more raises it: the
-   release's build job takes `id-token: write` and `attestations: write` to sign
-   provenance, and its publish job takes `contents: write` (required to publish
-   a release) and `attestations: read`. A job-level write under a declared
-   top-level read is not penalized, so it costs nothing.
+   `contents: read` at the top, and only the job that needs more raises it on
+   itself: in the release, the build job takes `id-token: write` and
+   `attestations: write` to sign provenance, the publish and notes-apply jobs
+   take `contents: write` because they write, and the crates.io job takes
+   `id-token: write`. A job-level write under a declared top-level read is not
+   penalized, so it costs nothing.
 4. **Add `require_last_push_approval` to the `main: review` ruleset.** It is
    free, it is the only real setting missing before the score stops at 8, and it
    protects a future non-admin collaborator. We deliberately do **not** set
@@ -63,11 +64,8 @@ byproduct**. Concretely:
    itself — see the overflow fix it forced in `read_len_delimited`.
 
    It runs weekly in CI (issue #264), as `.github/workflows/fuzz.yml` — a
-   scheduled run plus `workflow_dispatch` that fuzzes for 300 s on a nightly
-   toolchain (cargo-fuzz requires nightly), restores and saves the corpus
-   through the Actions cache (a per-run key plus a shared `restore-keys` prefix,
-   since cache entries are immutable), and uploads crash reproducers as an
-   artifact. The target itself is unchanged.
+   scheduled run plus `workflow_dispatch`; the workflow owns the toolchain, the
+   corpus cache and the crash artifact. The target itself is unchanged.
 
    ClusterFuzzLite and OSS-Fuzz stay rejected: continuous fuzzing is recurring
    infrastructure this one small parser does not need, and neither option buys
@@ -98,8 +96,8 @@ single-organization project without gaming the checks. The review-gate approval 
 `Code-Review` today, but only because that check's implementation does not
 filter bot reviewers — see Consequences.
 
-`SAST` is a deliberate no. CodeQL was retired (ADR-0064), so the check returns
-to 0 (no SAST tool detected); do not re-add a scanner for this check alone.
+`SAST` is a deliberate no: CodeQL was retired (ADR-0064), so the check returns
+to 0 (no SAST tool detected).
 
 ## Consequences
 
