@@ -176,10 +176,11 @@ login the repo already uses — and it writes nothing:
    never silently dropped.
 2. **CI wall time** — the last N completed `CI` runs, per job (median and max
    from each job's `started_at`/`completed_at`), with the `Test` matrix legs
-   called out against their 6-minute target. The overall wall is the run's
-   `createdAt`→`updatedAt` span, so it includes GitHub's queue time. Cancelled
-   runs and runs without an executed `Test` leg (docs-only, draft,
-   `release/*`) are excluded, so the wall reported is the one a code PR pays.
+   called out against their 6-minute target. The overall wall is the latest
+   attempt's job span (first job start to last job end), so GitHub's queue time
+   and the gap between rerun attempts are excluded. Cancelled runs and runs
+   without an executed `Test` leg (docs-only, draft, `release/*`) are excluded,
+   so the wall reported is the one a code PR pays.
 3. **Commit mix and module growth** — the `fix` and `feat` shares of the commits
    since the window start, and every production module over 2,000 lines as
    `check-structure` counts them.

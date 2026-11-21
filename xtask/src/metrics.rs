@@ -113,17 +113,18 @@ struct GateReport {
 struct RunRow {
     id: u64,
     conclusion: Option<String>,
-    /// Whole-run wall time, computed by `gh --jq` from `createdAt`/`updatedAt`.
-    seconds: i64,
 }
 
 /// One job of a CI run; `steps` tells an executed job from a dispatched one
-/// whose steps were all skipped.
+/// whose steps were all skipped, and `attempt` keeps a rerun's earlier attempt
+/// out of the wall time.
 #[derive(Deserialize)]
 struct JobRow {
     name: String,
     conclusion: Option<String>,
-    seconds: i64,
+    attempt: u64,
+    start: i64,
+    end: i64,
     #[serde(default)]
     steps: Vec<StepRow>,
 }
@@ -163,14 +164,16 @@ struct Author {
 }
 
 #[derive(Deserialize)]
-struct PrComments {
-    comments: Vec<CommentBody>,
-}
-
-#[derive(Deserialize)]
 struct CommentBody {
     body: String,
     author: Author,
+}
+
+/// A comment as the REST issues endpoint returns it (`user`, not `author`).
+#[derive(Deserialize)]
+struct RestComment {
+    body: String,
+    user: Author,
 }
 
 pub(crate) fn cli() {
@@ -330,15 +333,24 @@ fn newest_merged(mut prs: Vec<PrRow>, limit: usize) -> Vec<PrRow> {
 }
 
 fn pr_comment_bodies(number: u64) -> Result<Vec<CommentBody>, String> {
+    // The REST endpoint paginates; `gh pr view --json comments` fetches one
+    // page, so a PR with more than 100 comments would lose its later rounds.
+    let endpoint = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments?per_page=100");
     let args = [
-        "pr".to_string(),
-        "view".to_string(),
-        number.to_string(),
-        "--json".to_string(),
-        "comments".to_string(),
+        "api".to_string(),
+        endpoint,
+        "--paginate".to_string(),
+        "--slurp".to_string(),
     ];
-    let comments: PrComments = parse_json(&gh(&args)?, "the PR comments")?;
-    Ok(comments.comments)
+    let pages: Vec<Vec<RestComment>> = parse_json(&gh(&args)?, "the PR comments")?;
+    Ok(pages
+        .into_iter()
+        .flatten()
+        .map(|comment| CommentBody {
+            body: comment.body,
+            author: comment.user,
+        })
+        .collect())
 }
 
 /// A gate review round's verdict. Only the review workflow's comments count —
@@ -543,8 +555,7 @@ fn print_gates(report: &GateReport, requested: usize) {
 // ---------------------------------------------------------------------------
 
 fn ci_wall(limit: usize) -> Result<WallReport, String> {
-    let jq = "[.[] | {id: .databaseId, conclusion, \
-              seconds: ((.updatedAt|fromdateiso8601) - (.createdAt|fromdateiso8601))}]";
+    let jq = "[.[] | {id: .databaseId, conclusion}]";
     let args = [
         "run".to_string(),
         "list".to_string(),
@@ -555,7 +566,7 @@ fn ci_wall(limit: usize) -> Result<WallReport, String> {
         "--limit".to_string(),
         limit.to_string(),
         "--json".to_string(),
-        "databaseId,conclusion,createdAt,updatedAt".to_string(),
+        "databaseId,conclusion".to_string(),
         "--jq".to_string(),
         jq.to_string(),
     ];
@@ -572,7 +583,7 @@ fn ci_wall(limit: usize) -> Result<WallReport, String> {
             report.cancelled += 1;
             continue;
         }
-        let jobs = run_jobs(run.id)?;
+        let jobs = latest_attempt(run_jobs(run.id)?);
         // A docs-only/draft/release run still dispatches the `Test` matrix with
         // every step skipped; only an executed test step makes it a code run
         // whose wall the charter's 6-minute target measures.
@@ -581,12 +592,14 @@ fn ci_wall(limit: usize) -> Result<WallReport, String> {
             continue;
         }
         report.runs += 1;
-        report.overall.push(run.seconds);
+        if let Some(wall) = job_span(&jobs) {
+            report.overall.push(wall);
+        }
         for job in jobs {
             if job.conclusion.as_deref() == Some("cancelled") {
                 continue;
             }
-            report.jobs.entry(job.name).or_default().push(job.seconds);
+            report.jobs.entry(job.name).or_default().push(job.end - job.start);
         }
     }
     Ok(report)
@@ -605,11 +618,29 @@ fn executed_test_leg(jobs: &[JobRow]) -> bool {
 fn run_jobs(run: u64) -> Result<Vec<JobRow>, String> {
     let jq = "[.jobs[] | select(.started_at != null and .completed_at != null \
               and .conclusion != \"skipped\") \
-              | {name, conclusion, steps: [.steps[] | {name, conclusion}], \
-                 seconds: ((.completed_at|fromdateiso8601) - (.started_at|fromdateiso8601))}]";
+              | {name, conclusion, attempt: .run_attempt, \
+                 start: (.started_at|fromdateiso8601), \
+                 end: (.completed_at|fromdateiso8601), \
+                 steps: [.steps[] | {name, conclusion}]}]";
     let endpoint = format!("repos/{{owner}}/{{repo}}/actions/runs/{run}/jobs?per_page=100");
     let args = ["api".to_string(), endpoint, "--jq".to_string(), jq.to_string()];
     parse_json(&gh(&args)?, "the CI run's jobs")
+}
+
+/// Only the run's latest attempt: a rerun's earlier attempt must not stretch
+/// the wall time across the gap between attempts.
+fn latest_attempt(jobs: Vec<JobRow>) -> Vec<JobRow> {
+    let latest = jobs.iter().map(|job| job.attempt).max().unwrap_or_default();
+    jobs.into_iter().filter(|job| job.attempt == latest).collect()
+}
+
+/// The latest attempt's execution span: its first job's start to its last
+/// job's end. Queue time belongs to no job, and an earlier attempt is gone, so
+/// neither inflates the number.
+fn job_span(jobs: &[JobRow]) -> Option<i64> {
+    let start = jobs.iter().map(|job| job.start).min()?;
+    let end = jobs.iter().map(|job| job.end).max()?;
+    Some((end - start).max(0))
 }
 
 fn print_wall(report: &WallReport, requested: usize) {
@@ -617,7 +648,8 @@ fn print_wall(report: &WallReport, requested: usize) {
     if let Some(median) = median(&report.overall.iter().map(|s| *s as f64).collect::<Vec<_>>()) {
         let max = report.overall.iter().copied().max().unwrap_or_default();
         println!(
-            "  overall wall (queue included): median {} · max {} over {} code run(s) — target ≤ 6m",
+            "  overall wall (latest attempt, queue excluded): median {} · max {} over {} code \
+             run(s) — target ≤ 6m",
             duration(median),
             duration(max as f64),
             report.runs
@@ -913,11 +945,13 @@ mod tests {
 
     #[test]
     fn a_dispatched_test_job_with_every_step_skipped_is_not_a_code_run() {
-        let job = JobRow {
-            name: "Test (macos-latest)".to_string(),
-            conclusion: Some("success".to_string()),
-            seconds: 5,
-            steps: vec![
+        let job = job(
+            "Test (macos-latest)",
+            1,
+            0,
+            5,
+            "success",
+            vec![
                 StepRow {
                     name: "Set up job".to_string(),
                     conclusion: Some("success".to_string()),
@@ -927,22 +961,45 @@ mod tests {
                     conclusion: Some("skipped".to_string()),
                 },
             ],
-        };
+        );
         assert!(!executed_test_leg(&[job]));
     }
 
     #[test]
     fn an_executed_test_step_makes_the_run_a_code_run() {
-        let job = JobRow {
-            name: "Test (macos-latest)".to_string(),
-            conclusion: Some("failure".to_string()),
-            seconds: 300,
-            steps: vec![StepRow {
+        let job = job(
+            "Test (macos-latest)",
+            1,
+            0,
+            300,
+            "failure",
+            vec![StepRow {
                 name: format!("Run {TEST_STEP}"),
                 conclusion: Some("failure".to_string()),
             }],
-        };
+        );
         assert!(executed_test_leg(&[job]));
+    }
+
+    #[test]
+    fn a_rerun_gap_is_not_part_of_the_wall() {
+        let jobs = vec![
+            job("Test (macos-latest)", 1, 0, 100, "success", vec![]),
+            job("Test (macos-latest)", 2, 1_000, 1_200, "success", vec![]),
+            job("Check", 2, 1_005, 1_100, "success", vec![]),
+        ];
+        assert_eq!(job_span(&latest_attempt(jobs)), Some(200));
+    }
+
+    fn job(name: &str, attempt: u64, start: i64, end: i64, conclusion: &str, steps: Vec<StepRow>) -> JobRow {
+        JobRow {
+            name: name.to_string(),
+            conclusion: Some(conclusion.to_string()),
+            attempt,
+            start,
+            end,
+            steps,
+        }
     }
 
     #[test]
