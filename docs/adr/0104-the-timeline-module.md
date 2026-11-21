@@ -6,7 +6,7 @@
 >
 > **Amends**: ADR-0038 (synthetic keying, the read floor and the equal-key rule)
 > and ADR-0082 (a compaction row's receipt cut). **Supersedes** ADR-0040 (the
-> `seq`-derived fold ids), ADR-0045 (the live tail's lifecycle) and ADR-0050
+> stable panel fold ids), ADR-0045 (the live tail's lifecycle) and ADR-0050
 > (the Turn boundary), whose surviving rules are below. The exact ordering rules
 > and their invariants are #1040's acceptance criteria; this ADR records the
 > module boundary and the ownership move.
@@ -168,11 +168,13 @@ it finalizes without the tail and the continuation carries it, and a split with
 nothing but a live tail may finalize an otherwise empty card, as ADR-0043's
 Todo Panel always did. Its `element_id` is allocated when it first appears and
 reused at settle, so the client's fold state survives the move: an id derives
-from `seq` (`tool_{seq}` / `reason_{seq}`), never from a body position, and the
-todo tail's fixed `todo` id is the one panel that is not a timeline entry. `seq`
-is never reused or renumbered. A Card Chain split's continuation starts folded —
-a new message inherits no client state — and a retry begins with no inherited
-state either (ADR-0058).
+from a stable identity, never from a body position — `reason_{seq}` for a
+reasoning panel, and `tool_{call_id}` for a tool panel (spec #561's per-call
+identity, which lets a takeover's collect strip exactly the calls it resolved,
+ADR-0071) — and the todo tail's fixed `todo` id is the one panel that is not a
+timeline entry. That identity is never reused or renumbered. A Card Chain
+split's continuation starts folded — a new message inherits no client state —
+and a retry begins with no inherited state either (ADR-0058).
 
 ### The Turn boundary this move preserves
 

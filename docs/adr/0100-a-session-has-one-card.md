@@ -323,7 +323,7 @@ standing.
   carve-out. **Retired** with the claimed block; its **draft** rule moved into
   this ADR's "A question switch keeps the draft".
 - ADR-0040 — the Session Snapshot tail's fold ids. **Retired** with the rebuild
-  path; the `seq`-derived panel ids are **ADR-0104's** now.
+  path; the stable panel ids are **ADR-0104's** now.
 - ADR-0093 — the Session Snapshot's folded receipt log. **Retired** with the
   snapshot card; its **layout** rule moved into this ADR's "A typed input sits
   at the card's end".
