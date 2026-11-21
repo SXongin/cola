@@ -168,9 +168,10 @@ login the repo already uses — and it writes nothing:
    `CODEX_REVIEW_VERDICT: PASS|FAIL`; a `FAIL` is a blocking round) and their
    median. A person or other bot quoting a verdict is not a round. The PR's
    `<!-- gate-dossier -->` comment is the human record that count should agree
-   with: the report prints the gate round count a dossier states and names any
-   PR where it differs from the verdict comments. The rest of its prose is not
-   parsed, and a dossier that quotes a verdict is not counted as a round. PRs
+   with: the report prints the gate round count a dossier states, names any PR
+   where it differs from the verdict comments, and names a dossier count whose
+   PR has no verdict comment at all. The rest of its prose is not parsed, and a
+   dossier that quotes a verdict is not counted as a round. PRs
    over the cap, release cuts, and Dependabot PRs are reported as excluded,
    never silently dropped.
 2. **CI wall time** — the last N completed `CI` runs, per job (median and max
