@@ -227,11 +227,62 @@ fn previous_char(line: &str, index: usize) -> char {
     line[..index].chars().next_back().unwrap_or(' ')
 }
 
-/// Characters that continue a repository path. `#` is excluded so an anchor is
-/// not part of the path, and a non-ASCII alphanumeric is allowed so a file with
-/// a Chinese name is still a citation.
+/// Characters that continue a repository path: anything but whitespace, control
+/// characters and the Markdown/prose delimiters that can follow a citation.
+///
+/// An allow-list cannot work here: a decomposed name carries a combining mark
+/// (`cafe\u{0301}.md`) that `char::is_alphanumeric` rejects, and a Chinese name
+/// carries ideographs a byte-oriented rule would miss. `#` ends a path so an
+/// anchor stays out of it; `:` ends a pin's path; the CJK punctuation marks are
+/// how a sentence delimits a citation without spaces.
 fn is_path_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '/' | '_' | '.' | '-')
+    !c.is_whitespace()
+        && !c.is_control()
+        && !matches!(
+            c,
+            '#' | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+                | ','
+                | ';'
+                | ':'
+                | '|'
+                | '*'
+                | '?'
+                | '!'
+                | '…'
+                | '，'
+                | '。'
+                | '、'
+                | '：'
+                | '；'
+                | '！'
+                | '？'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '（'
+                | '）'
+                | '【'
+                | '】'
+                | '《'
+                | '》'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '—'
+                | '–'
+        )
 }
 
 /// Characters that, immediately before `src/`, `docs/…` or `ADR-`, mean the
@@ -759,6 +810,16 @@ mod tests {
 
     /// Chinese prose has no spaces, so a citation directly after it must still
     /// be extracted.
+    /// A decomposed name carries a combining mark (`cafe\u{0301}.md`), which an
+    /// alphanumeric allow-list would truncate and then call missing.
+    #[test]
+    fn a_combining_mark_in_a_path_resolves() {
+        let tree = Tree::new("combining-mark");
+        tree.file("docs/reference/cafe\u{0301}.md", "# api\n");
+        tree.file("docs/note.md", "`docs/reference/cafe\u{0301}.md`\n");
+        assert_eq!(tree.check().findings.len(), 0);
+    }
+
     #[test]
     fn a_citation_after_chinese_prose_is_extracted() {
         let targets: Vec<Target> = targets("见ADR-0042")
@@ -868,11 +929,18 @@ mod tests {
         assert!(job.contains("cargo xtask check-doc-links"));
     }
 
+    /// The first `bash` block is the verification loop; the descriptive section
+    /// below it also names the command and must not satisfy this test.
     #[test]
     fn the_verification_loop_runs_the_command() {
         let contributing = std::fs::read_to_string(crate::repo_root().join("CONTRIBUTING.md"))
             .expect("CONTRIBUTING.md must be readable");
-        assert!(contributing.contains("cargo xtask check-doc-links"));
+        let block = contributing
+            .split("```bash")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the verification-loop block must exist");
+        assert!(block.contains("cargo xtask check-doc-links"));
     }
 
     #[test]
@@ -887,6 +955,19 @@ mod tests {
         let tree = Tree::new("exit-failure");
         tree.file("docs/note.md", "ADR-9999\n");
         assert_eq!(run_on(&tree.root), 1);
+    }
+
+    /// A banner warning is printed but never turns a clean tree into a failure.
+    #[test]
+    fn a_banner_warning_runs_to_success() {
+        let tree = Tree::new("exit-warning");
+        tree.file(
+            "docs/adr/0002-banners.md",
+            "> **Amended by ADR-0001**: a\n> **Reopened by ADR-0001**: b\n\
+             > **Retired by ADR-0001**: c\n",
+        );
+        assert_eq!(run_on(&tree.root), 0);
+        assert_eq!(tree.check().warnings.len(), 1);
     }
 
     /// The acceptance criterion's "passes on the tree", with a plausibility

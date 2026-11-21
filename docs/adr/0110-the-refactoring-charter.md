@@ -5,6 +5,11 @@
 > "Unchanged, with evidence" point there instead of restating the three-round
 > budget.
 
+> **Amended (2026-11-22, #1131)**: `check-doc-links` now fails a dangling
+> citation and warns on an ADR's 3+ `… by ADR-NNNN` banners, so the ratchet
+> table below gains its row; the paragraph that said the guard "will fail"
+> is read through this banner.
+
 The four contracts a refactor here is settled by — code (#1109), tests (#1111),
 docs (#1112), flow (#1110) — and the segment that applies them first (#1115),
 one decision, on evidence cited from #1105–#1108.
@@ -100,10 +105,8 @@ What a guard decides, and what only a reviewer can:
 | Conventional Commits subject | `check-commit-msg` |
 | dependencies and advisories | `cargo deny` |
 
-`check-doc-links` (#1131) fails a dangling `ADR-NNNN`, doc path or `src/…:line`
-pin and warns on an ADR carrying 3+ `… by ADR-NNNN` amendment banners; the
-count is reported, not enforced — whether the banners demand a read stays a
-review act.
+`check-doc-links` (#1131) will fail a dangling reference and warn on an ADR's
+banner count; the banner rule stays reviewable until something enforces it.
 
 Review-only, because a predicate cannot decide them: the one-behaviour test
 rule and its exceptions; a new `Option<&Gate>` or `*_for_test` production
