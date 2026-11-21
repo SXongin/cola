@@ -26,7 +26,8 @@ decision; the earlier ADRs are pointers here.
   admitted in that window was durable (`session_inbox`, `delivery:"steer"`) but
   had no runner to promote it — and cola took the Supplement path with no card,
   so `split_card_chain` found nothing to split and the message vanished with no
-  receipt. The active map is process-local and lossy (ADR-0059 said so).
+  receipt. The active map is process-local and lossy (ADR-0059 said so): an interrupt, a
+move, or a location eviction can all leave a run outliving its runner.
 - **ADR-0062 fixed that with ownership** — the guard, or a card chain a live
   renderer owns — but **#1056 showed the card-only arm has the mirror failure.**
   A Supplement whose steer failed still split the chain; when the run that was
@@ -59,7 +60,9 @@ delivery, so a genuinely live run merges it exactly as a Supplement would. The
 ownership is re-read **after** that awaited read, so a renderer that leases the
 guard meanwhile routes the message as the Supplement it is. A card-only chain's
 recorded card is **collected before the message is classified**: no guard means
-no in-process writer, so that card is exactly the #1056 orphan.
+no in-process writer, so that card is exactly the #1056 orphan, and the reap
+runs on this message's path instead of leaving the stale card under the new
+Turn's card.
 
 The status read stays **advisory**: it picks the new card's opening line —
 「📨 已收到，将并入当前运行」 when it said live, an ordinary loading card
@@ -97,7 +100,8 @@ card's state under the same cards lock an ending is applied with, so a Turn that
 settles between the ownership read and the split either stamps the continuation
 or is seen as terminal and refuses it. A merged steer whose chain ends in that
 window reports 「补充消息已提交，但当前卡片无法继续」, never silently. Every path
-that frees the guard settles the card first, so no guard loss leaves a
+that frees the guard settles the card first — a failed stale-mapping recreate
+stamps the Error ending before releasing — so no guard loss leaves a
 live-looking card behind. Both messages say **unconfirmed**, never undelivered:
 an ambiguous Codex response may still have landed and keeps its marker for
 reconciliation (ADR-0092), so cola must not invite a resend. The split's admission reports a permanently
