@@ -73,7 +73,7 @@ facts about its Card Chain, in one sidecar.**
   from the facts, returning the predecessor the takeover paths act on;
   `ChainRecords::release` is the only removal; and `chain::release_spent`
   owns the spent rule: a record leaves when its card reaches a terminal
-  ending whose write is confirmed (ADR-0063's amendment, ADR-0067), never
+  ending whose write is confirmed (ADR-0063, ADR-0067), never
   while the delivery outbox still owes one. The flush path calls it after
   every ending PATCH, as does the reap's `DiscardRecord` arm. The reap's
   ladder calls `release` directly only where it established the cause itself:

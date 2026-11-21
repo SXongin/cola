@@ -475,7 +475,7 @@ the run no longer owns is never reached.
 
 Decision 4 posts the card as its own message and never lets it move. A run may last up to
 24 hours, so every reply and every Turn message pushes the one surface that carries 「⏹ 终止」
-further up; reaching it again meant scrolling. `/card` (ADR-0043, 2026-09-22 amendment) is the
+further up; reaching it again meant scrolling. `/card` (ADR-0043) is the
 same need solved for the live **Turn** card, and it cannot serve this one: a Terminal Card
 joins no **Card Chain**, so there is nothing for a split to continue.
 

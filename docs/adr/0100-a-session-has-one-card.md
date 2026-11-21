@@ -1,7 +1,7 @@
 # A session has one card, and `/card` is how you read it
 
 > **Supersedes ADR-0028** (the Session Snapshot card). **Amends ADR-0043's
-> 2026-09-22 `/card` amendment**: the pull gains a second state.
+> `/card` rule**: the pull gains a second state.
 
 ## Context
 

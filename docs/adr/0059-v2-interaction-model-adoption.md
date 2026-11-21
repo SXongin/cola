@@ -157,12 +157,13 @@ onto the V1-shaped one.**
   rendering chain instead of starting a second Turn — and `busy()` no longer
   reads a followed session as idle (previously the server-yield path could reap
   the Owned Server out from under a run cola was still rendering). **This
-  supersedes ADR-0043's 2026-09-24 guard-release rule** — its "the inflight
+  supersedes the guard-release rule ADR-0043 once carried** — its "the inflight
   guard is released, so the next message is a normal new Turn" and the
   rejected alternative "not releasing the guard while busy": that rejection
   assumed the 10-minute bound owned the ending, while with no total budget the
-  follow owns it. ADR-0043 carries the amendment banner; its split and receipt
-  machinery stands unchanged and is reused below.
+  follow owns it. ADR-0043 now holds the guard for the whole post-prompt path
+  (ADR-0074); its split and receipt machinery stands unchanged and is reused
+  below.
 
 - **One Session Sync pass.** The external-message flow becomes Session Sync:
   the existing per-thread pass over the Active Session keeps notifying External
@@ -209,7 +210,7 @@ onto the V1-shaped one.**
   watermark stays user-message-scoped — a Wake never moves it.
 - ADR-0043's supplement split and receipt machinery is reused for Wake
   continuations, anchored on the user message when no Supplement exists; its
-  guard-release rule is superseded, and ADR-0043 carries the amendment banner.
+  guard-release rule is superseded (ADR-0043, ADR-0074).
 - ADR-0058's retry matrix is unchanged in mechanism: its settled/unfinished
   read stays the transcript projection of whether the submission was answered
   (`turn_for_user(..).complete`), and this ADR does not alter that projection.

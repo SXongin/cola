@@ -101,7 +101,7 @@ matrix reads it instead of sniffing generations.
 
 The #386 spec's 「`/stop` — prompt Done」 is superseded: a deliberate stop is
 the operator's decision, not a failure, and finalizes the card `Stopped`
-(「⏹ 已停止」, #394; ADR-0043's 2026-09-28 stop-terminal amendment). `Stopped`
+(「⏹ 已停止」, #394; ADR-0043). `Stopped`
 is terminal for every running probe and renders no retry button, so a stopped
 card never enters this matrix; the abort text the server recorded is never
 written to the card, and the completion notice says 已停止.
@@ -160,5 +160,5 @@ deliberately stays out of the glossary.
 Source: spec #391 (retry semantics; build tickets #392–#396). Related: #387
 (the replay flood), PR #390 (the render baseline), #386 (the follow whose
 fallback can fail a live run), #394 (the stopped terminal); ADR-0026 (the id),
-ADR-0040's 2026-09-28 amendment, ADR-0043's 2026-09-28 amendment, ADR-0050
+ADR-0040's 2026-09-28 amendment, ADR-0043, ADR-0050
 (Turn interface operations), ADR-0057 (the live contract suite).
