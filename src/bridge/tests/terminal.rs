@@ -6798,6 +6798,18 @@ async fn the_terminal_control_clicks_carry_five_keys_and_ack_with_their_results(
     assert!(unknown_ack.card.is_none());
     assert_eq!(unknown_ack.toast.as_deref(), Some("未知的终端操作。"));
 
+    // A live card before its cap renders no 继续 button at all, so the refusal
+    // is driven through the same rendered control payload with `op` switched —
+    // its exact result is pinned without a second (cap-length) fixture.
+    let mut not_past_cap = kill.clone();
+    not_past_cap["op"] = serde_json::json!("continue");
+    let refusal = app
+        .host_action(not_past_cap)
+        .await
+        .expect("继续 before the cap is refused with a toast");
+    assert!(refusal.card.is_none());
+    assert_eq!(refusal.toast.as_deref(), Some("命令尚未到达时限。"));
+
     let ack = app
         .host_action(kill)
         .await
@@ -6805,6 +6817,75 @@ async fn the_terminal_control_clicks_carry_five_keys_and_ack_with_their_results(
     assert!(ack.card.is_none(), "the run loop owns the card");
     assert_eq!(ack.toast.as_deref(), Some("⏹ 正在终止…"));
 
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+}
+
+/// Past the cap a live Terminal Card renders 「继续」. Its payload carries the
+/// same five routing keys, and the accepted click answers its **exact** toast
+/// with no card — the run loop owns the card and extends the cap. This is the
+/// `continue` half of the control op's characterization (the accepted 终止 and
+/// the default arm's refusals live in the sibling above).
+#[cfg(unix)]
+#[tokio::test]
+async fn the_terminal_continue_click_carries_five_keys_and_acks_with_its_exact_toast() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run --timeout 1s sh -c 'for i in $(seq 1 30); do echo tick-$i; sleep 0.1; done'",
+                key,
+                "msg_continue",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    // The cap is what renders 「继续」; before it the card offers only 终止.
+    let card = live_card_with(&platform, "continue").await;
+    let continue_click = button_value(&card, "continue").expect("the cap state offers 继续");
+    assert_eq!(
+        value_keys(&continue_click),
+        ["action", "chat_id", "op", "run_id", "thread_id"],
+        "the 继续 click carries exactly these keys: {continue_click}"
+    );
+    assert_eq!(continue_click["action"], "terminal");
+    assert_eq!(continue_click["op"], "continue");
+    assert_eq!(continue_click["chat_id"], "chat_1");
+    assert_eq!(continue_click["thread_id"], "chat_1");
+    assert!(
+        continue_click["run_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the control names the run it was rendered for: {continue_click}"
+    );
+
+    let ack = app
+        .host_action(continue_click)
+        .await
+        .expect("the current run's 继续 is accepted");
+    assert!(ack.card.is_none(), "the run loop owns the card");
+    assert_eq!(ack.toast.as_deref(), Some("⏱ 已延长时限，继续跟踪输出…"));
+
+    let kill = button_value(&card, "kill").expect("the capped card still carries 终止");
+    let kill_ack = app
+        .host_action(kill)
+        .await
+        .expect("the run is ended after the assertion");
+    assert_eq!(kill_ack.toast.as_deref(), Some("⏹ 正在终止…"));
     tokio::time::timeout(Duration::from_secs(10), running)
         .await
         .expect("the killed run ends")
