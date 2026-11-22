@@ -39,6 +39,7 @@ use crate::bridge::handler::{App, CardActionResult};
 mod agent;
 mod autoaccept;
 mod cleanup;
+mod dir;
 mod file;
 mod mcp;
 mod model;
@@ -47,6 +48,8 @@ mod question;
 mod resume;
 mod retry;
 mod skill;
+mod sub;
+mod switch;
 mod terminal;
 mod think;
 mod turn_diff;
@@ -248,6 +251,28 @@ pub(crate) const VERBS: &[Entry] = &[
         op: None,
         gate: Gate::Always,
         run: skill::run,
+    },
+    // The session/directory pickers (#1122) — last because their bodies are
+    // where the store/topic shared state lives. Each multiplexes its ops inside
+    // the body (`dir` also by `view: "browse"`, ADR-0078), so one entry per
+    // action is exactly the shape the single dispatch arm had.
+    Entry {
+        action: "switch",
+        op: None,
+        gate: Gate::Always,
+        run: switch::run,
+    },
+    Entry {
+        action: "dir",
+        op: None,
+        gate: Gate::Always,
+        run: dir::run,
+    },
+    Entry {
+        action: "sub",
+        op: None,
+        gate: Gate::Always,
+        run: sub::run,
     },
 ];
 
