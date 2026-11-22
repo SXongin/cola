@@ -2,6 +2,13 @@
   "version": 1,
   "functions": [
     {
+      "path": "src/bridge/card_action/file.rs",
+      "function": "handle_file_card_action",
+      "metric": "too_many_lines",
+      "value": 251,
+      "body": "89705ccd7514a28f"
+    },
+    {
       "path": "src/bridge/chain/reconcile.rs",
       "function": "send_projected_successor",
       "metric": "too_many_lines",
@@ -119,13 +126,6 @@
       "metric": "too_many_lines",
       "value": 116,
       "body": "0206a01450ced91e"
-    },
-    {
-      "path": "src/bridge/handler.rs",
-      "function": "handle_file_card_action",
-      "metric": "too_many_lines",
-      "value": 251,
-      "body": "89705ccd7514a28f"
     },
     {
       "path": "src/bridge/handler.rs",
@@ -641,7 +641,7 @@
     },
     {
       "path": "src/bridge/handler.rs",
-      "lines": 6287
+      "lines": 5835
     },
     {
       "path": "src/bridge/handles.rs",
