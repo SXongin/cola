@@ -361,7 +361,7 @@ impl TerminalAskAiRequest {
 /// message, the **path** (a Tool Panel's Turn card can carry several file
 /// panels, so the clicked message alone does not name one file), and the content
 /// identity (a re-read rotates it, so changed bytes may be sent again).
-pub(crate) type ViewerFileTransferKey = (String, String, String, u64);
+type ViewerFileTransferKey = (String, String, String, u64);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViewerFileTransferStatus {
     Sent,
