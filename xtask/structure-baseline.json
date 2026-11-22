@@ -335,14 +335,14 @@
       "function": "flush_card_locked",
       "metric": "cognitive_complexity",
       "value": 120,
-      "body": "fb6622a3aa4cc665"
+      "body": "ae84079b298d5443"
     },
     {
       "path": "src/bridge/turn/flush.rs",
       "function": "flush_card_locked",
       "metric": "too_many_lines",
-      "value": 512,
-      "body": "fb6622a3aa4cc665"
+      "value": 503,
+      "body": "ae84079b298d5443"
     },
     {
       "path": "src/bridge/turn/mod.rs",
@@ -629,7 +629,7 @@
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "lines": 2267
+      "lines": 2259
     },
     {
       "path": "src/bridge/command.rs",
@@ -661,7 +661,7 @@
     },
     {
       "path": "src/bridge/turn/mod.rs",
-      "lines": 4884
+      "lines": 4877
     },
     {
       "path": "src/bridge/turn/render.rs",
@@ -1029,7 +1029,7 @@
     },
     {
       "path": "src/bridge/chain/records.rs",
-      "count": 9
+      "count": 8
     },
     {
       "path": "src/bridge/command.rs",
@@ -1157,7 +1157,7 @@
     },
     {
       "path": "src/bridge/turn/flush.rs",
-      "count": 3
+      "count": 1
     },
     {
       "path": "src/bridge/turn/interaction.rs",
@@ -1165,7 +1165,7 @@
     },
     {
       "path": "src/bridge/turn/mod.rs",
-      "count": 12
+      "count": 10
     },
     {
       "path": "src/bridge/turn/ownership.rs",
