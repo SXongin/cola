@@ -396,7 +396,7 @@ the marker after the process exits.
 5. Do not merge until CI (fmt, clippy, test, release build, dependency audit) is
    green. Agent-authored PRs additionally wait for the user's own verification
    and explicit go-ahead before merging (see *Branch workflow*; the release cut
-   is the ADR-0033 exception).
+   is the ADR-0033 exception, and a spec-recorded merge grant is the other).
 6. **Open it as a draft, and flip it to ready when the code is final.** A draft
    PR runs only the cheap jobs — `Classify`, `Format`, `Dependency audit`,
    `Docs drift`; `Check`, `Coverage`, the live suites and both `Test` legs skip
