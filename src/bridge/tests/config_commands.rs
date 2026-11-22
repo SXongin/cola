@@ -996,6 +996,126 @@ async fn agent_card_picker_and_button() {
     );
 }
 
+/// Characterization for the CardAction seam (#1121): what the `/agent`
+/// picker's two click shapes carry and what each returns. An option button is
+/// `{action, chat_id, thread_id, value}` and the clear control swaps only its
+/// `action` tag (clearing is a mechanism, never a value — ADR-0020). A pick
+/// acks with the refreshed card plus its toast; the clear does likewise. The
+/// pair is pinned so moving the body behind the seam cannot change the wire
+/// contract.
+#[tokio::test]
+async fn the_agent_clicks_carry_four_keys_and_ack_with_their_toasts() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_agents(vec![crate::backend::types::AgentInfo {
+        name: "build".into(),
+        description: Some("build agent".into()),
+        mode: Some("primary".into()),
+        hidden: Some(false),
+    }]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/agent",
+        key,
+        "msg_agent_contract",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    let card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("an agent card should be sent");
+
+    let pick = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "agent" && button["value"]["value"] == "build")
+        .expect("the agent card offers the build pick");
+    assert_eq!(
+        value_keys(&pick["value"]),
+        ["action", "chat_id", "thread_id", "value"],
+        "the agent pick carries exactly these keys: {}",
+        pick["value"]
+    );
+    let ack = app
+        .host_action(pick["value"].clone())
+        .await
+        .expect("the agent pick acks");
+    assert!(ack.card.is_some(), "the pick refreshes the agent card");
+    assert_eq!(ack.toast.as_deref(), Some("Agent: build（下一条消息开始生效）"));
+
+    let clear = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "agent_clear")
+        .expect("the agent card offers the clear control");
+    assert_eq!(
+        value_keys(&clear["value"]),
+        ["action", "chat_id", "thread_id", "value"],
+        "the agent clear carries exactly these keys: {}",
+        clear["value"]
+    );
+    assert_eq!(clear["value"]["value"], "");
+    let ack = app
+        .host_action(clear["value"].clone())
+        .await
+        .expect("the agent clear acks");
+    assert!(ack.card.is_some(), "the clear refreshes the agent card");
+    assert_eq!(ack.toast.as_deref(), Some("已清除 Agent（回到服务器默认）"));
+}
+
+/// Characterization for the CardAction seam (#1121): the `modes` capability is
+/// decided once, by the seam's gate. With the surface absent both agent clicks
+/// are refused with `None` — not a toast, and before any store read — so a
+/// picker card persisted under an older attachment cannot answer on its own.
+#[tokio::test]
+async fn the_agent_clicks_are_refused_when_modes_is_absent() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.capabilities.modes = false;
+    let (app, _platform) = build_app(cfg, backend).await;
+    for action in ["agent", "agent_clear"] {
+        let ack = app
+            .host_action(serde_json::json!({
+                "action": action,
+                "chat_id": "chat_1",
+                "thread_id": "chat_1",
+                "value": "build",
+            }))
+            .await;
+        assert!(
+            ack.is_none(),
+            "{action} on a client without modes is refused with no result"
+        );
+    }
+}
+
 /// `/agent --reset` (text) clears the per-session override; a bare agent
 /// name never clears — it is always a pick.
 #[tokio::test]
@@ -1130,6 +1250,87 @@ async fn autoaccept_card_toggles_flag() {
     app.host_action(value).await.expect("autoaccept off card action");
     let entry = app.sessions.lock().await.get_active(&key).cloned().unwrap();
     assert!(!entry.auto_accept, "flag should flip off");
+}
+
+/// Characterization for the CardAction seam (#1121): what the `/autoaccept`
+/// toggle's buttons carry and what each returns. Both buttons are
+/// `{action, chat_id, thread_id, value}`; each click flips the flag, acks with
+/// the rebuilt toggle card and speaks the new state.
+#[tokio::test]
+async fn the_autoaccept_clicks_carry_four_keys_and_ack_with_their_toasts() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/autoaccept",
+        key,
+        "msg_autoaccept_contract",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    let card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("an autoaccept card should be sent");
+
+    let on = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "autoaccept" && button["value"]["value"] == "on")
+        .expect("the toggle card offers the on control");
+    assert_eq!(
+        value_keys(&on["value"]),
+        ["action", "chat_id", "thread_id", "value"],
+        "the autoaccept on click carries exactly these keys: {}",
+        on["value"]
+    );
+    let ack = app
+        .host_action(on["value"].clone())
+        .await
+        .expect("the autoaccept on click acks");
+    assert!(ack.card.is_some(), "the toggle refreshes its card");
+    assert_eq!(ack.toast.as_deref(), Some("已开启自动审批"));
+
+    let off = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "autoaccept" && button["value"]["value"] == "off")
+        .expect("the toggle card offers the off control");
+    assert_eq!(
+        value_keys(&off["value"]),
+        ["action", "chat_id", "thread_id", "value"],
+        "the autoaccept off click carries exactly these keys: {}",
+        off["value"]
+    );
+    let ack = app
+        .host_action(off["value"].clone())
+        .await
+        .expect("the autoaccept off click acks");
+    assert!(ack.card.is_some(), "the toggle refreshes its card");
+    assert_eq!(ack.toast.as_deref(), Some("已关闭自动审批"));
 }
 
 /// A card toggle whose flag write fails must report it and approve nothing,
@@ -1906,6 +2107,94 @@ async fn think_card_button_records_variant() {
             .is_none(),
         "think_clear must clear the variant"
     );
+}
+
+/// Characterization for the CardAction seam (#1121): what the `/think`
+/// picker's two click shapes carry and what each returns. An option button is
+/// `{action, chat_id, thread_id, value}` and the clear control swaps only its
+/// `action` tag (ADR-0020). Both clicks refresh the card; the pick's toast
+/// names the new level and the clear's says it returned to the model default.
+#[tokio::test]
+async fn the_think_clicks_carry_four_keys_and_ack_with_their_toasts() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: "opencode-go".into(),
+        models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
+    }]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: Some("opencode-go/deepseek-v4-flash".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/think",
+        key,
+        "msg_think_contract",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    let card = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("a think card should be sent");
+
+    let pick = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "think" && button["value"]["value"] == "high")
+        .expect("the think card offers the high pick");
+    assert_eq!(
+        value_keys(&pick["value"]),
+        ["action", "chat_id", "thread_id", "value"],
+        "the think pick carries exactly these keys: {}",
+        pick["value"]
+    );
+    let ack = app
+        .host_action(pick["value"].clone())
+        .await
+        .expect("the think pick acks");
+    assert!(ack.card.is_some(), "the pick refreshes the think card");
+    assert_eq!(ack.toast.as_deref(), Some("Thinking: high（下一条消息开始生效）"));
+
+    let clear = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "think_clear")
+        .expect("the think card offers the clear control");
+    assert_eq!(
+        value_keys(&clear["value"]),
+        ["action", "chat_id", "thread_id", "value"],
+        "the think clear carries exactly these keys: {}",
+        clear["value"]
+    );
+    assert_eq!(clear["value"]["value"], "");
+    let ack = app
+        .host_action(clear["value"].clone())
+        .await
+        .expect("the think clear acks");
+    assert!(ack.card.is_some(), "the clear refreshes the think card");
+    assert_eq!(ack.toast.as_deref(), Some("已清除思考等级（回到模型默认）"));
 }
 
 /// Switching `/model` to a model that doesn't declare the current variant

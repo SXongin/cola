@@ -67,6 +67,86 @@ async fn command_text(
     platform.texts().await.join("\n")
 }
 
+/// Characterization for the CardAction seam (#1121): the `/model` picker's two
+/// click shapes. A provider navigation button and a concrete model pick both
+/// carry `{action, chat_id, thread_id, level, value}`; the provider click acks
+/// with the drilled model page as its replacement card and no toast, while the
+/// model pick acks with no card and the exact applied toast.
+#[tokio::test]
+async fn the_model_clicks_carry_five_keys_and_ack_with_their_results() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: "opencode".into(),
+        models: vec![model_option("deepseek-v4-flash", &[])],
+    }]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut live = entry();
+    live.model = Some("opencode/deepseek-v4-flash".into());
+    seed_entry(&app, live).await;
+
+    send_command_in(
+        &app,
+        "/model",
+        key(),
+        "msg_model_contract",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let calls = platform.calls.lock().await.clone();
+    let card = calls
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("a model card should be sent");
+
+    let provider = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "model" && button["value"]["value"] == "opencode")
+        .expect("the model card offers the provider drill-down");
+    assert_eq!(
+        value_keys(&provider["value"]),
+        ["action", "chat_id", "level", "thread_id", "value"],
+        "the provider click carries exactly these keys: {}",
+        provider["value"]
+    );
+    assert_eq!(provider["value"]["level"], "provider");
+    let nav = app
+        .host_action(provider["value"].clone())
+        .await
+        .expect("the provider click acks");
+    assert!(nav.toast.is_none(), "navigation speaks nothing");
+    let page = nav.card.expect("the provider click swaps in the model page");
+
+    let pick = card_buttons(&page)
+        .into_iter()
+        .find(|button| {
+            button["value"]["action"] == "model" && button["value"]["value"] == "opencode/deepseek-v4-flash"
+        })
+        .expect("the model page offers the model");
+    assert_eq!(
+        value_keys(&pick["value"]),
+        ["action", "chat_id", "level", "thread_id", "value"],
+        "the model pick carries exactly these keys: {}",
+        pick["value"]
+    );
+    assert_eq!(pick["value"]["level"], "model");
+    let ack = app
+        .host_action(pick["value"].clone())
+        .await
+        .expect("the model pick acks");
+    assert!(ack.card.is_none(), "a model pick is toast-only");
+    assert_eq!(
+        ack.toast.as_deref(),
+        Some("Model: opencode/deepseek-v4-flash（下一条消息开始生效）")
+    );
+}
+
 /// Spec #930 acceptance 1: a Pending Session records the **model only**, and
 /// the first message carries it into `thread/start` — with no provider.
 #[tokio::test]
