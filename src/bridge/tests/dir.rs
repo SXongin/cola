@@ -1649,6 +1649,70 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
     );
 }
 
+/// #1120 — a browse card's file row is the `file` entry's `op: None` default:
+/// it carries exactly the listing's routing keys (and no `op`), and its click
+/// acks with the exact open toast and no card before PATCHing the clicked
+/// browse card into the viewer in place.
+#[tokio::test]
+async fn the_browse_file_row_pins_its_payload_keys_and_exact_result() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let file = proj.path().join("notes.md");
+    std::fs::write(&file, "# notes\nbody\n").unwrap();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    let card = app
+        .host_action(browse_action("go", &proj_dir))
+        .await
+        .unwrap()
+        .card
+        .expect("card");
+    let mut payload = file_row(&card, "notes.md")["value"].clone();
+    assert_eq!(
+        value_keys(&payload),
+        [
+            "action",
+            "chat_id",
+            "dir",
+            "keyword",
+            "page",
+            "path",
+            "show_hidden",
+            "thread_id"
+        ],
+        "the file row carries exactly these keys: {payload}"
+    );
+    assert_eq!(payload["action"], "file");
+    assert!(
+        payload.get("op").is_none(),
+        "a browse row is the default (no-op) shape: {payload}"
+    );
+    assert!(payload.get("session_id").is_none(), "{payload}");
+    assert_eq!(payload["path"], canonical(&file));
+    assert_eq!(payload["dir"], proj_dir);
+
+    payload["open_message_id"] = serde_json::json!("msg_file_row");
+    let result = app.host_action(payload).await.expect("the click acks");
+    assert!(result.card.is_none(), "the bounded read follows acknowledgement");
+    assert_eq!(result.toast.as_deref(), Some("正在打开文件…"));
+    wait_for_card_update(&platform, "browse row viewer", CardUpdates::Latest, |card| {
+        card_text(card).contains("# notes")
+    })
+    .await;
+    assert!(
+        patches_to(&platform, "msg_file_row")
+            .await
+            .last()
+            .is_some_and(|card| card_text(card).contains("# notes")),
+        "the row opens the viewer in the clicked browse card"
+    );
+}
+
 /// A file row's `path` is read **verbatim**, never trimmed (#742 review): it
 /// names a filesystem entry the scan just saw, not free text, and Unix allows a
 /// name that ends in whitespace. Trimming would open a *different* file (if that

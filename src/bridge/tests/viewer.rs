@@ -5266,3 +5266,313 @@ async fn the_rich_text_reply_targets_the_cards_own_container() {
         "each reply targets its own card's command: {targets:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1120 — the `action: "file"` clicks behind the CardAction seam. Three shapes
+// share the action: the viewer's own `op: "send"`, a Tool Panel's `op:
+// "preview"` (which must never PATCH the clicked Turn card, #778), and the
+// no-op default that serves a browse row plus the viewer's own `page`/`view`/
+// `reread` ops (the body parses those itself). Each click's payload keys and
+// exact `CardActionResult` are pinned here so moving the bodies out of
+// `handler.rs` cannot change either.
+// ---------------------------------------------------------------------------
+
+/// 「发为文件」 carries exactly the viewer's routing keys and acks with its exact
+/// toast and no card; the spawned transfer then sends the bytes once and PATCHes
+/// the clicked **viewer** card — that message IS the viewer.
+#[tokio::test]
+async fn the_viewer_send_click_pins_its_payload_keys_and_exact_result() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "# notes\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key,
+        "m_view",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let payload = send_as_file_payload(&card);
+    assert_eq!(
+        value_keys(&payload),
+        [
+            "action",
+            "chat_id",
+            "op",
+            "page",
+            "path",
+            "session_dir",
+            "thread_id",
+            "viewer_file_identity"
+        ],
+        "the 发为文件 click carries exactly these keys: {payload}"
+    );
+    assert_eq!(payload["action"], "file");
+    assert_eq!(payload["op"], "send");
+    assert_eq!(payload["chat_id"], "chat_1");
+    assert_eq!(payload["thread_id"], "chat_1");
+    assert_eq!(payload["path"], canonical(&file));
+    assert_eq!(payload["page"], 1);
+
+    let mut dispatch = payload;
+    dispatch["open_message_id"] = serde_json::json!("msg_view_card");
+    let ack = app.host_action(dispatch).await.expect("the click acks");
+    assert!(ack.card.is_none(), "the click does not rebuild the card inline");
+    assert_eq!(
+        ack.toast.as_deref(),
+        Some("正在发送文件…"),
+        "the callback's acknowledgement is stable"
+    );
+
+    // The send transfer posts the bytes once and PATCHes the clicked card.
+    wait_for_card_update(&platform, "send outcome", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "exactly one File Message"
+    );
+    let patched = patches_to(&platform, "msg_view_card").await;
+    assert!(
+        patched
+            .last()
+            .is_some_and(|card| card_text(card).contains("已发送为文件消息")),
+        "the clicked viewer card carries the send outcome"
+    );
+}
+
+/// A Tool Panel's 「🌐 预览网页」 carries exactly four keys and acks with its exact
+/// toast and no card. The file goes out as one File Message, and the clicked
+/// message — the agent's Turn card — is never PATCHed (#778).
+#[tokio::test]
+async fn the_tool_panel_preview_click_pins_its_keys_exact_result_and_never_patches() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("index.html"), "<!doctype html><p>hi</p>\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let payload = crate::feishu::card::session::tool_page_value("ses_seed", "index.html");
+    assert_eq!(
+        value_keys(&payload),
+        ["action", "op", "path", "session_id"],
+        "the preview click carries exactly these keys: {payload}"
+    );
+    assert_eq!(payload["action"], "file");
+    assert_eq!(payload["op"], "preview");
+    assert_eq!(payload["path"], "index.html");
+    assert_eq!(payload["session_id"], "ses_seed");
+
+    let mut dispatch = payload;
+    dispatch["open_message_id"] = serde_json::json!("msg_turn_card");
+    let ack = app.host_action(dispatch.clone()).await.expect("the click acks");
+    assert!(ack.card.is_none(), "the click does not rebuild the card inline");
+    assert_eq!(ack.toast.as_deref(), Some("正在发送文件…"));
+
+    // Wait for the transfer to land, then for the send memory to make a
+    // duplicate click read `文件已发送` — that is the spawned task's end, so a
+    // PATCH racing the send would already have been issued.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if !file_messages(&platform).await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the preview's File Message lands");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let toast = app
+                .host_action(dispatch.clone())
+                .await
+                .expect("a duplicate click is acknowledged")
+                .toast;
+            if toast.as_deref() == Some("文件已发送") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the send is remembered");
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "a duplicate click cannot post a second File Message"
+    );
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "the Tool Panel's Turn card is never PATCHed (#778)"
+    );
+}
+
+/// A Tool Panel's 「📂 打开」 carries exactly three keys and acks with its exact
+/// toast and no card; the viewer is replied as a NEW standalone card, never a
+/// PATCH of the clicked Turn card it was opened from.
+#[tokio::test]
+async fn the_tool_panel_open_click_pins_its_keys_and_exact_result() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("notes.txt"), "# notes\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let payload = crate::feishu::card::session::tool_file_value("ses_seed", "notes.txt");
+    assert_eq!(
+        value_keys(&payload),
+        ["action", "path", "session_id"],
+        "the tool 打开 click carries exactly these keys: {payload}"
+    );
+    assert_eq!(payload["action"], "file");
+    assert!(
+        payload.get("op").is_none(),
+        "an 打开 is the default shape: {payload}"
+    );
+
+    let mut dispatch = payload;
+    dispatch["open_message_id"] = serde_json::json!("msg_turn_card");
+    let ack = app.host_action(dispatch).await.expect("the click acks");
+    assert!(ack.card.is_none(), "the bounded read follows acknowledgement");
+    assert_eq!(ack.toast.as_deref(), Some("正在打开文件…"));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if platform
+                .replied_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains("# notes"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the standalone viewer reply lands");
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "a tool open replies its own viewer instead of rewriting the Turn card"
+    );
+}
+
+/// A viewer's `page` and `reread` buttons are the `file` entry's default arm
+/// (`op` values with no op-keyed entry): both carry the viewer's routing keys
+/// and ack with their exact busy toasts and no card, then PATCH in place.
+#[tokio::test]
+async fn the_viewer_page_and_reread_clicks_pin_their_keys_and_exact_results() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("long.txt"), numbered_lines(3000)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat long.txt",
+        key,
+        "m_long",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+
+    let page = pager_button(&card, "下一页")["value"].clone();
+    assert_eq!(
+        value_keys(&page),
+        [
+            "action",
+            "chat_id",
+            "keyword",
+            "op",
+            "page",
+            "path",
+            "session_dir",
+            "thread_id",
+            "viewer_file_identity"
+        ],
+        "the pager click carries exactly these keys: {page}"
+    );
+    assert_eq!(page["action"], "file");
+    assert_eq!(page["op"], "page");
+    assert_eq!(page["page"], 2);
+
+    let before = patches_to(&platform, "msg_long").await.len();
+    let mut dispatch = page;
+    dispatch["open_message_id"] = serde_json::json!("msg_long");
+    let ack = app.host_action(dispatch).await.expect("the page flip acks");
+    assert!(ack.card.is_none(), "the rebuild stays off the callback");
+    assert_eq!(ack.toast.as_deref(), Some("正在翻页…"));
+    let page2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let patches = patches_to(&platform, "msg_long").await;
+            if patches.len() > before {
+                break patches.last().unwrap().clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the pager's PATCH lands");
+    assert!(card_text(&page2).contains("line 3000"), "the next window renders");
+
+    let reread = card_buttons(&page2)
+        .into_iter()
+        .find(|button| button["value"]["op"] == "reread")
+        .expect("the viewer offers a re-read")["value"]
+        .clone();
+    assert_eq!(
+        value_keys(&reread),
+        [
+            "action",
+            "chat_id",
+            "op",
+            "page",
+            "path",
+            "session_dir",
+            "thread_id",
+            "viewer_file_identity"
+        ],
+        "the re-read click carries exactly these keys: {reread}"
+    );
+    assert_eq!(reread["op"], "reread");
+
+    let before = patches_to(&platform, "msg_long").await.len();
+    let mut dispatch = reread;
+    dispatch["open_message_id"] = serde_json::json!("msg_long");
+    let ack = app.host_action(dispatch).await.expect("the re-read acks");
+    assert!(ack.card.is_none(), "the re-read stays off the callback");
+    assert_eq!(ack.toast.as_deref(), Some("正在重新读取…"));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if patches_to(&platform, "msg_long").await.len() > before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the re-read's PATCH lands");
+}
