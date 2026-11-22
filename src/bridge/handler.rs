@@ -241,13 +241,13 @@ enum ViewerFileOp {
 /// and 9): the clicked card and the **Terminal Log** path, plus the settled
 /// card's own render inputs so a click's outcome can be PATCHed back onto the
 /// same card without a card-view read or a second state store.
-struct TerminalCardRequest {
-    message_id: String,
+pub(crate) struct TerminalCardRequest {
+    pub(crate) message_id: String,
     chat_id: String,
     /// The run every settled button names (ADR-0086 decision 4). Carried so a
     /// click can be checked against the Chat/Topic's current run id — the stale
     /// rule the Terminal Run Record makes checkable (#827).
-    run_id: String,
+    pub(crate) run_id: String,
     thread_id: String,
     /// Whether the card lives in a group chat. A click carries no chat type of
     /// its own, and the 「问 AI」 submission needs it to rebuild the Chat/Topic
@@ -267,7 +267,7 @@ struct TerminalCardRequest {
 impl TerminalCardRequest {
     /// Parse the button value; `None` when the click cannot be routed (no card
     /// id, no log path) or the payload is not one of ours.
-    fn from_value(value: &serde_json::Value) -> Option<Self> {
+    pub(crate) fn from_value(value: &serde_json::Value) -> Option<Self> {
         let message_id = value.get("open_message_id")?.as_str()?.to_string();
         let path = value.get("path")?.as_str()?.to_string();
         if message_id.is_empty() || path.is_empty() {
@@ -321,8 +321,8 @@ impl TerminalCardRequest {
 /// with. The submission therefore needs neither the live process nor the
 /// **Terminal Log** on disk — a run the sweep marked lost keeps its button
 /// working.
-struct TerminalAskAiRequest {
-    card: TerminalCardRequest,
+pub(crate) struct TerminalAskAiRequest {
+    pub(crate) card: TerminalCardRequest,
     /// The window the card showed: already ANSI-stripped, line-capped and
     /// bounded by the display tail budget.
     output: String,
@@ -336,7 +336,7 @@ impl TerminalAskAiRequest {
     /// Parse the button value; `None` when the payload is not one of ours (a
     /// submission without a window has nothing to quote, and one without a run
     /// id cannot name the run it was rendered for).
-    fn from_value(value: &serde_json::Value) -> Option<Self> {
+    pub(crate) fn from_value(value: &serde_json::Value) -> Option<Self> {
         let card = TerminalCardRequest::from_value(value)?;
         if card.run_id.is_empty() {
             return None;
@@ -1144,7 +1144,7 @@ fn turn_diff_file_name(session_id: &str, from: &str) -> String {
 /// RAII claim for one in-flight File Viewer action. A duplicate callback gets
 /// acknowledged without spawning another sender; Drop releases even if the
 /// spawned task is cancelled or unwinds.
-struct ViewerActionGuard {
+pub(crate) struct ViewerActionGuard {
     in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     key: (String, String),
 }
@@ -1575,7 +1575,11 @@ impl App {
     /// Claim one clicked viewer card until its spawned operation and final card
     /// update complete. The real card message id is supplied by Feishu callback
     /// context; chat scopes it defensively across targets.
-    fn claim_viewer_action(&self, thread_key: &ThreadKey, message_id: &str) -> Option<ViewerActionGuard> {
+    pub(crate) fn claim_viewer_action(
+        &self,
+        thread_key: &ThreadKey,
+        message_id: &str,
+    ) -> Option<ViewerActionGuard> {
         let key = (thread_key.chat_id.clone(), message_id.to_string());
         let mut in_flight = self
             .viewer_actions_in_flight
@@ -3260,31 +3264,6 @@ impl App {
                 // but must NOT PATCH — the clicked message is the agent's Turn
                 // card (#778) — and a browse card's file row, which carries no op
                 // and opens the file in place. The op tells the three apart.
-                // The Terminal Card's 「📄 完整输出」 (ADR-0086 decision 7): the
-                // click acknowledges and a spawned, bounded transfer uploads the
-                // Terminal Log as ONE File Message, then PATCHes the card with
-                // the outcome. A 30 MB upload never runs inside the callback's
-                // ack budget.
-                "terminal" => match value.get("op").and_then(|v| v.as_str()) {
-                    Some("full_output") => self.handle_terminal_full_output(&value).await,
-                    // 「问 AI」 (ADR-0086 decision 9): the ONLY path by which
-                    // terminal output reaches the model. Like the retrieval
-                    // click it leaves the callback: the normal prompt pipeline
-                    // runs off the ack, because it may ensure a server and wait
-                    // on a whole Turn.
-                    Some("ask_ai") => self.handle_terminal_ask_ai(&value).await,
-                    // 「↻ 重跑」 (ADR-0086 decisions 4 and 5): the click names a
-                    // run, the chat's record must still be that run, and the
-                    // command/cwd/timeout come from the record — which is why
-                    // the button works after a restart and why a redelivered
-                    // click is refused as stale instead of running twice.
-                    Some("rerun") => self.handle_terminal_rerun(&value).await,
-                    // 「⏹ 终止」 / 「继续」 (ADR-0086 decision 6): the click
-                    // only routes to the Chat/Topic's current run, whose id
-                    // the button carries. A click for any other run id is
-                    // refused as stale, and the run loop owns the group.
-                    _ => self.handle_terminal_action(&value).await,
-                },
                 "file" => match value.get("op").and_then(|v| v.as_str()) {
                     Some("send") => self.handle_viewer_file_action(&value, ViewerFileOp::Send).await,
                     Some("preview") => {
@@ -5021,116 +5000,6 @@ impl App {
     /// replies under the ORIGINAL user message, spec #655), and the
     /// agent/autoaccept toasts already established that a picker does not
     /// replace itself on a pick.
-    /// Route a Terminal Card control (ADR-0086 decision 6). The handler never
-    /// touches the process group: it looks the run up by the button's run id,
-    /// refuses a stale id, and enqueues the signal for the run loop. A control
-    /// is refused by state, not hidden, so a redelivered click is a no-op.
-    async fn handle_terminal_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let thread_key = thread_key_from_value(value);
-        if thread_key.chat_id.is_empty() {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("这张卡片缺少会话信息，无法操作。".to_string()),
-            });
-        }
-        let run_id = value.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
-        let op = value
-            .get("op")
-            .and_then(|v| v.as_str())
-            .and_then(crate::bridge::terminal::TerminalOp::parse);
-        let Some(op) = op else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("未知的终端操作。".to_string()),
-            });
-        };
-        let outcome = {
-            let runs = self
-                .terminal_runs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            runs.control(&thread_key, run_id, op)
-        };
-        let toast = match outcome {
-            crate::bridge::terminal::TerminalControlOutcome::Accepted => match op {
-                crate::bridge::terminal::TerminalOp::Kill => "⏹ 正在终止…",
-                crate::bridge::terminal::TerminalOp::Continue => "⏱ 已延长时限，继续跟踪输出…",
-            },
-            crate::bridge::terminal::TerminalControlOutcome::Stale => "这张终端卡片的操作已过期。",
-            crate::bridge::terminal::TerminalControlOutcome::NotPastCap => "命令尚未到达时限。",
-        };
-        Some(CardActionResult {
-            card: None,
-            toast: Some(toast.to_string()),
-        })
-    }
-
-    /// Handle a 「↻ 重跑」 click (ADR-0086 decisions 4 and 5). The claim and the
-    /// stale check happen together, synchronously, inside the callback — cheap,
-    /// so the ack is never held — and the run itself is spawned off it. The
-    /// command, cwd and timeout come from the **Terminal Run Record**, which is
-    /// what makes the button work after a restart and what a multi-kilobyte
-    /// command is kept out of the card's JSON for.
-    async fn handle_terminal_rerun(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let thread_key = thread_key_from_value(value);
-        if thread_key.chat_id.is_empty() {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("这张卡片缺少会话信息，无法操作。".to_string()),
-            });
-        }
-        let run_id = value.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
-        // The clicked card is this run's new reply target: a rerun posts under
-        // the card it was clicked on, which is where its reader is looking.
-        let Some(message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("这条操作缺少消息位置，无法重跑。".to_string()),
-            });
-        };
-        let message_id = message_id.to_string();
-        let requester = value
-            .get("operator_open_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let claim = crate::bridge::terminal::claim_rerun(&self.command_handles(), &thread_key, run_id);
-        let toast = match claim {
-            crate::bridge::terminal::RerunClaim::Stale => "这张终端卡片的操作已过期。",
-            // The slot is held (the command this card names, or a successor,
-            // is still running): the record is untouched, so the card's own id
-            // stays current for a later click.
-            crate::bridge::terminal::RerunClaim::Busy => {
-                "这个会话已有终端命令在运行，请先点击运行卡片的「⏹ 终止」。"
-            }
-            crate::bridge::terminal::RerunClaim::Accepted(claimed) => {
-                let app = Arc::clone(self);
-                tokio::spawn(async move {
-                    if let Err(e) = crate::bridge::terminal::rerun(
-                        &app.command_handles(),
-                        claimed,
-                        crate::bridge::terminal::TerminalRequest {
-                            message_id: &message_id,
-                            requester_open_id: requester.as_deref(),
-                            // Replaced from the record inside `rerun`: a
-                            // button payload carries no chat type, and the
-                            // record does.
-                            is_group: false,
-                        },
-                    )
-                    .await
-                    {
-                        tracing::error!("Terminal rerun: {}", e);
-                    }
-                });
-                "↻ 正在重跑…"
-            }
-        };
-        Some(CardActionResult {
-            card: None,
-            toast: Some(toast.to_string()),
-        })
-    }
-
     async fn handle_skill_card_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
@@ -6026,48 +5895,6 @@ impl App {
         }
     }
 
-    /// The Terminal Card's 「📄 完整输出」 click (ADR-0086 decision 7) — the
-    /// Terminal Command's counterpart of the viewer's 「发为文件」. The card
-    /// callback must ack inside Feishu's budget, and a 30 MB upload cannot fit
-    /// it, so the click claims the card, spawns the transfer and answers a
-    /// toast immediately. The spawned step reads a bounded copy of the
-    /// **Terminal Log**, sends it as exactly ONE File Message under the clicked
-    /// card, and PATCHes that card with the outcome — so a large upload neither
-    /// dies with the callback nor leaves the clicker without a result.
-    ///
-    /// It reuses the viewer's path on purpose: the same [`send_file_message`]
-    /// lane (content-hash upload cache, one bounded send), the same
-    /// [`SharedCore::viewer_transfer_timeout_ms`] per-call bound and the same
-    /// per-card in-flight claim. A second upload implementation is exactly what
-    /// this must not grow.
-    async fn handle_terminal_full_output(
-        self: &Arc<Self>,
-        value: &serde_json::Value,
-    ) -> Option<CardActionResult> {
-        let Some(request) = TerminalCardRequest::from_value(value) else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("无效操作".to_string()),
-            });
-        };
-        let thread_key = thread_key_from_value(value);
-        let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, &request.message_id) else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("正在发送完整输出…".to_string()),
-            });
-        };
-        let app = Arc::clone(self);
-        tokio::spawn(async move {
-            let _in_flight_guard = in_flight_guard;
-            app.run_terminal_full_output(request).await;
-        });
-        Some(CardActionResult {
-            card: None,
-            toast: Some("正在发送完整输出…".to_string()),
-        })
-    }
-
     /// The 「📄 完整输出」 transfer itself, off the card callback. One bounded
     /// local read (the delivery copy and the display tail), one File Message
     /// through the viewer's lane, then one PATCH onto the clicked card carrying
@@ -6075,7 +5902,7 @@ impl App {
     /// is the log's first 30 MB plus a truncation line — the log on disk is
     /// never truncated, because the child's descriptor offset does not move
     /// back.
-    async fn run_terminal_full_output(self: &Arc<Self>, request: TerminalCardRequest) {
+    pub(crate) async fn run_terminal_full_output(self: &Arc<Self>, request: TerminalCardRequest) {
         let timeout_ms = self
             .viewer_transfer_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -6325,89 +6152,12 @@ impl App {
         }
     }
 
-    /// The Terminal Card's 「问 AI」 click (ADR-0086 decision 9) — the ONE
-    /// explicit door by which a Terminal Command's output reaches the model.
-    /// No Terminal Command ever submits its own output, so this click is the
-    /// only path into the Session Transcript.
-    ///
-    /// The payload is self-describing: the command, the output window and the
-    /// run id it was rendered for. The submission therefore needs neither a
-    /// live process nor the **Terminal Log** on disk, so it works on a run the
-    /// startup sweep marked lost (ADR-0086 decision 5).
-    ///
-    /// The click claims the run's one submission before anything is spawned, so
-    /// a redelivered or double-clicked button cannot submit the same output
-    /// twice, and a click naming a run a newer command replaced is refused as
-    /// stale (ADR-0086 decision 4) — refused by state, never hidden.
-    ///
-    /// The callback must ack inside Feishu's budget, and the normal prompt
-    /// pipeline may ensure a server and wait on a whole Turn, so the click
-    /// acknowledges and spawns it. The card is PATCHed with what happened to
-    /// the *submission* — a new Turn or a Supplement — never with a claim that
-    /// the model answered; the answer belongs to the Turn's own card.
-    async fn handle_terminal_ask_ai(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let Some(request) = TerminalAskAiRequest::from_value(value) else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("无效操作".to_string()),
-            });
-        };
-        let thread_key = thread_key_from_value(value);
-        let (guard, toast) = match crate::bridge::terminal::AskAiGuard::claim(
-            &self.terminal_runs,
-            &self.terminal_records,
-            &thread_key,
-            &request.card.run_id,
-        ) {
-            crate::bridge::terminal::AskAiClaim::Accepted(guard) => (guard, "🤖 正在把终端输出提交给 AI…"),
-            crate::bridge::terminal::AskAiClaim::InFlight => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("正在提交给 AI…".to_string()),
-                });
-            }
-            crate::bridge::terminal::AskAiClaim::AlreadySubmitted => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("这份输出已经提交给 AI 了。".to_string()),
-                });
-            }
-            crate::bridge::terminal::AskAiClaim::Stale => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("这张终端卡片的操作已过期。".to_string()),
-                });
-            }
-            // The durable authority is unreadable and this process never ran
-            // the command: nothing can prove the card current, so refuse rather
-            // than hand old output to the model (#827 review, finding 1). The
-            // toast says which failure it is, so the reader knows to re-run.
-            crate::bridge::terminal::AskAiClaim::Unverifiable => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(
-                        "⚠️ 找不到这次运行的记录，无法确认它是否仍是最新的，因此没有提交（避免把旧输出交给 AI）。"
-                            .to_string(),
-                    ),
-                });
-            }
-        };
-        let app = Arc::clone(self);
-        tokio::spawn(async move {
-            app.run_terminal_ask_ai(request, guard).await;
-        });
-        Some(CardActionResult {
-            card: None,
-            toast: Some(toast.to_string()),
-        })
-    }
-
     /// The 「问 AI」 submission itself, off the card callback: build the framed
     /// prompt from the button's payload, hand it to the one prompt pipeline,
     /// and PATCH the clicked card with the submission's outcome. `guard` holds
     /// the run's one submission slot; it is released as retryable unless the
     /// pipeline accepted the message.
-    async fn run_terminal_ask_ai(
+    pub(crate) async fn run_terminal_ask_ai(
         self: &Arc<Self>,
         request: TerminalAskAiRequest,
         guard: crate::bridge::terminal::AskAiGuard,
