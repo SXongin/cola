@@ -1694,7 +1694,11 @@ async fn the_browse_file_row_pins_its_payload_keys_and_exact_result() {
     );
     assert!(payload.get("session_id").is_none(), "{payload}");
     assert_eq!(payload["path"], canonical(&file));
-    assert_eq!(payload["dir"], proj_dir);
+    // The card renders the RESOLVED listing base (`resolve_browse_path`
+    // canonicalises symlinks and short-name spellings), so the row's `dir` is
+    // the canonical directory even though the `go` action above asked with the
+    // raw tempdir spelling.
+    assert_eq!(payload["dir"], canonical(proj.path()));
 
     payload["open_message_id"] = serde_json::json!("msg_file_row");
     let result = app.host_action(payload).await.expect("the click acks");
