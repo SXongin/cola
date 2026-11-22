@@ -666,13 +666,13 @@ _Avoid_: Notification, message, signal
 - Every inbound message or card action carries exactly one **Principal** (its sender or clicking user), which the **Access List** authorizes
 - The **Host** is the **Principal** the first successful **Claim** writes into the **Access List**
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session** (or one **Pending Session**)
-- A **Chat** or **Topic** has one **Session Mapping**: its activated **Session**s, its **Active Session** and its **Pending Session**
-- A **Topic** is created around its **Topic Root** and anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card** (ADR-0023)
+- A **Chat** or **Topic** has one **Session Mapping**: its activated **Session**s and its **Active Session**, with a **Pending Session** beside it
+- A **Topic** is created around its **Topic Root**, and a cola-opened one is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card** (ADR-0023)
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**; a **Turn** spans one or more **Executions**, and a **Wake** may follow with another **Execution** (ADR-0059)
 - A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
 - A **Compaction** is a generation-neutral, **Session**-scoped fact on the **Session Transcript**, never a **Turn** (ADR-0082)
 - A **Wake Watermark** records which **Wake**s a card chain has announced; the **Sync Watermark** is user-message-scoped (ADR-0061)
-- A **Background Task** run's endings are **Task Ending**s under one **Task Run Id** (ADR-0080)
+- A **Background Task** run's endings are **Task Ending**s under one **Task Run Id**, at most one per class (ADR-0080)
 - A **Card Chain**'s **Rendered Cursor** records how far its card has confirmed rendered (ADR-0071)
 - A **Keyed Submission** carries the **Chain Generation** its writer decided under (ADR-0072)
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
@@ -682,7 +682,7 @@ _Avoid_: Notification, message, signal
 - One **Runtime Reconciliation** step corroborates every **Session**'s live **Background Tasks** and serves Session Sync, the Turn's drain and the follow/settle loop (ADR-0065, ADR-0073)
 - An **Instant Reminder** and a **Completion Notice** are the two Feishu notifications: the reminder for a pending **Permission**/**Question**, the notice for a **Turn**'s end (ADR-0059, ADR-0060, ADR-0109)
 - A **Turn** renders one **Tool Panel** per tool call, chosen by the call's **Tool Kind** and **Tool Detail** (ADR-0042, ADR-0105)
-- A **File Content** is a file payload a transcript part carries, contrasted with a **Prompt Attachment**, its inbound counterpart
+- A **File Content** is a file payload a transcript part carries; a **File Message** is the separate message that carries one, and a **Prompt Attachment** is its inbound counterpart
 - A **Directory Browser** lists children and a file row opens a **File Viewer** on the **Path Scope** (ADR-0083)
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Card** is the one card a **Session** renders into (ADR-0043, ADR-0100)
