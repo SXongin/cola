@@ -666,7 +666,7 @@ _Avoid_: Notification, message, signal
 - Every inbound message or card action carries exactly one **Principal** (its sender or clicking user), which the **Access List** authorizes
 - The **Host** is the **Principal** the first successful **Claim** writes into the **Access List**
 - A **Chat** contains many **Topics**; a **Chat** may hold several **Sessions** directly (lobby), while a **Topic** holds exactly one **Session** (or one **Pending Session**)
-- A **Chat** or **Topic** has one **Session Mapping**: its activated **Session**s and its **Active Session**, with a **Pending Session** beside it
+- A **Chat** or **Topic** has one **Session Mapping**: its activated **Session**s, at most one **Active Session**, and a **Pending Session** beside it
 - A **Topic** is created around its **Topic Root**, and a cola-opened one is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card** (ADR-0023)
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**; a **Turn** spans one or more **Executions**, and a **Wake** may follow with another **Execution** (ADR-0059)
 - A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
