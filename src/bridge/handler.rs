@@ -544,12 +544,13 @@ pub struct CardActionResult {
 /// Everything a terminal card's recovery click needs once its claim is held:
 /// the claimed fixture, the Chat/Topic it belongs to, the directory its reads
 /// route under, and the narrow handle bundle the spawned pipeline runs with.
-/// Built by [`App::claim_recovery_click`].
-struct RecoveryClick {
-    recovery: crate::bridge::turn::TurnRecovery,
-    thread_key: ThreadKey,
-    directory: Option<String>,
-    handles: crate::bridge::handles::TurnHandles,
+/// Built by [`App::claim_recovery_click`] and destructured by the verb module
+/// that claimed it ([`crate::bridge::card_action::retry`]).
+pub(crate) struct RecoveryClick {
+    pub(crate) recovery: crate::bridge::turn::TurnRecovery,
+    pub(crate) thread_key: ThreadKey,
+    pub(crate) directory: Option<String>,
+    pub(crate) handles: crate::bridge::handles::TurnHandles,
 }
 
 /// The thread a card callback routes to. Every cola card button carries its
@@ -3206,7 +3207,11 @@ impl App {
     /// Handle a card action (permission Allow/Deny, question answer/reject,
     /// error-card retry). Returns the updated card showing the decision, so the
     /// caller can send it back in the ack, plus an optional Toast for instant
-    /// client feedback. Dispatches to the flow that owns the action tag.
+    /// client feedback. What every click shares lives here — the Host gate, the
+    /// payload parse, the capability gates, the one ADR-0089 deadline and the
+    /// span — and the matched verb's body lives behind the CardAction seam
+    /// ([`crate::bridge::card_action`]), which the dispatch looks up by
+    /// `action`/`op`.
     ///
     /// The whole dispatch runs inside the click's [`span::action`] (ADR-0048):
     /// every line the action and its awaits produce is then retrievable by the
@@ -3232,30 +3237,17 @@ impl App {
                 .unwrap_or((None, None));
         let action_span = span::action(session_id.as_deref(), thread_key.as_ref());
         let dispatch = async {
-            // The Turn card's 「🔍 查看完整变化」 carries `op` and NO `action`
-            // (#477/spec #797): route it before the action match, without
-            // widening the button's exact four-key payload.
-            if op == crate::feishu::card::turn_diff::TURN_DIFF_OP {
-                // A card persisted under a client that had the surface may be
-                // clicked after a reattach: omit the read, don't guess it.
-                if !self.core.flow_handles().backend.capabilities().diffs {
+            // A verb behind the CardAction seam (#1156) is one lookup: an
+            // op-only entry (the Turn card's action-less diff click) wins, then
+            // the action table. The capability gate is the entry's, applied
+            // here so a verb never reads capabilities itself (ADR-0106).
+            if let Some(verb) = crate::bridge::card_action::lookup(action, op) {
+                if !verb.gate.is_open(&self.core) {
                     return None;
                 }
-                return self.handle_turn_diff_action(&value).await;
+                return (verb.run)(self, &value, deadline, callback_started).await;
             }
             match action {
-                "perm" => {
-                    self.permission
-                        .handle_card_action(&self.flow_handles(), &value)
-                        .await
-                }
-                "question" => {
-                    self.question
-                        .handle_card_action(&self.flow_handles(), &value)
-                        .await
-                }
-                "retry" => self.handle_retry_action(&value).await,
-                "cleanup" => self.handle_cleanup_action(&value).await,
                 "resume" => self.handle_resume_action(&value).await,
                 "switch" => self.handle_switch_card_action(&self.core, &value, deadline).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
@@ -5708,7 +5700,7 @@ impl App {
     /// try again. `label` names the action in the warn lines ("retry" /
     /// "resume"); the callers spawn their own pipelines and ack with their own
     /// toasts.
-    async fn claim_recovery_click(
+    pub(crate) async fn claim_recovery_click(
         self: &Arc<Self>,
         value: &serde_json::Value,
         from: crate::feishu::card::CardState,
@@ -5764,7 +5756,7 @@ impl App {
     /// bounded like the File Message once-guard: a later click is a no-op
     /// (「已发送」, or the ambiguous-send wording) and never generates or uploads
     /// again. Distinct Turns are distinct keys.
-    async fn handle_turn_diff_action(
+    pub(crate) async fn handle_turn_diff_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
@@ -6890,85 +6882,6 @@ impl App {
         .await;
     }
 
-    /// Re-submit a failed prompt from the error-card "retry" button (spec
-    /// #391). The card callback must ack within 3s, so the click claims the
-    /// retry (the atomic double-click guard behind the Turn interface), spawns
-    /// the decision pipeline and returns a "retrying" toast immediately; the
-    /// pipeline then reads the session's status and transcript once, decides,
-    /// and either re-attaches the card to a run that is still alive, or marks
-    /// the failed card `Retried` and submits the prompt onto a NEW card below
-    /// it.
-    ///
-    /// The claim is released when nothing is submitted and nothing is
-    /// re-attached (a session/thread that vanished, or a busy run with no
-    /// anchor to follow), so a later click can try again.
-    async fn handle_retry_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let RecoveryClick {
-            recovery,
-            thread_key,
-            directory,
-            handles,
-        } = self
-            .claim_recovery_click(value, crate::feishu::card::CardState::Error, "retry")
-            .await?;
-        let app = Arc::clone(self);
-        let span = span::turn(&recovery.session_id, &thread_key, None);
-        tokio::spawn(
-            async move {
-                app.run_retry(handles, recovery, thread_key, directory).await;
-            }
-            .instrument(span),
-        );
-        Some(CardActionResult {
-            card: None,
-            toast: Some("正在重试...".to_string()),
-        })
-    }
-
-    /// The waiting card's 「清理待确认任务」 click (spec #588, ticket #590): the
-    /// user's exit for the ⚠️ 状态待确认 residue no machine can confirm. The
-    /// card callback must ack within 3s, so the click claims the cleanup (the
-    /// same atomic double-click guard the retry uses, on the waiting card),
-    /// spawns the pipeline and returns a "cleaning" toast immediately; the
-    /// pipeline then reads the session's transcript and runtime once, retires
-    /// exactly the unconfirmed live tasks it finds, and re-renders the waiting
-    /// card.
-    async fn handle_cleanup_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let sid = value.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-        if sid.is_empty() {
-            return None;
-        }
-        let handles = self.turn_handles();
-        if !crate::bridge::turn::Turn::claim_cleanup(&handles.cards, sid).await {
-            tracing::warn!("cleanup: no waiting card with unconfirmed tasks for session {sid}");
-            return None;
-        }
-        let (thread_key, directory) = {
-            let sessions = self.sessions.lock().await;
-            (
-                sessions.thread_for_session(sid),
-                sessions.directory_for_session(sid),
-            )
-        };
-        let Some(thread_key) = thread_key else {
-            crate::bridge::turn::Turn::release_cleanup_claim(&handles.cards, sid).await;
-            tracing::warn!("cleanup: no thread mapped for session {sid}");
-            return None;
-        };
-        let session_id = sid.to_string();
-        let span = span::turn(&session_id, &thread_key, None);
-        tokio::spawn(
-            async move {
-                Self::run_cleanup(handles, session_id, directory).await;
-            }
-            .instrument(span),
-        );
-        Some(CardActionResult {
-            card: None,
-            toast: Some("正在清理...".to_string()),
-        })
-    }
-
     /// The cleanup's read → reconcile → retire → re-render pipeline, off the
     /// ack path (spec #588, #590). The click's own read runs the shared,
     /// NON-throttled reconcile ([`crate::bridge::runtime::reconcile_now`]) —
@@ -6999,7 +6912,7 @@ impl App {
     /// and its button leave on the click's own pass. A read that fails, and a
     /// verdict that changed nothing at all, give the claim back so the button
     /// stays usable.
-    async fn run_cleanup(
+    pub(crate) async fn run_cleanup(
         handles: crate::bridge::handles::TurnHandles,
         session_id: String,
         directory: Option<String>,
@@ -7175,7 +7088,7 @@ impl App {
     /// never recreates the "click does nothing" bug. The submit branches hand
     /// off to `Turn::start`, which marks the failed card `Retried` once it
     /// holds the session's inflight guard and replies the attempt's new card.
-    async fn run_retry(
+    pub(crate) async fn run_retry(
         self: Arc<Self>,
         handles: crate::bridge::handles::TurnHandles,
         retry: crate::bridge::turn::TurnRecovery,
