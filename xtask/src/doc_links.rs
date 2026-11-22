@@ -282,8 +282,10 @@ fn is_preceding_path_char(c: char) -> bool {
 }
 
 /// A `.` or `..` component climbs out of the tree the citation claims to name.
+/// Both separators count: Windows treats `\` as a separator too, so
+/// `src/..\outside.md:1` is the same escape as `src/../outside.md:1`.
 fn has_traversal(path: &str) -> bool {
-    path.split('/')
+    path.split(['/', '\\'])
         .any(|component| component == "." || component == "..")
 }
 
@@ -801,6 +803,20 @@ mod tests {
     fn a_pin_that_climbs_out_of_src_fails() {
         let tree = Tree::new("pin-traversal");
         tree.file("docs/note.md", "`src/../CONTRIBUTING.md:1`\n");
+        let findings = tree.check().findings;
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].to_string().contains("path escapes src/"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    /// Windows treats `\` as a separator, so it is an escape too.
+    #[test]
+    fn a_pin_that_climbs_out_of_src_with_a_backslash_fails() {
+        let tree = Tree::new("pin-traversal-backslash");
+        tree.file("docs/note.md", "`src/..\\CONTRIBUTING.md:1`\n");
         let findings = tree.check().findings;
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
