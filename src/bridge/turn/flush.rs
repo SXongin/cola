@@ -6,8 +6,6 @@
 //! outside the Turn module. The card-delivery helpers other flows genuinely use
 //! (target resolution, stale marking) stay in their owning modules.
 
-use std::sync::Arc;
-
 use super::state::{CardFallback, SliceFingerprint};
 use super::wake::record_landed_rendered;
 use super::{MAX_CARD_CHAIN, SplitKind, Turn};
@@ -19,17 +17,6 @@ use crate::bridge::handles::CardsHandle;
 /// The visible marker a twice-refused payload leaves on its continuation card
 /// (issue #886): the user must never see a card silently stop updating.
 const CARD_CONTENT_SKIPPED: &str = "⚠️ 部分内容未能显示（飞书拒绝了卡片内容）";
-
-/// A one-shot test gate inside the staged-cursor drain reconcile (spec #561,
-/// review #569): awaited between the delivery check and the confirmation, so a
-/// test can stage a newer cursor in that exact window. Only tests construct
-/// one; production passes `None`.
-pub(crate) struct ReconcileGate {
-    /// Signalled when the reconcile parked at the gate.
-    pub(crate) entered: Arc<tokio::sync::Notify>,
-    /// The reconcile proceeds once this is signalled.
-    pub(crate) release: Arc<tokio::sync::Notify>,
-}
 
 /// Whether `e` is Feishu's deterministic card-content rejection (`230099`).
 /// The same card JSON fails on every retry, so the flush degrades instead.
@@ -378,7 +365,6 @@ async fn confirm_staged_cursor(
     chain_id: Option<u64>,
     expected: crate::bridge::turn::state::StagedCursorId,
     rendered: &[EndingKey],
-    gate: Option<&ConfirmGate>,
 ) {
     // ONE critical section (spec #561, review #569): the stage comparison —
     // `take_staged_cursor`'s last-applied guard — and the durable record write
@@ -405,12 +391,6 @@ async fn confirm_staged_cursor(
         record_landed_rendered(cards, Some(card), session_id, rendered);
         return;
     };
-    // The ordering test parks one confirmation here (spec #561, review #569):
-    // inside the critical section, so a newer confirmation waits for it.
-    if let Some(gate) = gate {
-        gate.entered.notify_one();
-        gate.release.notified().await;
-    }
     // ONE record write (spec #561, review #569): this very body carried the
     // chain's orphan gap this far — a PARTIAL body only advances the durable
     // gap, so a restart (or the next slice) resumes after what a card showed,
@@ -433,32 +413,6 @@ async fn confirm_staged_cursor(
     if let Some(seq) = expected.awaiting_seq {
         cards.chains.clear_owed_rendered(card_message_id, seq);
     }
-}
-
-/// A one-shot test gate inside one cursor confirmation (spec #561, review
-/// #569): awaited after the stage take and before the durable write — inside
-/// the confirmation's cards critical section — so the ordering test can
-/// interleave a newer confirmation there. Only tests construct one; production
-/// passes `None`.
-pub(crate) struct ConfirmGate {
-    /// Signalled when the confirmation parked at the gate.
-    pub(crate) entered: Arc<tokio::sync::Notify>,
-    /// The confirmation proceeds once this is signalled.
-    pub(crate) release: Arc<tokio::sync::Notify>,
-}
-
-/// The test seam's confirmation entry (spec #561, review #569): confirm one
-/// exact staged cursor, optionally parked at `gate`.
-#[cfg(test)]
-pub(crate) async fn confirm_staged_cursor_for_test(
-    cards: &CardsHandle,
-    session_id: &str,
-    card_message_id: &str,
-    expected: crate::bridge::turn::state::StagedCursorId,
-    rendered: &[EndingKey],
-    gate: Option<&ConfirmGate>,
-) {
-    confirm_staged_cursor(cards, session_id, card_message_id, None, expected, rendered, gate).await;
 }
 
 /// Fold a failed card write into the staged Rendered Cursor (spec #561): a
@@ -511,7 +465,7 @@ async fn note_cursor_write_failure(
             // The drain delivered this payload first: the write landed, so
             // confirm the exact stage this body carried — the mark and the
             // cursor in ONE write (issue #671, ticket #672).
-            confirm_staged_cursor(cards, session_id, card_message_id, None, stage, rendered, None).await;
+            confirm_staged_cursor(cards, session_id, card_message_id, None, stage, rendered).await;
             return;
         }
     }
@@ -530,18 +484,6 @@ async fn note_cursor_write_failure(
 /// delivering it (a refusal, or a superseded payload) is dropped; a still-owed
 /// one stays for its own confirmation.
 pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
-    reconcile_staged(cards, None).await;
-}
-
-/// [`reconcile_staged_cursors`] with a test gate (spec #561, review #569):
-/// the reconcile parks between the delivery check and the confirmation, so a
-/// test can stage a newer cursor in that exact window.
-#[cfg(test)]
-pub(crate) async fn reconcile_staged_cursors_gated(cards: &CardsHandle, gate: &ReconcileGate) {
-    reconcile_staged(cards, Some(gate)).await;
-}
-
-async fn reconcile_staged(cards: &CardsHandle, gate: Option<&ReconcileGate>) {
     let due: Vec<(String, String, u64, crate::bridge::turn::state::StagedCursorId)> = {
         let live = cards.cards.lock().await;
         live.iter()
@@ -558,14 +500,10 @@ async fn reconcile_staged(cards: &CardsHandle, gate: Option<&ReconcileGate>) {
     };
     for (session_id, card_message_id, seq, expected) in due {
         if cards.feishu.card_write_delivered(&card_message_id, seq) {
-            if let Some(gate) = gate {
-                gate.entered.notify_one();
-                gate.release.notified().await;
-            }
             // Only the stage whose delivery was just verified is confirmed: a
             // body staged since (a fresh flush whose PATCH is still pending) is
             // left for its own confirmation (review #569).
-            confirm_staged_cursor(cards, &session_id, &card_message_id, None, expected, &[], None).await;
+            confirm_staged_cursor(cards, &session_id, &card_message_id, None, expected, &[]).await;
         } else if cards
             .feishu
             .settled_card_write_delivered(&card_message_id)
@@ -929,16 +867,8 @@ pub(super) async fn flush_card_locked(
                     // The body's endings ride the same confirmation, so a
                     // superseded or replaced chain still flips their shown bits
                     // (ADR-0080; issue #671, ticket #672).
-                    confirm_staged_cursor(
-                        cards,
-                        session_id,
-                        &card_id,
-                        None,
-                        stage,
-                        &built.rendered_endings,
-                        None,
-                    )
-                    .await;
+                    confirm_staged_cursor(cards, session_id, &card_id, None, stage, &built.rendered_endings)
+                        .await;
                     // The PATCH carried this slice's completion entries: the
                     // staged Wake Watermark is now user-visible (ADR-0061).
                     drain_wake_watermark(cards, session_id, watermark).await;
@@ -1216,7 +1146,6 @@ pub(super) async fn flush_card_locked(
                         None,
                         stage,
                         &finalized.rendered_endings,
-                        None,
                     )
                     .await;
                 }
@@ -2670,13 +2599,13 @@ mod tests {
         cards
             .chains
             .record_ending("ses_test", &run("call_1"), owed_ending(TaskEndingClass::Evidence));
-        super::confirm_staged_cursor_for_test(
+        super::confirm_staged_cursor(
             &cards,
             "ses_test",
             "om_live",
+            None,
             stage,
             &[staged("call_1", TaskEndingClass::Evidence)],
-            None,
         )
         .await;
 

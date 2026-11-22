@@ -1898,40 +1898,6 @@ impl ChainRecords {
         }
     }
 
-    /// Record how far a confirmed write carried the chain's pending orphan gap
-    /// (spec #561, review #569), scoped like [`Self::note_pending_gap`]: a body
-    /// that stopped mid-gap ADVANCES the gap's cursor — so a restart (or the
-    /// next slice) resumes after the content a card already showed instead of
-    /// re-rendering it — while a body that reached the gap's end consumes the
-    /// durable fact. Production confirmations go through the ONE-write
-    /// [`Self::advance_cursor_and_gap`]; this is the store tests' seam.
-    #[cfg(test)]
-    pub(crate) fn advance_pending_gap(
-        &self,
-        session_id: &str,
-        card_message_id: &str,
-        frontier: &CursorFrontier,
-        complete: bool,
-    ) -> bool {
-        let mut state = self.lock();
-        let client = state.client_id.clone();
-        match state.records.get_mut(&client, session_id) {
-            Some(card) if card.card_message_id == card_message_id => {
-                let Some(gap) = card.pending_gap.as_mut() else {
-                    return false;
-                };
-                if complete {
-                    card.pending_gap = None;
-                } else {
-                    gap.cursor.frontier = Some(frontier.clone());
-                }
-                self.write(&state);
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// Set `flag` on the record naming `card_message_id` — the shared body of
     /// the record-scoped flag mutations (the reap's one-per-life marks). Returns
     /// whether the record still names that card (a stale mutation for a
@@ -2523,7 +2489,14 @@ mod tests {
             delivered_chars: 5,
             prefix_digest: Some(cursor_prefix_digest("尾巴")),
         };
-        assert!(chains.advance_pending_gap("ses_a", "om_new", &frontier, false));
+        // A confirmed body that stopped mid-gap: the production one-write
+        // confirmation advances the cursor and the gap's cursor together
+        // (spec #561, review #569).
+        let body = RenderedCursor {
+            frontier: Some(frontier.clone()),
+            ..RenderedCursor::default()
+        };
+        chains.advance_cursor_and_gap("ses_a", "om_new", &body, Some((&frontier, false)), &[]);
         assert_eq!(
             chains
                 .get("ses_a")
@@ -2556,7 +2529,7 @@ mod tests {
             "an ordinary re-point carries the advanced gap"
         );
 
-        assert!(chains.advance_pending_gap("ses_a", "om_third", &frontier, true));
+        chains.advance_cursor_and_gap("ses_a", "om_third", &body, Some((&frontier, true)), &[]);
         assert!(
             ChainRecords::load(path.clone())
                 .get("ses_a")

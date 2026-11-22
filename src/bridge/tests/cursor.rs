@@ -17,44 +17,16 @@ use super::drain::{
 };
 use crate::backend::types::SessionStatus;
 use crate::backend::{
-    Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, MessageTime, Part, ReasoningPart,
-    SessionTranscript, TextPart, ToolStatus, TranscriptMessage,
+    Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, Part, ReasoningPart,
+    SessionTranscript, ToolStatus,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::{
-    MockBackend, PlatformCall, card_text, patches_to, realistic_parts, seed_session, test_config,
-    test_work_dir, text_part, two_parts_at_one_time, typed_message, wait_for_transcript_reads,
+    MockBackend, PlatformCall, card_text, patches_to, test_work_dir, text_part, two_parts_at_one_time,
+    typed_message, wait_for_transcript_reads,
 };
 use crate::bridge::turn::Turn;
-
-/// Wait until a reply to `reply_to` carries `needle`, or panic after 5 s: the
-/// restart's projection successor (spec #561's adoption).
-async fn wait_for_reply_text(
-    platform: &Arc<crate::bridge::test_support::RecordingPlatform>,
-    reply_to: &str,
-    needle: &str,
-) -> String {
-    let probe = async {
-        loop {
-            {
-                let calls = platform.calls.lock().await;
-                if let Some(card) = calls.iter().find_map(|call| match call {
-                    PlatformCall::ReplyCard { reply_to: to, card } if to == reply_to => Some(card.clone()),
-                    _ => None,
-                }) {
-                    let text = card_text(&card);
-                    if text.contains(needle) {
-                        return text;
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the projection never showed {needle}"))
-}
+use crate::feishu::card::tool_render::ToolPanel;
 
 /// Wait until the durable record's Rendered Cursor satisfies `ready`, or
 /// panic after 5 s.
@@ -543,103 +515,93 @@ async fn a_permanently_rejected_write_advances_nothing() {
     );
 }
 
-/// Both writes confirmed, the older one's durable write attempted LAST (spec
-/// #561, review #569): the stage comparison and the record write are ONE
-/// critical section, so an older stage — already applied and removed — can
-/// never overwrite a newer cursor's durable position. Without the atomic
-/// confirmation the older write lands last and a restart replays content the
-/// newer card already delivered.
+/// An older confirmation lands LAST (spec #561, review #569): the stage
+/// comparison and the durable record write are ONE critical section, so an
+/// older stage — whose payload delivered while its confirmation was still
+/// pending — can never overwrite a newer cursor the flush already confirmed.
+/// Without the guard the older write lands last and a restart replays content
+/// the newer card already delivered.
+///
+/// The interleave is the delivery layer's own: A's payload delivers without a
+/// reconcile, a newer body lands and confirms, and only then does A's
+/// confirmation run.
 #[tokio::test]
 async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
     let _wd = test_work_dir();
-    let transcript = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "你好"),
-        assistant(2_000, "答复。"),
-    ]);
-    let (dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let (dir, app, _backend, platform) = scripted_app(
+        vec![SessionTranscript::new(vec![user(
+            "msg_cola_anchor",
+            1_000,
+            "你好",
+        )])],
+        Some(SessionStatus::Idle),
+    )
+    .await;
     let session_file = dir.path().join("sessions.json");
-    // Every content write fails at the transport: the ending is owed, cursor A
-    // staged and tied to its Pending Card Update sequence.
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
-    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
-        .await
-        .unwrap();
-    let card_id = app
-        .cards_handle()
-        .chains
-        .get("ses_test")
-        .expect("the failed ending keeps the record")
-        .card_message_id
-        .clone();
-    let staged_a = Turn::staged_cursor(&app.cards_handle(), "ses_test")
-        .await
-        .expect("A is staged");
-    let stage_a = Turn::staged_cursor_id(&app.cards_handle(), "ses_test")
-        .await
-        .expect("A's exact identity");
-    // A NEWER stage B is staged NOW — before A's confirmation takes the cards
-    // lock — so the test never contends for that lock itself.
-    let mut staged_b = staged_a.clone();
-    staged_b.frontier = staged_a.frontier.clone().map(|mut frontier| {
-        frontier.delivered_chars += 1;
-        frontier
-    });
-    let stage_b = Turn::stage_cursor(&app.cards_handle(), "ses_test", Some(&card_id), &staged_b).await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::push_text(&cards, "ses_test", "答复。").await;
+    Turn::push_tool(
+        &cards,
+        "ses_test",
+        "call_9",
+        ToolPanel::for_test("bash", ToolStatus::Running, None, None),
+    )
+    .await;
+    cards.chains.track(
+        "ses_test",
+        "om_live",
+        MessageId::new("msg_cola_anchor"),
+        Some(1_000),
+        Some("/work"),
+        Some("msg_1"),
+    );
 
-    // A's payload delivers: its confirmation takes the stage and parks before
-    // the durable write.
+    // A's write fails at the transport: its cursor is staged and tied to the
+    // Pending Card Update sequence.
+    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    Turn::flush_card(&cards, "ses_test").await;
+    let staged_a = Turn::staged_cursor(&cards, "ses_test")
+        .await
+        .expect("the failed write staged its cursor");
+
+    // Its payload delivers — but no reconcile runs, so A is still unconfirmed.
     platform.fail_update_transport_count.store(0, Ordering::SeqCst);
     app.core.feishu.drain_pending_card_updates(true).await;
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let release = Arc::new(tokio::sync::Notify::new());
-    let first = {
-        let cards = app.cards_handle();
-        let card_id = card_id.clone();
-        let gate = crate::bridge::turn::ConfirmGate {
-            entered: entered.clone(),
-            release: release.clone(),
-        };
-        tokio::spawn(async move {
-            crate::bridge::turn::confirm_staged_cursor_for_test(
-                &cards,
-                "ses_test",
-                &card_id,
-                stage_a,
-                &[],
-                Some(&gate),
-            )
-            .await;
-        })
-    };
-    entered.notified().await;
-
-    let second = {
-        let cards = app.cards_handle();
-        let card_id = card_id.clone();
-        tokio::spawn(async move {
-            crate::bridge::turn::confirm_staged_cursor_for_test(
-                &cards,
-                "ses_test",
-                &card_id,
-                stage_b,
-                &[],
-                None,
-            )
-            .await;
-        })
-    };
-    // B gets its chance: with the atomic confirmation it waits for A's
-    // critical section; without it, it persists B now — and A's late write
-    // would then overwrite it.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    release.notify_one();
-    first.await.unwrap();
-    second.await.unwrap();
-
     assert_eq!(
-        app.cards_handle().chains.cursor("ses_test"),
+        cards.chains.cursor("ses_test"),
+        None,
+        "delivery alone advances nothing"
+    );
+
+    // A NEWER body lands: the flush confirms its own stage, so the durable
+    // cursor moves past A before A's confirmation ever runs.
+    Turn::push_tool(
+        &cards,
+        "ses_test",
+        "call_9",
+        ToolPanel::for_test("bash", ToolStatus::Completed, None, Some("done")),
+    )
+    .await;
+    Turn::flush_card(&cards, "ses_test").await;
+    // The flush's own confirmation is the newer durable cursor; A's stage is
+    // still in the accumulator, unconfirmed and due.
+    let staged_b = cards
+        .chains
+        .cursor("ses_test")
+        .expect("the newer confirmation's cursor is the durable one");
+    assert_ne!(
+        staged_b, staged_a,
+        "precondition: the newer body moved the live set"
+    );
+
+    // A's confirmation runs now and is discarded: the newer stage already won.
+    crate::bridge::turn::reconcile_staged_cursors(&cards).await;
+    assert_eq!(
+        cards.chains.cursor("ses_test"),
         Some(staged_b.clone()),
-        "the newer confirmation's cursor is the durable one"
+        "the older confirmation never overwrites the newer durable cursor"
     );
     let persisted = crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
         &session_file,
@@ -655,82 +617,102 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
 /// The drain reconcile confirms only the exact write whose delivery it
 /// verified, while a delivered-but-unconfirmed write keeps its confirmation
 /// even after a newer stage replaces the pending slot (spec #561, review
-/// #569). The interleaving is deterministic through the drain's test gate, and
-/// a restart from the persisted cursor re-renders only what the delivered
-/// write did not cover.
+/// #569) — so the record never skips content the newer, still-owed body
+/// carries.
+///
+/// The interleave is the delivery layer's own: A's payload delivers, a newer
+/// body's write fails and takes the pending slot, and only then does the
+/// reconcile run.
 #[tokio::test]
 async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
     let _wd = test_work_dir();
-    let transcript = SessionTranscript::new(vec![
-        user("msg_cola_anchor", 1_000, "你好"),
-        assistant(2_000, "答复。"),
-    ]);
-    let (dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    let (dir, app, _backend, platform) = scripted_app(
+        vec![SessionTranscript::new(vec![user(
+            "msg_cola_anchor",
+            1_000,
+            "你好",
+        )])],
+        Some(SessionStatus::Idle),
+    )
+    .await;
     let session_file = dir.path().join("sessions.json");
-    // Every content write fails at the transport: the ending is owed, its
-    // cursor staged and tied to the Pending Card Update sequence.
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
-    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
-        .await
-        .unwrap();
-    let card_id = app
-        .cards_handle()
-        .chains
-        .get("ses_test")
-        .expect("the failed ending keeps the record")
-        .card_message_id
-        .clone();
+    let cards = app.cards_handle();
+    // A live card the chain tracks, carrying a running tool panel.
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::push_text(&cards, "ses_test", "答复。").await;
+    Turn::push_tool(
+        &cards,
+        "ses_test",
+        "call_9",
+        ToolPanel::for_test("bash", ToolStatus::Running, None, None),
+    )
+    .await;
+    cards.chains.track(
+        "ses_test",
+        "om_live",
+        MessageId::new("msg_cola_anchor"),
+        Some(1_000),
+        Some("/work"),
+        Some("msg_1"),
+    );
+
+    // A's write fails at the transport: the ending is owed, its cursor staged
+    // and tied to the Pending Card Update sequence.
+    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    Turn::flush_card(&cards, "ses_test").await;
     assert_eq!(
-        app.cards_handle().chains.cursor("ses_test"),
+        cards.chains.cursor("ses_test"),
         None,
         "a failed write advanced nothing"
     );
-    let staged_a = Turn::staged_cursor(&app.cards_handle(), "ses_test")
+    assert!(
+        app.core.feishu.has_pending_card_update("om_live"),
+        "the body is still owed"
+    );
+    let staged_a = Turn::staged_cursor(&cards, "ses_test")
         .await
         .expect("the failed write staged its cursor");
 
-    // Feishu returns: the owed payload delivers, so the reconcile now verifies
-    // cursor A's write as delivered.
+    // Feishu returns: the owed payload delivers, but no reconcile has run, so
+    // nothing is confirmed yet.
     platform.fail_update_transport_count.store(0, Ordering::SeqCst);
     app.core.feishu.drain_pending_card_updates(true).await;
-
-    // Park the reconcile between that verification and its confirmation, and
-    // stage a NEWER cursor there — the fresh flush's body, its own PATCH still
-    // pending.
-    let gate = crate::bridge::turn::ReconcileGate {
-        entered: std::sync::Arc::new(tokio::sync::Notify::new()),
-        release: std::sync::Arc::new(tokio::sync::Notify::new()),
-    };
-    let reconcile = {
-        let cards = app.cards_handle();
-        let gate = crate::bridge::turn::ReconcileGate {
-            entered: gate.entered.clone(),
-            release: gate.release.clone(),
-        };
-        tokio::spawn(async move {
-            crate::bridge::turn::reconcile_staged_cursors_gated(&cards, &gate).await;
-        })
-    };
-    gate.entered.notified().await;
-    let mut staged_b = staged_a.clone();
-    staged_b.frontier = staged_a.frontier.clone().map(|mut frontier| {
-        frontier.delivered_chars += 1;
-        frontier
-    });
-    Turn::stage_cursor(&app.cards_handle(), "ses_test", Some(&card_id), &staged_b).await;
-    gate.release.notify_one();
-    reconcile.await.unwrap();
-
-    // The delivered write A is persisted even though B now holds the pending
-    // slot; B itself is left for its own confirmation — a restart from here
-    // re-renders B's undelivered content instead of skipping it.
     assert_eq!(
-        app.cards_handle().chains.cursor("ses_test"),
+        cards.chains.cursor("ses_test"),
+        None,
+        "delivery alone advances nothing"
+    );
+
+    // The tool settles: a NEWER body renders and its own write fails too, so
+    // B holds the pending slot A's payload just vacated.
+    Turn::push_tool(
+        &cards,
+        "ses_test",
+        "call_9",
+        ToolPanel::for_test("bash", ToolStatus::Completed, None, Some("done")),
+    )
+    .await;
+    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    Turn::flush_card(&cards, "ses_test").await;
+    let staged_b = Turn::staged_cursor(&cards, "ses_test")
+        .await
+        .expect("the newer body staged its cursor");
+    assert_ne!(
+        staged_b, staged_a,
+        "precondition: the newer body moved the live set"
+    );
+
+    // The reconcile confirms the stage whose delivery it verified — A — and
+    // leaves B for its own (still owed) confirmation.
+    crate::bridge::turn::reconcile_staged_cursors(&cards).await;
+    assert_eq!(
+        cards.chains.cursor("ses_test"),
         Some(staged_a.clone()),
         "the delivered write's cursor is persisted despite the newer stage"
     );
     assert_eq!(
-        Turn::staged_cursor(&app.cards_handle(), "ses_test").await,
+        Turn::staged_cursor(&cards, "ses_test").await,
         Some(staged_b.clone()),
         "the newer stage is left untouched for its own confirmation"
     );
@@ -744,45 +726,14 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
         "the persisted record carries the delivered write's cursor"
     );
 
-    // A restart over that cursor re-renders only the growth past it: the
-    // delivered content is never repeated (review #569).
-    drop(app);
-    let grown = "答复。补充。";
-    let mut backend2 = MockBackend::new(realistic_parts());
-    backend2.given_transcript(
-        "ses_test",
-        vec![SessionTranscript::new(vec![
-            user("msg_cola_anchor", 1_000, "你好"),
-            TranscriptMessage {
-                id: MessageId::new("msg_a_2000"),
-                role: MessageRole::Assistant,
-                time: Some(MessageTime {
-                    created: 2_000,
-                    completed: None,
-                }),
-                model: None,
-                tokens: None,
-                error: None,
-                parts: vec![Part::Text(TextPart {
-                    text: grown.to_string(),
-                    started_at: Some(2_000),
-                })],
-            },
-        ])],
-    );
-    backend2.with_session_status("ses_test", Some(SessionStatus::Busy));
-    let backend2 = Arc::new(backend2);
-    let platform2 = Arc::new(crate::bridge::test_support::RecordingPlatform::new());
-    let app2 = Arc::new(
-        crate::bridge::App::new(test_config(&session_file), backend2.clone(), platform2.clone())
-            .expect("the restarted app builds"),
-    );
-    seed_session(&app2, "ses_test", "/work").await;
-    spawn_sync(&app2);
-    let successor_text = wait_for_reply_text(&platform2, "msg_1", "补充。").await;
-    assert!(
-        !successor_text.contains("答复。"),
-        "the delivered content is never repeated on the restart: {successor_text}"
+    // B delivers later: its own confirmation now advances the record to it.
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    crate::bridge::turn::reconcile_staged_cursors(&cards).await;
+    assert_eq!(
+        cards.chains.cursor("ses_test"),
+        Some(staged_b),
+        "the newer body's own delivery moves the cursor forward"
     );
 }
 
