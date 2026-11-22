@@ -49,9 +49,11 @@ pub(crate) enum Target {
     DocPath(String),
     /// An `src/…:start-end` pin (`end` equals `start` for a single line).
     SourcePin { path: String, start: usize, end: usize },
-    /// A pin whose line number does not fit the platform's `usize`; carried as
-    /// written so the finding quotes the citation.
-    InvalidPin { text: String },
+    /// A pin that cannot name a source: an `usize` overflow or a path that
+    /// climbs out of `src/`. Carried as written so the finding quotes it.
+    InvalidPin { text: String, reason: &'static str },
+    /// A doc path that climbs out of `docs/` with a `.`/`..` component.
+    InvalidPath { text: String },
 }
 
 impl Target {
@@ -61,7 +63,7 @@ impl Target {
             Self::DocPath(path) => path.clone(),
             Self::SourcePin { path, start, end } if end == start => format!("{path}:{start}"),
             Self::SourcePin { path, start, end } => format!("{path}:{start}-{end}"),
-            Self::InvalidPin { text } => text.clone(),
+            Self::InvalidPin { text, .. } | Self::InvalidPath { text } => text.clone(),
         }
     }
 
@@ -167,7 +169,14 @@ fn doc_path_targets(line: &str, out: &mut Vec<Target>) {
             // The slice already ends at the first non-path character, so only
             // a sentence's full stop can still be attached to it.
             let path = line[start..start + prefix.len() + length].trim_end_matches('.');
-            if path.len() > prefix.len() {
+            if path.len() <= prefix.len() {
+                continue;
+            }
+            if has_traversal(path) {
+                out.push(Target::InvalidPath {
+                    text: path.to_string(),
+                });
+            } else {
                 out.push(Target::DocPath(path.to_string()));
             }
         }
@@ -195,6 +204,7 @@ fn source_pin_targets(line: &str, out: &mut Vec<Target>) {
         let Ok(start_line) = digits.parse::<usize>() else {
             out.push(Target::InvalidPin {
                 text: format!("{path}:{digits}"),
+                reason: "invalid line number",
             });
             continue;
         };
@@ -209,11 +219,24 @@ fn source_pin_targets(line: &str, out: &mut Vec<Target>) {
                     Err(_) => {
                         out.push(Target::InvalidPin {
                             text: format!("{path}:{digits}-{end_digits}"),
+                            reason: "invalid line number",
                         });
                         continue;
                     }
                 }
             }
+        }
+        if has_traversal(path) {
+            let text = if end_line == start_line {
+                format!("{path}:{start_line}")
+            } else {
+                format!("{path}:{start_line}-{end_line}")
+            };
+            out.push(Target::InvalidPin {
+                text,
+                reason: "path escapes src/",
+            });
+            continue;
         }
         out.push(Target::SourcePin {
             path: path.to_string(),
@@ -292,6 +315,12 @@ fn is_preceding_path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-')
 }
 
+/// A `.` or `..` component climbs out of the tree the citation claims to name.
+fn has_traversal(path: &str) -> bool {
+    path.split('/')
+        .any(|component| component == "." || component == "..")
+}
+
 /// Count the `Amended/Superseded/Retired/Reopened/Ratified by ADR-NNNN` banners
 /// in one ADR. A dated amendment ("Amended 2026-10-01 (#470)") is a banner too
 /// in the review sense, but it is not the `by ADR` form ADR-0110 counts.
@@ -307,7 +336,14 @@ pub(crate) fn banner_count(content: &str) -> usize {
                 return false;
             };
             let label = &rest[..end];
-            BANNER_VERBS.iter().any(|verb| label.starts_with(verb)) && label.contains("by ADR-")
+            if !BANNER_VERBS.iter().any(|verb| label.starts_with(verb)) {
+                return false;
+            }
+            // `by ADR-NNNN` must carry a four-digit number; a malformed label is
+            // not the banner form ADR-0110 counts.
+            label.split_once("by ADR-").is_some_and(|(_, tail)| {
+                tail.len() >= 4 && tail[..4].bytes().all(|byte| byte.is_ascii_digit())
+            })
         })
         .count()
 }
@@ -420,7 +456,8 @@ fn dangling(
     let mut line_counts: BTreeMap<String, Option<usize>> = BTreeMap::new();
     for (line, target) in targets {
         let reason = match target {
-            Target::InvalidPin { .. } => Some("invalid line number".to_string()),
+            Target::InvalidPin { reason, .. } => Some(reason.to_string()),
+            Target::InvalidPath { .. } => Some("path escapes docs/".to_string()),
             Target::Adr(number) if !adrs.contains_key(number) => Some("no such ADR".to_string()),
             Target::Adr(_) => None,
             Target::DocPath(doc) if !root.join(doc).is_file() => Some("no such file".to_string()),
@@ -752,6 +789,32 @@ mod tests {
     }
 
     #[test]
+    fn a_pin_that_climbs_out_of_src_fails() {
+        let tree = Tree::new("pin-traversal");
+        tree.file("docs/note.md", "`src/../CONTRIBUTING.md:1`\n");
+        let findings = tree.check().findings;
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].to_string().contains("path escapes src/"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
+    fn a_doc_path_that_climbs_out_of_docs_fails() {
+        let tree = Tree::new("path-traversal");
+        tree.file("docs/note.md", "`docs/research/../../CONTRIBUTING.md`\n");
+        let findings = tree.check().findings;
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0].to_string().contains("path escapes docs/"),
+            "{}",
+            findings[0]
+        );
+    }
+
+    #[test]
     fn a_line_number_too_large_to_parse_fails() {
         let tree = Tree::new("pin-start-overflow");
         tree.file("src/small.rs", "one\n");
@@ -843,6 +906,12 @@ mod tests {
                        > **Amended by the 2026-11-04 update below**: z\n\
                        > **Partly superseded by the 2026-09-26 update**: w\n";
         assert_eq!(banner_count(content), 1);
+    }
+
+    #[test]
+    fn a_malformed_by_adr_label_is_not_a_banner() {
+        let content = "> **Amended by ADR-**: x\n> **Amended by ADR-NNNN**: y\n";
+        assert_eq!(banner_count(content), 0);
     }
 
     #[test]
