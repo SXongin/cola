@@ -18,11 +18,14 @@
 //! }
 //! ```
 //!
-//! The rule a verb follows: it reads its own payload keys, never re-derives the
-//! deadline (the dispatch owns it), never re-reads capabilities (it declares a
-//! [`Gate`] instead), and returns the click's [`CardActionResult`] or `None`
-//! when the click must go unanswered. Adding a verb is one module plus one
-//! [`VERBS`] entry — the dispatch is never edited.
+//! The rule a verb follows: it reads its own payload keys, mints no clock (the
+//! dispatch owns `callback_started`), and never re-reads capabilities (it
+//! declares a [`Gate`]). A verb bounding its own surface read against the **ack**
+//! budget derives that from `callback_started`; the dispatch's `deadline` is
+//! the tighter store budget every write settles on (ADR-0089). It returns the
+//! click's [`CardActionResult`] or `None` when the click must go unanswered.
+//! Adding a verb is one module plus one [`VERBS`] entry — the dispatch is never
+//! edited.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -62,14 +65,9 @@ pub(crate) type Run = for<'a> fn(&'a Arc<App>, &'a serde_json::Value, Instant, I
 pub(crate) enum Gate {
     /// Every attachment has this surface.
     Always,
-    /// The Backend reads session/turn diffs. A card persisted under a client
-    /// that had the surface may be clicked after a reattach: omit the read,
-    /// don't guess it.
+    /// The Backend reads session/turn diffs.
     Diffs,
-    /// The Backend can select an agent (`/agent`): an agent list plus a
-    /// per-session override. A picker card persisted under a client that had
-    /// the surface may be clicked after a reattach: refuse the pick, don't
-    /// re-read the capability inside the verb.
+    /// The Backend can select an agent (`/agent`) with a per-session override.
     Modes,
 }
 
@@ -131,9 +129,9 @@ pub(crate) const VERBS: &[Entry] = &[
         gate: Gate::Always,
         run: cleanup::run,
     },
-    // The mode/configuration group (#1121). `agent`/`agent_clear` are the only
-    // verbs whose surface is capability-gated: the dispatch applies
-    // `Gate::Modes` before the body, so neither module re-reads it.
+    // The mode/configuration group (#1121). `agent`/`agent_clear` need the
+    // Backend's `modes` capability: the dispatch applies `Gate::Modes` before
+    // the body, so neither module re-reads it.
     Entry {
         action: "agent",
         op: None,
