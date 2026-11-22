@@ -18,6 +18,7 @@
 //! doc cites it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -108,13 +109,15 @@ pub(crate) struct Report {
 }
 
 /// Extract every citation in `content`, one entry per line, deduplicated within
-/// a line so a sentence naming the same target twice is reported once.
-pub(crate) fn targets(content: &str) -> Vec<(usize, Target)> {
+/// a line so a sentence naming the same target twice is reported once. `root` is
+/// needed because a doc path is resolved against the filesystem (see
+/// [`resolve_doc_path`]).
+pub(crate) fn targets(content: &str, root: &Path) -> Vec<(usize, Target)> {
     let mut found = Vec::new();
     for (index, line) in content.lines().enumerate() {
         let mut targets = Vec::new();
         adr_targets(line, &mut targets);
-        doc_path_targets(line, &mut targets);
+        doc_path_targets(line, root, &mut targets);
         source_pin_targets(line, &mut targets);
         targets.sort();
         targets.dedup();
@@ -153,34 +156,65 @@ fn adr_targets(line: &str, out: &mut Vec<Target>) {
     }
 }
 
-/// `docs/research/…` and `docs/reference/…` paths, with a sentence's full stop
-/// and any `#anchor` stripped.
-fn doc_path_targets(line: &str, out: &mut Vec<Target>) {
+/// `docs/research/…` and `docs/reference/…` paths.
+fn doc_path_targets(line: &str, root: &Path, out: &mut Vec<Target>) {
     for prefix in ["docs/research/", "docs/reference/"] {
         for (start, _) in line.match_indices(prefix) {
             if start > 0 && is_preceding_path_char(previous_char(line, start)) {
                 continue;
             }
-            let rest = &line[start + prefix.len()..];
-            let length = rest.find(|c: char| !is_path_char(c)).unwrap_or(rest.len());
-            if length == 0 {
-                continue;
-            }
-            // The slice already ends at the first non-path character, so only
-            // a sentence's full stop can still be attached to it.
-            let path = line[start..start + prefix.len() + length].trim_end_matches('.');
+            let path = resolve_doc_path(line, start, prefix.len(), root);
             if path.len() <= prefix.len() {
                 continue;
             }
-            if has_traversal(path) {
-                out.push(Target::InvalidPath {
-                    text: path.to_string(),
-                });
+            if has_traversal(&path) {
+                out.push(Target::InvalidPath { text: path });
             } else {
-                out.push(Target::DocPath(path.to_string()));
+                out.push(Target::DocPath(path));
             }
         }
     }
+}
+
+/// The cited doc path: the longest prefix of the whitespace-delimited run that
+/// exists as a file.
+///
+/// A character allow-list cannot decide where a path ends — `!`, `*` and a
+/// combining mark are all legal name characters — so the filesystem decides.
+/// When nothing exists, fall back to the delimiter token so the dangling
+/// citation is still reported rather than silently dropped.
+fn resolve_doc_path(line: &str, start: usize, prefix_len: usize, root: &Path) -> String {
+    let rest = &line[start..];
+    let run_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let mut resolved: Option<&str> = None;
+    for end in prefix_len..=run_len {
+        if !rest.is_char_boundary(end) {
+            continue;
+        }
+        let candidate = &rest[..end];
+        // A shorter existing prefix is the citation only when the character
+        // after it is prose, not a path continuation: `x.md中` is `x.md`, but a
+        // missing `x.md.bak` must not resolve to the existing `x.md`.
+        let followed_by_prose =
+            end == run_len || !is_preceding_path_char(rest[end..].chars().next().unwrap_or(' '));
+        if candidate.len() > prefix_len && followed_by_prose && root.join(candidate).is_file() {
+            resolved = Some(candidate);
+        }
+    }
+    if let Some(path) = resolved {
+        return path.to_string();
+    }
+    // Nothing exists: report the whitespace-delimited token with an anchor and
+    // the sentence punctuation a citation can butt against removed.
+    rest[..run_len]
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([
+            '.', ',', ';', ')', ']', '>', '"', '\'', '`', '…', '。', '，', '、', '；', '：', '）', '」',
+            '』', '】', '》', '”', '’',
+        ])
+        .to_string()
 }
 
 /// `src/…:line` and `src/…:start-end` pins. A bare `src/…` path is not a pin.
@@ -190,12 +224,23 @@ fn source_pin_targets(line: &str, out: &mut Vec<Target>) {
             continue;
         }
         let rest = &line[start..];
-        let end = rest.find(|c: char| !is_path_char(c)).unwrap_or(rest.len());
-        let path = &rest[..end];
-        if path == "src/" || !rest[end..].starts_with(':') {
+        let run_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let run = &rest[..run_len];
+        // `:` anchors the pin, so the path is everything before the first
+        // colon followed by a digit — legal name characters such as `!` stay in
+        // it without a character allow-list deciding where it ends.
+        let Some(colon) = run
+            .char_indices()
+            .find(|(index, c)| *c == ':' && run[index + 1..].starts_with(|d: char| d.is_ascii_digit()))
+            .map(|(index, _)| index)
+        else {
+            continue;
+        };
+        let path = &run[..colon];
+        if path == "src/" {
             continue;
         }
-        let after = &rest[end + 1..];
+        let after = &run[colon + 1..];
         let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
         if digits.is_empty() {
             // `src/x.rs:` with no number is not a pin.
@@ -250,64 +295,6 @@ fn previous_char(line: &str, index: usize) -> char {
     line[..index].chars().next_back().unwrap_or(' ')
 }
 
-/// Characters that continue a repository path: anything but whitespace, control
-/// characters and the Markdown/prose delimiters that can follow a citation.
-///
-/// An allow-list cannot work here: a decomposed name carries a combining mark
-/// (`cafe\u{0301}.md`) that `char::is_alphanumeric` rejects, and a Chinese name
-/// carries ideographs a byte-oriented rule would miss. `#` ends a path so an
-/// anchor stays out of it; `:` ends a pin's path; the CJK punctuation marks are
-/// how a sentence delimits a citation without spaces.
-fn is_path_char(c: char) -> bool {
-    !c.is_whitespace()
-        && !c.is_control()
-        && !matches!(
-            c,
-            '#' | '`'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '<'
-                | '>'
-                | '"'
-                | '\''
-                | ','
-                | ';'
-                | ':'
-                | '|'
-                | '*'
-                | '?'
-                | '!'
-                | '…'
-                | '，'
-                | '。'
-                | '、'
-                | '：'
-                | '；'
-                | '！'
-                | '？'
-                | '「'
-                | '」'
-                | '『'
-                | '』'
-                | '（'
-                | '）'
-                | '【'
-                | '】'
-                | '《'
-                | '》'
-                | '“'
-                | '”'
-                | '‘'
-                | '’'
-                | '—'
-                | '–'
-        )
-}
-
 /// Characters that, immediately before `src/`, `docs/…` or `ADR-`, mean the
 /// token is part of a longer path or word. Deliberately ASCII-only: Chinese
 /// prose has no spaces, so `见ADR-0042` must still be a citation.
@@ -343,9 +330,14 @@ pub(crate) fn banner_count(content: &str) -> usize {
             // not the banner form ADR-0110 counts.
             label.split_once("by ADR-").is_some_and(|(_, tail)| {
                 // `str::get` refuses a slice that is not a char boundary, so a
-                // malformed Unicode label is a non-banner, not a panic.
+                // malformed Unicode label is a non-banner, not a panic. The
+                // fifth character must not be a digit: `ADR-00012` is not
+                // `ADR-NNNN`.
                 tail.get(..4)
                     .is_some_and(|prefix| prefix.bytes().all(|byte| byte.is_ascii_digit()))
+                    && !tail
+                        .get(4..)
+                        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
             })
         })
         .count()
@@ -535,7 +527,7 @@ pub(crate) fn check_tree(root: &Path) -> Result<Report, String> {
     };
     for source in &sources {
         let historical = source.path.starts_with(HISTORICAL_PINS_PREFIX);
-        let targets: Vec<(usize, Target)> = targets(&source.content)
+        let targets: Vec<(usize, Target)> = targets(&source.content, root)
             .into_iter()
             .filter(|(_, target)| !(historical && target.is_source_pin()))
             .collect();
@@ -556,23 +548,29 @@ pub(crate) fn run() {
 /// The command body and its exit status, without the process exit: a dangling
 /// citation is a failure, a banner warning is not.
 fn run_on(root: &Path) -> i32 {
+    run_with(root, &mut std::io::stderr())
+}
+
+/// [`run_on`] writing to `out`, so the tests can assert what the command prints.
+fn run_with(root: &Path, out: &mut impl Write) -> i32 {
     let report = match check_tree(root) {
         Ok(report) => report,
         Err(error) => {
-            eprintln!("{error}");
+            let _ = writeln!(out, "{error}");
             return 1;
         }
     };
     for warning in &report.warnings {
-        eprintln!("{warning}");
+        let _ = writeln!(out, "{warning}");
     }
     if report.findings.is_empty() {
         return 0;
     }
     for finding in &report.findings {
-        eprintln!("{finding}");
+        let _ = writeln!(out, "{finding}");
     }
-    eprintln!(
+    let _ = writeln!(
+        out,
         "{} dangling doc citation(s) — fix the reference or delete it; re-run \
          `cargo xtask check-doc-links`",
         report.findings.len()
@@ -583,6 +581,12 @@ fn run_on(root: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extract with no filesystem behind it, so doc paths use their fallback
+    /// token; resolution itself is exercised through [`Tree`].
+    fn extract(line: &str) -> Vec<(usize, Target)> {
+        targets(line, Path::new("/nonexistent-cola-doc-links"))
+    }
 
     /// A throwaway repository tree; each test gets its own directory.
     struct Tree {
@@ -623,7 +627,7 @@ mod tests {
     #[test]
     fn every_citation_kind_is_extracted() {
         let line = "See ADR-0042, `docs/research/x/y.md`, and `src/bridge/core.rs:47-52`.";
-        let targets: Vec<Target> = targets(line).into_iter().map(|(_, t)| t).collect();
+        let targets: Vec<Target> = extract(line).into_iter().map(|(_, t)| t).collect();
         assert_eq!(
             targets,
             vec![
@@ -641,7 +645,7 @@ mod tests {
     #[test]
     fn markdown_punctuation_and_anchors_are_not_part_of_a_path() {
         let line = "see docs/reference/api.md#section, and docs/research/a/b.md).";
-        let paths: Vec<String> = targets(line)
+        let paths: Vec<String> = extract(line)
             .into_iter()
             .filter_map(|(_, target)| match target {
                 Target::DocPath(path) => Some(path),
@@ -659,12 +663,12 @@ mod tests {
 
     #[test]
     fn a_bare_source_path_is_not_a_pin() {
-        assert!(targets("`src/bridge/core.rs`").is_empty());
+        assert!(extract("`src/bridge/core.rs`").is_empty());
     }
 
     #[test]
     fn a_shorthand_adr_list_resolves_every_number() {
-        let targets: Vec<Target> = targets("ADR-0105/0106/0107")
+        let targets: Vec<Target> = extract("ADR-0105/0106/0107")
             .into_iter()
             .map(|(_, target)| target)
             .collect();
@@ -680,30 +684,30 @@ mod tests {
 
     #[test]
     fn a_five_digit_number_is_not_an_adr_citation() {
-        assert!(targets("ADR-00012").is_empty());
+        assert!(extract("ADR-00012").is_empty());
     }
 
     #[test]
     fn a_host_repository_path_is_not_a_cola_pin() {
-        assert!(targets("packages/core/src/session.ts:75-82").is_empty());
+        assert!(extract("packages/core/src/session.ts:75-82").is_empty());
     }
 
     #[test]
     fn a_degenerate_src_prefix_is_not_a_pin() {
-        assert!(targets("`src/:12`").is_empty());
+        assert!(extract("`src/:12`").is_empty());
     }
 
     #[test]
     fn a_non_adr_continuation_ends_the_shorthand_run() {
         for line in ["ADR-0105/x", "ADR-0105/01062"] {
-            let targets: Vec<Target> = targets(line).into_iter().map(|(_, target)| target).collect();
+            let targets: Vec<Target> = extract(line).into_iter().map(|(_, target)| target).collect();
             assert_eq!(targets, vec![Target::Adr("0105".to_string())], "{line}");
         }
     }
 
     #[test]
     fn a_trailing_hyphen_without_a_range_end_is_a_single_line_pin() {
-        let targets: Vec<Target> = targets("`src/a.rs:12-`")
+        let targets: Vec<Target> = extract("`src/a.rs:12-`")
             .into_iter()
             .map(|(_, target)| target)
             .collect();
@@ -894,6 +898,27 @@ mod tests {
     /// be extracted.
     /// A decomposed name carries a combining mark (`cafe\u{0301}.md`), which an
     /// alphanumeric allow-list would truncate and then call missing.
+    /// `!` (and any other legal name character) is inside the path: the
+    /// filesystem decides where an existing citation ends.
+    #[test]
+    fn a_path_with_a_bang_resolves() {
+        let tree = Tree::new("bang-path");
+        tree.file("docs/reference/api!.md", "# api\n");
+        tree.file("src/thing!.rs", "one\n");
+        tree.file("docs/note.md", "`docs/reference/api!.md` and `src/thing!.rs:1`\n");
+        assert_eq!(tree.check().findings.len(), 0);
+    }
+
+    /// A missing file whose name extends an existing one must not resolve to
+    /// the shorter file: the next character is still a path continuation.
+    #[test]
+    fn a_missing_path_that_extends_an_existing_one_fails() {
+        let tree = Tree::new("extended-path");
+        tree.file("docs/reference/api.md", "# api\n");
+        tree.file("docs/note.md", "`docs/reference/api.md.bak`\n");
+        assert_eq!(tree.check().findings.len(), 1);
+    }
+
     #[test]
     fn a_combining_mark_in_a_path_resolves() {
         let tree = Tree::new("combining-mark");
@@ -904,7 +929,7 @@ mod tests {
 
     #[test]
     fn a_citation_after_chinese_prose_is_extracted() {
-        let targets: Vec<Target> = targets("见ADR-0042")
+        let targets: Vec<Target> = extract("见ADR-0042")
             .into_iter()
             .map(|(_, target)| target)
             .collect();
@@ -945,6 +970,11 @@ mod tests {
     fn a_malformed_by_adr_label_is_not_a_banner() {
         let content = "> **Amended by ADR-**: x\n> **Amended by ADR-NNNN**: y\n";
         assert_eq!(banner_count(content), 0);
+    }
+
+    #[test]
+    fn a_five_digit_banner_number_is_not_a_banner() {
+        assert_eq!(banner_count("> **Amended by ADR-00012**: x\n"), 0);
     }
 
     /// The four-digit check must not slice inside a multi-byte character.
@@ -1059,27 +1089,37 @@ mod tests {
     fn a_clean_tree_runs_to_success() {
         let tree = Tree::new("exit-clean");
         tree.file("docs/note.md", "ADR-0001\n");
-        assert_eq!(run_on(&tree.root), 0);
+        let mut output = Vec::new();
+        assert_eq!(run_with(&tree.root, &mut output), 0);
+        assert!(output.is_empty());
     }
 
     #[test]
     fn a_dangling_citation_runs_to_failure() {
         let tree = Tree::new("exit-failure");
         tree.file("docs/note.md", "ADR-9999\n");
-        assert_eq!(run_on(&tree.root), 1);
+        let mut output = Vec::new();
+        assert_eq!(run_with(&tree.root, &mut output), 1);
+        let text = String::from_utf8(output).expect("the report is UTF-8");
+        assert!(text.contains("ADR-9999"), "{text}");
     }
 
     /// A banner warning is printed but never turns a clean tree into a failure.
     #[test]
-    fn a_banner_warning_runs_to_success() {
+    fn a_banner_warning_is_printed_and_runs_to_success() {
         let tree = Tree::new("exit-warning");
         tree.file(
             "docs/adr/0002-banners.md",
             "> **Amended by ADR-0001**: a\n> **Reopened by ADR-0001**: b\n\
              > **Retired by ADR-0001**: c\n",
         );
-        assert_eq!(run_on(&tree.root), 0);
-        assert_eq!(tree.check().warnings.len(), 1);
+        let mut output = Vec::new();
+        assert_eq!(run_with(&tree.root, &mut output), 0);
+        let text = String::from_utf8(output).expect("the report is UTF-8");
+        assert!(
+            text.contains("warning: docs/adr/0002-banners.md: 3 amendment banners"),
+            "{text}"
+        );
     }
 
     /// The acceptance criterion's "passes on the tree", with a plausibility
