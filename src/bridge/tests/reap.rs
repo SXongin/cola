@@ -6025,6 +6025,109 @@ async fn a_restart_successor_carries_the_cleanup_button_and_the_click_works() {
     );
 }
 
+/// Characterization for the CardAction seam (#1119): the Waiting card's
+/// 「清理待确认任务」 click is the `{action, session_id}` pair and nothing else,
+/// and that exact payload acks with the cleaning toast and no card. The pair is
+/// pinned so moving the verb's body behind the seam (#1156) cannot change what
+/// the button sends or what the Host sees.
+#[tokio::test]
+async fn the_cleanup_click_carries_two_keys_and_acks_with_the_cleaning_toast() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+    let delivered = "已经写了一半。";
+    seed_cursor_record(
+        &session_file,
+        "om_frozen",
+        "msg_cola_anchor",
+        Some(1_000),
+        Some("/work"),
+        Some(text_frontier(delivered)),
+        &[],
+    );
+    let waiting = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下 CI"),
+        assistant(2_000, delivered),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![BackgroundTask {
+        tool: ToolIdentity {
+            name: "subagent".into(),
+            call_id: "call_sub".into(),
+        },
+        shell_id: None,
+        child_id: Some("ses_child".into()),
+        started_at: Some(2_100),
+    }]);
+    let (app, platform, backend) =
+        restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
+    platform.given_card_view("om_frozen", realistic_card_view());
+
+    spawn_sync(&app);
+    let (successor, _) = wait_for_projection(&platform, "om_frozen").await;
+    assert_eq!(card_header(&successor), "⏳ 等待后台任务");
+
+    // The runtime cannot confirm the child: the successor's next pass renders
+    // the unconfirmed row and the cleanup button through the same card build.
+    backend.task_runtime.lock().unwrap().children = vec![("ses_child".into(), ChildRuntime::Inactive)];
+    wait_for_update(&platform, "msg_reply", "the unconfirmed successor", |card| {
+        card_text(card).contains("⚠️ 状态待确认")
+    })
+    .await;
+    let marked = last_update_of(&platform, "msg_reply").await.unwrap();
+    let button = card_tags(&marked, "button")
+        .into_iter()
+        .find(|button| button["value"]["action"] == "cleanup")
+        .expect("the unconfirmed successor offers the cleanup button");
+    let mut keys: Vec<&str> = button["value"]
+        .as_object()
+        .expect("the button carries an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["action", "session_id"],
+        "the cleanup click carries exactly these keys: {}",
+        button["value"]
+    );
+    assert_eq!(button["value"]["action"], "cleanup");
+    assert_eq!(button["value"]["session_id"], "ses_test");
+
+    let ack = app
+        .host_action(button["value"].clone())
+        .await
+        .expect("the cleanup click acks on the successor");
+    assert_eq!(
+        ack.toast.as_deref(),
+        Some("正在清理..."),
+        "the cleanup click acks with the cleaning toast"
+    );
+    assert!(
+        ack.card.is_none(),
+        "the cleanup ack must not rewrite the clicked card"
+    );
+}
+
+/// Characterization for the CardAction seam (#1119): a cleanup click that
+/// names no session is refused with NO result — not a toast — so the seam
+/// cannot answer a stale card on the verb's behalf.
+#[tokio::test]
+async fn the_cleanup_click_without_a_session_is_not_answered() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    let ack = app.host_action(serde_json::json!({ "action": "cleanup" })).await;
+    assert!(
+        ack.is_none(),
+        "a cleanup click naming no session is refused with no result"
+    );
+}
+
 /// The ended twin of the empty-delta rule (issue #583): a cursor covering the
 /// whole read over an ENDED run still drops its armed successor and PATCHes
 /// the old card's ending in place — content decides only the terminal case.
