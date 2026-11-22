@@ -6725,3 +6725,337 @@ async fn a_failed_freeze_past_the_cap_still_restores_the_run_card() {
         .expect("the killed run ends")
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// #1123 — the terminal card's four ops behind the CardAction seam. One
+// characterization test per op pins the exact payment a rendered button carries
+// and the exact CardActionResult a click returns, so moving the bodies out of
+// `handler.rs` cannot change either.
+// ---------------------------------------------------------------------------
+
+/// A live Terminal Card's control buttons (`kill`/`continue`) carry exactly the
+/// five routing keys. A click on the Chat/Topic's current run answers its
+/// accepted toast; a stale run id and any other `op` answer the default arm's
+/// refusals. All of them are toast-only — the run loop owns the card.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_terminal_control_clicks_carry_five_keys_and_ack_with_their_results() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms
+        .store(10, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 30", key, "msg_run", ConversationKind::P2p).await;
+        }
+    });
+    wait_for_replied_cards(&platform, 1).await;
+
+    let card = live_card_with(&platform, "kill").await;
+    let kill = button_value(&card, "kill").expect("the live card carries 终止");
+    assert_eq!(
+        value_keys(&kill),
+        ["action", "chat_id", "op", "run_id", "thread_id"],
+        "the 终止 click carries exactly these keys: {kill}"
+    );
+    assert_eq!(kill["action"], "terminal");
+    assert_eq!(kill["op"], "kill");
+    assert_eq!(kill["chat_id"], "chat_1");
+    assert_eq!(kill["thread_id"], "chat_1");
+    assert!(
+        kill["run_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the control names the run it was rendered for: {kill}"
+    );
+
+    let mut stale = kill.clone();
+    stale["run_id"] = serde_json::json!("not-the-current-run");
+    let stale_ack = app
+        .host_action(stale)
+        .await
+        .expect("a stale control is refused with a toast");
+    assert!(stale_ack.card.is_none(), "a refusal writes no card");
+    assert_eq!(stale_ack.toast.as_deref(), Some("这张终端卡片的操作已过期。"));
+
+    let unknown = serde_json::json!({
+        "action": "terminal",
+        "op": "bogus",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "run_id": kill["run_id"],
+    });
+    let unknown_ack = app
+        .host_action(unknown)
+        .await
+        .expect("any other op falls through to the default arm's refusal");
+    assert!(unknown_ack.card.is_none());
+    assert_eq!(unknown_ack.toast.as_deref(), Some("未知的终端操作。"));
+
+    let ack = app
+        .host_action(kill)
+        .await
+        .expect("the current run's 终止 is accepted");
+    assert!(ack.card.is_none(), "the run loop owns the card");
+    assert_eq!(ack.toast.as_deref(), Some("⏹ 正在终止…"));
+
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+}
+
+/// A settled Terminal Card's 「↻ 重跑」 button carries exactly the five routing
+/// keys (the record, not the payload, holds the command); a stale run id is
+/// refused without starting anything, and the current one acks before the
+/// spawned rerun runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_terminal_rerun_click_carries_five_keys_and_acks_or_refuses() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'rerun-contract-marker\\n'",
+        key,
+        "msg_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    let settled = settled_card(&platform).await;
+    let rerun = button_value(&settled, "rerun").expect("a settled card carries 重跑");
+    assert_eq!(
+        value_keys(&rerun),
+        ["action", "chat_id", "op", "run_id", "thread_id"],
+        "the 重跑 click carries exactly these keys: {rerun}"
+    );
+    assert_eq!(rerun["action"], "terminal");
+    assert_eq!(rerun["op"], "rerun");
+    assert_eq!(rerun["chat_id"], "chat_1");
+    assert!(
+        rerun["run_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "the rerun names the run the record check compares: {rerun}"
+    );
+
+    let mut stale = rerun.clone();
+    stale["run_id"] = serde_json::json!("not-the-current-run");
+    let stale_ack = app
+        .host_action_on_message(stale, "msg_reply")
+        .await
+        .expect("a stale rerun is refused with a toast");
+    assert!(stale_ack.card.is_none(), "a refusal writes no card");
+    assert_eq!(stale_ack.toast.as_deref(), Some("这张终端卡片的操作已过期。"));
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "a stale rerun starts nothing"
+    );
+
+    let ack = app
+        .host_action_on_message(rerun, "msg_reply")
+        .await
+        .expect("the rerun is acknowledged");
+    assert!(ack.card.is_none(), "the rerun is spawned off the ack");
+    assert_eq!(ack.toast.as_deref(), Some("↻ 正在重跑…"));
+
+    // The spawned rerun posts its own card under the card it was clicked on;
+    // waiting for it keeps no live run outliving the test.
+    wait_for_replied_cards(&platform, 2).await;
+}
+
+/// A settled Terminal Card's 「📄 完整输出」 button carries the eight routing
+/// keys (and seven on `terminal_card`). The click acks immediately — the
+/// upload never runs inside the callback — and the spawned transfer PATCHes the
+/// clicked card with its outcome. A payload with no log path is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_full_output_click_carries_eight_keys_and_replaces_the_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "full-output-contract-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key,
+        "msg_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    let payload = full_output_payload(&platform).await;
+    assert_eq!(
+        value_keys(&payload),
+        [
+            "action",
+            "chat_id",
+            "chat_type",
+            "op",
+            "path",
+            "run_id",
+            "terminal_card",
+            "thread_id"
+        ],
+        "the 完整输出 click carries exactly these keys: {payload}"
+    );
+    assert_eq!(
+        value_keys(&payload["terminal_card"]),
+        [
+            "command",
+            "cwd",
+            "elapsed_ms",
+            "exit_code",
+            "lost",
+            "output_over_limit",
+            "run_id"
+        ],
+        "the card's render inputs are exactly these keys: {}",
+        payload["terminal_card"]
+    );
+    assert_eq!(payload["action"], "terminal");
+    assert_eq!(payload["op"], "full_output");
+
+    let ack = app
+        .host_action_on_message(payload.clone(), "msg_reply")
+        .await
+        .expect("the click is acknowledged");
+    assert!(ack.card.is_none(), "the 30 MB upload never runs inside the ack");
+    assert_eq!(ack.toast.as_deref(), Some("正在发送完整输出…"));
+
+    let patched = wait_for_patch_containing(&platform, "msg_reply", "完整输出已作为文件消息发送").await;
+    assert!(
+        card_text(&patched).contains(marker),
+        "the replacement card keeps the output tail: {}",
+        card_text(&patched)
+    );
+    let rebuilt = button_value(&patched, "full_output").expect("the rebuilt card keeps 完整输出");
+    assert_eq!(
+        rebuilt["run_id"], payload["run_id"],
+        "the rebuilt button names the same run"
+    );
+
+    let mut invalid = payload;
+    invalid
+        .as_object_mut()
+        .expect("a button value is an object")
+        .remove("path");
+    let refusal = app
+        .host_action_on_message(invalid, "msg_reply")
+        .await
+        .expect("a payload with no log path is refused");
+    assert!(refusal.card.is_none());
+    assert_eq!(refusal.toast.as_deref(), Some("无效操作"));
+}
+
+/// A settled Terminal Card's 「问 AI」 button carries the ten routing keys (the
+/// full_output eight plus the rendered output window), with seven on
+/// `terminal_card`. A stale run id is refused, a payload with no output window
+/// is invalid, and the current click acks before the spawned Turn runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_ask_ai_click_carries_ten_keys_and_acks_or_refuses() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "ask-ai-contract-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'; exit 3"),
+        key,
+        "msg_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    let payload = ask_ai_payload(&platform).await;
+    assert_eq!(
+        value_keys(&payload),
+        [
+            "action",
+            "chat_id",
+            "chat_type",
+            "op",
+            "output",
+            "output_truncated",
+            "path",
+            "run_id",
+            "terminal_card",
+            "thread_id"
+        ],
+        "the 问 AI click carries exactly these keys: {payload}"
+    );
+    assert_eq!(
+        value_keys(&payload["terminal_card"]),
+        [
+            "command",
+            "cwd",
+            "elapsed_ms",
+            "exit_code",
+            "lost",
+            "output_over_limit",
+            "run_id"
+        ],
+        "the card's render inputs are exactly these keys: {}",
+        payload["terminal_card"]
+    );
+    assert_eq!(payload["action"], "terminal");
+    assert_eq!(payload["op"], "ask_ai");
+    assert!(
+        payload["output"].as_str().is_some_and(|out| out.contains(marker)),
+        "the button carries the window it was rendered with: {payload}"
+    );
+
+    let mut stale = payload.clone();
+    stale["run_id"] = serde_json::json!("not-the-current-run");
+    let stale_ack = app
+        .host_action_on_message(stale, "msg_reply")
+        .await
+        .expect("a stale 问 AI is refused with a toast");
+    assert!(stale_ack.card.is_none(), "a refusal writes no card");
+    assert_eq!(stale_ack.toast.as_deref(), Some("这张终端卡片的操作已过期。"));
+
+    let mut invalid = payload.clone();
+    invalid
+        .as_object_mut()
+        .expect("a button value is an object")
+        .remove("output");
+    let invalid_ack = app
+        .host_action_on_message(invalid, "msg_reply")
+        .await
+        .expect("a payload with no output window is invalid");
+    assert!(invalid_ack.card.is_none());
+    assert_eq!(invalid_ack.toast.as_deref(), Some("无效操作"));
+
+    let ack = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("the click is acknowledged");
+    assert!(ack.card.is_none(), "a whole Turn never runs inside the ack");
+    assert_eq!(ack.toast.as_deref(), Some("🤖 正在把终端输出提交给 AI…"));
+
+    // The submission is spawned off the ack; waiting for the prompt keeps no
+    // live Turn outliving the test.
+    wait_for_prompt_containing(&prompts, marker).await;
+}
