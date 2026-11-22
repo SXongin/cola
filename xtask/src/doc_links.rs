@@ -342,7 +342,10 @@ pub(crate) fn banner_count(content: &str) -> usize {
             // `by ADR-NNNN` must carry a four-digit number; a malformed label is
             // not the banner form ADR-0110 counts.
             label.split_once("by ADR-").is_some_and(|(_, tail)| {
-                tail.len() >= 4 && tail[..4].bytes().all(|byte| byte.is_ascii_digit())
+                // `str::get` refuses a slice that is not a char boundary, so a
+                // malformed Unicode label is a non-banner, not a panic.
+                tail.get(..4)
+                    .is_some_and(|prefix| prefix.bytes().all(|byte| byte.is_ascii_digit()))
             })
         })
         .count()
@@ -386,8 +389,15 @@ fn read_adrs(root: &Path) -> Result<BTreeMap<String, String>, String> {
 /// Every Markdown document the guard reads, sorted by path. `docs/research/` is
 /// skipped as a source; the root documents are always read.
 fn scan_sources(root: &Path) -> Result<Vec<SourceDoc>, String> {
+    let docs = root.join("docs");
+    let docs_root = docs.canonicalize().map_err(|e| {
+        format!(
+            "error: cannot resolve doc-links directory {}: {e}",
+            docs.display()
+        )
+    })?;
     let mut paths = Vec::new();
-    collect_markdown(&root.join("docs"), &mut paths, &mut BTreeSet::new())?;
+    collect_markdown(&docs, &docs_root, &mut paths, &mut BTreeSet::new())?;
     for relative in ROOT_DOCS {
         let path = root.join(relative);
         if !path.is_file() {
@@ -412,16 +422,18 @@ fn scan_sources(root: &Path) -> Result<Vec<SourceDoc>, String> {
 
 fn collect_markdown(
     dir: &Path,
+    docs_root: &Path,
     paths: &mut Vec<PathBuf>,
     visited: &mut BTreeSet<PathBuf>,
 ) -> Result<(), String> {
     // Canonicalising before the visited check keeps a directory symlink (the
     // repo has none under `docs/`, but a future one must not loop) from
-    // walking the same tree through ever-longer paths.
+    // walking the same tree through ever-longer paths. The same canonical path
+    // keeps a link that escapes the checkout out of the scan.
     let canonical = dir
         .canonicalize()
         .map_err(|e| format!("error: cannot resolve doc-links directory {}: {e}", dir.display()))?;
-    if !visited.insert(canonical) {
+    if !canonical.starts_with(docs_root) || !visited.insert(canonical) {
         return Ok(());
     }
     let entries = std::fs::read_dir(dir)
@@ -429,8 +441,15 @@ fn collect_markdown(
     for entry in entries {
         let entry = entry.map_err(|e| format!("error: cannot read an entry of {}: {e}", dir.display()))?;
         let path = entry.path();
-        if path.is_dir() {
-            collect_markdown(&path, paths, visited)?;
+        // A broken or out-of-tree link is not part of the docs tree.
+        let Ok(target) = path.canonicalize() else {
+            continue;
+        };
+        if !target.starts_with(docs_root) {
+            continue;
+        }
+        if target.is_dir() {
+            collect_markdown(&path, docs_root, paths, visited)?;
         } else if path.extension().is_some_and(|ext| ext == "md") {
             paths.push(path);
         }
@@ -892,6 +911,20 @@ mod tests {
         assert_eq!(targets, vec![Target::Adr("0042".to_string())]);
     }
 
+    /// A link out of `docs/` (even to an unreadable or enormous tree) is not
+    /// part of the scan.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_out_of_docs_is_not_followed() {
+        let tree = Tree::new("symlink-outside");
+        tree.file("outside.md", "See ADR-9999.\n");
+        std::os::unix::fs::symlink(tree.root.join("outside.md"), tree.root.join("docs/loop.md"))
+            .expect("create the file symlink");
+        std::os::unix::fs::symlink(&tree.root, tree.root.join("docs/up"))
+            .expect("create the directory symlink");
+        assert!(tree.check().findings.is_empty());
+    }
+
     #[test]
     fn a_non_ascii_adr_filename_is_ignored_without_panicking() {
         let tree = Tree::new("non-ascii-adr");
@@ -912,6 +945,12 @@ mod tests {
     fn a_malformed_by_adr_label_is_not_a_banner() {
         let content = "> **Amended by ADR-**: x\n> **Amended by ADR-NNNN**: y\n";
         assert_eq!(banner_count(content), 0);
+    }
+
+    /// The four-digit check must not slice inside a multi-byte character.
+    #[test]
+    fn a_non_ascii_banner_label_is_not_a_banner() {
+        assert_eq!(banner_count("> **Amended by ADR-éaé**: x\n"), 0);
     }
 
     #[test]
