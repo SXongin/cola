@@ -44,6 +44,7 @@ mod model;
 mod perm;
 mod question;
 mod retry;
+mod terminal;
 mod think;
 mod turn_diff;
 
@@ -85,8 +86,9 @@ impl Gate {
 pub(crate) struct Entry {
     /// The payload's `action` tag; empty for an op-only verb.
     pub(crate) action: &'static str,
-    /// The payload's `op` tag, when the verb is selected by it. `None` means
-    /// the action tag alone selects the verb.
+    /// The payload's `op` tag, when the verb is selected by it. `None` makes
+    /// the entry its action's default: it matches any op that names no
+    /// op-specific sibling (and a click carrying no op at all).
     pub(crate) op: Option<&'static str>,
     /// The capability the verb's surface needs before it exists at all.
     pub(crate) gate: Gate,
@@ -104,6 +106,35 @@ pub(crate) const VERBS: &[Entry] = &[
         op: Some(crate::feishu::card::turn_diff::TURN_DIFF_OP),
         gate: Gate::Diffs,
         run: turn_diff::run,
+    },
+    // The Terminal Card's five ops (#1123, ADR-0086 decisions 4–9). The three
+    // op-keyed verbs are selected by `op`; the default entry is the fallback
+    // for `kill`/`continue` and for any op that names none of them. The
+    // lookup's precedence — exact op before the default — is what keeps the
+    // fallback from shadowing its siblings.
+    Entry {
+        action: "terminal",
+        op: Some("full_output"),
+        gate: Gate::Always,
+        run: terminal::run_full_output,
+    },
+    Entry {
+        action: "terminal",
+        op: Some("ask_ai"),
+        gate: Gate::Always,
+        run: terminal::run_ask_ai,
+    },
+    Entry {
+        action: "terminal",
+        op: Some("rerun"),
+        gate: Gate::Always,
+        run: terminal::run_rerun,
+    },
+    Entry {
+        action: "terminal",
+        op: None,
+        gate: Gate::Always,
+        run: terminal::run_control,
     },
     Entry {
         action: "perm",
@@ -176,16 +207,33 @@ pub(crate) const VERBS: &[Entry] = &[
     },
 ];
 
-/// The verb a click selects: an op-only entry (one with no `action`) wins over
-/// the action table, so the Turn card's action-less diff click keeps routing
-/// exactly where it routed before the seam existed.
+/// The verb a click selects. Precedence, highest first:
+///
+/// 1. an op-only entry (one with no `action`) whose `op` is the click's — the
+///    Turn card's action-less diff click, which must keep routing exactly where
+///    it routed before the seam existed;
+/// 2. an entry for the click's `action` whose `op` is the click's **exact** op;
+/// 3. an entry for the click's `action` with `op: None` — that action's
+///    default.
+///
+/// Exact-op before the default fallback is load-bearing for an action that has
+/// both shapes (the terminal card): a default entry is a fallback, never a
+/// shadow over its own op-specific siblings, whatever order [`VERBS`] lists
+/// them in. The op-only rule stays first because those entries carry no action
+/// to compare.
 pub(crate) fn lookup(action: &str, op: &str) -> Option<&'static Entry> {
     let by_op = VERBS
         .iter()
         .find(|entry| entry.action.is_empty() && entry.op == Some(op));
-    by_op.or_else(|| {
-        VERBS.iter().find(|entry| {
-            !entry.action.is_empty() && entry.action == action && entry.op.is_none_or(|key| key == op)
-        })
+    if let Some(entry) = by_op {
+        return Some(entry);
+    }
+    let exact = VERBS
+        .iter()
+        .find(|entry| !entry.action.is_empty() && entry.action == action && entry.op == Some(op));
+    exact.or_else(|| {
+        VERBS
+            .iter()
+            .find(|entry| !entry.action.is_empty() && entry.action == action && entry.op.is_none())
     })
 }
