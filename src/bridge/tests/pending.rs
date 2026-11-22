@@ -1691,3 +1691,61 @@ async fn variant_only_pending_switches_the_creates_recorded_model() {
     assert_eq!(calls[0].1.id, "plain");
     assert_eq!(calls[0].1.variant.as_deref(), Some("high"));
 }
+
+// ---------------------------------------------------------------------------
+// #1122 — the switch card's 新建 click behind the CardAction seam. Its payload
+// keys and exact result are pinned here because the op's real effect is the
+// Pending Session declaration (ADR-0041), not a card.
+// ---------------------------------------------------------------------------
+
+/// The `/switch` card's ＋ 新建会话 carries exactly its routing/filter keys and
+/// answers the refreshed list plus the pending's exact toast, declaring the
+/// Pending Session in the conversation's current project.
+#[tokio::test]
+async fn the_switch_new_click_pins_its_payload_keys_and_exact_result() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_old", "旧会话", "/work/proj", 100)]);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_old", "/work/proj"),
+    )
+    .await;
+
+    send_command(&app, "/switch", "msg_switch").await;
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the /switch card replies");
+    let payload = click_value(&card, "new", None);
+    assert_eq!(
+        value_keys(&payload),
+        ["action", "chat_id", "keyword", "op", "page", "scope", "thread_id"],
+        "the 新建 click carries exactly these keys: {payload}"
+    );
+    assert_eq!(payload["action"], "switch");
+    assert_eq!(payload["op"], "new");
+    assert_eq!(payload["chat_id"], "chat_1");
+    assert_eq!(payload["thread_id"], "chat_1");
+    assert_eq!(payload["keyword"], "");
+    assert_eq!(payload["scope"], "dir");
+    assert_eq!(payload["page"], 1);
+
+    let result = app.host_action(payload).await.expect("the click answers");
+    assert!(result.card.is_some(), "新建 refreshes the list");
+    assert_eq!(result.toast.as_deref(), Some("下一条消息创建会话"));
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .map(|pending| pending.directory.clone()),
+        Some("/work/proj".to_string()),
+        "the pending is declared in the current project (ADR-0041)"
+    );
+}

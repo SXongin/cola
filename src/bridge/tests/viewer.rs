@@ -5576,3 +5576,144 @@ async fn the_viewer_page_and_reread_clicks_pin_their_keys_and_exact_results() {
     .await
     .expect("the re-read's PATCH lands");
 }
+
+// ---------------------------------------------------------------------------
+// #1122 — the viewer's two directory controls carry the browse sub-handler's
+// payload (`browse_view_value`): 「📂 所在目录」 (`go`) and 「← 返回目录」
+// (`restore`). Their key sets and exact results are pinned here, beside the
+// browse-file row's own payload (#1120), before the browse body leaves
+// `handler.rs`.
+// ---------------------------------------------------------------------------
+
+/// 「📂 所在目录」 carries exactly the browse view's keys and answers the browse
+/// card at the file's parent directory, with no toast.
+#[tokio::test]
+async fn the_parent_directory_click_pins_its_payload_keys_and_exact_result() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("notes.txt"), "# notes\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key,
+        "m_cat",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = first_card(&platform).await;
+    let payload = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "📂 所在目录")
+        .expect("the viewer carries 所在目录")["value"]
+        .clone();
+    assert_eq!(
+        value_keys(&payload),
+        [
+            "action",
+            "chat_id",
+            "dir",
+            "keyword",
+            "op",
+            "page",
+            "show_hidden",
+            "thread_id",
+            "view"
+        ],
+        "the 所在目录 click carries the viewer's browse view: {payload}"
+    );
+    assert_eq!(payload["action"], "dir");
+    assert_eq!(payload["view"], "browse");
+    assert_eq!(payload["op"], "go");
+    assert_eq!(payload["dir"], canonical(proj.path()));
+
+    let result = app.host_action(payload).await.expect("the click answers");
+    assert_eq!(card_header(&result.card.expect("the browse card")), "📁 浏览目录");
+    assert!(result.toast.is_none(), "the swap is silent: {:?}", result.toast);
+}
+
+/// 「← 返回目录」 carries exactly the browse view's keys and restores the
+/// listing it was opened from, with no toast.
+#[tokio::test]
+async fn the_return_directory_click_pins_its_payload_keys_and_exact_result() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    for name in ["alpha", "beta"] {
+        std::fs::create_dir(proj.path().join(name)).unwrap();
+    }
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "# notes\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    // Open the viewer the way a browse file row does, carrying the listing.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "file",
+            "path": file.to_string_lossy(),
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "dir": proj.path().to_string_lossy(),
+            "show_hidden": true,
+            "keyword": "alph",
+            "page": 1,
+            "open_message_id": "msg_listing_viewer",
+        }))
+        .await
+        .expect("the row open is acknowledged");
+    assert!(result.card.is_none(), "classification stays off the callback");
+    wait_for_card_update(&platform, "viewer open", CardUpdates::Latest, |card| {
+        card_text(card).contains("notes")
+    })
+    .await;
+    let card = patches_to(&platform, "msg_listing_viewer")
+        .await
+        .last()
+        .cloned()
+        .expect("the row open patches the clicked card");
+    let payload = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "← 返回目录")
+        .expect("the row-opened viewer offers the way back")["value"]
+        .clone();
+    assert_eq!(
+        value_keys(&payload),
+        [
+            "action",
+            "chat_id",
+            "dir",
+            "keyword",
+            "op",
+            "page",
+            "show_hidden",
+            "thread_id",
+            "view"
+        ],
+        "the 返回目录 click carries the listing's browse view: {payload}"
+    );
+    assert_eq!(payload["op"], "restore");
+    assert_eq!(payload["keyword"], "alph");
+    assert_eq!(payload["show_hidden"], true);
+
+    let result = app.host_action(payload).await.expect("the click answers");
+    let card = result.card.expect("the browse card");
+    assert_eq!(card_header(&card), "📁 浏览目录");
+    assert!(
+        card_text(&card).contains("匹配 `alph`"),
+        "the listing's filter is restored: {}",
+        card_text(&card)
+    );
+    assert!(
+        result.toast.is_none(),
+        "the restore is silent: {:?}",
+        result.toast
+    );
+}

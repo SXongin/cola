@@ -1312,3 +1312,103 @@ async fn switch_card_adopt_refuses_an_unmapped_child() {
     let after = std::fs::read(&store_path).expect("the store is still readable");
     assert_eq!(before, after, "the refusal writes nothing");
 }
+
+// ---------------------------------------------------------------------------
+// #1122 — the `/sub` card behind the CardAction seam. Its two ops' payload key
+// sets and exact results are pinned here before the body leaves `handler.rs`.
+// ---------------------------------------------------------------------------
+
+/// The `/sub` card's search submit and pager are its only controls: pin both
+/// payloads, then their exact results — a search resets to page 1 narrowed by
+/// the typed keyword, a flip rebuilds the payload's page, and any other op is
+/// unanswered.
+#[tokio::test]
+async fn sub_card_controls_pin_their_payload_keys_and_exact_results() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let mut sessions = vec![list_session("ses_root", "根会话", "/work/root", 100)];
+    for i in 1..=8 {
+        sessions.push(child_of(
+            &format!("ses_c{i}"),
+            &format!("子会话{i}"),
+            "/work/root",
+            i * 100,
+            "ses_root",
+            "build",
+        ));
+    }
+    backend.given_sessions(sessions);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_root", "/work/root"),
+    )
+    .await;
+
+    send_command(&app, "/sub", "msg_sub").await;
+    let card = first_card(&platform).await;
+
+    let search = click_value(&card, "search", None);
+    assert_eq!(
+        value_keys(&search),
+        ["action", "chat_id", "op", "thread_id"],
+        "the /sub search submit carries exactly these keys: {search}"
+    );
+    assert_eq!(search["action"], "sub");
+    assert_eq!(search["op"], "search");
+
+    let page = click_value(&card, "page", None);
+    assert_eq!(
+        value_keys(&page),
+        ["action", "chat_id", "keyword", "op", "page", "thread_id"],
+        "the /sub pager carries exactly these keys: {page}"
+    );
+    assert_eq!(page["op"], "page");
+
+    // A search clears the cache, narrows by the typed keyword and lands on 1.
+    let mut search = search;
+    search["keyword"] = serde_json::json!("子会话1");
+    let searched = app.host_action(search).await.expect("the search answers");
+    let card = searched.card.expect("the search rebuilds the card");
+    assert!(searched.toast.is_none(), "a search is silent");
+    assert!(
+        card_text(&card).contains("子会话1 ·"),
+        "the matching child is listed: {}",
+        card_text(&card)
+    );
+    assert!(
+        !card_text(&card).contains("子会话8 ·"),
+        "the rest are filtered out"
+    );
+
+    // A flip rebuilds the payload's page, filter echoed.
+    let mut page = page;
+    page["keyword"] = serde_json::json!("子会话");
+    page["page"] = serde_json::json!(2);
+    let flipped = app.host_action(page).await.expect("the flip answers");
+    let card = flipped.card.expect("the flip rebuilds the card");
+    assert!(flipped.toast.is_none(), "a flip is silent");
+    assert!(
+        card.to_string().contains("\"default_value\":\"子会话\""),
+        "the filter is carried back into the search box"
+    );
+    assert!(
+        card_text(&card).contains("子会话2 ·") && !card_text(&card).contains("子会话8 ·"),
+        "page two is the second window: {}",
+        card_text(&card)
+    );
+
+    // Read-only: an op the card never renders is unanswered.
+    let unknown = serde_json::json!({
+        "action": "sub",
+        "op": "attach",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+    });
+    assert!(
+        app.host_action(unknown).await.is_none(),
+        "no /sub op outside search/page is answered"
+    );
+}

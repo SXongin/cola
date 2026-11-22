@@ -2590,3 +2590,125 @@ async fn a_topic_cover_marks_a_linked_worktree() {
         "the marker follows the checkout name, as on the Turn Footer: {cover}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1122 — the switch card's 建话题接管 / 强制建话题接管 clicks behind the
+// CardAction seam: their payload keys and exact results, including the
+// force-confirm hop, pinned before the body leaves `handler.rs`.
+// ---------------------------------------------------------------------------
+
+/// A `/switch` row's 建话题接管 carries the row payload plus the card's own
+/// message reference, and the force hop carries the same keys with
+/// `force_topic_adopt`; both answer the refreshed list and the exact toast.
+#[tokio::test]
+async fn the_switch_topic_adopt_clicks_pin_their_payload_keys_and_exact_results() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_free", "空闲会话", "/work/free", 200),
+        list_session("ses_owned", "被占用", "/work/owned", 300),
+    ]);
+    let mut platform = RecordingPlatform::new();
+    platform.chat_names.insert("oc_other".into(), "隔壁群".into());
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("oc_other".into(), "oc_other".into()),
+            "ses_owned",
+            "/work/owned",
+        ),
+    )
+    .await;
+
+    send_command(&app, "/switch", "msg_switch").await;
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the /switch card replies");
+    let mut topic_payload = click_value(&card, "topic_adopt", Some("ses_free"));
+    assert_eq!(
+        value_keys(&topic_payload),
+        [
+            "action",
+            "chat_id",
+            "keyword",
+            "op",
+            "page",
+            "scope",
+            "session_id",
+            "thread_id"
+        ],
+        "the 建话题接管 row carries exactly these keys: {topic_payload}"
+    );
+    assert_eq!(topic_payload["action"], "switch");
+    assert_eq!(topic_payload["op"], "topic_adopt");
+    topic_payload["open_message_id"] = serde_json::json!("om_switch_card");
+
+    let adopted = app.host_action(topic_payload).await.expect("topic_adopt answers");
+    assert!(
+        card_text(&adopted.card.expect("topic_adopt refreshes the list")).contains("会话管理"),
+        "the list is refreshed"
+    );
+    assert_eq!(adopted.toast.as_deref(), Some("已建话题接管"));
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .map(|entry| entry.session_id.clone()),
+        Some("ses_free".to_string()),
+        "the session is mapped to the new topic"
+    );
+
+    // The occupied row hops to the force-confirm card; pin its two payloads.
+    let mut occupied = click_value(&card, "topic_adopt", Some("ses_owned"));
+    occupied["open_message_id"] = serde_json::json!("om_switch_card");
+    let force_card = app
+        .host_action(occupied)
+        .await
+        .expect("the occupied topic_adopt answers")
+        .card
+        .expect("the force-confirm card");
+    let force = click_value(&force_card, "force_topic_adopt", Some("ses_owned"));
+    assert_eq!(
+        value_keys(&force),
+        [
+            "action",
+            "chat_id",
+            "keyword",
+            "op",
+            "page",
+            "scope",
+            "session_id",
+            "thread_id"
+        ],
+        "强制建话题接管 carries exactly these keys: {force}"
+    );
+    assert_eq!(force["op"], "force_topic_adopt");
+    assert_eq!(
+        value_keys(&click_value(&force_card, "back", None)),
+        ["action", "chat_id", "keyword", "op", "page", "scope", "thread_id"]
+    );
+
+    let mut force = force;
+    force["open_message_id"] = serde_json::json!("om_switch_card");
+    let forced = app.host_action(force).await.expect("force_topic_adopt answers");
+    assert!(forced.card.is_some(), "force_topic_adopt refreshes the list");
+    assert_eq!(forced.toast.as_deref(), Some("已建话题接管"));
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&topic_key)
+            .map(|entry| entry.session_id.clone()),
+        Some("ses_owned".to_string()),
+        "the steal maps the occupied session to the new topic"
+    );
+}

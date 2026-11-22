@@ -5247,6 +5247,19 @@ pub(crate) fn value_keys(value: &serde_json::Value) -> Vec<&str> {
     keys
 }
 
+/// The `value` of the first button on `card` whose `op` is `op`, optionally
+/// narrowed to a `session_id`: the payload a click replays, for characterizing
+/// its wire contract beside [`value_keys`].
+pub(crate) fn click_value(card: &serde_json::Value, op: &str, session_id: Option<&str>) -> serde_json::Value {
+    card_buttons(card)
+        .into_iter()
+        .find(|button| {
+            button["value"]["op"] == op && session_id.is_none_or(|id| button["value"]["session_id"] == id)
+        })
+        .unwrap_or_else(|| panic!("no `{op}` button for session {session_id:?} on {card}"))["value"]
+        .clone()
+}
+
 /// Every element anywhere on the card carrying `tag`, in document order —
 /// elements nest in forms, panels and column sets, so a top-level scan misses
 /// most controls.

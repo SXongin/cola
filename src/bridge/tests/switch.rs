@@ -2896,3 +2896,347 @@ async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
         "and it sends no request / touches no thread provider"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1122 — the `/switch` picker behind the CardAction seam. Every control's
+// wire payload (`value` key set) and every op's exact `CardActionResult` are
+// pinned here, so moving the body out of `handler.rs` cannot change either.
+// The `dir`/`sub` halves live in `dir.rs`/`child.rs`; topic creation's mapping
+// stays pinned by `switch_card_topic_adopt_action_creates_topic` (#1122).
+// ---------------------------------------------------------------------------
+
+/// The payload a `/switch` control with no per-row state carries.
+fn switch_click_value(op: &str) -> serde_json::Value {
+    serde_json::json!({
+        "action": "switch",
+        "op": op,
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+    })
+}
+
+/// Dispatch a `/switch` click the Host made and require an answer.
+async fn switch_click(app: &Arc<App>, value: serde_json::Value) -> crate::bridge::handler::CardActionResult {
+    app.host_action(value).await.expect("the switch op answers")
+}
+
+/// Every `/switch` control's payload key set, exactly as the card renders it:
+/// the row's adopt/topic_adopt pair, the scope toggle, the pager, the search
+/// submit, the footer's new, and the force-confirm/compact cards' back — plus
+/// the force-confirm card's force_adopt.
+#[tokio::test]
+async fn switch_card_controls_pin_each_click_payload_key_set() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(
+        (1..=7)
+            .map(|i| list_session(&format!("ses_p{i}"), &format!("项目{i}"), "/work/proj", i * 100))
+            .collect(),
+    );
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key, "ses_p1", "/work/proj"),
+    )
+    .await;
+    // One row is owned by another chat, so its 接管 answers the force card.
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("oc_other".into(), "oc_other".into()),
+            "ses_p7",
+            "/work/proj",
+        ),
+    )
+    .await;
+
+    send_command(&app, "/switch", "msg_switch").await;
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the /switch card replies");
+
+    // The row buttons carry the routing pair plus the active filter and page.
+    let row = [
+        "action",
+        "chat_id",
+        "keyword",
+        "op",
+        "page",
+        "scope",
+        "session_id",
+        "thread_id",
+    ];
+    assert_eq!(value_keys(&click_value(&card, "adopt", Some("ses_p2"))), row);
+    assert_eq!(
+        value_keys(&click_value(&card, "topic_adopt", Some("ses_p2"))),
+        row
+    );
+    // The scope toggle carries the TARGET scope; the active session scopes the
+    // card to its directory, so the rendered toggle is 全部.
+    let scope = click_value(&card, "scope", None);
+    assert_eq!(
+        value_keys(&scope),
+        ["action", "chat_id", "keyword", "op", "scope", "thread_id"]
+    );
+    assert_eq!(scope["scope"], "all");
+    // The pager, the footer's 新建 and the list's 返回列表 share one shape.
+    let filter_page = ["action", "chat_id", "keyword", "op", "page", "scope", "thread_id"];
+    assert_eq!(value_keys(&click_value(&card, "page", None)), filter_page);
+    assert_eq!(value_keys(&click_value(&card, "new", None)), filter_page);
+    // The search submit carries the scope it re-searches in, and no page.
+    assert_eq!(
+        value_keys(&click_value(&card, "search", None)),
+        ["action", "chat_id", "op", "scope", "thread_id"]
+    );
+
+    // 接管 on the row another chat owns answers the force-confirm card, whose
+    // own two controls are pinned rather than assumed.
+    let force_card = app
+        .host_action(click_value(&card, "adopt", Some("ses_p7")))
+        .await
+        .expect("the occupied adopt answers")
+        .card
+        .expect("the force-confirm card");
+    assert_eq!(
+        value_keys(&click_value(&force_card, "force_adopt", Some("ses_p7"))),
+        row
+    );
+    assert_eq!(value_keys(&click_value(&force_card, "back", None)), filter_page);
+
+    // The compact 已切换 card keeps the same 返回列表 shape.
+    let compact = app
+        .host_action(click_value(&card, "adopt", Some("ses_p2")))
+        .await
+        .expect("a free adopt answers")
+        .card
+        .expect("the compact 已切换 card");
+    assert_eq!(value_keys(&click_value(&compact, "back", None)), filter_page);
+}
+
+/// Every `/switch` op's exact result: the rebuild ops answer a `/switch` card
+/// and no toast, the adoption ops answer the compact 已切换 card with the same
+/// verb in the toast, and the topic ops answer the refreshed list with
+/// 已建话题接管. The occupied adoption's force-confirm refusal is pinned too.
+#[tokio::test]
+async fn switch_card_every_op_pins_its_exact_result() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_home", "家", "/work/home", 100),
+        list_session("ses_free", "空闲会话", "/work/free", 200),
+        list_session("ses_owned", "被占用", "/work/owned", 300),
+        list_session("ses_topic_free", "话题空闲", "/work/tfree", 400),
+        list_session("ses_topic_owned", "话题被占用", "/work/towned", 500),
+    ]);
+    let mut platform = RecordingPlatform::new();
+    platform.chat_names.insert("oc_other".into(), "隔壁群".into());
+    let platform = Arc::new(platform);
+    let app = Arc::new(App::new(cfg, Arc::new(backend), platform).unwrap());
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key.clone(), "ses_home", "/work/home"),
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("oc_other".into(), "oc_other".into()),
+            "ses_owned",
+            "/work/owned",
+        ),
+    )
+    .await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(
+            crate::config::ThreadKey::new("oc_other".into(), "oc_other".into()),
+            "ses_topic_owned",
+            "/work/towned",
+        ),
+    )
+    .await;
+
+    // page: a rebuilt list, no toast.
+    let page = switch_click(&app, switch_click_value("page")).await;
+    assert!(
+        card_text(&page.card.expect("page rebuilds the list")).contains("会话管理"),
+        "page returns the /switch card"
+    );
+    assert!(page.toast.is_none(), "page is silent: {:?}", page.toast);
+
+    // scope: the target scope's list, no toast.
+    let scope = switch_click(
+        &app,
+        serde_json::json!({
+            "action": "switch",
+            "op": "scope",
+            "scope": "all",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }),
+    )
+    .await;
+    assert!(
+        card_text(&scope.card.expect("scope rebuilds the list")).contains("最近会话"),
+        "scope returns the widened list"
+    );
+    assert!(scope.toast.is_none(), "scope is silent: {:?}", scope.toast);
+
+    // back: the list, no toast.
+    let back = switch_click(&app, switch_click_value("back")).await;
+    assert!(card_text(&back.card.expect("back rebuilds the list")).contains("会话管理"));
+    assert!(back.toast.is_none(), "back is silent: {:?}", back.toast);
+
+    // search: the narrowed list at page 1, no toast, keyword echoed.
+    let mut search_value = switch_click_value("search");
+    search_value["keyword"] = serde_json::json!("free");
+    let search = switch_click(&app, search_value).await;
+    let search_card = search.card.expect("search rebuilds the list");
+    assert!(card_text(&search_card).contains("空闲会话"));
+    assert!(
+        search_card.to_string().contains("\"default_value\":\"free\""),
+        "the typed keyword is echoed"
+    );
+    assert!(search.toast.is_none(), "search is silent: {:?}", search.toast);
+
+    // new: the pending declaration's toast and a refreshed list.
+    let new = switch_click(&app, switch_click_value("new")).await;
+    assert!(new.card.is_some(), "new refreshes the list");
+    assert_eq!(new.toast.as_deref(), Some("下一条消息创建会话"));
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key)
+            .map(|pending| pending.directory.clone()),
+        Some("/work/home".to_string()),
+        "new declares the pending in the current project"
+    );
+
+    // topic_adopt: the topic is created and the list refreshed.
+    let mut topic_free = switch_click_value("topic_adopt");
+    topic_free["session_id"] = serde_json::json!("ses_topic_free");
+    topic_free["open_message_id"] = serde_json::json!("om_switch");
+    let topic_free = switch_click(&app, topic_free).await;
+    assert!(card_text(&topic_free.card.expect("topic_adopt refreshes the list")).contains("会话管理"));
+    assert_eq!(topic_free.toast.as_deref(), Some("已建话题接管"));
+
+    // force_topic_adopt: the occupied session is wrapped too.
+    let mut topic_owned = switch_click_value("force_topic_adopt");
+    topic_owned["session_id"] = serde_json::json!("ses_topic_owned");
+    topic_owned["open_message_id"] = serde_json::json!("om_switch");
+    let topic_owned = switch_click(&app, topic_owned).await;
+    assert!(topic_owned.card.is_some(), "force_topic_adopt refreshes the list");
+    assert_eq!(topic_owned.toast.as_deref(), Some("已建话题接管"));
+
+    // adopt: the compact 已切换 card and the same verb in the toast.
+    let mut adopt = switch_click_value("adopt");
+    adopt["session_id"] = serde_json::json!("ses_free");
+    let adopt = switch_click(&app, adopt).await;
+    assert!(
+        card_text(&adopt.card.expect("adopt patches the card")).contains("已切换到该会话"),
+        "adopt answers the compact state"
+    );
+    assert_eq!(adopt.toast.as_deref(), Some("已切换「空闲会话」"));
+
+    // adopt on a session another chat owns: the force-confirm card, with the
+    // owner named in the toast — never an adoption.
+    let mut occupied = switch_click_value("adopt");
+    occupied["session_id"] = serde_json::json!("ses_owned");
+    let occupied = switch_click(&app, occupied).await;
+    assert!(
+        card_text(
+            &occupied
+                .card
+                .expect("the occupied adopt answers the confirm card")
+        )
+        .contains("强制接管")
+    );
+    assert_eq!(
+        occupied.toast.as_deref(),
+        Some("该会话被 隔壁群 占用，请确认是否强制接管")
+    );
+
+    // force_adopt: the steal lands and patches to the compact state.
+    let mut force = switch_click_value("force_adopt");
+    force["session_id"] = serde_json::json!("ses_owned");
+    let force = switch_click(&app, force).await;
+    assert!(card_text(&force.card.expect("force_adopt patches the card")).contains("已切换到该会话"));
+    assert_eq!(force.toast.as_deref(), Some("已切换「被占用」"));
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key).unwrap().session_id,
+        "ses_owned",
+        "force_adopt steals the mapping"
+    );
+}
+
+/// The switch card's adoption refusals, exact: an unmapped child is refused by
+/// both 接管 and 强制接管 with the `/sub attach` pointer, its 建话题 form is
+/// refused too, 建话题 without the card's message reference says so, and a
+/// session the server no longer lists answers nothing.
+#[tokio::test]
+async fn switch_card_adoption_refusals_pin_their_exact_toasts() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let mut child = list_session("ses_c1", "重写渲染", "/work/root", 300);
+    child.parent_id = Some("ses_root".into());
+    backend.given_sessions(vec![
+        list_session("ses_root", "根会话", "/work/root", 100),
+        child,
+        list_session("ses_free", "空闲会话", "/work/free", 200),
+    ]);
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key, "ses_root", "/work/root"),
+    )
+    .await;
+
+    let child_refusal = "⚠️ 会话「重写渲染」是子任务会话，不能用 `/switch` 接管；请用 \
+                         `/sub attach ses_c1` 接管它（该命令只接管当前会话的直接子会话）。";
+    for op in ["adopt", "force_adopt"] {
+        let mut value = switch_click_value(op);
+        value["session_id"] = serde_json::json!("ses_c1");
+        let refusal = switch_click(&app, value).await;
+        assert!(refusal.card.is_none(), "{op} on a child patches no card");
+        assert_eq!(refusal.toast.as_deref(), Some(child_refusal), "{op} refusal");
+    }
+
+    // 建话题接管 of a child is refused before any topic work.
+    let mut topic_child = switch_click_value("topic_adopt");
+    topic_child["session_id"] = serde_json::json!("ses_c1");
+    topic_child["open_message_id"] = serde_json::json!("om_switch");
+    let topic_child = switch_click(&app, topic_child).await;
+    assert!(topic_child.card.is_none());
+    assert_eq!(topic_child.toast.as_deref(), Some("子任务会话不支持接管"));
+
+    // A topic needs the card's own message reference.
+    let mut topic_no_anchor = switch_click_value("topic_adopt");
+    topic_no_anchor["session_id"] = serde_json::json!("ses_free");
+    let topic_no_anchor = switch_click(&app, topic_no_anchor).await;
+    assert!(topic_no_anchor.card.is_none());
+    assert_eq!(
+        topic_no_anchor.toast.as_deref(),
+        Some("无法创建话题（缺少卡片消息引用）")
+    );
+
+    // A stale id names no session: the click goes unanswered.
+    let mut stale = switch_click_value("adopt");
+    stale["session_id"] = serde_json::json!("ses_gone");
+    assert!(
+        app.host_action(stale).await.is_none(),
+        "an adoption of an unlisted session answers nothing"
+    );
+}
