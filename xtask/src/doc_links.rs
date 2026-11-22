@@ -927,6 +927,10 @@ mod tests {
             .and_then(|rest| rest.split("\n  audit:").next())
             .expect("the docs-drift job must exist");
         assert!(job.contains("cargo xtask check-doc-links"));
+        assert!(
+            !job.contains("needs: classify"),
+            "a classify-gated job would skip the docs-only PRs this guard is for"
+        );
     }
 
     /// The first `bash` block is the verification loop; the descriptive section
