@@ -191,7 +191,7 @@ fn doc_path_token(rest: &str) -> &str {
         .next()
         .unwrap_or_default()
         .trim_end_matches([
-            '.', ',', ';', ')', ']', '>', '"', '\'', '`', '…', '。', '，', '、', '；', '：', '）', '」',
+            '.', ',', ';', ':', ')', ']', '>', '"', '\'', '`', '…', '。', '，', '、', '；', '：', '）', '」',
             '』', '】', '》', '”', '’',
         ])
 }
@@ -880,18 +880,29 @@ mod tests {
         assert_eq!(tree.check().findings.len(), 1);
     }
 
-    /// Chinese prose has no spaces, so a citation directly after it must still
-    /// be extracted.
-    /// A decomposed name carries a combining mark (`cafe\u{0301}.md`), which an
-    /// alphanumeric allow-list would truncate and then call missing.
-    /// `!` (and any other legal name character) is inside the path: the
-    /// filesystem decides where an existing citation ends.
+    /// `!` is a legal name character, so it is inside the cited token.
     #[test]
     fn a_path_with_a_bang_resolves() {
         let tree = Tree::new("bang-path");
         tree.file("docs/reference/api!.md", "# api\n");
+        tree.file("docs/note.md", "`docs/reference/api!.md`\n");
+        assert_eq!(tree.check().findings.len(), 0);
+    }
+
+    #[test]
+    fn a_pin_with_a_bang_resolves() {
+        let tree = Tree::new("bang-pin");
         tree.file("src/thing!.rs", "one\n");
-        tree.file("docs/note.md", "`docs/reference/api!.md` and `src/thing!.rs:1`\n");
+        tree.file("docs/note.md", "`src/thing!.rs:1`\n");
+        assert_eq!(tree.check().findings.len(), 0);
+    }
+
+    /// A colon after a backticked path is prose, not part of the name.
+    #[test]
+    fn a_colon_after_a_path_is_not_part_of_it() {
+        let tree = Tree::new("colon-path");
+        tree.file("docs/reference/api.md", "# api\n");
+        tree.file("docs/note.md", "See `docs/reference/api.md`: details follow.\n");
         assert_eq!(tree.check().findings.len(), 0);
     }
 
@@ -905,6 +916,8 @@ mod tests {
         assert_eq!(tree.check().findings.len(), 1);
     }
 
+    /// A decomposed name carries a combining mark (`cafe\u{0301}.md`), which an
+    /// alphanumeric allow-list would truncate and then call missing.
     #[test]
     fn a_combining_mark_in_a_path_resolves() {
         let tree = Tree::new("combining-mark");
@@ -913,6 +926,8 @@ mod tests {
         assert_eq!(tree.check().findings.len(), 0);
     }
 
+    /// Chinese prose has no spaces, so a citation directly after it must still
+    /// be extracted.
     #[test]
     fn a_citation_after_chinese_prose_is_extracted() {
         let targets: Vec<Target> = extract("见ADR-0042")
