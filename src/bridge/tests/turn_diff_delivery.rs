@@ -775,3 +775,103 @@ async fn a_v1_turn_terminates_without_an_index() {
         "the settle read was attempted; V1 answers Ok(None)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1124 — the Turn card's action-less diff click behind the CardAction seam.
+// The button value carries `op` and NO `action`; both its exact key set and the
+// click's exact `CardActionResult` are pinned, and the test dispatches exactly
+// the rendered shape.
+// ---------------------------------------------------------------------------
+
+/// The complete-diff button carries exactly `{directory, from, op, session_id}`
+/// — an action-less click the op-only registry entry selects. Dispatching that
+/// rendered shape answers 「正在生成完整 diff…」 with no card, then the spawned
+/// delivery posts its File Message under the clicked card.
+#[tokio::test]
+async fn the_turn_diff_click_carries_no_action_and_pins_its_exact_result() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        super::drain::user("msg_cola_anchor", 1_000, "第一条消息"),
+        super::drain::assistant(2_000, "完成。"),
+    ];
+    let (_dir, app, backend, platform) = super::drain::scripted_app(
+        vec![SessionTranscript::new(timeline)],
+        Some(crate::backend::types::SessionStatus::Idle),
+    )
+    .await;
+    backend
+        .session_diff_available
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *backend
+        .session_diff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(TurnDiff(vec![diff_file("src/a.rs", 2, 1)]));
+
+    let turn = super::drain::spawn_turn(&app, super::drain::ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn ends")
+        .expect("the turn task does not panic")
+        .expect("the turn succeeded");
+
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.updated_cards().await);
+    let card = cards
+        .iter()
+        .rev()
+        .find(|card| card_text(card).contains("📝 本轮期间工作区变化"))
+        .unwrap_or_else(|| panic!("the terminal card carries the settled index: {cards:?}"));
+    let button = card_buttons(card)
+        .into_iter()
+        .find(|element| element["value"]["op"] == "turn_diff")
+        .expect("the terminal card carries the complete-diff button")
+        .clone();
+    let value = button["value"].clone();
+    assert_eq!(
+        value_keys(&value),
+        ["directory", "from", "op", "session_id"],
+        "the diff click carries exactly these keys: {value}"
+    );
+    assert_eq!(value["op"], "turn_diff");
+    assert!(
+        value.get("action").is_none(),
+        "the diff click carries NO action — the registry selects it by op alone: {value}"
+    );
+    assert_eq!(value["session_id"], "ses_test");
+    assert_eq!(value["from"], "msg_cola_anchor");
+
+    // Dispatch exactly the rendered shape: no `action`, no `open_message_id`
+    // (the callback context supplies the clicked card's id).
+    let ack = app
+        .host_action_on_message(value, CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+    assert!(ack.card.is_none(), "the click never rebuilds the card inline");
+    assert_eq!(ack.toast.as_deref(), Some("正在生成完整 diff…"));
+
+    wait_for_file_message(&platform).await;
+}
+
+/// The `diffs` capability is the DISPATCH's gate, not the body's (#1124): a
+/// card persisted under a client that had the surface can be clicked after a
+/// reattach, so with the surface gone the click is omitted — no read is
+/// guessed.
+#[tokio::test]
+async fn the_turn_diff_click_is_omitted_when_the_attachment_lost_the_surface() {
+    let (_dir, cfg) = app_config();
+    let mut backend = MockBackend::new(Vec::new());
+    backend.capabilities.diffs = false;
+    let (app, platform, backend) = app_with_backend(cfg, backend);
+
+    let ack = app.host_action_on_message(click(), CARD_MESSAGE).await;
+    assert!(
+        ack.is_none(),
+        "a click whose surface the attachment no longer has is omitted"
+    );
+    assert!(
+        backend.session_diff_calls.lock().await.is_empty(),
+        "the omitted click never guesses a diff read"
+    );
+    assert!(file_messages(&platform).await.is_empty(), "nothing is sent");
+}
