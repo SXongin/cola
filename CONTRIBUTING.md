@@ -48,10 +48,13 @@ This rule applies to agents too: **agents never merge a feature/task PR.**
 They run the loop up to the green PR — branch, work, commit, rebase, open the
 PR, get CI and review green — and then stop, or hand the PR over when a gate
 stop predicate fires (*Reviewing*). The user verifies the change
-themselves and gives the explicit go-ahead (or merges it themselves). The
-release cut is the one exception: `cargo xtask release` performs its own
-CI-gated merge after the user confirms the smoke test (ADR-0033). Do not stop
-at "branch off `main`" or ask which base to use; the base is always `main`.
+themselves and gives the explicit go-ahead (or merges it themselves). Two
+exceptions: the release cut, where `cargo xtask release` performs its own
+CI-gated merge after the user confirms the smoke test (ADR-0033); and a **merge
+grant recorded in a spec** (`docs/agents/issue-tracker.md`, "Specs and
+tickets"), which is the user's explicit go-ahead given in advance for that
+batch. Do not stop at "branch off `main`" or ask which base to use; the base is
+always `main`.
 
 ### Branch naming
 
