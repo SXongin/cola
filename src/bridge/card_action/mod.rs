@@ -39,6 +39,7 @@ use crate::bridge::handler::{App, CardActionResult};
 mod agent;
 mod autoaccept;
 mod cleanup;
+mod file;
 mod mcp;
 mod model;
 mod perm;
@@ -108,6 +109,32 @@ pub(crate) const VERBS: &[Entry] = &[
         op: Some(crate::feishu::card::turn_diff::TURN_DIFF_OP),
         gate: Gate::Diffs,
         run: turn_diff::run,
+    },
+    // The `action: "file"` surface (#1120): three cards share the tag, told
+    // apart by `op`. `send` (the viewer's own transfer, which PATCHes the
+    // clicked viewer card) and `preview` (a Tool Panel's File Message, which
+    // must NEVER PATCH the agent's Turn card, #778) are exact-op entries; the
+    // `op: None` default serves a browse row (no op) and the viewer's own
+    // `page`/`view`/`reread` controls, whose `op` the body parses itself. The
+    // lookup's exact-op precedence keeps the default from shadowing its
+    // siblings.
+    Entry {
+        action: "file",
+        op: Some("send"),
+        gate: Gate::Always,
+        run: file::run_send,
+    },
+    Entry {
+        action: "file",
+        op: Some("preview"),
+        gate: Gate::Always,
+        run: file::run_preview,
+    },
+    Entry {
+        action: "file",
+        op: None,
+        gate: Gate::Always,
+        run: file::run,
     },
     // The Terminal Card's five ops (#1123, ADR-0086 decisions 4–9). The three
     // op-keyed verbs are selected by `op`; the default entry is the fallback
