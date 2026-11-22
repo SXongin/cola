@@ -33,10 +33,15 @@ use tokio::time::Instant;
 use crate::bridge::core::SharedCore;
 use crate::bridge::handler::{App, CardActionResult};
 
+mod agent;
+mod autoaccept;
 mod cleanup;
+mod mcp;
+mod model;
 mod perm;
 mod question;
 mod retry;
+mod think;
 mod turn_diff;
 
 /// A verb's body, resolved inside the click's [`span`](crate::bridge::span).
@@ -61,6 +66,11 @@ pub(crate) enum Gate {
     /// that had the surface may be clicked after a reattach: omit the read,
     /// don't guess it.
     Diffs,
+    /// The Backend can select an agent (`/agent`): an agent list plus a
+    /// per-session override. A picker card persisted under a client that had
+    /// the surface may be clicked after a reattach: refuse the pick, don't
+    /// re-read the capability inside the verb.
+    Modes,
 }
 
 impl Gate {
@@ -68,6 +78,7 @@ impl Gate {
         match self {
             Self::Always => true,
             Self::Diffs => core.flow_handles().backend.capabilities().diffs,
+            Self::Modes => core.flow_handles().backend.capabilities().modes,
         }
     }
 }
@@ -119,6 +130,51 @@ pub(crate) const VERBS: &[Entry] = &[
         op: None,
         gate: Gate::Always,
         run: cleanup::run,
+    },
+    // The mode/configuration group (#1121). `agent`/`agent_clear` are the only
+    // verbs whose surface is capability-gated: the dispatch applies
+    // `Gate::Modes` before the body, so neither module re-reads it.
+    Entry {
+        action: "agent",
+        op: None,
+        gate: Gate::Modes,
+        run: agent::run,
+    },
+    Entry {
+        action: "agent_clear",
+        op: None,
+        gate: Gate::Modes,
+        run: agent::run_clear,
+    },
+    Entry {
+        action: "autoaccept",
+        op: None,
+        gate: Gate::Always,
+        run: autoaccept::run,
+    },
+    Entry {
+        action: "mcp",
+        op: None,
+        gate: Gate::Always,
+        run: mcp::run,
+    },
+    Entry {
+        action: "model",
+        op: None,
+        gate: Gate::Always,
+        run: model::run,
+    },
+    Entry {
+        action: "think",
+        op: None,
+        gate: Gate::Always,
+        run: think::run,
+    },
+    Entry {
+        action: "think_clear",
+        op: None,
+        gate: Gate::Always,
+        run: think::run_clear,
     },
 ];
 
