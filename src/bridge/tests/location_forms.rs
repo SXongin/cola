@@ -3236,6 +3236,61 @@ async fn mcp_reopen_sends_a_fresh_card_then_clears_the_dismissal() {
     assert_eq!(posted_cards(&fixture.platform).await.len(), 3);
 }
 
+/// Characterization for the CardAction seam (#1121): the dismissed form's
+/// 「↩️ 重新打开」 control carries exactly
+/// `{action, op, chat_id, thread_id, request_id, directory}` — the directory is
+/// the one whose list produced the form, never re-derived — and clicking the
+/// rendered value acks with the reopen toast plus the rebuilt listing card.
+#[tokio::test]
+async fn the_mcp_reopen_click_carries_six_keys_and_acks_with_the_reopened_toast() {
+    let fixture = fixture(
+        false,
+        &[("/work", location_form("frm_mcp_contract"))],
+        &[entry("chat_1", "ses_1", "/work")],
+        |backend| {
+            backend.with_mcp_statuses_in("/work", vec![status("context7", McpServerState::Connected)]);
+        },
+    )
+    .await;
+    sweep(&fixture).await;
+    let original = posted_card(&fixture.platform).await;
+    let defer = button_with_reply(&original, "defer").expect("a 稍后 control");
+    fixture.app.host_action(defer).await.expect("a click result");
+
+    send_command(&fixture.app, "/mcp", "msg_mcp_contract").await;
+    let listing = posted_cards(&fixture.platform)
+        .await
+        .pop()
+        .expect("the /mcp card");
+    let reopen = button_with_action_op(&listing, "mcp", "reopen").expect("a reopen control");
+    assert_eq!(
+        value_keys(&reopen),
+        ["action", "chat_id", "directory", "op", "request_id", "thread_id",],
+        "the reopen click carries exactly these keys: {reopen}"
+    );
+    assert_eq!(reopen["action"], "mcp");
+    assert_eq!(reopen["op"], "reopen");
+    assert_eq!(reopen["request_id"], "frm_mcp_contract");
+    assert_eq!(reopen["directory"], "/work");
+
+    let ack = fixture
+        .app
+        .host_action(reopen)
+        .await
+        .expect("the reopen click has a result");
+    assert_eq!(
+        ack.toast.as_deref(),
+        Some("已重新打开，请在新的卡片上作答。"),
+        "the click acks with the reopen toast"
+    );
+    let card = ack.card.expect("the reopened listing is rebuilt as the ack card");
+    assert!(
+        card_text(&card).contains("🔌 MCP"),
+        "the rebuilt listing card is returned: {}",
+        card_text(&card)
+    );
+}
+
 /// The optional status read must not hold the reopen past the click deadline:
 /// the form list is enough to send the fresh card, and a repaint is optional.
 #[tokio::test]

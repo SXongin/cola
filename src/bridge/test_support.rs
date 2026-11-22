@@ -5233,6 +5233,20 @@ pub(crate) fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> 
     card_tags(card, "button")
 }
 
+/// A button payload's keys, sorted: the wire contract a click carries,
+/// independent of the JSON object's key order. Characterization tests pin this
+/// set so a card-surface change cannot add or drop a routing key unnoticed.
+pub(crate) fn value_keys(value: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("a button value carries an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys
+}
+
 /// Every element anywhere on the card carrying `tag`, in document order —
 /// elements nest in forms, panels and column sets, so a top-level scan misses
 /// most controls.
