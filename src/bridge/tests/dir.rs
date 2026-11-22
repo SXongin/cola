@@ -2180,3 +2180,318 @@ async fn dir_browse_caps_a_huge_directory_scan() {
         "exactly the cap was scanned, not the extra entry: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1122 — the `/dir` Recent Directories card and its browse sub-card behind the
+// CardAction seam. Every control's wire payload (`value` key set) and each op's
+// exact `CardActionResult` are pinned here so moving the bodies out of
+// `handler.rs` cannot change either. `browse`'s own multiplexing on
+// `view: "browse"` is pinned through the browse card's controls.
+// ---------------------------------------------------------------------------
+
+/// Every `/dir` control's payload key set: the Recent Directories card's row
+/// pair, its browse entry, search submit and pager; then the browse card's
+/// node actions, drill-downs, filter/pager/toggle and 最近目录 swap.
+#[tokio::test]
+async fn dir_card_controls_pin_each_click_payload_key_set() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    for i in 1..=8 {
+        std::fs::create_dir(proj.path().join(format!("子目录{i}"))).unwrap();
+    }
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(
+        (1..=8)
+            .map(|i| {
+                list_session(
+                    &format!("ses_d{i}"),
+                    &format!("项目{i}"),
+                    &format!("/work/d{i}"),
+                    i * 100,
+                )
+            })
+            .collect(),
+    );
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    send_command(&app, "/dir", "msg_dir").await;
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the /dir card replies");
+    let row = [
+        "action",
+        "chat_id",
+        "directory",
+        "keyword",
+        "op",
+        "page",
+        "thread_id",
+    ];
+    assert_eq!(value_keys(&click_value(&card, "pick", None)), row);
+    assert_eq!(value_keys(&click_value(&card, "topic", None)), row);
+    // The browse entry and the search submit are bare routing payloads.
+    assert_eq!(
+        value_keys(&click_value(&card, "browse", None)),
+        ["action", "chat_id", "op", "thread_id"]
+    );
+    assert_eq!(
+        value_keys(&click_value(&card, "search", None)),
+        ["action", "chat_id", "op", "thread_id"]
+    );
+    assert_eq!(
+        value_keys(&click_value(&card, "page", None)),
+        ["action", "chat_id", "keyword", "op", "page", "thread_id"]
+    );
+
+    // 浏览目录 opens the browse card in place; its controls all carry the view.
+    let browse_card = app
+        .host_action(click_value(&card, "browse", None))
+        .await
+        .expect("browse opens")
+        .card
+        .expect("the browse card");
+    let browse = [
+        "action",
+        "chat_id",
+        "dir",
+        "keyword",
+        "op",
+        "page",
+        "show_hidden",
+        "thread_id",
+        "view",
+    ];
+    for op in ["go", "filter", "page", "show_hidden", "pick", "topic"] {
+        assert_eq!(
+            value_keys(&click_value(&browse_card, op, None)),
+            browse,
+            "the browse card's `{op}` control carries the view"
+        );
+    }
+    assert_eq!(
+        click_value(&browse_card, "pick", None)["view"],
+        "browse",
+        "the split's discriminator rides every browse control"
+    );
+    // ← 最近目录 swaps the card, so it is a bare routing payload.
+    assert_eq!(
+        value_keys(&click_value(&browse_card, "recent", None)),
+        ["action", "chat_id", "op", "thread_id"]
+    );
+}
+
+/// Every `/dir` op's exact result: pick declares a pending (and the current
+/// directory only toasts), topic wraps a pending in a topic, search/page
+/// rebuild, browse swaps cards, and the browse ops rebuild the listing — while
+/// the two malformed shapes (no directory, no message reference, a file, an
+/// unknown op) answer their exact refusal.
+#[tokio::test]
+async fn dir_card_every_op_pins_its_exact_result() {
+    let _wd = test_work_dir();
+    let proj = browse_project();
+    let proj_dir = proj.path().to_string_lossy().to_string();
+    let alpha = proj.path().join("alpha");
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "x").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![
+        list_session("ses_a", "项目A", "/work/a", 100),
+        list_session("ses_b", "项目B", "/work/b", 200),
+    ]);
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(&app, seeded_entry(&key, &proj_dir)).await;
+
+    // pick on the conversation's own directory: a toast only (before any other
+    // pick declares a Pending Session, which would supersede this directory).
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": proj_dir,
+        }))
+        .await
+        .expect("the current pick answers");
+    assert!(result.card.is_some(), "the card still refreshes");
+    assert_eq!(result.toast.as_deref(), Some("已在当前目录"));
+
+    // pick on a new directory: a pending, never a server session.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+        }))
+        .await
+        .expect("pick answers");
+    assert!(card_text(&result.card.expect("pick refreshes the card")).contains("最近目录"));
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("下一条消息将在目录 `/work/b` 创建会话")
+    );
+
+    // No directory at all: the generic refusal, no card.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("the empty pick answers");
+    assert!(result.card.is_none());
+    assert_eq!(result.toast.as_deref(), Some("无效操作"));
+
+    // topic: a pending topic around /work/b.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "topic",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+            "open_message_id": "om_dir_card",
+        }))
+        .await
+        .expect("topic answers");
+    assert!(card_text(&result.card.expect("topic refreshes the card")).contains("最近目录"));
+    assert_eq!(result.toast.as_deref(), Some("已建话题（b）——下一条消息创建会话"));
+
+    // search and page: rebuilt lists, no toast.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "search",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "keyword": "work",
+        }))
+        .await
+        .expect("search answers");
+    assert!(card_text(&result.card.expect("search rebuilds")).contains("匹配 `work` 的目录"));
+    assert!(result.toast.is_none(), "search is silent: {:?}", result.toast);
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "page",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "page": 1,
+        }))
+        .await
+        .expect("page answers");
+    assert!(result.card.is_some());
+    assert!(result.toast.is_none(), "page is silent: {:?}", result.toast);
+
+    // browse swaps the card; recent swaps it back.
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "browse",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("browse answers");
+    assert!(card_text(&result.card.expect("browse card")).contains("浏览目录"));
+    assert!(result.toast.is_none(), "browse is silent: {:?}", result.toast);
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "recent",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("recent answers");
+    assert!(card_text(&result.card.expect("recent card")).contains("最近目录"));
+    assert!(result.toast.is_none(), "recent is silent: {:?}", result.toast);
+
+    // The browse sub-handler's rebuilds.
+    for (op, extra) in [
+        ("go", serde_json::json!({"dir": proj_dir.clone(), "keyword": ""})),
+        (
+            "filter",
+            serde_json::json!({"dir": proj_dir.clone(), "keyword": "al"}),
+        ),
+        (
+            "restore",
+            serde_json::json!({"dir": proj_dir.clone(), "keyword": "", "page": 1}),
+        ),
+        ("page", serde_json::json!({"dir": proj_dir.clone(), "page": 1})),
+        (
+            "show_hidden",
+            serde_json::json!({"dir": proj_dir.clone(), "show_hidden": false}),
+        ),
+    ] {
+        let mut value = serde_json::json!({
+            "action": "dir",
+            "view": "browse",
+            "op": op,
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        });
+        for (key, field) in extra.as_object().unwrap() {
+            value[key] = field.clone();
+        }
+        let result = app.host_action(value).await.expect("the browse rebuild answers");
+        assert!(
+            card_text(&result.card.expect("the browse rebuild answers a card")).contains("当前目录"),
+            "`{op}` rebuilds the browse card"
+        );
+        assert!(result.toast.is_none(), "`{op}` is silent: {:?}", result.toast);
+    }
+
+    // 选择 on a directory: a pending at its canonical path.
+    let result = app
+        .host_action(browse_action("pick", &alpha.to_string_lossy()))
+        .await
+        .expect("browse pick answers");
+    let canonical_alpha = std::fs::canonicalize(&alpha).unwrap();
+    assert!(result.card.is_some(), "browse pick refreshes the card");
+    let expected_pick = format!(
+        "下一条消息将在目录 `{}` 创建会话",
+        canonical_alpha.to_string_lossy()
+    );
+    assert_eq!(result.toast.as_deref(), Some(expected_pick.as_str()));
+
+    // 建话题 without the card's own message reference: the shared refusal.
+    let result = app
+        .host_action(browse_action("topic", &proj_dir))
+        .await
+        .expect("browse topic answers");
+    assert!(result.card.is_none());
+    assert_eq!(result.toast.as_deref(), Some("无法创建话题（缺少卡片消息引用）"));
+
+    // 选择 on a file: only directories can be selected.
+    let result = app
+        .host_action(browse_action("pick", &file.to_string_lossy()))
+        .await
+        .expect("the file pick answers");
+    assert!(result.card.is_none());
+    let expected_missing = format!("目录不存在：{}", file.to_string_lossy());
+    assert_eq!(result.toast.as_deref(), Some(expected_missing.as_str()));
+
+    // An op neither card knows: the generic refusal.
+    let result = app
+        .host_action(browse_action("attach", &proj_dir))
+        .await
+        .expect("the unknown browse op answers");
+    assert!(result.card.is_none());
+    assert_eq!(result.toast.as_deref(), Some("无效操作"));
+}

@@ -417,3 +417,36 @@ async fn host_card_action_proceeds() {
         "the Host's click must reach the backend"
     );
 }
+
+/// The picker verbs sit behind the same card-action gate as every other click
+/// (#1122): a stranger's `/switch` 接管 is refused before the verb runs, so no
+/// mapping is written. Pins that moving `switch`/`dir`/`sub` behind the seam
+/// cannot let a click skip the Host gate.
+#[tokio::test]
+async fn non_host_switch_click_is_refused_before_the_verb() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let mut value = serde_json::json!({
+        "action": "switch",
+        "op": "adopt",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "session_id": "ses_free",
+    });
+    value["operator_open_id"] = serde_json::json!("ou_mallory");
+    let result = app.handle_card_action(value).await.expect("a refusal result");
+
+    assert!(result.card.is_none(), "a refusal must not patch the card");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("此 cola 已设为私有，仅限机主使用。")
+    );
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    assert!(
+        app.sessions.lock().await.get_active(&key).is_none(),
+        "the refused click adopts nothing"
+    );
+}
