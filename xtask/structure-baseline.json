@@ -2,11 +2,32 @@
   "version": 1,
   "functions": [
     {
+      "path": "src/bridge/card_action/dir.rs",
+      "function": "handle_dir_browse_action",
+      "metric": "too_many_lines",
+      "value": 116,
+      "body": "0206a01450ced91e"
+    },
+    {
       "path": "src/bridge/card_action/file.rs",
       "function": "handle_file_card_action",
       "metric": "too_many_lines",
       "value": 251,
       "body": "89705ccd7514a28f"
+    },
+    {
+      "path": "src/bridge/card_action/switch.rs",
+      "function": "handle_switch_card_action",
+      "metric": "cognitive_complexity",
+      "value": 28,
+      "body": "383d7f5a890f7a8c"
+    },
+    {
+      "path": "src/bridge/card_action/switch.rs",
+      "function": "handle_switch_card_action",
+      "metric": "too_many_lines",
+      "value": 204,
+      "body": "383d7f5a890f7a8c"
     },
     {
       "path": "src/bridge/chain/reconcile.rs",
@@ -119,27 +140,6 @@
       "metric": "too_many_lines",
       "value": 176,
       "body": "73e257fa6be07608"
-    },
-    {
-      "path": "src/bridge/handler.rs",
-      "function": "handle_dir_browse_action",
-      "metric": "too_many_lines",
-      "value": 116,
-      "body": "0206a01450ced91e"
-    },
-    {
-      "path": "src/bridge/handler.rs",
-      "function": "handle_switch_card_action",
-      "metric": "cognitive_complexity",
-      "value": 28,
-      "body": "383d7f5a890f7a8c"
-    },
-    {
-      "path": "src/bridge/handler.rs",
-      "function": "handle_switch_card_action",
-      "metric": "too_many_lines",
-      "value": 204,
-      "body": "383d7f5a890f7a8c"
     },
     {
       "path": "src/bridge/handler.rs",
@@ -641,7 +641,7 @@
     },
     {
       "path": "src/bridge/handler.rs",
-      "lines": 5835
+      "lines": 4851
     },
     {
       "path": "src/bridge/handles.rs",
@@ -706,6 +706,10 @@
       "function": "trait Backend: ServerLifecycle + Send + Sync::steer"
     },
     {
+      "path": "src/bridge/card_action/switch.rs",
+      "function": "impl App::topic_adopt_target"
+    },
+    {
       "path": "src/bridge/chain/reconcile.rs",
       "function": "ending_pipeline"
     },
@@ -756,10 +760,6 @@
     {
       "path": "src/bridge/external.rs",
       "function": "impl ExternalFlow::split_wake_continuation"
-    },
-    {
-      "path": "src/bridge/handler.rs",
-      "function": "impl App::topic_adopt_target"
     },
     {
       "path": "src/bridge/handles.rs",
