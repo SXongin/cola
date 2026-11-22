@@ -578,6 +578,82 @@ async fn error_card_retry_reuses_the_unstored_id_and_replies_a_new_card() {
     );
 }
 
+/// Characterization for the CardAction seam (#1119): the Error card's
+/// 「🔄 重试」 click is the `{action, session_id}` pair and nothing else, and
+/// that exact payload acks with the retrying toast and no card. The pair is
+/// pinned here so moving the verb's body behind the seam (#1156) cannot change
+/// what the button sends or what the Host sees.
+#[tokio::test]
+async fn the_retry_click_carries_two_keys_and_acks_with_the_retrying_toast() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.fail_prompts(1, "Simulated provider failure");
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, Arc::new(mock), platform.clone()).unwrap());
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let error_card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the failed prompt renders the error card");
+    let button = card_buttons(&error_card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "retry")
+        .expect("the Error card offers the retry button");
+    let mut keys: Vec<&str> = button["value"]
+        .as_object()
+        .expect("the button carries an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["action", "session_id"],
+        "the retry click carries exactly these keys: {}",
+        button["value"]
+    );
+    assert_eq!(button["value"]["action"], "retry");
+    assert_eq!(button["value"]["session_id"], "ses_test");
+
+    let ack = app
+        .host_action(button["value"].clone())
+        .await
+        .expect("the retry click acks");
+    assert_retry_ack(Some(ack));
+}
+
+/// Characterization for the CardAction seam (#1119): a retry click that names
+/// no session is refused with NO result — not a toast — so the seam cannot
+/// answer a stale card on the verb's behalf.
+#[tokio::test]
+async fn the_retry_click_without_a_session_is_not_answered() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    let ack = app.host_action(serde_json::json!({ "action": "retry" })).await;
+    assert!(
+        ack.is_none(),
+        "a retry click naming no session is refused with no result"
+    );
+}
+
 /// The settled-failure cell of the retry matrix (spec #391): the failed turn's
 /// newest assistant reply carries a terminal finish, so a same-id re-post
 /// would be a server no-op. The retry takes a FRESH `msg_cola_` id, marks the
