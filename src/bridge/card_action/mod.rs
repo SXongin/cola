@@ -43,7 +43,9 @@ mod mcp;
 mod model;
 mod perm;
 mod question;
+mod resume;
 mod retry;
+mod skill;
 mod terminal;
 mod think;
 mod turn_diff;
@@ -155,6 +157,12 @@ pub(crate) const VERBS: &[Entry] = &[
         run: retry::run,
     },
     Entry {
+        action: "resume",
+        op: None,
+        gate: Gate::Always,
+        run: resume::run,
+    },
+    Entry {
         action: "cleanup",
         op: None,
         gate: Gate::Always,
@@ -204,6 +212,15 @@ pub(crate) const VERBS: &[Entry] = &[
         op: None,
         gate: Gate::Always,
         run: think::run_clear,
+    },
+    // The `/skill` picker (#664): a row tap is the default; its `search`/`page`
+    // clicks are the same module's other branch, selected through this default
+    // entry (the body parses `op` itself, exactly as it did in `handler.rs`).
+    Entry {
+        action: "skill",
+        op: None,
+        gate: Gate::Always,
+        run: skill::run,
     },
 ];
 

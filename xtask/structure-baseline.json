@@ -641,7 +641,7 @@
     },
     {
       "path": "src/bridge/handler.rs",
-      "lines": 6558
+      "lines": 6287
     },
     {
       "path": "src/bridge/handles.rs",

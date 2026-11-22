@@ -394,22 +394,22 @@ struct TurnDiffRead {
 }
 
 /// One Turn Diff callback's whole routing payload, owned by the spawned task.
-struct TurnDiffClick {
-    session_id: String,
+pub(crate) struct TurnDiffClick {
+    pub(crate) session_id: String,
     /// The Turn anchor's user-message id (empty is allowed for future entries;
     /// V2 then asks for the latest Turn, while V1 cannot aggregate without it).
-    from: String,
+    pub(crate) from: String,
     /// The per-child-session routing key the #477 button carries.
-    directory: String,
+    pub(crate) directory: String,
     /// The clicked Turn card, which the File Message replies under
     /// (`open_message_id` — never part of the card's own JSON).
-    message_id: String,
+    pub(crate) message_id: String,
 }
 
 /// RAII claim for one in-flight Turn Diff delivery. A duplicate click is
 /// acknowledged without spawning a second one; Drop releases the claim —
 /// removing a `Sending` entry so a failed or cancelled attempt stays retryable.
-struct TurnDiffClaim {
+pub(crate) struct TurnDiffClaim {
     sends: Arc<std::sync::Mutex<indexmap::IndexMap<(String, String), TurnDiffSendState>>>,
     key: (String, String),
 }
@@ -2043,7 +2043,7 @@ impl App {
     /// ([`Self::ensure_server_for`]): the skill list comes from the server, so a
     /// serverless cola must attach or spawn before the read — otherwise every id
     /// reads as unknown and the picker is empty. See the comment in the body.
-    async fn handle_skill_command(
+    pub(crate) async fn handle_skill_command(
         self: &Arc<Self>,
         thread_key: ThreadKey,
         msg: crate::bridge::IncomingMessage,
@@ -3252,7 +3252,6 @@ impl App {
                 return (verb.run)(self, &value, deadline, callback_started).await;
             }
             match action {
-                "resume" => self.handle_resume_action(&value).await,
                 "switch" => self.handle_switch_card_action(&self.core, &value, deadline).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value, deadline).await,
@@ -3272,7 +3271,6 @@ impl App {
                     }
                     _ => self.handle_file_card_action(&self.core, &value).await,
                 },
-                "skill" => self.handle_skill_card_action(&value).await,
                 _ => None,
             }
         };
@@ -4986,174 +4984,6 @@ impl App {
         )
     }
 
-    /// Handle a `/skill` picker card callback (#664): `op: "search"` and
-    /// `op: "page"` rebuild the card in place ([`Self::rebuild_skill_card`]);
-    /// anything else is a ROW TAP (spec #652, ticket #656): a row carries the
-    /// skill's exact id, and the tap dispatches it straight to
-    /// [`Self::handle_skill_command`] — the same submit path a typed command
-    /// takes, minus the text parse. The id is NOT round-tripped as
-    /// `/skill <id>` text: V1's id IS the skill name, which can contain
-    /// whitespace (`Implement Spec`), and `/skill Implement Spec` would parse as
-    /// two ids and resolve neither. The click must ack within 3s while a turn
-    /// runs for the length of a model reply, so the submission is spawned off
-    /// the ack; the picker card stays put (the dedicated loaded-skill card
-    /// replies under the ORIGINAL user message, spec #655), and the
-    /// agent/autoaccept toasts already established that a picker does not
-    /// replace itself on a pick.
-    async fn handle_skill_card_action(
-        self: &Arc<Self>,
-        value: &serde_json::Value,
-    ) -> Option<CardActionResult> {
-        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        if op == "search" || op == "page" {
-            return Some(self.rebuild_skill_card(value).await);
-        }
-        let id = value.get("value").and_then(|v| v.as_str()).unwrap_or("");
-        if id.is_empty() {
-            return None;
-        }
-        let app = Arc::clone(self);
-        let value = value.clone();
-        let toast = format!("正在加载技能 {id}…");
-        let id = id.to_string();
-        tokio::spawn(async move {
-            // The Chat/Topic kind the picker was sent in: every button carries
-            // it next to chat_id/thread_id, since a click has no chat_type of
-            // its own (see `build_skill_card`).
-            let callback_string =
-                |key: &str| value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let chat_id = callback_string("chat_id");
-            // A non-topic key's `thread_id` IS its `chat_id` (ThreadKey), so
-            // drop it: re-classifying must not mistake the top level for a
-            // topic. A real topic's `thread_id` differs and is kept.
-            let thread_id = value
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .filter(|id| *id != chat_id)
-                .map(str::to_string);
-            let chat_type = {
-                let t = callback_string("chat_type");
-                if t.is_empty() { "group".to_string() } else { t }
-            };
-            let requester = value
-                .get("operator_open_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            // The loaded-skill card (and the turn's card) must reply under the
-            // ORIGINAL user message the picker was sent under, exactly like a
-            // typed dispatch — not under the picker card. The picker's buttons
-            // carry that id (`reply_message_id`, see `build_skill_card`); a card
-            // built before that field existed falls back to the picker's own
-            // message.
-            let reply_to = {
-                let carried = callback_string("reply_message_id");
-                if carried.is_empty() {
-                    callback_string("open_message_id")
-                } else {
-                    carried
-                }
-            };
-            let kind = ConversationKind::classify(&chat_type, thread_id.as_deref());
-            let thread_key = kind.thread_key(&chat_id, thread_id.as_deref());
-            app.handle_skill_command(
-                thread_key,
-                crate::bridge::IncomingMessage {
-                    message_id: reply_to,
-                    chat_id,
-                    chat_type,
-                    thread_id,
-                    parent_id: None,
-                    text: format!("#{id}"),
-                    images: vec![],
-                    files: vec![],
-                    omitted: vec![],
-                    requester_open_id: requester,
-                },
-                crate::bridge::command::SkillInvocation {
-                    ids: vec![id],
-                    picker_on_empty: true,
-                },
-            )
-            .await;
-        });
-        Some(CardActionResult {
-            card: None,
-            toast: Some(toast),
-        })
-    }
-
-    /// Rebuild the `/skill` picker card in place for an `op: "search"` /
-    /// `op: "page"` callback (#664). The filter (keyword, page) rides the button
-    /// payload (ADR-0052); the skill list is re-read from the server — unlike
-    /// `/dir`, which reads the local store — scoped to the Chat/Topic's project
-    /// directory. Best-effort: a failed read degrades to the no-skills state.
-    /// The `chat_type` + `reply_message_id` the picker carries ride back onto the
-    /// fresh rows, so a later tap still replies the loaded-skill card under the
-    /// ORIGINAL user message (spec #655). No Lazy Start here: a rebuild never
-    /// submits a prompt, and the ack must stay fast.
-    async fn rebuild_skill_card(self: &Arc<Self>, value: &serde_json::Value) -> CardActionResult {
-        let thread_key = thread_key_from_value(value);
-        let keyword = value
-            .get("keyword")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        // A missing/garbage page reads as 1; the builder clamps an out-of-range
-        // page to the last.
-        let page = value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-        // The picker's own `chat_type`, absent only on the WS name-only
-        // form-submit fallback. Defaulting to "group" is inert for routing:
-        // `ConversationKind::thread_key` keys every non-topic kind on `chat_id`,
-        // and a real topic is recognised by its distinct `thread_id`, not the
-        // chat type — so the rebuilt rows route identically either way. Only the
-        // tap's reply target degrades (below), the accepted fallback shape.
-        let chat_type = value
-            .get("chat_type")
-            .and_then(|v| v.as_str())
-            .filter(|t| !t.is_empty())
-            .unwrap_or("group")
-            .to_string();
-        // The original user message the picker replied under; a card built
-        // before this field existed (or the name-only form-submit fallback)
-        // falls back to the picker card's own message.
-        let reply_message_id = value
-            .get("reply_message_id")
-            .and_then(|v| v.as_str())
-            .filter(|id| !id.is_empty())
-            .or_else(|| value.get("open_message_id").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_string();
-        let card = self
-            .build_skill_card_for(&thread_key, &keyword, page, &chat_type, &reply_message_id)
-            .await;
-        CardActionResult {
-            card: Some(card),
-            toast: None,
-        }
-    }
-
-    /// Read the skills for `thread_key`'s project directory, narrow them by
-    /// `keyword` (id / name / description), and window them to `page` (#664).
-    async fn build_skill_card_for(
-        self: &Arc<Self>,
-        thread_key: &ThreadKey,
-        keyword: &str,
-        page: usize,
-        chat_type: &str,
-        message_id: &str,
-    ) -> serde_json::Value {
-        let directory = self.command_handles().current_project_directory(thread_key).await;
-        let skills = self
-            .client
-            .list_skills((!directory.is_empty()).then_some(directory.as_str()))
-            .await;
-        let filtered = crate::feishu::card::picker::filter_skills(&skills, keyword);
-        crate::feishu::card::picker::build_skill_card(
-            thread_key, &filtered, keyword, page, chat_type, message_id, None,
-        )
-    }
-
     /// The claim-and-dispatch preamble the Error card's retry (spec #391) and
     /// the Unreceived card's 重新发起 (#437) share: claim `from`'s recovery
     /// action (the atomic double-click gate), resolve the thread and directory
@@ -5209,86 +5039,9 @@ impl App {
         })
     }
 
-    /// Handle the Turn card's 「🔍 查看完整变化」 click (spec #797, ticket #801).
-    ///
-    /// Feishu's card callback has a 3 s, no-retry budget (ADR-0078) and a diff
-    /// fetch + HTML upload cannot fit it, so the click claims the Turn, spawns
-    /// the delivery and returns a Toast immediately. The in-process guard is
-    /// keyed by `(session_id, from)` — the card's exact Turn identity — and is
-    /// bounded like the File Message once-guard: a later click is a no-op
-    /// (「已发送」, or the ambiguous-send wording) and never generates or uploads
-    /// again. Distinct Turns are distinct keys.
-    pub(crate) async fn handle_turn_diff_action(
-        self: &Arc<Self>,
-        value: &serde_json::Value,
-    ) -> Option<CardActionResult> {
-        let session_id = value
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let from = value
-            .get("from")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let directory = value
-            .get("directory")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let message_id = value
-            .get("open_message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if session_id.is_empty() || message_id.is_empty() {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("无效操作".to_string()),
-            });
-        }
-        let key = (session_id.clone(), from.clone());
-        {
-            let sends = self
-                .turn_diff_sends
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(state) = sends.get(&key) {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(turn_diff_state_toast(*state).to_string()),
-                });
-            }
-        }
-        let Some(claim) = self.claim_turn_diff(&key) else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("正在生成完整 diff…".to_string()),
-            });
-        };
-        let click = TurnDiffClick {
-            session_id,
-            from,
-            directory,
-            message_id,
-        };
-        let app = Arc::clone(self);
-        tokio::spawn(async move {
-            let _claim = claim;
-            app.run_turn_diff_delivery(click).await;
-        });
-        Some(CardActionResult {
-            card: None,
-            toast: Some("正在生成完整 diff…".to_string()),
-        })
-    }
-
     /// Claim one Turn Diff delivery. `None` means a delivery for the same
     /// Turn is already in flight (the guard's Drop releases a failed one).
-    fn claim_turn_diff(&self, key: &(String, String)) -> Option<TurnDiffClaim> {
+    pub(crate) fn claim_turn_diff(&self, key: &(String, String)) -> Option<TurnDiffClaim> {
         let mut sends = self
             .turn_diff_sends
             .lock()
@@ -5308,6 +5061,17 @@ impl App {
         })
     }
 
+    /// The Toast a repeated Turn Diff click answers from its stored state,
+    /// `None` when the Turn has no delivery recorded (#801).
+    pub(crate) fn turn_diff_state_toast(&self, key: &(String, String)) -> Option<&'static str> {
+        self.turn_diff_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+            .map(turn_diff_state_toast)
+    }
+
     /// Mark a delivery's terminal state. The RAII claim leaves terminal states
     /// in place (only `Sending` is removed on drop).
     fn set_turn_diff_state(&self, key: &(String, String), state: TurnDiffSendState) {
@@ -5325,7 +5089,7 @@ impl App {
     /// self-contained HTML artifact, upload it once and post exactly ONE File
     /// Message under the clicked Turn card. Every network step is bounded by
     /// the viewer transfer's bound; every failure is spoken, never dropped.
-    async fn run_turn_diff_delivery(self: &Arc<Self>, click: TurnDiffClick) {
+    pub(crate) async fn run_turn_diff_delivery(self: &Arc<Self>, click: TurnDiffClick) {
         let key = (click.session_id.clone(), click.from.clone());
         let timeout_ms = self
             .viewer_transfer_timeout_ms
@@ -6510,41 +6274,6 @@ impl App {
         }
     }
 
-    /// Handle the Unreceived card's 重新发起 action (ADR-0062, #437): on V2 the
-    /// click interrupts (a no-op when the Session is already idle) and resumes,
-    /// promoting the queued steer at the new run's start; on V1, which has no
-    /// resume endpoint, the action degrades to resubmitting the message as a
-    /// new Turn. Either way the already-admitted message is reused, never
-    /// retyped, and the transcript message is never duplicated.
-    ///
-    /// The card callback must ack within 3s, so the click claims the action
-    /// (the same atomic double-click guard the Error card's retry uses), spawns
-    /// the pipeline and returns a toast immediately. A claim that cannot
-    /// proceed (no thread mapping, or a prompt already in flight) is released,
-    /// so a later press can try again.
-    async fn handle_resume_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
-        let RecoveryClick {
-            recovery,
-            thread_key,
-            directory,
-            handles,
-        } = self
-            .claim_recovery_click(value, crate::feishu::card::CardState::Unreceived, "resume")
-            .await?;
-        let app = Arc::clone(self);
-        let span = span::turn(&recovery.session_id, &thread_key, None);
-        tokio::spawn(
-            async move {
-                app.run_resume(handles, recovery, thread_key, directory).await;
-            }
-            .instrument(span),
-        );
-        Some(CardActionResult {
-            card: None,
-            toast: Some("正在重新发起...".to_string()),
-        })
-    }
-
     /// The resume pipeline, off the ack path.
     ///
     /// V2 (the generation has the resume write): interrupt first — a no-op
@@ -6564,7 +6293,7 @@ impl App {
     ///
     /// A failed write releases the claim and leaves the card Unreceived: the
     /// button keeps working for a later press, never a dead end.
-    async fn run_resume(
+    pub(crate) async fn run_resume(
         self: Arc<Self>,
         handles: crate::bridge::handles::TurnHandles,
         recovery: crate::bridge::turn::TurnRecovery,
