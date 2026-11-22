@@ -1322,3 +1322,125 @@ fn pager_next_value(card: &serde_json::Value) -> Option<serde_json::Value> {
         .then(|| e["columns"][2]["elements"][0]["value"].clone())
     })
 }
+
+// ---------------------------------------------------------------------------
+// #1124 — the `/skill` picker behind the CardAction seam. The row tap is what
+// the seam's `skill` entry handles; its payload keys and its exact
+// `CardActionResult` are pinned so moving the body out of `handler.rs` cannot
+// change either. The search/page rebuilds are the same entry's other branch and
+// are pinned here too.
+// ---------------------------------------------------------------------------
+
+/// A picker row carries exactly the six routing keys, and a tap on it answers
+/// the loading toast with no card: the picker stays put while the spawned
+/// `#<id>` submission replies its own card under the original user message.
+#[tokio::test]
+async fn the_skill_row_click_pins_its_payload_keys_and_exact_result() {
+    let fx = SkillFixture::build().await;
+    fx.send("/skill").await;
+
+    let cards = fx.platform.replied_cards().await;
+    let row = crate::bridge::test_support::card_buttons(&cards[0])
+        .into_iter()
+        .find(|button| button["value"]["action"] == "skill")
+        .expect("the picker renders a skill row")
+        .clone();
+    let value = row["value"].clone();
+    assert_eq!(
+        value_keys(&value),
+        [
+            "action",
+            "chat_id",
+            "chat_type",
+            "reply_message_id",
+            "thread_id",
+            "value"
+        ],
+        "the row click carries exactly these keys: {value}"
+    );
+    assert_eq!(value["action"], "skill");
+    assert_eq!(value["chat_id"], "chat_1");
+    assert_eq!(value["thread_id"], "chat_1");
+    assert_eq!(value["chat_type"], "p2p");
+    assert_eq!(value["reply_message_id"], "msg_skill");
+    assert_eq!(value["value"], "implement-spec");
+
+    let ack = fx.app.host_action(value).await.expect("the tap must ack");
+    assert!(ack.card.is_none(), "the picker does not replace itself on a pick");
+    assert_eq!(ack.toast.as_deref(), Some("正在加载技能 implement-spec…"));
+
+    // The spawned submission is the row's payload, re-entering the typed path.
+    wait_for(&fx.prompt_calls, 1).await;
+    assert_eq!(*fx.prompt_calls.lock().await, vec!["#implement-spec".to_string()]);
+}
+
+/// The picker's page and search buttons carry exactly their routing keys; both
+/// rebuild the card in place (a card, no toast), the same result an `op:
+/// "search"` / `op: "page"` click returns.
+#[tokio::test]
+async fn the_skill_page_and_search_clicks_pin_their_payload_keys_and_results() {
+    let fx = SkillFixture::with_skills(paged_skills(crate::feishu::card::picker::SKILL_PAGE_ROWS + 5)).await;
+    fx.send("/skill").await;
+
+    let cards = fx.platform.replied_cards().await;
+    let next = crate::bridge::test_support::card_buttons(&cards[0])
+        .into_iter()
+        .find(|button| button["value"]["op"] == "page" && button["value"]["page"] == 2)
+        .expect("a >page list renders 下一页")
+        .clone();
+    let page = next["value"].clone();
+    assert_eq!(
+        value_keys(&page),
+        [
+            "action",
+            "chat_id",
+            "chat_type",
+            "keyword",
+            "op",
+            "page",
+            "reply_message_id",
+            "thread_id"
+        ],
+        "the page click carries exactly these keys: {page}"
+    );
+    assert_eq!(page["action"], "skill");
+    assert_eq!(page["op"], "page");
+    assert_eq!(page["page"], 2);
+
+    let flipped = fx.app.host_action(page).await.expect("the page flip must ack");
+    assert!(flipped.toast.is_none(), "a rebuild answers no toast");
+    let card = flipped.card.expect("the page flip rebuilds the card in place");
+
+    let submit = crate::bridge::test_support::card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["op"] == "search")
+        .expect("a >page list renders the search form")
+        .clone();
+    let search = submit["value"].clone();
+    assert_eq!(
+        value_keys(&search),
+        [
+            "action",
+            "chat_id",
+            "chat_type",
+            "op",
+            "reply_message_id",
+            "thread_id"
+        ],
+        "the search submit carries exactly these keys: {search}"
+    );
+    assert_eq!(search["action"], "skill");
+    assert_eq!(search["op"], "search");
+
+    // The extractor attaches the typed keyword before dispatch (the unit tests
+    // cover that extraction), so dispatch the shape the handler actually sees.
+    let mut search = search;
+    search["keyword"] = serde_json::json!("skill-3");
+    let rebuilt = fx.app.host_action(search).await.expect("the search must ack");
+    assert!(rebuilt.toast.is_none(), "a rebuild answers no toast");
+    let card = rebuilt.card.expect("the search rebuilds the card in place");
+    assert!(
+        card.to_string().contains("匹配 `skill-3` 的技能"),
+        "the searched card names the filter: {card}"
+    );
+}

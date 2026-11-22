@@ -4522,3 +4522,70 @@ async fn a_retired_launch_panel_does_not_stuck_panel_the_settle() {
         "V1 has no retirer, so the launch panel keeps its grace"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1124 — the Unreceived card's 重新发起 behind the CardAction seam. The button
+// payload and the click's exact `CardActionResult` are pinned so moving the
+// body out of `handler.rs` cannot change either.
+// ---------------------------------------------------------------------------
+
+/// 「重新发起」 carries exactly `{action, session_id}`, and the click answers
+/// the resume toast with no card: the resumed run re-arms the SAME card, so the
+/// ack never replaces it.
+#[tokio::test]
+async fn the_resume_click_pins_its_payload_keys_and_exact_result() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_resume_supported(true);
+    // The message never lands, so the Turn ends Unreceived and renders the
+    // recovery button.
+    backend.given_transcript("ses_test", vec![SessionTranscript::new(Vec::new())]);
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    Turn::run(&app.turn_handles(), ctx("ses_test", "第一条消息"))
+        .await
+        .unwrap();
+
+    let unreceived = platform.updated_cards().await.last().cloned().unwrap();
+    let button = card_buttons(&unreceived)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "resume")
+        .expect("the Unreceived card offers 重新发起")
+        .clone();
+    let value = button["value"].clone();
+    assert_eq!(
+        value_keys(&value),
+        ["action", "session_id"],
+        "the 重新发起 click carries exactly these keys: {value}"
+    );
+    assert_eq!(value["action"], "resume");
+    assert_eq!(value["session_id"], "ses_test");
+
+    // The resumed run promotes the queued message and settles; script the
+    // transcript first so the spawned pipeline finishes inside the test.
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "第一条消息"),
+            assistant(2_000, "第一轮回答。"),
+        ])],
+    )
+    .await;
+
+    let ack = app
+        .host_action(value)
+        .await
+        .expect("the click must claim the resume");
+    assert!(
+        ack.card.is_none(),
+        "the resumed run re-arms the same card; the ack replaces nothing"
+    );
+    assert_eq!(ack.toast.as_deref(), Some("正在重新发起..."));
+
+    wait_for_card_header(&platform, "完成").await;
+}
