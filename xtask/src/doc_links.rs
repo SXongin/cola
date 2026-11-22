@@ -109,15 +109,13 @@ pub(crate) struct Report {
 }
 
 /// Extract every citation in `content`, one entry per line, deduplicated within
-/// a line so a sentence naming the same target twice is reported once. `root` is
-/// needed because a doc path is resolved against the filesystem (see
-/// [`resolve_doc_path`]).
-pub(crate) fn targets(content: &str, root: &Path) -> Vec<(usize, Target)> {
+/// a line so a sentence naming the same target twice is reported once.
+pub(crate) fn targets(content: &str) -> Vec<(usize, Target)> {
     let mut found = Vec::new();
     for (index, line) in content.lines().enumerate() {
         let mut targets = Vec::new();
         adr_targets(line, &mut targets);
-        doc_path_targets(line, root, &mut targets);
+        doc_path_targets(line, &mut targets);
         source_pin_targets(line, &mut targets);
         targets.sort();
         targets.dedup();
@@ -157,55 +155,37 @@ fn adr_targets(line: &str, out: &mut Vec<Target>) {
 }
 
 /// `docs/research/…` and `docs/reference/…` paths.
-fn doc_path_targets(line: &str, root: &Path, out: &mut Vec<Target>) {
+fn doc_path_targets(line: &str, out: &mut Vec<Target>) {
     for prefix in ["docs/research/", "docs/reference/"] {
         for (start, _) in line.match_indices(prefix) {
             if start > 0 && is_preceding_path_char(previous_char(line, start)) {
                 continue;
             }
-            let path = resolve_doc_path(line, start, prefix.len(), root);
+            let path = doc_path_token(&line[start..]);
             if path.len() <= prefix.len() {
                 continue;
             }
-            if has_traversal(&path) {
-                out.push(Target::InvalidPath { text: path });
+            if has_traversal(path) {
+                out.push(Target::InvalidPath {
+                    text: path.to_string(),
+                });
             } else {
-                out.push(Target::DocPath(path));
+                out.push(Target::DocPath(path.to_string()));
             }
         }
     }
 }
 
-/// The cited doc path: the longest prefix of the whitespace-delimited run that
-/// exists as a file.
+/// The cited doc path: the whitespace-delimited token with an `#anchor` and the
+/// sentence punctuation a citation can butt against removed.
 ///
-/// A character allow-list cannot decide where a path ends — `!`, `*` and a
-/// combining mark are all legal name characters — so the filesystem decides.
-/// When nothing exists, fall back to the delimiter token so the dangling
-/// citation is still reported rather than silently dropped.
-fn resolve_doc_path(line: &str, start: usize, prefix_len: usize, root: &Path) -> String {
-    let rest = &line[start..];
+/// Inside the token every character is allowed — `!`, `*` and a combining mark
+/// are legal name characters, and an allow-list that excludes them hid real
+/// files. Only the token's end is decided here; whether it exists is the
+/// caller's check, so a missing `api.md!.bak` is reported rather than resolved
+/// to an existing `api.md`.
+fn doc_path_token(rest: &str) -> &str {
     let run_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    let mut resolved: Option<&str> = None;
-    for end in prefix_len..=run_len {
-        if !rest.is_char_boundary(end) {
-            continue;
-        }
-        let candidate = &rest[..end];
-        // A shorter existing prefix is the citation only when the character
-        // after it is prose, not a path continuation: `x.md中` is `x.md`, but a
-        // missing `x.md.bak` must not resolve to the existing `x.md`.
-        let followed_by_prose =
-            end == run_len || !is_preceding_path_char(rest[end..].chars().next().unwrap_or(' '));
-        if candidate.len() > prefix_len && followed_by_prose && root.join(candidate).is_file() {
-            resolved = Some(candidate);
-        }
-    }
-    if let Some(path) = resolved {
-        return path.to_string();
-    }
-    // Nothing exists: report the whitespace-delimited token with an anchor and
-    // the sentence punctuation a citation can butt against removed.
     rest[..run_len]
         .split('#')
         .next()
@@ -214,7 +194,6 @@ fn resolve_doc_path(line: &str, start: usize, prefix_len: usize, root: &Path) ->
             '.', ',', ';', ')', ']', '>', '"', '\'', '`', '…', '。', '，', '、', '；', '：', '）', '」',
             '』', '】', '》', '”', '’',
         ])
-        .to_string()
 }
 
 /// `src/…:line` and `src/…:start-end` pins. A bare `src/…` path is not a pin.
@@ -355,6 +334,9 @@ fn read_adrs(root: &Path) -> Result<BTreeMap<String, String>, String> {
     let mut adrs = BTreeMap::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("error: cannot read an entry of {}: {e}", dir.display()))?;
+        if !entry.path().is_file() {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let bytes = name.as_bytes();
         if bytes.len() < 6
@@ -527,7 +509,7 @@ pub(crate) fn check_tree(root: &Path) -> Result<Report, String> {
     };
     for source in &sources {
         let historical = source.path.starts_with(HISTORICAL_PINS_PREFIX);
-        let targets: Vec<(usize, Target)> = targets(&source.content, root)
+        let targets: Vec<(usize, Target)> = targets(&source.content)
             .into_iter()
             .filter(|(_, target)| !(historical && target.is_source_pin()))
             .collect();
@@ -582,10 +564,10 @@ fn run_with(root: &Path, out: &mut impl Write) -> i32 {
 mod tests {
     use super::*;
 
-    /// Extract with no filesystem behind it, so doc paths use their fallback
-    /// token; resolution itself is exercised through [`Tree`].
+    /// Extract one line; resolution against the tree is exercised through
+    /// [`Tree`].
     fn extract(line: &str) -> Vec<(usize, Target)> {
-        targets(line, Path::new("/nonexistent-cola-doc-links"))
+        targets(line)
     }
 
     /// A throwaway repository tree; each test gets its own directory.
@@ -611,6 +593,10 @@ mod tests {
             std::fs::create_dir_all(path.parent().expect("a file has a parent"))
                 .expect("create the parent directory");
             std::fs::write(path, content).expect("write the file");
+        }
+
+        fn dir(&self, relative: &str) {
+            std::fs::create_dir_all(self.root.join(relative)).expect("create the directory");
         }
 
         fn check(&self) -> Report {
@@ -915,7 +901,7 @@ mod tests {
     fn a_missing_path_that_extends_an_existing_one_fails() {
         let tree = Tree::new("extended-path");
         tree.file("docs/reference/api.md", "# api\n");
-        tree.file("docs/note.md", "`docs/reference/api.md.bak`\n");
+        tree.file("docs/note.md", "`docs/reference/api.md!.bak`\n");
         assert_eq!(tree.check().findings.len(), 1);
     }
 
@@ -948,6 +934,18 @@ mod tests {
         std::os::unix::fs::symlink(&tree.root, tree.root.join("docs/up"))
             .expect("create the directory symlink");
         assert!(tree.check().findings.is_empty());
+    }
+
+    /// A directory whose name looks like an ADR is not an ADR: the citation
+    /// must fail as "no such ADR" with the citing line, not as a read error.
+    #[test]
+    fn a_directory_named_like_an_adr_is_not_an_adr() {
+        let tree = Tree::new("adr-directory");
+        tree.dir("docs/adr/9999-ghost.md");
+        tree.file("docs/note.md", "See ADR-9999.\n");
+        let findings = tree.check().findings;
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].to_string().contains("no such ADR"), "{}", findings[0]);
     }
 
     #[test]
