@@ -670,22 +670,22 @@ _Avoid_: Notification, message, signal
 - A **Topic** is created around its **Topic Root** and, when cola opens it, is anchored on its **Topic Anchor**; a cola-created **Topic Root** is a **Topic Cover Card** (ADR-0023)
 - A **Session** contains many **Turns** and has one **Project** and one optional **Agent**; a **Turn** spans one or more **Executions**, and a **Wake** may follow with another **Execution** (ADR-0059)
 - A **Session** is read through one **Session Transcript**, whose projections serve rendering, **Session Sync** and the **Session Snapshot**
-- A **Compaction** is a generation-neutral, **Session**-scoped fact on the **Session Transcript**, never a **Turn**, shown on the live card body's **Timeline** and in the **Session Snapshot** read's recent tail (ADR-0082; the split/restart delivery gap: #1049)
+- A **Compaction** is a generation-neutral, **Session**-scoped fact on the **Session Transcript**, never a **Turn** (ADR-0082)
 - A **Wake Watermark** records which **Wake**s a card chain has announced; the **Sync Watermark** is user-message-scoped (ADR-0061)
-- A **Background Task** run's endings are durable **Task Ending**s under one **Task Run Id**, rendered by whichever card **Background Task State**'s `apply` shows them to (ADR-0080)
+- A **Background Task** run's endings are durable **Task Ending**s under one **Task Run Id** (ADR-0080)
 - A **Card Chain**'s **Rendered Cursor** records how far its card has confirmed rendered (ADR-0071)
 - A **Keyed Submission** carries the **Chain Generation** its writer decided under, and the card-delivery queue orders it (ADR-0072)
 - A **Turn** renders into a **Card Chain**; a pending **Permission**/**Question** rides its newest card as an **Interaction Block**, and resolving one leaves an **Interaction Receipt**
 - A **Session**'s card chain has one **Card Ownership** verdict at a time — the in-process claim × the current card's class — which the **Supplement** routing, the yielded card's write admission, the durable reap and the settle ticket each read (ADR-0060, ADR-0063, ADR-0070, ADR-0109)
-- A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; a **Command** reply does not split it, and `/card` pulls the live card down on explicit request (ADR-0043, ADR-0109)
-- A **Turn** with live runs (Background Tasks or child agents) yields its card (ADR-0059, ADR-0109), and the Session's live runs ride the newest card as one **Background Task Ledger** (ADR-0060)
+- A **Supplement** splits its **Turn**'s **Card Chain** so the continuation card is the newest message; a **Command** reply does not split it (ADR-0043, ADR-0109)
+- A **Turn** with live runs (Background Tasks or child agents) yields its card (ADR-0059, ADR-0109), and the Session's live runs are listed by one **Background Task Ledger** (ADR-0060)
 - One **Runtime Reconciliation** step corroborates every **Session**'s live **Background Tasks**, serving Session Sync, the Turn's drain and the follow/settle loop over the transcript read each already made (ADR-0065, ADR-0073)
 - An **Instant Reminder** pins the conversation while a **Permission**/**Question** is pending; a **Completion Notice** announces a **Turn**'s end (ADR-0059, ADR-0060, ADR-0109)
 - A **Turn** renders one **Tool Panel** per tool call, chosen by the call's **Tool Kind** and **Tool Detail** (ADR-0042, ADR-0105)
-- A **File Content** is a file payload a transcript part carries, delivered beside its **Tool Panel**, as a **File Message**, or recorded from a user message
+- A **File Content** is a file payload a transcript part carries, contrasted with a **Prompt Attachment**, its inbound counterpart
 - A **Directory Browser** lists children and a file row opens a **File Viewer** on the **Path Scope** (ADR-0083)
 - A **Session** receives many **Permissions** and **Questions**
-- A **Session Card** is the one card a **Session** renders into; `/card` pulls it to the newest position or posts it from a **Session Snapshot** read (ADR-0043, ADR-0100)
+- A **Session Card** is the one card a **Session** renders into, live or from a **Session Snapshot** read (ADR-0043, ADR-0100)
 - The **Bridge** reads the **Session Transcript** from a **Backend** and renders **Card** updates on the **Platform**
 - A prompt's **Quoted Context** and **Prompt Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
