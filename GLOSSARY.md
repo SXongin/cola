@@ -682,7 +682,7 @@ _Avoid_: Notification, message, signal
 - One **Runtime Reconciliation** step corroborates every **Session**'s live **Background Tasks** and serves Session Sync, the Turn's drain and the follow/settle loop (ADR-0065, ADR-0073)
 - An **Instant Reminder** and a **Completion Notice** are the two Feishu notifications: the reminder for a pending **Permission**/**Question**, the notice for a **Turn**'s end (ADR-0059, ADR-0060, ADR-0109)
 - A **Turn** renders one **Tool Panel** per tool call, chosen by the call's **Tool Kind** and **Tool Detail** (ADR-0042, ADR-0105)
-- A **File Content** is a file payload a transcript part carries; a **File Message** is the separate message that carries one, and a **Prompt Attachment** is its inbound counterpart
+- A **File Content** is a file payload a transcript part carries; a **File Message** is the separate message that carries one, and a **Prompt Attachment** is its inbound counterpart (ADR-0076)
 - A **Directory Browser** lists children and a file row opens a **File Viewer** on the **Path Scope** (ADR-0083)
 - A **Session** receives many **Permissions** and **Questions**
 - A **Session Card** is the one card a **Session** renders into (ADR-0043, ADR-0100)
