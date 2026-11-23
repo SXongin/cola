@@ -147,3 +147,15 @@ attach seam gets its own research candidate; C8 (`ServerIdentity`) stays HOLD.
 
 - #1140 (this decision), #1141 (the spec), #684 (absorbed), #685 (untouched).
 - ADR-0079 (pointer), ADR-0080, ADR-0105, ADR-0106, ADR-0110.
+
+## Amendment (2026-11-23): two methods beside the durable seam's three
+
+§2's `RunEndingStore` pinned three methods (`ended_at`, `record`, `owed`); the
+landing (#1169) keeps all three with their names, and adds two, because both
+facts are the sidecar's and not the neutral owner's. `observe_run` is the
+read's alias-aware resolve-and-fold in one critical section, so a read's
+observation cannot race a writer minting a second record for the same run —
+the one-lock rule §2's prune depends on. `record_retirement` carries the
+retirement→ending identity and label mapping, which belongs beside the bytes it
+writes: the label rule is the ledger's, and the owner must stay neutral and
+never name a card type.
