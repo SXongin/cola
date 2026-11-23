@@ -936,8 +936,8 @@ fn retire_task_child_evidence(
     Some(retirement)
 }
 
-/// The child-evidence transition for a run no Background Task represents
-/// (`apply_child_evidence`'s run path): a terminal child retires the run as a
+/// The child-evidence transition for a run no Background Task represents (the
+/// child-only run path): a terminal child retires the run as a
 /// [`TaskRetirement`] keyed by its durable identity; a gone child retires it as
 /// lost. `Unfinished` is no evidence and changes nothing.
 fn retire_run_child_evidence(
@@ -1154,4 +1154,709 @@ fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option
         finished_at: ending.finished_at,
         label: ending.identity.label.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::backend::runs::TaskRunIdentity;
+    use crate::backend::{
+        AgentCapabilities, AgentRunRef, DelegationEffect, MessageId, MessageRole, MessageTime, Phase,
+        ShellEnd, ShellRuntime, ToolCall, ToolDetail, ToolStatus, TranscriptMessage,
+    };
+    use crate::bridge::chain::ChainRecords;
+    use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
+
+    const SESSION: &str = "ses_a";
+
+    fn message(calls: Vec<ToolCall>) -> TranscriptMessage {
+        TranscriptMessage {
+            id: MessageId::new("msg_1"),
+            role: MessageRole::Assistant,
+            time: Some(MessageTime {
+                created: 1_000,
+                completed: None,
+            }),
+            model: None,
+            tokens: None,
+            error: None,
+            parts: calls.into_iter().map(Part::Tool).collect(),
+        }
+    }
+
+    fn launch(call_id: &str, children: &[&str], started_at: i64) -> ToolCall {
+        ToolCall {
+            identity: ToolIdentity {
+                name: "task".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Running,
+            started_at: Some(started_at),
+            detail: ToolDetail::Delegation {
+                runs: children
+                    .iter()
+                    .map(|child| AgentRunRef {
+                        run_id: (*child).into(),
+                        status: None,
+                    })
+                    .collect(),
+                effect: DelegationEffect::Launch,
+            },
+            ..ToolCall::default()
+        }
+    }
+
+    fn report(call_id: &str, child: &str, status: ToolStatus, started_at: i64) -> ToolCall {
+        ToolCall {
+            identity: ToolIdentity {
+                name: "subAgentActivity".into(),
+                call_id: call_id.into(),
+            },
+            status,
+            started_at: Some(started_at),
+            detail: ToolDetail::Delegation {
+                runs: vec![AgentRunRef {
+                    run_id: child.into(),
+                    status: None,
+                }],
+                effect: DelegationEffect::Report,
+            },
+            ..ToolCall::default()
+        }
+    }
+
+    fn task(call_id: &str, child: &str, started_at: i64) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: None,
+            child_id: Some(child.into()),
+            started_at: Some(started_at),
+        }
+    }
+
+    fn shell_task(call_id: &str, shell_id: &str, started_at: i64) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: call_id.into(),
+            },
+            shell_id: Some(shell_id.into()),
+            child_id: None,
+            started_at: Some(started_at),
+        }
+    }
+
+    fn run_key(key: &str, child: &str) -> RunKey {
+        RunKey {
+            key: key.into(),
+            call_id: Some(key.into()),
+            shell_id: None,
+            child_id: Some(child.into()),
+            job_id: None,
+            wake_id: None,
+        }
+    }
+
+    /// The owner on a real Chain Record — the durable tier production attaches
+    /// (ADR-0111 §2). Attaching it is what makes a test an absence assertion: a
+    /// transition that only mutated the transcript would leave this store empty.
+    fn owner_with_store() -> (RunLifecycle, Arc<ChainRecords>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = Arc::new(ChainRecords::load(dir.path().join("chain_records.json")));
+        let owner = RunLifecycle::new();
+        owner.attach_store(chains.clone());
+        (owner, chains, dir)
+    }
+
+    fn keys(owner: &RunLifecycle, read: &SessionTranscript) -> Vec<String> {
+        owner.live(read).map(|run| run.run_id.clone()).collect::<Vec<_>>()
+    }
+
+    fn launch_panel_status(read: &SessionTranscript, call_id: &str) -> ToolStatus {
+        read.messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.identity.call_id == call_id => Some(call.status.clone()),
+                _ => None,
+            })
+            .expect("the launch call")
+    }
+
+    /// Invariant 1 (2cbdc717, ADR-0080/0111 §1): **one ending of each class per
+    /// run**. A V2 background subagent is both a Background Task and a derived
+    /// run, so the task path's retirement takes the matching run with it — the
+    /// run path can never mint a second ending for the same child. A re-derived
+    /// class is not recorded again; a different class is its own claim (a
+    /// Cleanup never suppresses a late Wake).
+    ///
+    /// Fails when `retire_task_child_evidence`'s matching-run removal is
+    /// deleted: the run survives, the run path retires it, and the read carries
+    /// two retirements for one child.
+    #[test]
+    fn one_ending_of_each_class_is_recorded_once_per_child() {
+        let (owner, chains, _dir) = owner_with_store();
+        let mut read =
+            SessionTranscript::new(vec![message(vec![launch("call_spawn", &["ses_child"], 1_000)])])
+                .with_background_tasks(vec![task("call_spawn", "ses_child", 1_000)]);
+        read.unconfirmed_tasks.insert("call_spawn".into());
+
+        let retirement = owner
+            .retire(
+                SESSION,
+                RetireRead::Observed(&mut read),
+                "call_spawn",
+                RetireCause::ChildEvidence(ChildEvidence::Terminal {
+                    completed_at: 2_000,
+                    started_at: None,
+                }),
+            )
+            .expect("the task carries the child's ending");
+        assert_eq!(retirement.task.child_id.as_deref(), Some("ses_child"));
+        assert_eq!(read.task_retirements.len(), 1, "one child, one retirement");
+        assert!(
+            read.runs.is_empty(),
+            "the matching run leaves with its task, so the run path cannot re-read it"
+        );
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 2_000,
+                        started_at: None,
+                    }),
+                )
+                .is_none(),
+            "a retired child is no live run: the run path invents no second ending"
+        );
+        assert_eq!(read.task_retirements.len(), 1);
+        let evidence_endings = |session: &str| {
+            chains
+                .endings(session)
+                .into_iter()
+                .flat_map(|record| record.endings)
+                .filter(|ending| ending.class == TaskEndingClass::Evidence)
+                .count()
+        };
+        assert_eq!(
+            evidence_endings(SESSION),
+            1,
+            "the durable ending was recorded once"
+        );
+
+        // A class is the claim, not the run: the Cleanup and the Wake that
+        // follows it are two facts about one run (ADR-0080), while a second
+        // Cleanup is the same claim already made.
+        let mut cleaned =
+            SessionTranscript::new(vec![message(vec![launch("call_clean", &["ses_clean"], 1_000)])])
+                .with_background_tasks(vec![task("call_clean", "ses_clean", 1_000)]);
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut cleaned),
+                    "call_clean",
+                    RetireCause::Cleanup { now_ms: 3_000 },
+                )
+                .is_some()
+        );
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut cleaned),
+                    "call_clean",
+                    RetireCause::Cleanup { now_ms: 4_000 },
+                )
+                .is_none(),
+            "the click's second application names no live run"
+        );
+        owner.retire(
+            SESSION,
+            RetireRead::Commit,
+            "",
+            RetireCause::Wake {
+                run: Box::new(run_key("call_clean", "ses_clean")),
+                ending: Box::new(TaskEnding::owed(
+                    TaskEndingClass::Wake,
+                    TaskRunIdentity::default(),
+                )),
+            },
+        );
+        let record = chains
+            .endings(SESSION)
+            .into_iter()
+            .find(|record| record.run.names("call_clean"))
+            .expect("the cleaned run's record");
+        assert_eq!(
+            record
+                .endings
+                .iter()
+                .filter(|ending| ending.class == TaskEndingClass::Cleanup)
+                .count(),
+            1,
+            "a class is recorded once: {record:?}"
+        );
+        assert_eq!(
+            record
+                .endings
+                .iter()
+                .filter(|ending| ending.class == TaskEndingClass::Wake)
+                .count(),
+            1,
+            "a Cleanup does not suppress the late Wake's own class: {record:?}"
+        );
+    }
+
+    /// Invariant 2 (268ec8e3, 51c3dfa1, ADR-0111 §1): a run the client reports
+    /// **terminal keeps its row while it owes an ending**. The client's status is
+    /// evidence toward the transition, never the definition of live: the run
+    /// leaves only when its own durable ending resolves it, so the ledger keeps
+    /// its ⚠️ row and the entry exists for the card.
+    ///
+    /// Fails when `live` is changed to filter on the client's status (the branch
+    /// this invariant replaced): the row would vanish with no entry.
+    #[test]
+    fn a_terminal_run_keeps_its_row_while_it_owes_an_ending() {
+        let owner = RunLifecycle::new();
+        let mut read = SessionTranscript::new(vec![message(vec![
+            launch("call_spawn", &["ses_child"], 1_000),
+            report("call_report", "ses_child", ToolStatus::Completed, 2_000),
+        ])]);
+        assert_eq!(read.runs[0].status, RunStatus::Completed);
+        owner.observe(SESSION, &mut read, LiveRunSurface::full());
+        assert_eq!(
+            read.runs.len(),
+            1,
+            "a terminal run that owes an ending keeps its row"
+        );
+        assert_eq!(keys(&owner, &read), vec!["ses_child".to_string()]);
+
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 3_000,
+                        started_at: None,
+                    }),
+                )
+                .is_some(),
+            "the child's own evidence is the ending"
+        );
+        assert!(read.runs.is_empty(), "the ending resolves the row");
+        assert!(keys(&owner, &read).is_empty());
+    }
+
+    /// Invariant 3 (2cbdc717, 51c3dfa1): child evidence is ordered by the
+    /// **turn's own start**, not by its completion stamp. A Codex completion
+    /// rounds to the previous turn's start; the evidence a previous turn carried
+    /// must never end the current generation of the same child — on either the
+    /// task path or the run path.
+    ///
+    /// Fails when either path's turn-start comparison is deleted: the stale
+    /// evidence retires the live row.
+    #[test]
+    fn a_previous_turns_child_evidence_never_ends_the_live_run() {
+        let owner = RunLifecycle::new();
+        let stale = ChildEvidence::Terminal {
+            completed_at: 21_000,
+            started_at: Some(5_000),
+        };
+        let mut read =
+            SessionTranscript::new(vec![message(vec![launch("call_spawn", &["ses_child"], 20_000)])])
+                .with_background_tasks(vec![task("call_spawn", "ses_child", 20_000)]);
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut read),
+                    "call_spawn",
+                    RetireCause::ChildEvidence(stale),
+                )
+                .is_none(),
+            "a previous turn's terminal item is no evidence for this one"
+        );
+        assert_eq!(read.background_tasks.len(), 1, "the live task stays listed");
+
+        let mut runs =
+            SessionTranscript::new(vec![message(vec![launch("call_spawn", &["ses_child"], 20_000)])]);
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut runs),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(stale),
+                )
+                .is_none(),
+            "the run path applies the same turn-start rule"
+        );
+        assert_eq!(runs.runs.len(), 1, "the live run stays listed");
+
+        // The current turn's own evidence is the ending.
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut read),
+                    "call_spawn",
+                    RetireCause::ChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 21_000,
+                        started_at: Some(20_500),
+                    }),
+                )
+                .is_some()
+        );
+        assert!(read.background_tasks.is_empty());
+    }
+
+    /// Invariant 4 (604edd53, ADR-0106/0111 §2): the `child_evidence` capability
+    /// axis **gates the read**. A client whose surface does not declare it is
+    /// never asked for a child session's evidence, while its rows and the
+    /// runtime verdict read are untouched. `reports_live_runs` alone is not the
+    /// gate: background runs and child evidence are different declarations.
+    ///
+    /// Fails when the reconcile's `child_evidence` early return is deleted: the
+    /// child read fires and the mock records the call.
+    #[tokio::test]
+    async fn the_child_evidence_axis_gates_the_read() {
+        let mut mock = crate::bridge::test_support::MockBackend::new(Vec::new());
+        mock.capabilities = AgentCapabilities {
+            background_runs: true,
+            child_evidence: false,
+            ..AgentCapabilities::full()
+        };
+        let mock = Arc::new(mock);
+        let reads = Arc::clone(&mock.child_evidence_calls);
+        let backend: Arc<dyn crate::backend::Backend> = mock;
+
+        let mut read =
+            SessionTranscript::new(vec![]).with_background_tasks(vec![task("call_task", "ses_child", 1_000)]);
+        read.unconfirmed_tasks.insert("call_task".into());
+        let pass = crate::bridge::runtime::RuntimeReconcile::new()
+            .observe(&backend, SESSION, "/work", &mut read, 200, None)
+            .await;
+        assert!(pass.is_some(), "the runtime verdict read still runs");
+        assert!(
+            reads.lock().await.is_empty(),
+            "a client without the child_evidence axis is never asked for a child read"
+        );
+        assert_eq!(read.background_tasks.len(), 1, "the unread task keeps its row");
+    }
+
+    /// Invariant 5 (3d611fc5, ADR-0108 §10): the launch panel is the record of
+    /// the request, so it **settles with the run its client reported**: a
+    /// terminal `subAgentActivity` leaves no live ⏳ panel. A sibling still
+    /// running keeps the panel live, one launch settles only when ALL its
+    /// children are terminal, and a reported failure outranks a completion.
+    ///
+    /// Fails when the settle's all-terminal guard is deleted: the panel settles
+    /// beside a live sibling.
+    #[test]
+    fn a_launch_panel_settles_with_its_reported_run() {
+        let mut read = SessionTranscript::new(vec![message(vec![
+            launch("call_pair", &["ses_a", "ses_b"], 1_000),
+            report("call_report_a", "ses_a", ToolStatus::Completed, 2_000),
+        ])]);
+        assert_eq!(
+            launch_panel_status(&read, "call_pair"),
+            ToolStatus::Running,
+            "a live sibling keeps the shared launch panel live"
+        );
+
+        read.messages.push(message(vec![report(
+            "call_report_b",
+            "ses_b",
+            ToolStatus::Error,
+            3_000,
+        )]));
+        let runs = crate::backend::runs::derive_runs(&read.messages);
+        settle_reported_panels(&mut read.messages, &runs);
+        assert_eq!(
+            launch_panel_status(&read, "call_pair"),
+            ToolStatus::Error,
+            "every child is terminal, and a reported failure outranks a completion"
+        );
+    }
+
+    /// Invariant 6 (b6d62cf7, e68516ec, ADR-0080/0111 §1): a **resumed run is a
+    /// new generation** of the same child. A durable ending older than the run's
+    /// newest start does not suppress it — dated or undated (a Lost ending still
+    /// names its generation by the start the derivation captured) — while the
+    /// generation it ended stays retired.
+    ///
+    /// Fails when `observe`'s generation comparison is deleted: the older ending
+    /// prunes the resumed row.
+    #[test]
+    fn a_resumed_run_is_a_new_generation() {
+        let (owner, chains, _dir) = owner_with_store();
+        chains.record_ending(
+            SESSION,
+            &run_key("ses_child", "ses_child"),
+            TaskEnding {
+                class: TaskEndingClass::Evidence,
+                state: TaskEndingState::Owed,
+                finished_at: Some(4_000),
+                evidence: Some(TaskEndingEvidence::ChildEnded),
+                identity: TaskRunIdentity {
+                    started_at: Some(4_000),
+                    ..TaskRunIdentity::default()
+                },
+            },
+        );
+        chains.record_ending(
+            SESSION,
+            &run_key("ses_lost", "ses_lost"),
+            TaskEnding {
+                class: TaskEndingClass::Evidence,
+                state: TaskEndingState::Owed,
+                finished_at: None,
+                evidence: Some(TaskEndingEvidence::Lost),
+                identity: TaskRunIdentity {
+                    started_at: Some(4_000),
+                    ..TaskRunIdentity::default()
+                },
+            },
+        );
+
+        let resumed = |key: &str, at: i64| {
+            SessionTranscript::new(vec![message(vec![launch("call_resume", &[key], at)])])
+        };
+        let mut resumed_dated = resumed("ses_child", 5_000);
+        owner.observe(SESSION, &mut resumed_dated, LiveRunSurface::full());
+        assert_eq!(
+            resumed_dated.runs.len(),
+            1,
+            "a launch after the ending is the child's new generation"
+        );
+        let mut ended_dated = resumed("ses_child", 3_000);
+        owner.observe(SESSION, &mut ended_dated, LiveRunSurface::full());
+        assert!(
+            ended_dated.runs.is_empty(),
+            "the generation the ending covers stays retired"
+        );
+
+        let mut resumed_undated = resumed("ses_lost", 5_000);
+        owner.observe(SESSION, &mut resumed_undated, LiveRunSurface::full());
+        assert_eq!(
+            resumed_undated.runs.len(),
+            1,
+            "an undated ending still names the generation its start captured"
+        );
+        let mut ended_undated = resumed("ses_lost", 3_000);
+        owner.observe(SESSION, &mut ended_undated, LiveRunSurface::full());
+        assert!(ended_undated.runs.is_empty());
+    }
+
+    /// Invariant 7 (9d1e0d19, ce56cd21, f2296b54): **liveness is the reported
+    /// run's**. An `ActivityReports` client states the child's phase and clock on
+    /// the parent read, so the line needs no child transcript; a terminal report
+    /// states no live activity, and once the owner records the run's ending its
+    /// row (the line's source) is gone.
+    ///
+    /// The render's own branch — the merge and clear in
+    /// `gather_render_liveness` — is pinned by the ledger's live-panel tests
+    /// (`a_yielded_subagents_row_shows_its_childs_liveness`); this test pins the
+    /// owner-side source it reads. Fails when the run-child retirement arm is
+    /// removed: the retired run stays in `live()` and keeps a stale line.
+    #[test]
+    fn liveness_reads_the_reported_run_and_leaves_with_its_ending() {
+        let owner = RunLifecycle::new();
+        let read = SessionTranscript::new(vec![message(vec![report(
+            "call_activity",
+            "ses_child",
+            ToolStatus::Running,
+            2_000,
+        )])]);
+        assert_eq!(read.runs.len(), 1, "the report alone creates the run");
+        let run = &read.runs[0];
+        assert!(run.is_live());
+        let liveness = TaskLiveness::from_run(
+            run.activity
+                .as_ref()
+                .expect("a running report states the child's activity"),
+        );
+        assert_eq!(liveness.activity, ChildActivity::Phase(Phase::Waiting));
+        assert_eq!(
+            liveness.last_activity_ms,
+            Some(2_000),
+            "the report's own clock is the line's age source"
+        );
+        assert_eq!(
+            keys(&owner, &read),
+            vec!["ses_child".to_string()],
+            "the reported run is the owner's live projection"
+        );
+
+        // A terminal report states no live activity: the line has no source.
+        let mut terminal = SessionTranscript::new(vec![
+            message(vec![report(
+                "call_activity",
+                "ses_child",
+                ToolStatus::Running,
+                2_000,
+            )]),
+            message(vec![report(
+                "call_done",
+                "ses_child",
+                ToolStatus::Completed,
+                3_000,
+            )]),
+        ]);
+        assert_eq!(terminal.runs[0].status, RunStatus::Completed);
+        assert!(
+            terminal.runs[0].activity.is_none(),
+            "a terminal report leaves no activity to render"
+        );
+        assert!(
+            owner
+                .retire(
+                    SESSION,
+                    RetireRead::Observed(&mut terminal),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 3_000,
+                        started_at: None,
+                    }),
+                )
+                .is_some()
+        );
+        assert!(keys(&owner, &terminal).is_empty(), "the line leaves with its row");
+    }
+
+    /// Absence (the deleted runtime path): the runtime verdict's transition is
+    /// `RunLifecycle::retire`'s, and its ending is recorded **through an
+    /// attached store** at derivation (ADR-0080/0111) — not by a transcript-only
+    /// mutation of the old `apply_*` shape.
+    ///
+    /// Fails if `retire` returns the retirement without recording it (the
+    /// read-local mutation the owner replaced): the store would carry nothing.
+    #[test]
+    fn the_runtime_verdict_records_through_an_attached_store() {
+        let (owner, chains, _dir) = owner_with_store();
+        let mut read =
+            SessionTranscript::new(vec![]).with_background_tasks(vec![shell_task("call_bg", "sh_bg", 1_000)]);
+        owner.apply_task_runtime(
+            SESSION,
+            &mut read,
+            &TaskRuntime {
+                shells: vec![(
+                    "sh_bg".to_string(),
+                    ShellRuntime::Ended {
+                        end: ShellEnd::Exited,
+                        completed_at: Some(2_000),
+                    },
+                )],
+                children: vec![],
+            },
+        );
+        assert!(read.background_tasks.is_empty(), "the verdict retires the row");
+        let record = chains
+            .endings(SESSION)
+            .into_iter()
+            .find(|record| record.run.names("call_bg"))
+            .expect("the verdict's ending is the owner's durable write");
+        let ending = record
+            .endings
+            .iter()
+            .find(|ending| ending.class == TaskEndingClass::Evidence)
+            .expect("the verdict is an evidence ending");
+        assert_eq!(
+            ending.evidence,
+            Some(TaskEndingEvidence::Ended("exited".to_string())),
+            "the store keeps the runtime's own word"
+        );
+        assert_eq!(ending.finished_at, Some(2_000), "and its clock");
+        assert_eq!(ending.state, TaskEndingState::Owed, "nothing has shown it yet");
+    }
+
+    /// Absence (the deleted cleanup path): a click leaves the live list **through
+    /// `RunLifecycle::retire`**, so its Cleanup ending is durable, not a
+    /// read-local mutation the next read would forget.
+    ///
+    /// Fails if `cleanup` goes back to mutating only the transcript: the store's
+    /// record would be empty.
+    #[test]
+    fn a_cleanup_click_records_its_ending_through_retire() {
+        let (owner, chains, _dir) = owner_with_store();
+        let mut read = SessionTranscript::new(vec![]).with_background_tasks(vec![task(
+            "call_clean",
+            "ses_clean",
+            1_000,
+        )]);
+        owner.cleanup(SESSION, &mut read, &["call_clean".to_string()], 3_000);
+        assert!(read.background_tasks.is_empty());
+        let record = chains
+            .endings(SESSION)
+            .into_iter()
+            .find(|record| record.run.names("call_clean"))
+            .expect("the click's ending is recorded");
+        let ending = record
+            .endings
+            .iter()
+            .find(|ending| ending.class == TaskEndingClass::Cleanup)
+            .expect("the click is a Cleanup ending");
+        assert_eq!(ending.finished_at, Some(3_000), "the click's own clock");
+    }
+
+    /// Absence (the deleted `Wake` write): the completion commit's ending goes
+    /// through the owner's read-less `retire`, so a store attached **only** to the
+    /// owner sees it (pinned at the commit site by
+    /// `render::tests::a_committed_wake_records_the_runs_wake_ending`).
+    ///
+    /// Fails if the Wake's ending is recorded by a bare `ChainRecords::record`
+    /// outside `retire`.
+    #[test]
+    fn a_wake_commit_records_through_retire_without_a_read() {
+        let (owner, chains, _dir) = owner_with_store();
+        let wake = RunKey {
+            key: "sh_bg".into(),
+            call_id: None,
+            shell_id: Some("sh_bg".into()),
+            child_id: None,
+            job_id: None,
+            wake_id: Some("msg_wake".into()),
+        };
+        owner.retire(
+            SESSION,
+            RetireRead::Commit,
+            "",
+            RetireCause::Wake {
+                run: Box::new(wake),
+                ending: Box::new(TaskEnding {
+                    class: TaskEndingClass::Wake,
+                    state: TaskEndingState::Owed,
+                    finished_at: Some(2_000),
+                    evidence: Some(TaskEndingEvidence::Wake(Some("completed".into()))),
+                    identity: TaskRunIdentity::default(),
+                }),
+            },
+        );
+        let record = chains
+            .endings(SESSION)
+            .into_iter()
+            .find(|record| record.run.names("sh_bg"))
+            .expect("the Wake's ending");
+        let ending = record
+            .endings
+            .iter()
+            .find(|ending| ending.class == TaskEndingClass::Wake)
+            .expect("the Wake class");
+        assert_eq!(ending.finished_at, Some(2_000));
+        assert_eq!(
+            ending.evidence,
+            Some(TaskEndingEvidence::Wake(Some("completed".into())))
+        );
+    }
 }

@@ -4024,10 +4024,62 @@ mod tests {
         );
     }
 
+    /// A durable tier ONLY the run owner holds: it counts the Wake endings
+    /// recorded through it and delegates every fact to the Chain Record. The
+    /// completion commit's Wake route is `RunLifecycle::retire` (ADR-0111 §2), so
+    /// a reverted direct `ChainRecords::record_ending` bypasses this store — its
+    /// count staying 0 is the absence assertion, and its counterpart (`retire`)
+    /// is the name in the failure message (ADR-0110 §2).
+    struct OwnerOnlyStore {
+        chains: Arc<crate::bridge::chain::ChainRecords>,
+        wake_endings: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::backend::runs::RunEndingStore for OwnerOnlyStore {
+        fn ended_at(&self, session_id: &str, run: &RunKey) -> Option<(Option<i64>, Option<i64>)> {
+            crate::backend::runs::RunEndingStore::ended_at(&*self.chains, session_id, run)
+        }
+
+        fn record(&self, session_id: &str, run: &RunKey, ending: crate::backend::runs::TaskEnding) -> bool {
+            if ending.class == TaskEndingClass::Wake {
+                self.wake_endings
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            crate::backend::runs::RunEndingStore::record(&*self.chains, session_id, run, ending)
+        }
+
+        fn owed(&self, session_id: &str) -> Vec<crate::backend::runs::TaskRunRecord> {
+            crate::backend::runs::RunEndingStore::owed(&*self.chains, session_id)
+        }
+
+        fn observe_run(&self, session_id: &str, held: &RunKey) -> bool {
+            crate::backend::runs::RunEndingStore::observe_run(&*self.chains, session_id, held)
+        }
+
+        fn record_retirement(
+            &self,
+            session_id: &str,
+            retirement: &crate::backend::TaskRetirement,
+            input: Option<&serde_json::Value>,
+        ) -> bool {
+            crate::backend::runs::RunEndingStore::record_retirement(
+                &*self.chains,
+                session_id,
+                retirement,
+                input,
+            )
+        }
+    }
+
     /// ADR-0080: the Wake path WRITES the run's Wake ending — one durable fact
     /// on the run, recorded where its completion is committed — and the entry it
     /// stages carries that same `(run, Wake)` pair, so the delivering body's
     /// confirmation flips its shown bit in the cursor's own write.
+    ///
+    /// The write's ROUTE is the owner's (`RunLifecycle::retire`, ADR-0111 §2):
+    /// the store attached here is held only by the owner, so a completion that
+    /// reverted to a direct `ChainRecords::record_ending` would record on disk
+    /// and leave this count at 0.
     #[tokio::test]
     async fn a_committed_wake_records_the_runs_wake_ending() {
         use crate::bridge::chain::ChainRecords;
@@ -4037,6 +4089,11 @@ mod tests {
         let cards = app.cards_handle();
         let run = planned_run("call_sub");
         let mut acc = StreamAccumulator::new("test");
+        let wake_endings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cards.tasks.runs().attach_store(Arc::new(OwnerOnlyStore {
+            chains: Arc::clone(&cards.chains),
+            wake_endings: Arc::clone(&wake_endings),
+        }));
 
         let inserted = commit_planned_entries(
             &mut acc,
@@ -4058,6 +4115,11 @@ mod tests {
             .expect("the recorded ending is the Wake class");
         assert_eq!(wake.state, TaskEndingState::Owed, "nothing has shown it yet");
         assert_eq!(wake.finished_at, Some(1_000), "the Wake's own clock");
+        assert_eq!(
+            wake_endings.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the completion records through `RunLifecycle::retire`, not a direct Chain Records write"
+        );
 
         // The delivering body's confirmation is what flips the bit.
         cards
