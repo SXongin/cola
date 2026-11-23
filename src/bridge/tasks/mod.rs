@@ -66,9 +66,3 @@ pub(crate) mod state;
 pub(crate) use handle::TasksHandle;
 pub(crate) use model::{identity_of_task, identity_of_wake, task_kind, task_label};
 pub(crate) use state::TaskCell;
-
-/// The run lifecycle's own unit tests (`src/backend/transcript.rs`) still name
-/// the type they construct. Test-only: production reaches the tier through
-/// [`crate::backend::Backend::runs`] (ADR-0111).
-#[cfg(test)]
-pub(crate) type BackgroundTaskOverlay = crate::backend::runs::RunLifecycle;

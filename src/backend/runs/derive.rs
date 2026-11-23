@@ -575,7 +575,7 @@ pub fn child_run_finished(transcript: &SessionTranscript) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::runs::test_seam::TranscriptRunTransitions;
+    use crate::backend::runs::{RetireCause, RetireRead, RunLifecycle};
     use crate::backend::{
         AgentRunRef, ChildEvidence, FinishReason, MessageId, MessageTime, StepFinish, ToolIdentity,
         TurnAnchor, TurnSettle,
@@ -795,13 +795,19 @@ mod tests {
             read.runs[0].started_at, None,
             "an address does not date the child"
         );
-        assert!(read.apply_run_child_evidence(
-            "thread_1",
-            ChildEvidence::Terminal {
-                completed_at: 12_010,
-                started_at: Some(12_001)
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "thread_1",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 12_010,
+                        started_at: Some(12_001)
+                    }),
+                )
+                .is_some()
+        );
         assert!(read.runs.is_empty(), "the child's own turn ends it");
     }
 
@@ -831,13 +837,19 @@ mod tests {
             Some(20_000),
             "the resume dates the new generation"
         );
-        assert!(!read.apply_run_child_evidence(
-            "thread_1",
-            ChildEvidence::Terminal {
-                completed_at: 20_010,
-                started_at: Some(12_001)
-            }
-        ));
+        assert!(
+            !RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "thread_1",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 20_010,
+                        started_at: Some(12_001)
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(read.runs.len(), 1, "the live generation survives");
     }
 
@@ -855,13 +867,19 @@ mod tests {
         let mut done = report("call_report", "thread_1", "completed");
         done.started_at = Some(2_100);
         let mut read = transcript(vec![launch, done]);
-        assert!(read.apply_run_child_evidence(
-            "thread_1",
-            ChildEvidence::Terminal {
-                completed_at: 3_000,
-                started_at: Some(1_900)
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "thread_1",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 3_000,
+                        started_at: Some(1_900)
+                    }),
+                )
+                .is_some()
+        );
         assert!(read.runs.is_empty(), "the child's own ending still applies");
     }
 
@@ -1109,13 +1127,19 @@ mod tests {
             ToolStatus::Running,
             Some(1_000),
         )]);
-        assert!(read.apply_run_child_evidence(
-            "ses_child",
-            ChildEvidence::Terminal {
-                completed_at: 7_000,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 7_000,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert!(read.runs.is_empty());
         let launch_status = read.messages[0]
             .parts
@@ -1699,15 +1723,19 @@ mod tests {
         assert!(run.is_live());
 
         assert!(
-            !read.apply_run_child_evidence(
-                "ses_child",
-                ChildEvidence::Terminal {
-                    // The completion lands AFTER the resume, but the turn it
-                    // belongs to started before it.
-                    completed_at: 6_000,
-                    started_at: Some(4_000)
-                }
-            ),
+            !RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        // The completion lands AFTER the resume, but the turn it
+                        // belongs to started before it.
+                        completed_at: 6_000,
+                        started_at: Some(4_000)
+                    }),
+                )
+                .is_some(),
             "a pre-resume turn is older than the resumed start"
         );
         assert_eq!(read.runs.len(), 1, "the resumed run stays live");
@@ -1832,13 +1860,19 @@ mod tests {
         );
 
         let mut read = read;
-        assert!(read.apply_run_child_evidence(
-            "thread_1",
-            ChildEvidence::Terminal {
-                completed_at: 3,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "thread_1",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 3,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(read.task_retirements.len(), 1);
         assert_eq!(
             read.task_retirements[0].label.as_deref(),
@@ -1882,13 +1916,19 @@ mod tests {
             ToolStatus::Running,
             Some(1),
         )]);
-        assert!(read.apply_run_child_evidence(
-            "ses_child",
-            ChildEvidence::Terminal {
-                completed_at: 9,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 9,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert!(read.runs.is_empty(), "the run leaves the live list");
         assert_eq!(read.task_retirements.len(), 1);
         let retirement = &read.task_retirements[0];
@@ -1920,13 +1960,19 @@ mod tests {
             ToolStatus::Running,
             Some(1_700_000_000_000),
         )]);
-        assert!(read.apply_run_child_evidence(
-            "ses_child",
-            ChildEvidence::Terminal {
-                completed_at: 1_700_000_002_000,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 1_700_000_002_000,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert!(read.runs.is_empty(), "the run retires on its child's evidence");
         assert_eq!(read.task_retirements[0].finished_at, Some(1_700_000_002_000));
     }
@@ -1944,16 +1990,22 @@ mod tests {
             ToolStatus::Running,
             Some(1_500),
         )]);
-        assert!(read.apply_run_child_evidence(
-            "ses_child",
-            ChildEvidence::Terminal {
-                // The wire serializes the turn start into second 1; the run
-                // started at 1_500 ms in the same second. ADR-0108 records the
-                // ambiguity: a same-second start is accepted.
-                completed_at: 2_000,
-                started_at: Some(1_000)
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        // The wire serializes the turn start into second 1; the run
+                        // started at 1_500 ms in the same second. ADR-0108 records the
+                        // ambiguity: a same-second start is accepted.
+                        completed_at: 2_000,
+                        started_at: Some(1_000)
+                    }),
+                )
+                .is_some()
+        );
         assert!(read.runs.is_empty());
 
         let mut read = transcript(vec![call(
@@ -1964,13 +2016,17 @@ mod tests {
             Some(5_000),
         )]);
         assert!(
-            !read.apply_run_child_evidence(
-                "ses_child",
-                ChildEvidence::Terminal {
-                    completed_at: 6_000,
-                    started_at: Some(4_000)
-                }
-            ),
+            !RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 6_000,
+                        started_at: Some(4_000)
+                    }),
+                )
+                .is_some(),
             "a previous turn is stale even when its completion lands after the resume"
         );
 
@@ -1982,13 +2038,17 @@ mod tests {
             Some(1_500),
         )]);
         assert!(
-            !read.apply_run_child_evidence(
-                "ses_child",
-                ChildEvidence::Terminal {
-                    completed_at: 999,
-                    started_at: None
-                }
-            ),
+            !RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut read),
+                    "ses_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 999,
+                        started_at: None
+                    }),
+                )
+                .is_some(),
             "no turn start falls back to the completion clock"
         );
     }

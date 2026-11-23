@@ -3723,7 +3723,7 @@ impl RenderPoll {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::runs::test_seam::TranscriptRunTransitions;
+    use crate::backend::runs::{RetireCause, RetireRead, RunLifecycle};
 
     /// Issue #910 (the CI hang): a poll parked in a transcript read must not
     /// stall `RenderPoll::stop` — and therefore the turn's finalization — when
@@ -4077,7 +4077,7 @@ mod tests {
         let acc = StreamAccumulator::new("test");
         let mut transcript =
             SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
-        transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["call_sub".to_string()], 2_000);
         // The read carries no launch part, so `tool_input` joins nothing.
         assert!(transcript.tool_input("call_sub").is_none());
 
@@ -4661,12 +4661,14 @@ mod tests {
         let acc = StreamAccumulator::new("test");
         let mut transcript =
             SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
-        transcript.apply_child_evidence(
+        let _ = RunLifecycle::new().retire(
+            "",
+            RetireRead::Observed(&mut transcript),
             "call_sub",
-            crate::backend::ChildEvidence::Terminal {
+            RetireCause::ChildEvidence(crate::backend::ChildEvidence::Terminal {
                 completed_at: 2_000,
                 started_at: None,
-            },
+            }),
         );
         let facts = facts_with("call_sub", TaskEndingClass::Legacy, TaskEndingState::Shown);
 
@@ -4705,7 +4707,7 @@ mod tests {
             let acc = StreamAccumulator::new("test");
             let mut transcript =
                 SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
-            transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+            RunLifecycle::new().cleanup("", &mut transcript, &["call_sub".to_string()], 2_000);
 
             assert!(
                 plan_runtime_entries(
@@ -4728,7 +4730,7 @@ mod tests {
         let acc = StreamAccumulator::new("test");
         let mut transcript =
             SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
-        transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["call_sub".to_string()], 2_000);
         let ending = |class: TaskEndingClass, state: TaskEndingState| DurableEnding {
             class,
             state,

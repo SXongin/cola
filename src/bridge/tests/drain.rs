@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::backend::runs::test_seam::TranscriptRunTransitions;
+use crate::backend::runs::{RetireCause, RetireRead, RunLifecycle};
 use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd,
@@ -4471,13 +4471,19 @@ async fn a_retired_launch_panel_does_not_stuck_panel_the_settle() {
     let cards = app.cards_handle();
 
     let mut read = wedged_launch_transcript();
-    assert!(read.apply_run_child_evidence(
-        "ses_child",
-        crate::backend::ChildEvidence::Terminal {
-            completed_at: 3_000,
-            started_at: None
-        }
-    ));
+    assert!(
+        RunLifecycle::new()
+            .retire(
+                "",
+                RetireRead::Observed(&mut read),
+                "ses_child",
+                RetireCause::RunChildEvidence(crate::backend::ChildEvidence::Terminal {
+                    completed_at: 3_000,
+                    started_at: None
+                }),
+            )
+            .is_some()
+    );
     assert!(read.runs.is_empty(), "the child evidence retires the run");
 
     let launch = crate::backend::ToolCall {

@@ -20,11 +20,6 @@ use serde_json::Value;
 
 use super::file_content::FileContent;
 
-// The liveness overlay's bytes moved into the Background Task State module
-// (#682); this module's own tests still exercise the type by name.
-#[cfg(test)]
-use crate::bridge::tasks::BackgroundTaskOverlay;
-
 /// One Session's normalized read: every message the backend reports, decoded
 /// into typed views, in the order the backend returned them, plus the current
 /// generation's interaction facts.
@@ -2473,7 +2468,7 @@ pub enum ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::runs::test_seam::TranscriptRunTransitions;
+    use crate::backend::runs::{RetireCause, RetireRead, RunLifecycle};
 
     fn message(
         id: &str,
@@ -2978,19 +2973,34 @@ mod tests {
             TurnSettle::Waiting,
             "a client-terminal run still owes its evidence"
         );
-        assert!(!failed.apply_run_child_evidence("thread_child", ChildEvidence::Unfinished));
+        assert!(
+            !RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut failed),
+                    "thread_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Unfinished),
+                )
+                .is_some()
+        );
         assert_eq!(
             failed.settle_with(Some(&anchor), true),
             TurnSettle::Waiting,
             "Unfinished evidence is no exit"
         );
-        assert!(failed.apply_run_child_evidence(
-            "thread_child",
-            ChildEvidence::Terminal {
-                completed_at: 1_500,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut failed),
+                    "thread_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 1_500,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(
             failed.task_retirements[0].ending,
             TaskRetirementEnding::ClientFailed
@@ -3000,13 +3010,19 @@ mod tests {
         let mut cancelled = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)]);
         cancelled.runs = vec![run(RunStatus::Cancelled)];
-        assert!(cancelled.apply_run_child_evidence(
-            "thread_child",
-            ChildEvidence::Terminal {
-                completed_at: 1_500,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut cancelled),
+                    "thread_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 1_500,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(
             cancelled.task_retirements[0].ending,
             TaskRetirementEnding::ClientCancelled
@@ -3015,13 +3031,19 @@ mod tests {
         let mut runtime_end = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)]);
         runtime_end.runs = vec![run(RunStatus::Running)];
-        assert!(runtime_end.apply_run_child_evidence(
-            "thread_child",
-            ChildEvidence::Terminal {
-                completed_at: 1_500,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut runtime_end),
+                    "thread_child",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 1_500,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(
             runtime_end.task_retirements[0].ending,
             TaskRetirementEnding::ChildEnded
@@ -3092,7 +3114,7 @@ mod tests {
                 transcript.unconfirmed_tasks.contains("call_activity"),
                 "the ⚠️ row and its button are the wait's affordance"
             );
-            transcript.apply_cleanup(&["call_activity".to_string()], 2_000);
+            RunLifecycle::new().cleanup("", &mut transcript, &["call_activity".to_string()], 2_000);
             assert!(transcript.runs.is_empty(), "the click retires the run");
             assert_eq!(
                 transcript.task_retirements[0].ending,
@@ -3173,45 +3195,69 @@ mod tests {
         // Both children complete: the panel settles only with the last one.
         let mut transcript = read(None);
         assert_eq!(transcript.runs.len(), 2, "one run per named child");
-        assert!(transcript.apply_run_child_evidence(
-            "thread_a",
-            ChildEvidence::Terminal {
-                completed_at: 2_000,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut transcript),
+                    "thread_a",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 2_000,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(
             launch_status(&transcript),
             ToolStatus::Running,
             "the sibling still runs: no ✅ beside a live child"
         );
-        assert!(transcript.apply_run_child_evidence(
-            "thread_b",
-            ChildEvidence::Terminal {
-                completed_at: 3_000,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut transcript),
+                    "thread_b",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 3_000,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(launch_status(&transcript), ToolStatus::Completed);
 
         // A failed child outranks its completed sibling, even though the
         // failure retired first.
         let mut failed = read(Some(RunStatus::Failed));
-        assert!(failed.apply_run_child_evidence(
-            "thread_a",
-            ChildEvidence::Terminal {
-                completed_at: 2_000,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut failed),
+                    "thread_a",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 2_000,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(launch_status(&failed), ToolStatus::Running);
-        assert!(failed.apply_run_child_evidence(
-            "thread_b",
-            ChildEvidence::Terminal {
-                completed_at: 3_000,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut failed),
+                    "thread_b",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 3_000,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         assert_eq!(
             launch_status(&failed),
             ToolStatus::Error,
@@ -3283,13 +3329,19 @@ mod tests {
             .runs
             .retain(|run| run.child_id.as_deref() != Some("thread_a"));
         assert_eq!(transcript.runs.len(), 1, "only B is left in the live list");
-        assert!(transcript.apply_run_child_evidence(
-            "thread_b",
-            ChildEvidence::Terminal {
-                completed_at: 3_000,
-                started_at: None
-            }
-        ));
+        assert!(
+            RunLifecycle::new()
+                .retire(
+                    "",
+                    RetireRead::Observed(&mut transcript),
+                    "thread_b",
+                    RetireCause::RunChildEvidence(ChildEvidence::Terminal {
+                        completed_at: 3_000,
+                        started_at: None
+                    }),
+                )
+                .is_some()
+        );
         let status = transcript
             .messages
             .iter()
@@ -3365,7 +3417,7 @@ mod tests {
             transcript.unconfirmed_tasks.contains("call_sub"),
             "the ⚠️ row and its button are the wait's affordance"
         );
-        transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["call_sub".to_string()], 2_000);
         assert!(
             transcript.background_tasks.is_empty(),
             "the click retires the task"
@@ -3429,14 +3481,14 @@ mod tests {
         // The only child is cleaned: the panel settles with it.
         let mut transcript = transcript_at(&["ses_child"]);
         transcript.unconfirmed_tasks.insert("ses_child".into());
-        transcript.apply_cleanup(&["ses_child".to_string()], 2_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["ses_child".to_string()], 2_000);
         assert!(transcript.runs.is_empty());
         assert_eq!(status(&transcript), ToolStatus::Completed);
 
         // A shared launch keeps reading live while its sibling still runs.
         let mut shared = transcript_at(&["ses_a", "ses_b"]);
         shared.unconfirmed_tasks.insert("ses_a".into());
-        shared.apply_cleanup(&["ses_a".to_string()], 2_000);
+        RunLifecycle::new().cleanup("", &mut shared, &["ses_a".to_string()], 2_000);
         assert_eq!(
             status(&shared),
             ToolStatus::Running,
@@ -3500,19 +3552,23 @@ mod tests {
                 shell_task("call_run", "sh_run"),
                 child_task.clone(),
             ]);
-        transcript.apply_task_runtime(&TaskRuntime {
-            shells: vec![
-                (
-                    "sh_done".into(),
-                    ShellRuntime::Ended {
-                        end: ShellEnd::Exited,
-                        completed_at: Some(2_000),
-                    },
-                ),
-                ("sh_run".into(), ShellRuntime::Running),
-            ],
-            children: vec![("ses_child".into(), ChildRuntime::Inactive)],
-        });
+        RunLifecycle::new().apply_task_runtime(
+            "",
+            &mut transcript,
+            &TaskRuntime {
+                shells: vec![
+                    (
+                        "sh_done".into(),
+                        ShellRuntime::Ended {
+                            end: ShellEnd::Exited,
+                            completed_at: Some(2_000),
+                        },
+                    ),
+                    ("sh_run".into(), ShellRuntime::Running),
+                ],
+                children: vec![("ses_child".into(), ChildRuntime::Inactive)],
+            },
+        );
         assert_eq!(
             transcript
                 .background_tasks
@@ -3543,10 +3599,14 @@ mod tests {
         let mut lost = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![shell_task("call_lost", "sh_lost")]);
-        lost.apply_task_runtime(&TaskRuntime {
-            shells: vec![("sh_lost".into(), ShellRuntime::Missing)],
-            children: vec![],
-        });
+        RunLifecycle::new().apply_task_runtime(
+            "",
+            &mut lost,
+            &TaskRuntime {
+                shells: vec![("sh_lost".into(), ShellRuntime::Missing)],
+                children: vec![],
+            },
+        );
         assert_eq!(
             lost.task_retirements[0].ending,
             TaskRetirementEnding::Lost,
@@ -3565,11 +3625,15 @@ mod tests {
         let mut untouched = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![shell_task("call_bg", "sh_bg")]);
-        untouched.apply_task_runtime(&TaskRuntime {
-            shells: vec![("sh_other".into(), ShellRuntime::Missing)],
-            children: vec![],
-        });
-        untouched.apply_task_runtime(&TaskRuntime::default());
+        RunLifecycle::new().apply_task_runtime(
+            "",
+            &mut untouched,
+            &TaskRuntime {
+                shells: vec![("sh_other".into(), ShellRuntime::Missing)],
+                children: vec![],
+            },
+        );
+        RunLifecycle::new().apply_task_runtime("", &mut untouched, &TaskRuntime::default());
         assert_eq!(untouched.background_tasks.len(), 1);
         assert!(untouched.task_retirements.is_empty());
         assert_eq!(untouched.settle(Some(&anchor)), TurnSettle::Waiting);
@@ -3601,7 +3665,7 @@ mod tests {
         transcript.unconfirmed_tasks.insert("call_clear".into());
         transcript.unconfirmed_tasks.insert("call_keep".into());
 
-        transcript.apply_cleanup(&["call_clear".to_string()], 3_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["call_clear".to_string()], 3_000);
 
         assert_eq!(
             transcript
@@ -3637,11 +3701,11 @@ mod tests {
         );
 
         // An id with no live task invents no retirement.
-        transcript.apply_cleanup(&["call_absent".to_string()], 4_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["call_absent".to_string()], 4_000);
         assert_eq!(transcript.task_retirements.len(), 1);
 
         // The last live task's cleanup is the true end.
-        transcript.apply_cleanup(&["call_keep".to_string()], 4_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["call_keep".to_string()], 4_000);
         assert!(transcript.background_tasks.is_empty());
         assert_eq!(transcript.task_retirements.len(), 2);
         assert_eq!(transcript.settle(Some(&anchor)), TurnSettle::Complete);
@@ -3677,7 +3741,7 @@ mod tests {
         }];
         transcript.unconfirmed_tasks.insert("call_sub".into());
 
-        transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
+        RunLifecycle::new().cleanup("", &mut transcript, &["call_sub".to_string()], 2_000);
 
         assert!(transcript.background_tasks.is_empty());
         assert!(
@@ -3722,12 +3786,14 @@ mod tests {
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![child_task("call_sub", "ses_child")]);
         terminal.unconfirmed_tasks.insert("call_sub".into());
-        terminal.apply_child_evidence(
+        let _ = RunLifecycle::new().retire(
+            "",
+            RetireRead::Observed(&mut terminal),
             "call_sub",
-            ChildEvidence::Terminal {
+            RetireCause::ChildEvidence(ChildEvidence::Terminal {
                 completed_at: 2_000,
                 started_at: None,
-            },
+            }),
         );
         assert!(
             terminal.background_tasks.is_empty(),
@@ -3758,7 +3824,12 @@ mod tests {
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![child_task("call_sub", "ses_child")]);
         gone.unconfirmed_tasks.insert("call_sub".into());
-        gone.apply_child_evidence("call_sub", ChildEvidence::Gone);
+        let _ = RunLifecycle::new().retire(
+            "",
+            RetireRead::Observed(&mut gone),
+            "call_sub",
+            RetireCause::ChildEvidence(ChildEvidence::Gone),
+        );
         assert_eq!(
             gone.task_retirements,
             vec![TaskRetirement {
@@ -3777,7 +3848,12 @@ mod tests {
             .with_executions(vec![boundary(1_200)])
             .with_background_tasks(vec![child_task("call_sub", "ses_child")]);
         unfinished.unconfirmed_tasks.insert("call_sub".into());
-        unfinished.apply_child_evidence("call_sub", ChildEvidence::Unfinished);
+        let _ = RunLifecycle::new().retire(
+            "",
+            RetireRead::Observed(&mut unfinished),
+            "call_sub",
+            RetireCause::ChildEvidence(ChildEvidence::Unfinished),
+        );
         assert_eq!(unfinished.background_tasks.len(), 1);
         assert!(unfinished.unconfirmed_tasks.contains("call_sub"));
         assert!(
@@ -3787,12 +3863,14 @@ mod tests {
         assert_eq!(unfinished.settle(Some(&anchor)), TurnSettle::Waiting);
 
         // An id with no live task invents no retirement.
-        unfinished.apply_child_evidence(
+        let _ = RunLifecycle::new().retire(
+            "",
+            RetireRead::Observed(&mut unfinished),
             "call_absent",
-            ChildEvidence::Terminal {
+            RetireCause::ChildEvidence(ChildEvidence::Terminal {
                 completed_at: 3_000,
                 started_at: None,
-            },
+            }),
         );
         assert_eq!(unfinished.background_tasks.len(), 1);
         assert!(unfinished.task_retirements.is_empty());
@@ -3853,7 +3931,7 @@ mod tests {
     /// live list's own facts (the retirement entries) are not what it filters.
     #[test]
     fn recorded_retirements_leave_later_reads_of_the_live_list() {
-        let overlay = BackgroundTaskOverlay::default();
+        let overlay = RunLifecycle::default();
         let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![background_shell(1_100)]);
         let mut transcript = live();
         overlay.observe(
@@ -3924,7 +4002,7 @@ mod tests {
             child_id: Some("ses_child".into()),
             started_at: Some(1_100),
         };
-        let overlay = BackgroundTaskOverlay::default();
+        let overlay = RunLifecycle::default();
         let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
 
         let mut untouched = live();
@@ -4008,10 +4086,14 @@ mod tests {
         // A Running verdict resolves the carried marker; the task stays live.
         let mut running = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
         running.unconfirmed_tasks.insert("call_sub".into());
-        running.apply_task_runtime(&TaskRuntime {
-            shells: vec![],
-            children: vec![("ses_child".into(), ChildRuntime::Running)],
-        });
+        RunLifecycle::new().apply_task_runtime(
+            "",
+            &mut running,
+            &TaskRuntime {
+                shells: vec![],
+                children: vec![("ses_child".into(), ChildRuntime::Running)],
+            },
+        );
         assert!(
             running.unconfirmed_tasks.is_empty(),
             "positive evidence resolves the marker"
@@ -4020,17 +4102,25 @@ mod tests {
 
         // An Inactive verdict (re)sets it, carried or not.
         let mut inactive = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
-        inactive.apply_task_runtime(&TaskRuntime {
-            shells: vec![],
-            children: vec![("ses_child".into(), ChildRuntime::Inactive)],
-        });
+        RunLifecycle::new().apply_task_runtime(
+            "",
+            &mut inactive,
+            &TaskRuntime {
+                shells: vec![],
+                children: vec![("ses_child".into(), ChildRuntime::Inactive)],
+            },
+        );
         assert!(inactive.unconfirmed_tasks.contains("call_sub"));
         let mut re_marked = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
         re_marked.unconfirmed_tasks.insert("call_sub".into());
-        re_marked.apply_task_runtime(&TaskRuntime {
-            shells: vec![],
-            children: vec![("ses_child".into(), ChildRuntime::Inactive)],
-        });
+        RunLifecycle::new().apply_task_runtime(
+            "",
+            &mut re_marked,
+            &TaskRuntime {
+                shells: vec![],
+                children: vec![("ses_child".into(), ChildRuntime::Inactive)],
+            },
+        );
         assert!(
             re_marked.unconfirmed_tasks.contains("call_sub"),
             "an inactive child keeps its marker"
@@ -4040,10 +4130,14 @@ mod tests {
         // marker; a shell verdict elsewhere does not touch it either.
         let mut unanswered = SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
         unanswered.unconfirmed_tasks.insert("call_sub".into());
-        unanswered.apply_task_runtime(&TaskRuntime {
-            shells: vec![("sh_other".into(), ShellRuntime::Running)],
-            children: vec![],
-        });
+        RunLifecycle::new().apply_task_runtime(
+            "",
+            &mut unanswered,
+            &TaskRuntime {
+                shells: vec![("sh_other".into(), ShellRuntime::Running)],
+                children: vec![],
+            },
+        );
         assert!(
             unanswered.unconfirmed_tasks.contains("call_sub"),
             "a verdict with no answer for the child changes nothing"
