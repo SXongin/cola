@@ -1496,8 +1496,8 @@ pub enum TaskRetirementEnding {
     ClientCancelled,
     /// The user's cleanup click retired the task (spec #588, ticket #590):
     /// never produced by a read, only by
-    /// [`SessionTranscript::apply_cleanup`], and recorded in the process-local
-    /// overlay like every other retirement.
+    /// [`RunLifecycle::cleanup`](crate::backend::runs::RunLifecycle::cleanup),
+    /// and recorded in the process-local overlay like every other retirement.
     Cleaned,
 }
 
