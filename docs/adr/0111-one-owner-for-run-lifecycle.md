@@ -159,3 +159,9 @@ the one-lock rule §2's prune depends on. `record_retirement` carries the
 retirement→ending identity and label mapping, which belongs beside the bytes it
 writes: the label rule is the ledger's, and the owner must stay neutral and
 never name a card type.
+
+The same landing gives `retire` a read-less form: §2's sketch takes the observed
+transcript, but a **Wake**'s ending is its completion commit's own fact
+(ADR-0080), so the transition takes either that read or none (`RetireRead`) and
+the Wake cause records the ending without pruning a row — the read prunes it
+later through `observe`.
