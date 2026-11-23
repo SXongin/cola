@@ -526,6 +526,22 @@ async fn a_permanently_rejected_write_advances_nothing() {
 /// The interleave is the delivery layer's own: A's payload delivers without a
 /// reconcile, a newer body lands and confirms, and only then does A's
 /// confirmation run.
+///
+/// Two confirmations cannot contend, which is why this test orders them: every
+/// confirmation writer holds the cards lock through its take-and-write —
+/// `confirm_staged_cursor`, the drain's `reconcile_staged_cursors` (re-locking
+/// into the same section), and the takeover `attach_and_repoint` — so the guard
+/// orders an older stage only against a newer *confirmed* stage: a later
+/// confirmation of an older stage leaves the record unchanged. A takeover
+/// cannot supply the race instead: its armed successor stays card-less until
+/// the create lands, so a concurrent `flush_card_locked` writes nothing and no
+/// drain-confirmable stage can be staged in that window. One gap in the
+/// guarantee stays open (#1186): the live PATCH's direct `advance_cursor_and_gap`
+/// in `flush_card_locked` writes the record without advancing
+/// `confirmed_cursor_stage`, so a cancelled confirmation plus a later older due
+/// stage can still move the record back. This test pins the confirmation
+/// ordering, not that window; a stress test fails only probabilistically, and a
+/// test-only park is banned by ADR-0110 §2.
 #[tokio::test]
 async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
     let _wd = test_work_dir();
