@@ -216,7 +216,7 @@
       "function": "ensure_permission_companion",
       "metric": "too_many_lines",
       "value": 195,
-      "body": "193efdeff317897e"
+      "body": "fdd415ea6f97d48c"
     },
     {
       "path": "src/bridge/request/delivery.rs",
@@ -538,7 +538,7 @@
       "function": "tool_panel_element",
       "metric": "too_many_lines",
       "value": 103,
-      "body": "3846e04996a3fa40"
+      "body": "b1f084b0cf814bea"
     },
     {
       "path": "src/feishu/card/viewer.rs",
@@ -646,7 +646,7 @@
     },
     {
       "path": "src/bridge/request/kind.rs",
-      "lines": 3223
+      "lines": 3180
     },
     {
       "path": "src/bridge/terminal.rs",
@@ -682,7 +682,7 @@
     },
     {
       "path": "src/feishu/card/tool_render.rs",
-      "lines": 3959
+      "lines": 2916
     },
     {
       "path": "src/feishu/delivery.rs",
@@ -1323,6 +1323,10 @@
     {
       "path": "src/feishu/card/tool_render.rs",
       "count": 2
+    },
+    {
+      "path": "src/feishu/card/tool_view/mod.rs",
+      "count": 1
     },
     {
       "path": "src/feishu/card/turn_diff.rs",
