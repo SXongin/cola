@@ -6,6 +6,11 @@
 > card write) and read-model shapes (a Background Task, an Agent Run) stay as
 > recorded. What changes is who applies them: one owner, not four apply paths.
 > ADR-0079 is already a five-line pointer and carries no new banner.
+>
+> It also supersedes ADR-0080's "the seam is an internal module, not a trait —
+> one adapter is not a seam": this store trait is the backend→bridge dependency
+> boundary (the owner is neutral, `ChainRecords` the one implementation), not an
+> abstraction over hypothetical adapters.
 
 ## Context
 
@@ -47,9 +52,8 @@ client declared terminal stays in the read until its child transcript's evidence
 records the ending, or it would leave the ledger with no completion entry
 (`268ec8e3`).
 
-The predicate is one function: `is_live(run) = !store.resolves(run.key,
-run.generation)`. The ledger row, the panel liveness, the completion entry and
-the Turn's `Waiting` are projections of it, not independent facts.
+The predicate is `is_live(run) = !store.resolves(run.key, run.generation)`; the
+row, the liveness line, the entry and `Waiting` are projections of it.
 
 ### 2. One owner, in the neutral read model
 
@@ -70,21 +74,18 @@ The interface is one transition and one projection:
 
 - `observe(session, &mut transcript, surface) -> Option<Pass>` — apply the
   endings and overlay, prune the ended, synthesize an owed retirement;
-- `evidence_waits(transcript, anchor) -> Vec<EvidenceWait>` — the suspects one
-  reconcile cycle may read, with "a run a Background Task already represents is
-  not read twice" in one place;
+- `evidence_waits(transcript, anchor) -> Vec<EvidenceWait>` — the suspects a
+  cycle may read, with the task-owned rule in one place;
 - `retire(session, &mut transcript, key, cause) -> Option<TaskRetirement>` — the
   single transition for all four causes (Wake, runtime verdict, child evidence,
   Cleanup); the store dedupes per `(key, generation, class)`, so an evidence
   ending suppresses a late Wake (ADR-0080) while a Cleanup does not (it says
   nothing about how the run ended).
-- `live(transcript) -> impl Iterator<Item = &AgentRun>` — the predicate's one
-  projection.
+- `live(transcript) -> impl Iterator<Item = &AgentRun>` — the predicate's projection.
 
-`Pass` keeps today's two-phase commit: an evidence or Cleanup ending is recorded
-at derivation (a Wake's with its completion commit), and the volatile overlay
-commits only after the card write that carried the read was accepted
-(ADR-0072/0080). Dropping a pass loses nothing durable.
+`Pass` keeps today's two-phase commit: evidence/Cleanup recorded at derivation
+(a Wake's at its completion commit), the overlay only after the carrier write is
+accepted (ADR-0072/0080). Dropping a pass loses nothing durable.
 
 ### 3. What the owner does not own
 
@@ -121,8 +122,6 @@ attach seam gets its own research candidate; C8 (`ServerIdentity`) stays HOLD.
   `child_evidence` gating, launch settle, resumed generation, reported
   liveness), plus an absence test for each deleted guard that fails if it
   returns.
-- **The ratchet moves with the bodies.** `--bless` re-keys the baselined
-  functions to `src/backend/runs/`; values only go down.
 
 ## Migration (three landings, each behavior-preserving)
 
