@@ -1,5 +1,10 @@
 # The read model carries tool semantics and agent runs
 
+> **Amended by ADR-0111 (2026-11-23)**: the read-model shapes below stay; the
+> live/ended transition and the durable ending now have one owner,
+> `RunLifecycle` (`src/backend/runs/lifecycle.rs`), not the four `apply_*`
+> paths. The capability axes stay ADR-0106's.
+
 > **Amended by ADR-0108 (2026-11-16)**: decision 3's
 > variant list gains `ToolDetail::Plan`, `Skill` and `Ask` — the calls that
 > carry the plan list, a loaded skill and a question. The vocabulary ticket

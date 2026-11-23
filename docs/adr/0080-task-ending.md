@@ -1,5 +1,11 @@
 # A Background Task's ending is one durable fact, shown once by the Rendered Cursor's confirmation
 
+> **Amended by ADR-0111 (2026-11-23)**: the ending facts below stay this ADR's;
+> the owner that applies them is now one `RunLifecycle` in the backend read
+> model (`src/backend/runs/lifecycle.rs`). The 2026-10-14 ratified split —
+> ending at derivation, a Wake's at its completion commit, shown on
+> confirmation — is unchanged.
+
 > **Amended by ADR-0105**: the same ending classes cover a child-only **Agent
 > Run** (no Background Task); its child transcript's terminal item is the
 > evidence, and every rule below applies to it unchanged. A run first named by a
