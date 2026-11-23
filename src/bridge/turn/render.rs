@@ -10,18 +10,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::Instrument;
 
+use crate::backend::runs::{
+    RunKey, TaskEnding as DurableEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState,
+    TaskRunIdentity,
+};
 use crate::backend::{
     BackgroundTask, Compaction, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding,
     ToolStatus, TurnAnchor, Wake, WakeSource,
 };
-use crate::bridge::chain::{EndingFacts, EndingKey, TaskEndingClass, TaskEndingState};
+use crate::bridge::chain::{EndingFacts, EndingKey};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
 use crate::bridge::handles::{
     CONTENT_CACHE_CAP, CardsHandle, ContentCell, ContentCellCache, ContentCellHold, FILE_MESSAGE_SENDS_CAP,
     FileMessageSends, RequestsHandle, SessionsHandle, TurnHandles, content_cell, evict_oldest_idle,
 };
 use crate::bridge::span;
-use crate::bridge::tasks::TaskRunId;
 use crate::bridge::turn::state;
 use crate::bridge::turn::state::{
     CompactionRow, LedgerCadence, LedgerChange, RenderedPart, StreamAccumulator,
@@ -668,7 +671,7 @@ fn wake_completion_entry(
     wake: &Wake,
     retired: Option<&BackgroundTask>,
     finished_at: i64,
-    durable: Option<&crate::bridge::chain::TaskRunIdentity>,
+    durable: Option<&TaskRunIdentity>,
 ) -> Option<TaskCompletionEntry> {
     let kind = match wake.source {
         WakeSource::Shell => TaskKind::Shell,
@@ -733,7 +736,7 @@ pub(super) enum PlannedAnnounce {
         state: Option<String>,
         /// The identity the run's Wake ending is recorded with: the launch's own
         /// facts when the read still carries it, else what the Wake itself names.
-        identity: crate::bridge::chain::TaskRunIdentity,
+        identity: TaskRunIdentity,
     },
     /// A synthetic retirement — a runtime verdict, a child's own terminal
     /// transcript, or the user's cleanup (ADR-0080): the ending's own announce
@@ -816,7 +819,7 @@ impl<'a> Endings<'a> {
 
     /// Record one run's ending durably (ADR-0080) — the Wake path's own write,
     /// at the moment the run's completion is committed.
-    fn record(&self, run: &TaskRunId, ending: crate::bridge::chain::TaskEnding) -> bool {
+    fn record(&self, run: &RunKey, ending: DurableEnding) -> bool {
         match self.cards {
             Some(cards) => cards.chains.record_ending(self.session_id, run, ending),
             None => false,
@@ -999,7 +1002,7 @@ fn plan_wake_entries(
 fn wake_ending_spoken_for(
     facts: &crate::bridge::chain::EndingFacts,
     acc: &StreamAccumulator,
-    run: &TaskRunId,
+    run: &RunKey,
 ) -> bool {
     // The durable ending exists and is no longer OWED — SHOWN, or SURRENDERED by
     // the saturation cap.
@@ -1017,14 +1020,14 @@ fn wake_ending_spoken_for(
 /// own identity when the read still carries it, folded with the Wake's named keys
 /// (its shell/child id, its job id and its Wake id); else the Wake's ids alone.
 /// `None` when neither side names anything — the identity is never invented.
-fn wake_run(wake: &Wake, retired: Option<&BackgroundTask>) -> Option<TaskRunId> {
-    let from_wake = TaskRunId::of_wake(wake);
+fn wake_run(wake: &Wake, retired: Option<&BackgroundTask>) -> Option<RunKey> {
+    let from_wake = RunKey::of_wake(wake);
     match (retired, from_wake) {
         // The launch is the strongest identity (its call id is the key every
         // writer of that read agrees on); the Wake's ids ride along as aliases,
         // so the record it resolves already carries the Wake id too.
         (Some(task), from_wake) => {
-            let mut run = TaskRunId::of_launch(task);
+            let mut run = RunKey::of_launch(task);
             if let Some(from_wake) = from_wake {
                 run.absorb(&from_wake);
             }
@@ -1076,7 +1079,7 @@ fn plan_runtime_entries(
             TaskRetirementEnding::Cleaned => TaskEndingClass::Cleanup,
             _ => TaskEndingClass::Evidence,
         };
-        let run = TaskRunId::of_launch(task);
+        let run = RunKey::of_launch(task);
         // The one entry gate (ADR-0080): the run's ending is already SPOKEN FOR —
         // this chain placed the entry (whatever class wrote it: the family's rule
         // is one entry per run), or an earlier card's confirmed write SHOWED one
@@ -1666,11 +1669,11 @@ pub(super) fn commit_planned_entries(
         {
             endings.record(
                 run,
-                crate::bridge::chain::TaskEnding {
+                DurableEnding {
                     class: *class,
-                    state: crate::bridge::chain::TaskEndingState::Owed,
+                    state: TaskEndingState::Owed,
                     finished_at: Some(*created_ms),
-                    evidence: Some(crate::bridge::chain::TaskEndingEvidence::Wake(state.clone())),
+                    evidence: Some(TaskEndingEvidence::Wake(state.clone())),
                     identity: identity.clone(),
                 },
             );
@@ -3752,6 +3755,7 @@ mod tests {
         );
     }
 
+    use crate::backend::runs::{TaskEndingState, TaskRunIdentity, TaskRunRecord};
     use crate::backend::{
         BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, FinishReason, MessageId,
         MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, TodoList, TodoStatus, TodoStep,
@@ -3760,8 +3764,7 @@ mod tests {
     use crate::backend::{ToolDetail, ToolKind};
     use crate::bridge::App;
     use crate::bridge::chain::{
-        CursorFrontier, CursorPartKind, EndingFacts, PendingGap, RenderedCursor, TaskEndingState,
-        TaskRunIdentity, TaskRunRecord, cursor_prefix_digest,
+        CursorFrontier, CursorPartKind, EndingFacts, PendingGap, RenderedCursor, cursor_prefix_digest,
     };
     use crate::bridge::test_support::{
         HostCardAction, MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card,
@@ -3777,8 +3780,8 @@ mod tests {
 
     /// The run one test's entry names (ADR-0080): the launch's call id, with the
     /// child session's own id riding along as the alias a Wake names it by.
-    fn planned_run(call_id: &str) -> TaskRunId {
-        TaskRunId {
+    fn planned_run(call_id: &str) -> RunKey {
+        RunKey {
             key: call_id.to_string(),
             call_id: Some(call_id.to_string()),
             shell_id: None,
@@ -3825,7 +3828,7 @@ mod tests {
     fn facts_with(call_id: &str, class: TaskEndingClass, state: TaskEndingState) -> EndingFacts {
         EndingFacts::new(vec![TaskRunRecord {
             run: planned_run(call_id),
-            endings: vec![crate::bridge::chain::TaskEnding {
+            endings: vec![DurableEnding {
                 class,
                 state,
                 finished_at: Some(2_000),
@@ -4067,7 +4070,7 @@ mod tests {
 
         let facts = EndingFacts::new(vec![TaskRunRecord {
             run: planned_run("call_sub"),
-            endings: vec![crate::bridge::chain::TaskEnding {
+            endings: vec![DurableEnding {
                 class: TaskEndingClass::Cleanup,
                 state: TaskEndingState::Owed,
                 finished_at: Some(2_000),
@@ -4110,7 +4113,7 @@ mod tests {
         let ending = |class: TaskEndingClass,
                       state: TaskEndingState,
                       started_at: Option<i64>,
-                      label: &str| crate::bridge::chain::TaskEnding {
+                      label: &str| DurableEnding {
             class,
             state,
             finished_at: Some(2_000),
@@ -4163,7 +4166,7 @@ mod tests {
             label: None,
         };
         let transcript = SessionTranscript::new(vec![]).with_wakes(vec![wake]);
-        let ids_only = crate::bridge::chain::TaskEnding {
+        let ids_only = DurableEnding {
             class: TaskEndingClass::Cleanup,
             state: TaskEndingState::Shown,
             finished_at: Some(2_000),
@@ -4177,7 +4180,7 @@ mod tests {
                 label: None,
             },
         };
-        let label_only = crate::bridge::chain::TaskEnding {
+        let label_only = DurableEnding {
             class: TaskEndingClass::Wake,
             state: TaskEndingState::Owed,
             finished_at: Some(2_000),
@@ -4188,7 +4191,7 @@ mod tests {
             },
         };
         let facts = EndingFacts::new(vec![TaskRunRecord {
-            run: TaskRunId {
+            run: RunKey {
                 key: "call_sub".into(),
                 call_id: Some("call_sub".into()),
                 shell_id: Some("shell_durable".into()),
@@ -4227,7 +4230,7 @@ mod tests {
             label: None,
         };
         let transcript = SessionTranscript::new(vec![]).with_wakes(vec![wake]);
-        let ids_only = crate::bridge::chain::TaskEnding {
+        let ids_only = DurableEnding {
             class: TaskEndingClass::Cleanup,
             state: TaskEndingState::Shown,
             finished_at: Some(2_000),
@@ -4244,7 +4247,7 @@ mod tests {
         // The newest ending named no id at all (a launchless Wake's own
         // identity), so the durable ids can come only from the earlier one — and
         // nothing on the record carries a label or a start clock.
-        let wake_ending = crate::bridge::chain::TaskEnding {
+        let wake_ending = DurableEnding {
             class: TaskEndingClass::Wake,
             state: TaskEndingState::Owed,
             finished_at: Some(3_000),
@@ -4255,7 +4258,7 @@ mod tests {
             },
         };
         let facts = EndingFacts::new(vec![TaskRunRecord {
-            run: TaskRunId {
+            run: RunKey {
                 key: "call_sub".into(),
                 call_id: Some("call_sub".into()),
                 shell_id: Some("shell_durable".into()),
@@ -4399,7 +4402,8 @@ mod tests {
     /// that can place it owes, so the plan and the commit both place it.
     #[tokio::test]
     async fn a_surrendered_wake_ending_is_never_re_offered() {
-        use crate::bridge::chain::{ChainRecords, TaskEnding as ChainEnding, TaskRunIdentity};
+        use crate::backend::runs::{TaskEnding as ChainEnding, TaskRunIdentity};
+        use crate::bridge::chain::ChainRecords;
 
         let dir = tempfile::tempdir().unwrap();
         let chains = ChainRecords::load(dir.path().join("chain_records.json"));
@@ -4712,7 +4716,7 @@ mod tests {
         let mut transcript =
             SessionTranscript::new(vec![]).with_background_tasks(vec![live_subagent_task("call_sub")]);
         transcript.apply_cleanup(&["call_sub".to_string()], 2_000);
-        let ending = |class: TaskEndingClass, state: TaskEndingState| crate::bridge::chain::TaskEnding {
+        let ending = |class: TaskEndingClass, state: TaskEndingState| DurableEnding {
             class,
             state,
             finished_at: Some(2_000),

@@ -16,14 +16,14 @@ use super::timeline::{
 };
 #[cfg(test)]
 use crate::backend::TranscriptMessage;
+use crate::backend::runs::{RunKey, TaskEndingClass};
 use crate::backend::{
     AgentCapabilities, Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall,
     TurnAnchor, TurnDiffStats,
 };
-use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
+use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
 use crate::bridge::tasks::TaskCell;
-use crate::bridge::tasks::model::TaskRunId;
 use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::{CardBuilder, RunningToolView};
@@ -2646,13 +2646,13 @@ impl StreamAccumulator {
     /// Whether `run`'s ending of `class` already had its entry placed on this
     /// chain (ADR-0080): the in-life exactly-once gate the plan reads beside the
     /// durable shown bit.
-    pub(super) fn ending_announced(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+    pub(super) fn ending_announced(&self, run: &RunKey, class: TaskEndingClass) -> bool {
         self.tasks.ending_announced(run, class)
     }
 
     /// Whether ANY class of `run`'s ending already had its entry placed on this
     /// chain (ADR-0080): one entry per run, whatever class wrote it.
-    pub(super) fn ending_announced_any(&self, run: &TaskRunId) -> bool {
+    pub(super) fn ending_announced_any(&self, run: &RunKey) -> bool {
         self.tasks.ending_announced_any(run)
     }
 
@@ -3362,7 +3362,7 @@ impl StreamAccumulator {
     /// a restart read a genuinely un-announced late Wake at or below it as
     /// covered and suppress its continuation — #590's "a late Wake for a cleared
     /// task behaves as before; nothing is suppressed".
-    pub(super) fn announce_ending(&mut self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+    pub(super) fn announce_ending(&mut self, run: &RunKey, class: TaskEndingClass) -> bool {
         self.tasks.announce_ending(run, class)
     }
 
@@ -9186,8 +9186,8 @@ mod tests {
     }
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).
-    fn ending_run(call_id: &str) -> TaskRunId {
-        TaskRunId {
+    fn ending_run(call_id: &str) -> RunKey {
+        RunKey {
             key: call_id.to_string(),
             call_id: Some(call_id.to_string()),
             shell_id: None,

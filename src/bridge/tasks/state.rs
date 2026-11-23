@@ -14,9 +14,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::bridge::chain::TaskEndingClass;
-
-use super::model::TaskRunId;
+use crate::backend::runs::{RunKey, TaskEndingClass};
 
 /// The per-Session Background Task State: the per-chain delivery exactly-once
 /// sets. Every field is private to this module — no reader or writer outside
@@ -70,7 +68,7 @@ pub(crate) struct TaskState {
     /// never inserts a second timeline entry. The class itself is the identity,
     /// so no synthetic key spelling ever gates. A later card seeds the durable
     /// half through the Chain Record's shown bits, not through here.
-    announced_endings: Vec<(TaskRunId, TaskEndingClass)>,
+    announced_endings: Vec<(RunKey, TaskEndingClass)>,
 }
 
 impl TaskState {
@@ -84,7 +82,7 @@ impl TaskState {
     /// whether it was new — the synthetic retirement's exactly-once gate, keyed
     /// by the ending itself. A class the run already announced (under any id
     /// spelling) is not announced twice.
-    pub(crate) fn announce_ending(&mut self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+    pub(crate) fn announce_ending(&mut self, run: &RunKey, class: TaskEndingClass) -> bool {
         if self.ending_announced(run, class) {
             return false;
         }
@@ -95,7 +93,7 @@ impl TaskState {
     /// Whether `run`'s ending of `class` already had its entry placed on this
     /// chain (ADR-0080). The run matches by ANY id it is known by, so the
     /// retirement and the Wake naming one run differently still agree.
-    pub(crate) fn ending_announced(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+    pub(crate) fn ending_announced(&self, run: &RunKey, class: TaskEndingClass) -> bool {
         self.announced_endings
             .iter()
             .any(|(held, held_class)| *held_class == class && shares_id(held, run))
@@ -104,7 +102,7 @@ impl TaskState {
     /// Whether ANY class of `run`'s ending had its entry placed on this chain:
     /// the retirement's rule is one entry per run, whatever class wrote it (as
     /// the whole family's "exactly once per call id" reads).
-    pub(crate) fn ending_announced_any(&self, run: &TaskRunId) -> bool {
+    pub(crate) fn ending_announced_any(&self, run: &RunKey) -> bool {
         self.announced_endings
             .iter()
             .any(|(held, _)| shares_id(held, run))
@@ -150,7 +148,7 @@ impl TaskState {
 /// Whether two run identities name the same run: they share any id (the stored
 /// key, the launch's call id, the shell/child id, the Wake id). The in-memory
 /// counterpart of the Chain Record's alias resolution, for the announce gate.
-fn shares_id(a: &TaskRunId, b: &TaskRunId) -> bool {
+fn shares_id(a: &RunKey, b: &RunKey) -> bool {
     a.ids().any(|id| b.names(id))
 }
 
@@ -200,17 +198,17 @@ impl TaskCell {
     }
 
     /// Mark `run`'s `class` entry as placed on this chain (ADR-0080).
-    pub(crate) fn announce_ending(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+    pub(crate) fn announce_ending(&self, run: &RunKey, class: TaskEndingClass) -> bool {
         self.lock().announce_ending(run, class)
     }
 
     /// Whether `run`'s ending of `class` already had its entry placed here.
-    pub(crate) fn ending_announced(&self, run: &TaskRunId, class: TaskEndingClass) -> bool {
+    pub(crate) fn ending_announced(&self, run: &RunKey, class: TaskEndingClass) -> bool {
         self.lock().ending_announced(run, class)
     }
 
     /// Whether ANY class of `run`'s ending already had its entry placed here.
-    pub(crate) fn ending_announced_any(&self, run: &TaskRunId) -> bool {
+    pub(crate) fn ending_announced_any(&self, run: &RunKey) -> bool {
         self.lock().ending_announced_any(run)
     }
 

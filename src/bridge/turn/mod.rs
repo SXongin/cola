@@ -5250,9 +5250,9 @@ impl Turn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::runs::{RunKey, TaskEnding as DurableEnding, TaskEndingClass, TaskRunIdentity};
     use crate::bridge::App;
-    use crate::bridge::chain::{EndingKey, TaskEnding as DurableEnding, TaskEndingClass, TaskRunIdentity};
-    use crate::bridge::tasks::TaskRunId;
+    use crate::bridge::chain::EndingKey;
     use crate::bridge::test_support::{
         MockBackend, RecordingPlatform, build_app, realistic_parts, seed_entry, test_config, test_work_dir,
         turn_anchor,
@@ -5262,7 +5262,7 @@ mod tests {
     /// its confirmation needs to have a bit to flip.
     fn landed(call_id: &str) -> EndingKey {
         (
-            TaskRunId {
+            RunKey {
                 key: call_id.to_string(),
                 call_id: Some(call_id.to_string()),
                 shell_id: None,

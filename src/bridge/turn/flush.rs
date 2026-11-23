@@ -1503,16 +1503,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::{drain_wake_watermark, note_cursor_write_failure, staged_watermark_id};
-    use crate::bridge::chain::{EndingKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
-    use crate::bridge::tasks::TaskRunId;
+    use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
+    use crate::bridge::chain::EndingKey;
     use crate::bridge::test_support::*;
     use crate::bridge::turn::Turn;
     use crate::bridge::turn::state::{CardFallback, CardSession, EndingWrite, StreamAccumulator};
     use crate::feishu::card::CardState;
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).
-    fn run(call_id: &str) -> TaskRunId {
-        TaskRunId {
+    fn run(call_id: &str) -> RunKey {
+        RunKey {
             key: call_id.to_string(),
             call_id: Some(call_id.to_string()),
             shell_id: None,
