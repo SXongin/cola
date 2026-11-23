@@ -479,15 +479,21 @@ impl OpenCodeBackend {
             .await
     }
 
-    /// The session transcript, with this cola life's Background Task liveness
-    /// tier applied ([`TasksHandle::apply`], issue #454, review #588): a
-    /// Background Task the runtime confirmed ended leaves the live list here,
-    /// and a task the runtime could not confirm as running carries its
-    /// `⚠️ 状态待确认` marker, so no read path resurrects a retired task or
-    /// drops a marker between verdicts.
+    /// The session transcript, with this cola life's run lifecycle applied
+    /// ([`RunLifecycle::observe`](crate::backend::runs::RunLifecycle::observe),
+    /// issue #454, review #588): a Background Task the runtime confirmed ended
+    /// leaves the live list here, and a task the runtime could not confirm as
+    /// running carries its `⚠️ 状态待确认` marker, so no read path resurrects a
+    /// retired task or drops a marker between verdicts.
     pub async fn transcript(&self, session_id: &str) -> crate::error::Result<SessionTranscript> {
         let mut transcript = self.strategy().transcript(&self.transport, session_id).await?;
-        self.tasks.apply(session_id, &mut transcript);
+        // A read has no carrier write to gate the overlay on: the pass's
+        // durable facts are already recorded, so its admission is dropped here
+        // (ADR-0111 §2).
+        let _pass = self
+            .tasks
+            .runs()
+            .observe(session_id, &mut transcript, self.surface());
         Ok(transcript)
     }
 
@@ -514,6 +520,13 @@ impl OpenCodeBackend {
     /// owns the tier's bytes and its instance (ticket #682).
     pub(crate) fn tasks(&self) -> &TasksHandle {
         &self.tasks
+    }
+
+    /// The run lifecycle's owner the same handle carries (ADR-0111 §2). The
+    /// Bridge reaches the SAME instance through
+    /// [`crate::backend::Backend::runs`].
+    pub(crate) fn runs(&self) -> &crate::backend::runs::RunLifecycle {
+        self.tasks.runs()
     }
 
     /// The session's durable model/agent selection where the generation keeps
@@ -610,6 +623,17 @@ impl OpenCodeBackend {
     /// strategy and with it every axis.
     pub fn capabilities(&self) -> crate::backend::AgentCapabilities {
         self.strategy().capabilities()
+    }
+
+    /// The surface this read may observe, as the run lifecycle owner takes it
+    /// (ADR-0106/0111): the capability axes read once, so the owner never names
+    /// a backend capability itself.
+    fn surface(&self) -> crate::backend::runs::LiveRunSurface {
+        let capabilities = self.capabilities();
+        crate::backend::runs::LiveRunSurface {
+            reports_live_runs: capabilities.reports_live_runs(),
+            child_evidence: capabilities.child_evidence,
+        }
     }
 
     /// One shell's captured output window (spec #588, #592). See

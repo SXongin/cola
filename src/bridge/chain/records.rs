@@ -57,7 +57,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::runs::{
-    RunEndingStore, RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity, TaskRunRecord,
+    RunEndingStore, RunKey, TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState,
+    TaskRunIdentity, TaskRunRecord,
 };
 use crate::backend::{MessageId, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
@@ -2110,6 +2111,66 @@ impl RunEndingStore for ChainRecords {
             .into_iter()
             .filter(TaskRunRecord::owes)
             .collect()
+    }
+
+    fn observe_run(&self, session_id: &str, held: &RunKey) -> bool {
+        ChainRecords::observe_run(self, session_id, held)
+    }
+
+    /// The one mapping from a derived retirement to its durable ending: its
+    /// class, its evidence, its clock and the identity a later read
+    /// re-synthesizes the entry from. The label is the ledger's rule, which is
+    /// why it lives here (the owner is neutral).
+    fn record_retirement(
+        &self,
+        session_id: &str,
+        retirement: &crate::backend::TaskRetirement,
+        input: Option<&serde_json::Value>,
+    ) -> bool {
+        use crate::backend::TaskRetirementEnding;
+        let evidence = match &retirement.ending {
+            TaskRetirementEnding::Ended(end) => TaskEndingEvidence::Ended(end.as_str().to_string()),
+            TaskRetirementEnding::Lost => TaskEndingEvidence::Lost,
+            TaskRetirementEnding::ChildEnded => TaskEndingEvidence::ChildEnded,
+            // The client's own word is a process-local statement: the durable
+            // record keeps the evidence class (ADR-0080), never a new variant an
+            // older build could not deserialize.
+            TaskRetirementEnding::ClientFailed | TaskRetirementEnding::ClientCancelled => {
+                TaskEndingEvidence::ChildEnded
+            }
+            TaskRetirementEnding::Cleaned => {
+                return self.record(
+                    session_id,
+                    &RunKey::of_launch(&retirement.task),
+                    TaskEnding {
+                        class: TaskEndingClass::Cleanup,
+                        state: TaskEndingState::Owed,
+                        finished_at: retirement.finished_at,
+                        evidence: None,
+                        identity: crate::bridge::tasks::identity_of_task(
+                            &retirement.task,
+                            input,
+                            retirement.label.as_deref(),
+                        ),
+                    },
+                );
+            }
+        };
+        self.record(
+            session_id,
+            &RunKey::of_launch(&retirement.task),
+            TaskEnding {
+                class: TaskEndingClass::Evidence,
+                state: TaskEndingState::Owed,
+                finished_at: retirement.finished_at,
+                evidence: Some(evidence),
+                identity: crate::bridge::tasks::identity_of_task(
+                    &retirement.task,
+                    input,
+                    retirement.label.as_deref(),
+                ),
+            },
+        )
     }
 }
 

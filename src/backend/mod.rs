@@ -938,28 +938,33 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         self.capabilities().reports_live_runs()
     }
 
-    /// The Background Task State module's handle (ADR-0079, tickets #681/#682)
-    /// — the one instance the adapter was constructed with and the Bridge
-    /// records through. It owns the volatile liveness tier (issue #454, review
-    /// #588): the adapter applies it to every [`Self::transcript`] read
-    /// ([`crate::bridge::tasks::TasksHandle::apply`]), so a task the runtime
-    /// confirmed ended leaves the live list and a task it could not confirm as
-    /// running carries its `⚠️ 状态待确认` marker on every read path — the reap's
-    /// settle, a drain tick, the follow, the Snapshot status line and the
-    /// cleanup click's own read alike.
+    /// The Background Task State module's card-delivery handle (ADR-0079,
+    /// tickets #681/#682) — the one instance the adapter was constructed with:
+    /// the per-Session `TaskCell` store the card chain seeds and re-keys.
     ///
-    /// The module owns the tier's bytes AND its instance
-    /// ([`crate::bridge::tasks::TasksHandle`]): `src/main.rs` creates the
-    /// handle and threads it into the adapter at construction, and both the
-    /// adapter and the Bridge hold that same handle — the Bridge records
-    /// through exactly the handle every later read goes through, and a later
-    /// caller using the handle as the lifecycle owner sees the same
-    /// retirements.
+    /// The run liveness tier is NOT here (ADR-0111 §3): it moved to
+    /// [`Self::runs`], so this handle keeps card-chain state only. `src/main.rs`
+    /// creates it and threads it into the adapter at construction, and both the
+    /// adapter and the Bridge hold that same handle.
     ///
-    /// In-memory on purpose: it is a cola-life overlay, not durable state. A
-    /// restart loses it and the next read re-derives the same retirement, the
-    /// next verdict the same markers.
+    /// In-memory on purpose: the bindings are a cola-life fact, not durable
+    /// state.
     fn tasks(&self) -> &crate::bridge::tasks::TasksHandle;
+
+    /// The run lifecycle's one owner (ADR-0111 §2): the live/ended fact's
+    /// single writer — the durable-ending prune, the owed synthesis and the
+    /// retirement transitions. The adapter applies
+    /// [`crate::backend::runs::RunLifecycle::observe`] to every
+    /// [`Self::transcript`] read, so a run the reconcile confirmed ended leaves
+    /// the live list and one it could not confirm keeps its `⚠️ 状态待确认`
+    /// marker on every read path.
+    ///
+    /// Split from [`Self::tasks`] on purpose (ADR-0111 §3): that handle owns
+    /// card-chain state (the `TaskCell` bindings), this one owns run state.
+    /// They are created together (`TasksHandle::new`) so the adapter and the
+    /// Bridge share ONE instance of each, and the Bridge reaches the owner here
+    /// rather than through the cell store.
+    fn runs(&self) -> &crate::backend::runs::RunLifecycle;
 
     /// Read one shell's captured output window (spec #588, ticket #592): the
     /// record's last [`SHELL_OUTPUT_WINDOW_BYTES`] bytes, decoded and clipped
@@ -1224,6 +1229,10 @@ mod core_only_client {
 
         fn tasks(&self) -> &crate::bridge::tasks::TasksHandle {
             &self.tasks
+        }
+
+        fn runs(&self) -> &crate::backend::runs::RunLifecycle {
+            self.tasks.runs()
         }
 
         async fn model_context_window(&self, _provider: &str, _model: &str) -> Result<Option<i64>> {

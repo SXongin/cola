@@ -3858,10 +3858,15 @@ impl crate::backend::Backend for MockBackend {
                 }
             }
         }
-        // The Background Task overlay, applied exactly like the real adapter's
-        // (issue #454, review #588): retirements leave the live list and
-        // unconfirmed markers ride every read.
-        self.overlay.apply(session_id, &mut transcript);
+        // The run lifecycle, applied exactly like the real adapter's (issue
+        // #454, review #588): retirements leave the live list and unconfirmed
+        // markers ride every read.
+        let capabilities = self.capabilities;
+        let surface = crate::backend::runs::LiveRunSurface {
+            reports_live_runs: capabilities.reports_live_runs(),
+            child_evidence: capabilities.child_evidence,
+        };
+        let _pass = self.overlay.runs().observe(session_id, &mut transcript, surface);
         // A targeted read delay (spec #602 review, round 7): a read whose newest
         // assistant text matches the configured marker is a delayed-but-
         // SUCCESSFUL read — one-shot, so later reads flow. Used to prove the
@@ -4548,6 +4553,10 @@ impl crate::backend::Backend for MockBackend {
 
     fn tasks(&self) -> &crate::bridge::tasks::TasksHandle {
         &self.overlay
+    }
+
+    fn runs(&self) -> &crate::backend::runs::RunLifecycle {
+        self.overlay.runs()
     }
 
     /// The scripted output window (spec #588, #592), keyed by shell id; a

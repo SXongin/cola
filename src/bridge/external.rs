@@ -518,7 +518,7 @@ impl ExternalFlow {
             // records nothing and the task stays live for the next card that
             // can render its entry.
             if carried && let Some(pass) = pass {
-                pass.commit(&handles.backend, sid, &transcript);
+                pass.commit(handles.backend.runs(), sid, &transcript);
             }
         }
         let mut map = self.last_user_msg_epoch.lock().await;

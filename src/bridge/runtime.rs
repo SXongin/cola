@@ -19,10 +19,16 @@
 //! The reconcile records the evidence ending it derives **at derivation**
 //! (ADR-0080): one synchronous Chain Record write, the fact about the run
 //! rather than the card that will show its entry, an entry-less chain included.
+//! The write is the run lifecycle owner's, not this module's (ADR-0111 §2):
+//! every derivation goes through [`RunLifecycle::retire`], which records the
+//! ending and hands back the retirement the read renders — so the runtime
+//! reconcile keeps no ending-writing code of its own.
+//!
 //! What remains deferred is the process-local tier (spec #588, review PR #595):
-//! a reconcile pass hands back a [`ReconcilePass`] and writes NOTHING to the
-//! overlay itself. The caller commits it — one [`ReconcilePass::commit`] call —
-//! only AFTER the card write that carried the read's entries was accepted
+//! a reconcile pass hands back a [`Pass`](crate::backend::runs::Pass) and writes
+//! NOTHING to the overlay itself. The caller commits it — one
+//! [`Pass::commit`](crate::backend::runs::Pass::commit) call — only AFTER the
+//! card write that carried the read's entries was accepted
 //! (Session Sync's wake/ledger refresh, the drain tick's and the settle loop's
 //! completed render, the cleanup click's landed refresh). A caller whose
 //! carrier was refused drops the pass: the durable ending still retired the
@@ -57,6 +63,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::backend::runs::{Pass, RetireCause};
 use crate::backend::{Backend, SessionTranscript, ShellOutputRead, TurnAnchor};
 
 /// The default spacing between two runtime verdicts of one Session (ms): the
@@ -139,7 +146,8 @@ impl RuntimeReconcile {
     /// The step is deliberately gate-free on the READ side: each caller decides
     /// whether it can render what it observes (Session Sync's waiting-card
     /// admission, the live loops' own anchor) before calling. The WRITE side is
-    /// deferred: the returned [`ReconcilePass`] is the caller's to commit after
+    /// deferred: the returned [`Pass`](crate::backend::runs::Pass) is the caller's
+    /// to commit after
     /// its card write landed, and a pass that never commits records nothing.
     pub(crate) async fn observe(
         &self,
@@ -149,7 +157,7 @@ impl RuntimeReconcile {
         transcript: &mut SessionTranscript,
         read_timeout_ms: u64,
         anchor: Option<&TurnAnchor>,
-    ) -> Option<ReconcilePass> {
+    ) -> Option<Pass> {
         if !backend.reports_live_runs() {
             // A client with no live-run surface has nothing to reconcile: no
             // verdict, no child evidence, no shell window. The absence is the
@@ -167,8 +175,12 @@ impl RuntimeReconcile {
         // exist, and the Turn would wait on a run nothing can end.
         if shells.is_empty()
             && children.is_empty()
-            && transcript.run_evidence_suspects(anchor).is_empty()
-            && !transcript.needs_cleanup_marking()
+            && !backend
+                .runs()
+                .evidence_waits(transcript, anchor)
+                .iter()
+                .any(|wait| !wait.task)
+            && !backend.runs().needs_cleanup_marking(transcript)
         {
             return None;
         }
@@ -253,54 +265,6 @@ impl CycleBudget {
     }
 }
 
-/// One reconcile pass's admission to commit its verdicts to the process-local
-/// Background Task **cache** (spec #588, review PR #595; ADR-0080). Returned by
-/// [`RuntimeReconcile::observe`] and [`reconcile_now`] when — and only when — a
-/// verdict was applied to the read.
-///
-/// **The invariant that stays deferred**: the process-local overlay — this
-/// life's `retired` cache and the unconfirmed-marker set — is written only
-/// after the flush that carried the read's entries was accepted. This type is
-/// the only door to [`record_overlay`], so no reconcile writes the overlay from
-/// inside itself; each caller commits after the card write that carried the
-/// read's entries landed. Dropping the pass leaves the cache untouched — which
-/// is no loss, because the ENDING itself was already recorded durably at
-/// derivation ([`reconcile_now`]): the task still leaves the ledger and its
-/// entry stays owed to the next card that can carry it, and only the marker
-/// set waits on the accepted write.
-#[must_use = "commit the pass after the flush that carried its entries; dropping it leaves the cache (not the durable ending) unwritten"]
-pub(crate) struct ReconcilePass {
-    /// Whether the pass moved the read: a new retirement, or a changed
-    /// unconfirmed-marker set. A pass that changed nothing is still a pass —
-    /// its post-verdict marker set is what a commit writes.
-    changed: bool,
-}
-
-impl ReconcilePass {
-    /// Whether the pass moved the read: a retirement joined, or the
-    /// unconfirmed-marker set changed.
-    pub(crate) fn changed(&self) -> bool {
-        self.changed
-    }
-
-    /// Commit the pass's verdicts to the process-local overlay: every
-    /// retirement the transcript carries — the runtime verdict's, the child
-    /// evidence's, and the cleanup click's own synthetic Cleaned entries when
-    /// it calls this — so every later read (the live render, the drain's
-    /// settle, the follow, the reap) sees them gone; the launch record never
-    /// flips, so without the overlay the next read would resurrect the task.
-    /// And the pass's post-evidence unconfirmed set — carried markers
-    /// included, resolved ones absent — so a read the shared throttle does not
-    /// spend a verdict on keeps the markers and the cleanup button they gate
-    /// (review, spec #588).
-    ///
-    /// The caller's contract: the flush that carried this read's entries was
-    /// accepted, so every later read agrees with the card the user just saw.
-    pub(crate) fn commit(self, backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
-        record_overlay(backend, session_id, transcript);
-    }
-}
-
 /// One NON-throttled reconcile pass over a read's still-live Background Tasks
 /// (issue #454): the shell and child ids the read names, one bounded runtime
 /// read, the positive-evidence verdicts applied to the transcript, and at most
@@ -310,8 +274,8 @@ impl ReconcilePass {
 /// settle — so a flaky runtime can never end a wait.
 ///
 /// NOTHING is written to the overlay here (review, PR #595): the returned
-/// [`ReconcilePass`] is the caller's to commit once the card write that carried
-/// the read's entries was accepted. [`RuntimeReconcile::observe`] composes this
+/// [`Pass`](crate::backend::runs::Pass) is the caller's to commit once the card
+/// write that carried the read's entries was accepted. [`RuntimeReconcile::observe`] composes this
 /// under its attempt-stamped 30 s throttle, which is how the poll paths
 /// (Session Sync, the drain, the follow/settle loop) share one verdict; the
 /// cleanup click calls it directly (spec #588, #590), because a click must
@@ -339,7 +303,7 @@ pub(crate) async fn reconcile_now(
     transcript: &mut SessionTranscript,
     budget: CycleBudget,
     anchor: Option<&TurnAnchor>,
-) -> Option<ReconcilePass> {
+) -> Option<Pass> {
     if !backend.reports_live_runs() {
         return None;
     }
@@ -348,10 +312,14 @@ pub(crate) async fn reconcile_now(
     // launch/ref status) has no live child id but still owes the evidence read.
     // A childless run owes no read at all — its only exit is the Cleanup the
     // pass below marks it for — so it alone still justifies a pass.
+    let runs = backend.runs();
     if shells.is_empty()
         && children.is_empty()
-        && transcript.run_evidence_suspects(anchor).is_empty()
-        && !transcript.needs_cleanup_marking()
+        && !runs
+            .evidence_waits(transcript, anchor)
+            .iter()
+            .any(|wait| !wait.task)
+        && !runs.needs_cleanup_marking(transcript)
     {
         return None;
     }
@@ -368,7 +336,7 @@ pub(crate) async fn reconcile_now(
             // overlay re-applied them), so "changed" is measured against them:
             // a marker the verdict resolves is a change too.
             let unconfirmed_before = transcript.unconfirmed_tasks.clone();
-            transcript.apply_task_runtime(&runtime);
+            runs.apply_task_runtime(session_id, transcript, &runtime);
             // Record the RUNTIME verdict's endings AT DERIVATION (ADR-0080) —
             // one synchronous Chain Record write per run, the fact about the run
             // rather than the card that will show its entry, an entry-less chain
@@ -382,141 +350,18 @@ pub(crate) async fn reconcile_now(
             // the ledger and the entry stays owed. Only the process-local
             // overlay below stays gated on the caller's accepted write; the
             // unconfirmed marker keeps that gate unchanged.
-            let mut recorded_retirements = retired_before;
-            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
-            // The child-evidence step (#591, issue #464): a subagent the
-            // runtime no longer reports active can still be retirable on its
-            // own transcript's evidence — and the very failure mode this
-            // family exists for is the missing Wake. At most ONE light read
-            // per suspect per pass: a terminal step finish with its completion
-            // stamp retires the task, a gone child session retires it as lost,
-            // and a read that cannot conclude — or fails, or times out, or is
-            // skipped by the spent cycle budget — keeps the row exactly as the
-            // runtime marked it, never guessed. A read that DOES conclude
-            // records its ending at the derivation too.
-            // The child-evidence step is a `child_evidence`-only surface: a
-            // client that does not declare the read (V1's shape, or a client
-            // with background runs but no child evidence) must not be asked
-            // for it. Its tasks/runs keep whatever the runtime verdict left.
-            let reads_child_evidence = backend.capabilities().child_evidence;
-            if reads_child_evidence {
-                for (call_id, child_id) in transcript.unconfirmed_children() {
-                    match budget
-                        .read("child evidence read", backend.child_evidence(&child_id))
-                        .await
-                    {
-                        Some(Ok(evidence)) => {
-                            let had_task = transcript
-                                .background_tasks
-                                .iter()
-                                .any(|task| task.tool.call_id == call_id);
-                            transcript.apply_child_evidence(&call_id, evidence);
-                            let retired = had_task
-                                && !transcript
-                                    .background_tasks
-                                    .iter()
-                                    .any(|task| task.tool.call_id == call_id);
-                            record_new_endings(backend, session_id, transcript, &mut recorded_retirements);
-                            if retired {
-                                release_child_session(backend, &child_id).await;
-                            }
-                        }
-                        Some(Err(error)) => {
-                            tracing::debug!(
-                                "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
-                            );
-                        }
-                        // A read that timed out — or that the spent budget skipped
-                        // — yields no verdict, like the runtime read above.
-                        None => {}
-                    }
-                }
-            }
-            // The runs (spec #1057's P4): a child thread's own terminal item is
-            // the evidence, so a child that ends with no Wake retires its row
-            // and settles the yielded Turn. A run already represented by a
-            // Background Task was handled above and is not read twice.
-            //
-            // The gate is the ADR-0106 `child_evidence` axis, checked above:
-            // a client without the read keeps its runs as the runtime left
-            // them and is never asked for their children.
-            if reads_child_evidence {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                for (run_id, child_id) in transcript.run_evidence_suspects(anchor) {
-                    let was_live = transcript
-                        .runs
-                        .iter()
-                        .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
-                    match budget
-                        .read("run child evidence read", backend.child_evidence(&child_id))
-                        .await
-                    {
-                        Some(Ok(evidence)) => {
-                            if transcript.apply_run_child_evidence(&run_id, evidence) {
-                                record_new_endings(
-                                    backend,
-                                    session_id,
-                                    transcript,
-                                    &mut recorded_retirements,
-                                );
-                            } else if !was_live
-                                || (matches!(evidence, crate::backend::ChildEvidence::Unfinished)
-                                    && transcript.live_run_stale(&run_id, now_ms))
-                            {
-                                // A client-terminal run whose read did not
-                                // conclude stays visible as unconfirmed so a
-                                // Cleanup can end it. A live run keeps its live
-                                // line while the child may still be starting —
-                                // but once it has outlived the in-flight window
-                                // and the read still concludes nothing, no
-                                // machine can end it: the ⚠️ row and its button
-                                // are its exit.
-                                transcript.unconfirmed_tasks.insert(run_id.clone());
-                            }
-                            let still_live = transcript
-                                .runs
-                                .iter()
-                                .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
-                            if !still_live {
-                                // The run retired, or is terminal and no longer
-                                // needs its child subscription.
-                                release_child_session(backend, &child_id).await;
-                            }
-                        }
-                        Some(Err(error)) => {
-                            // A failed read is no verdict. A young live child
-                            // may still be starting, so it keeps its live line
-                            // and the next read retries; a stale one can only
-                            // end by the Cleanup.
-                            if !was_live || transcript.live_run_stale(&run_id, now_ms) {
-                                transcript.unconfirmed_tasks.insert(run_id.clone());
-                            }
-                            tracing::debug!(
-                                "session {session_id} run {run_id} child {child_id} evidence read failed: {error}; keeping its row"
-                            );
-                        }
-                        None => {
-                            // Inconclusive (timed out or budget-skipped): the
-                            // same rule as a failed read — a young live child
-                            // retries, a stale one needs the manual exit.
-                            if !was_live || transcript.live_run_stale(&run_id, now_ms) {
-                                transcript.unconfirmed_tasks.insert(run_id.clone());
-                            }
-                        }
-                    }
-                }
-            }
+            read_child_evidence(backend, runs, session_id, transcript, budget, anchor).await;
             // A childless run has no evidence read to conclude it: its only
             // exit is the user's Cleanup. Mark it so the ⚠️ row rides the
             // ledger and the Waiting card offers the button.
-            transcript.mark_cleanup_exits();
+            runs.mark_cleanup_exits(transcript);
             // NOTHING is committed here (review, PR #595): the caller commits
             // the returned pass only after the flush that carried this read's
             // entries was accepted.
-            Some(ReconcilePass {
-                changed: transcript.task_retirements.len() > retired_before
+            Some(Pass::new(
+                transcript.task_retirements.len() > retired_before
                     || transcript.unconfirmed_tasks != unconfirmed_before,
-            })
+            ))
         }
         Some(Err(error)) => {
             tracing::debug!(
@@ -525,9 +370,151 @@ pub(crate) async fn reconcile_now(
             // No runtime verdict, but the Cleanup exits do not depend on it:
             // a childless run or identity-less task must still get its button,
             // or a permanently failing runtime read wedges the Turn.
-            cleanup_mark_pass(transcript)
+            cleanup_mark_pass(backend, transcript)
         }
-        None => cleanup_mark_pass(transcript),
+        None => cleanup_mark_pass(backend, transcript),
+    }
+}
+
+/// The child-evidence step (#591, issue #464): one light read per suspect, the
+/// task path first and then the run path. A subagent the runtime no longer
+/// reports active can still be retirable on its own transcript's evidence — and
+/// the very failure mode this family exists for is the missing Wake. At most ONE
+/// read per suspect per pass: a terminal step finish with its completion stamp
+/// retires the task, a gone child session retires it as lost, and a read that
+/// cannot conclude — or fails, or times out, or is skipped by the spent cycle
+/// budget — keeps the row exactly as the runtime marked it, never guessed. A
+/// read that DOES conclude records its ending at the derivation too (the owner's
+/// `retire`, ADR-0080/0111).
+///
+/// The step is a `child_evidence`-only surface: a client that does not declare
+/// the read (V1's shape, or a client with background runs but no child evidence)
+/// must not be asked for it. Its tasks/runs keep whatever the runtime verdict
+/// left.
+async fn read_child_evidence(
+    backend: &Arc<dyn Backend>,
+    runs: &crate::backend::runs::RunLifecycle,
+    session_id: &str,
+    transcript: &mut SessionTranscript,
+    budget: CycleBudget,
+    anchor: Option<&TurnAnchor>,
+) {
+    if !backend.capabilities().child_evidence {
+        return;
+    }
+    // The Background Tasks first: the task path owns its run, and retiring one
+    // frees that run to be a suspect in THIS pass, exactly as it always has.
+    for wait in runs
+        .evidence_waits(transcript, anchor)
+        .into_iter()
+        .filter(|wait| wait.task)
+    {
+        let call_id = wait.key.clone();
+        let child_id = wait.child_id.clone();
+        match budget
+            .read("child evidence read", backend.child_evidence(&child_id))
+            .await
+        {
+            Some(Ok(evidence)) => {
+                let had_task = transcript
+                    .background_tasks
+                    .iter()
+                    .any(|task| task.tool.call_id == call_id);
+                runs.retire(
+                    session_id,
+                    transcript,
+                    &call_id,
+                    RetireCause::ChildEvidence(evidence),
+                );
+                let retired = had_task
+                    && !transcript
+                        .background_tasks
+                        .iter()
+                        .any(|task| task.tool.call_id == call_id);
+                if retired {
+                    release_child_session(backend, &child_id).await;
+                }
+            }
+            Some(Err(error)) => {
+                tracing::debug!(
+                    "session {session_id} child {child_id} evidence read failed: {error}; keeping its row"
+                );
+            }
+            // A read that timed out — or that the spent budget skipped — yields
+            // no verdict, like the runtime read.
+            None => {}
+        }
+    }
+    // The runs (spec #1057's P4): a child thread's own terminal item is the
+    // evidence, so a child that ends with no Wake retires its row and settles
+    // the yielded Turn.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for wait in runs
+        .evidence_waits(transcript, anchor)
+        .into_iter()
+        .filter(|wait| !wait.task)
+    {
+        let run_id = wait.key.clone();
+        let child_id = wait.child_id.clone();
+        let was_live = transcript
+            .runs
+            .iter()
+            .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
+        match budget
+            .read("run child evidence read", backend.child_evidence(&child_id))
+            .await
+        {
+            Some(Ok(evidence)) => {
+                let retired = runs
+                    .retire(
+                        session_id,
+                        transcript,
+                        &run_id,
+                        RetireCause::RunChildEvidence(evidence),
+                    )
+                    .is_some();
+                if !retired
+                    && (!was_live
+                        || (matches!(evidence, crate::backend::ChildEvidence::Unfinished)
+                            && transcript.live_run_stale(&run_id, now_ms)))
+                {
+                    // A client-terminal run whose read did not conclude stays
+                    // visible as unconfirmed so a Cleanup can end it: once a
+                    // live run outlives the in-flight window and the read still
+                    // concludes nothing, no machine can end it — the ⚠️ row and
+                    // its button are its exit.
+                    transcript.unconfirmed_tasks.insert(run_id.clone());
+                }
+                let still_live = transcript
+                    .runs
+                    .iter()
+                    .any(|run| run.ids().any(|id| id == run_id) && run.is_live());
+                if !still_live {
+                    // The run retired, or is terminal and no longer needs its
+                    // child subscription.
+                    release_child_session(backend, &child_id).await;
+                }
+            }
+            Some(Err(error)) => {
+                // A failed read is no verdict. A young live child may still be
+                // starting, so it keeps its live line and the next read retries;
+                // a stale one can only end by the Cleanup.
+                if !was_live || transcript.live_run_stale(&run_id, now_ms) {
+                    transcript.unconfirmed_tasks.insert(run_id.clone());
+                }
+                tracing::debug!(
+                    "session {session_id} run {run_id} child {child_id} evidence read failed: {error}; keeping its row"
+                );
+            }
+            None => {
+                // Inconclusive (timed out or budget-skipped): the same rule as a
+                // failed read — a young live child retries, a stale one needs
+                // the manual exit.
+                if !was_live || transcript.live_run_stale(&run_id, now_ms) {
+                    transcript.unconfirmed_tasks.insert(run_id.clone());
+                }
+            }
+        }
     }
 }
 
@@ -535,62 +522,10 @@ pub(crate) async fn reconcile_now(
 /// identity-less task) on a read that spent no verdict: the marker is the only
 /// way the waiting Turn can end, so a failed or skipped read must not withhold
 /// it. Returns a pass only when the set moved.
-fn cleanup_mark_pass(transcript: &mut SessionTranscript) -> Option<ReconcilePass> {
+fn cleanup_mark_pass(backend: &Arc<dyn Backend>, transcript: &mut SessionTranscript) -> Option<Pass> {
     let before = transcript.unconfirmed_tasks.clone();
-    transcript.mark_cleanup_exits();
-    (transcript.unconfirmed_tasks != before).then_some(ReconcilePass { changed: true })
-}
-
-/// Record every evidence ending the read derived after
-/// `recorded_retirements` (ADR-0080) — one synchronous Chain Record write per
-/// newly retired run, at the moment it was derived.
-/// `recorded_retirements` is advanced past what it wrote, so a caller can
-/// record again after a later child-evidence read without writing the same
-/// retirement twice. A read that FAILED or TIMED OUT never produced a
-/// retirement, so nothing is recorded for it.
-fn record_new_endings(
-    backend: &Arc<dyn Backend>,
-    session_id: &str,
-    transcript: &SessionTranscript,
-    recorded_retirements: &mut usize,
-) {
-    for retirement in &transcript.task_retirements[*recorded_retirements..] {
-        let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
-        backend
-            .tasks()
-            .record_evidence_ending(session_id, retirement, input);
-    }
-    *recorded_retirements = transcript.task_retirements.len();
-}
-
-/// Commit one reconcile pass's verdicts to the process-local cache (issue
-/// #454, review PR #595) — the body [`ReconcilePass::commit`] wraps, private so
-/// the pass is the only door: every retirement the transcript carries (the
-/// **durable ending** was already written at derivation, so this only fills
-/// this life's cache), and the pass's post-evidence unconfirmed set.
-/// [`reconcile_now`] never calls it itself; the caller commits only after the
-/// flush that carried the read's entries was accepted.
-///
-/// The DURABLE Task Ending fact (ADR-0080) is deliberately not written here:
-/// this gate counts a recoverably failed write still owed by the outbox as
-/// accepted, and a shown bit must ride a write that really DELIVERED the entry.
-/// The bit therefore travels with the body's staged cursor, whose confirmation
-/// is the project's delivered-write choke point.
-fn record_overlay(backend: &Arc<dyn Backend>, session_id: &str, transcript: &SessionTranscript) {
-    if !transcript.task_retirements.is_empty() {
-        let call_ids: Vec<String> = transcript
-            .task_retirements
-            .iter()
-            .map(|retirement| retirement.task.tool.call_id.clone())
-            .collect();
-        tracing::info!(
-            "session {session_id}: runtime reconciliation retired {} background task(s)",
-            call_ids.len()
-        );
-        backend.tasks().record(session_id, &call_ids);
-    }
-    let unconfirmed: Vec<String> = transcript.unconfirmed_tasks.iter().cloned().collect();
-    backend.tasks().set_unconfirmed(session_id, &unconfirmed);
+    backend.runs().mark_cleanup_exits(transcript);
+    (transcript.unconfirmed_tasks != before).then_some(Pass::new(true))
 }
 
 /// The shell and child session ids a read's still-live Background Tasks name,
@@ -667,6 +602,18 @@ async fn capture_shell_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The child-only runs the owner's one suspect list names, as the tests
+    /// assert them.
+    fn run_suspects(read: &SessionTranscript, anchor: Option<&TurnAnchor>) -> Vec<(String, String)> {
+        crate::backend::runs::RunLifecycle::new()
+            .evidence_waits(read, anchor)
+            .into_iter()
+            .filter(|wait| !wait.task)
+            .map(|wait| (wait.key, wait.child_id))
+            .collect()
+    }
+
     use crate::backend::{BackgroundTask, ChildRuntime, ShellEnd, ShellRuntime, ToolIdentity};
     use crate::bridge::chain::ChainRecords;
     use crate::bridge::test_support::MockBackend;
@@ -1218,7 +1165,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Vec::new()));
         let mut transcript = childless_activity();
         assert!(
-            transcript.needs_cleanup_marking(),
+            backend.runs().needs_cleanup_marking(&transcript),
             "the report minted a call-keyed run"
         );
 
@@ -1277,7 +1224,7 @@ mod tests {
         mock.fail_task_runtime_reads(usize::MAX);
         let backend: Arc<dyn Backend> = Arc::new(mock);
         let mut transcript = childless_activity();
-        assert!(transcript.needs_cleanup_marking());
+        assert!(backend.runs().needs_cleanup_marking(&transcript));
 
         let pass = reconcile_now(
             &backend,
@@ -1315,7 +1262,7 @@ mod tests {
                 child_id: None,
                 started_at: Some(1_000),
             }]);
-        assert!(transcript.needs_cleanup_marking());
+        assert!(backend.runs().needs_cleanup_marking(&transcript));
 
         let pass = reconcile_now(
             &backend,
@@ -1385,7 +1332,7 @@ mod tests {
         assert!(!transcript.runs[0].is_live(), "the ref states it completed");
         assert!(transcript.runs[0].reported_by.is_empty());
         assert_eq!(
-            transcript.run_evidence_suspects(None),
+            run_suspects(&transcript, None),
             vec![("thread_done".to_string(), "thread_done".to_string())],
             "a terminal ref still owes its child's own evidence"
         );

@@ -54,10 +54,11 @@ pub struct SessionTranscript {
     pub background_tasks: Vec<BackgroundTask>,
     /// The Background Tasks the read retired while no Wake retired them: a
     /// **runtime reconciliation** read that reported a terminal end or no
-    /// longer knows the task ([`SessionTranscript::apply_task_runtime`]), a
-    /// child-evidence read that concluded the subagent's own transcript
-    /// ([`SessionTranscript::apply_child_evidence`]), or the user's own
-    /// cleanup click ([`SessionTranscript::apply_cleanup`]). They have already
+    /// longer knows the task, a child-evidence read that concluded the
+    /// subagent's own transcript, or the user's own cleanup click — every one
+    /// derived by the run lifecycle owner
+    /// ([`crate::backend::runs::RunLifecycle::retire`], ADR-0111). They have
+    /// already
     /// left [`Self::background_tasks`], so the settle decision treats them as
     /// ended; the ledger renders each as a completion entry. Empty unless a
     /// reconciliation read, an evidence read or a cleanup ran.
@@ -162,327 +163,13 @@ impl SessionTranscript {
         self
     }
 
-    /// Apply one runtime reconciliation read (`TaskRuntime`, issue #454): a
-    /// shell the runtime reports ended — or no longer knows at all — leaves the
-    /// live list as a [`TaskRetirement`]; a subagent child the runtime reports
-    /// inactive stays live but is marked unconfirmed; a task with no verdict is
-    /// untouched. An empty read changes nothing, so V1 and a server that could
-    /// not answer reconcile to the transcript exactly as read.
-    ///
-    /// The retirement is deliberately limited to positive evidence: an id the
-    /// runtime did not mention (a failed per-shell read, an unrecognised active
-    /// entry) never retires a task. The unconfirmed marker is resolved only on
-    /// evidence too: the read carries the markers the overlay re-applied (the
-    /// previous reconciles' state), a `Running` verdict clears that child's
-    /// marker, an `Inactive` one (re)sets it, and a verdict that does not answer
-    /// for the child keeps exactly what the read carried. A task the verdict
-    /// retires drops its marker with it. A Wake-retired task is already absent
-    /// here.
-    pub fn apply_task_runtime(&mut self, runtime: &TaskRuntime) {
-        if runtime.shells.is_empty() && runtime.children.is_empty() {
-            return;
-        }
-        let mut kept = Vec::with_capacity(self.background_tasks.len());
-        let mut retired = Vec::new();
-        for task in std::mem::take(&mut self.background_tasks) {
-            let call_id = task.tool.call_id.clone();
-            if let Some(shell_id) = task.shell_id.clone() {
-                match runtime.shell(&shell_id) {
-                    // No verdict: the read could not place this shell — leave
-                    // the task exactly as the transcript read it.
-                    None | Some(ShellRuntime::Running) => kept.push(task),
-                    Some(ShellRuntime::Ended { end, completed_at }) => {
-                        self.unconfirmed_tasks.remove(&call_id);
-                        retired.push(TaskRetirement {
-                            task,
-                            ending: TaskRetirementEnding::Ended(end.clone()),
-                            finished_at: *completed_at,
-                            label: None,
-                        });
-                    }
-                    Some(ShellRuntime::Missing) => {
-                        self.unconfirmed_tasks.remove(&call_id);
-                        retired.push(TaskRetirement {
-                            task,
-                            ending: TaskRetirementEnding::Lost,
-                            finished_at: None,
-                            label: None,
-                        });
-                    }
-                }
-                continue;
-            }
-            let Some(child_id) = task.child_id.clone() else {
-                // A task with neither identity cannot be reconciled.
-                kept.push(task);
-                continue;
-            };
-            match runtime.child(&child_id) {
-                // Positive evidence the run is live: the marker resolves.
-                Some(ChildRuntime::Running) => {
-                    self.unconfirmed_tasks.remove(&call_id);
-                }
-                Some(ChildRuntime::Inactive) => {
-                    self.unconfirmed_tasks.insert(call_id);
-                }
-                // No answer (a read that could not place the child): keep the
-                // marker exactly as the read carried it.
-                None => {}
-            }
-            kept.push(task);
-        }
-        self.background_tasks = kept;
-        self.task_retirements.extend(retired);
-    }
-
-    /// Apply the user's manual cleanup (spec #588, ticket #590): every named
-    /// **live** Background Task or child-only run leaves its live list as a
-    /// [`TaskRetirement`] with the [`TaskRetirementEnding::Cleaned`] ending and
-    /// the click's own clock, exactly as a runtime reconciliation retires what
-    /// the runtime confirmed — so the settle rule follows (the last task gone is
-    /// the true end) and the ledger renders one 🧹 entry per cleared row. The
-    /// ids come from the caller's read of this same transcript, so an id with
-    /// no live task or run is ignored: a cleanup never invents a retirement for
-    /// something the read no longer lists. A run represented by a cleaned
-    /// Background Task leaves with it (one run, one ending). The cleared ids
-    /// also leave [`Self::unconfirmed_tasks`]; every other id stays as the read
-    /// left it.
-    pub fn apply_cleanup(&mut self, call_ids: &[String], now_ms: i64) {
-        let clearing: std::collections::HashSet<&str> = call_ids.iter().map(String::as_str).collect();
-        if clearing.is_empty() {
-            return;
-        }
-        let tasks_before = self.background_tasks.clone();
-        let mut kept = Vec::with_capacity(self.background_tasks.len());
-        let mut cleaned_task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for task in std::mem::take(&mut self.background_tasks) {
-            if clearing.contains(task.tool.call_id.as_str()) {
-                cleaned_task_ids.insert(task.tool.call_id.clone());
-                if let Some(child) = task.child_id.clone() {
-                    cleaned_task_ids.insert(child);
-                }
-                self.task_retirements.push(TaskRetirement {
-                    task,
-                    ending: TaskRetirementEnding::Cleaned,
-                    finished_at: Some(now_ms),
-                    label: None,
-                });
-            } else {
-                kept.push(task);
-            }
-        }
-        self.background_tasks = kept;
-        // A task-owned run leaves with its task: one run, one ending. Its
-        // ids are the ids the task just recorded, so the run loop below cannot
-        // keep it alive or mint a second cleanup ending. Its launch panel still
-        // settles with it (ADR-0108 §10), once the kept runs are back in place
-        // so a shared launch's live sibling keeps the panel running.
-        let mut cleaned_task_runs: Vec<AgentRun> = Vec::new();
-        if !cleaned_task_ids.is_empty() {
-            self.runs.retain(|run| {
-                let gone = run.ids().any(|id| cleaned_task_ids.contains(id))
-                    || run
-                        .child_id
-                        .as_ref()
-                        .is_some_and(|child| cleaned_task_ids.contains(child));
-                if gone {
-                    cleaned_task_runs.push(run.clone());
-                }
-                !gone
-            });
-        }
-        // A child-only run has no Background Task to clear: retire it through
-        // the same ending machinery, synthesized as the `subagent` row the
-        // evidence path uses. A run a task already represents is skipped (the
-        // task loop above owns that record).
-        let mut kept_runs = Vec::with_capacity(self.runs.len());
-        let mut cleaned_runs: Vec<AgentRun> = Vec::new();
-        for run in std::mem::take(&mut self.runs) {
-            let named = run.ids().any(|id| clearing.contains(id));
-            let task_owned = tasks_before.iter().any(|task| self.run_is_task(&run, task));
-            if named && !task_owned {
-                cleaned_runs.push(run);
-            } else {
-                kept_runs.push(run);
-            }
-        }
-        self.runs = kept_runs;
-        // The launch panel is the record of the request: a cleaned run settles
-        // it with the click's own ending, exactly as the evidence paths do.
-        for run in cleaned_task_runs.iter().chain(cleaned_runs.iter()) {
-            let launches: Vec<String> = run
-                .launched_by
-                .iter()
-                .map(|launch| launch.call_id.clone())
-                .collect();
-            self.settle_run_launch_panels(&launches, run.child_id.as_deref(), &TaskRetirementEnding::Cleaned);
-        }
-        for run in cleaned_runs {
-            self.task_retirements.push(TaskRetirement {
-                task: BackgroundTask {
-                    tool: ToolIdentity {
-                        name: "subagent".to_string(),
-                        call_id: run.ending_key().to_string(),
-                    },
-                    shell_id: None,
-                    child_id: run.child_id.clone(),
-                    started_at: run.started_at,
-                },
-                ending: TaskRetirementEnding::Cleaned,
-                finished_at: Some(now_ms),
-                label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
-            });
-        }
-        self.unconfirmed_tasks
-            .retain(|id| !clearing.contains(id.as_str()));
-    }
-
-    /// Apply one child-evidence read (#591, issue #464) to the suspect task
-    /// `call_id` — a live subagent the runtime reported inactive and whose own
-    /// newest assistant message was just read. A terminal [`ChildEvidence`]
-    /// retires the task with the message's completion clock (the
-    /// [`TaskRetirementEnding::ChildEnded`] ending), [`ChildEvidence::Gone`]
-    /// retires it as [`TaskRetirementEnding::Lost`] identity-only, and
-    /// [`ChildEvidence::Unfinished`] changes nothing — the row stays exactly as
-    /// the runtime marked it. An id with no live task invents no retirement.
-    pub fn apply_child_evidence(&mut self, call_id: &str, evidence: ChildEvidence) {
-        // Exhaustive and honest: no-evidence returns BEFORE anything is
-        // touched, and no other arm can turn it into an ending. A single
-        // `Unfinished => Lost` catch-all (or a guard whose arm disagrees with
-        // it) is how a healthy, unread child would be recorded lost.
-        let Some(index) = self
-            .background_tasks
-            .iter()
-            .position(|task| task.tool.call_id == call_id)
-        else {
-            return;
-        };
-        let started_at = self.background_tasks[index].started_at;
-        let (ending, finished_at) = match evidence {
-            ChildEvidence::Terminal {
-                completed_at,
-                started_at: turn_started_at,
-            } => {
-                let turn_start = turn_started_at.unwrap_or(completed_at);
-                if started_at.is_some_and(|started| turn_start.div_euclid(1000) < started.div_euclid(1000)) {
-                    // A previous turn's terminal item: the task stays live.
-                    return;
-                }
-                (TaskRetirementEnding::ChildEnded, Some(completed_at))
-            }
-            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
-            ChildEvidence::Unfinished => return,
-        };
-        let task = self.background_tasks.remove(index);
-        // One run, one ending: the run this task represents leaves with it, so
-        // the run-evidence loop cannot read the same child again and append a
-        // second retirement under its own key.
-        let mut launch_calls = vec![task.tool.call_id.clone()];
-        if let Some(child) = task.child_id.as_deref() {
-            for run in self
-                .runs
-                .iter()
-                .filter(|run| run.run_id == child || run.child_id.as_deref() == Some(child))
-            {
-                launch_calls.extend(run.launched_by.iter().map(|launch| launch.call_id.clone()));
-            }
-            self.runs
-                .retain(|run| run.run_id != child && run.child_id.as_deref() != Some(child));
-        }
-        // The launch panel is the record of the request, not the run: it
-        // settles with the ending instead of looking live beside it. A shared
-        // launch waits for its other children (see `settle_run_launch_panels`).
-        self.settle_run_launch_panels(&launch_calls, task.child_id.as_deref(), &ending);
-        self.unconfirmed_tasks.remove(call_id);
-        self.task_retirements.push(TaskRetirement {
-            task,
-            ending,
-            finished_at,
-            label: None,
-        });
-    }
-
-    /// The live subagent tasks a reconciliation read could not confirm as
-    /// running — one `(call_id, child_id)` per suspect, in the read's order.
-    /// The shared reconcile step spends at most one child-evidence read per
-    /// suspect per cycle (#591, issue #464); a child the runtime reports
-    /// running is never read, and neither is a task without a child session.
-    pub fn unconfirmed_children(&self) -> Vec<(String, String)> {
-        self.background_tasks
-            .iter()
-            .filter(|task| self.unconfirmed_tasks.contains(task.tool.call_id.as_str()))
-            .filter_map(|task| {
-                task.child_id
-                    .as_ref()
-                    .map(|child_id| (task.tool.call_id.clone(), child_id.clone()))
-            })
-            .collect()
-    }
-
-    /// The runs that still owe a child-evidence read, in read order: every run
-    /// still in this read with a child id, unless a Background Task already
-    /// represents it (the task's own runtime `child_evidence` path owns that
-    /// row). The status is deliberately not a filter: a run the client declared
-    /// terminal through a launch/ref status, or through a report, still has no
-    /// durable ending until its child's own item is read — skipping it would
-    /// drop the row with no entry and no ADR-0080 record.
-    ///
-    /// Each entry is `(ending key, child id)`: the ending key is the run's
-    /// `task_run_id` when minted (ADR-0080), which is what a recorded ending
-    /// resolves. A run represented by a Background Task is excluded, because
-    /// the existing runtime/child-evidence path already retires it; reading it
-    /// twice would spend a request and could retire it on a different clock.
-    pub fn run_evidence_suspects(&self, anchor: Option<&TurnAnchor>) -> Vec<(String, String)> {
-        // Only a live run, or a terminal one belonging to the current Turn,
-        // needs an evidence read. A terminal run from an earlier Turn is
-        // history: every read would otherwise re-read the session's whole child
-        // history and mint a completion entry for each. The Turn's own anchor is
-        // the boundary — the newest user message can be a Supplement, which is
-        // NOT a new Turn (ADR-0043) — and only a caller with no Turn (a Session
-        // Card read) falls back to it.
-        let cutoff = self.run_cutoff(anchor);
-        self.runs
-            .iter()
-            .filter(|run| Self::run_in_turn(run, cutoff))
-            .filter_map(|run| {
-                let child = run.child_id.as_deref()?;
-                let task = self
-                    .background_tasks
-                    .iter()
-                    .any(|task| self.run_is_task(run, task));
-                (!task).then(|| (run.ending_key().to_string(), child.to_string()))
-            })
-            .collect()
-    }
-
-    /// The boundary between the current Turn and history: the Turn's own
-    /// anchor when the caller has one, else the newest user message (a caller
-    /// with no Turn at all — a Session Card read). `None` when neither exists,
-    /// which leaves terminal runs in scope.
-    fn run_cutoff(&self, anchor: Option<&TurnAnchor>) -> Option<i64> {
-        anchor
-            .map(|anchor| anchor.created_ms)
-            .or_else(|| self.newest_turn_start())
-    }
-
-    /// The server time of the newest user message — where history ends and the
-    /// newest Turn begins. `None` when no user message carries a time (a
-    /// synthetic or a Wake-only read), which leaves terminal runs in scope.
-    fn newest_turn_start(&self) -> Option<i64> {
-        self.messages
-            .iter()
-            .rev()
-            .find(|message| message.role == super::MessageRole::User)
-            .and_then(|message| message.time.as_ref().map(|time| time.created))
-    }
-
     /// Whether `run` still lies inside the newest Turn's scope: a live run
     /// always does (its exit is owed), a terminal one only when a KNOWN start
     /// precedes the cutoff. A run with no start cannot be placed — the window
     /// that read it may have dropped its clock — so it is not history: only a
     /// dated start proves the run belongs to an earlier Turn. A same-second
     /// start counts as inside (ADR-0108 accepts that ambiguity).
-    fn run_in_turn(run: &AgentRun, cutoff: Option<i64>) -> bool {
+    pub(crate) fn run_in_turn(run: &AgentRun, cutoff: Option<i64>) -> bool {
         run.is_live() || cutoff.is_none_or(|cut| run.started_at.is_none_or(|start| start >= cut))
     }
 
@@ -503,40 +190,10 @@ impl SessionTranscript {
         })
     }
 
-    /// Whether the read carries an exit nothing else can produce: a run with no
-    /// child id (the call-keyed run a report created, spec #1057) or a
-    /// Background Task with neither a shell nor a child id. Neither has a
-    /// transcript to read and no Wake can name it, so the runtime reconcile
-    /// must run even when nothing is live — the Cleanup it marks is the only
-    /// exit.
-    pub fn needs_cleanup_marking(&self) -> bool {
-        self.runs.iter().any(|run| run.child_id.is_none())
-            || self
-                .background_tasks
-                .iter()
-                .any(|task| task.shell_id.is_none() && task.child_id.is_none())
-    }
-
-    /// Mark every childless run and identity-less task for the Cleanup exit:
-    /// with no child there is no evidence read that can end it, so the ⚠️ row
-    /// and its button are the only way the run/task — and the Turn waiting on
-    /// it — can end.
-    pub fn mark_cleanup_exits(&mut self) {
-        for run in self.runs.iter().filter(|run| run.child_id.is_none()) {
-            self.unconfirmed_tasks.insert(run.ending_key().to_string());
-        }
-        for task in self
-            .background_tasks
-            .iter()
-            .filter(|task| task.shell_id.is_none() && task.child_id.is_none())
-        {
-            self.unconfirmed_tasks.insert(task.tool.call_id.clone());
-        }
-    }
-
     /// Settle the launch calls an ended run named: the panel is the record of
-    /// the request, so it must not keep reading live beside a finished run.
-    fn settle_launch_calls(&mut self, call_ids: &[String], status: ToolStatus) {
+    /// the request, so it must not keep reading live beside a finished run. The
+    /// run lifecycle owner is its caller (ADR-0111 §2).
+    pub(crate) fn settle_launch_calls(&mut self, call_ids: &[String], status: ToolStatus) {
         for message in &mut self.messages {
             for part in &mut message.parts {
                 if let Part::Tool(call) = part
@@ -710,114 +367,6 @@ impl SessionTranscript {
         task.tool.call_id == run.ending_key()
             || run.ids().any(|id| task.tool.call_id == id)
             || (task.child_id.is_some() && task.child_id == run.child_id)
-    }
-
-    /// Apply one child-evidence read to a run that is not a Background Task
-    /// (`apply_child_evidence` is the task path): a terminal child retires the
-    /// run as a [`TaskRetirement`] keyed by its durable identity, so the ledger,
-    /// the completion entry and the settle decision all follow the one
-    /// ADR-0080 machinery; a gone child retires it as lost. `Unfinished` is no
-    /// evidence and changes nothing.
-    ///
-    /// The retirement's synthesized task names the run by its durable key, so
-    /// the ending records under the same `RunKey` every other writer resolves.
-    ///
-    /// A terminal child clock BEFORE the run's own start is a previous turn's
-    /// evidence, not this run's: a resumed child's newest assistant message can
-    /// still be the old turn's until the new one emits, and retiring on it
-    /// would end a run that just began. `Gone` carries no clock and is always
-    /// this run's (the child cannot be hosted at all).
-    pub fn apply_run_child_evidence(&mut self, run_id: &str, evidence: ChildEvidence) -> bool {
-        let Some(index) = self
-            .runs
-            .iter()
-            .position(|run| run.run_id == run_id || run.ending_key() == run_id)
-        else {
-            return false;
-        };
-        // A task path may already have retired this child this pass: never mint
-        // a second ending for one run.
-        if self.task_retirements.iter().any(|retirement| {
-            retirement.task.child_id.is_some() && retirement.task.child_id == self.runs[index].child_id
-        }) {
-            self.runs.remove(index);
-            return false;
-        }
-        let client_status = self.runs[index].status;
-        let (ending, finished_at) = match evidence {
-            ChildEvidence::Terminal {
-                completed_at,
-                started_at,
-            } => {
-                let turn_start = started_at.unwrap_or(completed_at);
-                // Only a launch (or a resume, which moves `started_at`) dates
-                // the generation. A report is an observation, not a new
-                // generation: a terminal report between the child's turn start
-                // and its evidence must not reject the child's own ending.
-                if self.runs[index].started_at.is_some_and(|started| {
-                    // The turn start is the ordering fact. A strictly earlier
-                    // second is a previous turn; a same-second start is
-                    // genuinely ambiguous (a normal first turn starts with its
-                    // spawn, and a resume can land in the same second as the
-                    // old turn) — ADR-0108 records that the ambiguity is
-                    // accepted in favour of not rejecting a fresh child's first
-                    // turn, and a completion is not compared (the wire states
-                    // it in whole seconds too, so a same-second completion
-                    // floors below a millisecond start).
-                    turn_start.div_euclid(1000) < started.div_euclid(1000)
-                }) {
-                    // A previous turn's terminal item, not this run's. Record
-                    // the rejection so a persistently stale suspect is
-                    // diagnosable instead of silently re-read forever.
-                    tracing::debug!(
-                        run = %self.runs[index].run_id,
-                        completed_at,
-                        turn_start,
-                        started_at = self.runs[index].started_at,
-                        "child evidence predates the run's start; keeping the run live"
-                    );
-                    return false;
-                }
-                let ending = match client_status {
-                    RunStatus::Failed => TaskRetirementEnding::ClientFailed,
-                    RunStatus::Cancelled => TaskRetirementEnding::ClientCancelled,
-                    _ => TaskRetirementEnding::ChildEnded,
-                };
-                (ending, Some(completed_at))
-            }
-            ChildEvidence::Gone => (TaskRetirementEnding::Lost, None),
-            // No evidence: the run stays exactly as the client stated it.
-            ChildEvidence::Unfinished => return false,
-        };
-        let run = self.runs.remove(index);
-        // The launch panel is the record of the request, not the run: it
-        // settles with the ending instead of reading live beside it. A shared
-        // launch waits for its other children (see `settle_run_launch_panels`).
-        let launch_calls: Vec<String> = run
-            .launched_by
-            .iter()
-            .map(|launch| launch.call_id.clone())
-            .collect();
-        self.settle_run_launch_panels(&launch_calls, run.child_id.as_deref(), &ending);
-        self.task_retirements.push(TaskRetirement {
-            task: BackgroundTask {
-                // The ledger's rows stay `shell`/`subagent` (ADR-0105's
-                // consequence): a child agent is a subagent run whatever
-                // producer named it.
-                tool: ToolIdentity {
-                    name: "subagent".to_string(),
-                    call_id: run.ending_key().to_string(),
-                },
-                shell_id: None,
-                child_id: run.child_id.clone(),
-                started_at: run.started_at,
-            },
-            ending,
-            finished_at,
-            label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
-        });
-        self.unconfirmed_tasks.remove(run.ending_key());
-        true
     }
 
     /// The newest user message by server time, if any — the message a Turn's
@@ -1103,7 +652,8 @@ impl SessionTranscript {
         // ending and must stay clearable.
         //
         // The wait for a child-bearing run is scoped to the run's OWN Turn, the
-        // same cut [`Self::run_evidence_suspects`] reads: a DATED terminal run
+        // same cut the run lifecycle's `evidence_waits` reads: a DATED terminal
+        // run
         // from an earlier Turn is history, and no read will ever mint its
         // ending. Waiting on it would wedge the newest Turn forever (and every
         // restart, since the lingering run is durable state). A run with no
@@ -2918,6 +2468,7 @@ pub enum ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::runs::test_seam::TranscriptRunTransitions;
 
     fn message(
         id: &str,
@@ -3531,7 +3082,7 @@ mod tests {
                 TurnSettle::Waiting,
                 "a childless run has no read to end it: only a Cleanup can"
             );
-            transcript.mark_cleanup_exits();
+            crate::backend::runs::RunLifecycle::new().mark_cleanup_exits(&mut transcript);
             assert!(
                 transcript.unconfirmed_tasks.contains("call_activity"),
                 "the ⚠️ row and its button are the wait's affordance"
@@ -3774,7 +3325,7 @@ mod tests {
             reported_by: Vec::new(),
         }];
         assert_eq!(
-            transcript.run_evidence_suspects(Some(&anchor)),
+            run_suspects(&transcript, Some(&anchor)),
             vec![("ses_child".to_string(), "ses_child".to_string())],
             "the Turn's anchor, not the supplement, is the boundary"
         );
@@ -3802,9 +3353,9 @@ mod tests {
                 child_id: None,
                 started_at: Some(1_100),
             }]);
-        assert!(transcript.needs_cleanup_marking());
+        assert!(crate::backend::runs::RunLifecycle::new().needs_cleanup_marking(&transcript));
         assert_eq!(transcript.settle_with(Some(&anchor), true), TurnSettle::Waiting);
-        transcript.mark_cleanup_exits();
+        crate::backend::runs::RunLifecycle::new().mark_cleanup_exits(&mut transcript);
         assert!(
             transcript.unconfirmed_tasks.contains("call_sub"),
             "the ⚠️ row and its button are the wait's affordance"
@@ -4242,6 +3793,17 @@ mod tests {
         assert!(unfinished.task_retirements.is_empty());
     }
 
+    /// The child-only runs the owner's one suspect list names, as the tests
+    /// assert them.
+    fn run_suspects(read: &SessionTranscript, anchor: Option<&TurnAnchor>) -> Vec<(String, String)> {
+        crate::backend::runs::RunLifecycle::new()
+            .evidence_waits(read, anchor)
+            .into_iter()
+            .filter(|wait| !wait.task)
+            .map(|wait| (wait.key, wait.child_id))
+            .collect()
+    }
+
     /// Spec #588 / #591: the suspects one reconcile cycle may read — only the
     /// live children the runtime marked unconfirmed; a running child, a shell,
     /// and an unmarked child are never suspects.
@@ -4262,14 +3824,19 @@ mod tests {
             task.clone(),
             background_shell(1_100),
         ]);
-        assert!(
-            transcript.unconfirmed_children().is_empty(),
-            "no marker means no suspect"
-        );
+        let task_waits = |read: &SessionTranscript| -> Vec<(String, String)> {
+            crate::backend::runs::RunLifecycle::new()
+                .evidence_waits(read, None)
+                .into_iter()
+                .filter(|wait| wait.task)
+                .map(|wait| (wait.key, wait.child_id))
+                .collect()
+        };
+        assert!(task_waits(&transcript).is_empty(), "no marker means no suspect");
 
         transcript.unconfirmed_tasks.insert("call_sub".into());
         assert_eq!(
-            transcript.unconfirmed_children(),
+            task_waits(&transcript),
             vec![("call_sub".to_string(), "ses_child".to_string())],
             "only the marked live child is a suspect"
         );
@@ -4284,7 +3851,11 @@ mod tests {
         let overlay = BackgroundTaskOverlay::default();
         let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![background_shell(1_100)]);
         let mut transcript = live();
-        overlay.apply("ses_a", &mut transcript);
+        overlay.observe(
+            "ses_a",
+            &mut transcript,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert_eq!(
             transcript.background_tasks.len(),
             1,
@@ -4293,14 +3864,22 @@ mod tests {
 
         overlay.record("ses_a", &["call_bg".to_string()]);
         let mut filtered = live();
-        overlay.apply("ses_a", &mut filtered);
+        overlay.observe(
+            "ses_a",
+            &mut filtered,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert!(
             filtered.background_tasks.is_empty(),
             "the recorded task leaves the live list"
         );
 
         let mut other_session = live();
-        overlay.apply("ses_b", &mut other_session);
+        overlay.observe(
+            "ses_b",
+            &mut other_session,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert_eq!(
             other_session.background_tasks.len(),
             1,
@@ -4316,7 +3895,11 @@ mod tests {
             child_id: None,
             started_at: Some(1_100),
         }]);
-        overlay.apply("ses_a", &mut other_id);
+        overlay.observe(
+            "ses_a",
+            &mut other_id,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert_eq!(other_id.background_tasks.len(), 1, "another call id is untouched");
     }
 
@@ -4340,7 +3923,11 @@ mod tests {
         let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
 
         let mut untouched = live();
-        overlay.apply("ses_a", &mut untouched);
+        overlay.observe(
+            "ses_a",
+            &mut untouched,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert!(
             untouched.unconfirmed_tasks.is_empty(),
             "nothing recorded yet marks nothing"
@@ -4348,14 +3935,18 @@ mod tests {
 
         overlay.set_unconfirmed("ses_a", &["call_sub".to_string()]);
         let mut marked = live();
-        overlay.apply("ses_a", &mut marked);
+        overlay.observe("ses_a", &mut marked, crate::backend::runs::LiveRunSurface::full());
         assert!(
             marked.unconfirmed_tasks.contains("call_sub"),
             "the recorded marker rides every later read"
         );
 
         let mut other_session = live();
-        overlay.apply("ses_b", &mut other_session);
+        overlay.observe(
+            "ses_b",
+            &mut other_session,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert!(
             other_session.unconfirmed_tasks.is_empty(),
             "another session is untouched"
@@ -4364,7 +3955,11 @@ mod tests {
         // The reconcile's replace write is how a verdict resolves a marker.
         overlay.set_unconfirmed("ses_a", &[]);
         let mut resolved = live();
-        overlay.apply("ses_a", &mut resolved);
+        overlay.observe(
+            "ses_a",
+            &mut resolved,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert!(
             resolved.unconfirmed_tasks.is_empty(),
             "a resolved verdict's replacement stops the marker riding reads"
@@ -4374,7 +3969,11 @@ mod tests {
         overlay.set_unconfirmed("ses_a", &["call_sub".to_string()]);
         overlay.record("ses_a", &["call_sub".to_string()]);
         let mut retired = live();
-        overlay.apply("ses_a", &mut retired);
+        overlay.observe(
+            "ses_a",
+            &mut retired,
+            crate::backend::runs::LiveRunSurface::full(),
+        );
         assert!(
             retired.background_tasks.is_empty(),
             "the retirement removes the task"

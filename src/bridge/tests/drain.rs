@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::backend::runs::test_seam::TranscriptRunTransitions;
 use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd,
@@ -3870,7 +3871,7 @@ async fn a_runtime_retirement_during_the_drain_ends_the_turn() {
     // only once the drain's render carried its entry — the same
     // record-after-flush invariant, pinned on this path.
     assert_eq!(
-        backend.overlay.retired_ids("ses_test"),
+        backend.overlay.runs().retired_ids("ses_test"),
         vec!["call_bg".to_string()],
         "the drain's accepted render records the retirement"
     );
@@ -3944,9 +3945,9 @@ async fn a_drain_whose_render_never_lands_records_nothing() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(
-        backend.overlay.retired_ids("ses_test").is_empty(),
+        backend.overlay.runs().retired_ids("ses_test").is_empty(),
         "a render that never landed records nothing: {:?}",
-        backend.overlay.retired_ids("ses_test")
+        backend.overlay.runs().retired_ids("ses_test")
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await

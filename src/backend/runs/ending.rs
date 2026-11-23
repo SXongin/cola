@@ -102,6 +102,24 @@ pub(crate) struct TaskRunIdentity {
     pub(crate) label: Option<String>,
 }
 
+impl TaskRunIdentity {
+    /// The [`BackgroundTask`] this identity re-synthesizes (ADR-0080), so a
+    /// durable ending's entry renders without the launch being in the read. The
+    /// run's stored key stands in for a launch call id the identity never
+    /// captured (a Wake's ending).
+    pub(crate) fn task(&self, fallback_key: &str) -> crate::backend::BackgroundTask {
+        crate::backend::BackgroundTask {
+            tool: crate::backend::ToolIdentity {
+                name: self.tool.clone().unwrap_or_else(|| "shell".to_string()),
+                call_id: self.call_id.clone().unwrap_or_else(|| fallback_key.to_string()),
+            },
+            shell_id: self.shell_id.clone(),
+            child_id: self.child_id.clone(),
+            started_at: self.started_at,
+        }
+    }
+}
+
 /// One durable **Task Ending** (ADR-0080): a claim about how one Background Task
 /// run ended, recorded at derivation — except a **Wake** completion's, recorded
 /// where its completion entry is committed to a card's render — and outliving

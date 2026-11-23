@@ -1848,7 +1848,7 @@ async fn a_task_ended_mid_turn_settles_the_turn_directly() {
     // process-local overlay only once the drain's render carried its entry —
     // the shared record-after-flush invariant, pinned on this path.
     assert_eq!(
-        backend.overlay.retired_ids("ses_test"),
+        backend.overlay.runs().retired_ids("ses_test"),
         vec!["call_bg".to_string()],
         "the drain's accepted render records the retirement"
     );
@@ -1898,9 +1898,9 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     // was not flipped — but the ENDING is durable (ADR-0080) and the task leaves
     // the ledger at once.
     assert!(
-        backend.overlay.retired_ids("ses_test").is_empty(),
+        backend.overlay.runs().retired_ids("ses_test").is_empty(),
         "a refused carrier commits no overlay cache: {:?}",
-        backend.overlay.retired_ids("ses_test")
+        backend.overlay.runs().retired_ids("ses_test")
     );
     // The ending's shown bit follows the same gate (ADR-0080): the entry never
     // reached a card, so no bit may be set — a later card must still render it.
@@ -1976,7 +1976,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
         "the entry renders exactly once on the card that can carry it: {successor}"
     );
     assert_eq!(
-        backend.overlay.retired_ids("ses_test"),
+        backend.overlay.runs().retired_ids("ses_test"),
         vec!["call_bg".to_string(), "sh_call_bg".to_string()],
         "the accepted successor render records the retirement, and the durable \
          ending's own shell-id alias is seeded beside it (ADR-0080)"
@@ -2031,7 +2031,7 @@ async fn a_queued_retirement_write_still_records() {
         .unwrap();
 
     assert_eq!(
-        backend.overlay.retired_ids("ses_test"),
+        backend.overlay.runs().retired_ids("ses_test"),
         vec!["call_bg".to_string()],
         "a queued-for-retry write is accepted: the pass records"
     );
@@ -2162,10 +2162,11 @@ async fn a_refused_yielded_refresh_recovers_on_settlement() {
     assert!(
         backend
             .overlay
+            .runs()
             .retired_ids("ses_test")
             .contains(&"call_bg".to_string()),
         "the settlement's accepted write records the retirement: {:?}",
-        backend.overlay.retired_ids("ses_test")
+        backend.overlay.runs().retired_ids("ses_test")
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")
         .await
@@ -3988,9 +3989,9 @@ async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
         "the notification previews the newer message: {notify}"
     );
     assert!(
-        backend.overlay.unconfirmed_call_ids("ses_test").is_empty(),
+        backend.overlay.runs().unconfirmed_call_ids("ses_test").is_empty(),
         "a superseded pass records no marker state: {:?}",
-        backend.overlay.unconfirmed_call_ids("ses_test")
+        backend.overlay.runs().unconfirmed_call_ids("ses_test")
     );
     // ADR-0080's reopened trade: the pass's carrier was superseded, so nothing
     // was committed to the process-local cache — but the runtime's evidence
@@ -4043,7 +4044,7 @@ async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
     )
     .await;
     assert_eq!(
-        backend.overlay.retired_ids("ses_test"),
+        backend.overlay.runs().retired_ids("ses_test"),
         vec!["call_bg".to_string(), "sh_call_bg".to_string()],
         "the accepted refresh records the retirement, and the durable ending's \
          own shell-id alias is seeded beside it (ADR-0080)"

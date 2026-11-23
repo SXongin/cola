@@ -1802,7 +1802,7 @@ impl Turn {
         if rendered.flush.accepted()
             && let Some(pass) = pass
         {
-            pass.commit(&handles.backend, &self.session_id, &transcript);
+            pass.commit(handles.backend.runs(), &self.session_id, &transcript);
         }
         // The same-snapshot ending rule (#604): the TRUE end is only real when
         // the read it was decided from was rendered AND showed no new content.
