@@ -8,7 +8,8 @@ use crate::bridge::handles::FlowHandles;
 use crate::bridge::pollers::{CardTarget, resolve_card_target};
 use crate::bridge::surfaces::{CompanionDelivery, CompanionLane, Surfaces};
 
-use super::kind::{PermissionOverflow, describe_action, describe_permission, permission_overflow};
+use super::kind::{PermissionOverflow, describe_permission, permission_overflow};
+use crate::feishu::card::tool_view::{PermissionView, permission_view};
 
 /// The exact content a companion carries and the digest covers.
 ///
@@ -70,13 +71,13 @@ fn text_digest(text: &str) -> u64 {
 /// cannot describe the same request differently.
 pub(crate) fn describe_permission_target_summary(p: &PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
-    let (emoji, label) = describe_action(action);
+    let PermissionView { icon, label, .. } = permission_view(action);
     // The excerpt is the target text, not the rendered body: the body's first
     // line already repeats the action above, and the full content (including
     // its chrome) travels in the companion.
     let excerpt: String = joined_patterns(p).chars().take(120).collect();
     format!(
-        "{emoji} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}",
+        "{icon} **{label}**\n**目标长度**: {} 字符\n**摘要**:\n{}",
         p.total_target_len(),
         crate::feishu::card::fenced_code(&excerpt, None)
     )
@@ -251,12 +252,12 @@ pub(crate) async fn ensure_permission_companion(
 
     let body = companion_text(p);
     let action = p.permission.as_deref().unwrap_or("?");
-    let (emoji, label) = describe_action(action);
+    let PermissionView { icon, label, .. } = permission_view(action);
     // A TARGET overflow is raw text, so it gets the action header and a fenced
     // block. A BODY overflow is already the renderer's markdown (action,
     // metadata, footer); send it as-is — fencing it would show the markdown
     // literally and prepending the action would repeat it.
-    let action_header = format!("{emoji} **{label}**\n\n");
+    let action_header = format!("{icon} **{label}**\n\n");
     let rich = companion_rich_body(&body, permission_overflow(p), &action_header);
     if let Some(md) = rich {
         let content = crate::feishu::card::viewer::rich_post_content(&md);

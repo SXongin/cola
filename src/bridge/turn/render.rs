@@ -35,7 +35,8 @@ use crate::bridge::turn::timeline::{
 use crate::config::ThreadKey;
 use crate::feishu::card::compaction::same_row;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
-use crate::feishu::card::tool_render::{FileDelivery, TaskLiveness};
+use crate::feishu::card::tool_render::FileDelivery;
+use crate::feishu::card::tool_view::TaskLiveness;
 
 use super::Turn;
 use super::flush::FlushOutcome;
@@ -3517,7 +3518,7 @@ async fn gather_render_liveness(
                 if let Some(child) = child {
                     if matches!(
                         child.activity,
-                        crate::feishu::card::tool_render::ChildActivity::Tool { .. }
+                        crate::feishu::card::tool_view::ChildActivity::Tool { .. }
                     ) {
                         liveness.activity = child.activity;
                     }
@@ -3789,7 +3790,8 @@ mod tests {
     };
     use crate::bridge::turn::timeline::TimelineKind;
     use crate::feishu::card::CardState;
-    use crate::feishu::card::tool_render::{ChildActivity, ToolPanel};
+    use crate::feishu::card::tool_render::ToolPanel;
+    use crate::feishu::card::tool_view::ChildActivity;
 
     /// The run one test's entry names (ADR-0080): the launch's call id, with the
     /// child session's own id riding along as the alias a Wake names it by.

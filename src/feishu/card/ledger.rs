@@ -22,7 +22,7 @@
 //! one.
 
 use super::sanitize::escaped_entities;
-use super::tool_render::TaskLiveness;
+use super::tool_view::TaskLiveness;
 use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
 use crate::backend::ShellOutputWindow;
 // The read-model type definitions live in the Background Task State module
@@ -636,7 +636,7 @@ fn secs_since(at_ms: i64, now_ms: i64) -> u64 {
 mod tests {
     use super::*;
     use crate::backend::Phase;
-    use crate::feishu::card::tool_render::ChildActivity;
+    use crate::feishu::card::tool_view::ChildActivity;
     use crate::feishu::card::vocab::{LEDGER_TITLE, TOOL_SHELL, TOOL_SUBAGENT};
 
     /// A shell row's output window (spec #588, #592) renders under the row as

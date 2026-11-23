@@ -658,7 +658,7 @@ pub(crate) fn collapsible_panel_elements(
 mod tests {
     use super::*;
     use crate::backend::{Phase, ToolDetail, ToolKind, ToolStatus};
-    use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
+    use crate::feishu::card::tool_view::{ChildActivity, TaskLiveness};
     use crate::feishu::card::{
         AWAITING_BOTH_TITLE, AWAITING_PERMISSION_TITLE, AWAITING_QUESTION_TITLE, AwaitingAction,
     };
