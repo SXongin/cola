@@ -687,8 +687,10 @@ impl RunLifecycle {
 /// run lifecycle's (ADR-0111 §2): the fold ([`super::derive`]) writes nothing,
 /// so the panel settles here — applied by `SessionTranscript::new` (so a raw
 /// projection and an observed read agree) and again by
-/// [`RunLifecycle::observe`], and by [`RunLifecycle::retire`] for the run it
-/// ends.
+/// [`RunLifecycle::observe`]. A run that RETIRES settles through
+/// [`SessionTranscript::settle_run_launch_panels`] instead
+/// ([`RunLifecycle::retire`]'s and the prune's own ending word), which is the
+/// same rule seen from the ending rather than from the client's report.
 pub(crate) fn settle_reported_panels(messages: &mut [crate::backend::TranscriptMessage], runs: &[AgentRun]) {
     let mut launch_ids: Vec<String> = runs
         .iter()

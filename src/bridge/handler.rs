@@ -4711,9 +4711,9 @@ impl App {
         // entry owed — and the marker stays as the read left it, so the
         // successor's still-usable button can clear it on the card that took the
         // chain. The commit is one call for the union — the pass's retirements,
-        // the cleaned retirements `apply_cleanup` appended above, and the
-        // post-verdict marker set — so no part of the cache can outlive the
-        // others.
+        // the cleaned retirements `RunLifecycle::cleanup` recorded and appended
+        // above, and the post-verdict marker set — so no part of the cache can
+        // outlive the others.
         if update.accepted() {
             pass.commit(handles.backend.runs(), &session_id, &transcript);
         } else {
