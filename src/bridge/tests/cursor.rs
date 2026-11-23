@@ -15,6 +15,7 @@ use super::drain::{
     assistant, ctx, scripted_app, settle_tool, spawn_sync, spawn_turn, tool_assistant, user,
     wait_for_card_text,
 };
+use super::reap::{realistic_card_view, restarted_app_with_backend, wait_for_projection};
 use crate::backend::types::SessionStatus;
 use crate::backend::{
     Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, Part, ReasoningPart,
@@ -618,7 +619,8 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
 /// verified, while a delivered-but-unconfirmed write keeps its confirmation
 /// even after a newer stage replaces the pending slot (spec #561, review
 /// #569) — so the record never skips content the newer, still-owed body
-/// carries.
+/// carries, and a restart from the confirmed cursor re-renders only the growth
+/// past it.
 ///
 /// The interleave is the delivery layer's own: A's payload delivers, a newer
 /// body's write fails and takes the pending slot, and only then does the
@@ -627,47 +629,35 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
 async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
     let _wd = test_work_dir();
     let (dir, app, _backend, platform) = scripted_app(
-        vec![SessionTranscript::new(vec![user(
-            "msg_cola_anchor",
-            1_000,
-            "你好",
-        )])],
+        vec![SessionTranscript::new(vec![
+            user("msg_cola_anchor", 1_000, "你好"),
+            assistant(2_000, "答复。"),
+        ])],
         Some(SessionStatus::Idle),
     )
     .await;
     let session_file = dir.path().join("sessions.json");
     let cards = app.cards_handle();
-    // A live card the chain tracks, carrying a running tool panel.
-    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
-    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
-    Turn::push_text(&cards, "ses_test", "答复。").await;
-    Turn::push_tool(
-        &cards,
-        "ses_test",
-        "call_9",
-        ToolPanel::for_test("bash", ToolStatus::Running, None, None),
-    )
-    .await;
-    cards.chains.track(
-        "ses_test",
-        "om_live",
-        MessageId::new("msg_cola_anchor"),
-        Some(1_000),
-        Some("/work"),
-        Some("msg_1"),
-    );
 
     // A's write fails at the transport: the ending is owed, its cursor staged
     // and tied to the Pending Card Update sequence.
-    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
-    Turn::flush_card(&cards, "ses_test").await;
+    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
+        .await
+        .unwrap();
+    let card_id = cards
+        .chains
+        .get("ses_test")
+        .expect("a failed ending write keeps the record")
+        .card_message_id
+        .clone();
     assert_eq!(
         cards.chains.cursor("ses_test"),
         None,
         "a failed write advanced nothing"
     );
     assert!(
-        app.core.feishu.has_pending_card_update("om_live"),
+        app.core.feishu.has_pending_card_update(&card_id),
         "the body is still owed"
     );
     let staged_a = Turn::staged_cursor(&cards, "ses_test")
@@ -684,13 +674,13 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
         "delivery alone advances nothing"
     );
 
-    // The tool settles: a NEWER body renders and its own write fails too, so
-    // B holds the pending slot A's payload just vacated.
+    // A NEWER body renders — a running tool joins the live set — and its own
+    // write fails too, so B holds the pending slot A's payload just vacated.
     Turn::push_tool(
         &cards,
         "ses_test",
         "call_9",
-        ToolPanel::for_test("bash", ToolStatus::Completed, None, Some("done")),
+        ToolPanel::for_test("bash", ToolStatus::Running, None, None),
     )
     .await;
     platform.fail_update_transport_count.store(1, Ordering::SeqCst);
@@ -724,6 +714,35 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
         persisted.cursor("ses_test"),
         Some(staged_a.clone()),
         "the persisted record carries the delivered write's cursor"
+    );
+
+    // A restart over that cursor re-renders only the growth past it: the
+    // transcribed answer grew while B was still owed, so the successor shows
+    // the growth once and repeats nothing A's delivered write covered. The
+    // sidecar is copied so this app can go on and deliver B below.
+    let restart_dir = tempfile::tempdir().unwrap();
+    let restart_file = restart_dir.path().join("sessions.json");
+    std::fs::copy(
+        crate::state::StateLayout::beside(&session_file, "chain_records.json"),
+        crate::state::StateLayout::beside(&restart_file, "chain_records.json"),
+    )
+    .expect("the persisted record copies for the restart");
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "答复。补充。"),
+    ]);
+    let (app2, platform2, _backend2) =
+        restarted_app_with_backend(&restart_file, transcript, Some(SessionStatus::Idle)).await;
+    platform2.given_card_view(&card_id, realistic_card_view());
+    spawn_sync(&app2);
+    let (_successor, successor_text) = wait_for_projection(&platform2, "msg_1").await;
+    assert!(
+        successor_text.contains("补充。"),
+        "the growth past the delivered cursor lands exactly once: {successor_text}"
+    );
+    assert!(
+        !successor_text.contains("答复。"),
+        "the delivered content is never repeated on the restart: {successor_text}"
     );
 
     // B delivers later: its own confirmation now advances the record to it.
