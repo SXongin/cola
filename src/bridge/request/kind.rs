@@ -3947,4 +3947,64 @@ Index: /proj/src/main.rs
             assert!(target.contains(label), "{action} receipt target: {target}");
         }
     }
+
+    /// The permission surface's characterization: every action name the two
+    /// generations report keeps exactly the words it rendered before #1135
+    /// moved the name→view table out of this module. One owner must not change
+    /// a human sentence.
+    #[test]
+    fn every_permission_action_keeps_its_words() {
+        let expected = [
+            ("bash", "⚡", "执行 Shell 命令"),
+            ("shell", "⚡", "执行 Shell 命令"),
+            ("command", "⚡", "执行 Shell 命令"),
+            ("permissions", "🔑", "申请额外权限"),
+            ("subagent", "🤖", "调用子代理"),
+            ("task", "🤖", "调用子代理"),
+            ("question", "❓", "向你提问"),
+            ("read", "📖", "读取文件"),
+            ("write", "✏️", "修改文件"),
+            ("edit", "✏️", "编辑文件"),
+            ("patch", "✏️", "应用补丁"),
+            ("apply_patch", "🔐", "执行操作"),
+            ("webfetch", "🌐", "访问网页"),
+            ("fetch", "🌐", "获取网络资源"),
+            ("websearch", "🌐", "网络搜索"),
+            ("grep", "🔎", "搜索内容"),
+            ("glob", "🔍", "查找文件"),
+            ("skill", "🧩", "调用技能"),
+            ("external_directory", "📁", "访问外部目录"),
+            ("kill", "🛑", "终止进程"),
+            ("ls", "📂", "列出目录"),
+            ("list", "📂", "列出内容"),
+            ("rename", "🔤", "重命名"),
+            ("remove", "🗑️", "删除文件"),
+            ("delete", "🗑️", "删除文件"),
+            ("rm", "🗑️", "删除文件"),
+            ("mkdir", "📁", "创建目录"),
+            ("move", "📦", "移动文件"),
+            ("mv", "📦", "移动文件"),
+            ("copy", "📋", "复制文件"),
+            ("cp", "📋", "复制文件"),
+            ("link", "🔗", "创建链接"),
+            ("ln", "🔗", "创建链接"),
+            ("install", "📥", "安装依赖"),
+            ("test", "🧪", "运行测试"),
+            ("build", "🏗️", "构建项目"),
+            ("git", "🌿", "执行 Git 操作"),
+            ("mystery", "🔐", "执行操作"),
+            ("", "🔐", "执行操作"),
+            ("?", "🔐", "执行操作"),
+        ];
+        for (action, emoji, label) in expected {
+            let p = perm(action, serde_json::json!({}));
+            assert_eq!(
+                describe_permission(&p),
+                format!(
+                    "{emoji} **{label}**\n**对象**:\n- `/proj/src/main.rs`\n\nAI 想要执行这个操作，是否允许？"
+                ),
+                "{action:?}: the permission body"
+            );
+        }
+    }
 }

@@ -11110,4 +11110,259 @@ excerpt two";
             assert!(line.contains(&format!("最多 5 {unit}")), "{name}: {line}");
         }
     }
+
+    /// TEMPORARY: print the panel characterization matrix.
+    #[test]
+    fn the_panel_views_are_characterization_pinned() {
+        fn detail_panel(
+            name: &str,
+            kind: ToolKind,
+            detail: ToolDetail,
+            input: serde_json::Value,
+            output: Option<&str>,
+        ) -> ToolPanel {
+            let mut tool = panel_with(
+                name,
+                ToolStatus::Completed,
+                input,
+                serde_json::Value::Null,
+                output,
+            );
+            tool.call.kind = kind;
+            tool.call.detail = detail;
+            tool
+        }
+        let image = detail_panel(
+            "codex/imageView",
+            ToolKind::Read,
+            ToolDetail::Read {
+                path: Some("/x/y.png".into()),
+                preview: None,
+                directory: false,
+                image: true,
+            },
+            json!({"path": "/x/y.png"}),
+            None,
+        );
+        let fetch = detail_panel(
+            "webfetch",
+            ToolKind::Fetch,
+            ToolDetail::None,
+            json!({"url": "https://a.example"}),
+            Some("body text"),
+        );
+        let launch = detail_panel(
+            "task",
+            ToolKind::Other,
+            ToolDetail::Delegation {
+                runs: Vec::new(),
+                effect: DelegationEffect::Launch,
+            },
+            json!({"description": "查资料", "subagent_type": "explore"}),
+            Some("<task id=\"1\">\n<summary>done</summary>\n<result>found it</result>\n</task>"),
+        );
+        let collab = ToolPanel::for_test(
+            "codex/collab_agent",
+            ToolStatus::Completed,
+            Some(
+                json!({"tool": "start", "senderThreadId": "t1", "receiverThreadIds": ["t2"], "prompt": "go", "model": "m", "reasoningEffort": "low", "status": "running", "agents": [{"threadId": "abcdefgh1234", "status": "running", "message": "busy", "label": null}]}),
+            ),
+            None,
+        );
+        // One representative call per identity the panel renders. The expected
+        // strings are the pre-#1135 output: the refactor that gives the panel
+        // and the permission surface one owner must change none of them.
+        let cases: Vec<(
+            &str,
+            ToolPanel,
+            &str,
+            Option<(Option<&str>, BodyStyle, &str)>,
+            usize,
+        )> = vec![
+            (
+                "command",
+                command_panel(
+                    "shell",
+                    ToolStatus::Completed,
+                    "make test",
+                    Some("/work"),
+                    Some(0),
+                    false,
+                    Some("all good"),
+                ),
+                "`make test`\n📁 `/work`",
+                Some((None, BodyStyle::Auto, "all good")),
+                8,
+            ),
+            (
+                "program",
+                program_panel(
+                    "execute",
+                    ToolStatus::Completed,
+                    "return 1",
+                    vec![nested("fetch", ToolStatus::Completed)],
+                    false,
+                    Some("1"),
+                ),
+                "```javascript\nreturn 1\n```",
+                Some((Some("1 个工具调用"), BodyStyle::Markdown, "- ✅ `fetch`\n\n1")),
+                18,
+            ),
+            (
+                "file-edits",
+                panel_with_edits(
+                    "edit",
+                    ToolStatus::Completed,
+                    json!({"filePath": "/x/a.rs"}),
+                    vec![FileEdit {
+                        path: "/x/a.rs".into(),
+                        action: FileAction::Update,
+                        rename_to: None,
+                        diff: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                    }],
+                    Some("ok"),
+                ),
+                "✏️ 编辑 `/x/a.rs`",
+                Some((
+                    Some("+1 −1"),
+                    BodyStyle::Markdown,
+                    "```rust\n@@ -1 +1 @@\n-old\n+new\n```",
+                )),
+                44,
+            ),
+            (
+                "read",
+                read_tool(
+                    ToolStatus::Completed,
+                    Some(json!({"filePath": "/x/y.rs"})),
+                    Some("<path>/x/y.rs</path>\n<type>file</type>\n<content>\n1: use std::fs;\n</content>"),
+                ),
+                "📖 `/x/y.rs`",
+                Some((
+                    Some("📄 `/x/y.rs`"),
+                    BodyStyle::Code(Some("rust")),
+                    "1: use std::fs;",
+                )),
+                79,
+            ),
+            ("image-read", image, "🖼 `/x/y.png`", None, 0),
+            (
+                "search-file",
+                search_tool_with_metadata(
+                    "glob",
+                    SearchScope::FileName,
+                    ToolStatus::Completed,
+                    json!({"pattern": "**/*.rs"}),
+                    json!({"count": 2, "truncated": false}),
+                    Some("a.rs\nb.rs"),
+                ),
+                "🔍 匹配 `**/*.rs`",
+                Some((None, BodyStyle::Auto, "a.rs\nb.rs")),
+                10,
+            ),
+            (
+                "search-web",
+                search_tool(
+                    "websearch",
+                    SearchScope::Web,
+                    ToolStatus::Completed,
+                    Some(json!({"query": "rust"})),
+                    Some("## 1. Rust\nhttps://rust-lang.org\nbody"),
+                ),
+                "🔎 `rust`",
+                Some((
+                    None,
+                    BodyStyle::Code(Some("json")),
+                    "## 1. Rust\nhttps://rust-lang.org\nbody",
+                )),
+                43,
+            ),
+            (
+                "fetch",
+                fetch,
+                "🌐 `https://a.example`",
+                Some((None, BodyStyle::Auto, "body text")),
+                9,
+            ),
+            (
+                "plan",
+                plan_tool(
+                    ToolStatus::Completed,
+                    Some(json!({"todos": [{"content": "one", "status": "completed"}]})),
+                    None,
+                ),
+                "📋 共 1 项任务",
+                None,
+                0,
+            ),
+            (
+                "skill",
+                detail_panel(
+                    "skill",
+                    ToolKind::Other,
+                    ToolDetail::Skill,
+                    json!({"name": "m15"}),
+                    Some("<skill_content name=\"m15\">\n# Body\n</skill_content>"),
+                ),
+                "🧩 m15",
+                Some((None, BodyStyle::Auto, "# Body")),
+                54,
+            ),
+            (
+                "ask",
+                detail_panel(
+                    "question",
+                    ToolKind::Other,
+                    ToolDetail::Ask,
+                    json!({"questions": [{"question": "哪個?"}]}),
+                    None,
+                ),
+                "❓ 1 个问题 · 哪個?",
+                None,
+                0,
+            ),
+            (
+                "launch",
+                launch,
+                "🔀 查资料\n🤖 `explore`",
+                Some((Some("done"), BodyStyle::Auto, "")),
+                76,
+            ),
+            (
+                "collab",
+                collab,
+                "📝 go\n🤖 `m` · low\n🔧 running",
+                Some((None, BodyStyle::Markdown, "⏳ `abcdefgh` · 运行中 · busy")),
+                35,
+            ),
+            (
+                "vendor",
+                ToolPanel::for_test(
+                    "mystery",
+                    ToolStatus::Completed,
+                    Some(json!({"a": 1, "b": [1, 2]})),
+                    Some("raw out"),
+                ),
+                "- a: 1\n- b: [1,2]",
+                Some((None, BodyStyle::Auto, "raw out")),
+                7,
+            ),
+        ];
+        for (name, panel, expected_input, expected_output, expected_estimate) in cases {
+            assert_eq!(
+                format_tool_input(&panel),
+                expected_input,
+                "{name}: the Input line"
+            );
+            let output = panel_output(&panel);
+            let expected = expected_output
+                .map(|(header, style, body)| (header.map(str::to_string), style, body.to_string()));
+            assert_eq!(output, expected, "{name}: the Output body");
+            assert_eq!(
+                panel_output_estimate(&panel),
+                expected_estimate,
+                "{name}: the body charge"
+            );
+        }
+    }
 }
