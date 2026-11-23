@@ -1,10 +1,12 @@
 //! The identity → view contract (#1135): one tool renders through both the
 //! Tool Panel and the permission card from the same [`ToolFamily`].
 
+use crate::backend::types::PermissionRequest;
 use crate::backend::{
     DelegationEffect, FileAction, FileEdit, SearchScope, ToolCall, ToolDetail, ToolIdentity, ToolKind,
     ToolOutput, ToolStatus,
 };
+use crate::bridge::request::kind::describe_permission;
 use crate::feishu::card::CardState;
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::ToolPanel;
@@ -23,6 +25,20 @@ fn panel(kind: ToolKind, detail: ToolDetail) -> ToolPanel {
         output: ToolOutput::default(),
         ..ToolCall::default()
     })
+}
+
+/// One permission request as an adapter reports it: the action name, one
+/// pattern, and the metadata the renderer reads.
+fn permission(action: &str, metadata: serde_json::Value) -> PermissionRequest {
+    PermissionRequest {
+        request_id: "per_1".to_string(),
+        session_id: Some("ses_1".to_string()),
+        permission: Some(action.to_string()),
+        patterns: vec!["/proj/src/main.rs".to_string()],
+        metadata: Some(metadata),
+        always: vec![],
+        always_supported: true,
+    }
 }
 
 fn panel_markdown(panel: ToolPanel) -> serde_json::Value {
@@ -124,10 +140,13 @@ fn one_tool_renders_through_both_surfaces() {
             !panel_markdown(call).as_str().unwrap_or_default().is_empty(),
             "{action}: the panel renders a body"
         );
+        // The permission surface's own renderer, not just its table: its body
+        // names the same tool.
         let words = permission_view(action);
+        let body = describe_permission(&permission(action, serde_json::json!({})));
         assert!(
-            !words.label.is_empty() && !words.icon.is_empty(),
-            "{action}: the permission surface renders its words"
+            body.starts_with(&format!("{} **{}**", words.icon, words.label)),
+            "{action}: the permission body renders its words: {body}"
         );
     }
 }
@@ -155,7 +174,13 @@ fn a_shell_call_and_a_shell_permission_render_from_one_identity() {
     assert_eq!(
         (words.icon, words.label),
         ("⚡", "执行 Shell 命令"),
-        "the permission surface renders the same tool"
+        "the permission surface names the same tool"
+    );
+    let body = describe_permission(&permission("shell", serde_json::json!({})));
+    assert_eq!(
+        body.lines().next(),
+        Some("⚡ **执行 Shell 命令**"),
+        "the permission card renders the same tool's sentence: {body}"
     );
 }
 
@@ -186,4 +211,40 @@ fn an_unknown_action_renders_the_generic_words() {
             "{action:?}"
         );
     }
+}
+
+/// The FileEdits identity end to end: the panel renders the hunks and the
+/// permission body renders the same change, both selected by this module — the
+/// panel by `(kind, detail)`, the permission by its action name and the one
+/// `renders_diff_body` flag.
+#[test]
+fn a_file_edit_and_an_edit_permission_render_the_same_change() {
+    let diff = "@@ -1 +1 @@\n-old\n+new";
+    let call = panel(
+        ToolKind::Edit,
+        ToolDetail::FileEdits(vec![FileEdit {
+            path: "/x/a.rs".to_string(),
+            action: FileAction::Update,
+            rename_to: None,
+            diff: Some(diff.to_string()),
+        }]),
+    );
+    assert_eq!(
+        ToolView::of(&call).family(),
+        permission_view("edit").family.expect("edit names the family"),
+        "one tool"
+    );
+    let panel_body = panel_markdown(call).as_str().unwrap_or_default().to_string();
+    assert!(
+        panel_body.contains("+new"),
+        "the panel renders the hunk: {panel_body}"
+    );
+    let permission_body = describe_permission(&permission(
+        "edit",
+        serde_json::json!({"filepath": "/x/a.rs", "diff": diff}),
+    ));
+    assert!(
+        permission_body.contains("**改动**: 📄 `/x/a.rs` (+1 −1)") && permission_body.contains("+new"),
+        "the permission card renders the same change: {permission_body}"
+    );
 }
