@@ -52,13 +52,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::backend::{BackgroundTask, SessionTranscript, TaskRetirement, TaskRetirementEnding};
-use crate::bridge::chain::{
-    ChainRecords, TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunRecord,
+use crate::backend::runs::{
+    RunKey, TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunRecord,
 };
+use crate::backend::{BackgroundTask, SessionTranscript, TaskRetirement, TaskRetirementEnding};
+use crate::bridge::chain::ChainRecords;
 
 use super::TaskCell;
-use super::model::{TaskRunId, identity_of_task, identity_task};
+use super::model::{identity_of_task, identity_task};
 
 /// The durable facts an earlier card of this Session already announced, read
 /// from the Chain Record — the durable half of ADR-0079's `restore(record,
@@ -341,7 +342,7 @@ impl TasksHandle {
         };
         self.record_ending(
             session_id,
-            &TaskRunId::of_launch(&retirement.task),
+            &RunKey::of_launch(&retirement.task),
             TaskEnding {
                 class: TaskEndingClass::Evidence,
                 state: TaskEndingState::Owed,
@@ -369,7 +370,7 @@ impl TasksHandle {
     ) -> bool {
         self.record_ending(
             session_id,
-            &TaskRunId::of_launch(task),
+            &RunKey::of_launch(task),
             TaskEnding {
                 class: TaskEndingClass::Cleanup,
                 state: TaskEndingState::Owed,
@@ -383,7 +384,7 @@ impl TasksHandle {
     /// Record one **Task Ending** durably (ADR-0080). `false` when the durable
     /// tier is not attached (the recordless-session shape) or the run already
     /// carries this class.
-    fn record_ending(&self, session_id: &str, run: &TaskRunId, ending: TaskEnding) -> bool {
+    fn record_ending(&self, session_id: &str, run: &RunKey, ending: TaskEnding) -> bool {
         match self.chains() {
             Some(chains) => chains.record_ending(session_id, run, ending),
             None => false,
@@ -495,7 +496,7 @@ impl TasksHandle {
         // next card.
         let chains = self.chains();
         transcript.background_tasks.retain(|task| {
-            let run = TaskRunId::of_launch(task);
+            let run = RunKey::of_launch(task);
             match &chains {
                 Some(chains) => !chains.observe_run(session_id, &run),
                 None => true,
@@ -503,7 +504,7 @@ impl TasksHandle {
         });
         if let Some(ids) = state.retired.get(session_id) {
             transcript.background_tasks.retain(|task| {
-                let run = TaskRunId::of_launch(task);
+                let run = RunKey::of_launch(task);
                 !run.ids().any(|id| ids.contains(id))
             });
         }
@@ -514,7 +515,7 @@ impl TasksHandle {
         // here too.
         let mut pruned_runs: Vec<crate::backend::AgentRun> = Vec::new();
         transcript.runs.retain(|run| {
-            let identity = TaskRunId {
+            let identity = RunKey {
                 key: run.ending_key().to_string(),
                 call_id: run.task_run_id.clone(),
                 shell_id: None,
@@ -643,11 +644,11 @@ fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::runs::TaskRunIdentity;
     use crate::backend::{
         AgentRun, MessageId, MessageTime, Part, RunStatus, ToolCall, ToolCallRef, ToolIdentity,
         TranscriptMessage, Wake, WakeSource,
     };
-    use crate::bridge::chain::TaskRunIdentity;
 
     /// A Wake naming only the shell id it reports — the launchless shape a read
     /// whose launch left it yields (ADR-0080).
@@ -673,7 +674,7 @@ mod tests {
     fn the_retired_cache_is_seeded_with_every_id_the_run_is_known_by() {
         let dir = tempfile::tempdir().unwrap();
         let chains = ChainRecords::load(dir.path().join("chain_records.json"));
-        let run = TaskRunId::of_wake(&launchless_wake("sh_call_bg")).expect("the Wake names the run");
+        let run = RunKey::of_wake(&launchless_wake("sh_call_bg")).expect("the Wake names the run");
         chains.record_ending(
             "ses_a",
             &run,
@@ -712,8 +713,8 @@ mod tests {
     }
 
     /// The run a writer holds when it knows ONLY the launch's call id.
-    fn only_call_id_run(call_id: &str) -> TaskRunId {
-        TaskRunId {
+    fn only_call_id_run(call_id: &str) -> RunKey {
+        RunKey {
             key: call_id.into(),
             call_id: Some(call_id.into()),
             shell_id: None,
@@ -735,7 +736,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let chains = std::sync::Arc::new(ChainRecords::load(dir.path().join("chain_records.json")));
         // The launchless Wake's record: keyed by the shell id alone.
-        let run = TaskRunId::of_wake(&launchless_wake("sh_call_bg")).expect("the Wake names the run");
+        let run = RunKey::of_wake(&launchless_wake("sh_call_bg")).expect("the Wake names the run");
         chains.record_ending(
             "ses_a",
             &run,
@@ -782,7 +783,7 @@ mod tests {
         let chains = ChainRecords::load(dir.path().join("chain_records.json"));
         chains.record_ending(
             "ses_a",
-            &TaskRunId {
+            &RunKey {
                 key: "ses_child".into(),
                 call_id: Some("call_child".into()),
                 shell_id: None,

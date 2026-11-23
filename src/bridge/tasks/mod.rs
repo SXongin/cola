@@ -14,8 +14,9 @@
 //! # What lives here now
 //!
 //! - [`model`] — the read-model type definitions (#680), the rows the
-//!   **Background Task Ledger** renders, plus the **Task Run Id** (ADR-0080)
-//!   one run's durable **Task Ending**s are keyed by.
+//!   **Background Task Ledger** renders. The **Run Key** (ADR-0080, formerly
+//!   **Task Run Id**) one run's durable **Task Ending**s are keyed by lives in
+//!   [`crate::backend::runs`] (ADR-0111).
 //! - [`state::TaskState`] / [`state::TaskCell`] — the per-Session cell holding
 //!   the four per-chain delivery sets (`announced_wakes`, `handed_over_wakes`,
 //!   `wake_floor`, `announced_endings`), and the shared handle to it. The cell moved
@@ -62,7 +63,6 @@ pub(crate) mod model;
 pub(crate) mod state;
 
 pub(crate) use handle::TasksHandle;
-pub(crate) use model::TaskRunId;
 pub(crate) use model::{identity_of_task, identity_of_wake, task_kind, task_label};
 pub(crate) use state::TaskCell;
 

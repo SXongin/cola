@@ -7,10 +7,8 @@
 //! the pinned copy, stay in `src/feishu/card/ledger.rs`, which re-exports these
 //! types so no caller's import path breaks.
 
-use serde::{Deserialize, Serialize};
-
+use crate::backend::runs::TaskRunIdentity;
 use crate::backend::{BackgroundTask, ShellOutputWindow, ToolIdentity, Wake, WakeSource};
-use crate::bridge::chain::TaskRunIdentity;
 use crate::feishu::card::tool_render::TaskLiveness;
 
 /// The kind of Background Task a ledger row names. Only these two background
@@ -193,115 +191,6 @@ impl LedgerChange {
     }
 }
 
-/// The stable identity of one **Background Task** run (ADR-0080), and the key
-/// its **Task Ending**s are recorded under.
-///
-/// The two sides that observe a run name it differently: a read still carrying
-/// the launch names the launching tool call's id, while a **Wake** arriving
-/// after the launch left the read (compaction, the V2 page cap) names only the
-/// shell/child id (or the job id) it reports — never an invented one. The
-/// identity therefore carries EVERY id the run is known by over one stored
-/// [`Self::key`], so a writer resolves against it (an exact key, an exact Wake
-/// id, else the newest record naming any other id it holds) instead of minting
-/// a second record for a run that already has one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TaskRunId {
-    /// The id the run's record is stored under: the launch's call id when the
-    /// writer holds one, else the shell id a Wake itself reports, else its job
-    /// id, else its child session.
-    pub(crate) key: String,
-    /// The launching tool call's id, when the writer holds the launch.
-    #[serde(default)]
-    pub(crate) call_id: Option<String>,
-    /// The shell the run executes in, when known.
-    #[serde(default)]
-    pub(crate) shell_id: Option<String>,
-    /// The child session a subagent runs in, when known.
-    #[serde(default)]
-    pub(crate) child_id: Option<String>,
-    /// The job a Wake reports for the run, when known — an alias wherever it
-    /// differs from the stored key, so a later writer naming the run by its job
-    /// id resolves the same record.
-    #[serde(default)]
-    pub(crate) job_id: Option<String>,
-    /// The Wake whose completion this run recorded, when known.
-    #[serde(default)]
-    pub(crate) wake_id: Option<String>,
-}
-
-impl TaskRunId {
-    /// The run a read that carries the LAUNCH names (ADR-0080): the launch's
-    /// own tool call id is the stored key — the one id every writer of that
-    /// read agrees on — and the ids it carries ride along as aliases.
-    pub(crate) fn of_launch(task: &BackgroundTask) -> Self {
-        let call_id = task.tool.call_id.clone();
-        Self {
-            key: call_id.clone(),
-            call_id: Some(call_id),
-            shell_id: task.shell_id.clone(),
-            child_id: task.child_id.clone(),
-            job_id: None,
-            wake_id: None,
-        }
-    }
-
-    /// The run a **Wake** names on its own (ADR-0080): the shell id it reports,
-    /// else the job it reports, else the child session — keyed by that same id.
-    /// `None` when the Wake names nothing at all: the identity is never
-    /// invented. Every id it reports rides as an alias, so a writer holding the
-    /// job id resolves the record the shell id keyed, and the reverse.
-    pub(crate) fn of_wake(wake: &Wake) -> Option<Self> {
-        let key = wake
-            .shell_id
-            .clone()
-            .or_else(|| wake.job_id.clone())
-            .or_else(|| wake.child_id.clone())?;
-        Some(Self {
-            key,
-            call_id: None,
-            shell_id: wake.shell_id.clone(),
-            child_id: wake.child_id.clone(),
-            job_id: wake.job_id.clone(),
-            wake_id: Some(wake.id.as_str().to_string()),
-        })
-    }
-
-    /// Every id this run is known by, the stored key first — what a resolution
-    /// matches a stored record's own ids against.
-    pub(crate) fn ids(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.key.as_str())
-            .chain(self.call_id.as_deref())
-            .chain(self.shell_id.as_deref())
-            .chain(self.child_id.as_deref())
-            .chain(self.job_id.as_deref())
-            .chain(self.wake_id.as_deref())
-    }
-
-    /// Whether this run is known by `id` — its stored key or any alias it holds.
-    pub(crate) fn names(&self, id: &str) -> bool {
-        self.ids().any(|held| held == id)
-    }
-
-    /// Fold every id `other` holds into this run (ADR-0080): a record carries
-    /// EVERY id its run is known by, so a later writer naming the run another
-    /// way resolves by alias instead of minting a second record. The stored key
-    /// never moves, and an id already known — the reused-id residual the
-    /// newest-match rule already accepts — is left as it was.
-    pub(crate) fn absorb(&mut self, other: &TaskRunId) {
-        for (known, held) in [
-            (&mut self.call_id, &other.call_id),
-            (&mut self.shell_id, &other.shell_id),
-            (&mut self.child_id, &other.child_id),
-            (&mut self.job_id, &other.job_id),
-            (&mut self.wake_id, &other.wake_id),
-        ] {
-            if known.is_none() {
-                *known = held.clone();
-            }
-        }
-    }
-}
-
 /// The identity a just-derived ending records (ADR-0080): the launch's own
 /// facts, plus the label its originating tool input names — or the label the
 /// retiring **Agent Run** already carries (`label_override`), so a completion
@@ -409,6 +298,7 @@ pub(crate) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::runs::RunKey;
     use crate::backend::{MessageId, WakeSource};
     use crate::bridge::test_support::launch_task;
 
@@ -428,14 +318,14 @@ mod tests {
 
     #[test]
     fn a_launch_names_the_run_by_its_tool_call() {
-        let id = TaskRunId::of_launch(&launch_task("call_1", Some("shell_1"), None));
+        let id = RunKey::of_launch(&launch_task("call_1", Some("shell_1"), None));
         assert_eq!(id.key, "call_1", "the launch's own call id is the stored key");
         assert!(id.names("call_1"));
         assert!(id.names("shell_1"), "the shell id the launch carries is an alias");
         assert!(!id.names("shell_2"));
         assert_eq!(id.wake_id, None, "a launch records no Wake");
 
-        let subagent = TaskRunId::of_launch(&launch_task("call_2", None, Some("ses_child")));
+        let subagent = RunKey::of_launch(&launch_task("call_2", None, Some("ses_child")));
         assert_eq!(subagent.key, "call_2");
         assert!(subagent.names("ses_child"));
     }
@@ -444,19 +334,19 @@ mod tests {
     /// id IT reports — never an invented one, and `None` when it names nothing.
     #[test]
     fn a_wake_names_the_run_only_by_an_id_it_reports() {
-        let shell = TaskRunId::of_wake(&wake(Some("shell_1"), None, None)).expect("the shell id names it");
+        let shell = RunKey::of_wake(&wake(Some("shell_1"), None, None)).expect("the shell id names it");
         assert_eq!(shell.key, "shell_1");
         assert_eq!(shell.wake_id.as_deref(), Some("msg_wake_1"));
         assert_eq!(shell.call_id, None, "a launchless Wake invents no call id");
 
-        let job = TaskRunId::of_wake(&wake(None, Some("job_1"), None)).expect("the job names it");
+        let job = RunKey::of_wake(&wake(None, Some("job_1"), None)).expect("the job names it");
         assert_eq!(job.key, "job_1", "the job stands in for the shell id");
 
-        let child = TaskRunId::of_wake(&wake(None, None, Some("ses_child"))).expect("the child names it");
+        let child = RunKey::of_wake(&wake(None, None, Some("ses_child"))).expect("the child names it");
         assert_eq!(child.key, "ses_child");
 
         assert_eq!(
-            TaskRunId::of_wake(&wake(None, None, None)),
+            RunKey::of_wake(&wake(None, None, None)),
             None,
             "a Wake naming no id names no run"
         );
@@ -464,8 +354,8 @@ mod tests {
         // by the shell (the stored key) but carries the job id as an alias
         // (ADR-0080: "the record carries every id the run is known by"), so a
         // later writer naming the run by the job id still resolves it.
-        let both = TaskRunId::of_wake(&wake(Some("shell_1"), Some("job_1"), Some("ses_child")))
-            .expect("shell first");
+        let both =
+            RunKey::of_wake(&wake(Some("shell_1"), Some("job_1"), Some("ses_child"))).expect("shell first");
         assert_eq!(both.key, "shell_1");
         assert_eq!(
             both.job_id.as_deref(),
@@ -523,12 +413,8 @@ mod tests {
     /// the stored key never moves.
     #[test]
     fn absorbing_a_later_writer_keeps_the_key_and_adds_the_ids() {
-        let mut stored = TaskRunId::of_wake(&wake(Some("shell_1"), None, None)).expect("the wake names it");
-        stored.absorb(&TaskRunId::of_launch(&launch_task(
-            "call_1",
-            Some("shell_1"),
-            None,
-        )));
+        let mut stored = RunKey::of_wake(&wake(Some("shell_1"), None, None)).expect("the wake names it");
+        stored.absorb(&RunKey::of_launch(&launch_task("call_1", Some("shell_1"), None)));
         assert_eq!(
             stored.key, "shell_1",
             "the stored key is the run's own, not the newcomer's"

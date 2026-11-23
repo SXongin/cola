@@ -1431,15 +1431,15 @@ pub(super) async fn release_inflight(handles: &TurnHandles, session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::chain::{EndingKey, TaskEnding as DurableEnding, TaskEndingClass, TaskRunIdentity};
-    use crate::bridge::tasks::TaskRunId;
+    use crate::backend::runs::{RunKey, TaskEnding as DurableEnding, TaskEndingClass, TaskRunIdentity};
+    use crate::bridge::chain::EndingKey;
     use crate::bridge::test_support::{MockBackend, build_app, realistic_parts, test_config, test_work_dir};
 
     /// One delivered create's staged ending (ADR-0080), and the durable record
     /// its confirmation needs to have a bit to flip.
     fn landed(call_id: &str) -> EndingKey {
         (
-            TaskRunId {
+            RunKey {
                 key: call_id.to_string(),
                 call_id: Some(call_id.to_string()),
                 shell_id: None,

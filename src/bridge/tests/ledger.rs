@@ -32,14 +32,14 @@ use super::drain::{
     assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_prepared, scripted_app_with,
     spawn_sync, spawn_turn, user, wait_for_card_text,
 };
+use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
 use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ChildEvidence, ChildRuntime, ContentBlock, FileAction, FileEdit, FinishReason, MessageId,
     MessageRole, Part, SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolDetail,
     ToolIdentity, ToolKind, ToolOutput, ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
-use crate::bridge::chain::{ChainRecords, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
-use crate::bridge::tasks::TaskRunId;
+use crate::bridge::chain::ChainRecords;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::feishu::card::CardState;
@@ -1995,8 +1995,8 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
 
 /// The run one launch's **Task Ending** is recorded under (ADR-0080): the
 /// launch's own tool call id, the id every writer of that read agrees on.
-fn run_of(call_id: &str) -> TaskRunId {
-    TaskRunId {
+fn run_of(call_id: &str) -> RunKey {
+    RunKey {
         key: call_id.to_string(),
         call_id: Some(call_id.to_string()),
         shell_id: None,
@@ -2759,7 +2759,7 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     };
-    assert_eq!(ending.state, crate::bridge::chain::TaskEndingState::Owed);
+    assert_eq!(ending.state, TaskEndingState::Owed);
     assert_eq!(
         ending.identity.label.as_deref(),
         Some("review the diff"),

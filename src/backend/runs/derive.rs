@@ -24,7 +24,7 @@
 //!   addresses the Turn's live runs as a set, so it mints nothing and attaches
 //!   to no single run.
 
-use super::{
+use crate::backend::{
     AgentRun, DelegationEffect, Part, Phase, RunActivity, RunStatus, SessionTranscript, ToolCall,
     ToolCallRef, ToolDetail, ToolStatus, TranscriptMessage,
 };
@@ -509,7 +509,7 @@ pub fn child_run_activity(transcript: &SessionTranscript) -> Option<RunActivity>
         // Only the child's own output is a phase: a user prompt it has received
         // but not answered is `waiting`, not `responding` — so the previous
         // turn's part and call no longer describe this one.
-        if message.role != super::MessageRole::Assistant {
+        if message.role != crate::backend::MessageRole::Assistant {
             newest_part = None;
             current = None;
             continue;
@@ -536,7 +536,7 @@ pub fn child_run_activity(transcript: &SessionTranscript) -> Option<RunActivity>
             }
         }
     }
-    let call = current.map(|(_, call)| super::CallView {
+    let call = current.map(|(_, call)| crate::backend::CallView {
         identity: call.identity.clone(),
         kind: call.kind,
         detail: call.detail.clone(),
@@ -564,18 +564,18 @@ pub fn child_run_activity(transcript: &SessionTranscript) -> Option<RunActivity>
 /// carries, if any. The one read both the client's status statement and the
 /// liveness suppression use, so they cannot disagree about which finish is
 /// "the finish".
-fn newest_step_finish(transcript: &SessionTranscript) -> Option<&super::FinishReason> {
+fn newest_step_finish(transcript: &SessionTranscript) -> Option<&crate::backend::FinishReason> {
     // A user message newer than the last assistant output is a new generation
     // of the same child: the previous turn's finish no longer states this one.
     // Compaction/Other messages between them do not hide the boundary.
     let last_user = transcript
         .messages
         .iter()
-        .rposition(|message| message.role == super::MessageRole::User);
+        .rposition(|message| message.role == crate::backend::MessageRole::User);
     let last_assistant = transcript
         .messages
         .iter()
-        .rposition(|message| message.role == super::MessageRole::Assistant);
+        .rposition(|message| message.role == crate::backend::MessageRole::Assistant);
     if let Some(user) = last_user
         && last_assistant.is_none_or(|assistant| user > assistant)
     {
@@ -585,7 +585,7 @@ fn newest_step_finish(transcript: &SessionTranscript) -> Option<&super::FinishRe
         .messages
         .iter()
         .rev()
-        .find(|message| message.role == super::MessageRole::Assistant)?;
+        .find(|message| message.role == crate::backend::MessageRole::Assistant)?;
     message.parts.iter().rev().find_map(|part| match part {
         Part::StepFinish(finish) => Some(&finish.reason),
         _ => None,
@@ -598,15 +598,15 @@ fn newest_step_finish(transcript: &SessionTranscript) -> Option<&super::FinishRe
 /// cola's `TaskEnding`, which the evidence path records separately.
 pub fn child_run_status(transcript: &SessionTranscript) -> Option<RunStatus> {
     match newest_step_finish(transcript)? {
-        super::FinishReason::Error => Some(RunStatus::Failed),
-        super::FinishReason::Stop | super::FinishReason::Length | super::FinishReason::ContentFilter => {
-            Some(RunStatus::Completed)
-        }
+        crate::backend::FinishReason::Error => Some(RunStatus::Failed),
+        crate::backend::FinishReason::Stop
+        | crate::backend::FinishReason::Length
+        | crate::backend::FinishReason::ContentFilter => Some(RunStatus::Completed),
         // A reason this build cannot name is not a client statement that the
         // run was cancelled: it still owes an exit (its evidence or a
         // cleanup), the same honesty `ToolStatus::Other` gets in `status_of`.
-        super::FinishReason::Other(_) => Some(RunStatus::Unknown),
-        super::FinishReason::ToolCalls | super::FinishReason::Unknown => None,
+        crate::backend::FinishReason::Other(_) => Some(RunStatus::Unknown),
+        crate::backend::FinishReason::ToolCalls | crate::backend::FinishReason::Unknown => None,
     }
 }
 
@@ -624,7 +624,7 @@ pub fn child_run_finished(transcript: &SessionTranscript) -> bool {
     // maps to, and the terminal finish itself (which `Other` keeps out of the
     // status so the client's statement stays honest).
     child_run_status(transcript).is_some_and(|status| status.is_terminal())
-        || newest_step_finish(transcript).is_some_and(super::FinishReason::is_terminal)
+        || newest_step_finish(transcript).is_some_and(crate::backend::FinishReason::is_terminal)
 }
 
 #[cfg(test)]
@@ -681,7 +681,7 @@ mod tests {
     fn transcript(calls: Vec<ToolCall>) -> SessionTranscript {
         SessionTranscript::new(vec![TranscriptMessage {
             id: MessageId::new("msg_1"),
-            role: super::super::MessageRole::Assistant,
+            role: crate::backend::MessageRole::Assistant,
             time: Some(MessageTime {
                 created: 1,
                 completed: None,
@@ -711,7 +711,7 @@ mod tests {
         report.started_at = Some(20);
         let read = SessionTranscript::new(vec![TranscriptMessage {
             id: MessageId::new("msg_1"),
-            role: super::super::MessageRole::Assistant,
+            role: crate::backend::MessageRole::Assistant,
             time: Some(MessageTime {
                 created: 10,
                 completed: None,
@@ -748,7 +748,7 @@ mod tests {
         report.started_at = Some(20);
         let read = SessionTranscript::new(vec![TranscriptMessage {
             id: MessageId::new("msg_1"),
-            role: super::super::MessageRole::Assistant,
+            role: crate::backend::MessageRole::Assistant,
             time: Some(MessageTime {
                 created: 10,
                 completed: None,
@@ -1179,7 +1179,7 @@ mod tests {
     fn a_terminal_run_from_an_earlier_turn_is_history() {
         let user = |id: &str, at: i64| TranscriptMessage {
             id: MessageId::new(id),
-            role: super::super::MessageRole::User,
+            role: crate::backend::MessageRole::User,
             time: Some(MessageTime {
                 created: at,
                 completed: None,
@@ -1194,7 +1194,7 @@ mod tests {
         };
         let launch = |id: &str, child: &str, at: i64, status: ToolStatus| TranscriptMessage {
             id: MessageId::new(id),
-            role: super::super::MessageRole::Assistant,
+            role: crate::backend::MessageRole::Assistant,
             time: Some(MessageTime {
                 created: at,
                 completed: None,
@@ -1256,7 +1256,7 @@ mod tests {
             user("msg_u1", 1_000),
             TranscriptMessage {
                 id: MessageId::new("msg_unplaced"),
-                role: super::super::MessageRole::Assistant,
+                role: crate::backend::MessageRole::Assistant,
                 time: Some(MessageTime {
                     created: 2_000,
                     completed: None,
@@ -1303,7 +1303,7 @@ mod tests {
         };
         let read = SessionTranscript::new(vec![TranscriptMessage {
             id: MessageId::new("msg_1"),
-            role: super::super::MessageRole::Assistant,
+            role: crate::backend::MessageRole::Assistant,
             time: Some(MessageTime {
                 created: 10,
                 completed: None,
@@ -1336,7 +1336,7 @@ mod tests {
         let read = SessionTranscript::new(vec![
             TranscriptMessage {
                 id: MessageId::new("msg_assistant"),
-                role: super::super::MessageRole::Assistant,
+                role: crate::backend::MessageRole::Assistant,
                 time: Some(MessageTime {
                     created: 1,
                     completed: Some(2),
@@ -1350,7 +1350,7 @@ mod tests {
             },
             TranscriptMessage {
                 id: MessageId::new("msg_user"),
-                role: super::super::MessageRole::User,
+                role: crate::backend::MessageRole::User,
                 time: Some(MessageTime {
                     created: 5,
                     completed: None,
@@ -1935,7 +1935,10 @@ mod tests {
         assert!(read.runs.is_empty(), "the run leaves the live list");
         assert_eq!(read.task_retirements.len(), 1);
         let retirement = &read.task_retirements[0];
-        assert_eq!(retirement.ending, super::super::TaskRetirementEnding::ChildEnded);
+        assert_eq!(
+            retirement.ending,
+            crate::backend::TaskRetirementEnding::ChildEnded
+        );
         assert_eq!(retirement.finished_at, Some(9));
         assert_eq!(
             retirement.task.tool.call_id, "ses_child",
@@ -2043,7 +2046,7 @@ mod tests {
         let finished = |reason: FinishReason| {
             SessionTranscript::new(vec![TranscriptMessage {
                 id: MessageId::new("msg_finish"),
-                role: super::super::MessageRole::Assistant,
+                role: crate::backend::MessageRole::Assistant,
                 time: Some(MessageTime {
                     created: 1,
                     completed: Some(2),

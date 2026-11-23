@@ -720,7 +720,7 @@ impl SessionTranscript {
     /// evidence and changes nothing.
     ///
     /// The retirement's synthesized task names the run by its durable key, so
-    /// the ending records under the same `TaskRunId` every other writer resolves.
+    /// the ending records under the same `RunKey` every other writer resolves.
     ///
     /// A terminal child clock BEFORE the run's own start is a previous turn's
     /// evidence, not this run's: a resumed child's newest assistant message can
