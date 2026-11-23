@@ -1416,7 +1416,7 @@ mod tests {
         );
     }
 
-    /// Invariant 2 (268ec8e3, 51c3dfa1, ADR-0111 §1): a run the client reports
+    /// Invariant 2 (268ec8e3, 1f58ec3e, 51c3dfa1, ADR-0111 §1): a run the client reports
     /// **terminal keeps its row while it owes an ending**. The client's status is
     /// evidence toward the transition, never the definition of live: the run
     /// leaves only when its own durable ending resolves it, so the ledger keeps
