@@ -1167,7 +1167,7 @@ mod tests {
         ShellEnd, ShellRuntime, ToolCall, ToolDetail, ToolStatus, TranscriptMessage,
     };
     use crate::bridge::chain::ChainRecords;
-    use crate::feishu::card::tool_render::{ChildActivity, TaskLiveness};
+    use crate::feishu::card::tool_view::{ChildActivity, TaskLiveness};
 
     const SESSION: &str = "ses_a";
 

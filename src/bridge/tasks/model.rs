@@ -9,7 +9,7 @@
 
 use crate::backend::runs::TaskRunIdentity;
 use crate::backend::{BackgroundTask, ShellOutputWindow, Wake, WakeSource};
-use crate::feishu::card::tool_render::TaskLiveness;
+use crate::feishu::card::tool_view::TaskLiveness;
 
 /// The kind of Background Task a ledger row names. Only these two background
 /// through the V2 tool shape (ADR-0059/0060).

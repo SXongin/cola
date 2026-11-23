@@ -13,6 +13,7 @@ pub(crate) mod shell;
 pub(crate) mod skill;
 pub(crate) mod terminal;
 pub(crate) mod tool_render;
+pub(crate) mod tool_view;
 pub(crate) mod turn_diff;
 pub(crate) mod viewer;
 pub(crate) mod vocab;

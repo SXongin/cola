@@ -1,18 +1,19 @@
-use std::borrow::Cow;
-
 use crate::backend::{
-    ContentBlock, DelegationEffect, FileAction, FileContent, FileEdit, NestedCall, Phase, RunActivity,
-    RunWaits, SearchScope, TodoList, TodoStatus, TodoStep, ToolCall, ToolDetail, ToolKind, ToolStatus,
-    V1_DIRECTORY_TYPE_TAG, V2_DIRECTORY_HEADER_PREFIX, read_output_is_directory,
+    ContentBlock, DelegationEffect, FileContent, SearchScope, TodoList, TodoStatus, TodoStep, ToolCall,
+    ToolDetail, ToolStatus, V1_DIRECTORY_TYPE_TAG, V2_DIRECTORY_HEADER_PREFIX,
 };
 
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::{CardMarkdown, serialized_len};
-use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
-use super::vocab::{self, INPUT_LABEL, OUTPUT_LABEL, phase_token};
+use super::shell::{collapsible_panel, panel_time_suffix};
+use super::tool_view::{
+    CommandShape, ProgramShape, ReadShape, SearchShape, TaskLiveness, ToolView, collab_agent_label,
+    file_edits_body,
+};
+use super::vocab::{self, INPUT_LABEL, OUTPUT_LABEL};
 use super::{
-    AwaitingAction, MAX_ELEMENT_TEXT_CHARS, clip_md, exceeds_md_budget, fenced_block_bytes,
-    fenced_block_overhead, fenced_code, fenced_overhead, truncate_md,
+    MAX_ELEMENT_TEXT_CHARS, clip_md, fenced_block_bytes, fenced_block_overhead, fenced_code, fenced_overhead,
+    truncate_md,
 };
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
@@ -20,12 +21,17 @@ use super::{
 /// command output can be meaningfully long.
 pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
 
+/// The panel's Input-line budget. A multi-line input (an edit diff, a skill
+/// metadata list) is summarized rather than flooding the card; a `Program` is
+/// the one exception, because its source IS the panel.
+const INPUT_MAX_CHARS: usize = 400;
+
 /// The line a `read` or `write` panel appends under a body its budget CLIPPED
 /// (ADR-0083 §8 amendment, #770/#788): the panel is a
 /// [`TOOL_OUTPUT_MAX_CHARS`]-character preview, so a clipped one says so where
 /// the reader can act on it — the way-in button inside the fold (「📂 打开」, or
 /// 「🌐 预览网页」 for an HTML page, #778).
-const PREVIEW_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
+pub(super) const PREVIEW_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
 
 /// The line a file-editing panel appends under a diff its budget CLIPPED. The
 /// note is a fenced body's ONLY clip signal: the `…` `truncate_md` appends
@@ -39,7 +45,7 @@ pub(crate) const DIFF_TRUNCATION_NOTE: &str = "_（改动过长，已截断）_"
 /// CLIPPED. The opaque `results` value can exceed the panel budget; the fenced
 /// body clips bare ([`clip_fenced_body`]) so the enclosing fence survives, and
 /// this line is the reader's only signal that the payload was cut.
-const SEARCH_TRUNCATION_NOTE: &str = "_（搜索结果过长，已截断）_";
+pub(super) const SEARCH_TRUNCATION_NOTE: &str = "_（搜索结果过长，已截断）_";
 
 /// The budget for a file-editing panel's diff BODY, measured in the bytes the
 /// body occupies once the card serializes it (its JSON-escaped form) — NOT in
@@ -263,12 +269,6 @@ impl ToolPanel {
         &self.call
     }
 
-    /// Whether this panel is the plan surface's carrier ([`is_plan_call`]),
-    /// derived once so the panel's title, input and output cannot disagree.
-    pub(crate) fn is_plan(&self) -> bool {
-        is_plan_call(self.call())
-    }
-
     /// The tool's built-in id (`bash`, `read`, …). It is diagnostic and the
     /// opaque fallback title; the `Execute` family selects its renderer by
     /// `(kind, detail)` instead (ADR-0105).
@@ -359,33 +359,7 @@ impl ToolPanel {
     /// agent's prose never reach here — only the adapter's typed detail is
     /// read.
     pub(crate) fn file_open_path(&self) -> Option<String> {
-        if let Some(edits) = file_edits(self) {
-            let [only] = edits.as_ref() else {
-                return None;
-            };
-            if only.action == FileAction::Delete {
-                return None;
-            }
-            let path = file_edit_display_path(only);
-            return (!path.trim().is_empty()).then(|| path.to_string());
-        }
-        // A Codex `imageView` reads a file, but its panel is not a preview of
-        // one (P1's read, out of the FileEdits ticket's scope): no button.
-        if is_image_read(self) {
-            return None;
-        }
-        let read = read_detail(self)?;
-        let path = read.path.filter(|path| !path.trim().is_empty())?;
-        // A panel of a file the viewer can show WHOLE: the body is a preview,
-        // so the way in is what the panel lacks. The two exclusions already
-        // reach the reader whole (a File Content's own delivery; a directory,
-        // which is no file at all), and a call with no output yet has no
-        // verdict — `?` leaves a still-running read buttonless until it
-        // renders one.
-        if read.directory || !self.files.is_empty() || read_output_is_directory(&self.output()?) {
-            return None;
-        }
-        Some(path.to_string())
+        ToolView::of(self).open_path(self)
     }
 
     /// How many card elements the 「📂 打开」 button adds (ADR-0083 §8, #743):
@@ -400,7 +374,7 @@ impl ToolPanel {
     /// card reads run facts its own shapes do not carry — a background launch's
     /// shell/session id, a search's result count — from here; a failure verdict
     /// is the adapter's (`ToolDetail`), never a raw re-parse.
-    fn metadata(&self) -> Option<&serde_json::Value> {
+    pub(super) fn metadata(&self) -> Option<&serde_json::Value> {
         self.call.metadata.as_ref()
     }
 
@@ -411,18 +385,7 @@ impl ToolPanel {
     /// from exactly these facts; the typed [`ToolStatus`] stays the protocol's
     /// own and is never rewritten.
     fn detail_failure(&self) -> bool {
-        if self.status() != &ToolStatus::Completed {
-            return false;
-        }
-        match ExecuteShape::of(self) {
-            Some(ExecuteShape::Command { exit, timeout, .. }) => {
-                timeout || exit.is_some_and(|exit| exit != 0)
-            }
-            Some(ExecuteShape::Program { calls, error, .. }) => {
-                error || calls.iter().any(|call| call.status.is_failure())
-            }
-            None => false,
-        }
+        ToolView::of(self).detail_failure(self)
     }
 
     /// The output text the panel renders: the decoder's text blocks joined (in
@@ -587,606 +550,6 @@ fn call_todo_list(call: &ToolCall) -> Option<TodoList> {
     })
 }
 
-/// The **Execute** family's two shapes (ADR-0105, spec #1057's P2): a shell-like
-/// command and a Code Mode program. Selection is `(kind, detail)` — never the
-/// vendor name — so `bash`, `shell` and `codex/command_execution` reach one
-/// renderer and a third adapter inherits it by declaring the same shape.
-///
-/// One selection point, so the input line, the output body, the failure verdict
-/// and the folded title's details cannot disagree about what the call is.
-enum ExecuteShape<'a> {
-    Command {
-        command: &'a str,
-        cwd: Option<&'a str>,
-        description: Option<&'a str>,
-        exit: Option<i64>,
-        timeout: bool,
-    },
-    Program {
-        source: &'a str,
-        language: Option<&'a str>,
-        calls: &'a [NestedCall],
-        error: bool,
-    },
-}
-
-impl<'a> ExecuteShape<'a> {
-    /// The `Execute` family's shape `tool` carries, when its adapter declared one. A
-    /// detail on a kind that is not `Execute` is not an Execute call (a lying
-    /// detail gets the opaque path, ADR-0105's consequence).
-    fn of(tool: &'a ToolPanel) -> Option<Self> {
-        match (tool.call().kind, &tool.call().detail) {
-            (
-                ToolKind::Execute,
-                ToolDetail::Command {
-                    command,
-                    cwd,
-                    description,
-                    exit,
-                    timeout,
-                },
-            ) => Some(Self::Command {
-                command,
-                cwd: cwd.as_deref(),
-                description: description.as_deref(),
-                exit: *exit,
-                timeout: *timeout,
-            }),
-            (
-                ToolKind::Execute,
-                ToolDetail::Program {
-                    source,
-                    language,
-                    calls,
-                    error,
-                },
-            ) => Some(Self::Program {
-                source,
-                language: language.as_deref(),
-                calls,
-                error: *error,
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// Whether the call is the `Execute` family's `Command` shape.
-fn is_command(tool: &ToolPanel) -> bool {
-    matches!(ExecuteShape::of(tool), Some(ExecuteShape::Command { .. }))
-}
-
-/// Whether the call is the `Execute` family's `Program` shape: the panel that
-/// spends the output budget on its input and puts its call count in the folded
-/// title.
-fn is_program(tool: &ToolPanel) -> bool {
-    matches!(ExecuteShape::of(tool), Some(ExecuteShape::Program { .. }))
-}
-
-/// Whether the call declares a non-empty `FileEdits` detail on a kind that can
-/// carry one, without cloning the merged list.
-fn has_file_edits(tool: &ToolPanel) -> bool {
-    matches!(
-        (tool.call().kind, &tool.call().detail),
-        (ToolKind::Edit | ToolKind::Delete | ToolKind::Move, ToolDetail::FileEdits(edits))
-            if !edits.is_empty()
-    )
-}
-
-/// The **FileEdits** family (ADR-0105, spec #1057's P3): a call that touched
-/// files, each with its action and diff. Selection is `(kind, detail)` — never
-/// the vendor name — so `edit`, `write`, `patch`, `apply_patch` and
-/// `codex/file_change` reach one renderer in one SHAPE, and a third adapter
-/// inherits it by declaring the same detail.
-///
-/// The kind must agree with the detail: a `FileEdits` on an unrelated kind is
-/// not this family (a lying detail gets the opaque path, ADR-0105's
-/// consequence).
-fn file_edits(tool: &ToolPanel) -> Option<Cow<'_, [FileEdit]>> {
-    match (tool.call().kind, &tool.call().detail) {
-        (ToolKind::Edit | ToolKind::Delete | ToolKind::Move, ToolDetail::FileEdits(edits))
-            if !edits.is_empty() =>
-        {
-            // A Move kind is admitted because ACP declares it; `FileAction`
-            // has no Move, so the detail's own action (Rename for a move,
-            // Update for an in-place edit) is the word shown.
-            //
-            // The adapters already merge duplicate paths; a third adapter may
-            // not, so the card re-merges only when it actually sees a repeat
-            // and otherwise borrows the detail (the common path costs no
-            // clone).
-            if has_duplicate_paths(edits) {
-                Some(Cow::Owned(crate::backend::merge_file_edits(
-                    edits.iter().cloned(),
-                )))
-            } else {
-                Some(Cow::Borrowed(edits.as_slice()))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn has_duplicate_paths(edits: &[FileEdit]) -> bool {
-    edits
-        .iter()
-        .enumerate()
-        .any(|(index, edit)| edits[..index].iter().any(|earlier| earlier.path == edit.path))
-}
-
-/// The `#947` action word for one file: add/update/delete/rename, never
-/// inferred from a hunk (a pure rename or a binary change has none).
-fn file_action_word(action: FileAction) -> &'static str {
-    match action {
-        FileAction::Add => "➕ 新增",
-        FileAction::Update => "✏️ 编辑",
-        FileAction::Delete => "🗑 删除",
-        FileAction::Rename => "📦 重命名",
-    }
-}
-
-/// The file a [`FileEdit`] names to the reader: a rename's destination (the
-/// file that now exists), otherwise its own path.
-fn file_edit_display_path(edit: &FileEdit) -> &str {
-    match edit.action {
-        FileAction::Rename => edit.rename_to.as_deref().unwrap_or(&edit.path),
-        _ => &edit.path,
-    }
-}
-
-/// The **Read** shape (ADR-0105 decision 5): a file or directory a call read.
-/// Keyed on `(kind, detail)`, so `read` and a future client's read reach the
-/// same renderer.
-struct ReadShape<'a> {
-    path: Option<&'a str>,
-    directory: bool,
-}
-
-fn read_detail(tool: &ToolPanel) -> Option<ReadShape<'_>> {
-    match (tool.call().kind, &tool.call().detail) {
-        (ToolKind::Read, ToolDetail::Read { path, directory, .. }) => Some(ReadShape {
-            path: path.as_deref(),
-            directory: *directory,
-        }),
-        _ => None,
-    }
-}
-
-/// The **Search** shape (ADR-0105 decision 5): a filename, content or web
-/// search. The scope picks the word and the body parser; the vendor name is
-/// never read.
-struct SearchShape<'a> {
-    query: Option<&'a String>,
-    matches: Option<u64>,
-    scope: SearchScope,
-}
-
-fn search_detail(tool: &ToolPanel) -> Option<SearchShape<'_>> {
-    match (tool.call().kind, &tool.call().detail) {
-        (
-            ToolKind::Search,
-            ToolDetail::Search {
-                query,
-                matches,
-                scope,
-            },
-        ) => Some(SearchShape {
-            query: query.as_ref(),
-            matches: *matches,
-            scope: *scope,
-        }),
-        _ => None,
-    }
-}
-
-/// Whether the panel is an IMAGE view — a neutral `Read { image: true }` the
-/// adapter declared. The image presentation is selected by that detail, never
-/// the vendor name, so a second adapter's image read under another id takes the
-/// same panel.
-fn is_image_read(tool: &ToolPanel) -> bool {
-    matches!(tool.call().detail, ToolDetail::Read { image: true, .. })
-}
-
-/// One file's action, with each path formatted by the caller: inline code on
-/// the Input line, the folded short name on the title. A rename names both
-/// ends.
-fn file_edit_action_with(edit: &FileEdit, path: impl Fn(&str) -> String) -> String {
-    let word = file_action_word(edit.action);
-    match edit.action {
-        FileAction::Rename => match edit.rename_to.as_deref().filter(|to| !to.is_empty()) {
-            Some(to) => format!("{} {} → {}", word, path(&edit.path), path(to)),
-            None => format!("{} {}", word, path(&edit.path)),
-        },
-        _ => format!("{} {}", word, path(&edit.path)),
-    }
-}
-
-/// One file's action on the Input line (#947): the word, then the path (or a
-/// rename's source → destination). The Input line is where the file is already
-/// named, so this is where the action belongs for a list.
-fn file_edit_action_line(edit: &FileEdit) -> String {
-    file_edit_action_with(edit, inline_code)
-}
-
-/// The folded title's fragment for one file: the action word and the short
-/// name (a rename names both ends). The title is one `plain_text` line, so a
-/// deep path keeps its tail; several files keep the count/totals fragment
-/// ([`multi_file_detail`]) instead.
-fn file_edit_title(edit: &FileEdit) -> String {
-    file_edit_action_with(edit, header_file_name)
-}
-
-/// The Input line a FileEdits panel renders: one action line per touched file
-/// (#947), so a multi-file patch names every file's action rather than only
-/// its first path.
-fn file_edits_input(edits: &[FileEdit], failed: bool) -> String {
-    // Ticket #1060: one file names it and its action; several keep the count
-    // and totals fragment — the per-file actions belong in the body. A failed
-    // call's changes are unknown, so it names the count only (the folded title
-    // makes the same call).
-    if edits.len() > 1 {
-        if failed {
-            return format!("📄 {} files", edits.len());
-        }
-        let (additions, deletions) = file_edits_totals(edits);
-        return format!("📄 {} files · +{additions} −{deletions}", edits.len());
-    }
-    edits
-        .iter()
-        .map(file_edit_action_line)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The additions and deletions every file's hunks record: `+`/`-` lines, as a
-/// unified diff writes them. One count for the totals the panel heads and the
-/// folded title carries, so they cannot disagree.
-fn file_edits_totals(edits: &[FileEdit]) -> (usize, usize) {
-    let mut additions = 0;
-    let mut deletions = 0;
-    for diff in edits.iter().filter_map(|edit| edit.diff.as_deref()) {
-        for line in diff.lines() {
-            if line.starts_with('+') {
-                additions += 1;
-            } else if line.starts_with('-') {
-                deletions += 1;
-            }
-        }
-    }
-    (additions, deletions)
-}
-
-/// One file's section in a FileEdits panel: its action line (markdown, outside
-/// any fence) and its own hunks, so a multi-file body keeps every action next
-/// to the change it names.
-struct FileEditSection {
-    action: Option<String>,
-    hunks: String,
-}
-
-/// The pieces a FileEdits panel composes: per-file sections (action + hunks)
-/// and the two trailing notes the ticket keeps apart — a `write`'s LSP note
-/// rides after the fence (pre-P3 #788), an edit/patch note stays inside it.
-struct FileEditsBody {
-    header: Option<String>,
-    sections: Vec<FileEditSection>,
-    lang: &'static str,
-    outside_tail: Option<String>,
-    inside_tail: Option<String>,
-}
-
-/// The FileEdits panel's pieces, unclipped. `None` for a FAILED call (its error
-/// text is the body) and for a list with no hunk and no action line to show.
-fn file_edits_body(tool: &ToolPanel) -> Option<FileEditsBody> {
-    if call_failed(tool) {
-        return None;
-    }
-    let edits = file_edits(tool)?;
-    let multi = edits.len() > 1;
-    let mut sections: Vec<FileEditSection> = Vec::new();
-    for edit in edits.iter() {
-        let hunks = edit
-            .diff
-            .as_deref()
-            .filter(|diff| !diff.trim().is_empty())
-            .unwrap_or_default()
-            .to_string();
-        let action = (multi || hunks.is_empty()).then(|| file_edit_action_line(edit));
-        if action.is_some() || !hunks.is_empty() {
-            sections.push(FileEditSection { action, hunks });
-        }
-    }
-    if sections.is_empty() {
-        return None;
-    }
-    let lang = diff_language_for(edits.iter().map(file_edit_display_path));
-    let header = match edits.as_ref() {
-        [only] => only.diff.as_deref().map(|_| {
-            let (additions, deletions) = file_edits_totals(std::slice::from_ref(only));
-            format!("+{additions} −{deletions}")
-        }),
-        _ => None,
-    };
-    let tail = file_edits_tail(tool);
-    // A `write`'s note (its own success summary precedes it) belonged outside
-    // the fence before P3 (#788), under its own 500-char bound. Any other
-    // producer's note stays inside, under the diff budget; an Add alone is not
-    // enough — an `apply_patch` Add keeps its note inside.
-    let (outside_tail, inside_tail) =
-        if edits.len() == 1 && edits[0].action == FileAction::Add && is_write_output(tool) {
-            (tail.map(|tail| truncate_md(&tail, WRITE_TAIL_MAX_CHARS)), None)
-        } else {
-            (None, tail)
-        };
-    Some(FileEditsBody {
-        header,
-        sections,
-        lang,
-        outside_tail,
-        inside_tail,
-    })
-}
-
-impl FileEditsBody {
-    /// The markdown body the panel writes, with every file's action line
-    /// immediately before its own fence. Each hunk block and the action list
-    /// share [`DIFF_MAX_ESCAPED_BYTES`]: the action list stops growing when
-    /// the budget is spent, a hunk block clips to the remainder, and the
-    /// returned flag tells the caller its truncation note is owed.
-    fn render(&self) -> (String, bool) {
-        let mut body = String::new();
-        let mut clipped = false;
-        let mut inside_tail = self.inside_tail.as_deref();
-        let last_section = self.sections.len().checked_sub(1);
-        for (index, section) in self.sections.iter().enumerate() {
-            let action = section.action.as_deref();
-            if let Some(action) = action {
-                let separator = if body.is_empty() { 0 } else { 2 };
-                if json_escaped_len(&body) + separator + json_escaped_len(action) > DIFF_MAX_ESCAPED_BYTES {
-                    clipped = true;
-                    break;
-                }
-                if !body.is_empty() {
-                    body.push_str("\n\n");
-                }
-                body.push_str(action);
-            }
-            let mut hunks = section.hunks.clone();
-            if Some(index) == last_section
-                && let Some(tail) = inside_tail.take()
-            {
-                if !hunks.is_empty() {
-                    hunks.push('\n');
-                }
-                hunks.push_str(tail);
-            }
-            if hunks.is_empty() {
-                continue;
-            }
-            let separator = if body.is_empty() { 0 } else { 2 };
-            let remaining = DIFF_MAX_ESCAPED_BYTES.saturating_sub(json_escaped_len(&body) + separator);
-            let clipped_hunks = clip_fenced_body(&hunks, Some(self.lang), remaining);
-            if clipped_hunks.is_empty() {
-                clipped = true;
-                break;
-            }
-            if clipped_hunks != hunks {
-                clipped = true;
-            }
-            if !body.is_empty() {
-                body.push_str("\n\n");
-            }
-            body.push_str(&fenced_code(&clipped_hunks, Some(self.lang)));
-        }
-        if let Some(tail) = &self.outside_tail {
-            let separator = if body.is_empty() { 0 } else { 2 };
-            let remaining = DIFF_MAX_ESCAPED_BYTES.saturating_sub(json_escaped_len(&body) + separator);
-            if remaining > 0 {
-                let original = tail.chars().count();
-                let tail = truncate_md(tail, remaining);
-                if tail.chars().count() < original {
-                    clipped = true;
-                }
-                if !body.is_empty() {
-                    body.push_str("\n\n");
-                }
-                body.push_str(&tail);
-            } else {
-                clipped = true;
-            }
-        }
-        (body, clipped)
-    }
-
-    fn clipped(&self) -> bool {
-        self.render().1
-    }
-}
-
-/// Whether the call's output carries a `write` tool's success summary (V1's
-/// `Wrote file successfully.`, V2's `Wrote/Created file successfully: …`).
-/// This is the producer's OUTPUT shape, not its id: an `apply_patch` Add must
-/// keep its LSP note inside the diff fence.
-fn is_write_output(tool: &ToolPanel) -> bool {
-    let Some(text) = tool.output() else {
-        return false;
-    };
-    let first = text.lines().next().unwrap_or("").trim_start();
-    [
-        "Wrote file successfully",
-        "Created file successfully",
-        "Successfully wrote",
-    ]
-    .iter()
-    .any(|prefix| first.starts_with(prefix))
-}
-
-/// The FileEdits panel's Output: markdown action lines outside the fence, the
-/// hunks inside it, already clipped under the diff byte budget. `BodyStyle`
-/// is `Markdown` because the body is composed: the generic renderer must not
-/// wrap the action lines in a second fence.
-fn file_edits_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    let body = file_edits_body(tool)?;
-    let (text, _) = body.render();
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some((body.header, BodyStyle::Markdown, text))
-}
-
-/// The tool's own trailing note after its success summary (V1's LSP
-/// diagnostics). `None` for a successful call with no note.
-fn file_edits_tail(tool: &ToolPanel) -> Option<String> {
-    if call_failed(tool) {
-        return None;
-    }
-    tool.output()
-        .as_deref()
-        .and_then(summary_tail)
-        .map(|tail| tail.trim_end().to_string())
-        .filter(|tail| !tail.is_empty())
-}
-
-/// The cap on a `write` panel's LSP note, restored to pre-P3's placement
-/// outside the fence (#788): the note is a preview, so it keeps its own bound
-/// rather than riding the diff budget.
-const WRITE_TAIL_MAX_CHARS: usize = 500;
-
-/// A live `task`/`subagent` call's child-session liveness (ADR-0054): what the
-/// child is doing right now, as the panel title shows it. Display-only data —
-/// the Bridge gathers it, the Platform formats it — so the panel stays a view
-/// over the call plus one read-only line. It is the card's view of the run's
-/// neutral [`RunActivity`] (`from_run`), so the panel, the ledger and the
-/// completion entry cannot disagree about one run.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TaskLiveness {
-    /// The child's current activity: its newest live tool, or the phase its
-    /// newest part implies.
-    pub activity: ChildActivity,
-    /// Epoch ms of the child's newest observed activity: the timer a phase
-    /// (no tool running) counts from. Stored as a time, not an age, so a
-    /// failed read never freezes a made-up "5s". `None` when the run's
-    /// activity carries no clock at all: the fragment then shows the phase
-    /// word with no age rather than an age measured from the epoch.
-    pub last_activity_ms: Option<i64>,
-    /// The child's pending wait, in the header's own vocabulary (ADR-0054).
-    pub wait: Option<AwaitingAction>,
-}
-
-/// What a child session is doing right now, as its transcript reports it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChildActivity {
-    /// The child's newest live tool. `started_at` is the server clock the
-    /// duration counts from; a call with no clock yet shows its name alone.
-    Tool { name: String, started_at: Option<i64> },
-    /// Between steps: the phase its newest part implies
-    /// (`waiting`/`reasoning`/`responding`).
-    Phase(Phase),
-}
-
-impl TaskLiveness {
-    /// The card's view of one run's neutral activity (ADR-0105, spec #1057's
-    /// P4). The token comes from the call's `(kind, detail)` via
-    /// [`vocab::tool_token`]; a phase with no live call reads
-    /// [`phase_token`]. A wait set renders both waits through the header's own
-    /// vocabulary.
-    pub(crate) fn from_run(activity: &RunActivity) -> Self {
-        let activity_kind = match &activity.call {
-            Some(call) => ChildActivity::Tool {
-                name: vocab::tool_token(&call.identity, call.kind, &call.detail).to_string(),
-                // The call's own server start is the clock: `shell 28s` counts
-                // from the call, not from the last activity.
-                started_at: call.started_at,
-            },
-            None => ChildActivity::Phase(activity.phase.unwrap_or(Phase::Waiting)),
-        };
-        let wait = activity.awaiting.and_then(awaiting_action);
-        Self {
-            activity: activity_kind,
-            last_activity_ms: activity.clock_ms(),
-            wait,
-        }
-    }
-
-    /// The fragment's parts, spelled once (ADR-0054, spec #501): the
-    /// activity's display label (a tool's own name, or the word for a phase
-    /// with no live tool), the clock its age counts from (`None` when the
-    /// fragment renders no age), and the wait's words. [`Self::title_fragment`]
-    /// assembles these for the card; the ledger's size reserve measures these,
-    /// so the two cannot drift apart over how an activity is displayed.
-    pub(crate) fn title_parts(&self) -> TitleParts<'_> {
-        TitleParts {
-            label: match &self.activity {
-                ChildActivity::Tool { name, .. } => name,
-                ChildActivity::Phase(phase) => phase_token(*phase),
-            },
-            age_clock_ms: match &self.activity {
-                ChildActivity::Tool { started_at, .. } => *started_at,
-                ChildActivity::Phase(_) => self.last_activity_ms,
-            },
-            wait: self.wait.and_then(|wait| wait.label()),
-        }
-    }
-
-    /// The title fragment a live task panel appends, in the header's own
-    /// shape — the activity first, then how long it has run: `bash 28s`,
-    /// `reasoning 12s`, `bash · 等待你的授权`. `now_ms` is passed in so the
-    /// elapsed time is measured at card build time.
-    pub fn title_fragment(&self, now_ms: i64) -> String {
-        let parts = self.title_parts();
-        let mut segments = match parts.age_clock_ms {
-            Some(at) => vec![format!("{} {}", parts.label, fmt_elapsed(secs_since(at, now_ms)))],
-            None => vec![parts.label.to_string()],
-        };
-        if let Some(wait) = parts.wait {
-            segments.push(wait.to_string());
-        }
-        segments.join(" · ")
-    }
-
-    /// The epoch-ms clock the fragment's rendered age counts from — the live
-    /// tool's server start, or the phase's newest activity. `None` when the
-    /// fragment shows no age at all (a tool with no server clock yet), so a
-    /// reader keyed on this fragment (the ledger's render clock, ADR-0060)
-    /// knows there is no number to tick.
-    pub fn age_clock_ms(&self) -> Option<i64> {
-        self.title_parts().age_clock_ms
-    }
-}
-
-/// A liveness fragment's own parts, the shape [`TaskLiveness::title_fragment`]
-/// renders and the ledger's `activity_estimate` reserves room for — one
-/// description, so the display and its cost cannot disagree.
-pub(crate) struct TitleParts<'a> {
-    /// The activity's display label: a tool's own name, or the phase word.
-    /// Raw here; the ledger escapes it where it reaches a markdown body.
-    pub(crate) label: &'a str,
-    /// The clock the rendered age counts from; `None` when the fragment shows
-    /// no age at all.
-    pub(crate) age_clock_ms: Option<i64>,
-    /// The wait's words without the header's icon, when one is pending.
-    pub(crate) wait: Option<&'a str>,
-}
-
-/// The liveness fragment's wait vocabulary, from the run's own set: both waits
-/// can be live at once (spec #1057's `RunWaits`).
-fn awaiting_action(waits: RunWaits) -> Option<AwaitingAction> {
-    if !waits.any() {
-        return None;
-    }
-    match (waits.permission, waits.question) {
-        (false, false) => None,
-        (true, false) => Some(AwaitingAction::Permission),
-        (false, true) => Some(AwaitingAction::Question),
-        (true, true) => Some(AwaitingAction::Both),
-    }
-}
-
-/// Seconds between two epoch-ms clocks, never negative.
-fn secs_since(at_ms: i64, now_ms: i64) -> u64 {
-    ((now_ms - at_ms).max(0) / 1000) as u64
-}
-
 /// The text a tool panel renders for a call: the decoder's text blocks joined
 /// (in decoder order), with a failure's message appended on its own line. An
 /// explicit empty text block still counts as output (the historical
@@ -1220,7 +583,7 @@ fn tool_output(call: &ToolCall, detail_failed: bool) -> Option<String> {
 /// following the output's first blank line, trimmed. `None` when the text IS
 /// the summary (or nothing) — the summary is dropped, never shown beside the
 /// hunks it summarizes.
-fn summary_tail(output: &str) -> Option<&str> {
+pub(super) fn summary_tail(output: &str) -> Option<&str> {
     output
         .split_once("\n\n")
         .map(|(_, tail)| tail.trim())
@@ -1292,7 +655,9 @@ impl ToolPanel {
         // A test fixture built by name still carries the detail the production
         // adapter declares for that vendor shape: the card selects by
         // `(kind, detail)`, never by the name, and the fixture must obey that.
-        if name == "codex/collab_agent" && collab_agent_shape(call.input.as_ref()) {
+        if name == "codex/collab_agent"
+            && crate::feishu::card::tool_view::collab_agent_shape(call.input.as_ref())
+        {
             call.detail = ToolDetail::Delegation {
                 runs: Vec::new(),
                 effect: DelegationEffect::Launch,
@@ -1309,14 +674,14 @@ impl ToolPanel {
         status: ToolStatus,
         input: Option<serde_json::Value>,
         output: Option<&str>,
-        edits: Vec<FileEdit>,
+        edits: Vec<crate::backend::FileEdit>,
     ) -> Self {
         Self::new(ToolCall {
             identity: crate::backend::ToolIdentity {
                 name: name.to_string(),
                 call_id: format!("call_{name}"),
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(edits),
             status,
             started_at: None,
@@ -1339,7 +704,7 @@ impl ToolPanel {
                 name: vocab::TOOL_READ.to_string(),
                 call_id: "call_read".to_string(),
             },
-            kind: ToolKind::Read,
+            kind: crate::backend::ToolKind::Read,
             detail: ToolDetail::Read {
                 path: path.map(str::to_string),
                 preview: None,
@@ -1390,7 +755,7 @@ impl ToolPanel {
 /// own body best, so the choice travels with `format_tool_output`'s result
 /// instead of being re-derived from the tool name at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyStyle {
+pub(crate) enum BodyStyle {
     /// Fence it when Feishu markdown would wrap a long line or fold lines into
     /// a Setext heading (the generic fallback for free text).
     Auto,
@@ -1536,95 +901,20 @@ fn header_name_basename(folded: &str) -> Option<&str> {
 /// `title`/`alt` ([`file_image_elements`]) so they never diverge: the image's
 /// fields are the SAME short name the header shows when it shows one, not a
 /// second, longer copy of the absolute path a `read` reports.
-fn header_file_name(name: &str) -> String {
+pub(super) fn header_file_name(name: &str) -> String {
     let folded = folded_header_name(name);
     let chosen = header_name_basename(&folded).unwrap_or(&folded);
     clip_header_name_tail(chosen, FILE_HEADER_NAME_MAX_CHARS)
 }
 
-/// The file a file-touching panel is about, as its FOLDED header names it
-/// (ADR-0083 §8 amendment, #766). The panel body carries the path in its Input
-/// line, but the body starts collapsed, so a file-editing panel used to say
-/// nothing about the file it touched until the reader unfolded it — and a text
-/// `read` likewise.
-///
-/// A MULTI-file list is the exception that names no path (#793): its folded
-/// header carries the file count and the change totals instead
-/// (`📄 3 files · +42 −7`). One path could not describe several files, the
-/// action lines that separate them are inside the fold, and the count is what
-/// tells the reader whether expanding is worth it. The totals come from the
-/// same typed [`FileEdit`] hunks the body renders, so they cannot disagree. A
-/// single file names its action and its short name — a rename names both ends.
-///
-/// The name is the same short form the File Content marker/caption uses
-/// ([`header_file_name`]): basename first, one printable line, tail-clipped to
-/// [`FILE_HEADER_NAME_MAX_CHARS`]. A folded header is one `plain_text` line,
-/// and on a phone a full absolute path would dominate it — the directories
-/// belong to the unfolded body and the viewer.
-///
-/// A `read` whose output carries a File Content gets NO fragment: that file is
-/// already named by the `📎` marker (`SentAsFile`/`Undelivered`, ADR-0076) or by
-/// the embedded image's caption, and two names for one file on one line is
-/// noise. `None` for every other tool and for a call with no usable path.
-fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
-    if let Some(edits) = file_edits(tool) {
-        // A failed call's body is the error text and its change is unknown, so
-        // `+0 −0` there would claim nothing changed; the count still stands.
-        if edits.len() > 1 {
-            let totals = (!call_failed(tool)).then(|| file_edits_totals(&edits));
-            return Some(multi_file_detail(edits.len(), totals));
-        }
-        return Some(format!(" · {}", file_edit_title(edits.first()?)));
-    }
-    if is_image_read(tool) {
-        return None;
-    }
-    let read = read_detail(tool)?;
-    if !tool.files().is_empty() {
-        return None;
-    }
-    let path = read.path.filter(|path| !path.trim().is_empty())?;
-    // The book icon the read panel's Input line already uses — and the one
-    // that still reads correctly for a directory read.
-    // A directory read may name its path with a trailing separator. Dropping it
-    // lets the short-name rule reach the directory's own name instead of
-    // rendering the whole path; a path that is nothing BUT separators keeps its
-    // form (`header_file_name` then falls back to it).
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    let name = if trimmed.is_empty() { path } else { trimmed };
-    Some(format!(" · 📖 {}", header_file_name(name)))
-}
-
 /// The folded-title fragment a multi-file patch carries: the file count and,
 /// when they are known, the change totals. One formatter for both the Codex
 /// and OpenCode producers, so the two cannot disagree.
-fn multi_file_detail(files: usize, totals: Option<(usize, usize)>) -> String {
+pub(super) fn multi_file_detail(files: usize, totals: Option<(usize, usize)>) -> String {
     match totals {
         Some((additions, deletions)) => format!(" · 📄 {files} files · +{additions} −{deletions}"),
         None => format!(" · 📄 {files} files"),
     }
-}
-
-/// The target agents a collaboration panel's folded title names (issue #962):
-/// the first row's thread — the call's receiver when it has one — plus how many
-/// other targets the same call covers. The label is the very eight-character id
-/// the body rows use, so the folded and unfolded views cannot disagree. The
-/// selection is the launch's neutral detail plus the adapter's input shape,
-/// never the identity name.
-fn panel_target_detail(tool: &ToolPanel) -> Option<String> {
-    if !is_collab_launch(tool) {
-        return None;
-    }
-    let obj = tool.input()?.as_object()?;
-    let agents = obj.get("agents")?.as_array()?;
-    let first = agents.first()?;
-    let label = collab_agent_label(first)?;
-    let count = agents.len();
-    let mut detail = format!(" · 🧵 {label}");
-    if count > 1 {
-        detail.push_str(&format!(" +{}", count - 1));
-    }
-    Some(detail)
 }
 
 /// Fold every line-breaking character of a value that rides a one-line
@@ -1632,7 +922,7 @@ fn panel_target_detail(tool: &ToolPanel) -> Option<String> {
 /// without that name's empty fallback, for a path the header shows as a
 /// fragment. A valid Unix path may carry a newline or a `U+2028`, and an
 /// unfolded one would break the folded title across lines.
-fn folded_header_fragment(text: &str) -> String {
+pub(super) fn folded_header_fragment(text: &str) -> String {
     text.chars()
         .map(|c| if is_header_line_break(c) { ' ' } else { c })
         .collect::<String>()
@@ -1640,24 +930,24 @@ fn folded_header_fragment(text: &str) -> String {
         .to_string()
 }
 
-/// The byte length the folded header's target detail [`panel_target_detail`]
-/// contributes to the card, for a card-size estimate that must charge what the
-/// header renders. `0` when the panel carries no detail; kept beside the render
-/// so the two cannot drift.
+/// The byte length the folded header's target detail
+/// ([`ToolView::target_detail`]) contributes to the card, for a card-size
+/// estimate that must charge what the header renders. `0` when the panel
+/// carries no detail; kept beside the render so the two cannot drift.
 pub(crate) fn panel_target_detail_estimate(tool: &ToolPanel) -> usize {
-    header_fragment_estimate(panel_target_detail(tool))
+    header_fragment_estimate(ToolView::of(tool).target_detail(tool))
 }
 
-/// The byte length the folded header's file detail [`panel_file_detail`]
-/// contributes to the card (ADR-0083 §8 amendment, #766), for a card-size
-/// estimate that must charge what the header renders. Like the File Content
-/// marker's estimate, the title is a `plain_text` element whose bytes reach the
-/// card JSON verbatim, so the detail is charged at its JSON-escaped length —
-/// charging the raw length would under-count a quote or control character in a
-/// filename. `0` when the panel carries no detail. Kept beside the render so
-/// the two cannot drift.
+/// The byte length the folded header's file detail
+/// ([`ToolView::file_detail`]) contributes to the card (ADR-0083 §8 amendment,
+/// #766), for a card-size estimate that must charge what the header renders.
+/// Like the File Content marker's estimate, the title is a `plain_text` element
+/// whose bytes reach the card JSON verbatim, so the detail is charged at its
+/// JSON-escaped length — charging the raw length would under-count a quote or
+/// control character in a filename. `0` when the panel carries no detail.
+/// Kept beside the render so the two cannot drift.
 pub(crate) fn panel_file_detail_estimate(tool: &ToolPanel) -> usize {
-    header_fragment_estimate(panel_file_detail(tool))
+    header_fragment_estimate(ToolView::of(tool).file_detail(tool))
 }
 
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
@@ -1789,7 +1079,7 @@ fn fence_lang_bytes(lang: Option<&str>) -> usize {
 /// fence and newlines) PLUS the opening fence's language token. The one budget
 /// test [`clip_fenced_body`] and the diff note share, so a body is clipped
 /// exactly when the note says so.
-fn fenced_body_fits(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> bool {
+pub(super) fn fenced_body_fits(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> bool {
     json_escaped_len(text) + fenced_block_overhead(text) + fence_lang_bytes(lang) <= max_escaped_bytes
 }
 
@@ -2059,22 +1349,6 @@ pub(crate) fn tool_open_button_estimate(tool: &ToolPanel, session_id: Option<&st
         .unwrap_or(0)
 }
 
-/// The note a `read` or `write` panel appends under a body its budget CLIPPED
-/// (ADR-0083 §8 amendment, #770/#788): the body is a
-/// [`TOOL_OUTPUT_MAX_CHARS`]-character preview, so a clipped one says what it
-/// is and names the way to the rest. It renders IFF that way renders — the
-/// panel carries a way-in button ([`tool_open_button_element`]: a `write`, a
-/// file read, and a Session to route the click by) — so the note never promises
-/// a control an unopenable panel does not have, and the size estimate can charge
-/// exactly the bytes it adds. `None` for every other panel and for a body that
-/// fits.
-fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
-    // The button first: a panel without one (a directory read, an image read, a
-    // routeless panel) leaves without assembling the body at all.
-    tool_open_button_element(tool, session_id)?;
-    preview_body_clipped(tool).then_some(PREVIEW_TRUNCATION_NOTE)
-}
-
 /// The Output triple a Codex `webSearch` panel renders. The app-server schema
 /// calls `results` opaque JSON, so only one shape is read as a result list —
 /// an array whose every entry has a non-empty `url` (a `title` is optional) —
@@ -2084,7 +1358,7 @@ fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option
 /// A search that has produced no results yet (`null`, or an empty list while
 /// still running) renders no Output at all: an empty Output beside the query
 /// would claim the search returned nothing.
-fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
+pub(super) fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
     let results = codex_search_results(tool)?;
     if let Some(entries) = codex_search_entries(results) {
         if entries.is_empty() && tool.is_live() {
@@ -2111,8 +1385,11 @@ fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyl
 /// `websearch`'s raw output is its content-block envelope
 /// (`[{type: "text", …}]`) and falls through to [`web_output`], never to this
 /// opaque JSON. `None` while the search has no results yet.
-fn codex_search_results(tool: &ToolPanel) -> Option<&serde_json::Value> {
-    if search_detail(tool)?.scope != SearchScope::Web {
+pub(super) fn codex_search_results(tool: &ToolPanel) -> Option<&serde_json::Value> {
+    let ToolView::Search(search) = ToolView::of(tool) else {
+        return None;
+    };
+    if search.scope != SearchScope::Web {
         return None;
     }
     if let Some(results) = tool
@@ -2151,7 +1428,7 @@ fn is_content_block_envelope(value: &serde_json::Value) -> bool {
 
 /// The raw-JSON body for a `results` value the card cannot confirm: a JSON
 /// string's own text, otherwise its pretty-printed JSON.
-fn codex_search_raw_body(results: &serde_json::Value) -> String {
+pub(super) fn codex_search_raw_body(results: &serde_json::Value) -> String {
     match results {
         serde_json::Value::String(text) => text.clone(),
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
@@ -2166,94 +1443,23 @@ fn codex_search_raw_body(results: &serde_json::Value) -> String {
 /// text is not a diff and takes no note, since there is no change to name.
 /// Unlike [`preview_truncation_note`] it needs no button: "已截断" is true even
 /// when nothing can be opened, so the reader still knows the diff is partial.
-fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
+pub(super) fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
     file_edits_body(tool)
-        .filter(FileEditsBody::clipped)
+        .filter(|body| body.clipped())
         .map(|_| DIFF_TRUNCATION_NOTE)
 }
 
-/// The note a Codex search's raw-JSON fallback appends under a body its budget
-/// CLIPPED ([`SEARCH_TRUNCATION_NOTE`]): the body clips bare, so without this
-/// line a cut payload would look complete. `None` for a recognized result list
-/// (its compact list always fits) and for a body that fits.
-fn codex_search_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
-    let results = codex_search_results(tool)?;
-    if codex_search_entries(results).is_some() {
-        return None;
-    }
-    let body = codex_search_raw_body(results);
-    (!fenced_body_fits(&body, Some("json"), TOOL_OUTPUT_MAX_CHARS)).then_some(SEARCH_TRUNCATION_NOTE)
-}
-
-/// The note a panel appends under a body its budget clipped: a `read` preview's
-/// way-in note, a FileEdits diff's bare clip signal, or a Codex search's raw
-/// payload note. One function, because the render and the size estimate must
-/// agree on exactly one note (a panel never carries two: its body is one shape).
-fn truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
-    preview_truncation_note(tool, session_id)
-        .or_else(|| diff_truncation_note(tool))
-        .or_else(|| codex_search_truncation_note(tool))
-}
-
-/// Whether a `read` panel's rendered body is clipped by its own budget — the
-/// clamp [`tool_panel_element`] applies ([`truncate_md`] at
-/// [`TOOL_OUTPUT_MAX_CHARS`]) — measured from the same body the render shows,
-/// the way every size estimate here re-derives its render, so the note
-/// [`preview_truncation_note`] renders is the one charged. A FileEdits diff is
-/// [`diff_truncation_note`]'s, not this one's.
-fn preview_body_clipped(tool: &ToolPanel) -> bool {
-    if is_image_read(tool) || read_detail(tool).is_none() {
-        return false;
-    }
-    tool.output()
-        .map(|raw| format_tool_output(tool, &raw).2)
-        .is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
-}
-
-/// The serialized byte length the truncation note [`truncation_note`] appends
-/// to a clipped body (ADR-0083 §8 amendment, #770/#788), for a card-size
-/// estimate that must charge exactly what the panel writes — a note the estimate
-/// missed would let a clipped body pass the split check while the serialized
-/// card still carries bytes nothing counted. `0` when the note does not render.
-/// Kept beside the render so the two cannot drift.
+/// The serialized byte length the truncation note appends to a clipped body
+/// (ADR-0083 §8 amendment, #770/#788), for a card-size estimate that must
+/// charge exactly what the panel writes — a note the estimate missed would let
+/// a clipped body pass the split check while the serialized card still carries
+/// bytes nothing counted. `0` when the note does not render. Kept beside the
+/// render so the two cannot drift.
 pub(crate) fn preview_truncation_note_estimate(tool: &ToolPanel, session_id: Option<&str>) -> usize {
-    truncation_note(tool, session_id)
+    ToolView::of(tool)
+        .note(tool, session_id)
         .map(|note| json_escaped_len(&CardMarkdown::new().element(note)))
         .unwrap_or(0)
-}
-
-/// The Output triple a panel renders: a Code Mode `Program`'s nested-call body,
-/// a FileEdits panel's hunks, a Codex `web_search`'s results (assembled from
-/// the adapter's metadata, not the text output), or the tool's output text
-/// through the shape-keyed formatter. One function, because the render and the
-/// size estimate must agree on which body a panel shows. A `Command` needs no
-/// branch here: its body is the call's output text, rendered through the shared
-/// command block ([`command_output_block`]) exactly where every panel's body
-/// is.
-fn panel_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    if is_program(tool) {
-        program_output(tool)
-    } else if let Some(edits) = file_edits_output(tool) {
-        Some(edits)
-    } else if let Some(search) = codex_web_search_output(tool) {
-        Some(search)
-    } else if let Some(collab) = codex_collab_output(tool) {
-        Some(collab)
-    } else if is_command(tool) {
-        // A `Command`'s body is its own output text, never a name-keyed
-        // formatter's: the shared command block (below, and in `terminal.rs`)
-        // owns how it is clipped and fenced.
-        tool.output().map(|raw| (None, BodyStyle::Auto, raw))
-    } else {
-        tool.output().map(|raw| format_tool_output(tool, &raw))
-    }
-}
-
-/// Whether the call settled as a FAILURE, by the same rule its status icon
-/// draws ([`ToolPanel::status_icon`]): [`ToolStatus::is_failure`], or a
-/// recorded fact in the call's shape that reports one.
-fn call_failed(tool: &ToolPanel) -> bool {
-    tool.detail_failure() || tool.status().is_failure()
 }
 
 /// The card bytes one adapter-assembled Output body contributes: its header
@@ -2263,7 +1469,7 @@ fn call_failed(tool: &ToolPanel) -> bool {
 /// body carries its dynamic fence and language tag. Shared by the Codex search
 /// results, a collaboration call's target rows and a Code Mode program's
 /// nested-call body, so none of them can drift from what it renders.
-fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, body: &str) -> usize {
+pub(super) fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, body: &str) -> usize {
     let header = header
         .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
         .unwrap_or(0);
@@ -2276,64 +1482,34 @@ fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, body: &str) -
     header + body
 }
 
-/// The serialized byte length the Output body a panel renders contributes to
-/// its card size (#788). The branches walk the bodies in the same order
-/// [`panel_output`] does, so the first body the renderer reaches is the one
-/// charged: a `Program`'s assembled nested-call body; a FileEdits panel's
-/// composed body ([`file_edits_body`], clipped at [`DIFF_MAX_ESCAPED_BYTES`]
-/// as the render writes it, #792); a Codex search's or collaboration call's
-/// assembled body; else the call's output text (a `Command`'s included,
-/// through the same shared block). Every body is measured JSON-ESCAPED (the
-/// form it takes inside the card's `content` string, each newline and quote
-/// costing its extra byte) and with the dynamic fence [`fenced_overhead`]
-/// charges for a body full of backticks. Kept beside the render so the
-/// estimate cannot charge a body the panel never writes, and a diff is
-/// charged under the SAME cap it renders under, never the old 3,000-character
-/// preview (#792).
-///
-/// The boundary #792's acceptance line names: a diff that already fit the old
-/// 3,000-character preview renders exactly as it did before and is charged at
-/// its rendered size — the clip is a no-op, so nothing grows. Only a diff the
-/// byte budget newly reveals (over 3,000 characters but inside
-/// [`DIFF_MAX_ESCAPED_BYTES`]) is charged larger than the old preview charge,
-/// because the card now carries those bytes. Ordinary `read` panels
-/// keep their 3,000-character budget and their old charge untouched.
-pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
-    // A Code Mode program's nested-call rows and result are assembled from the
-    // shape, not from the call's text output: charge the body the panel writes.
-    // Its progress header is the folded title's (`title_details`), not part of
-    // this body charge.
-    if is_program(tool) {
-        return program_output(tool)
-            .map(|(_, style, body)| assembled_body_estimate(None, style, &body))
-            .unwrap_or(0);
-    }
-    // A FileEdits panel composes markdown: action lines outside the fence and
-    // hunks inside it, already clipped at the diff byte budget. Charge the
-    // header plus the body exactly as `CardMarkdown` serializes it.
-    if let Some(body) = file_edits_body(tool) {
-        let header = body
-            .header
-            .as_deref()
-            .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
-            .unwrap_or(0);
-        return header + serialized_len(&body.render().0);
-    }
-    // A Codex search's or collaboration call's body is assembled from metadata,
-    // not from the call's (empty) text output, so it is charged from the same
-    // derivation the panel renders — header included, and the raw fallback's
-    // `json` fence tag, which the generic branch's constant does not carry.
-    if let Some((header, style, body)) = codex_web_search_output(tool).or_else(|| codex_collab_output(tool)) {
-        return assembled_body_estimate(header.as_deref(), style, &body);
-    }
-    // Everything else — a `Command` included — is its output text, clipped at
-    // the preview cap exactly as the render clips it.
+/// The card bytes a panel's plain output text contributes, clipped at the
+/// preview cap exactly as the render clips it. The fallback every identity
+/// whose body is not assembled from its shape charges.
+pub(super) fn call_output_charge(tool: &ToolPanel) -> usize {
     tool.output()
         .map(|body| {
             let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
             json_escaped_len(&body) + fenced_overhead(&body)
         })
         .unwrap_or(0)
+}
+
+/// The Input-line budget for a panel. Every shape is summarized into the folded
+/// panel; a `Program` is the one exception — its source IS the panel, so it gets
+/// the output budget.
+fn input_budget(view: &ToolView<'_>) -> usize {
+    if view.is_program() {
+        TOOL_OUTPUT_MAX_CHARS
+    } else {
+        INPUT_MAX_CHARS
+    }
+}
+
+/// The serialized byte length the Output body a panel renders contributes to
+/// its card size (#788). One identity answers it ([`ToolView`]), so the
+/// estimate cannot charge a body the panel never renders.
+pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
+    ToolView::of(tool).output_estimate(tool)
 }
 
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
@@ -2358,21 +1534,21 @@ pub(super) fn tool_panel_element(
     session_id: Option<&str>,
     md: &mut CardMarkdown,
 ) -> serde_json::Value {
-    // A `Program` assembles its body from its nested-call list, and a `write`
-    // renders its own `content` input, so those have their own builders; every
-    // other tool's body is its output text through the per-tool formatter (see
-    // [`panel_output`]). The result-count header (glob/grep) is metadata-side,
-    // so it is applied over either path.
-    let output = panel_output(tool);
-    let output = output.map(|(header, style, body)| (search_count_header(tool).or(header), style, body));
+    // One identity for the whole element: the Input line, the Output body,
+    // the body charge, the folded header details and the truncation note all
+    // come from it, so the branches below ask the view instead of re-deriving
+    // the tool. The result-count header (glob/grep) is metadata-side, so it is
+    // applied over either body path.
+    let view = ToolView::of(tool);
+    let output = view.output(tool);
+    let output = output.map(|(header, style, body)| (view.search_header(tool).or(header), style, body));
     // The plan panel is a status section, not a transcript: a parsed list is
     // the panel, so the generic Input line and Output marker would only frame
     // the checklist (a still-running call has no parsed output yet — the Input
     // line `📋 共 N 项任务` is all it can show), and its prefix names the
     // section rather than the call (a finished call would sit at a permanent ✅
     // while the counts right beside it still report open items).
-    let todo_panel = tool.is_plan();
-    let todowrite_list = todo_panel
+    let todowrite_list = view.is_plan()
         && output
             .as_ref()
             .is_some_and(|(_, style, _)| *style == BodyStyle::Markdown);
@@ -2381,19 +1557,12 @@ pub(super) fn tool_panel_element(
     // family's own line comes from its detail (which may name a command the raw
     // payload does not), and every other tool's from its input.
     if !todowrite_list {
-        let formatted = format_tool_input(tool);
+        let formatted = view.input(tool);
         if !formatted.is_empty() {
-            // A program is the exception to the 400-char input budget: its
-            // code is the panel, so it gets the output budget.
-            let budget = if is_program(tool) {
-                TOOL_OUTPUT_MAX_CHARS
-            } else {
-                400
-            };
+            let budget = input_budget(&view);
             // Trailing blank line so a multi-line input (edit diff, skill
-            // metadata list) can't swallow the Output section as a markdown
-            // lazy continuation of its last list line — Feishu would render
-            // the output label glued to the last input line.
+            // metadata list) cannot swallow the Output section as a markdown
+            // lazy continuation — Feishu would glue the output label on.
             content.push_str(&format!(
                 "**{INPUT_LABEL}**\n{}\n\n",
                 truncate_md(&formatted, budget)
@@ -2417,7 +1586,7 @@ pub(super) fn tool_panel_element(
             // the whole run above it, marker included, into one heading
             // (`## Output99- …`), glued together.
             content.push_str(&format!("**{OUTPUT_LABEL}**\n\n"));
-            if is_program(tool) {
+            if view.is_program() {
                 // The call count is the folded panel's progress line; the body
                 // leads with the nested call rows themselves.
                 title_details = header;
@@ -2431,8 +1600,8 @@ pub(super) fn tool_panel_element(
             // clipped diff has. A `read` preview keeps its 3,000-CHAR budget
             // and `truncate_md`'s marker (or `clip_md` when it carries the
             // way-in note), exactly as before.
-            let note = truncation_note(tool, session_id);
-            if is_command(tool) {
+            let note = view.note(tool, session_id);
+            if view.is_command() {
                 // A `Command`'s body is the shared command output block
                 // (ADR-0105, ADR-0086's "one render block, never a lifecycle"):
                 // the same clip and fence the Host Terminal Card puts its log
@@ -2442,7 +1611,7 @@ pub(super) fn tool_panel_element(
                 };
                 content.push_str(&command_output_block(&body, clip, false).0);
             } else {
-                let body = if has_file_edits(tool) && !call_failed(tool) {
+                let body = if view.has_file_edits() && !view.failed(tool) {
                     // Already composed and clipped by `file_edits_body`.
                     body
                 } else if note.is_some() && matches!(style, BodyStyle::Code(_)) {
@@ -2485,7 +1654,11 @@ pub(super) fn tool_panel_element(
         content = "_(no details)_".to_string();
     }
     let content = md.element(&content);
-    let icon = if todo_panel { "📋" } else { tool.status_icon() };
+    let icon = if view.is_plan() {
+        "📋"
+    } else {
+        tool.status_icon()
+    };
     let mut title = format!("{icon} {}{}", tool_display_name(tool), panel_time_suffix(at_ms));
     if let Some(details) = &title_details {
         title.push_str(&format!(" · {}", details));
@@ -2494,12 +1667,12 @@ pub(super) fn tool_panel_element(
     // (ADR-0083 §8 amendment, #766): its Input line is inside the fold, so a
     // collapsed `write`/`edit` — and a text `read` — would otherwise never name
     // the file it touched.
-    if let Some(detail) = panel_file_detail(tool) {
+    if let Some(detail) = view.file_detail(tool) {
         title.push_str(&detail);
     }
     // A collaboration panel's folded header names its target agent(s) — the
     // body that lists them is collapsed (issue #962).
-    if let Some(detail) = panel_target_detail(tool) {
+    if let Some(detail) = view.target_detail(tool) {
         title.push_str(&detail);
     }
     // A live task call carries its child session's liveness in the title, so
@@ -2957,81 +2130,21 @@ fn format_todo_list_with_explanation(todo: &TodoList) -> String {
     }
 }
 
-/// Render a tool's raw output string where the neutral shape says it has one.
-/// A **Read** output is OpenCode's envelope — V1's XML wrapper
-/// (`<path>…</path>`, `<type>…</type>`, `<content>…</content>`) or V2's header
-/// line over numbered lines — so the card shows the file's path and lines
-/// rather than the wrapper. A **Search** with web scope is a result envelope —
-/// render it as a title+url list. A launch keeps its own envelope
-/// ([`delegation_output`]); a tool with no typed detail keeps its renderer (a
-/// `skill` envelope); a plan call reads the neutral `TodoList` fact
-/// ([`plan_output`]); everything else passes through unchanged.
-///
-/// Returns `(header, body style, body)`: the header is the short markdown line
-/// above the body (file path, change count, result count); the style decides
-/// how the body blocks (see [`BodyStyle`]).
-fn format_tool_output(tool: &ToolPanel, output: &str) -> (Option<String>, BodyStyle, String) {
-    if tool.is_plan() {
-        return plan_output(output);
-    }
-    // A Codex `imageView` is a `Read` in the neutral model but keeps P1's
-    // presentation (its panel is not a text preview): show its output raw.
-    if is_image_read(tool) {
-        return (None, BodyStyle::Auto, output.to_string());
-    }
-    if read_detail(tool).is_some() {
-        return read_output(output);
-    }
-    if search_detail(tool).is_some_and(|search| search.scope == SearchScope::Web) {
-        return web_output(output);
-    }
-    if is_launch_call(tool) {
-        return delegation_output(output);
-    }
-    if matches!(tool.call().detail, ToolDetail::Skill)
-        && output.starts_with("<skill_content ")
-        && let Some(body) = parse_skill_envelope(output)
-    {
-        return (None, BodyStyle::Auto, body);
-    }
-    (None, BodyStyle::Auto, output.to_string())
-}
-
 /// A **web search**'s raw output: V1 emits a JSON envelope (`parallel`) or
 /// plain-text blocks (`exa`); V2 emits markdown result blocks. Each parser
 /// shape-gates itself, so an unrecognized provider output still passes through
 /// unchanged.
-fn web_output(output: &str) -> (Option<String>, BodyStyle, String) {
+pub(super) fn web_output(output: &str) -> (Option<String>, BodyStyle, String) {
     match parse_websearch_results(output) {
         Some((count, body)) => (Some(format!("🔎 {} 条结果", count)), BodyStyle::Markdown, body),
         None => (None, BodyStyle::Auto, output.to_string()),
     }
 }
 
-/// Whether a call launches a child run, selected by its neutral detail — never
-/// its vendor name (ADR-0105 §5). A third adapter's launch under a new id takes
-/// the same panel.
-fn is_launch_call(tool: &ToolPanel) -> bool {
-    matches!(
-        &tool.call().detail,
-        ToolDetail::Delegation {
-            effect: DelegationEffect::Launch,
-            ..
-        }
-    )
-}
-
-/// A Codex collaboration launch: the neutral launch detail plus the adapter's
-/// input shape. The rich collab presentation (prompt/model/target rows) needs
-/// that shape; the identity name is never the selector.
-fn is_collab_launch(tool: &ToolPanel) -> bool {
-    is_launch_call(tool) && collab_agent_shape(tool.input())
-}
-
 /// A launch's raw output: V1's `<task …>` envelope (whose `<summary>` can
 /// become the header) or V2's `<subagent …>` envelope. The marker, not the
 /// identity name, picks the parser.
-fn delegation_output(output: &str) -> (Option<String>, BodyStyle, String) {
+pub(super) fn delegation_output(output: &str) -> (Option<String>, BodyStyle, String) {
     if output.starts_with("<task ")
         && let Some((header, body)) = parse_task_envelope(output)
     {
@@ -3048,7 +2161,7 @@ fn delegation_output(output: &str) -> (Option<String>, BodyStyle, String) {
 /// A launch's Input line: its description and the child agent's type. V1 names
 /// the type `subagent_type`, V2 `agent`; both are payload data, read the same
 /// way whichever identity name the adapter chose.
-fn delegation_input(input: &serde_json::Value) -> String {
+pub(super) fn delegation_input(input: &serde_json::Value) -> String {
     let get = |key: &str| input.get(key).and_then(serde_json::Value::as_str);
     let desc = get("description").unwrap_or("子任务");
     let sub = get("agent")
@@ -3058,10 +2171,22 @@ fn delegation_input(input: &serde_json::Value) -> String {
     format!("🔀 {}{}", desc, sub)
 }
 
+/// A **skill** call's raw output: an adapter may wrap the loaded skill content in
+/// a `<skill_content …>` envelope, which the card unwraps. Any other shape passes
+/// through unchanged.
+pub(super) fn skill_output(output: &str) -> (Option<String>, BodyStyle, String) {
+    if output.starts_with("<skill_content ")
+        && let Some(body) = parse_skill_envelope(output)
+    {
+        return (None, BodyStyle::Auto, body);
+    }
+    (None, BodyStyle::Auto, output.to_string())
+}
+
 /// The plan surface's output: the neutral [`TodoList`] parsed from the call's
 /// output, rendered as the iconed checklist with its count header. A payload
 /// that does not parse passes through unchanged rather than being dropped.
-fn plan_output(output: &str) -> (Option<String>, BodyStyle, String) {
+pub(super) fn plan_output(output: &str) -> (Option<String>, BodyStyle, String) {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
         && let Some(todo) = parse_todo_list(&value)
         && !todo.is_empty()
@@ -3085,7 +2210,7 @@ fn plan_output(output: &str) -> (Option<String>, BodyStyle, String) {
 /// merely *mentions* the literal `<path>` (any file quoting it, e.g. a README
 /// documenting `--config <path>`) must still take the V2 branch below, or its
 /// path header, language token and first body line are all lost.
-fn read_output(output: &str) -> (Option<String>, BodyStyle, String) {
+pub(super) fn read_output(output: &str) -> (Option<String>, BodyStyle, String) {
     let v1_read_wrapper = output.trim_start().starts_with("<path>");
     if !v1_read_wrapper {
         // V2's read output carries no XML wrapper: a header line over numbered
@@ -3128,30 +2253,6 @@ fn read_output(output: &str) -> (Option<String>, BodyStyle, String) {
     )
 }
 
-/// The result-count header V2 records in a search call's metadata (`count` for
-/// a filename search, `matches` for a content search, plus its `truncated`
-/// flag). `None` when the shape is not one of those or the call carries no
-/// count — a generation that doesn't record it, or a third-party tool that
-/// merely claims an id — so the panel keeps its raw shape.
-fn search_count_header(tool: &ToolPanel) -> Option<String> {
-    let search = search_detail(tool)?;
-    let (count, unit) = match search.scope {
-        SearchScope::FileName => (search.matches?, "个文件"),
-        SearchScope::Content => (search.matches?, "处匹配"),
-        SearchScope::Web => return None,
-    };
-    let truncated = tool
-        .metadata()
-        .and_then(|metadata| metadata.get("truncated"))
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    Some(if truncated {
-        format!("{count} {unit} · 已截断")
-    } else {
-        format!("{count} {unit}")
-    })
-}
-
 /// The `Program` panel's output (the execute family's Code Mode shape): one
 /// status row per nested tool call the program made — the shape records them
 /// live, in start order, while the program runs — followed by the formatted
@@ -3159,10 +2260,11 @@ fn search_count_header(tool: &ToolPanel) -> Option<String> {
 /// nested failures and the program's OWN failure — which the panel promotes to
 /// its folded title (`title_details`). `None` when there is neither a nested
 /// call nor a result, so the panel falls back to its input alone.
-fn program_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    let Some(ExecuteShape::Program { calls, error, .. }) = ExecuteShape::of(tool) else {
-        return None;
-    };
+pub(super) fn program_output(
+    tool: &ToolPanel,
+    shape: &ProgramShape<'_>,
+) -> Option<(Option<String>, BodyStyle, String)> {
+    let calls = shape.calls;
     let result = tool.output();
     if calls.is_empty() && result.is_none() {
         return None;
@@ -3178,7 +2280,7 @@ fn program_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String
             segments.push(format!("{failures} 失败"));
         }
     }
-    if error {
+    if shape.error {
         segments.push("程序出错".to_string());
     }
     let header = (!segments.is_empty()).then(|| segments.join(" · "));
@@ -3380,7 +2482,7 @@ fn search_result_list(results: &[SearchEntry]) -> String {
 /// a different key, a missing url in one entry, a wrapped object — returns
 /// `None`, so the caller shows it raw rather than guessing (the schema calls
 /// `results` opaque JSON).
-fn codex_search_entries(results: &serde_json::Value) -> Option<Vec<SearchEntry>> {
+pub(super) fn codex_search_entries(results: &serde_json::Value) -> Option<Vec<SearchEntry>> {
     let array = results.as_array()?;
     let mut entries = Vec::with_capacity(array.len());
     for result in array {
@@ -3535,75 +2637,12 @@ pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
     vocab::tool_token(&call.identity, call.kind, &call.detail)
 }
 
-/// An image read's Input line: the file it looked at. Unlike a `read` there is
-/// no preview body to fold, so the panel only names it — with the same backtick
-/// flattening as a file change's path. Selected only when [`is_image_read`]
-/// holds (the neutral `Read` detail), never by name alone.
-fn image_input(input: &serde_json::Value) -> String {
-    let Some(obj) = input.as_object() else {
-        return input.to_string();
-    };
-    match obj
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-    {
-        Some(path) => format!("🖼 {}", inline_code(path)),
-        None => generic_tool_input(obj),
-    }
-}
-
-/// `collabAgentToolCall`: the whole shape cola's adapter writes (issue #962) —
-/// the tool and its status, the sender, the receiver list, the three optional
-/// scalars as **present** keys (the adapter writes them even as `null`, keyed
-/// like `webSearch`'s `action`), and one object per target state row.
-fn collab_agent_shape(input: Option<&serde_json::Value>) -> bool {
-    let Some(obj) = input.and_then(serde_json::Value::as_object) else {
-        return false;
-    };
-    let optional_scalar = |key: &str| {
-        obj.get(key)
-            .is_some_and(|value| value.is_null() || value.is_string())
-    };
-    obj.get("tool").and_then(serde_json::Value::as_str).is_some()
-        && optional_scalar("status")
-        && obj
-            .get("senderThreadId")
-            .and_then(serde_json::Value::as_str)
-            .is_some()
-        && obj
-            .get("receiverThreadIds")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|ids| ids.iter().all(serde_json::Value::is_string))
-        && optional_scalar("prompt")
-        && optional_scalar("model")
-        && optional_scalar("reasoningEffort")
-        && obj
-            .get("agents")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|agents| {
-                agents.iter().all(|agent| {
-                    agent
-                        .get("threadId")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some()
-                        && agent.get("status").and_then(serde_json::Value::as_str).is_some()
-                        && agent
-                            .get("message")
-                            .is_some_and(|message| message.is_null() || message.is_string())
-                        && agent
-                            .get("label")
-                            .is_none_or(|label| label.is_null() || label.is_string())
-                })
-            })
-}
-
 /// Wrap `text` in an inline code span whose delimiter is longer than any
 /// backtick run inside it, so a command or path containing backticks cannot
 /// close the span (Markdown's own rule). Content that starts or ends with a
 /// backtick takes one padding space on each side, or the delimiter merges with
 /// the content.
-fn inline_code(text: &str) -> String {
+pub(super) fn inline_code(text: &str) -> String {
     let longest = text
         .split(|character| character != '`')
         .map(str::len)
@@ -3619,82 +2658,21 @@ fn inline_code(text: &str) -> String {
 
 /// Render a tool call as the panel's Input line.
 ///
-/// Every migrated family is selected by `(kind, detail)` — never by a name: one
-/// renderer per shape covers `bash`/`shell`/`codex/command_execution` and Code
-/// Mode's `execute` (Execute), `edit`/`write`/`patch`/`apply_patch`/
-/// `codex/file_change` (FileEdits), the read, search and fetch shapes
-/// (ADR-0105, spec #1057's P2/P3). The plan's own input is the neutral
-/// `TodoList` fact; only the ids whose ENVELOPE is vendor-specific and has no
-/// shared shape (`task`, `skill`, `question`, Codex's collaboration rows,
-/// `codex/image`) still read their name.
-///
-/// A declared shape owns its Input line, the empty one included: an empty line
-/// renders no section, and it never falls through to the raw payload's key table
-/// (which would print `- command:` for a call the adapter already described).
-fn format_tool_input(tool: &ToolPanel) -> String {
-    if let Some(ExecuteShape::Command {
-        command,
-        cwd,
-        description,
-        ..
-    }) = ExecuteShape::of(tool)
-    {
-        return command_input(command, cwd, description);
-    }
-    if let Some(ExecuteShape::Program { source, language, .. }) = ExecuteShape::of(tool) {
-        return program_input(source, language);
-    }
-    if let Some(edits) = file_edits(tool) {
-        return file_edits_input(&edits, call_failed(tool));
-    }
-    if tool.is_plan() {
-        return tool.input().map(plan_input).unwrap_or_default();
-    }
-    if is_image_read(tool) {
-        return tool.input().map(image_input).unwrap_or_default();
-    }
-    if let Some(read) = read_detail(tool) {
-        return read_input(tool, read);
-    }
-    if let Some(search) = search_detail(tool) {
-        return search_input(tool, search);
-    }
-    if tool.call().kind == ToolKind::Fetch {
-        return fetch_input(tool.input());
-    }
-    // A Codex collaboration launch keeps its own vendor presentation (issue
-    // #962); the shared `Delegation` launch panel below is for the generic
-    // task/subagent shape. Both are selected by the neutral detail, never the
-    // identity name.
-    if is_collab_launch(tool) {
-        return tool.input().map(collab_agent_input).unwrap_or_default();
-    }
-    if is_launch_call(tool) {
-        return tool.input().map(delegation_input).unwrap_or_default();
-    }
-    tool.input()
-        .map(|input| match tool.call().detail {
-            ToolDetail::Skill => skill_input(input),
-            ToolDetail::Ask => question_input(input),
-            _ => format_generic_input(input),
-        })
-        .unwrap_or_default()
-}
-
-/// The Input line a `Command` renders: the command, its working directory and
-/// the client's one-line description. Every producer has already resolved its
-/// own key into the shape (V1's `workdir` and Codex's `cwd` are one `cwd`
-/// there), so there is no vendor split left to take. Empty when the shape names
-/// nothing — the shape is the whole input, so there is nothing else to show.
-fn command_input(command: &str, cwd: Option<&str>, description: Option<&str>) -> String {
+/// The one dispatch is [`ToolView::input`]: every shape is selected by
+/// `(kind, detail)` — never by a name — so `bash`/`shell`/
+/// `codex/command_execution` and Code Mode's `execute` (Execute), `edit`/
+/// `write`/`patch`/`apply_patch`/`codex/file_change` (FileEdits), and the read,
+/// search and fetch shapes share one line per shape (ADR-0105, spec #1057's
+/// P2/P3).
+pub(super) fn command_input(shape: &CommandShape<'_>) -> String {
     let mut line = String::new();
-    if !command.is_empty() {
-        line.push_str(&inline_code(command));
+    if !shape.command.is_empty() {
+        line.push_str(&inline_code(shape.command));
     }
-    if let Some(dir) = cwd {
+    if let Some(dir) = shape.cwd {
         line.push_str(&format!("\n📁 `{dir}`"));
     }
-    if let Some(description) = description {
+    if let Some(description) = shape.description {
         line.push_str(&format!("\n📝 {description}"));
     }
     line
@@ -3706,19 +2684,22 @@ fn command_input(command: &str, cwd: Option<&str>, description: Option<&str>) ->
 /// Mode's runtime is JavaScript and its wire declares no language, so that stays
 /// the default; a client that declares one names the fence. Empty when the shape
 /// carries no source, for the same reason as [`command_input`].
-fn program_input(source: &str, language: Option<&str>) -> String {
-    if source.is_empty() {
+pub(super) fn program_input(shape: &ProgramShape<'_>) -> String {
+    if shape.source.is_empty() {
         return String::new();
     }
-    let lang = language.filter(|lang| !lang.is_empty()).unwrap_or("javascript");
-    fenced_code(&truncate_md(source, TOOL_OUTPUT_MAX_CHARS - 64), Some(lang))
+    let lang = shape
+        .language
+        .filter(|lang| !lang.is_empty())
+        .unwrap_or("javascript");
+    fenced_code(&truncate_md(shape.source, TOOL_OUTPUT_MAX_CHARS - 64), Some(lang))
 }
 
 /// The Input line a **Read** renders: the book icon and the path, plus the
 /// page window when the raw input records one. The path comes from the typed
 /// detail; `offset`/`limit` are the call's own paging arguments and stay raw
 /// facts beside it.
-fn read_input(tool: &ToolPanel, read: ReadShape<'_>) -> String {
+pub(super) fn read_input(tool: &ToolPanel, read: &ReadShape<'_>) -> String {
     let Some(path) = read.path.filter(|path| !path.trim().is_empty()) else {
         // A path-less read keeps its raw payload (a bare string, an unknown
         // shape) rather than rendering an empty line.
@@ -3740,9 +2721,9 @@ fn read_input(tool: &ToolPanel, read: ReadShape<'_>) -> String {
 /// its query with the magnifier; a filename/content search names the pattern
 /// (`匹配 …`), then the path it was limited to, its `include` filter and its
 /// paging window when the raw input records them.
-fn search_input(tool: &ToolPanel, search: SearchShape<'_>) -> String {
+pub(super) fn search_input(tool: &ToolPanel, search: &SearchShape<'_>) -> String {
     let obj = tool.input().and_then(serde_json::Value::as_object);
-    let query = search.query.map(String::as_str).filter(|q| !q.is_empty());
+    let query = search.query.filter(|q| !q.is_empty());
     if search.scope == SearchScope::Web {
         return match query {
             Some(query) => format!("🔎 {}", inline_code(query)),
@@ -3784,7 +2765,7 @@ fn search_input(tool: &ToolPanel, search: SearchShape<'_>) -> String {
 }
 
 /// The Input line a **Fetch** renders: the URL it fetched.
-fn fetch_input(input: Option<&serde_json::Value>) -> String {
+pub(super) fn fetch_input(input: Option<&serde_json::Value>) -> String {
     let Some(obj) = input.and_then(serde_json::Value::as_object) else {
         return input
             .and_then(serde_json::Value::as_str)
@@ -3801,7 +2782,7 @@ fn fetch_input(input: Option<&serde_json::Value>) -> String {
 /// nested values compacted and clipped, or a non-object input as-is. A
 /// third-party tool whose name happens to spell a closed token reaches this
 /// path, never the built-in's presentation.
-fn format_generic_input(input: &serde_json::Value) -> String {
+pub(super) fn format_generic_input(input: &serde_json::Value) -> String {
     let obj = match input.as_object() {
         Some(o) => o,
         None => return input.as_str().map(|s| s.to_string()).unwrap_or_default(),
@@ -3810,7 +2791,7 @@ fn format_generic_input(input: &serde_json::Value) -> String {
 }
 
 /// A **skill** call's Input line (`ToolDetail::Skill`).
-fn skill_input(input: &serde_json::Value) -> String {
+pub(super) fn skill_input(input: &serde_json::Value) -> String {
     let obj = match input.as_object() {
         Some(o) => o,
         None => return input.as_str().map(|s| s.to_string()).unwrap_or_default(),
@@ -3823,7 +2804,7 @@ fn skill_input(input: &serde_json::Value) -> String {
 }
 
 /// A **question** call's Input line (`ToolDetail::Ask`).
-fn question_input(input: &serde_json::Value) -> String {
+pub(super) fn question_input(input: &serde_json::Value) -> String {
     let obj = match input.as_object() {
         Some(o) => o,
         None => return input.as_str().map(|s| s.to_string()).unwrap_or_default(),
@@ -3844,7 +2825,7 @@ fn question_input(input: &serde_json::Value) -> String {
 /// The plan surface's Input line: a still-running call has no parsed output
 /// yet, so the plan's size is all it can show (`📋 共 N 项任务`). A payload with
 /// no todo array keeps its raw form.
-fn plan_input(input: &serde_json::Value) -> String {
+pub(super) fn plan_input(input: &serde_json::Value) -> String {
     match parse_todos(input) {
         Some(todos) => format!("📋 共 {} 项任务", todos.len()),
         None => input.to_string(),
@@ -3863,7 +2844,7 @@ const COLLAB_MESSAGE_MAX_CHARS: usize = 160;
 /// RESULT and ride the panel's Output body ([`codex_collab_output`]): a `wait`
 /// may name many targets, more than the Input line's shared 400-character
 /// budget could hold.
-fn collab_agent_input(input: &serde_json::Value) -> String {
+pub(super) fn collab_agent_input(input: &serde_json::Value) -> String {
     let Some(obj) = input.as_object() else {
         return input.to_string();
     };
@@ -3916,8 +2897,8 @@ fn collab_payload_less_line(status: &str) -> String {
 /// short id, its own state word and — when the wire reported one — that state's
 /// message. `None` when the call has no target rows (a start payload), so the
 /// panel shows no empty Output section.
-fn codex_collab_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    if !is_collab_launch(tool) {
+pub(super) fn codex_collab_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
+    if !ToolView::of(tool).is_collab_launch() {
         return None;
     }
     let agents = tool.input()?.get("agents")?.as_array()?;
@@ -3995,28 +2976,6 @@ fn collab_model_line(model: Option<&str>, effort: Option<&str>) -> Option<String
     }
 }
 
-/// A target's readable label: the child's own `agentPath` when the read
-/// carried one (the `subAgentActivity` of the same child thread reports it),
-/// otherwise the thread id's first eight characters. Folded to one line
-/// because both the folded title (`plain_text`) and the body row are single
-/// lines, and a valid path may carry a newline.
-fn collab_agent_label(agent: &serde_json::Value) -> Option<String> {
-    let thread_id = agent.get("threadId").and_then(serde_json::Value::as_str)?;
-    let label = agent
-        .get("label")
-        .and_then(serde_json::Value::as_str)
-        .filter(|label| !label.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| thread_short_id(thread_id));
-    Some(folded_header_fragment(&label))
-}
-
-/// The 8-character id label the card falls back to when no readable agent
-/// path is known.
-fn thread_short_id(thread_id: &str) -> String {
-    thread_id.chars().take(8).collect()
-}
-
 /// A target agent's state icon (the collab item's `agentsStates`). The two
 /// failure states are the card's failure mark, like a settled call's.
 fn collab_state_icon(status: &str) -> &'static str {
@@ -4083,6 +3042,34 @@ fn first_chunk(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The panel's Input line, Output body and raw-output formatter through the
+    /// one identity view — the same call the layout makes.
+    fn format_tool_input(tool: &ToolPanel) -> String {
+        ToolView::of(tool).input(tool)
+    }
+
+    fn panel_output(tool: &ToolPanel) -> Option<crate::feishu::card::tool_view::ToolBody> {
+        ToolView::of(tool).output(tool)
+    }
+
+    fn format_tool_output(tool: &ToolPanel, output: &str) -> crate::feishu::card::tool_view::ToolBody {
+        ToolView::of(tool).format_output(output)
+    }
+
+    /// The folded-header file detail and a panel's truncation note, both owned
+    /// by [`ToolView`].
+    fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
+        ToolView::of(tool).file_detail(tool)
+    }
+
+    fn truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
+        ToolView::of(tool).note(tool, session_id)
+    }
+
+    fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
+        ToolView::of(tool).note(tool, session_id)
+    }
+
     /// A section label as the panel renders it. ADR-0107 §6: a copy rename
     /// edits `vocab.rs`, and the test reads the constant rather than repeating
     /// the word.
@@ -4093,9 +3080,15 @@ mod tests {
     fn output_md() -> String {
         format!("**{}**", crate::feishu::card::vocab::OUTPUT_LABEL)
     }
-    use crate::backend::{ToolIdentity, ToolOutput};
+    use crate::backend::{
+        FileAction, FileEdit, NestedCall, Phase, RunActivity, ToolIdentity, ToolKind, ToolOutput,
+    };
+    use crate::feishu::card::AwaitingAction;
     use crate::feishu::card::CardState;
     use crate::feishu::card::shell::CardBuilder;
+    use crate::feishu::card::tool_view::ChildActivity;
+    use crate::feishu::card::tool_view::{file_edits_output, image_input};
+    use crate::feishu::card::vocab::phase_token;
     use serde_json::json;
 
     /// A `read` panel whose one output block is a File Content, with the given
@@ -4110,7 +3103,7 @@ mod tests {
                 name: "read".into(),
                 call_id: "call_read".into(),
             },
-            kind: ToolKind::Read,
+            kind: crate::backend::ToolKind::Read,
             detail: ToolDetail::Read {
                 path: Some(name.to_string()),
                 preview: None,
@@ -5009,7 +4002,7 @@ mod tests {
                 blocks: Vec::new(),
                 error: Some("permission denied".into()),
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![FileEdit {
                 path: "src/main.rs".into(),
                 action: FileAction::Add,
@@ -6739,7 +5732,7 @@ Index: /x/src/main.rs
                 blocks: vec![ContentBlock::Text(raw.into())],
                 error: Some(raw.into()),
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![FileEdit {
                 path: "src/main.rs".into(),
                 action: FileAction::Update,
@@ -6780,7 +5773,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![file_edit("src/main.rs", FileAction::Update, diff)]),
             ..ToolCall::default()
         });
@@ -6868,7 +5861,7 @@ Index: src/main.rs
                 },
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(edits),
             ..ToolCall::default()
         })
@@ -7565,7 +6558,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![file_edit("src/main.rs", FileAction::Update, diff)]),
             ..ToolCall::default()
         })
@@ -7589,7 +6582,7 @@ Index: src/main.rs
                     .unwrap_or_default(),
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(if path.is_empty() {
                 Vec::new()
             } else {
@@ -7645,7 +6638,7 @@ Index: src/main.rs
                 error: None,
             },
             detail: ToolDetail::FileEdits(vec![file_edit("src/main.rs", FileAction::Update, &diff)]),
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             ..ToolCall::default()
         })
     }
@@ -7701,7 +6694,7 @@ Index: .config/opencode/AGENTS.md
                 )],
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![file_edit(
                 ".config/opencode/AGENTS.md",
                 FileAction::Update,
@@ -7771,7 +6764,7 @@ Index: .config/opencode/AGENTS.md
                 blocks: vec![ContentBlock::Text("Edited 2 files".into())],
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![
                 file_edit("/a/one.rs", FileAction::Update, patch_one),
                 file_edit("/a/two.rs", FileAction::Update, patch_two),
@@ -7826,7 +6819,7 @@ Index: src/main.rs
                 blocks: vec![ContentBlock::Text(text_output.into())],
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![file_edit("/x/one.rs", FileAction::Update, diff)]),
             ..ToolCall::default()
         });
@@ -7887,7 +6880,7 @@ Index: /x/one.rs
                 blocks: vec![ContentBlock::Text(text_output.into())],
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(vec![file_edit("/x/one.rs", FileAction::Update, diff)]),
             ..ToolCall::default()
         });
@@ -8500,7 +7493,7 @@ LSP errors detected in a.rs, please fix:
             Some("ok"),
         );
         assert!(!is_plan_call(tool.call()), "a name alone is not the plan arm");
-        assert!(!tool.is_plan());
+        assert!(!ToolView::of(&tool).is_plan());
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -9165,7 +8158,7 @@ LSP errors detected in a.rs, please fix:
         name: &str,
         status: ToolStatus,
         input: serde_json::Value,
-        edits: Vec<FileEdit>,
+        edits: Vec<crate::backend::FileEdit>,
         output: Option<&str>,
     ) -> ToolPanel {
         ToolPanel::new(ToolCall {
@@ -9183,7 +8176,7 @@ LSP errors detected in a.rs, please fix:
                     .unwrap_or_default(),
                 error: None,
             },
-            kind: ToolKind::Edit,
+            kind: crate::backend::ToolKind::Edit,
             detail: ToolDetail::FileEdits(edits),
             ..ToolCall::default()
         })
@@ -10272,7 +9265,7 @@ Report
                 name: "acme/picture".into(),
                 call_id: "call_other_image".into(),
             },
-            kind: ToolKind::Read,
+            kind: crate::backend::ToolKind::Read,
             status: ToolStatus::Completed,
             input: Some(json!({"path": "/w/shot.png"})),
             detail: ToolDetail::Read {
@@ -11172,13 +10165,14 @@ excerpt two";
         // One representative call per identity the panel renders. The expected
         // strings are the pre-#1135 output: the refactor that gives the panel
         // and the permission surface one owner must change none of them.
-        let cases: Vec<(
-            &str,
+        type Case<'a> = (
+            &'a str,
             ToolPanel,
-            &str,
-            Option<(Option<&str>, BodyStyle, &str)>,
+            &'a str,
+            Option<(Option<&'a str>, BodyStyle, &'a str)>,
             usize,
-        )> = vec![
+        );
+        let cases: Vec<Case<'_>> = vec![
             (
                 "command",
                 command_panel(

@@ -28,8 +28,9 @@ use crate::feishu::card::first_n_chars_bytes;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::{CardBuilder, RunningToolView};
 use crate::feishu::card::tool_render::{
-    FileDelivery, TaskLiveness, TodoPanel, ToolPanel, is_plan_call, todo_panel_estimate, tool_display_name,
+    FileDelivery, TodoPanel, ToolPanel, is_plan_call, todo_panel_estimate, tool_display_name,
 };
+use crate::feishu::card::tool_view::TaskLiveness;
 use crate::feishu::card::vocab;
 use crate::feishu::card::{AwaitingAction, CardState, format_tokens};
 use indexmap::IndexMap;
@@ -6375,7 +6376,7 @@ mod tests {
             launch("msg_child", "ses_child", 2_000),
         ]);
         let fragment = TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+            activity: crate::feishu::card::tool_view::ChildActivity::Tool {
                 name: "shell".into(),
                 started_at: Some(2_000),
             },
@@ -6464,7 +6465,7 @@ mod tests {
             })],
         };
         let fragment = TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+            activity: crate::feishu::card::tool_view::ChildActivity::Tool {
                 name: "shell".into(),
                 started_at: Some(2_000),
             },
@@ -8071,7 +8072,7 @@ mod tests {
             }]
         };
         let thinking = |last_activity_ms: i64| TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Phase(crate::backend::Phase::Waiting),
+            activity: crate::feishu::card::tool_view::ChildActivity::Phase(crate::backend::Phase::Waiting),
             last_activity_ms: Some(last_activity_ms),
             wait: None,
         };
@@ -8091,9 +8092,7 @@ mod tests {
         assert!(acc.set_ledger(row(thinking(start + 400)), start + 1_400, LedgerCadence::Second));
         // A shape change at the same instant owes too: the phase word...
         let replying = |at: i64| TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Phase(
-                crate::backend::Phase::Responding,
-            ),
+            activity: crate::feishu::card::tool_view::ChildActivity::Phase(crate::backend::Phase::Responding),
             last_activity_ms: Some(at),
             wait: None,
         };
@@ -8127,7 +8126,7 @@ mod tests {
             }]
         };
         let tool = |name: &str, wait: Option<crate::feishu::card::AwaitingAction>| TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+            activity: crate::feishu::card::tool_view::ChildActivity::Tool {
                 name: name.into(),
                 started_at: Some(start),
             },
@@ -8195,7 +8194,7 @@ mod tests {
             started_at: None,
         }]);
         let bash = TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Tool {
+            activity: crate::feishu::card::tool_view::ChildActivity::Tool {
                 name: "bash".into(),
                 started_at: Some(start),
             },
@@ -8233,9 +8232,7 @@ mod tests {
         );
         // The gather heals to a new typed activity: that change owes at once.
         let replying = TaskLiveness {
-            activity: crate::feishu::card::tool_render::ChildActivity::Phase(
-                crate::backend::Phase::Responding,
-            ),
+            activity: crate::feishu::card::tool_view::ChildActivity::Phase(crate::backend::Phase::Responding),
             last_activity_ms: Some(start + 31_000),
             wait: None,
         };
@@ -8362,7 +8359,7 @@ mod tests {
                 started_at: Some(started_at),
                 unconfirmed: false,
                 activity: Some(TaskLiveness {
-                    activity: crate::feishu::card::tool_render::ChildActivity::Phase(
+                    activity: crate::feishu::card::tool_view::ChildActivity::Phase(
                         crate::backend::Phase::Waiting,
                     ),
                     last_activity_ms: Some(activity_at),

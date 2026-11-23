@@ -21,6 +21,7 @@ use crate::feishu::card::question::FallbackLoss;
 use crate::feishu::card::tool_render::{
     DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_from_metadata, parse_edit_diff,
 };
+use crate::feishu::card::tool_view::{PermissionView, permission_view};
 
 use super::companion::{
     companion_target_digest, describe_permission_for, describe_permission_target_summary,
@@ -1791,7 +1792,7 @@ fn question_receipt(
 /// broken by server-provided content.
 pub(crate) fn permission_target(p: &crate::backend::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
-    let (emoji, label) = describe_action(action);
+    let PermissionView { icon, label, .. } = permission_view(action);
     let pattern = p
         .patterns
         .first()
@@ -1807,14 +1808,14 @@ pub(crate) fn permission_target(p: &crate::backend::types::PermissionRequest) ->
         .map(|f| truncate(f, 60));
     // An edit/patch is about the file (the body shows its diff); every other
     // action is about its first pattern.
-    let object = if matches!(action, "edit" | "patch" | "apply_patch") {
+    let object = if permission_view(action).renders_diff_body {
         file.or(pattern)
     } else {
         pattern.or(file)
     };
     match object {
-        Some(object) => format!("{emoji} {label} `{object}`"),
-        None => format!("{emoji} {label}"),
+        Some(object) => format!("{icon} {label} `{object}`"),
+        None => format!("{icon} {label}"),
     }
 }
 
@@ -2956,53 +2957,6 @@ async fn reply_question_scoped(
     }
 }
 
-/// Map an OpenCode permission action to a friendly emoji + Chinese description.
-///
-/// The action is the name of the tool asking, so the arms carry both
-/// generations: V1's `bash` beside V2's `shell`, V1's `task` beside V2's
-/// `subagent`, and the V2 tools whose permission assert names them directly
-/// (`question`, `grep`, `glob`, `skill`, `websearch`). An action with no arm
-/// still renders — as the generic `🔐 执行操作`.
-///
-/// Scope note (#1063): these are **copy sentences**, not tool-token slots, and
-/// the ticket's visible set does not rename them. ADR-0107's Context names the
-/// permission description as the third name→meaning table; folding it into the
-/// token vocabulary would change human sentences (`执行 Shell 命令`,
-/// `调用子代理`) and belongs to its own copy pass, not this rename.
-pub(crate) fn describe_action(action: &str) -> (&'static str, &'static str) {
-    match action {
-        "bash" | "shell" | "command" => ("⚡", "执行 Shell 命令"),
-        "permissions" => ("🔑", "申请额外权限"),
-        "subagent" | "task" => ("🤖", "调用子代理"),
-        "question" => ("❓", "向你提问"),
-        "read" => ("📖", "读取文件"),
-        "write" => ("✏️", "修改文件"),
-        "edit" => ("✏️", "编辑文件"),
-        "patch" => ("✏️", "应用补丁"),
-        "webfetch" => ("🌐", "访问网页"),
-        "fetch" => ("🌐", "获取网络资源"),
-        "websearch" => ("🌐", "网络搜索"),
-        "grep" => ("🔎", "搜索内容"),
-        "glob" => ("🔍", "查找文件"),
-        "skill" => ("🧩", "调用技能"),
-        "external_directory" => ("📁", "访问外部目录"),
-        "kill" => ("🛑", "终止进程"),
-        "ls" => ("📂", "列出目录"),
-        "list" => ("📂", "列出内容"),
-        "rename" => ("🔤", "重命名"),
-        "remove" | "delete" | "rm" => ("🗑️", "删除文件"),
-        "mkdir" => ("📁", "创建目录"),
-        "move" | "mv" => ("📦", "移动文件"),
-        "copy" | "cp" => ("📋", "复制文件"),
-        "link" | "ln" => ("🔗", "创建链接"),
-        "install" => ("📥", "安装依赖"),
-        "test" => ("🧪", "运行测试"),
-        "build" => ("🏗️", "构建项目"),
-        "git" => ("🌿", "执行 Git 操作"),
-        _ => ("🔐", "执行操作"),
-    }
-}
-
 /// How much of a permission's explanatory `reason` the card shows. The reason
 /// is context, not the decision target, and it keeps its own short budget even
 /// though the target budget is much larger — the spec's fixed 150 characters.
@@ -3017,8 +2971,13 @@ const PERMISSION_INPUT_CAPTION: &str = crate::feishu::card::vocab::INPUT_LABEL;
 /// behave alike).
 pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
-    let (emoji, label) = describe_action(action);
-    let mut s = format!("{} **{}**\n", emoji, label);
+    let PermissionView {
+        icon,
+        label,
+        renders_diff_body,
+        ..
+    } = permission_view(action);
+    let mut s = format!("{icon} **{label}**\n");
 
     // A client-agnostic explanatory line: Codex's approval requests carry a
     // `reason` (a network rule, extra write access), and showing it is the
@@ -3055,9 +3014,7 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     // request, so show the actual changed lines instead of dumping raw metadata
     // JSON (which used to make the card show a wall of escaped diff text).
     let diff = diff_from_metadata(p.metadata.as_ref());
-    if matches!(action, "edit" | "patch" | "apply_patch")
-        && let Some(diff) = diff.as_deref()
-    {
+    if renders_diff_body && let Some(diff) = diff.as_deref() {
         let parsed = parse_edit_diff(diff);
         let metadata_filepath = p
             .metadata
@@ -3170,8 +3127,8 @@ impl PermissionOverflow {
 /// the metadata actually carrying a diff, never on the action name alone: an
 /// `edit` with no diff still renders its scaffolding in one element.
 fn renders_diff_body(p: &crate::backend::types::PermissionRequest) -> bool {
-    matches!(p.permission.as_deref(), Some("edit" | "patch" | "apply_patch"))
-        && crate::feishu::card::tool_render::diff_from_metadata(p.metadata.as_ref()).is_some()
+    let action = p.permission.as_deref().unwrap_or("?");
+    permission_view(action).renders_diff_body && diff_from_metadata(p.metadata.as_ref()).is_some()
 }
 
 /// The ONE proof for "can the card show this request in full?".
