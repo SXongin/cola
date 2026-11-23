@@ -751,9 +751,10 @@ impl ToolPanel {
     }
 }
 
-/// How a Tool Panel's output body renders. The renderer for a tool knows its
-/// own body best, so the choice travels with `format_tool_output`'s result
-/// instead of being re-derived from the tool name at the call site.
+/// How a Tool Panel's output body renders. The identity's view knows its own
+/// body best, so the choice travels with the body it returns
+/// ([`super::tool_view::ToolBody`]) instead of being re-derived at the call
+/// site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyStyle {
     /// Fence it when Feishu markdown would wrap a long line or fold lines into
@@ -1441,8 +1442,9 @@ pub(super) fn codex_search_raw_body(results: &serde_json::Value) -> String {
 /// ([`file_edits_body`]) whose escaped body, fence and language tag exceed
 /// [`DIFF_MAX_ESCAPED_BYTES`] ([`fenced_body_fits`]) — a FAILED call's error
 /// text is not a diff and takes no note, since there is no change to name.
-/// Unlike [`preview_truncation_note`] it needs no button: "已截断" is true even
-/// when nothing can be opened, so the reader still knows the diff is partial.
+/// Unlike a read's preview note ([`ToolView::note`]) it needs no button:
+/// "已截断" is true even when nothing can be opened, so the reader still knows
+/// the diff is partial.
 pub(super) fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
     file_edits_body(tool)
         .filter(|body| body.clipped())
@@ -1520,8 +1522,8 @@ pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
 /// undelivered — appends the compact file marker [`file_header_marker`] so the
 /// file — and a `未发送` one above all — is visible while folded (ADR-0076
 /// amendment); an embedded image, visible beside the panel, adds none. The
-/// panel's own file also joins the header [`panel_file_detail`] (ADR-0083 §8
-/// amendment, #766). `element_id` is the panel's stable identity on the card
+/// panel's own file also joins the header through [`ToolView::file_detail`]
+/// (ADR-0083 §8 amendment, #766). `element_id` is the panel's stable identity on the card
 /// (see [`super::shell::collapsible_panel_chunks`]). `session_id` routes the
 /// panel's 「📂 打开」 button, which renders inside the fold — a `write`/`edit`
 /// panel's way into the file it produced (ADR-0083 §8 amendment, #766), and a
