@@ -137,6 +137,18 @@ struct WallReport {
     no_code: usize,
 }
 
+impl WallReport {
+    fn empty() -> Self {
+        Self {
+            runs: 0,
+            overall: Vec::new(),
+            jobs: BTreeMap::new(),
+            cancelled: 0,
+            no_code: 0,
+        }
+    }
+}
+
 /// One merged PR as `gh pr list` reports it.
 #[derive(Deserialize)]
 struct PrRow {
@@ -438,38 +450,44 @@ fn ci_wall(limit: usize) -> Result<WallReport, String> {
         jq.to_string(),
     ];
     let runs: Vec<RunRow> = parse_json(&gh(&args)?, "the CI run list")?;
-    let mut report = WallReport {
-        runs: 0,
-        overall: Vec::new(),
-        jobs: BTreeMap::new(),
-        cancelled: 0,
-        no_code: 0,
-    };
+    let mut report = WallReport::empty();
     for run in runs {
         if run.conclusion.as_deref() == Some("cancelled") {
             report.cancelled += 1;
             continue;
         }
         let jobs = latest_attempt(run_jobs(run.id)?);
-        // A docs-only/draft/release run still dispatches the `Test` matrix with
-        // every step skipped; only an executed test step makes it a code run
-        // whose wall the charter's 6-minute target measures.
-        if !executed_test_leg(&jobs) {
+        if accumulate_wall(&mut report, &jobs) {
+            report.runs += 1;
+        } else {
             report.no_code += 1;
-            continue;
-        }
-        report.runs += 1;
-        if let Some(wall) = job_span(&jobs) {
-            report.overall.push(wall);
-        }
-        for job in jobs {
-            if job.conclusion.as_deref() == Some("cancelled") {
-                continue;
-            }
-            report.jobs.entry(job.name).or_default().push(job.end - job.start);
         }
     }
     Ok(report)
+}
+
+/// Fold one run's latest-attempt jobs into `report`, returning whether the run
+/// was a code run. A docs-only/draft/release run still dispatches the `Test`
+/// matrix with every step skipped; only an executed test step makes its wall
+/// part of the sample the charter's 6-minute target measures.
+fn accumulate_wall(report: &mut WallReport, jobs: &[JobRow]) -> bool {
+    if !executed_test_leg(jobs) {
+        return false;
+    }
+    if let Some(wall) = job_span(jobs) {
+        report.overall.push(wall);
+    }
+    for job in jobs {
+        if job.conclusion.as_deref() == Some("cancelled") {
+            continue;
+        }
+        report
+            .jobs
+            .entry(job.name.clone())
+            .or_default()
+            .push(job.end - job.start);
+    }
+    true
 }
 
 fn executed_test_leg(jobs: &[JobRow]) -> bool {
@@ -482,16 +500,34 @@ fn executed_test_leg(jobs: &[JobRow]) -> bool {
     })
 }
 
+/// The projection `run_jobs` hands `gh --jq`: the wire fields the wall report
+/// reads (`started_at`, `completed_at`, `run_attempt`, `steps`) mapped to
+/// `JobRow`, with jobs that never ran or were skipped dropped. The recorded
+/// response in the tests runs this exact text, so a field rename or a loosened
+/// filter fails there instead of silently misreporting the command.
+const JOBS_JQ: &str = "[.jobs[] | select(.started_at != null and .completed_at != null \
+                        and .conclusion != \"skipped\") \
+                        | {name, conclusion, attempt: .run_attempt, \
+                           start: (.started_at|fromdateiso8601), \
+                           end: (.completed_at|fromdateiso8601), \
+                           steps: [.steps[] | {name, conclusion}]}]";
+
 fn run_jobs(run: u64) -> Result<Vec<JobRow>, String> {
-    let jq = "[.jobs[] | select(.started_at != null and .completed_at != null \
-              and .conclusion != \"skipped\") \
-              | {name, conclusion, attempt: .run_attempt, \
-                 start: (.started_at|fromdateiso8601), \
-                 end: (.completed_at|fromdateiso8601), \
-                 steps: [.steps[] | {name, conclusion}]}]";
     let endpoint = format!("repos/{{owner}}/{{repo}}/actions/runs/{run}/jobs?per_page=100");
-    let args = ["api".to_string(), endpoint, "--jq".to_string(), jq.to_string()];
-    parse_json(&gh(&args)?, "the CI run's jobs")
+    let args = [
+        "api".to_string(),
+        endpoint,
+        "--jq".to_string(),
+        JOBS_JQ.to_string(),
+    ];
+    parse_jobs(&gh(&args)?)
+}
+
+/// The projected jobs text, as both `gh --jq` and the recorded fixture carry
+/// it: `run_jobs` parses what its program emits, and the recorded-response test
+/// drives the same step.
+fn parse_jobs(projected: &str) -> Result<Vec<JobRow>, String> {
+    parse_json(projected, "the CI run's jobs")
 }
 
 /// Only the run's latest attempt: a rerun's earlier attempt must not stretch
@@ -867,6 +903,207 @@ mod tests {
             end,
             steps,
         }
+    }
+
+    /// A recorded `GET /repos/{owner}/{repo}/actions/runs/9001/jobs` response,
+    /// abridged to the fields the report reads and the neighbours a filter could
+    /// trip over: an earlier attempt, a `skipped` job, two never-completed jobs,
+    /// and a cancelled job whose span counts but whose per-job sample does not.
+    const RECORDED_JOBS: &str = r#"{
+  "total_count": 8,
+  "jobs": [
+    {
+      "id": 101,
+      "run_id": 9001,
+      "run_attempt": 1,
+      "name": "Test (ubuntu-latest)",
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-11-20T09:00:00Z",
+      "completed_at": "2026-11-20T09:12:00Z",
+      "steps": [
+        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"number": 2, "name": "Run cargo test --workspace --locked", "status": "completed", "conclusion": "failure"}
+      ]
+    },
+    {
+      "id": 201,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "Test (ubuntu-latest)",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-20T10:05:00Z",
+      "completed_at": "2026-11-20T10:12:00Z",
+      "steps": [
+        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"number": 2, "name": "Run cargo test --workspace --locked", "status": "completed", "conclusion": "success"},
+        {"number": 3, "name": "Post Run cargo test --workspace --locked", "status": "completed", "conclusion": "success"}
+      ]
+    },
+    {
+      "id": 202,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "Check",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-20T10:04:30Z",
+      "completed_at": "2026-11-20T10:07:30Z",
+      "steps": [
+        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"}
+      ]
+    },
+    {
+      "id": 203,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "Docs drift",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-11-20T10:04:00Z",
+      "completed_at": "2026-11-20T10:04:20Z",
+      "steps": [
+        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "skipped"}
+      ]
+    },
+    {
+      "id": 204,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "Live OpenCode",
+      "status": "queued",
+      "conclusion": null,
+      "started_at": null,
+      "completed_at": null,
+      "steps": []
+    },
+    {
+      "id": 205,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "Format",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-20T10:04:00Z",
+      "completed_at": "2026-11-20T10:04:30Z",
+      "steps": [
+        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"},
+        {"number": 2, "name": "Run cargo fmt --all -- --check", "status": "completed", "conclusion": "success"}
+      ]
+    },
+    {
+      "id": 206,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "Coverage",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-11-20T10:06:00Z",
+      "completed_at": null,
+      "steps": [
+        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"}
+      ]
+    },
+    {
+      "id": 207,
+      "run_id": 9001,
+      "run_attempt": 2,
+      "name": "Dependency audit",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "started_at": "2026-11-20T10:04:00Z",
+      "completed_at": "2026-11-20T10:05:00Z",
+      "steps": [
+        {"number": 1, "name": "Set up job", "status": "completed", "conclusion": "success"}
+      ]
+    }
+  ]
+}"#;
+
+    /// Run the exact program `run_jobs` hands `gh --jq` over a recorded
+    /// response, so a wire-field rename or a loosened filter fails here where
+    /// the real command would only misreport. `jq` is the tool the command
+    /// already relies on (`gh` ships its own) and the CI runner provides it; a
+    /// missing binary fails this test rather than passing without pinning.
+    fn project(recorded: &str) -> String {
+        use std::io::Write as _;
+
+        let mut jq = Command::new("jq")
+            .args(["-c", JOBS_JQ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("jq on PATH, the program `gh --jq` runs");
+        jq.stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(recorded.as_bytes())
+            .expect("write the recorded response");
+        let output = jq.wait_with_output().expect("jq finishes");
+        assert!(
+            output.status.success(),
+            "the projection rejects the recorded response: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("jq emits UTF-8")
+    }
+
+    #[test]
+    fn a_recorded_jobs_response_drives_the_wall_report() {
+        let jobs = parse_jobs(&project(RECORDED_JOBS)).expect("the projected jobs parse");
+        let latest = latest_attempt(jobs);
+        assert_eq!(
+            latest
+                .iter()
+                .map(|job| (job.name.as_str(), job.attempt))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Test (ubuntu-latest)", 2),
+                ("Check", 2),
+                ("Format", 2),
+                ("Dependency audit", 2),
+            ],
+            "the skipped and never-completed jobs are filtered and the rerun's earlier attempt is gone"
+        );
+
+        // (a) The latest attempt runs from its first job's start (Format and
+        // the cancelled audit) to its last job's end (Test): 10:04 → 10:12.
+        assert_eq!(job_span(&latest), Some(8 * 60));
+
+        // (b) The `Test` leg's `cargo test` step executed, so this is a code run.
+        assert!(executed_test_leg(&latest));
+
+        // (c) Timestamps survive `fromdateiso8601` and every job keeps its span.
+        let test = latest
+            .iter()
+            .find(|job| job.name == "Test (ubuntu-latest)")
+            .expect("the Test leg survives the projection");
+        assert_eq!((test.start, test.end), (1_795_169_100, 1_795_169_520));
+        assert_eq!(
+            test.steps
+                .iter()
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Set up job",
+                "Run cargo test --workspace --locked",
+                "Post Run cargo test --workspace --locked",
+            ]
+        );
+
+        let mut report = WallReport::empty();
+        assert!(accumulate_wall(&mut report, &latest));
+        assert_eq!(report.overall, vec![8 * 60]);
+        assert_eq!(report.jobs["Test (ubuntu-latest)"], [7 * 60]);
+        assert_eq!(report.jobs["Check"], [3 * 60]);
+        assert_eq!(report.jobs["Format"], [30]);
+        assert_eq!(
+            report.jobs.get("Dependency audit"),
+            None,
+            "a cancelled job adds no per-job sample"
+        );
     }
 
     #[test]
