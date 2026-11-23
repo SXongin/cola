@@ -19,10 +19,12 @@
 //! - [`RunLifecycle::observe`] — apply the durable endings and the overlay to
 //!   one read: synthesize the owed retirements, prune the ended (alias-aware),
 //!   settle the launch panels of what left, re-apply the markers.
-//! - [`RunLifecycle::retire`] — the single transition for every derivation
-//!   cause (runtime verdict, child evidence, Cleanup): the row leaves its live
-//!   list, its launch panel settles, and its ending is recorded durably *at
-//!   derivation*.
+//! - [`RunLifecycle::retire`] — the single transition for every cause a run can
+//!   end by (runtime verdict, child evidence, Cleanup, and a **Wake**'s
+//!   completion commit): a read-derived cause takes the observed transcript, so
+//!   the row leaves its live list and its launch panel settles; every cause's
+//!   ending is recorded durably where ADR-0080 puts it — at derivation, or for a
+//!   Wake at its completion commit ([`RetireRead::Commit`]).
 //! - [`RunLifecycle::evidence_waits`] — the one suspect list a cycle may spend a
 //!   child-evidence read on, the "a Background Task already represents this run"
 //!   rule included.
@@ -31,8 +33,9 @@
 //! # Two-phase commit
 //!
 //! [`Pass`] keeps ADR-0080's split: an evidence or Cleanup ending is recorded at
-//! derivation (a Wake's with its completion commit, in the render path), while
-//! the volatile overlay is written only after the carrier write that showed the
+//! derivation, a Wake's at its completion commit (the render path's
+//! [`RunLifecycle::retire`] call with [`RetireRead::Commit`]), while the
+//! volatile overlay is written only after the carrier write that showed the
 //! read's entries was accepted (ADR-0072/0080). Dropping a pass loses nothing
 //! durable — the next read synthesizes the owed entry from the record.
 //!
@@ -87,9 +90,22 @@ pub(crate) struct EvidenceWait {
     pub(crate) task: bool,
 }
 
+/// What a [`RunLifecycle::retire`] transition may read and rewrite (ADR-0111
+/// §2). Three of the four causes are derived from an observed read and rewrite
+/// it; a **Wake**'s is the completion commit's own fact and has no read — its
+/// ending is recorded where ADR-0080 puts it, at the commit, and the read prunes
+/// the run later through [`RunLifecycle::observe`].
+pub(crate) enum RetireRead<'a> {
+    /// The read the derivation was made from: the row leaves its live list, its
+    /// launch panel settles and its marker resolves.
+    Observed(&'a mut SessionTranscript),
+    /// No read: the **Wake**'s run and its already-built ending ride
+    /// [`RetireCause::Wake`], and nothing is pruned or settled here.
+    Commit,
+}
+
 /// Why one run leaves the live list (ADR-0111 §2): the derivation the caller
-/// made, never the owner's guess. A **Wake**'s ending is recorded where its
-/// completion entry is committed (ADR-0080/0111 §2), not through here.
+/// made, never the owner's guess.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RetireCause {
     /// The runtime's verdict: the shell's terminal end, or that the runtime no
@@ -105,6 +121,20 @@ pub(crate) enum RetireCause {
     RunChildEvidence(ChildEvidence),
     /// The user's cleanup click, at `now_ms`.
     Cleanup { now_ms: i64 },
+    /// A **Wake**'s completion, recorded where its completion entry is committed
+    /// (ADR-0080): the run the Wake names and the ending the commit built. Its
+    /// timing is the commit's — this cause records and returns, pruning nothing
+    /// (the read settles it later through [`RunLifecycle::observe`]).
+    Wake {
+        /// The run's durable identity, as the Wake (and the read that still
+        /// carried its launch) named it. Boxed: a Wake names the whole identity
+        /// and the built ending, which dwarfs the other causes' clocks.
+        run: Box<RunKey>,
+        /// The ending the commit built: the Wake class, its reported state as
+        /// evidence, the Wake's clock and the identity an entry re-synthesizes
+        /// from.
+        ending: Box<TaskEnding>,
+    },
 }
 
 /// One reconcile pass's admission to commit its verdicts to the process-local
@@ -426,21 +456,44 @@ impl RunLifecycle {
         transcript.runs.iter()
     }
 
-    /// The single transition (ADR-0111 §2): `key` names one live run — a
-    /// Background Task by its call id, or a child-only Agent Run by any id it is
-    /// known by — and `cause` is the derivation that ended it. The row leaves
-    /// its live list, its launch panel settles, and its ending is recorded
-    /// durably AT DERIVATION. `None` when the key names no live run, or the
-    /// cause is not evidence for the one it names (a previous turn's terminal
-    /// item, an unfinished child): nothing is guessed.
+    /// The single transition (ADR-0111 §2) for every cause a run can end by.
+    ///
+    /// For a read-derived cause (`RuntimeVerdict`, `ChildEvidence`,
+    /// `RunChildEvidence`, `Cleanup`), `read` is the observed transcript and
+    /// `key` names one live run — a Background Task by its call id, or a
+    /// child-only Agent Run by any id it is known by: the row leaves its live
+    /// list, its launch panel settles, and its ending is recorded durably AT
+    /// DERIVATION. `None` when the key names no live run, or the cause is not
+    /// evidence for the one it names (a previous turn's terminal item, an
+    /// unfinished child): nothing is guessed.
+    ///
+    /// For [`RetireCause::Wake`], `read` is [`RetireRead::Commit`], `key` is
+    /// unused (the cause carries the run's whole [`RunKey`], since a Wake names
+    /// its run by the stored key and every alias it reports), and the ending is
+    /// recorded where the completion entry is committed (ADR-0080) — nothing is
+    /// pruned or settled, and the return is `None`.
     pub(crate) fn retire(
         &self,
         session_id: &str,
-        transcript: &mut SessionTranscript,
+        read: RetireRead<'_>,
         key: &str,
         cause: RetireCause,
     ) -> Option<TaskRetirement> {
+        let RetireRead::Observed(transcript) = read else {
+            // `RetireRead::Commit` exists for the Wake cause alone: it records
+            // the ending the completion commit built and touches no read.
+            if let RetireCause::Wake { run, ending } = cause {
+                self.record_ending(session_id, &run, *ending);
+            }
+            return None;
+        };
         let retirement = match cause {
+            // A Wake has no live row to settle — the read prunes it later
+            // through `observe` — so its ending is recorded and nothing else.
+            RetireCause::Wake { run, ending } => {
+                self.record_ending(session_id, &run, *ending);
+                return None;
+            }
             RetireCause::RuntimeVerdict { end, completed_at } => {
                 retire_runtime_verdict(transcript, key, end.as_ref(), completed_at)?
             }
@@ -468,7 +521,12 @@ impl RunLifecycle {
         now_ms: i64,
     ) {
         for call_id in call_ids {
-            self.retire(session_id, transcript, call_id, RetireCause::Cleanup { now_ms });
+            self.retire(
+                session_id,
+                RetireRead::Observed(transcript),
+                call_id,
+                RetireCause::Cleanup { now_ms },
+            );
             transcript.unconfirmed_tasks.remove(call_id);
         }
     }
@@ -537,7 +595,7 @@ impl RunLifecycle {
         for (call_id, end, completed_at) in verdicts {
             self.retire(
                 session_id,
-                transcript,
+                RetireRead::Observed(transcript),
                 &call_id,
                 RetireCause::RuntimeVerdict { end, completed_at },
             );
@@ -627,6 +685,15 @@ impl RunLifecycle {
             for id in record.run.ids() {
                 retired.insert(id.to_string());
             }
+        }
+    }
+
+    /// Record one already-built **Task Ending** durably — the Wake completion
+    /// commit's own write (ADR-0080), through the same seam every other class
+    /// goes through.
+    fn record_ending(&self, session_id: &str, run: &RunKey, ending: TaskEnding) {
+        if let Some(store) = self.store() {
+            store.record(session_id, run, ending);
         }
     }
 
