@@ -37,5 +37,5 @@ pub(crate) use ending::{
     TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunIdentity, TaskRunRecord,
 };
 pub(crate) use key::RunKey;
-pub(crate) use lifecycle::{LiveRunSurface, Pass, RetireCause, RunLifecycle};
+pub(crate) use lifecycle::{LiveRunSurface, Pass, RetireCause, RunLifecycle, settle_reported_panels};
 pub(crate) use store::RunEndingStore;

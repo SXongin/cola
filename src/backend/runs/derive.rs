@@ -30,68 +30,13 @@ use crate::backend::{
 };
 
 /// Derive the runs one read names, in the order their first fact appears.
-pub(crate) fn derive_runs(messages: &mut [TranscriptMessage]) -> Vec<AgentRun> {
-    let runs = {
-        let read: &[TranscriptMessage] = messages;
-        derive_runs_read(read)
-    };
-    // A report is an update to its run, and the launch panel is the record of
-    // the request: once the client reports the run ended, the panel settles
-    // with it rather than reading `Running` beside a finished run.
-    let mut settled: Vec<(String, ToolStatus)> = Vec::new();
-    let mut launch_ids: Vec<String> = runs
-        .iter()
-        .flat_map(|run| run.launched_by.iter().map(|launch| launch.call_id.clone()))
-        .collect();
-    launch_ids.sort();
-    launch_ids.dedup();
-    for launch_id in launch_ids {
-        let group: Vec<&AgentRun> = runs
-            .iter()
-            .filter(|run| run.launched_by.iter().any(|launch| launch.call_id == launch_id))
-            .collect();
-        // One launch may name N children: it settles only when every one of
-        // them is terminal, and a failure outranks a cancellation/complete. The
-        // launch CALL's own status is a client fact too: a call the client
-        // reported failed stays failed even if a later report completes the
-        // child (ADR-0108 §10 records the derivation).
-        if group.is_empty() || !group.iter().all(|run| run.status.is_terminal()) {
-            continue;
-        }
-        let client_status = messages
-            .iter()
-            .flat_map(|message| &message.parts)
-            .find_map(|part| match part {
-                Part::Tool(call) if call.identity.call_id == launch_id => Some(call.status.clone()),
-                _ => None,
-            });
-        let failed = group.iter().any(|run| run.status == RunStatus::Failed)
-            || matches!(client_status, Some(ToolStatus::Error));
-        let cancelled = group.iter().any(|run| run.status == RunStatus::Cancelled)
-            || matches!(&client_status, Some(ToolStatus::Other(reason)) if reason == "interrupted");
-        let status = if failed {
-            ToolStatus::Error
-        } else if cancelled {
-            ToolStatus::Other("interrupted".to_string())
-        } else {
-            ToolStatus::Completed
-        };
-        settled.push((launch_id, status));
-    }
-    if !settled.is_empty() {
-        for message in messages.iter_mut() {
-            for part in &mut message.parts {
-                if let Part::Tool(call) = part
-                    && let Some((_, status)) = settled
-                        .iter()
-                        .find(|(call_id, _)| call_id == &call.identity.call_id)
-                {
-                    call.status = status.clone();
-                }
-            }
-        }
-    }
-    runs
+///
+/// The fold WRITES nothing (ADR-0111 §2): the launch panel is the run
+/// lifecycle's fact, settled by the owner's `observe`/`retire` from the
+/// client's own statements, so the derivation stays a pure function of the
+/// read.
+pub(crate) fn derive_runs(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
+    derive_runs_read(messages)
 }
 
 fn derive_runs_read(messages: &[TranscriptMessage]) -> Vec<AgentRun> {
