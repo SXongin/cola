@@ -3066,10 +3066,6 @@ mod tests {
         ToolView::of(tool).note(tool, session_id)
     }
 
-    fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
-        ToolView::of(tool).note(tool, session_id)
-    }
-
     /// A section label as the panel renders it. ADR-0107 §6: a copy rename
     /// edits `vocab.rs`, and the test reads the constant rather than repeating
     /// the word.
@@ -3828,7 +3824,7 @@ mod tests {
             )),
         );
         assert!(clipped.file_open_path().is_some());
-        assert!(preview_truncation_note(&clipped, Some("ses_1")).is_some());
+        assert!(truncation_note(&clipped, Some("ses_1")).is_some());
         // The note is plain text — nothing in it is sanitizer-expanded or
         // JSON-escaped — so its charge is its own byte length.
         assert_eq!(
