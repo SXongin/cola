@@ -614,7 +614,7 @@
   "files": [
     {
       "path": "src/backend/transcript.rs",
-      "lines": 2432
+      "lines": 2429
     },
     {
       "path": "src/bridge/chain/reconcile.rs",
@@ -993,12 +993,16 @@
       "count": 1
     },
     {
+      "path": "src/backend/runs/lifecycle.rs",
+      "count": 1
+    },
+    {
       "path": "src/backend/runs/mod.rs",
       "count": 1
     },
     {
       "path": "src/backend/transcript.rs",
-      "count": 6
+      "count": 5
     },
     {
       "path": "src/backend/turn_diff.rs",
@@ -1130,10 +1134,6 @@
     },
     {
       "path": "src/bridge/tasks/handle.rs",
-      "count": 1
-    },
-    {
-      "path": "src/bridge/tasks/mod.rs",
       "count": 1
     },
     {
