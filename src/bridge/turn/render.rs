@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Instrument;
 
 use crate::backend::runs::{
-    RunKey, TaskEnding as DurableEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState,
-    TaskRunIdentity,
+    RetireCause, RetireRead, RunKey, TaskEnding as DurableEnding, TaskEndingClass, TaskEndingEvidence,
+    TaskEndingState, TaskRunIdentity,
 };
 use crate::backend::{
     BackgroundTask, Compaction, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding,
@@ -746,11 +746,12 @@ pub(super) enum PlannedAnnounce {
     Synthetic,
 }
 
-/// The durable **Task Ending** seam a render's plan and commit read — and, for a
-/// Wake, write — through (ADR-0080): the Session and, when the venue has one, the
-/// cards handle its Chain Record lives behind. `None` for the venues that must
-/// not touch durability (the synchronous test render), whose gates then see
-/// nothing recorded and plan every entry.
+/// The durable **Task Ending** facts a render's plan and commit read (ADR-0080):
+/// the Session and, when the venue has one, the cards handle its Chain Record
+/// lives behind. A Wake's own ending is *written* through the run lifecycle's
+/// owner the cards handle carries (ADR-0111 §2), at the same commit. `None` for
+/// the venues that must not touch durability (the synchronous test render),
+/// whose gates then see nothing recorded and plan every entry.
 #[derive(Clone)]
 pub(super) struct Endings<'a> {
     cards: Option<&'a CardsHandle>,
@@ -817,13 +818,24 @@ impl<'a> Endings<'a> {
         facts
     }
 
-    /// Record one run's ending durably (ADR-0080) — the Wake path's own write,
-    /// at the moment the run's completion is committed.
-    fn record(&self, run: &RunKey, ending: DurableEnding) -> bool {
-        match self.cards {
-            Some(cards) => cards.chains.record_ending(self.session_id, run, ending),
-            None => false,
-        }
+    /// Record one run's **Wake** ending through the run lifecycle's owner
+    /// ([`RunLifecycle::retire`](crate::backend::runs::RunLifecycle::retire),
+    /// ADR-0111 §2), at the moment the run's completion is committed — the
+    /// timing ADR-0080 pins. The owner records it and nothing else: the read
+    /// prunes the run later through its own `observe`.
+    fn record(&self, run: &RunKey, ending: DurableEnding) {
+        let Some(cards) = self.cards else {
+            return;
+        };
+        cards.tasks.runs().retire(
+            self.session_id,
+            RetireRead::Commit,
+            run.key.as_str(),
+            RetireCause::Wake {
+                run: Box::new(run.clone()),
+                ending: Box::new(ending),
+            },
+        );
     }
 }
 

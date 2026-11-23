@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use crate::backend::{ChildEvidence, SessionTranscript, TaskRuntime};
 
-use super::{LiveRunSurface, RetireCause, RunLifecycle};
+use super::{LiveRunSurface, RetireCause, RetireRead, RunLifecycle};
 
 impl LiveRunSurface {
     /// The full surface: a caller that is not an adapter (a test driving the
@@ -80,12 +80,22 @@ impl TranscriptRunTransitions for SessionTranscript {
     }
 
     fn apply_child_evidence(&mut self, call_id: &str, evidence: ChildEvidence) {
-        RunLifecycle::new().retire("", self, call_id, RetireCause::ChildEvidence(evidence));
+        RunLifecycle::new().retire(
+            "",
+            RetireRead::Observed(self),
+            call_id,
+            RetireCause::ChildEvidence(evidence),
+        );
     }
 
     fn apply_run_child_evidence(&mut self, run_id: &str, evidence: ChildEvidence) -> bool {
         RunLifecycle::new()
-            .retire("", self, run_id, RetireCause::RunChildEvidence(evidence))
+            .retire(
+                "",
+                RetireRead::Observed(self),
+                run_id,
+                RetireCause::RunChildEvidence(evidence),
+            )
             .is_some()
     }
 }

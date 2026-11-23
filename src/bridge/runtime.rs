@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::backend::runs::{Pass, RetireCause};
+use crate::backend::runs::{Pass, RetireCause, RetireRead};
 use crate::backend::{Backend, SessionTranscript, ShellOutputRead, TurnAnchor};
 
 /// The default spacing between two runtime verdicts of one Session (ms): the
@@ -422,7 +422,7 @@ async fn read_child_evidence(
                     .any(|task| task.tool.call_id == call_id);
                 runs.retire(
                     session_id,
-                    transcript,
+                    RetireRead::Observed(transcript),
                     &call_id,
                     RetireCause::ChildEvidence(evidence),
                 );
@@ -468,7 +468,7 @@ async fn read_child_evidence(
                 let retired = runs
                     .retire(
                         session_id,
-                        transcript,
+                        RetireRead::Observed(transcript),
                         &run_id,
                         RetireCause::RunChildEvidence(evidence),
                     )
