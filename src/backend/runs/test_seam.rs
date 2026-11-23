@@ -8,12 +8,15 @@
 //! Nothing here is a production door: the owner's interface
 //! ([`RunLifecycle::observe`], [`RunLifecycle::retire`],
 //! [`RunLifecycle::evidence_waits`], [`RunLifecycle::live`]) is the only one.
+//!
+//! Only observation seams live here. A test-only TRANSITION twin — the deleted
+//! `apply_*` names, or a `*_for_test` forwarding shim — is banned
+//! (`CODING_STANDARDS.md`, ADR-0110 §2): the tests drive the owner directly, so
+//! the four retired paths cannot return under a test-only door.
 
 use std::collections::HashSet;
 
-use crate::backend::{ChildEvidence, SessionTranscript, TaskRuntime};
-
-use super::{LiveRunSurface, RetireCause, RetireRead, RunLifecycle};
+use super::{LiveRunSurface, RunLifecycle};
 
 impl LiveRunSurface {
     /// The full surface: a caller that is not an adapter (a test driving the
@@ -51,51 +54,5 @@ impl RunLifecycle {
             .unwrap_or_default();
         ids.sort();
         ids
-    }
-}
-
-/// The four derivation transitions as PURE transcript transforms, for the unit
-/// tests that assert one derivation's effect on a read (the transcript, derive,
-/// render and drain test modules). Production reaches the same bodies through
-/// the backend's ONE owner — [`RunLifecycle::retire`], [`RunLifecycle::cleanup`]
-/// and [`RunLifecycle::apply_task_runtime`]; these tests attach no durable tier,
-/// so only the read's shape is under test.
-///
-/// Test-only on purpose: a second production door would be a second writer
-/// (ADR-0111 §2), which is exactly what this landing removes.
-pub(crate) trait TranscriptRunTransitions {
-    fn apply_task_runtime(&mut self, runtime: &TaskRuntime);
-    fn apply_cleanup(&mut self, call_ids: &[String], now_ms: i64);
-    fn apply_child_evidence(&mut self, call_id: &str, evidence: ChildEvidence);
-    fn apply_run_child_evidence(&mut self, run_id: &str, evidence: ChildEvidence) -> bool;
-}
-
-impl TranscriptRunTransitions for SessionTranscript {
-    fn apply_task_runtime(&mut self, runtime: &TaskRuntime) {
-        RunLifecycle::new().apply_task_runtime("", self, runtime);
-    }
-
-    fn apply_cleanup(&mut self, call_ids: &[String], now_ms: i64) {
-        RunLifecycle::new().cleanup("", self, call_ids, now_ms);
-    }
-
-    fn apply_child_evidence(&mut self, call_id: &str, evidence: ChildEvidence) {
-        RunLifecycle::new().retire(
-            "",
-            RetireRead::Observed(self),
-            call_id,
-            RetireCause::ChildEvidence(evidence),
-        );
-    }
-
-    fn apply_run_child_evidence(&mut self, run_id: &str, evidence: ChildEvidence) -> bool {
-        RunLifecycle::new()
-            .retire(
-                "",
-                RetireRead::Observed(self),
-                run_id,
-                RetireCause::RunChildEvidence(evidence),
-            )
-            .is_some()
     }
 }
