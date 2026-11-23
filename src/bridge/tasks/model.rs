@@ -8,7 +8,7 @@
 //! types so no caller's import path breaks.
 
 use crate::backend::runs::TaskRunIdentity;
-use crate::backend::{BackgroundTask, ShellOutputWindow, ToolIdentity, Wake, WakeSource};
+use crate::backend::{BackgroundTask, ShellOutputWindow, Wake, WakeSource};
 use crate::feishu::card::tool_render::TaskLiveness;
 
 /// The kind of Background Task a ledger row names. Only these two background
@@ -235,26 +235,6 @@ pub(crate) fn identity_of_wake(wake: &Wake) -> TaskRunIdentity {
         child_id: wake.child_id.clone(),
         started_at: None,
         label: wake.label.clone().filter(|label| !label.trim().is_empty()),
-    }
-}
-
-/// The [`BackgroundTask`] a durable identity re-synthesizes (ADR-0080), so a
-/// read that no longer carries the launch still renders the run's entry.
-/// `fallback_key` stands in for a call id a Wake-keyed record never captured,
-/// and a record written before the tool name was captured reads as a shell (the
-/// tolerant default every other reader uses).
-pub(crate) fn identity_task(identity: &TaskRunIdentity, fallback_key: &str) -> BackgroundTask {
-    BackgroundTask {
-        tool: ToolIdentity {
-            name: identity.tool.clone().unwrap_or_else(|| "shell".to_string()),
-            call_id: identity
-                .call_id
-                .clone()
-                .unwrap_or_else(|| fallback_key.to_string()),
-        },
-        shell_id: identity.shell_id.clone(),
-        child_id: identity.child_id.clone(),
-        started_at: identity.started_at,
     }
 }
 

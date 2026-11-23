@@ -3711,6 +3711,7 @@ impl RenderPoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::runs::test_seam::TranscriptRunTransitions;
 
     /// Issue #910 (the CI hang): a poll parked in a transcript read must not
     /// stall `RenderPoll::stop` — and therefore the turn's finalization — when

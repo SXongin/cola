@@ -1,10 +1,11 @@
 //! The Background Task State module (ADR-0079).
 //!
-//! One owner for a **Background Task**'s lifecycle, per Session: which tasks
-//! are live, what ended each one, and whether its completion entry has already
-//! been shown — the facts today spread across the Backend's process-local
-//! overlay, the `StreamAccumulator`'s delivery sets and the **Chain Record**'s
-//! durable sections.
+//! The **Background Task**'s card-chain state, per Session: which `TaskCell`
+//! generation's live card owns, the durable facts a fresh cell is seeded with,
+//! and whether its completion entry has already been shown. The **run** half —
+//! which tasks are live, what ended each one — moved to
+//! [`crate::backend::runs::RunLifecycle`] (ADR-0111, #1169); this module keeps
+//! the delivery half (ADR-0111 §3).
 //!
 //! Its interface is a read model — the rows the **Background Task Ledger**
 //! renders plus the completion entries a read owes ([`model`]) — and never the
@@ -22,17 +23,17 @@
 //!   `wake_floor`, `announced_endings`), and the shared handle to it. The cell moved
 //!   out of `StreamAccumulator` in #681; the accumulator holds a `TaskCell` and
 //!   keeps thin forwarding methods, so no caller changes.
-//! - [`handle::TasksHandle`] — the module's one handle and per-Session store,
-//!   created by `src/main.rs` and threaded into the adapter **at construction**
-//!   (#682). It keys each cell by `(session, chain generation)` — the
-//!   generation selects the entry, and a re-install prunes the session's other
-//!   generations — reads the durable tier a fresh cell is seeded from, re-keys
-//!   a binding when its card moves to a fresh session
-//!   ([`handle::TasksHandle::rekey`], `Turn::recreate`), and **owns the
-//!   volatile liveness tier**: the process-local memoization (#682) the
-//!   adapter applies to every read at the pinned apply seam and the Bridge
-//!   records through the same handle. There is one instance, held by the
-//!   adapter and the Bridge alike.
+//! - [`handle::TasksHandle`] — the module's per-Session cell store, created by
+//!   `src/main.rs` and threaded into the adapter **at construction** (#682). It
+//!   keys each cell by `(session, chain generation)` — the generation selects
+//!   the entry, and a re-install prunes the session's other generations — reads
+//!   the durable tier a fresh cell is seeded from, and re-keys a binding when
+//!   its card moves to a fresh session ([`handle::TasksHandle::rekey`],
+//!   `Turn::recreate`). It also creates the process's ONE
+//!   [`crate::backend::runs::RunLifecycle`], reachable through
+//!   [`handle::TasksHandle::runs`] and
+//!   [`crate::backend::Backend::runs`], so the adapter and the Bridge share one
+//!   instance of each half.
 //!
 //! Nothing about the behaviour changes here.
 //!
@@ -66,8 +67,8 @@ pub(crate) use handle::TasksHandle;
 pub(crate) use model::{identity_of_task, identity_of_wake, task_kind, task_label};
 pub(crate) use state::TaskCell;
 
-/// The liveness tier's own unit tests (`src/backend/transcript.rs`) still name
-/// the type they construct; it is the module's handle, since #682 folded the
-/// overlay into it. Test-only: production reaches the tier through the handle.
+/// The run lifecycle's own unit tests (`src/backend/transcript.rs`) still name
+/// the type they construct. Test-only: production reaches the tier through
+/// [`crate::backend::Backend::runs`] (ADR-0111).
 #[cfg(test)]
-pub(crate) type BackgroundTaskOverlay = TasksHandle;
+pub(crate) type BackgroundTaskOverlay = crate::backend::runs::RunLifecycle;

@@ -1,16 +1,19 @@
-//! The Background Task State store (ADR-0079, tickets #681, #682).
+//! The Background Task State store's card-delivery half (ADR-0079, tickets
+//! #681, #682).
 //!
-//! [`TasksHandle`] is the module's entry point and its per-Session store: it
-//! maps a `(session, chain generation)` key to the [`TaskCell`] that
-//! generation's live card owns — the generation **selects** the entry — and
-//! reads the durable **Chain Record** a fresh cell is seeded from. It also owns
-//! the module's liveness tier (#682): the process-local **cache** of the durable
-//! **Task Ending**s (ADR-0080) — the tasks a **Runtime Reconciliation**
-//! confirmed ended or the user cleared, and the live tasks it could not confirm
-//! as running. The endings themselves are durable, recorded at derivation;
-//! [`Self::apply`] reads them directly and the `retired` cache is seeded from
-//! them at every install, so the restart re-derives nothing and no later read
-//! can resurrect a retired task.
+//! [`TasksHandle`] is the module's per-Session store of **Task Cells**: it maps
+//! a `(session, chain generation)` key to the [`TaskCell`] that generation's
+//! live card owns — the generation **selects** the entry — and reads the
+//! durable **Chain Record** a fresh cell is seeded from.
+//!
+//! **The run half is not here.** The live/ended fact moved to
+//! [`crate::backend::runs::RunLifecycle`] (ADR-0111 #1169): the process-local
+//! `retired` cache, the unconfirmed-marker set, the durable-ending prune and the
+//! owed synthesis all live with that owner. This handle keeps only card-chain
+//! state — [`Self::install`], [`Self::cell`], [`Self::rekey`],
+//! [`Self::durable_seed`] — and hands the run owner out through
+//! [`Self::runs`], so the adapter and the Bridge still share ONE instance of
+//! each.
 //!
 //! **Binding lifetime.** A binding is born at a card install ([`Self::install`],
 //! through [`Self::restore`]) and dies with the session's next install (which
@@ -23,43 +26,35 @@
 //!
 //! **One instance, two holders.** The handle is created by `src/main.rs` and
 //! threaded into the OpenCode adapter **at construction**
-//! (`OpenCodeBackend::with_tasks`, ticket #682): the
-//! adapter holds it and applies the liveness tier to **every** transcript read
-//! at the pinned apply seam, while the Bridge reaches the SAME handle through
-//! [`crate::backend::Backend::tasks`] and records through
-//! [`Self::record_evidence_ending`] / [`Self::record_cleanup_ending`] (the
-//! durable endings) and [`Self::record`] / [`Self::set_unconfirmed`] (the
-//! cache). There is therefore exactly one owner of the
-//! tier: a retirement the Bridge records is what every later read sees, and a
-//! later caller holding the handle as the lifecycle owner sees the same
-//! retirements the adapter holds, because the two are one handle. The module
-//! owns the tier's bytes and its instance alike — the adapter no longer holds
-//! a separate overlay.
+//! (`OpenCodeBackend::with_tasks`, ticket #682): the adapter holds it, applies
+//! the run owner's [`crate::backend::runs::RunLifecycle::observe`] to **every**
+//! transcript read at the pinned apply seam, while the Bridge reaches the SAME
+//! handles through [`crate::backend::Backend::tasks`] and
+//! [`crate::backend::Backend::runs`]. There is therefore exactly one owner of
+//! the run lifecycle: a retirement the Bridge records is what every later read
+//! sees.
 //!
 //! **Late-bound durable tier.** The handle is created BEFORE the Chain Record
 //! (the adapter needs one at construction; `SharedCore::new` builds the Chain
 //! Record), so the durable tier is attached afterwards with
-//! [`Self::attach_chains`] — idempotent and replaceable. Until it is attached
-//! the durable seed is empty and a binding's generation is `0`, exactly the
-//! recordless-session shape; every production path attaches before it binds.
+//! [`Self::attach_chains`] — idempotent and replaceable, and it attaches to the
+//! run owner in the same call. Until it is attached the durable seed is empty
+//! and a binding's generation is `0`, exactly the recordless-session shape;
+//! every production path attaches before it binds.
 //!
 //! The lock order is recorded once, canonically, beside
 //! `crate::bridge::handles::CardsHandle`'s lock doc. The store, chain and
-//! liveness mutexes here are plain [`std::sync::Mutex`]es, taken and released
-//! inside each call — never awaited, never held across an await; the Chain
-//! Record's own lock is taken before the store lock, never after.
+//! run-lifecycle mutexes here are plain [`std::sync::Mutex`]es, taken and
+//! released inside each call — never awaited, never held across an await; the
+//! Chain Record's own lock is taken before the store lock, never after.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::backend::runs::{
-    RunKey, TaskEnding, TaskEndingClass, TaskEndingEvidence, TaskEndingState, TaskRunRecord,
-};
-use crate::backend::{BackgroundTask, SessionTranscript, TaskRetirement, TaskRetirementEnding};
+use crate::backend::runs::{RunEndingStore, RunLifecycle};
 use crate::bridge::chain::ChainRecords;
 
 use super::TaskCell;
-use super::model::{identity_of_task, identity_task};
 
 /// The durable facts an earlier card of this Session already announced, read
 /// from the Chain Record — the durable half of ADR-0079's `restore(record,
@@ -77,10 +72,10 @@ pub(crate) struct DurableSeed {
     pub(crate) watermark_ms: Option<i64>,
 }
 
-/// The module's per-Session store, its handle to the durable tier and its
-/// ownership of the volatile liveness tier. Cheap to clone (the map, the Chain
-/// Record and the liveness map are each behind an `Arc`) and held beside the
-/// Chain Record it reads.
+/// The module's per-Session store of card-delivery cells, its handle to the
+/// durable tier, and the run lifecycle owner created beside it. Cheap to clone
+/// (the map, the Chain Record, the owner and its overlay are each behind an
+/// `Arc`) and held beside the Chain Record it reads.
 ///
 /// The store is keyed by `(session_id, chain generation)`: a lookup names a
 /// session AND a generation and gets that chain's cell, so the generation
@@ -89,12 +84,17 @@ pub(crate) struct DurableSeed {
 /// under a changed generation cannot leave the previous chain's cell behind.
 /// [`Self::cell`] is the store's read side; [`Self::rekey`] is the binding's
 /// session-id transition (`Turn::recreate`).
+///
+/// [`Self::runs`] is the ONE [`RunLifecycle`] (ADR-0111): the overlay, the
+/// durable-ending prune and the retirement transitions live there, and the
+/// adapter and the Bridge share this instance through
+/// [`crate::backend::Backend::runs`].
 #[derive(Clone)]
 pub(crate) struct TasksHandle {
     /// The durable Chain Record (ADR-0069): the Wake Watermark a fresh cell is
-    /// seeded from, and the durable Task Endings this tier's reads consult
-    /// (ADR-0080). Late-bound ([`Self::attach_chains`]) because the handle is
-    /// created before the record; `None` until then, which reads as the
+    /// seeded from and the generation lookups a binding resolves against.
+    /// Late-bound ([`Self::attach_chains`]) because the handle is created
+    /// before the record; `None` until then, which reads as the
     /// recordless-session shape.
     chains: Arc<Mutex<Option<Arc<ChainRecords>>>>,
     /// session_id → chain generation → the cell that generation's live card
@@ -102,51 +102,17 @@ pub(crate) struct TasksHandle {
     /// pruning in [`Self::install`] is one `retain` on the session's own map,
     /// and the session → generation hierarchy reads as it is.
     store: Arc<Mutex<HashMap<String, HashMap<u64, TaskCell>>>>,
-    /// The process-local **cache** of the durable **Task Ending**s (ADR-0080):
-    /// the tasks the runtime confirmed ended or the user cleared, and the live
-    /// tasks the runtime could not confirm as running (the `⚠️ 状态待确认`
-    /// markers). The facts themselves are now durable — the reconcile records
-    /// an evidence ending the moment it derives it, and the cleanup click its
-    /// own ([`Self::record_evidence_ending`] / [`Self::record_cleanup_ending`]),
-    /// so the `retired` set is an optimization, not the source of truth: it is
-    /// seeded from the session's durable endings at every install
-    /// ([`Self::restore`]) and [`Self::apply`] consults the endings directly, so
-    /// a restart re-derives nothing and no later read can resurrect a retired
-    /// task. The transcript's launch record never flips, so without this tier
-    /// every re-read would resurrect a task whose ending a failed write could
-    /// not record — a live turn's ledger would show it again, and the next Turn
-    /// would yield waiting on it, forever.
-    ///
-    /// The unconfirmed marker is NOT durable and keeps ADR-0073's accepted-write
-    /// gate unchanged: it is derived per read
-    /// ([`SessionTranscript::apply_task_runtime`]) from a verdict the shared
-    /// throttle rations, so a read the runtime was not asked about — a Session
-    /// Sync refresh, a drain tick, a follow — must keep the marker (and the
-    /// cleanup button it gates) rather than drop it with no evidence the child
-    /// is running (review, spec #588). The Bridge replaces it
-    /// ([`Self::set_unconfirmed`]) only after the flush that carried a
-    /// reconciliation read's entries was accepted, so a refused carrier records
-    /// nothing.
-    ///
-    /// [`Self::apply`] applies the tier to every transcript the adapter returns,
-    /// so no read path can disagree. A marker is re-applied only to a task still
-    /// live in the read, so a retired task's marker never surfaces as live state.
-    liveness: Arc<Mutex<OverlayState>>,
-}
-
-#[derive(Default)]
-struct OverlayState {
-    /// session_id → the call ids the runtime (or a cleanup) retired.
-    retired: HashMap<String, HashSet<String>>,
-    /// session_id → the live call ids the runtime could not confirm as
-    /// running.
-    unconfirmed: HashMap<String, HashSet<String>>,
+    /// The run lifecycle's one owner (ADR-0111). Created here because
+    /// `src/main.rs` builds this handle before the Chain Record exists and
+    /// threads it into the adapter; the two halves are separately reachable
+    /// through the Backend, and share this instance.
+    runs: RunLifecycle,
 }
 
 impl Default for TasksHandle {
     /// The handle with an unattached durable tier and nothing recorded — the
-    /// shape [`Self::new`] builds, and the one the liveness tier's own unit
-    /// tests construct (`src/backend/transcript.rs`).
+    /// shape [`Self::new`] builds, and the one the cell store's own unit tests
+    /// construct.
     fn default() -> Self {
         Self::new()
     }
@@ -160,18 +126,26 @@ impl TasksHandle {
         Self {
             chains: Arc::new(Mutex::new(None)),
             store: Arc::new(Mutex::new(HashMap::new())),
-            liveness: Arc::new(Mutex::new(OverlayState::default())),
+            runs: RunLifecycle::new(),
         }
     }
 
-    /// Attach the durable Chain Record the handle's seed, generation lookups
-    /// and bindings read. Idempotent and replaceable: called once by
-    /// `SharedCore::new`, right after it builds the record, on the SAME handle
-    /// the adapter was constructed with — every clone of the handle sees the
-    /// attachment, since the slot is shared behind an `Arc`.
+    /// The run lifecycle's one owner (ADR-0111): the live/ended fact's writer.
+    pub(crate) fn runs(&self) -> &RunLifecycle {
+        &self.runs
+    }
+
+    /// Attach the durable Chain Record the handle's seed, generation lookups and
+    /// bindings read — and, in the same call, the run owner's durable tier, so
+    /// one attachment keeps both halves on one record. Idempotent and
+    /// replaceable: called once by `SharedCore::new`, right after it builds the
+    /// record, on the SAME handle the adapter was constructed with — every clone
+    /// of the handle sees the attachment, since the slots are shared behind an
+    /// `Arc`.
     pub(crate) fn attach_chains(&self, chains: Arc<ChainRecords>) {
         let mut slot = self.chains_slot();
-        *slot = Some(chains);
+        *slot = Some(Arc::clone(&chains));
+        self.runs.attach_store(chains as Arc<dyn RunEndingStore>);
     }
 
     /// The attached Chain Record, cloned out of its shared slot. `None` until
@@ -220,15 +194,14 @@ impl TasksHandle {
         generations.retain(|bound, _| *bound == generation);
     }
 
-    /// The session's registered cell: the store's read side, and the resolution
-    /// a later slice's `apply` uses. `install` keeps a session at exactly ONE
-    /// entry, but that entry is stamped with the generation the chain was on at
-    /// BIND time while a Chain Record re-point bumps the chain's generation
-    /// afterwards (the re-point follows the install) with no following install.
-    /// So the read HEALS the binding: the session's single entry is re-stamped
-    /// at the chain's CURRENT generation before it resolves, and a binding can
-    /// never be read against a stale key. `None` when the session has no
-    /// binding.
+    /// The session's registered cell: the store's read side. `install` keeps a
+    /// session at exactly ONE entry, but that entry is stamped with the
+    /// generation the chain was on at BIND time while a Chain Record re-point
+    /// bumps the chain's generation afterwards (the re-point follows the
+    /// install) with no following install. So the read HEALS the binding: the
+    /// session's single entry is re-stamped at the chain's CURRENT generation
+    /// before it resolves, and a binding can never be read against a stale key.
+    /// `None` when the session has no binding.
     pub(crate) fn cell(&self, session_id: &str) -> Option<TaskCell> {
         let current = self.generation(session_id);
         let mut store = self.store();
@@ -249,45 +222,13 @@ impl TasksHandle {
     /// the facts come from [`Self::durable_seed`] read AFTER the binding; the
     /// caller seeds it through the accumulator's forwarding setter
     /// (`set_wake_floor`), which reaches the cell the store owns for that
-    /// binding, not a side door. The liveness tier's `retired`
-    /// cache is seeded here too (ADR-0080), from the same durable endings.
+    /// binding, not a side door. The run owner's `retired` cache is seeded here
+    /// too (ADR-0080/0111), from the same durable endings.
     pub(crate) fn restore(&self, session_id: &str, cell: &TaskCell) -> DurableSeed {
         self.install(session_id, cell);
         let seed = self.durable_seed(session_id);
-        self.seed_retired(session_id);
+        self.runs.seed_retired(session_id);
         seed
-    }
-
-    /// Seed the liveness tier's `retired` cache from the session's durable
-    /// endings (ADR-0080): every run with a durable ending ended, whatever the
-    /// read still lists, so a fresh install's reads carry the retirements the
-    /// Chain Record already knows about without spending a reconcile verdict on
-    /// them. EVERY id the run is known by is seeded — not just its stored key
-    /// and call id — so the process-local fallback matches a row a read names by
-    /// an alias (a shell/child id where the read's call id differs). Idempotent —
-    /// [`Self::record`] folds the same ids.
-    fn seed_retired(&self, session_id: &str) {
-        let records = self.session_run_records(session_id);
-        if records.is_empty() {
-            return;
-        }
-        let mut state = self.liveness();
-        let retired = state.retired.entry(session_id.to_string()).or_default();
-        for record in &records {
-            for id in record.run.ids() {
-                retired.insert(id.to_string());
-            }
-        }
-    }
-
-    /// The session's durable run records, oldest first (ADR-0080) — the one
-    /// read every ending consumer here goes through. Empty before the durable
-    /// tier is attached (the recordless-session shape) and for a session that
-    /// recorded no ending.
-    fn session_run_records(&self, session_id: &str) -> Vec<TaskRunRecord> {
-        self.chains()
-            .map(|chains| chains.endings(session_id))
-            .unwrap_or_default()
     }
 
     /// The binding's **session-id transition**: the live card moved from
@@ -305,294 +246,6 @@ impl TasksHandle {
         let _ = self.store().remove(from_session_id);
     }
 
-    /// Record the call ids the runtime retired for one session. Idempotent.
-    pub(crate) fn record(&self, session_id: &str, call_ids: &[String]) {
-        let mut state = self.liveness();
-        let session = state.retired.entry(session_id.to_string()).or_default();
-        for call_id in call_ids {
-            session.insert(call_id.clone());
-        }
-    }
-
-    /// Record the **Evidence** ending a reconcile pass just derived (ADR-0080):
-    /// one synchronous Chain Record write at derivation, the fact about the run
-    /// rather than the card that will show it — so a refused carrier, an
-    /// entry-less chain and a restart all keep it. `input` is the launch's tool
-    /// input, when the read still carries it, so the ending captures the label.
-    /// A failed or timed-out read never reaches here; a run that already carries
-    /// an evidence ending is not re-recorded.
-    pub(crate) fn record_evidence_ending(
-        &self,
-        session_id: &str,
-        retirement: &TaskRetirement,
-        input: Option<&serde_json::Value>,
-    ) -> bool {
-        let evidence = match &retirement.ending {
-            TaskRetirementEnding::Ended(end) => TaskEndingEvidence::Ended(end.as_str().to_string()),
-            TaskRetirementEnding::Lost => TaskEndingEvidence::Lost,
-            TaskRetirementEnding::ChildEnded => TaskEndingEvidence::ChildEnded,
-            // The client's own word is a process-local statement: the durable
-            // record keeps the evidence class (ADR-0080), never a new variant
-            // an older build could not deserialize.
-            TaskRetirementEnding::ClientFailed | TaskRetirementEnding::ClientCancelled => {
-                TaskEndingEvidence::ChildEnded
-            }
-            // Never derived by the reconcile; the cleanup click records its own.
-            TaskRetirementEnding::Cleaned => return false,
-        };
-        self.record_ending(
-            session_id,
-            &RunKey::of_launch(&retirement.task),
-            TaskEnding {
-                class: TaskEndingClass::Evidence,
-                state: TaskEndingState::Owed,
-                finished_at: retirement.finished_at,
-                evidence: Some(evidence),
-                identity: identity_of_task(&retirement.task, input, retirement.label.as_deref()),
-            },
-        )
-    }
-
-    /// Record the **Cleanup** ending the user's click just derived for one
-    /// cleared run (ADR-0080): durable the moment the click derives it — outside
-    /// the refresh's accepted-write gate, because the fact is about the run, not
-    /// the card that will show its 🧹 entry. A cleaned run's later Wake is its
-    /// own ending (#590), so this never claims the run ended. `label` is the
-    /// derived `TaskRetirement`'s own label, which a child-only run has even
-    /// when the read no longer carries its launch input.
-    pub(crate) fn record_cleanup_ending(
-        &self,
-        session_id: &str,
-        task: &BackgroundTask,
-        finished_at: i64,
-        input: Option<&serde_json::Value>,
-        label: Option<&str>,
-    ) -> bool {
-        self.record_ending(
-            session_id,
-            &RunKey::of_launch(task),
-            TaskEnding {
-                class: TaskEndingClass::Cleanup,
-                state: TaskEndingState::Owed,
-                finished_at: Some(finished_at),
-                evidence: None,
-                identity: identity_of_task(task, input, label),
-            },
-        )
-    }
-
-    /// Record one **Task Ending** durably (ADR-0080). `false` when the durable
-    /// tier is not attached (the recordless-session shape) or the run already
-    /// carries this class.
-    fn record_ending(&self, session_id: &str, run: &RunKey, ending: TaskEnding) -> bool {
-        match self.chains() {
-            Some(chains) => chains.record_ending(session_id, run, ending),
-            None => false,
-        }
-    }
-
-    /// Replace one session's unconfirmed-marker set with exactly `call_ids` —
-    /// the reconcile's post-verdict set of live tasks it could not confirm as
-    /// running. Replace semantics let a verdict clear a marker: a set without
-    /// the id stops riding later reads, while a failed read never calls this
-    /// and so clears nothing.
-    pub(crate) fn set_unconfirmed(&self, session_id: &str, call_ids: &[String]) {
-        let mut state = self.liveness();
-        if call_ids.is_empty() {
-            state.unconfirmed.remove(session_id);
-            return;
-        }
-        state
-            .unconfirmed
-            .insert(session_id.to_string(), call_ids.iter().cloned().collect());
-    }
-
-    /// Every id one session's liveness tier has recorded as retired, sorted —
-    /// the test seam for "a refused refresh records nothing" (spec #588, review
-    /// PR #595). The set holds EVERY id a run is known by (its call id, its
-    /// shell/child id, its Wake id), not just call ids, so it matches a row the
-    /// read names by any of them. Production reads the tier only through
-    /// [`Self::apply`].
-    #[cfg(test)]
-    pub(crate) fn retired_ids(&self, session_id: &str) -> Vec<String> {
-        self.sorted_ids(|state| state.retired.get(session_id))
-    }
-
-    /// The call ids one session's liveness tier carries as unconfirmed, sorted
-    /// — [`Self::retired_ids`]'s marker-side twin.
-    #[cfg(test)]
-    pub(crate) fn unconfirmed_call_ids(&self, session_id: &str) -> Vec<String> {
-        self.sorted_ids(|state| state.unconfirmed.get(session_id))
-    }
-
-    /// A session's recorded id set, cloned and sorted for an order-free test
-    /// assertion.
-    #[cfg(test)]
-    fn sorted_ids(&self, pick: impl Fn(&OverlayState) -> Option<&HashSet<String>>) -> Vec<String> {
-        let state = self.liveness();
-        let mut ids: Vec<String> = pick(&state)
-            .map(|ids| ids.iter().cloned().collect())
-            .unwrap_or_default();
-        ids.sort();
-        ids
-    }
-
-    /// Apply the liveness tier to one read (ADR-0080): every ending the
-    /// session's Chain Record carries is a **Task Retirement** the read owes an
-    /// entry — synthesized for the read even when it derives nothing (the
-    /// restart case, a carrier that never took the entry) — every run with a
-    /// durable ending leaves `transcript`'s live list whatever the read still
-    /// lists, and every recorded unconfirmed marker is re-inserted for a task
-    /// still live in it. A session with nothing recorded is untouched (the
-    /// common case does no set lookup per task).
-    ///
-    /// The synthesis runs BEFORE the retention, over the same records, so an
-    /// owed ending's entry is planned before its row leaves. Only an OWED
-    /// ending is synthesized: a shown one already rendered, and a Wake ending
-    /// renders from the Wake itself, never here.
-    pub(crate) fn apply(&self, session_id: &str, transcript: &mut SessionTranscript) {
-        let state = self.liveness();
-        let records = self.session_run_records(session_id);
-        for record in &records {
-            for ending in record
-                .endings
-                .iter()
-                .filter(|ending| ending.state == TaskEndingState::Owed)
-            {
-                let Some(retirement) = synthesized_retirement(record, ending) else {
-                    continue;
-                };
-                // A read that derived this run's retirement itself already
-                // carries it; the synthesis never doubles it.
-                if transcript
-                    .task_retirements
-                    .iter()
-                    .any(|known| known.task.tool.call_id == retirement.task.tool.call_id)
-                {
-                    continue;
-                }
-                transcript.task_retirements.push(retirement);
-            }
-        }
-        // Every run with a durable ending has ended, whenever it was derived:
-        // its row leaves the read, so a later reconcile cannot resurrect it and
-        // the ledger cannot keep waiting on it. The match is ALIAS-AWARE
-        // (ADR-0080): the record carries every id the run is known by, and the
-        // row's own ids (its call id, its shell/child id) resolve the same
-        // record — so a launchless Wake that keyed the record by a shell id
-        // still prunes a row the read names by a different call id. RESOLVE AND
-        // FOLD IN ONE LOCK (`observe_run`): the read hands the record the ids
-        // the row was named by before any writer can act on the same observation,
-        // so a writer holding only one of them resolves the one record instead of
-        // minting a second one for one run. The process-local `retired` cache
-        // rides along for a run whose ending write a restart lost; it too matches
-        // any id the row is known by.
-        //
-        // ORDERING: the endings snapshot above was taken BEFORE this
-        // observation, so a completion a writer records in between is pruned
-        // from THIS read's live list while its ending is synthesized only on a
-        // later read — the prune may make one card update miss a completion
-        // entry it would otherwise have shown, and that entry stays owed to the
-        // next card.
-        let chains = self.chains();
-        transcript.background_tasks.retain(|task| {
-            let run = RunKey::of_launch(task);
-            match &chains {
-                Some(chains) => !chains.observe_run(session_id, &run),
-                None => true,
-            }
-        });
-        if let Some(ids) = state.retired.get(session_id) {
-            transcript.background_tasks.retain(|task| {
-                let run = RunKey::of_launch(task);
-                !run.ids().any(|id| ids.contains(id))
-            });
-        }
-        // The child-only runs obey the same rule (spec #1057's P4): a run with
-        // a durable ending has ended, and the process-local cache matches it by
-        // any id it is known by. The run carries the durable key as
-        // `task_run_id`, so the record a launchless writer minted resolves
-        // here too.
-        let mut pruned_runs: Vec<crate::backend::AgentRun> = Vec::new();
-        transcript.runs.retain(|run| {
-            let identity = RunKey {
-                key: run.ending_key().to_string(),
-                call_id: run.task_run_id.clone(),
-                shell_id: None,
-                child_id: run.child_id.clone(),
-                job_id: None,
-                wake_id: None,
-            };
-            // A resumed run is a new generation of the same child: an ending
-            // older than the run's newest start must not suppress it.
-            let ended = match &chains {
-                Some(chains) => {
-                    chains
-                        .run_ended_at(session_id, &identity)
-                        .is_some_and(|(ended_at, ending_start)| match (ended_at, run.started_at) {
-                            (Some(ended_at), Some(started_at)) => ended_at >= started_at,
-                            // An undated ending still names its generation by the
-                            // start the derivation captured: a resumed run (a
-                            // later start) survives, the ended one does not.
-                            (None, Some(started_at)) => {
-                                ending_start.is_none_or(|ending_start| started_at <= ending_start)
-                            }
-                            _ => true,
-                        })
-                }
-                None => false,
-            };
-            // The process-local set carries no clock: it may only suppress a
-            // run the client already reports ended, never a live resume.
-            let retired = !run.is_live()
-                && state
-                    .retired
-                    .get(session_id)
-                    .is_some_and(|ids| identity.ids().any(|id| ids.contains(id)));
-            let keep = !ended && !retired;
-            if !keep {
-                pruned_runs.push(run.clone());
-            }
-            keep
-        });
-        // A run with a durable ending leaves the read before the fold that
-        // would settle its launch panel, so the panel would keep reading live
-        // beside the ledger's entry. The prune settles it (ADR-0108 §10); the
-        // newest report still in the messages supplies a failure word.
-        for run in &pruned_runs {
-            let launches: Vec<String> = run
-                .launched_by
-                .iter()
-                .map(|launch| launch.call_id.clone())
-                .collect();
-            transcript.settle_run_launch_panels(
-                &launches,
-                run.child_id.as_deref(),
-                &crate::backend::TaskRetirementEnding::ChildEnded,
-            );
-        }
-        let Some(ids) = state.unconfirmed.get(session_id) else {
-            return;
-        };
-        for task in &transcript.background_tasks {
-            if ids.contains(task.tool.call_id.as_str()) {
-                transcript.unconfirmed_tasks.insert(task.tool.call_id.clone());
-            }
-        }
-        for run in &transcript.runs {
-            // A marker minted while a call-keyed run had no child id names its
-            // creating call. Once a later sighting fills the child id, the
-            // durable key moves and that marker no longer names this run's
-            // ending: drop it, so a live child never reads as unconfirmed.
-            let stale_childless = run.child_id.is_some()
-                && !ids.contains(run.ending_key())
-                && ids.contains(run.run_id.as_str());
-            if !stale_childless && run.ids().any(|id| ids.contains(id)) {
-                transcript.unconfirmed_tasks.insert(run.ending_key().to_string());
-            }
-        }
-    }
-
     /// The Chain Record's shared slot, locked for the caller's one step.
     fn chains_slot(&self) -> MutexGuard<'_, Option<Arc<ChainRecords>>> {
         self.chains
@@ -605,50 +258,17 @@ impl TasksHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-
-    fn liveness(&self) -> MutexGuard<'_, OverlayState> {
-        self.liveness
-            .lock()
-            .expect("the task-overlay lock is never poisoned")
-    }
-}
-
-/// The [`TaskRetirement`] an OWED durable ending owes the read (ADR-0080): the
-/// entry the next card renders, rebuilt from the record's own identity — no
-/// transcript launch needed. `None` for a class the read synthesizes from
-/// somewhere else: a **Wake** ending renders from the Wake itself, and the
-/// pre-#659 **legacy** class is the retirement's own dedup, never an entry.
-/// An evidence ending whose evidence a record did not carry is not synthesized
-/// either — a claim about the run with nothing to render.
-fn synthesized_retirement(record: &TaskRunRecord, ending: &TaskEnding) -> Option<TaskRetirement> {
-    let retirement_ending = match ending.class {
-        TaskEndingClass::Evidence => match ending.evidence.as_ref()? {
-            TaskEndingEvidence::Ended(status) => {
-                TaskRetirementEnding::Ended(crate::backend::ShellEnd::from_status(status))
-            }
-            TaskEndingEvidence::Lost => TaskRetirementEnding::Lost,
-            TaskEndingEvidence::ChildEnded => TaskRetirementEnding::ChildEnded,
-            TaskEndingEvidence::Wake(_) => return None,
-        },
-        TaskEndingClass::Cleanup => TaskRetirementEnding::Cleaned,
-        TaskEndingClass::Wake | TaskEndingClass::Legacy => return None,
-    };
-    Some(TaskRetirement {
-        task: identity_task(&ending.identity, &record.run.key),
-        ending: retirement_ending,
-        finished_at: ending.finished_at,
-        label: ending.identity.label.clone(),
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::runs::TaskRunIdentity;
+    use crate::backend::runs::{LiveRunSurface, RunKey, TaskEnding, TaskEndingClass, TaskRunIdentity};
     use crate::backend::{
         AgentRun, MessageId, MessageTime, Part, RunStatus, ToolCall, ToolCallRef, ToolIdentity,
         TranscriptMessage, Wake, WakeSource,
     };
+    use crate::backend::{BackgroundTask, SessionTranscript};
 
     /// A Wake naming only the shell id it reports — the launchless shape a read
     /// whose launch left it yields (ADR-0080).
@@ -687,7 +307,7 @@ mod tests {
         // endings.
         handle.restore("ses_a", &TaskCell::new());
 
-        let ids = handle.retired_ids("ses_a");
+        let ids = handle.runs().retired_ids("ses_a");
         assert!(
             ids.contains(&"sh_call_bg".to_string()),
             "the shell id (the record's key) is seeded: {ids:?}"
@@ -753,7 +373,9 @@ mod tests {
             shell_task("call_bg", Some("sh_call_bg")),
             shell_task("call_bg", None),
         ]);
-        handle.apply("ses_a", &mut transcript);
+        handle
+            .runs()
+            .observe("ses_a", &mut transcript, LiveRunSurface::full());
         assert!(
             transcript.background_tasks.is_empty(),
             "every row the read observed leaves the ledger: {transcript:?}"
@@ -824,7 +446,9 @@ mod tests {
             parts: vec![Part::Tool(launch)],
         }]);
         assert_eq!(transcript.runs.len(), 1, "the launch derives one run");
-        handle.apply("ses_a", &mut transcript);
+        handle
+            .runs()
+            .observe("ses_a", &mut transcript, LiveRunSurface::full());
         assert!(transcript.runs.is_empty(), "the durable ending prunes the run");
         let status = transcript
             .messages
@@ -849,7 +473,9 @@ mod tests {
     #[test]
     fn an_adopted_run_drops_its_childless_marker() {
         let handle = TasksHandle::new();
-        handle.set_unconfirmed("ses_a", &["call_activity".to_string()]);
+        handle
+            .runs()
+            .set_unconfirmed("ses_a", &["call_activity".to_string()]);
         let mut transcript = SessionTranscript::new(vec![]);
         transcript.runs = vec![AgentRun {
             run_id: "call_activity".into(),
@@ -867,7 +493,9 @@ mod tests {
             addressed_by: Vec::new(),
             reported_by: Vec::new(),
         }];
-        handle.apply("ses_a", &mut transcript);
+        handle
+            .runs()
+            .observe("ses_a", &mut transcript, LiveRunSurface::full());
         assert!(
             transcript.unconfirmed_tasks.is_empty(),
             "the child-bearing run is evidence-owned now: {:?}",

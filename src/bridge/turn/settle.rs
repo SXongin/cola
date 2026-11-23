@@ -167,7 +167,7 @@ pub(super) async fn run(
                 if rendered.flush.accepted()
                     && let Some(pass) = pass.take()
                 {
-                    pass.commit(&flow.backend, session_id, &transcript);
+                    pass.commit(flow.backend.runs(), session_id, &transcript);
                 }
                 Some(transcript)
             }

@@ -4656,39 +4656,28 @@ impl App {
         // One clock for the click's whole write: the synthetic retirements'
         // own timestamps and the refresh's render clock are the same moment.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if !cleared.is_empty() {
-            // The read's own cleanup rides the local transcript BEFORE the
-            // refresh (review, PR #595): the dropped rows, the 🧹 entries and
-            // the settle decision all come from this transcript, so it carries
-            // them into the write.
-            transcript.apply_cleanup(&cleared, now_ms);
-        }
-        // The click's own ending, recorded AT DERIVATION (ADR-0080): every
-        // cleared run's Cleanup ending is durable the moment the click derives
-        // it — OUTSIDE the refresh gate below, because the fact is about the
-        // run, not about the card that will show its 🧹 entry. A refresh the
-        // chain replaces still leaves the task ended and the entry owed to the
-        // next card that can carry it; only the process-local overlay record
-        // waits on the refresh. The process-local overlay record does NOT sit
-        // here — it is gated on the refresh's outcome below.
+        // The read's own cleanup rides the local transcript BEFORE the refresh
+        // (review, PR #595), and the click's own Cleanup ending is recorded AT
+        // DERIVATION (ADR-0080) by the owner's `retire` — OUTSIDE the refresh
+        // gate below, because the fact is about the run, not about the card
+        // that will show its 🧹 entry. A refresh the chain replaces still
+        // leaves the task ended and the entry owed to the next card that can
+        // carry it; only the process-local overlay record waits on the refresh
+        // (it does NOT sit here — it is gated on the refresh's outcome below).
+        handles
+            .backend
+            .runs()
+            .cleanup(&session_id, &mut transcript, &cleared, now_ms);
+        // A cleaned run/task no longer needs its child subscription: a Codex
+        // child adopted for liveness is released at the retirement — AFTER the
+        // ending was recorded, so a stalled or cancelled release cannot lose it.
+        // Every Cleared retirement the read carries is released, including one
+        // `observe` synthesized from a durable ending an earlier click recorded.
         for retirement in transcript
             .task_retirements
             .iter()
             .filter(|retirement| matches!(retirement.ending, TaskRetirementEnding::Cleaned))
         {
-            // Record the fact BEFORE the best-effort release: a stalled or
-            // cancelled release must not lose the Cleanup ending (ADR-0080:
-            // recorded when derived).
-            let input = transcript.tool_input(retirement.task.tool.call_id.as_str());
-            handles.backend.tasks().record_cleanup_ending(
-                &session_id,
-                &retirement.task,
-                now_ms,
-                input,
-                retirement.label.as_deref(),
-            );
-            // The cleaned run/task no longer needs its child subscription: a
-            // Codex child adopted for liveness is released at the retirement.
             if let Some(child) = retirement.task.child_id.as_deref() {
                 crate::bridge::runtime::release_child_session(&handles.backend, child).await;
             }
@@ -4726,7 +4715,7 @@ impl App {
         // post-verdict marker set — so no part of the cache can outlive the
         // others.
         if update.accepted() {
-            pass.commit(&handles.backend, &session_id, &transcript);
+            pass.commit(handles.backend.runs(), &session_id, &transcript);
         } else {
             tracing::warn!(
                 "cleanup: the refresh was not accepted on session {session_id}; \

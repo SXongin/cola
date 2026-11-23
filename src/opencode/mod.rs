@@ -249,6 +249,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::tasks(self)
     }
 
+    fn runs(&self) -> &crate::backend::runs::RunLifecycle {
+        OpenCodeBackend::runs(self)
+    }
+
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {
         OpenCodeBackend::model_context_window(self, provider, model).await
     }

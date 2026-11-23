@@ -630,6 +630,7 @@ pub fn child_run_finished(transcript: &SessionTranscript) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::runs::test_seam::TranscriptRunTransitions;
     use crate::backend::{
         AgentRunRef, ChildEvidence, FinishReason, MessageId, MessageTime, StepFinish, ToolIdentity,
         TurnAnchor, TurnSettle,
@@ -676,6 +677,17 @@ mod tests {
         let mut call = call(call_id, DelegationEffect::Report, &[child], status, Some(2));
         call.input = Some(serde_json::json!({"kind": kind, "agentThreadId": child}));
         call
+    }
+
+    /// The child-only runs the owner's one suspect list names, as the tests
+    /// assert them.
+    fn run_suspects(read: &SessionTranscript, anchor: Option<&TurnAnchor>) -> Vec<(String, String)> {
+        crate::backend::runs::RunLifecycle::new()
+            .evidence_waits(read, anchor)
+            .into_iter()
+            .filter(|wait| !wait.task)
+            .map(|wait| (wait.key, wait.child_id))
+            .collect()
     }
 
     fn transcript(calls: Vec<ToolCall>) -> SessionTranscript {
@@ -1221,7 +1233,7 @@ mod tests {
             created_ms: 5_000,
         };
         assert_eq!(
-            read.run_evidence_suspects(Some(&anchor_b)),
+            run_suspects(&read, Some(&anchor_b)),
             vec![("ses_new".to_string(), "ses_new".to_string())],
             "only the current Turn's terminal run owes evidence"
         );
@@ -1269,7 +1281,7 @@ mod tests {
             user("msg_u2", 5_000),
         ]);
         assert_eq!(
-            unplaced.run_evidence_suspects(Some(&anchor_b)),
+            run_suspects(&unplaced, Some(&anchor_b)),
             vec![("ses_unplaced".to_string(), "ses_unplaced".to_string())],
             "an unplaceable terminal run is not history"
         );
@@ -1505,7 +1517,7 @@ mod tests {
             read.run_children().is_empty(),
             "nothing to read for a run with no child id"
         );
-        assert!(read.run_evidence_suspects(None).is_empty());
+        assert!(run_suspects(&read, None).is_empty());
     }
 
     /// A launch naming N children mints a DISTINCT durable key per run
@@ -1869,7 +1881,7 @@ mod tests {
         assert_eq!(read.runs[0].status, RunStatus::Completed);
         assert!(!read.runs[0].is_live(), "the client states the run ended");
         assert_eq!(
-            read.run_evidence_suspects(None),
+            run_suspects(&read, None),
             vec![("thread_1".to_string(), "thread_1".to_string())],
             "the child read still has to confirm the end"
         );
@@ -1910,7 +1922,7 @@ mod tests {
             child_id: Some("thread_1".into()),
             started_at: Some(1),
         });
-        assert!(read.run_evidence_suspects(None).is_empty());
+        assert!(run_suspects(&read, None).is_empty());
         assert!(read.run_is_task(&read.runs[0], &read.background_tasks[0]));
     }
 

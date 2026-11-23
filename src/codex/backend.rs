@@ -3362,9 +3362,14 @@ impl Backend for CodexClient {
         // pending chosen id binds to the turn whose user item carries it, so
         // the authorship answer is exact even before the next prompt.
         self.reconcile_submissions(session_id, &transcript);
-        // The same life's retirement overlay OpenCode applies: a child run the
+        // The same life's run lifecycle OpenCode applies: a child run the
         // reconcile ended must not reappear from the parent's launch items.
-        self.tasks.apply(session_id, &mut transcript);
+        let capabilities = self.capabilities();
+        let surface = crate::backend::runs::LiveRunSurface {
+            reports_live_runs: capabilities.reports_live_runs(),
+            child_evidence: capabilities.child_evidence,
+        };
+        let _pass = self.tasks.runs().observe(session_id, &mut transcript, surface);
         Ok(transcript)
     }
 
@@ -3404,6 +3409,10 @@ impl Backend for CodexClient {
 
     fn tasks(&self) -> &TasksHandle {
         &self.tasks
+    }
+
+    fn runs(&self) -> &crate::backend::runs::RunLifecycle {
+        self.tasks.runs()
     }
 
     /// Codex's explicit capability declaration (ADR-0106, spec #1057 P5).
@@ -3927,6 +3936,10 @@ impl Backend for CodexLifecycle {
 
     fn tasks(&self) -> &TasksHandle {
         &self.tasks
+    }
+
+    fn runs(&self) -> &crate::backend::runs::RunLifecycle {
+        self.tasks.runs()
     }
 
     /// Every Codex client this lifecycle can attach has the same surface, so
