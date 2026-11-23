@@ -1,12 +1,11 @@
 # One owner for the run lifecycle: the Run Lifecycle module
 
-> **Amends ADR-0080 and ADR-0105.** Their ending facts (one durable ending per
-> run generation, recorded at derivation, shown once on a confirmed card write)
-> and read-model shapes (a Background Task, an Agent Run) stay as recorded. What
-> changes is who applies them: one owner, not four apply paths. ADR-0079 is
-> already a five-line pointer and carries no new banner.
-
-The C12 seam (#1140); the construction lands as #1141 (spec) and its children.
+> **Amends ADR-0080 and ADR-0105.** Their ending facts (at most one ending per
+> class per run generation; an evidence or Cleanup ending recorded at
+> derivation, a Wake's with its completion commit; shown once on a confirmed
+> card write) and read-model shapes (a Background Task, an Agent Run) stay as
+> recorded. What changes is who applies them: one owner, not four apply paths.
+> ADR-0079 is already a five-line pointer and carries no new banner.
 
 ## Context
 
@@ -40,12 +39,13 @@ it owes an ending) are one missing seam seen from two sides.
 ### 1. The invariant is the ending
 
 For every run — a Background Task or a child-only Agent Run, keyed by one
-**Task Run Id** and its generation — **at most one durable ending** is
-recorded. The live set is its complement: a run is live when no ending resolves
-its `(key, generation)`. A client's `status` is **evidence toward a transition,
-never the definition of live**: a run the client declared terminal stays in the
-read until its child transcript's evidence records the ending, or it would leave
-the ledger with no completion entry (`268ec8e3`).
+**Task Run Id** and its generation — **at most one ending of each class** is
+recorded (evidence, Cleanup, Wake). The live set is its complement: a run is
+live when no ending resolves its `(key, generation)`. A client's `status` is
+**evidence toward a transition, never the definition of live**: a run the
+client declared terminal stays in the read until its child transcript's evidence
+records the ending, or it would leave the ledger with no completion entry
+(`268ec8e3`).
 
 The predicate is one function: `is_live(run) = !store.resolves(run.key,
 run.generation)`. The ledger row, the panel liveness, the completion entry and
@@ -69,21 +69,22 @@ truth.
 The interface is one transition and one projection:
 
 - `observe(session, &mut transcript, surface) -> Option<Pass>` — apply the
-  durable endings and the overlay, prune the ended, synthesize an owed
-  retirement, re-mark the unconfirmed;
+  endings and overlay, prune the ended, synthesize an owed retirement;
 - `evidence_waits(transcript, anchor) -> Vec<EvidenceWait>` — the suspects one
   reconcile cycle may read, with "a run a Background Task already represents is
   not read twice" in one place;
-- `retire(session, &mut transcript, key, cause) -> Option<TaskRetirement>` —
-  the single transition, for all four causes (Wake, runtime verdict, child
-  evidence, Cleanup); the store's `record` returns false for an already-ended
-  generation, which is the retirement-once guard;
+- `retire(session, &mut transcript, key, cause) -> Option<TaskRetirement>` — the
+  single transition for all four causes (Wake, runtime verdict, child evidence,
+  Cleanup); the store dedupes per `(key, generation, class)`, so an evidence
+  ending suppresses a late Wake (ADR-0080) while a Cleanup does not (it says
+  nothing about how the run ended).
 - `live(transcript) -> impl Iterator<Item = &AgentRun>` — the predicate's one
   projection.
 
-`Pass` keeps today's two-phase commit: the durable ending is recorded at
-derivation, the volatile overlay commits only after the card write that carried
-the read was accepted (ADR-0072/0080). Dropping a pass loses nothing durable.
+`Pass` keeps today's two-phase commit: an evidence or Cleanup ending is recorded
+at derivation (a Wake's with its completion commit), and the volatile overlay
+commits only after the card write that carried the read was accepted
+(ADR-0072/0080). Dropping a pass loses nothing durable.
 
 ### 3. What the owner does not own
 
@@ -116,9 +117,10 @@ attach seam gets its own research candidate; C8 (`ServerIdentity`) stays HOLD.
 - **#684 is absorbed.** Its four-state verdict (Live / Ended(evidence) /
   Unconfirmed / Lost) is this interface's output.
 - **The regression suite gains a home.** One test per sampled invariant
-  (retire-once, terminal-but-owed, turn-start evidence, `child_evidence` gating,
-  launch settle, resumed generation, reported liveness), plus an absence test
-  for each deleted guard that fails if it returns.
+  (retire-once per class, terminal-but-owed, turn-start evidence,
+  `child_evidence` gating, launch settle, resumed generation, reported
+  liveness), plus an absence test for each deleted guard that fails if it
+  returns.
 - **The ratchet moves with the bodies.** `--bless` re-keys the baselined
   functions to `src/backend/runs/`; values only go down.
 
@@ -141,7 +143,6 @@ attach seam gets its own research candidate; C8 (`ServerIdentity`) stays HOLD.
 - The shown bit, the delivery pipeline (#685) and the Rendered Cursor.
 - The capability axes and the card surface (C5, ADR-0106).
 - Read-surface privatisation / a projection type (deferred ticket).
-- Any behaviour change the sampled fixes did not already pin.
 
 ## References
 
