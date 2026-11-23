@@ -118,14 +118,14 @@
       "function": "poll_session",
       "metric": "cognitive_complexity",
       "value": 32,
-      "body": "1dc4d57bfe93967c"
+      "body": "6f4f0f0b0d9f5505"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "poll_session",
       "metric": "too_many_lines",
       "value": 151,
-      "body": "1dc4d57bfe93967c"
+      "body": "6f4f0f0b0d9f5505"
     },
     {
       "path": "src/bridge/external.rs",
@@ -303,13 +303,6 @@
       "body": "4a0c1c0a7793ba62"
     },
     {
-      "path": "src/bridge/runtime.rs",
-      "function": "reconcile_now",
-      "metric": "too_many_lines",
-      "value": 121,
-      "body": "72f169b023967f33"
-    },
-    {
       "path": "src/bridge/terminal.rs",
       "function": "run_claimed",
       "metric": "cognitive_complexity",
@@ -405,14 +398,14 @@
       "function": "run",
       "metric": "cognitive_complexity",
       "value": 29,
-      "body": "0fb99dfa183ce674"
+      "body": "aa2dc93afae33923"
     },
     {
       "path": "src/bridge/turn/settle.rs",
       "function": "run",
       "metric": "too_many_lines",
       "value": 139,
-      "body": "0fb99dfa183ce674"
+      "body": "aa2dc93afae33923"
     },
     {
       "path": "src/bridge/turn/state.rs",
@@ -621,7 +614,7 @@
   "files": [
     {
       "path": "src/backend/transcript.rs",
-      "lines": 2877
+      "lines": 2432
     },
     {
       "path": "src/bridge/chain/reconcile.rs",
@@ -641,7 +634,7 @@
     },
     {
       "path": "src/bridge/handler.rs",
-      "lines": 4851
+      "lines": 4840
     },
     {
       "path": "src/bridge/handles.rs",
@@ -1137,7 +1130,7 @@
     },
     {
       "path": "src/bridge/tasks/handle.rs",
-      "count": 4
+      "count": 1
     },
     {
       "path": "src/bridge/tasks/mod.rs",
