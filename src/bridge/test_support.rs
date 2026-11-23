@@ -3866,6 +3866,9 @@ impl crate::backend::Backend for MockBackend {
             reports_live_runs: capabilities.reports_live_runs(),
             child_evidence: capabilities.child_evidence,
         };
+        // A read has no carrier write to gate the overlay on: the pass's
+        // durable facts are already recorded, so its admission is dropped here
+        // (ADR-0111 §2).
         let _pass = self.overlay.runs().observe(session_id, &mut transcript, surface);
         // A targeted read delay (spec #602 review, round 7): a read whose newest
         // assistant text matches the configured marker is a delayed-but-
