@@ -104,7 +104,12 @@ pub struct SessionTranscript {
 
 impl SessionTranscript {
     pub fn new(mut messages: Vec<TranscriptMessage>) -> Self {
-        let runs = crate::backend::runs::derive_runs(&mut messages);
+        let runs = crate::backend::runs::derive_runs(&messages);
+        // A report is an update to its run, and the launch panel is the record
+        // of the request: once the client reports every run it launched
+        // terminal, the panel settles with them (ADR-0108 §10). The settle is
+        // the run lifecycle's projection, not the fold's write (ADR-0111 §2).
+        crate::backend::runs::settle_reported_panels(&mut messages, &runs);
         Self {
             messages,
             runs,
