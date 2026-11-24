@@ -51,6 +51,11 @@ pub(crate) use flush::FlushOutcome;
 /// module's decision carries and this module's render consumes.
 pub(crate) use state::CursorSeed;
 
+/// The cursor stage stamp (issue #1186): the process-global token a staged body
+/// mints, which the Chain Record keeps beside the cursor it wrote so no writer —
+/// a late confirmation or the direct accepted PATCH — can move it backwards.
+pub(crate) use state::next_cursor_stage;
+
 /// The one card ownership verdict (ADR-0070, spec #545): computed by one read
 /// over the waits state and the card map; the prompt router, the Wake gate,
 /// the reap and the `/stop` acknowledgement read its named rules. Its module

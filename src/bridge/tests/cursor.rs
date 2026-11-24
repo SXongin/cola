@@ -535,13 +535,13 @@ async fn a_permanently_rejected_write_advances_nothing() {
 /// confirmation of an older stage leaves the record unchanged. A takeover
 /// cannot supply the race instead: its armed successor stays card-less until
 /// the create lands, so a concurrent `flush_card_locked` writes nothing and no
-/// drain-confirmable stage can be staged in that window. One gap in the
-/// guarantee stays open (#1186): the live PATCH's direct `advance_cursor_and_gap`
-/// in `flush_card_locked` writes the record without advancing
-/// `confirmed_cursor_stage`, so a cancelled confirmation plus a later older due
-/// stage can still move the record back. This test pins the confirmation
-/// ordering, not that window; a stress test fails only probabilistically, and a
-/// test-only park is banned by ADR-0110 §2.
+/// drain-confirmable stage can be staged in that window. What this test pins is
+/// the ACCUMULATOR's half — the in-memory base and its watermark. The durable
+/// half is the record's own stage stamp (issue #1186), which orders a
+/// confirmation against the live PATCH's direct advance;
+/// `the_direct_patch_advance_outranks_an_older_stage_confirmed_later` pins that
+/// one. Neither is reachable by a stress test — it fails only
+/// probabilistically — and a test-only park is banned by ADR-0110 §2.
 #[tokio::test]
 async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
     let _wd = test_work_dir();
@@ -628,6 +628,142 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
         persisted.cursor("ses_test"),
         Some(staged_b),
         "the persisted record keeps the newer cursor"
+    );
+}
+
+/// The durable cursor can only move forward across two writers (issue #1186):
+/// the live PATCH advances the record DIRECTLY, before any await (ADR-0080), so
+/// the accumulator's watermark — which only a confirmation advances — can lag
+/// it. A stage whose confirmation a cancellation dropped, then, may still be
+/// due after a newer body wrote the record, and its confirmation must read as
+/// stale. The record's stage stamp is what makes it stale: the direct advance
+/// carries the body's stamp, and an older one never moves the cursor or the gap
+/// back.
+///
+/// The interleave is the production one — A's payload delivers with its
+/// confirmation still pending, a newer body's PATCH is accepted and writes the
+/// record directly, and only then does A's confirmation run — driven step by
+/// step here because the cancellation itself has no seam (ADR-0110 §2 bans
+/// adding one).
+#[tokio::test]
+async fn the_direct_patch_advance_outranks_an_older_stage_confirmed_later() {
+    let _wd = test_work_dir();
+    let (dir, app, _backend, platform) = scripted_app(
+        vec![SessionTranscript::new(vec![user(
+            "msg_cola_anchor",
+            1_000,
+            "你好",
+        )])],
+        Some(SessionStatus::Idle),
+    )
+    .await;
+    let session_file = dir.path().join("sessions.json");
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    Turn::push_text(&cards, "ses_test", "答复。").await;
+    Turn::push_tool(
+        &cards,
+        "ses_test",
+        "call_9",
+        ToolPanel::for_test("bash", ToolStatus::Running, None, None),
+    )
+    .await;
+    cards.chains.track(
+        "ses_test",
+        "om_live",
+        MessageId::new("msg_cola_anchor"),
+        Some(1_000),
+        Some("/work"),
+        Some("msg_1"),
+    );
+
+    // A's write fails at the transport: its cursor is staged and tied to the
+    // Pending Card Update sequence.
+    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    Turn::flush_card(&cards, "ses_test").await;
+    let staged_a = Turn::staged_cursor(&cards, "ses_test")
+        .await
+        .expect("the failed write staged its cursor");
+
+    // Its payload delivers — but no reconcile runs, so A is still due and its
+    // confirmation has not happened. This is the state a cancelled flush
+    // leaves behind.
+    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    app.core.feishu.drain_pending_card_updates(true).await;
+    assert_eq!(
+        cards.chains.cursor("ses_test"),
+        None,
+        "delivery alone advances nothing"
+    );
+
+    // A NEWER body's PATCH is accepted, and its direct advance writes the
+    // record in that same synchronous step (ADR-0080), stamped as the newest
+    // cursor write there is. Its own confirmation is the one the cancellation
+    // ate.
+    let newer = RenderedCursor {
+        frontier: Some(CursorFrontier {
+            message_id: MessageId::new("msg_tool_4000"),
+            part_index: 0,
+            kind: CursorPartKind::Tool,
+            started_at: None,
+            delivered_chars: "答复。".chars().count(),
+            prefix_digest: Some(cursor_prefix_digest("答复。")),
+        }),
+        ..RenderedCursor::default()
+    };
+    cards
+        .chains
+        .advance_cursor_and_gap("ses_test", "om_live", &newer, None, &[]);
+    assert_ne!(
+        staged_a, newer,
+        "precondition: the two bodies are different render points"
+    );
+    assert_eq!(
+        cards.chains.cursor("ses_test"),
+        Some(newer.clone()),
+        "precondition: the direct advance wrote the newer body's cursor"
+    );
+
+    // A's confirmation now runs. Its stage is the one the record has already
+    // overtaken, so it moves nothing — the cursor stays where the delivered
+    // newer body put it, and a restart re-renders nothing that body showed.
+    crate::bridge::turn::reconcile_staged_cursors(&cards).await;
+    assert_eq!(
+        cards.chains.cursor("ses_test"),
+        Some(newer.clone()),
+        "an older stage confirmed after the direct advance never moves the cursor back"
+    );
+    let persisted = crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
+    assert_eq!(
+        persisted.cursor("ses_test"),
+        Some(newer),
+        "the persisted record keeps the newer cursor too"
+    );
+
+    // The guard is not a latch: a write the record has not overtaken still
+    // advances it, so a later delivered body moves the frontier on as before.
+    let latest = RenderedCursor {
+        frontier: Some(CursorFrontier {
+            message_id: MessageId::new("msg_a_6000"),
+            part_index: 0,
+            kind: CursorPartKind::Text,
+            started_at: Some(6_000),
+            delivered_chars: "补充。".chars().count(),
+            prefix_digest: Some(cursor_prefix_digest("补充。")),
+        }),
+        ..RenderedCursor::default()
+    };
+    cards
+        .chains
+        .advance_cursor_and_gap("ses_test", "om_live", &latest, None, &[]);
+    assert_eq!(
+        cards.chains.cursor("ses_test"),
+        Some(latest),
+        "a newer stage still advances the record"
     );
 }
 

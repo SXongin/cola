@@ -371,6 +371,9 @@ async fn confirm_staged_cursor(
     // happen atomically, so a concurrent confirmation can never interleave
     // between them. An older stage arriving after a newer one was applied is
     // discarded by the guard, and the durable cursor only ever moves forward.
+    // The record keeps the body's stamp for the same reason (issue #1186): the
+    // live PATCH advances it directly, without this accumulator's watermark, so
+    // the durable write itself refuses a stage the record has already overtaken.
     //
     // A confirmation whose stage can NO LONGER be taken — the session was
     // replaced by a fresh Turn, its chain changed, or the cap evicted the stage
@@ -399,9 +402,10 @@ async fn confirm_staged_cursor(
     // entries ride the same write (ADR-0080): a crash between two writes would
     // leave the card having shown the entry with its shown bit still owed, and a
     // restart would re-post it.
-    cards.chains.advance_cursor_and_gap(
+    cards.chains.advance_staged_cursor_and_gap(
         session_id,
         card_message_id,
+        expected.id,
         &confirmed.cursor,
         confirmed.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
         &confirmed.rendered_endings,
@@ -730,9 +734,10 @@ pub(super) async fn flush_card_locked(
                         // ONE chains write, in this synchronous step before any
                         // await (ADR-0080). A later cancellation cannot lose the
                         // bit, and a crash cannot leave it apart from the cursor it
-                        // was confirmed with. The staged confirmation below writes
-                        // the same values again — an idempotent no-op on an
-                        // already-advanced record.
+                        // was confirmed with. The write stamps itself newest, so a
+                        // stage whose confirmation the cancellation ate can never
+                        // move the record back; the confirmation below is therefore
+                        // refused as stale, having nothing left to add.
                         cards.chains.advance_cursor_and_gap(
                             session_id,
                             &card_id,
@@ -984,8 +989,9 @@ pub(super) async fn flush_card_locked(
                     Ok(()) => {
                         // Accepted NOW: advance the finalized body's cursor, gap
                         // and endings' shown bits in ONE synchronous write, before
-                        // any await (ADR-0080). The staged confirmation below
-                        // re-writes them idempotently.
+                        // any await (ADR-0080). The staged confirmation below is
+                        // refused as stale — this write stamped itself newest (issue
+                        // #1186) — so no older stage can move the record back.
                         cards.chains.advance_cursor_and_gap(
                             session_id,
                             &card_id,
