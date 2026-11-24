@@ -18,6 +18,7 @@ pub(crate) mod diff_command;
 pub(crate) mod dir;
 pub(crate) mod drain;
 pub(crate) mod external;
+pub(crate) mod harness;
 pub(crate) mod ledger;
 pub(crate) mod leftovers;
 pub(crate) mod location_forms;
