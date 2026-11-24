@@ -6035,4 +6035,32 @@ mod tests {
             )]
         );
     }
+
+    /// The rejected-Loading fallback is the minimal schema-2.0 card: no header,
+    /// one markdown element carrying the waiting line and the sanitized
+    /// subtitle — byte for byte what a degraded Loading send posts.
+    #[test]
+    fn the_loading_fallback_card_is_the_minimal_schema() {
+        assert_eq!(
+            loading_fallback_card(""),
+            serde_json::json!({
+                "schema": "2.0",
+                "config": { "wide_screen_mode": true },
+                "body": { "elements": [
+                    { "tag": "markdown", "content": "⏳ 正在处理，请稍候…" }
+                ] },
+            })
+        );
+        assert_eq!(
+            loading_fallback_card("标题").to_string(),
+            serde_json::json!({
+                "schema": "2.0",
+                "config": { "wide_screen_mode": true },
+                "body": { "elements": [
+                    { "tag": "markdown", "content": "⏳ 正在处理，请稍候…\n\n标题" }
+                ] },
+            })
+            .to_string()
+        );
+    }
 }

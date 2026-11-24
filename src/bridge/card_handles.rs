@@ -557,6 +557,16 @@ mod tests {
             .collect()
     }
 
+    /// The receipt is one plain markdown element, byte for byte — the shape a
+    /// resolution splices into the cached card.
+    #[test]
+    fn the_receipt_element_is_one_markdown_element() {
+        assert_eq!(
+            receipt_element("✅ 已允许一次").to_string(),
+            r#"{"content":"✅ 已允许一次","tag":"markdown"}"#
+        );
+    }
+
     /// Every cached copy of a block is discoverable, not just the one the
     /// registry currently names — a re-host can leave an older copy behind.
     #[test]

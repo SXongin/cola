@@ -911,7 +911,7 @@ async fn a_rejected_card_fallback_shows_the_same_body_extent_as_the_card() {
     );
     assert_eq!(
         card_a,
-        crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS,
+        crate::feishu::card::budget::TOOL_PANEL.max,
         "a body past the per-fold cap is clipped to it"
     );
 }

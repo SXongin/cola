@@ -580,7 +580,7 @@ async fn a_backtick_heavy_output_keeps_the_newest_line_within_the_budget() {
     let texts = card_texts(&card);
     for text in &texts {
         assert!(
-            text.chars().count() <= crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
+            text.chars().count() <= crate::feishu::card::budget::CARD_ELEMENT.max,
             "every element stays inside the per-element budget ({} chars): {text}",
             text.chars().count()
         );

@@ -5184,12 +5184,12 @@ impl StreamAccumulator {
                 // single item never exceeds the per-card budget; the budget
                 // accumulates across items and splits at the boundary. The
                 // component estimate is a LOWER bound: `with_text` chunks at
-                // MAX_ELEMENT_TEXT_CHARS but a construct lead or line-boundary
+                // the card element's budget but a construct lead or line-boundary
                 // slack can add an element, and the budget's own margin
                 // absorbs it.
                 TimelineKind::Text(t) => {
                     let chars = t.chars().count();
-                    let elements = chars.div_ceil(crate::feishu::card::MAX_ELEMENT_TEXT_CHARS);
+                    let elements = chars.div_ceil(crate::feishu::card::budget::CARD_ELEMENT.max);
                     (elements, t.len() + 40, chars)
                 }
                 // A receipt is one small markdown line.
@@ -5796,7 +5796,11 @@ impl StreamAccumulator {
             form: PartForm::Reasoning,
             key_at: self.entry_key_of(source).or(key_at),
             shown_at,
-            source: Some(self.rewrite_source(source, text, Some(crate::feishu::card::REASONING_TEXT_CAP))),
+            source: Some(self.rewrite_source(
+                source,
+                text,
+                Some(crate::feishu::card::budget::REASONING_ELEMENT.max),
+            )),
         };
         let read_order = HashMap::new();
         let message = self.scripted_transcript();
@@ -7149,13 +7153,13 @@ mod tests {
 
     /// #788: a `write` panel's Output section is the call's own `content`, not
     /// its one-line success sentence, so `panel_estimate` must charge those
-    /// bytes — the raw input cap alone would leave up to `TOOL_OUTPUT_MAX_CHARS`
+    /// bytes — the raw input cap alone would leave up to `budget::TOOL_PANEL.max`
     /// uncharged, and a card of written files could exceed Feishu's size cap
     /// instead of splitting.
     #[test]
     fn panel_estimate_charges_a_write_panels_content_body() {
         let write = |content: &str| write_panel("big.rs", content, Some("Wrote file successfully."));
-        let max = crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS;
+        let max = crate::feishu::card::budget::TOOL_PANEL.max;
         let long = write(&"x".repeat(max));
         let short = write("x");
         let body = crate::feishu::card::tool_render::panel_output_estimate(&long)
@@ -7189,11 +7193,11 @@ mod tests {
             ToolStatus::Completed,
             Some(serde_json::json!({
                 "filePath": "x.md",
-                "content": widest.repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS * 2),
+                "content": widest.repeat(crate::feishu::card::budget::TOOL_PANEL.max * 2),
             })),
             Some(&format!(
                 "Wrote file successfully.\n\n{}",
-                widest.repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS),
+                widest.repeat(crate::feishu::card::budget::TOOL_PANEL.max),
             )),
         );
         let estimate = panel_estimate(&panel, Some("ses_1"));
@@ -7512,7 +7516,7 @@ mod tests {
         // Each full-size tool panel serializes to ~3.4KB; 12 of them (~41KB of
         // body) exceed MAX_CARD_JSON_CHARS but not MAX_CARD_COMPONENTS, so only
         // the size budget can catch the overflow.
-        let big_output = "o".repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS);
+        let big_output = "o".repeat(crate::feishu::card::budget::TOOL_PANEL.max);
         for i in 0..12 {
             acc.push_tool(
                 &format!("call_{}", i),
@@ -7563,7 +7567,7 @@ mod tests {
         // chars (fits under MAX_CARD_JSON_CHARS), but the BYTE estimate is
         // 7 * ~9.4K = ~66K bytes (way over) — a char-counted estimate would
         // wrongly ship one ~66KB card and Feishu would reject it.
-        let cjk_output = "中".repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS);
+        let cjk_output = "中".repeat(crate::feishu::card::budget::TOOL_PANEL.max);
         for i in 0..7 {
             acc.push_tool(
                 &format!("call_{}", i),

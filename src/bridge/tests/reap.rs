@@ -10672,7 +10672,10 @@ async fn a_restart_renders_a_long_reasoning_parts_undisclosed_suffix() {
             .frontier
             .as_ref()
             .map(|frontier| (frontier.kind, frontier.delivered_chars)),
-        Some((CursorPartKind::Reasoning, crate::feishu::card::REASONING_TEXT_CAP)),
+        Some((
+            CursorPartKind::Reasoning,
+            crate::feishu::card::budget::REASONING_ELEMENT.max
+        )),
         "the frontier counts only the characters the card displayed"
     );
     // Issue #1025: the cursor's extent and its digest must name the SAME

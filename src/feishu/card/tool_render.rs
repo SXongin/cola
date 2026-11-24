@@ -3,6 +3,7 @@ use crate::backend::{
     ToolDetail, ToolStatus, V1_DIRECTORY_TYPE_TAG, V2_DIRECTORY_HEADER_PREFIX,
 };
 
+use super::budget::{self, SurfaceBudget};
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::{CardMarkdown, serialized_len};
 use super::shell::{collapsible_panel, panel_time_suffix};
@@ -11,61 +12,28 @@ use super::tool_view::{
     file_edits_body,
 };
 use super::vocab::{self, INPUT_LABEL, OUTPUT_LABEL};
-use super::{
-    MAX_ELEMENT_TEXT_CHARS, clip_md, fenced_block_bytes, fenced_block_overhead, fenced_code, fenced_overhead,
-    truncate_md,
-};
-
-/// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
-/// old 800: code-wrapped output renders without line wrapping, so a file or
-/// command output can be meaningfully long.
-pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
-
-/// The panel's Input-line budget. A multi-line input (an edit diff, a skill
-/// metadata list) is summarized rather than flooding the card; a `Program` is
-/// the one exception, because its source IS the panel.
-const INPUT_MAX_CHARS: usize = 400;
+use super::{clip, fenced_block_bytes, fenced_block_overhead, fenced_code, fenced_overhead};
 
 /// The line a `read` or `write` panel appends under a body its budget CLIPPED
 /// (ADR-0083 §8 amendment, #770/#788): the panel is a
-/// [`TOOL_OUTPUT_MAX_CHARS`]-character preview, so a clipped one says so where
+/// [`budget::TOOL_PANEL`](super::budget::TOOL_PANEL)-character preview, so a clipped one says so where
 /// the reader can act on it — the way-in button inside the fold (「📂 打开」, or
 /// 「🌐 预览网页」 for an HTML page, #778).
 pub(super) const PREVIEW_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
 
 /// The line a file-editing panel appends under a diff its budget CLIPPED. The
-/// note is a fenced body's ONLY clip signal: the `…` `truncate_md` appends
+/// note is a fenced body's ONLY clip signal: the `…` a marked cut appends
 /// stops Feishu rendering the block as code at all (#788), so the body clips
-/// bare ([`clip_md`]) and this line says why. Unlike
+/// bare (`budget::TOOL_PANEL.bare()`) and this line says why. Unlike
 /// [`PREVIEW_TRUNCATION_NOTE`] it names no way-in: the 「📂 打开」 button opens
 /// the file's CURRENT content, not the diff that changed it.
 pub(crate) const DIFF_TRUNCATION_NOTE: &str = "_（改动过长，已截断）_";
 
 /// The line a Codex search's raw-JSON fallback appends under a body its budget
 /// CLIPPED. The opaque `results` value can exceed the panel budget; the fenced
-/// body clips bare ([`clip_fenced_body`]) so the enclosing fence survives, and
+/// body clips bare ([`fenced_body_head`]) so the enclosing fence survives, and
 /// this line is the reader's only signal that the payload was cut.
 pub(super) const SEARCH_TRUNCATION_NOTE: &str = "_（搜索结果过长，已截断）_";
-
-/// The budget for a file-editing panel's diff BODY, measured in the bytes the
-/// body occupies once the card serializes it (its JSON-escaped form) — NOT in
-/// characters, and not the [`TOOL_OUTPUT_MAX_CHARS`] preview cap.
-///
-/// A real diff routinely exceeds 3,000 characters, and a panel cannot be split
-/// (the whole card is bounded by [`super::MAX_CARD_JSON_CHARS`]), so a diff gets
-/// its own cap at roughly half the card budget, leaving room for the panel's
-/// input, header, button and note. Bytes are what Feishu limits and what the
-/// splitter estimates; a character cap would let one CJK char (3 bytes) or one
-/// control char (JSON's six-byte `\uXXXX` escape) count as one and blow the
-/// budget by up to sixfold.
-///
-/// The budget covers the escaped body, the fence [`fenced_code`] wraps it in AND
-/// the opening fence's language token ([`clip_fenced_body`]): a body carrying a
-/// long backtick run would otherwise clip at ~12 KB and demand ~24 KB more in
-/// fence, and a body that just fits without a tag can be pushed over by the tag
-/// alone. Shared with the permission card, which renders the same diff under
-/// the same cap (#794).
-pub(crate) const DIFF_MAX_ESCAPED_BYTES: usize = 12_000;
 
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
 ///
@@ -345,7 +313,7 @@ impl ToolPanel {
     /// from the adapter's typed detail, so the button, the Input line and the
     /// folded title cannot disagree about which file the call touched. A FILE
     /// `read` names one too (ADR-0083 §8 amendment, #770): its panel is a
-    /// preview of the file clipped to [`TOOL_OUTPUT_MAX_CHARS`], so the whole
+    /// preview of the file clipped to [`budget::TOOL_PANEL`](super::budget::TOOL_PANEL), so the whole
     /// file is a tap away rather than on the card. Two read shapes are
     /// excluded, both of which already reach the reader whole: a read carrying
     /// a File Content (an image or a PDF has its own delivery, ADR-0076) and a
@@ -834,7 +802,7 @@ fn is_header_line_break(c: char) -> bool {
 /// panel HEADER (ADR-0076 amendment): every line-breaking character
 /// ([`is_header_line_break`] — a newline, a carriage return, a tab, any other
 /// `Cc`, and the `U+2028`/`U+2029` separators) becomes a space, so the one-line
-/// `plain_text` title cannot wrap or break. `truncate_md` clips by character
+/// `plain_text` title cannot wrap or break. The marked character clip cuts by character
 /// count and would pass a newline straight through, and a valid filename may
 /// carry one. One character in, one character out, so the clip's character
 /// budget is unchanged. The folded name is then trimmed: a name that is ALL
@@ -864,7 +832,7 @@ fn folded_header_name(name: &str) -> String {
 /// name still shows its extension. Applied to the basename
 /// ([`header_file_name`]), this only bites a genuinely long FILE name; a long
 /// absolute PATH is reduced to its basename first, so its directories never
-/// spend the budget. Character-counted like the body's [`truncate_md`], so a
+/// spend the budget. Character-counted like the body's marked clip, so a
 /// multibyte (CJK) name clips on a character boundary and never splits one — the
 /// tail-side mirror of the head clip it replaces. A name already within the
 /// budget is returned unchanged, with no `…`.
@@ -1078,7 +1046,7 @@ fn fence_lang_bytes(lang: Option<&str>) -> usize {
 /// Whether `text` fits a fenced-body budget: its JSON-escaped length PLUS the
 /// whole fence [`fenced_code`] will wrap it in (dynamic backtick run, minimum
 /// fence and newlines) PLUS the opening fence's language token. The one budget
-/// test [`clip_fenced_body`] and the diff note share, so a body is clipped
+/// test [`fenced_body_head`] and the diff note share, so a body is clipped
 /// exactly when the note says so.
 pub(super) fn fenced_body_fits(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> bool {
     json_escaped_len(text) + fenced_block_overhead(text) + fence_lang_bytes(lang) <= max_escaped_bytes
@@ -1103,10 +1071,10 @@ pub(super) fn fenced_body_fits(text: &str, lang: Option<&str>, max_escaped_bytes
 /// budget, and stops before the one that would cross it (the charge only ever
 /// grows, so the first over-budget prefix is the answer). Measured in escaped
 /// bytes, not characters, so the cap matches the card's own byte budget
-/// ([`DIFF_MAX_ESCAPED_BYTES`], #792); the cut lands on a character boundary.
+/// ([`budget::DIFF_FENCED`](super::budget::DIFF_FENCED), #792); the cut lands on a character boundary.
 /// Shared with the permission card, which passes its own selected language
 /// (#794).
-pub(crate) fn clip_fenced_body(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> String {
+pub(super) fn fenced_body_head(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> String {
     if fenced_body_fits(text, lang, max_escaped_bytes) {
         return text.to_string();
     }
@@ -1130,15 +1098,15 @@ pub(crate) fn clip_fenced_body(text: &str, lang: Option<&str>, max_escaped_bytes
     clipped
 }
 
-/// [`clip_fenced_body`] from the END: keep the NEWEST bytes of a body under the
+/// [`fenced_body_head`] from the END: keep the NEWEST bytes of a body under the
 /// same budget, dropping the oldest ones. Output panes need this — a command's
 /// last line is its diagnostic, so a fence-sized clip must eat the prefix, not
-/// the tail. The walk is the same charge as [`clip_fenced_body`] (escaped
+/// the tail. The walk is the same charge as [`fenced_body_head`] (escaped
 /// bytes + the fence the accumulated suffix needs + `lang`), run backwards and
 /// then reversed; the fence only grows as the walk extends leftward, so the
 /// first over-budget character stops it. No truncation marker, for the same
-/// reason as [`clip_fenced_body`].
-pub(crate) fn clip_fenced_tail(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> String {
+/// reason as [`fenced_body_head`].
+pub(super) fn fenced_body_tail(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> String {
     if fenced_body_fits(text, lang, max_escaped_bytes) {
         return text.to_string();
     }
@@ -1162,59 +1130,6 @@ pub(crate) fn clip_fenced_tail(text: &str, lang: Option<&str>, max_escaped_bytes
     kept.into_iter().rev().collect()
 }
 
-/// How a shell-like command's output body is clipped to its budget. Each
-/// variant names ONE existing clip rule rather than a new one — a panel preview
-/// keeps [`truncate_md`]'s `…` marker, a fenced element clips bare (a `…` right
-/// before the closing fence stops Feishu rendering the block as code at all,
-/// #788) — so the two surfaces that share the block keep their measured
-/// behaviour and share only the composition above it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputClip {
-    /// A markdown head clip, budgeted in CHARACTERS, ending on the shared `…`.
-    Chars { max_chars: usize },
-    /// A fenced element's head clip, budgeted in the JSON-ESCAPED BYTES the
-    /// element actually carries, clipped bare.
-    Bytes { max_bytes: usize },
-    /// [`Self::Bytes`] from the END: the newest bytes survive, because a
-    /// command's last line is its diagnostic.
-    BytesTail { max_bytes: usize },
-}
-
-impl OutputClip {
-    /// The clip one fenced element's body takes under `prefix`, keeping its
-    /// head: the element's whole budget is [`MAX_ELEMENT_TEXT_CHARS`], so the
-    /// prefix and its newline come out of the body's.
-    pub(crate) fn under_element(prefix: &str) -> Self {
-        Self::Bytes {
-            max_bytes: element_body_budget(prefix),
-        }
-    }
-
-    /// [`Self::under_element`] from the END: the newest bytes survive, because a
-    /// command's last line is its diagnostic.
-    pub(crate) fn tail_under_element(prefix: &str) -> Self {
-        Self::BytesTail {
-            max_bytes: element_body_budget(prefix),
-        }
-    }
-
-    /// The clipped body: the budget applies and no fence is added, for a caller
-    /// that needs the exact text the block shows (a button's payload).
-    pub(crate) fn clipped(self, body: &str) -> String {
-        match self {
-            Self::Chars { max_chars } => truncate_md(body, max_chars),
-            Self::Bytes { max_bytes } => clip_fenced_body(body, None, max_bytes),
-            Self::BytesTail { max_bytes } => clip_fenced_tail(body, None, max_bytes),
-        }
-    }
-}
-
-/// The bytes one fenced element's body may spend under `prefix`: the element's
-/// whole budget ([`MAX_ELEMENT_TEXT_CHARS`]) less the prefix and its newline.
-fn element_body_budget(prefix: &str) -> usize {
-    MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1)
-}
-
 /// The `Command` output block — one code path for a `Command` Tool Panel
 /// (ADR-0105) and the Host **Terminal Card** (ADR-0086: the two share a render
 /// block, never a lifecycle, a Chain or a record).
@@ -1225,8 +1140,8 @@ fn element_body_budget(prefix: &str) -> usize {
 /// Feishu's markdown would wrap a long line or fold the lines above a Setext
 /// underline into one heading. Returns the block and whether `clip` cut the
 /// body, so a caller's own "it was truncated" line follows the same verdict.
-pub(crate) fn command_output_block(body: &str, clip: OutputClip, preformatted: bool) -> (String, bool) {
-    let clipped = clip.clipped(body);
+pub(crate) fn command_output_block(body: &str, budget: SurfaceBudget, preformatted: bool) -> (String, bool) {
+    let clipped = clip::clip(body).cut(budget);
     let cut = clipped != body;
     let block = if preformatted || needs_code_block(&clipped) {
         fenced_code(&clipped, None)
@@ -1370,13 +1285,13 @@ pub(super) fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String
     }
     // The value is a string (a provider's own message) or a shape the schema
     // reserves the right to change: show it, don't interpret it. It clips BARE
-    // before the fence, because the `…` `truncate_md` appends directly before a
+    // before the fence, because the `…` a marked cut appends directly before a
     // closing fence stops Feishu rendering the block as code at all (#788).
     let body = codex_search_raw_body(results);
     Some((
         None,
         BodyStyle::Code(Some("json")),
-        clip_fenced_body(&body, Some("json"), TOOL_OUTPUT_MAX_CHARS),
+        clip::clip(&body).cut_fenced(Some("json"), budget::TOOL_PANEL_FENCED),
     ))
 }
 
@@ -1440,7 +1355,7 @@ pub(super) fn codex_search_raw_body(results: &serde_json::Value) -> String {
 /// ([`DIFF_TRUNCATION_NOTE`]): the clip's only signal, because the fenced body
 /// clips bare (#788). Renders IFF the body the panel shows is a recognized diff
 /// ([`file_edits_body`]) whose escaped body, fence and language tag exceed
-/// [`DIFF_MAX_ESCAPED_BYTES`] ([`fenced_body_fits`]) — a FAILED call's error
+/// [`budget::DIFF_FENCED`](super::budget::DIFF_FENCED) ([`fenced_body_fits`]) — a FAILED call's error
 /// text is not a diff and takes no note, since there is no change to name.
 /// Unlike a read's preview note ([`ToolView::note`]) it needs no button:
 /// "已截断" is true even when nothing can be opened, so the reader still knows
@@ -1466,7 +1381,7 @@ pub(crate) fn preview_truncation_note_estimate(tool: &ToolPanel, session_id: Opt
 
 /// The card bytes one adapter-assembled Output body contributes: its header
 /// through the card's sanitizer, then the body clipped at
-/// [`TOOL_OUTPUT_MAX_CHARS`] and charged in the form the renderer writes it —
+/// [`budget::TOOL_PANEL`](super::budget::TOOL_PANEL) and charged in the form the renderer writes it —
 /// a generated list goes through the sanitizer (which expands `<`), a fenced
 /// body carries its dynamic fence and language tag. Shared by the Codex search
 /// results, a collaboration call's target rows and a Code Mode program's
@@ -1475,7 +1390,7 @@ pub(super) fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, bo
     let header = header
         .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
         .unwrap_or(0);
-    let body = truncate_md(body, TOOL_OUTPUT_MAX_CHARS);
+    let body = clip::clip(body).cut(budget::TOOL_PANEL);
     let body = match style {
         BodyStyle::Markdown => serialized_len(&body),
         BodyStyle::Code(lang) => json_escaped_len(&body) + fenced_overhead(&body) + fence_lang_bytes(lang),
@@ -1490,7 +1405,7 @@ pub(super) fn assembled_body_estimate(header: Option<&str>, style: BodyStyle, bo
 pub(super) fn call_output_charge(tool: &ToolPanel) -> usize {
     tool.output()
         .map(|body| {
-            let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
+            let body = clip::clip(&body).cut(budget::TOOL_PANEL);
             json_escaped_len(&body) + fenced_overhead(&body)
         })
         .unwrap_or(0)
@@ -1499,11 +1414,11 @@ pub(super) fn call_output_charge(tool: &ToolPanel) -> usize {
 /// The Input-line budget for a panel. Every shape is summarized into the folded
 /// panel; a `Program` is the one exception — its source IS the panel, so it gets
 /// the output budget.
-fn input_budget(view: &ToolView<'_>) -> usize {
+fn input_budget(view: &ToolView<'_>) -> SurfaceBudget {
     if view.is_program() {
-        TOOL_OUTPUT_MAX_CHARS
+        budget::TOOL_PANEL
     } else {
-        INPUT_MAX_CHARS
+        budget::TOOL_INPUT
     }
 }
 
@@ -1567,7 +1482,7 @@ pub(super) fn tool_panel_element(
             // lazy continuation — Feishu would glue the output label on.
             content.push_str(&format!(
                 "**{INPUT_LABEL}**\n{}\n\n",
-                truncate_md(&formatted, budget)
+                clip::clip(&formatted).cut(budget)
             ));
         }
     }
@@ -1579,7 +1494,7 @@ pub(super) fn tool_panel_element(
             // strikethrough), so it must not be fenced into literal `- ✅ …`
             // rows even when a task text is long.
             title_details = header;
-            content.push_str(&truncate_md(&body, TOOL_OUTPUT_MAX_CHARS));
+            content.push_str(&clip::clip(&body).cut(budget::TOOL_PANEL));
         } else {
             // The Output marker owns its own paragraph: without the blank line any
             // following line that Feishu reads as a block start that cannot
@@ -1600,7 +1515,7 @@ pub(super) fn tool_panel_element(
             // Feishu rendering the block as code at all (measured, #788), and
             // the note below already says it was clipped — the only signal a
             // clipped diff has. A `read` preview keeps its 3,000-CHAR budget
-            // and `truncate_md`'s marker (or `clip_md` when it carries the
+            // and the marked clip's marker (bare when it carries the
             // way-in note), exactly as before.
             let note = view.note(tool, session_id);
             if view.is_command() {
@@ -1608,18 +1523,15 @@ pub(super) fn tool_panel_element(
                 // (ADR-0105, ADR-0086's "one render block, never a lifecycle"):
                 // the same clip and fence the Host Terminal Card puts its log
                 // through. No diff note belongs to a command.
-                let clip = OutputClip::Chars {
-                    max_chars: TOOL_OUTPUT_MAX_CHARS,
-                };
-                content.push_str(&command_output_block(&body, clip, false).0);
+                content.push_str(&command_output_block(&body, budget::TOOL_PANEL, false).0);
             } else {
                 let body = if view.has_file_edits() && !view.failed(tool) {
                     // Already composed and clipped by `file_edits_body`.
                     body
                 } else if note.is_some() && matches!(style, BodyStyle::Code(_)) {
-                    clip_md(&body, TOOL_OUTPUT_MAX_CHARS)
+                    clip::clip(&body).cut(budget::TOOL_PANEL.bare())
                 } else {
-                    truncate_md(&body, TOOL_OUTPUT_MAX_CHARS)
+                    clip::clip(&body).cut(budget::TOOL_PANEL)
                 };
                 // File content (read) and FileEdits hunks always render as a
                 // fenced code block; a `Markdown` body (websearch results) never
@@ -1723,7 +1635,7 @@ pub(super) fn todo_panel_element(
     match todo {
         TodoPanel::List { todo, .. } => {
             let details = format!("共 {} 项 · {}", todo.steps.len(), todo_counts(&todo.steps));
-            let body = truncate_md(&format_todo_list_with_explanation(todo), TOOL_OUTPUT_MAX_CHARS);
+            let body = clip::clip(&format_todo_list_with_explanation(todo)).cut(budget::TOOL_PANEL);
             let content = md.element(&body);
             let title = format!(
                 "📋 {}{} · {}",
@@ -2298,7 +2210,7 @@ pub(super) fn program_output(
         // The result is often JSON; fence it when the generic long-line rules
         // would wrap or fold it. Truncation happens before fencing so the
         // panel's own budget clamp cannot leave an unclosed fence.
-        let result = truncate_md(&result, TOOL_OUTPUT_MAX_CHARS - 256);
+        let result = clip::clip(&result).cut(budget::TOOL_PANEL.less(256));
         if needs_code_block(&result) {
             body.push_str(&fenced_code(&result, None));
         } else {
@@ -2694,7 +2606,10 @@ pub(super) fn program_input(shape: &ProgramShape<'_>) -> String {
         .language
         .filter(|lang| !lang.is_empty())
         .unwrap_or("javascript");
-    fenced_code(&truncate_md(shape.source, TOOL_OUTPUT_MAX_CHARS - 64), Some(lang))
+    fenced_code(
+        &clip::clip(shape.source).cut(budget::TOOL_PANEL.less(64)),
+        Some(lang),
+    )
 }
 
 /// The Input line a **Read** renders: the book icon and the path, plus the
@@ -2915,7 +2830,7 @@ pub(super) fn codex_collab_output(tool: &ToolPanel) -> Option<(Option<String>, B
 /// (or that line) instead of a row clipped mid-message. A `wait` may name more
 /// targets than this — the title counts them all, and the body names the rest
 /// explicitly rather than hiding them behind a bare ellipsis.
-const COLLAB_ROWS_MAX_CHARS: usize = TOOL_OUTPUT_MAX_CHARS - 40;
+const COLLAB_ROWS_MAX_CHARS: usize = budget::TOOL_PANEL.max - 40;
 
 /// The target rows of a collaboration call, in the adapter's own order. Every
 /// row is a whole one; targets that no longer fit are counted by the closing
@@ -3622,7 +3537,7 @@ mod tests {
     /// #743/#766 gave `write`/`edit` (`action: "file"`, no `op`, the Session to
     /// route by), in the same in-fold position (#767): the body's FIRST
     /// element, so the panel stays folded and a long body cannot push it out of
-    /// view. The body is a `TOOL_OUTPUT_MAX_CHARS`-character preview, which is
+    /// view. The body is a `budget::TOOL_PANEL.max`-character preview, which is
     /// exactly why a read needs the way in, and the folded header keeps naming
     /// the file while it is collapsed.
     #[test]
@@ -3808,7 +3723,7 @@ mod tests {
         assert!(tool_open_button_element(&settled, Some("ses_1")).is_some());
     }
 
-    /// The `read` body is a `TOOL_OUTPUT_MAX_CHARS`-character preview, so a
+    /// The `read` body is a `budget::TOOL_PANEL.max`-character preview, so a
     /// body the clamp cut says so and points at the way to the rest — the
     /// 「📂 打开」 button inside the fold (ADR-0083 §8 amendment, #770). A body
     /// that fits carries no note; a clipped DIRECTORY listing carries none
@@ -3895,7 +3810,7 @@ mod tests {
         assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no button, no note: {md}");
     }
 
-    /// 300 numbered lines of well over [`TOOL_OUTPUT_MAX_CHARS`] characters — a
+    /// 300 numbered lines of well over [`budget::TOOL_PANEL`](super::budget::TOOL_PANEL) characters — a
     /// `read` body the panel clips, the shape the truncation note exists for
     /// (ADR-0083 §8 amendment, #770).
     fn long_read_lines() -> String {
@@ -4039,7 +3954,7 @@ mod tests {
             .and_then(|rest| rest.split_once("\n```"))
             .expect("the fenced body");
         assert!(
-            json_escaped_len(body) > TOOL_OUTPUT_MAX_CHARS,
+            json_escaped_len(body) > budget::TOOL_PANEL.max,
             "the fixture is past the old preview cap"
         );
         assert!(
@@ -4053,13 +3968,13 @@ mod tests {
     /// body-only charge would let a near-budget card evade the split (#788).
     #[test]
     fn the_file_edits_estimate_charges_the_dynamic_fence() {
-        let content = "`".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let content = "`".repeat(budget::TOOL_PANEL.max);
         let panel = write_panel("notes.md", &content, ToolStatus::Completed, None);
         let body = file_edits_body(&panel).expect("the Add body");
         let hunks = &body.sections[0].hunks;
-        let clipped = clip_fenced_body(hunks, Some(body.lang), DIFF_MAX_ESCAPED_BYTES);
+        let clipped = clip::clip(hunks).cut_fenced(Some(body.lang), budget::DIFF_FENCED);
         assert!(
-            fenced_block_overhead(&clipped) > TOOL_OUTPUT_MAX_CHARS,
+            fenced_block_overhead(&clipped) > budget::TOOL_PANEL.max,
             "the fence dwarfs the body it wraps"
         );
         let header = body
@@ -4078,7 +3993,7 @@ mod tests {
     /// takes the preview cap and the render and estimate agree (#788/#792).
     #[test]
     fn a_failed_file_edit_keeps_the_error_under_the_preview_cap() {
-        let error = format!("write failed: {}", "e".repeat(TOOL_OUTPUT_MAX_CHARS * 3));
+        let error = format!("write failed: {}", "e".repeat(budget::TOOL_PANEL.max * 3));
         let mut panel = write_panel("big.rs", "content", ToolStatus::Error, None);
         panel.call.output.blocks = Vec::new();
         panel.call.output.error = Some(error.clone());
@@ -4090,7 +4005,7 @@ mod tests {
         );
         assert!(md.contains('…'), "the preview clamp marks the cut: {md}");
         let body = format_tool_output(&panel, &panel.output().unwrap()).2;
-        let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
+        let body = clip::clip(&body).cut(budget::TOOL_PANEL);
         assert_eq!(
             panel_output_estimate(&panel),
             json_escaped_len(&body) + fenced_overhead(&body),
@@ -4161,7 +4076,7 @@ mod tests {
         let (text, clipped) = body.render();
         assert!(clipped, "the action list is over budget");
         assert!(
-            json_escaped_len(&text) <= DIFF_MAX_ESCAPED_BYTES,
+            json_escaped_len(&text) <= budget::DIFF_FENCED.max,
             "the body stays inside the diff budget: {}",
             json_escaped_len(&text)
         );
@@ -6293,7 +6208,7 @@ Index: src/main.rs
     }
 
     /// A file-editing panel whose diff exceeds the panel budget clips the body
-    /// BARE and says so below the fence (#788, this fix). The `…` `truncate_md`
+    /// BARE and says so below the fence (#788, this fix). The `…` a marked cut
     /// appends sits immediately before the closing fence, which stops Feishu
     /// rendering the block as code at all — so before this, the LARGEST diffs
     /// were the ones that lost monospace and syntax colour entirely. Unlike a
@@ -6339,7 +6254,7 @@ Index: src/main.rs
             output: ToolOutput {
                 raw: Some(json!("Edit failed.")),
                 blocks: vec![ContentBlock::Text("Edit failed.".into())],
-                error: Some("x".repeat(2 * TOOL_OUTPUT_MAX_CHARS)),
+                error: Some("x".repeat(2 * budget::TOOL_PANEL.max)),
             },
             ..ToolCall::default()
         });
@@ -6363,13 +6278,13 @@ Index: src/main.rs
         // Plain ASCII: 6,000 chars plus the fence and `rust` tag fit.
         let ascii = "a".repeat(6_000);
         assert_eq!(
-            clip_fenced_body(&ascii, Some("rust"), DIFF_MAX_ESCAPED_BYTES),
+            clip::clip(&ascii).cut_fenced(Some("rust"), budget::DIFF_FENCED),
             ascii
         );
         // CJK: 5,000 chars is 15,000 escaped bytes; whole characters only.
         let cjk = "中".repeat(5_000);
         assert_eq!(
-            clip_fenced_body(&cjk, Some("rust"), DIFF_MAX_ESCAPED_BYTES),
+            clip::clip(&cjk).cut_fenced(Some("rust"), budget::DIFF_FENCED),
             "中".repeat(3_996)
         );
         // The tag is what clips at the boundary: 3,997 chars plus the 8-byte
@@ -6377,28 +6292,28 @@ Index: src/main.rs
         // 4-byte `rust` tag makes 12,003 — over the cap.
         let boundary = "中".repeat(3_997);
         assert_eq!(
-            clip_fenced_body(&boundary, None, DIFF_MAX_ESCAPED_BYTES),
+            clip::clip(&boundary).cut_fenced(None, budget::DIFF_FENCED),
             boundary
         );
         assert_eq!(
-            clip_fenced_body(&boundary, Some("rust"), DIFF_MAX_ESCAPED_BYTES),
+            clip::clip(&boundary).cut_fenced(Some("rust"), budget::DIFF_FENCED),
             "中".repeat(3_996)
         );
         // A control character is JSON's widest escape: six bytes, so the cap
         // holds 1,998 of them beside the fence and the 4-byte tag.
         let control = "\u{1}".repeat(3_000);
-        let clipped = clip_fenced_body(&control, Some("rust"), DIFF_MAX_ESCAPED_BYTES);
+        let clipped = clip::clip(&control).cut_fenced(Some("rust"), budget::DIFF_FENCED);
         assert_eq!(clipped.chars().count(), 1_998);
         assert_eq!(
             json_escaped_len(&clipped) + fenced_block_overhead(&clipped) + "rust".len(),
-            DIFF_MAX_ESCAPED_BYTES
+            budget::DIFF_FENCED.max
         );
         // A single 20,000-backtick run: the fence is one backtick longer on
         // each side, so only 3,997 survive — 3,997 escaped bytes plus a 7,998
         // byte fence and the 4-byte tag. Clipping on escaped bytes alone would
         // keep 12,000 and then pay ~24,000 more in fence.
         let ticks = "`".repeat(20_000);
-        let clipped = clip_fenced_body(&ticks, Some("rust"), DIFF_MAX_ESCAPED_BYTES);
+        let clipped = clip::clip(&ticks).cut_fenced(Some("rust"), budget::DIFF_FENCED);
         assert_eq!(clipped.len(), 3_997);
         assert_eq!(
             json_escaped_len(&clipped) + fenced_block_overhead(&clipped) + "rust".len(),
@@ -6425,7 +6340,7 @@ Index: src/main.rs
         let ascii_body = parse_edit_diff(&ascii).expect("a hunk diff parses").body;
         let ascii_fenced = json_escaped_len(&ascii_body) + fenced_block_overhead(&ascii_body) + "rust".len();
         assert!(
-            ascii_fenced <= DIFF_MAX_ESCAPED_BYTES,
+            ascii_fenced <= budget::DIFF_FENCED.max,
             "the fixture fits the byte budget with its fence and tag: {ascii_fenced}"
         );
         let panel = edit_panel(&ascii);
@@ -6468,11 +6383,11 @@ Index: src/main.rs
         assert_eq!(after, DIFF_TRUNCATION_NOTE, "the note follows the fence: {md}");
         let fenced = json_escaped_len(body) + fenced_block_overhead(body) + "rust".len();
         assert!(
-            fenced <= DIFF_MAX_ESCAPED_BYTES,
+            fenced <= budget::DIFF_FENCED.max,
             "the rendered body, fence and tag respect the budget: {fenced}"
         );
         assert!(
-            fenced > DIFF_MAX_ESCAPED_BYTES - 8,
+            fenced > budget::DIFF_FENCED.max - 8,
             "the clip fills the budget rather than cutting early: {fenced}"
         );
     }
@@ -6500,7 +6415,7 @@ Index: src/main.rs
             "the charge is the rendered body, fence, tag and header"
         );
         assert!(
-            estimate < DIFF_MAX_ESCAPED_BYTES + 200,
+            estimate < budget::DIFF_FENCED.max + 200,
             "and the charge is capped with the body: {estimate}"
         );
 
@@ -6513,7 +6428,7 @@ Index: src/main.rs
         }
         let ascii_body = parse_edit_diff(&ascii).expect("a hunk diff parses").body;
         assert!(
-            json_escaped_len(&ascii_body) > TOOL_OUTPUT_MAX_CHARS,
+            json_escaped_len(&ascii_body) > budget::TOOL_PANEL.max,
             "the fixture is past the old character cap: {}",
             json_escaped_len(&ascii_body)
         );
@@ -6607,7 +6522,7 @@ Index: src/main.rs
     }
 
     /// A file-editing panel whose rendered diff body is longer than
-    /// [`DIFF_MAX_ESCAPED_BYTES`]: the shape the clip note exists for.
+    /// [`budget::DIFF_FENCED`](super::budget::DIFF_FENCED): the shape the clip note exists for.
     fn long_diff_panel(name: &str) -> ToolPanel {
         let mut diff = String::from(
             "\
@@ -9702,7 +9617,7 @@ excerpt two";
     }
 
     /// A result list longer than the panel budget is markdown, so the generic
-    /// `truncate_md` marker is safe — it must never be fenced (which would
+    /// marked clip's marker is safe — it must never be fenced (which would
     /// turn the list into literal syntax) and must not lose its count header.
     #[test]
     fn a_long_result_list_truncates_as_markdown() {
@@ -9797,13 +9712,7 @@ excerpt two";
             false,
             Some(&raw),
         );
-        let (block, cut) = command_output_block(
-            &raw,
-            OutputClip::Chars {
-                max_chars: TOOL_OUTPUT_MAX_CHARS,
-            },
-            false,
-        );
+        let (block, cut) = command_output_block(&raw, budget::TOOL_PANEL, false);
         assert!(!cut, "a body inside the budget is not cut");
         assert!(block.starts_with("```\n"), "a long line fences: {block}");
         let md = panel_md(tool);

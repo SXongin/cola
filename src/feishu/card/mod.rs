@@ -1,3 +1,5 @@
+pub(crate) mod budget;
+pub(crate) mod clip;
 pub(crate) mod command;
 pub(crate) mod compaction;
 pub(crate) mod element;
@@ -293,34 +295,6 @@ pub const FEISHU_CARD_LIMIT_BYTES: usize = 30_000;
 /// count.
 pub const MAX_CARD_JSON_CHARS: usize = FEISHU_CARD_LIMIT_BYTES - 5_000;
 
-/// Cola's own budget for one markdown element — NOT a Feishu per-element cap.
-/// The platform documents no text-length limit per markdown element (a single
-/// 8000-char ASCII / 3060-char CJK element renders fully via both create and
-/// PATCH); the hard card limits are 30KB total and 200 elements/components
-/// (11310). Keeping each element ≤ 3000 chars keeps a card of many elements
-/// comfortably inside both. Reasoning, tool input/output and the question are
-/// capped per-element on top of this.
-pub const MAX_ELEMENT_TEXT_CHARS: usize = 3000;
-
-/// Split `text` into chunks of at most `max` chars (character-aware), keeping
-/// the full content. This is the plain-text splitter — the whole-card fenced
-/// fallback fences each chunk itself — and is fence-blind; a markdown blob
-/// whose fences or tables must survive the cut goes through
-/// `sanitize::chunk_markdown` instead (issue #1096).
-pub(crate) fn chunk_text(text: &str, max: usize) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut chunks = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        let take: String = rest.chars().take(max).collect();
-        chunks.push(take.clone());
-        rest = &rest[take.len()..];
-    }
-    chunks
-}
-
 /// Which kind of request keeps the turn paused (ADR-0014): the header names
 /// the one that is actually pending (permission vs question) instead of
 /// lumping both under one title.
@@ -463,13 +437,6 @@ pub(crate) fn fenced_overhead(text: &str) -> usize {
     fenced_block_overhead(text).saturating_sub(fenced_block_bytes(0))
 }
 
-/// The content cap for a session title, in characters. The server's `title`
-/// agent caps its own output at 100 characters; matching that keeps every
-/// legal title verbatim while still guarding the card against a title that
-/// did not pass through that cap. `truncate_md` adds its `…` marker on top,
-/// so the rendered label is at most one character longer than this budget.
-const TITLE_MAX_CHARS: usize = 100;
-
 /// The markers of the tool-call markup a hallucinating `title` model can emit
 /// in place of a title (real example:
 /// `<tool_call><function=bash><parameter=command>ls -la …`). Matched
@@ -507,7 +474,7 @@ fn cut_tool_call_markup(title: &str) -> &str {
 /// A server title is untrusted display text: the title model can emit
 /// tool-call markup instead of a title (see `cut_tool_call_markup`) and only
 /// the server's own path applies a cap, so the label is cut at that markup and
-/// its content capped at `TITLE_MAX_CHARS` characters (the truncation marker
+/// its content capped at [`budget::CARD_TITLE`] (the truncation marker
 /// rides on top) — a card subtitle stays a subtitle.
 pub fn clean_session_label(name: &str) -> String {
     let cleaned = crate::feishu::message::strip_mention_tokens(name);
@@ -518,7 +485,7 @@ pub fn clean_session_label(name: &str) -> String {
     {
         String::new()
     } else {
-        truncate_md(cleaned, TITLE_MAX_CHARS)
+        clip::clip(cleaned).cut(budget::CARD_TITLE)
     }
 }
 
@@ -555,51 +522,10 @@ pub(crate) fn test_local_ms(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
         .timestamp_millis()
 }
 
-/// How many characters of one reasoning entry a card element displays: the
-/// reasoning panel is clipped to this many model characters plus a "…" marker
-/// (spec #561, review #569). The Rendered Cursor's delivered extent for a
-/// reasoning part is clamped to it — a frontier must never claim characters
-/// the card never showed, or a restart would skip them.
-pub(crate) const REASONING_TEXT_CAP: usize = 800;
-
-/// Whether [`truncate_md`] would cut `text` at `max_len`: the character
-/// comparison the clip itself makes, so a caller that must know whether a
-/// rendered body was ACTUALLY clipped — a `read` panel's truncation note
-/// (ADR-0083 §8 amendment, #770) — decides on exactly the case the `…` marks
-/// rather than on a second, drifting rule.
-pub(crate) fn exceeds_md_budget(text: &str, max_len: usize) -> bool {
-    text.chars().count() > max_len
-}
-
-/// Clip `text` to at most `max_len` characters, appending a "…" marker when it
-/// was cut. Character-counted so CJK content (3 bytes/char) is truncated at the
-/// same visual length as ASCII instead of at a byte budget.
-pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
-    if exceeds_md_budget(text, max_len) {
-        format!("{}…", text.chars().take(max_len).collect::<String>())
-    } else {
-        text.to_string()
-    }
-}
-
-/// [`truncate_md`] with NO truncation marker: the bare clip a FENCED code body
-/// takes when the note below the fence already says it was clipped. An ellipsis
-/// immediately before a closing fence stops Feishu rendering the block as code
-/// at all — measured on a live card (#788): the same body with the `…` renders
-/// plain, without it the syntax colour returns — so a fenced body that carries a
-/// truncation note clips bare, and every other clip keeps the marker.
-pub(crate) fn clip_md(text: &str, max_len: usize) -> String {
-    if exceeds_md_budget(text, max_len) {
-        text.chars().take(max_len).collect()
-    } else {
-        text.to_string()
-    }
-}
-
 /// Byte length of the first `n` characters of `s` — what a render that clips
 /// at `n` characters contributes to the card's serialized size. Card budgets
 /// count UTF-8 bytes (Feishu rejects on bytes, not characters) while every
-/// clip ([`truncate_md`]) counts characters, so this is the one conversion
+/// clip ([`clip::Clip::cut`]) counts characters, so this is the one conversion
 /// between the two units a size estimate may use.
 pub(crate) fn first_n_chars_bytes(s: &str, n: usize) -> usize {
     s.chars().take(n).map(|c| c.len_utf8()).sum()
@@ -623,6 +549,216 @@ pub(crate) fn format_tokens(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod element_schema {
+        use super::super::element::{CardElement, ElementTag, is, is_running_panel, tag};
+
+        use serde_json::{Value, json};
+
+        /// Every constructor writes the exact 2.0 shape — the wire contract a
+        /// refactor must not move. Strings are the serialized form so key order
+        /// (`serde_json`'s sorted map) and an accidental extra key both fail.
+        #[test]
+        fn the_constructors_write_the_exact_wire_shapes() {
+            assert_eq!(
+                CardElement::markdown("正文").into_value().to_string(),
+                r#"{"content":"正文","tag":"markdown"}"#
+            );
+            assert_eq!(
+                CardElement::plain_text("标题").into_value().to_string(),
+                r#"{"content":"标题","tag":"plain_text"}"#
+            );
+            assert_eq!(CardElement::hr().into_value().to_string(), r#"{"tag":"hr"}"#);
+            assert_eq!(
+                CardElement::button("重试", "primary", json!({ "op": "retry" }))
+                    .into_value()
+                    .to_string(),
+                r#"{"tag":"button","text":{"content":"重试","tag":"plain_text"},"type":"primary","value":{"op":"retry"}}"#
+            );
+        }
+
+        /// A panel is folded, carries the shared fold icon, and gains its
+        /// `element_id` only when one is named.
+        #[test]
+        fn the_panel_shape_is_folded_and_keeps_its_optional_id() {
+            let element = CardElement::markdown("正文").into_value();
+            let panel = CardElement::panel("⏳ bash", vec![element], Some("tool_call_1")).into_value();
+            assert_eq!(
+                panel.to_string(),
+                r#"{"element_id":"tool_call_1","elements":[{"content":"正文","tag":"markdown"}],"expanded":false,"header":{"icon":{"tag":"standard_icon","token":"down-small-ccm_outlined"},"icon_position":"right","title":{"content":"⏳ bash","tag":"plain_text"}},"tag":"collapsible_panel"}"#
+            );
+            assert_eq!(element_tag(&panel, "element_id"), Some("tool_call_1"));
+
+            let anonymous = CardElement::panel("标题", Vec::new(), None).into_value();
+            assert_eq!(anonymous.get("element_id"), None, "{anonymous}");
+        }
+
+        /// The tag table is total in both directions and refuses a non-element.
+        #[test]
+        fn the_tag_table_round_trips_and_refuses_unknown_tags() {
+            for tag in [
+                ElementTag::Markdown,
+                ElementTag::PlainText,
+                ElementTag::Button,
+                ElementTag::Panel,
+                ElementTag::ColumnSet,
+                ElementTag::Input,
+                ElementTag::Form,
+                ElementTag::Hr,
+                ElementTag::Action,
+                ElementTag::Image,
+            ] {
+                assert_eq!(ElementTag::from_wire(tag.wire()), Some(tag));
+            }
+            assert_eq!(ElementTag::from_wire("div"), None);
+            assert_eq!(ElementTag::from_wire("md"), None, "a post node is not an element");
+        }
+
+        /// A named element is identified by its tag and nothing else; a value with
+        /// no tag (or a tag outside the schema) is no element.
+        #[test]
+        fn only_a_known_tag_names_an_element() {
+            assert!(is(
+                &json!({ "tag": "markdown", "content": "一" }),
+                ElementTag::Markdown
+            ));
+            assert!(!is(
+                &json!({ "tag": "markdown", "content": "一" }),
+                ElementTag::Panel
+            ));
+            assert_eq!(
+                tag(&json!({ "tag": "collapsible_panel", "elements": [] })),
+                Some(ElementTag::Panel)
+            );
+            assert_eq!(tag(&json!({ "no": "tag" })), None);
+            assert_eq!(tag(&json!("plain string")), None);
+        }
+
+        /// A running panel is the fold whose plain-text title opens with the running
+        /// glyph; the ledger shares the glyph but is matched before this is asked,
+        /// and a completed panel's title opens with its ending icon.
+        #[test]
+        fn only_a_running_panels_title_counts_as_running() {
+            let panel = |title: &str| json!({ "tag": "collapsible_panel", "header": { "title": { "tag": "plain_text", "content": title } } });
+            assert!(is_running_panel(&panel("⏳ bash")));
+            assert!(!is_running_panel(&panel("✅ bash")));
+            assert!(!is_running_panel(&json!({ "tag": "markdown", "content": "⏳" })));
+            assert!(!is_running_panel(&json!({ "tag": "collapsible_panel" })));
+            assert!(!is_running_panel(&json!({
+                "tag": "collapsible_panel",
+                "header": { "title": { "tag": "markdown", "content": "⏳ bash" } },
+            })));
+        }
+
+        fn element_tag<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+            value.get(key).and_then(Value::as_str)
+        }
+    }
+
+    mod surface_budgets {
+        use super::super::budget::*;
+
+        /// The numbers are the ones the card has always used, and a shrink never
+        /// underflows.
+        #[test]
+        fn the_surface_budgets_keep_their_measured_values() {
+            assert_eq!(CARD_ELEMENT.max, 3_000);
+            assert_eq!(TIMELINE_ENTRY.max, 6_000);
+            assert_eq!(TOOL_PANEL.max, 3_000);
+            assert_eq!(TOOL_PANEL_FENCED.max, 3_000);
+            assert_eq!(DIFF_FENCED.max, 12_000);
+            assert_eq!(TOOL_INPUT.max, 400);
+            assert_eq!(REASONING_ELEMENT.max, 800);
+            assert_eq!(CARD_TITLE.max, 100);
+            assert_eq!(CARD_ELEMENT.less(10).max, 2_990);
+            assert_eq!(CARD_ELEMENT.less(usize::MAX).max, 0);
+            assert_eq!(
+                TOOL_PANEL_FENCED.under_prefix("**目录**").max,
+                3_000 - "**目录**".len() - 1
+            );
+        }
+
+        /// The rule travels with the surface: a narrative budget keeps its marker
+        /// and construct-aware split, a fenced one counts escaped bytes, a bare one
+        /// drops the marker, and a plain one is fence-blind.
+        #[test]
+        fn the_rules_travel_with_the_budget() {
+            assert_eq!(CARD_ELEMENT.cut, CutRule::Marked);
+            assert_eq!(CARD_ELEMENT.split, SplitRule::Markdown);
+            assert_eq!(TOOL_PANEL.bare().cut, CutRule::Bare);
+            assert_eq!(TOOL_PANEL_FENCED.cut, CutRule::FencedBytes);
+            assert_eq!(TOOL_PANEL_FENCED_TAIL.cut, CutRule::FencedBytesTail);
+            assert_eq!(PLAIN_ELEMENT.split, SplitRule::Plain);
+        }
+    }
+
+    mod clip_entry_point {
+        use super::super::budget;
+        use super::super::clip::clip;
+
+        /// The marked cut appends the shared `…` only when it cuts; the bare cut
+        /// drops the marker and keeps the same head (#788).
+        #[test]
+        fn a_marked_cut_keeps_the_marker_and_a_bare_cut_drops_it() {
+            let budget = budget::CARD_ELEMENT.less(2_997);
+            assert_eq!(clip("abcdef").cut(budget), "abc…");
+            assert_eq!(
+                clip("abc").cut(budget),
+                "abc",
+                "a body inside the budget is whole"
+            );
+            assert_eq!(clip("abcdef").cut(budget.bare()), "abc");
+            assert!(clip("abcdef").exceeds(budget));
+            assert!(!clip("abc").exceeds(budget));
+        }
+
+        /// A character clip counts characters, not bytes: CJK content clips at the
+        /// same visual length as ASCII.
+        #[test]
+        fn a_character_cut_counts_characters_not_bytes() {
+            let budget = budget::CARD_ELEMENT.less(2_998);
+            assert_eq!(clip("中文字").cut(budget), "中文…");
+        }
+
+        /// The plain split keeps the full content and cuts only on the count; the
+        /// markdown split keeps each chunk self-contained, closing and re-opening a
+        /// fence that crosses the budget (#1096).
+        #[test]
+        fn the_plain_split_is_fence_blind_and_the_markdown_split_is_not() {
+            assert_eq!(
+                clip("abcdef").split(budget::SurfaceBudget::plain(2)),
+                ["ab", "cd", "ef"]
+            );
+            assert!(clip("").split(budget::SurfaceBudget::plain(2)).is_empty());
+
+            let fenced = "```\nlet x = 1;\nlet y = 2;\n```";
+            let chunks = clip(fenced).split(budget::SurfaceBudget::chars(20));
+            assert!(chunks.len() > 1, "the fixture must cross the budget: {chunks:?}");
+            for chunk in &chunks {
+                assert!(chunk.starts_with("```"), "a chunk re-opens the fence: {chunk:?}");
+                assert!(chunk.ends_with("```"), "a chunk closes the fence: {chunk:?}");
+            }
+        }
+
+        /// The fenced cut charges the fence and the language token against its
+        /// escaped-byte budget: a body whose text fits can still clip once the
+        /// block around it is counted, and the tail rule keeps the newest bytes.
+        #[test]
+        fn a_fenced_cut_charges_the_fence_and_the_language() {
+            let budget = budget::SurfaceBudget::fenced(15);
+            // 8 bytes of minimum fence + 7 body characters.
+            assert_eq!(clip("abcdefghij").cut(budget), "abcdefg");
+            assert_eq!(
+                clip("abcdefghij").cut(budget::SurfaceBudget::fenced_tail(15)),
+                "defghij"
+            );
+            // The `rust` token costs four more bytes: 8 fence + 4 lang + 3 body.
+            assert_eq!(
+                clip("abcdefghij").cut_fenced(Some("rust"), budget::SurfaceBudget::fenced(15)),
+                "abc"
+            );
+        }
+    }
 
     /// The fence charge is exactly the fence the render writes: `fenced_overhead`
     /// plus the minimum fence (which the per-element wrapper constant covers)
@@ -893,11 +1029,11 @@ mod tests {
     /// a card-length paragraph; CJK is cut by character, not by byte.
     #[test]
     fn clean_session_label_caps_the_display_length() {
-        let long = "修".repeat(TITLE_MAX_CHARS + 40);
+        let long = "修".repeat(budget::CARD_TITLE.max + 40);
         let label = clean_session_label(&long);
-        assert_eq!(label.chars().count(), TITLE_MAX_CHARS + 1);
+        assert_eq!(label.chars().count(), budget::CARD_TITLE.max + 1);
         assert!(label.ends_with('…'), "clipped label is marked: {label}");
-        let at_cap = "短".repeat(TITLE_MAX_CHARS);
+        let at_cap = "短".repeat(budget::CARD_TITLE.max);
         assert_eq!(clean_session_label(&at_cap), at_cap, "at the cap stays verbatim");
     }
 }

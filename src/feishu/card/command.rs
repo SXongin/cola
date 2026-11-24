@@ -27,6 +27,8 @@ use crate::bridge::command::{help_text, matches_keyword, pending_label};
 use crate::bridge::display::feishu_side_label;
 use crate::bridge::handles::CommandHandles;
 use crate::config::ThreadKey;
+
+use super::budget::SurfaceBudget;
 use crate::error::Result;
 
 use super::session::BrowseView;
@@ -995,11 +997,14 @@ fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) ->
         text.push_str("🧩 可用技能：\n");
         let shown = skills.len().min(super::skill::MAX_FALLBACK_SKILLS);
         for skill in &skills[..shown] {
-            let id = super::truncate_md(&skill.id, super::picker::SKILL_ROW_LABEL_CHARS);
-            let name = super::truncate_md(&skill.name, super::picker::SKILL_ROW_LABEL_CHARS);
+            let id =
+                super::clip::clip(&skill.id).cut(SurfaceBudget::chars(super::picker::SKILL_ROW_LABEL_CHARS));
+            let name = super::clip::clip(&skill.name)
+                .cut(SurfaceBudget::chars(super::picker::SKILL_ROW_LABEL_CHARS));
             match super::picker::skill_description_line(skill) {
                 Some(description) => {
-                    let description = super::truncate_md(description, super::picker::SKILL_ROW_LABEL_CHARS);
+                    let description = super::clip::clip(description)
+                        .cut(SurfaceBudget::chars(super::picker::SKILL_ROW_LABEL_CHARS));
                     text.push_str(&format!("- `{id}` {name} — {description}\n"));
                 }
                 None => text.push_str(&format!("- `{id}` {name}\n")),
@@ -1010,7 +1015,7 @@ fn skill_list_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) ->
         }
     }
     text.push_str("用法：`#<id>`");
-    super::truncate_md(&text, super::skill::FALLBACK_TEXT_CHARS)
+    super::clip::clip(&text).cut(SurfaceBudget::chars(super::skill::FALLBACK_TEXT_CHARS))
 }
 
 /// Reply the dedicated loaded-skill card (spec #652, ticket #655, acceptance
@@ -1051,7 +1056,8 @@ fn loaded_skill_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) 
     }
     let (allowed, hidden) = super::skill::plan_skill_folds(skills);
     for (skill, allowed) in skills.iter().zip(&allowed) {
-        let name = super::truncate_md(&skill.name, super::picker::SKILL_ROW_LABEL_CHARS);
+        let name =
+            super::clip::clip(&skill.name).cut(SurfaceBudget::chars(super::picker::SKILL_ROW_LABEL_CHARS));
         text.push_str(&format!("🧩 已加载技能：{name}\n"));
         text.push_str(&super::skill::fold_body(skill, *allowed));
         text.push('\n');
@@ -1059,7 +1065,7 @@ fn loaded_skill_text(skills: &[crate::backend::SkillInfo], error: Option<&str>) 
     if hidden > 0 {
         text.push_str(&format!("…等 {hidden} 个技能未列出\n"));
     }
-    super::truncate_md(text.trim_end(), super::skill::FALLBACK_TEXT_CHARS)
+    super::clip::clip(text.trim_end()).cut(SurfaceBudget::chars(super::skill::FALLBACK_TEXT_CHARS))
 }
 
 #[cfg(test)]

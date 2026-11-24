@@ -2,6 +2,8 @@ use serde_json::json;
 
 use crate::backend::types::UncollectableReason;
 
+use super::budget::SurfaceBudget;
+use super::clip;
 use super::sanitize::CardMarkdown;
 use super::shell::card_shell;
 use super::tool_render::json_escaped_len;
@@ -486,14 +488,14 @@ pub(crate) fn permission_block_estimate(
 /// leaves the reader unable to tell what they answered — the question's
 /// sentence is the only part that can.
 pub(crate) fn question_target(questions: &[crate::backend::types::QuestionInfo]) -> String {
-    super::truncate_md(
+    clip::clip(
         &questions
             .iter()
             .map(|qi| question_label(qi, 24))
             .collect::<Vec<_>>()
             .join("、"),
-        60,
     )
+    .cut(SurfaceBudget::chars(60))
 }
 
 /// One question's display label for a residue: the question it asked, with its
@@ -528,7 +530,7 @@ fn one_line_label(text: &str, max_chars: usize) -> String {
     let window: String = text.chars().take(LABEL_SCAN_CHARS).collect();
     let flattened = window.split_whitespace().collect::<Vec<_>>().join(" ");
     let safe = flattened.replace('`', "'");
-    super::truncate_md(&safe, max_chars)
+    clip::clip(&safe).cut(SurfaceBudget::chars(max_chars))
 }
 
 /// A one-line-per-question summary of a `question` request, for the stale card.

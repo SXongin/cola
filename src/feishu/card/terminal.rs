@@ -17,7 +17,7 @@
 //! `Command` output block the Tool Panel's `Command` shape renders its body
 //! with ([`command_output_block`]), so a long backtick run can never make the
 //! fence (which grows with the run) push the element past
-//! [`MAX_ELEMENT_TEXT_CHARS`](super::MAX_ELEMENT_TEXT_CHARS), and a clip rule
+//! [`budget::CARD_ELEMENT`](super::budget::CARD_ELEMENT), and a clip rule
 //! fixed on one surface is the other's too.
 //!
 //! The display tail is line-oriented and bounded twice (ADR-0086 §"The
@@ -33,9 +33,11 @@ use std::time::Duration;
 
 use serde_json::json;
 
+use super::budget;
+use super::clip;
 use super::sanitize::CardMarkdown;
 use super::shell::{card_shell, fmt_elapsed};
-use super::tool_render::{OutputClip, command_output_block};
+use super::tool_render::command_output_block;
 use super::vocab::OUTPUT_LABEL;
 
 /// The newest characters of a **Terminal Log** a card shows: the live tail and
@@ -420,11 +422,11 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
         // Clipping twice is idempotent, so the rebuilt card renders the same.
         // The body each element actually shows, from the same clips it renders
         // through, so the payload cannot disagree with the card.
-        let cwd = OutputClip::under_element("**目录**").clipped(view.cwd);
-        let command = OutputClip::under_element("**命令**").clipped(view.command);
+        let cwd = fenced_preview("**目录**", view.cwd);
+        let command = fenced_preview("**命令**", view.command);
         // The 「问 AI」 window is exactly the fenced element's body, so the
         // submission quotes what the reader sees (ADR-0086 decision 9).
-        let window = OutputClip::tail_under_element(&format!("**{OUTPUT_LABEL}**")).clipped(&output);
+        let window = tail_fenced_preview(&format!("**{OUTPUT_LABEL}**"), &output);
         elements.push(settled_buttons_row(
             full_output,
             &cwd,
@@ -574,13 +576,25 @@ fn button_column(label: &str, kind: &str, value: serde_json::Value) -> serde_jso
     })
 }
 
+/// The body [`fenced_element`] renders for one field under `prefix`, kept from
+/// the head: the same clip the element itself goes through, so a button's
+/// payload cannot disagree with the card.
+fn fenced_preview(prefix: &str, text: &str) -> String {
+    clip::clip(text).cut_fenced(None, budget::TOOL_PANEL_FENCED.under_prefix(prefix))
+}
+
+/// [`fenced_preview`] from the END: the output's newest line survives.
+fn tail_fenced_preview(prefix: &str, text: &str) -> String {
+    clip::clip(text).cut_fenced(None, budget::TOOL_PANEL_FENCED_TAIL.under_prefix(prefix))
+}
+
 /// One fenced element under the per-element budget, through the **Command
 /// output block** the Tool Panel's `Command` shape renders its body with
 /// (`command_output_block`, ADR-0086: a render block, never a lifecycle) — one
 /// code path, so a clip or fence rule fixed on the panel cannot be wrong here.
 /// The block charges the body's JSON-escaped bytes PLUS the dynamic fence
 /// `fenced_code` will add, so the whole element (prefix, fence and body) stays
-/// inside [`MAX_ELEMENT_TEXT_CHARS`](super::MAX_ELEMENT_TEXT_CHARS); the returned
+/// inside [`budget::CARD_ELEMENT`](super::budget::CARD_ELEMENT); the returned
 /// flag says whether the body had to be cut. `keep_tail` clips from the end, so
 /// the output's newest line — its diagnostic — survives.
 fn fenced_element(
@@ -589,13 +603,13 @@ fn fenced_element(
     keep_tail: bool,
     markdown: &mut CardMarkdown,
 ) -> (serde_json::Value, bool) {
-    let clip = if keep_tail {
-        OutputClip::tail_under_element(prefix)
+    let budget = if keep_tail {
+        budget::TOOL_PANEL_FENCED_TAIL.under_prefix(prefix)
     } else {
-        OutputClip::under_element(prefix)
+        budget::TOOL_PANEL_FENCED.under_prefix(prefix)
     };
     // A Terminal Log and a command line are machine output: always fenced.
-    let (block, was_clipped) = command_output_block(body, clip, true);
+    let (block, was_clipped) = command_output_block(body, budget, true);
     let element = json!({
         "tag": "markdown",
         "content": markdown.clean(&format!("{prefix}\n{block}")),
@@ -877,7 +891,7 @@ pub(crate) fn full_output_notice(outcome: FullOutputOutcome<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feishu::card::MAX_ELEMENT_TEXT_CHARS;
+    use crate::feishu::card::budget;
 
     fn settled(stopped: bool, survivors: bool) -> serde_json::Value {
         build_terminal_card(TerminalCard {
@@ -1161,7 +1175,7 @@ mod tests {
         });
         let (block, cut) = command_output_block(
             &body,
-            OutputClip::tail_under_element(&format!("**{OUTPUT_LABEL}**")),
+            budget::TOOL_PANEL_FENCED_TAIL.under_prefix(&format!("**{OUTPUT_LABEL}**")),
             true,
         );
         assert!(!cut, "a body inside the per-element budget is not cut");
@@ -1358,7 +1372,7 @@ mod tests {
     /// so, and names only what was cut.
     #[test]
     fn a_clipped_cwd_or_command_says_so() {
-        let long = "x".repeat(MAX_ELEMENT_TEXT_CHARS + 1);
+        let long = "x".repeat(budget::CARD_ELEMENT.max + 1);
 
         let text = crate::bridge::test_support::card_text(&card_with(&long, "make"));
         assert!(text.contains("（目录过长，已截断显示）"), "{text}");
@@ -1379,7 +1393,7 @@ mod tests {
         assert!(text.contains("（目录和命令过长，已截断显示）"), "{text}");
         for element in crate::bridge::test_support::card_texts(&card) {
             assert!(
-                element.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                element.chars().count() <= budget::CARD_ELEMENT.max,
                 "the note stays inside the per-element budget ({} chars): {element}",
                 element.chars().count()
             );

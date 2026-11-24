@@ -957,7 +957,7 @@ async fn a_seeded_reasoning_replay_confirms_one_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let session_file = dir.path().join("sessions.json");
     let full = format!("{}{}", "隐".repeat(900), "尾巴");
-    let cap = crate::feishu::card::REASONING_TEXT_CAP;
+    let cap = crate::feishu::card::budget::REASONING_ELEMENT.max;
     super::reap::seed_cursor_record(
         &session_file,
         "om_frozen",

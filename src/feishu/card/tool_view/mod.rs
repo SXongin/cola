@@ -35,7 +35,8 @@ use crate::backend::{
     read_output_is_directory,
 };
 
-use super::exceeds_md_budget;
+use super::budget;
+use super::clip;
 use super::tool_render::{
     BodyStyle, PREVIEW_TRUNCATION_NOTE, SEARCH_TRUNCATION_NOTE, ToolPanel, assembled_body_estimate,
     call_output_charge, codex_collab_output, codex_web_search_output, collab_agent_input, command_input,
@@ -406,7 +407,7 @@ impl<'a> ToolView<'a> {
         };
         tool.output()
             .map(|raw| read_output(&raw).2)
-            .is_some_and(|body| exceeds_md_budget(&body, super::tool_render::TOOL_OUTPUT_MAX_CHARS))
+            .is_some_and(|body| clip::clip(&body).exceeds(budget::TOOL_PANEL))
     }
 
     /// The panel's Input line. A declared shape owns its line, the empty one
@@ -634,7 +635,7 @@ fn codex_search_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
         return None;
     }
     let body = super::tool_render::codex_search_raw_body(results);
-    (!super::tool_render::fenced_body_fits(&body, Some("json"), super::tool_render::TOOL_OUTPUT_MAX_CHARS))
+    (!super::tool_render::fenced_body_fits(&body, Some("json"), budget::TOOL_PANEL_FENCED.max))
         .then_some(SEARCH_TRUNCATION_NOTE)
 }
 

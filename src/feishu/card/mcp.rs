@@ -12,10 +12,11 @@ use serde_json::json;
 use crate::backend::types::{McpServerState, McpServerStatus, QuestionRequest};
 use crate::config::ThreadKey;
 
+use super::budget::{self, SurfaceBudget};
 use super::question::location_form_summary_raw;
 use super::sanitize::{CardMarkdown, serialized_len};
 use super::shell::card_shell;
-use super::{MAX_CARD_COMPONENTS, MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, truncate_md};
+use super::{MAX_CARD_COMPONENTS, MAX_CARD_JSON_CHARS, clip};
 
 /// How the pull surface describes one pending Location Form. A form with no
 /// durable decision yet has not been pushed; a pushed one already has its own
@@ -35,7 +36,7 @@ pub(crate) struct McpFormRow<'a> {
 }
 
 /// One row's raw text clip. A row is one short line; keeping it well under
-/// [`MAX_ELEMENT_TEXT_CHARS`] leaves room for the sanitizer's `<` expansion
+/// [`budget::CARD_ELEMENT`] leaves room for the sanitizer's `<` expansion
 /// (five characters per `<`) and the surrounding markdown.
 const MCP_ROW_CHARS: usize = 400;
 
@@ -136,13 +137,13 @@ impl BoundedBody {
     }
 
     fn push_inner(&mut self, text: &str, button: Option<serde_json::Value>, reserve: bool) -> bool {
-        let clipped = truncate_md(text, MCP_ROW_CHARS);
+        let clipped = clip::clip(text).cut(SurfaceBudget::chars(MCP_ROW_CHARS));
         let mut cleaned = self.markdown.clean(&clipped);
-        if cleaned.chars().count() > MAX_ELEMENT_TEXT_CHARS {
+        if cleaned.chars().count() > budget::CARD_ELEMENT.max {
             // Defensive: the raw clip already keeps the sanitizer's `<`
             // expansion under this cap, but a future row builder must not
             // inherit an unbounded element.
-            cleaned = truncate_md(&cleaned, MAX_ELEMENT_TEXT_CHARS);
+            cleaned = clip::clip(&cleaned).cut(budget::CARD_ELEMENT);
         }
         let element_cap = if reserve {
             MAX_CARD_COMPONENTS - MCP_ELEMENT_RESERVE

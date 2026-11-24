@@ -21,9 +21,10 @@
 //! did before, and V1 (which carries no Background Task facts) never shows
 //! one.
 
+use super::budget::SurfaceBudget;
 use super::sanitize::escaped_entities;
 use super::tool_view::TaskLiveness;
-use super::{first_n_chars_bytes, fmt_local_time, truncate_md};
+use super::{clip, first_n_chars_bytes, fmt_local_time};
 use crate::backend::ShellOutputWindow;
 // The read-model type definitions live in the Background Task State module
 // (ADR-0079): this module keeps the copy, the formats and the budgets over
@@ -497,7 +498,7 @@ fn window_clock_secs(window: &ShellOutputWindow) -> u64 {
 /// drift apart (ADR-0060).
 fn folded_label(label: &str) -> String {
     let label = label.replace(['\n', '\r'], " ");
-    truncate_md(&label, TASK_LABEL_CHARS)
+    clip::clip(&label).cut(SurfaceBudget::chars(TASK_LABEL_CHARS))
 }
 
 /// The live row's label: the shared folded/clipped shape ([`folded_label`])

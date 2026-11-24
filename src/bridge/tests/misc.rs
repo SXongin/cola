@@ -921,6 +921,22 @@ async fn restart_announce_lobby_sends_to_the_chat() {
         PlatformCall::SendCard { receive_id, card } => {
             assert_eq!(receive_id, "oc_1");
             assert!(card_text(card).contains("已重启完成"));
+            // A lobby restart's announcement is the exact shell card, byte for
+            // byte: title, template and one markdown body.
+            assert_eq!(
+                card,
+                &serde_json::json!({
+                    "schema": "2.0",
+                    "config": { "wide_screen_mode": true },
+                    "header": {
+                        "title": { "tag": "plain_text", "content": "♻️ 已重启" },
+                        "template": "green",
+                    },
+                    "body": { "elements": [
+                        { "tag": "markdown", "content": "cola 已重启完成。" }
+                    ] },
+                })
+            );
         }
         other => panic!("expected a chat card, got {other:?}"),
     }

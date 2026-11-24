@@ -8,11 +8,9 @@ use std::borrow::Cow;
 
 use crate::backend::{FileAction, FileEdit};
 
-use super::super::tool_render::{
-    BodyStyle, DIFF_MAX_ESCAPED_BYTES, ToolPanel, clip_fenced_body, diff_language_for, json_escaped_len,
-    summary_tail,
-};
-use super::super::truncate_md;
+use super::super::budget::{self, SurfaceBudget};
+use super::super::clip;
+use super::super::tool_render::{BodyStyle, ToolPanel, diff_language_for, json_escaped_len, summary_tail};
 use super::ToolView;
 
 /// The merged edit list a FileEdits call renders. The adapters already merge
@@ -184,7 +182,10 @@ pub(crate) fn file_edits_body(tool: &ToolPanel) -> Option<FileEditsBody> {
     // enough — an `apply_patch` Add keeps its note inside.
     let (outside_tail, inside_tail) =
         if edits.len() == 1 && edits[0].action == FileAction::Add && is_write_output(tool) {
-            (tail.map(|tail| truncate_md(&tail, WRITE_TAIL_MAX_CHARS)), None)
+            (
+                tail.map(|tail| clip::clip(&tail).cut(SurfaceBudget::chars(WRITE_TAIL_MAX_CHARS))),
+                None,
+            )
         } else {
             (None, tail)
         };
@@ -200,7 +201,7 @@ pub(crate) fn file_edits_body(tool: &ToolPanel) -> Option<FileEditsBody> {
 impl FileEditsBody {
     /// The markdown body the panel writes, with every file's action line
     /// immediately before its own fence. Each hunk block and the action list
-    /// share [`DIFF_MAX_ESCAPED_BYTES`]: the action list stops growing when
+    /// share [`budget::DIFF_FENCED`]: the action list stops growing when
     /// the budget is spent, a hunk block clips to the remainder, and the
     /// returned flag tells the caller its truncation note is owed.
     pub(crate) fn render(&self) -> (String, bool) {
@@ -212,7 +213,7 @@ impl FileEditsBody {
             let action = section.action.as_deref();
             if let Some(action) = action {
                 let separator = if body.is_empty() { 0 } else { 2 };
-                if json_escaped_len(&body) + separator + json_escaped_len(action) > DIFF_MAX_ESCAPED_BYTES {
+                if json_escaped_len(&body) + separator + json_escaped_len(action) > budget::DIFF_FENCED.max {
                     clipped = true;
                     break;
                 }
@@ -234,8 +235,11 @@ impl FileEditsBody {
                 continue;
             }
             let separator = if body.is_empty() { 0 } else { 2 };
-            let remaining = DIFF_MAX_ESCAPED_BYTES.saturating_sub(json_escaped_len(&body) + separator);
-            let clipped_hunks = clip_fenced_body(&hunks, Some(self.lang), remaining);
+            let remaining = budget::DIFF_FENCED
+                .max
+                .saturating_sub(json_escaped_len(&body) + separator);
+            let clipped_hunks =
+                clip::clip(&hunks).cut_fenced(Some(self.lang), SurfaceBudget::fenced(remaining));
             if clipped_hunks.is_empty() {
                 clipped = true;
                 break;
@@ -250,10 +254,12 @@ impl FileEditsBody {
         }
         if let Some(tail) = &self.outside_tail {
             let separator = if body.is_empty() { 0 } else { 2 };
-            let remaining = DIFF_MAX_ESCAPED_BYTES.saturating_sub(json_escaped_len(&body) + separator);
+            let remaining = budget::DIFF_FENCED
+                .max
+                .saturating_sub(json_escaped_len(&body) + separator);
             if remaining > 0 {
                 let original = tail.chars().count();
-                let tail = truncate_md(tail, remaining);
+                let tail = clip::clip(tail).cut(SurfaceBudget::chars(remaining));
                 if tail.chars().count() < original {
                     clipped = true;
                 }
