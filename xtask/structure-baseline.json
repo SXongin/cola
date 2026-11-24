@@ -669,10 +669,6 @@
     {
       "path": "src/feishu/card/tool_render.rs",
       "lines": 2833
-    },
-    {
-      "path": "src/feishu/delivery.rs",
-      "lines": 2001
     }
   ],
   "too_many_arguments": [

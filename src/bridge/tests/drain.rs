@@ -4199,7 +4199,7 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
     // notice's delay start — it is still owed a fifth of a second later (with the
     // wait removed the drain's own delivery would fire it at once).
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !noticed(&platform).await,
@@ -4368,7 +4368,7 @@ async fn a_deferred_notice_is_suppressed_when_a_new_turn_replaced_the_card() {
     // The owed write drains — to the ORIGINAL card. The deferred notice must
     // not follow it to the replacement card's request.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let notices = platform.completion_notices().await;

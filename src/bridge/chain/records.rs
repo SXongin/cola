@@ -2287,7 +2287,7 @@ pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
         card.card_message_id().map(str::to_string)
     };
     if let Some(card_message_id) = card_message_id
-        && cards.feishu.has_pending_card_update(&card_message_id)
+        && cards.feishu.delivery().has_pending_card_update(&card_message_id)
     {
         return;
     }

@@ -4723,7 +4723,10 @@ pub(crate) async fn announce_completion(
                 let notice = notice.clone();
                 Box::new(move || spawn_notice(&cards, &platform, delay_ms, notice))
             };
-            match platform.defer_notice_until_delivered(&card_id, seq, deferred) {
+            match platform
+                .delivery()
+                .defer_notice_until_delivered(&card_id, seq, deferred)
+            {
                 crate::feishu::NoticeGate::Armed => {}
                 crate::feishu::NoticeGate::Delivered => {
                     spawn_notice(cards, platform, delay_ms, notice);

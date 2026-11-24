@@ -400,7 +400,7 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
         "a failed write advanced nothing"
     );
     assert!(
-        app.core.feishu.has_pending_card_update(&card_id),
+        app.core.feishu.delivery().has_pending_card_update(&card_id),
         "the ending is still owed"
     );
     assert_eq!(
@@ -412,7 +412,7 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
     // Feishu returns: the drain delivers the owed payload, and the reconcile
     // advances the staged cursor exactly once — one persisted write.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
 
     assert_eq!(
@@ -487,7 +487,7 @@ async fn a_permanently_rejected_write_advances_nothing() {
     // platform's create id); its content update is refused.
     wait_for_update_attempts(&platform, "msg_reply", 1).await;
     assert!(
-        !app.core.feishu.has_pending_card_update("msg_reply"),
+        !app.core.feishu.delivery().has_pending_card_update("msg_reply"),
         "a refused write leaves only a tombstone"
     );
 
@@ -568,7 +568,7 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
 
     // Its payload delivers — but no reconcile runs, so A is still unconfirmed.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     assert_eq!(
         cards.chains.cursor("ses_test"),
         None,
@@ -673,7 +673,7 @@ async fn the_direct_patch_advance_outranks_an_older_stage_confirmed_later() {
     // confirmation has not happened. This is the state a cancelled flush
     // leaves behind.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     assert_eq!(
         cards.chains.cursor("ses_test"),
         None,
@@ -792,7 +792,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
         "a failed write advanced nothing"
     );
     assert!(
-        app.core.feishu.has_pending_card_update(&card_id),
+        app.core.feishu.delivery().has_pending_card_update(&card_id),
         "the body is still owed"
     );
     let staged_a = Turn::staged_cursor(&cards, "ses_test")
@@ -802,7 +802,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
     // Feishu returns: the owed payload delivers, but no reconcile has run, so
     // nothing is confirmed yet.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     assert_eq!(
         cards.chains.cursor("ses_test"),
         None,
@@ -882,7 +882,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
 
     // B delivers later: its own confirmation now advances the record to it.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&cards).await;
     assert_eq!(
         cards.chains.cursor("ses_test"),

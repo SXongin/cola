@@ -334,9 +334,10 @@ async fn collect_pipeline(
         CollectGeneration::AtSubmission => cards.chains.generation(session_id),
         CollectGeneration::Handover(generation) => generation,
     };
-    let bound = cards.feishu.keyed_ticket_await();
+    let bound = cards.feishu.delivery().keyed_ticket_await();
     let ticket = cards
         .feishu
+        .delivery()
         .submit_ordered(KeyedSubmission {
             message_id: card_message_id,
             generation,
@@ -644,6 +645,7 @@ async fn probe_card(
         if handles
             .cards
             .feishu
+            .delivery()
             .has_pending_card_update(record.card_message_id.as_str())
         {
             return CardProbe::Recorded {
@@ -660,7 +662,12 @@ async fn probe_card(
             terminal: !running,
             // Only a terminal card consults the outbox: a live card is kept by
             // its own lifecycle either way.
-            update_pending: !running && handles.cards.feishu.has_pending_card_update(current_id),
+            update_pending: !running
+                && handles
+                    .cards
+                    .feishu
+                    .delivery()
+                    .has_pending_card_update(current_id),
         };
     }
     CardProbe::Successor {
@@ -792,7 +799,7 @@ async fn apply(
             // spawn another attempt — up to ~4 concurrent card-view GETs before
             // the first submission. The PATCH count stays one: the first
             // submission takes the queue's key and the rest are dropped.
-            if !handles.cards.feishu.keyed_write_covered(
+            if !handles.cards.feishu.delivery().keyed_write_covered(
                 &record.card_message_id,
                 record.generation,
                 CardWriteIntent::Stamp,
@@ -1689,6 +1696,7 @@ async fn ending_pipeline(
     )
     .await;
     let ticket = platform
+        .delivery()
         .submit_ordered(KeyedSubmission {
             message_id: &card_message_id,
             generation,
@@ -1797,7 +1805,10 @@ impl ApplyPass<'_> {
         // The queue's settled-key answer is a read-only query, not a Feishu
         // call: an already-settled ending resolves inline with no read and no
         // submission.
-        if let Some(delivered) = platform.keyed_write_settled(&card_message_id, generation, intent) {
+        if let Some(delivered) = platform
+            .delivery()
+            .keyed_write_settled(&card_message_id, generation, intent)
+        {
             continuation.apply(if delivered {
                 EndingOutcome::Landed
             } else {
@@ -1806,7 +1817,7 @@ impl ApplyPass<'_> {
             return;
         }
         let view_timeout_ms = self.handles.cards.preserved_view_timeout_ms();
-        let bound = platform.keyed_ticket_await();
+        let bound = platform.delivery().keyed_ticket_await();
         tokio::spawn(ending_pipeline(
             platform,
             card,
@@ -1921,8 +1932,9 @@ async fn stamp_restart_attempt(
         None => return,
     };
     let card = restamped_keeping_body(&ending_card(CardState::Restarted, None, None), &view);
-    let bound = platform.keyed_ticket_await();
+    let bound = platform.delivery().keyed_ticket_await();
     match platform
+        .delivery()
         .submit_ordered(KeyedSubmission {
             message_id: card_message_id,
             generation,
@@ -2611,6 +2623,7 @@ mod tests {
         let outcome = handles
             .cards
             .feishu
+            .delivery()
             .submit_ordered(crate::feishu::delivery::KeyedSubmission {
                 message_id: "om_chain",
                 generation,
@@ -2625,7 +2638,13 @@ mod tests {
             matches!(outcome, crate::feishu::delivery::WriteOutcome::Failed(_)),
             "the ending is still owed: {outcome:?}"
         );
-        assert!(handles.cards.feishu.has_pending_card_update("om_chain"));
+        assert!(
+            handles
+                .cards
+                .feishu
+                .delivery()
+                .has_pending_card_update("om_chain")
+        );
 
         // The Idle entry reports the record's owed ending, so the reap Keeps
         // instead of projecting or re-settling the recorded card.
@@ -2646,9 +2665,19 @@ mod tests {
 
         // Once the outbox drains, the read is the documented orphan.
         platform.clear_fail_update();
-        handles.cards.feishu.drain_pending_card_updates(true).await;
+        handles
+            .cards
+            .feishu
+            .delivery()
+            .drain_pending_card_updates(true)
+            .await;
         wait_for("the drain delivers the owed ending", || async {
-            if handles.cards.feishu.has_pending_card_update("om_chain") {
+            if handles
+                .cards
+                .feishu
+                .delivery()
+                .has_pending_card_update("om_chain")
+            {
                 None
             } else {
                 Some(())
