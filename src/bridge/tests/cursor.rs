@@ -8,7 +8,6 @@
 //! cards sent/patched and the sidecar fact — never private internals.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::drain::{
@@ -23,8 +22,8 @@ use crate::backend::{
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::{
-    MockBackend, PlatformCall, card_text, patches_to, test_work_dir, text_part, two_parts_at_one_time,
-    typed_message, wait_for_transcript_reads,
+    ALWAYS, MockBackend, PlatformCall, UpdateFailure, card_text, patches_to, test_work_dir, text_part,
+    two_parts_at_one_time, typed_message, wait_for_transcript_reads,
 };
 use crate::bridge::turn::Turn;
 use crate::feishu::card::tool_render::ToolPanel;
@@ -397,7 +396,7 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
     // Every content write fails at the transport: nothing lands, and the
     // ending is the newest owed payload.
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     let chains = app.cards_handle().chains.clone();
     let writes0 = chains.writes();
 
@@ -428,7 +427,7 @@ async fn a_failed_card_write_stages_and_the_drain_advances_the_cursor_once() {
 
     // Feishu returns: the drain delivers the owed payload, and the reconcile
     // advances the staged cursor exactly once — one persisted write.
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
 
@@ -495,7 +494,7 @@ async fn a_permanently_rejected_write_advances_nothing() {
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
     // Every write is permanently refused (a semantic refusal, not a content
     // rejection): no later write can ever carry the text.
-    platform.fail_update_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, ALWAYS);
 
     // The merged drain keeps the turn running on its own task; the test
     // inspects the refused write's tombstone while it runs.
@@ -577,14 +576,14 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
 
     // A's write fails at the transport: its cursor is staged and tied to the
     // Pending Card Update sequence.
-    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, 1);
     Turn::flush_card(&cards, "ses_test").await;
     let staged_a = Turn::staged_cursor(&cards, "ses_test")
         .await
         .expect("the failed write staged its cursor");
 
     // Its payload delivers — but no reconcile runs, so A is still unconfirmed.
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     assert_eq!(
         cards.chains.cursor("ses_test"),
@@ -680,7 +679,7 @@ async fn the_direct_patch_advance_outranks_an_older_stage_confirmed_later() {
 
     // A's write fails at the transport: its cursor is staged and tied to the
     // Pending Card Update sequence.
-    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, 1);
     Turn::flush_card(&cards, "ses_test").await;
     let staged_a = Turn::staged_cursor(&cards, "ses_test")
         .await
@@ -689,7 +688,7 @@ async fn the_direct_patch_advance_outranks_an_older_stage_confirmed_later() {
     // Its payload delivers — but no reconcile runs, so A is still due and its
     // confirmation has not happened. This is the state a cancelled flush
     // leaves behind.
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     assert_eq!(
         cards.chains.cursor("ses_test"),
@@ -793,7 +792,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
 
     // A's write fails at the transport: the ending is owed, its cursor staged
     // and tied to the Pending Card Update sequence.
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
         .await
         .unwrap();
@@ -818,7 +817,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
 
     // Feishu returns: the owed payload delivers, but no reconcile has run, so
     // nothing is confirmed yet.
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     assert_eq!(
         cards.chains.cursor("ses_test"),
@@ -835,7 +834,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
         ToolPanel::for_test("bash", ToolStatus::Running, None, None),
     )
     .await;
-    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, 1);
     Turn::flush_card(&cards, "ses_test").await;
     let staged_b = Turn::staged_cursor(&cards, "ses_test")
         .await
@@ -898,7 +897,7 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
     );
 
     // B delivers later: its own confirmation now advances the record to it.
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&cards).await;
     assert_eq!(

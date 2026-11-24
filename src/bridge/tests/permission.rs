@@ -2593,9 +2593,7 @@ async fn an_inline_recovery_post_failure_keeps_the_old_block() {
 async fn an_inline_recovery_keeps_the_new_card_when_withdrawal_fails() {
     let _wd = test_work_dir();
     let (app, platform, replies, allow, _dir) = shrunk_summary_fixture().await;
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
 
     let result = app
         .host_action_on_message(allow, "om_live")
@@ -2848,9 +2846,7 @@ async fn a_fallback_withdraws_an_existing_block_to_its_move_receipt() {
 
     // The first withdrawal PATCH fails: the old block and its handle stay, no
     // fallback card is posted, and the request stays retryable.
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
     let mut seen = std::collections::HashSet::new();
     app.permission.sweep(&app.flow_handles(), &mut seen).await;
 

@@ -2386,9 +2386,7 @@ async fn a_failed_actionable_stamp_keeps_the_error_card_current() {
         .expect("the Error card");
     platform.given_card_view("om_error", error_card);
     platform.given_reply_id("om_read");
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
 
     app.handle_message(incoming(
         "msg_card".into(),
@@ -2502,9 +2500,7 @@ async fn a_failed_previous_read_stamp_keeps_the_old_read_current() {
     .await;
     let first = platform.replied_cards().await[0].clone();
     platform.given_card_view("om_idle_1", first);
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
 
     app.handle_message(incoming(
         "msg_card_2".into(),

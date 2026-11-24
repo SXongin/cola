@@ -4160,7 +4160,7 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
     ]);
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
     // Every content write fails at the transport: the ending PATCH is owed.
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     // The repaint delay's clock starts when the carrier is ACCEPTED (#650), so
     // this armed-but-undelivered ending must wait it out from the drain, not
     // from the flush that armed it.
@@ -4189,7 +4189,7 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
     // Feishu returns: the drain delivers the owed update, and only then does the
     // notice's delay start — it is still owed a fifth of a second later (with the
     // wait removed the drain's own delivery would fire it at once).
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
@@ -4337,7 +4337,7 @@ async fn a_deferred_notice_is_suppressed_when_a_new_turn_replaced_the_card() {
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
     // Every content write fails at the transport: the terminal PATCH is owed
     // and the notice is deferred until that exact write drains.
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     let mut context = ctx("ses_test", "你好");
     context.is_group = true;
     context.requester_open_id = Some(TEST_HOST.to_string());
@@ -4358,7 +4358,7 @@ async fn a_deferred_notice_is_suppressed_when_a_new_turn_replaced_the_card() {
 
     // The owed write drains — to the ORIGINAL card. The deferred notice must
     // not follow it to the replacement card's request.
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 

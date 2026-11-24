@@ -907,9 +907,7 @@ async fn a_failed_retried_marker_patch_does_not_block_the_retry() {
 
     // The mark's PATCH fails (one plain platform error); the retry must still
     // go ahead.
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;

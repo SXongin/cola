@@ -413,6 +413,32 @@ pub enum ReplyOutcome {
     Refused(u16),
 }
 
+/// "No count": a scripted failure stays until the test clears it.
+pub(crate) const ALWAYS: usize = usize::MAX;
+
+/// The consequence a scripted `update_message` call has. The five shapes all
+/// steer the same call, so a test expresses its failure with one knob — this
+/// enum — instead of a counter per shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateFailure {
+    /// A plain Feishu API error: the caller only warns (spec #391).
+    Permanent,
+    /// `230099` card-content rejection: degrade and retry.
+    ContentRefused,
+    /// `230002` message gone, inside a 2xx body: permanent, stop retrying.
+    MessageGone,
+    /// A bare HTTP 404: says nothing about the message, keep the retry state.
+    Http404,
+    /// A transport-class error (`BridgeError::Io`): ambiguous, the PATCH may
+    /// have landed.
+    Transport,
+    /// A plain Feishu error only for a card whose JSON contains this needle.
+    /// The live patch loop rewrites its card on its own cadence, so a global
+    /// count cannot aim at one write under test (a pull's freeze, say); a
+    /// content match can.
+    Content(&'static str),
+}
+
 /// Records every card cola would send, instead of posting to Feishu.
 pub struct RecordingPlatform {
     pub calls: Arc<tokio::sync::Mutex<Vec<PlatformCall>>>,
@@ -444,32 +470,12 @@ pub struct RecordingPlatform {
     /// retried without duplicating receipts, while the loading card's own
     /// reply — if any — succeeds).
     pub fail_reply_card_count: std::sync::atomic::AtomicUsize,
-    /// The next N `update_message` calls fail with a card-content rejection
-    /// (`230099`, what Feishu returns for a card whose markdown it refuses):
-    /// the flush must degrade the card and retry instead of resending it.
-    pub fail_update_card_content_count: std::sync::atomic::AtomicUsize,
-    /// The next N `update_message` calls fail with a plain Feishu error: the
-    /// caller must only warn (the retry's `Retried` marker PATCH must never
-    /// block the retry itself, spec #391).
-    pub fail_update_count: std::sync::atomic::AtomicUsize,
-    /// The next N `update_message` calls report Feishu's message-gone error
-    /// (`230002`, delivered inside a 2xx body as an API code) — the permanent
-    /// shape a caller neutralizing a card must stop retrying.
-    pub fail_update_message_gone_count: std::sync::atomic::AtomicUsize,
-    /// The next N `update_message` calls fail with a bare HTTP 404. Unlike the
-    /// `230002` shape this says nothing about the message (a proxy, an endpoint
-    /// outage), so a caller must keep its retry state.
-    pub fail_update_http_404_count: std::sync::atomic::AtomicUsize,
-    /// The next N `update_message` calls fail with a transport-class error
-    /// (`BridgeError::Io`, the shape a timeout or dropped connection surfaces
-    /// as) instead of an API response. An ambiguous failure: the PATCH may
-    /// have landed, so callers must not treat it as a definite card rejection.
-    pub fail_update_transport_count: std::sync::atomic::AtomicUsize,
-    /// `(needle, remaining)`: the next N `update_message` calls whose card JSON
-    /// contains `needle` fail before landing. The live patch loop rewrites its
-    /// card on its own cadence, so a global counter cannot aim at one write under
-    /// test (a pull's freeze, say); a content match can.
-    pub fail_update_containing: std::sync::Mutex<Vec<(String, usize)>>,
+    /// The scripted `update_message` failure: `Some((failure, remaining))`,
+    /// where `remaining` is how many calls it still applies to ([`ALWAYS`]
+    /// keeps it until [`clear_fail_update`]). One field, one consequence per
+    /// call: the five shapes all steer the same call, so a test names the
+    /// consequence it means and nothing else.
+    pub fail_update: std::sync::Mutex<Option<(UpdateFailure, usize)>>,
     /// The next N `reply_card` calls fail with the same typed rejection, for
     /// the continuation-send recovery path.
     pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
@@ -590,12 +596,7 @@ impl RecordingPlatform {
             hang_topic_messages: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_in_thread_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_update_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_update_message_gone_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_update_http_404_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_update_transport_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_update_containing: std::sync::Mutex::new(Vec::new()),
+            fail_update: std::sync::Mutex::new(None),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize::new(0),
             reply_card_outcomes: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -663,13 +664,15 @@ impl RecordingPlatform {
         self.reply_card_outcomes.lock().unwrap().push_back(outcome);
     }
 
-    /// Fail the next `count` `update_message` calls whose card JSON contains
-    /// `needle`, leaving every other card's writes alone.
-    pub fn fail_updates_containing(&self, needle: &str, count: usize) {
-        self.fail_update_containing
-            .lock()
-            .unwrap()
-            .push((needle.to_string(), count));
+    /// Script the next `times` `update_message` calls to fail with `failure`;
+    /// [`ALWAYS`] keeps it until [`clear_fail_update`].
+    pub fn fail_update(&self, failure: UpdateFailure, times: usize) {
+        *self.fail_update.lock().unwrap() = Some((failure, times));
+    }
+
+    /// Stop scripting `update_message` failures.
+    pub fn clear_fail_update(&self) {
+        *self.fail_update.lock().unwrap() = None;
     }
 
     /// Park the first `method` call targeting `target` until `release`, after
@@ -1053,60 +1056,33 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn update_message(&self, message_id: &str, card: &serde_json::Value) -> crate::error::Result<()> {
-        // A per-content failure the caller can aim: the live patch loop writes
-        // the same card on its own cadence, so a global counter would be eaten
-        // by it before the write under test.
-        let targeted = {
-            let mut failing = self.fail_update_containing.lock().unwrap();
-            let card_json = card.to_string();
-            match failing
-                .iter_mut()
-                .find(|(needle, remaining)| *remaining > 0 && card_json.contains(needle.as_str()))
-            {
-                Some((_, remaining)) => {
-                    *remaining -= 1;
-                    true
-                }
+        let failure = {
+            let mut scripted = self.fail_update.lock().unwrap();
+            let applicable = match scripted.as_ref() {
+                Some((UpdateFailure::Content(needle), _)) => card.to_string().contains(*needle),
+                Some(_) => true,
                 None => false,
+            };
+            if !applicable {
+                None
+            } else {
+                let failure = scripted.as_ref().map(|(failure, _)| *failure);
+                let spent = scripted.as_mut().is_some_and(|(_, remaining)| {
+                    if *remaining == ALWAYS {
+                        false
+                    } else if *remaining <= 1 {
+                        true
+                    } else {
+                        *remaining -= 1;
+                        false
+                    }
+                });
+                if spent {
+                    *scripted = None;
+                }
+                failure
             }
         };
-        let rejected = self
-            .fail_update_card_content_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0;
-        if rejected {
-            self.fail_update_card_content_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        let failed = self.fail_update_count.load(std::sync::atomic::Ordering::SeqCst) > 0;
-        if failed {
-            self.fail_update_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        let transport_failed = self
-            .fail_update_transport_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0;
-        if transport_failed {
-            self.fail_update_transport_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        let message_gone = self
-            .fail_update_message_gone_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0;
-        if message_gone {
-            self.fail_update_message_gone_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        let http_404 = self
-            .fail_update_http_404_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0;
-        if http_404 {
-            self.fail_update_http_404_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
         let gate = self.take_gate("update", message_id);
         let accepted_before_reply = gate.as_ref().is_some_and(|gate| gate.accepted_before_reply);
         if accepted_before_reply {
@@ -1124,40 +1100,30 @@ impl feishu::Platform for RecordingPlatform {
                 card: card.clone(),
             });
         }
-        if targeted {
-            return Err(crate::error::BridgeError::Feishu(
+        match failure {
+            None => Ok(()),
+            Some(UpdateFailure::Permanent) => Err(crate::error::BridgeError::Feishu(
                 "simulated card update failure".into(),
-            ));
-        }
-        if rejected {
-            return Err(crate::error::BridgeError::CardContentRejected {
+            )),
+            Some(UpdateFailure::ContentRefused) => Err(crate::error::BridgeError::CardContentRejected {
                 code: 230099,
                 detail: "simulated card content rejection".into(),
-            });
-        }
-        if failed {
-            return Err(crate::error::BridgeError::Feishu(
-                "simulated card update failure".into(),
-            ));
-        }
-        if transport_failed {
-            return Err(crate::error::BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "simulated update transport failure",
-            )));
-        }
-        if message_gone {
-            return Err(crate::error::BridgeError::Feishu(
+            }),
+            Some(UpdateFailure::MessageGone) => Err(crate::error::BridgeError::Feishu(
                 "update error 230002: message not found".into(),
-            ));
-        }
-        if http_404 {
-            return Err(crate::error::BridgeError::FeishuHttp {
+            )),
+            Some(UpdateFailure::Http404) => Err(crate::error::BridgeError::FeishuHttp {
                 status: 404,
                 detail: "simulated bare 404".into(),
-            });
+            }),
+            Some(UpdateFailure::Content(_)) => Err(crate::error::BridgeError::Feishu(
+                "simulated card update failure".into(),
+            )),
+            Some(UpdateFailure::Transport) => Err(crate::error::BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated update transport failure",
+            ))),
         }
-        Ok(())
     }
 
     async fn edit_message(

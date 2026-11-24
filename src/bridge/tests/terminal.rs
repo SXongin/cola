@@ -5328,9 +5328,7 @@ async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
     seed_entry(&app, entry(&key, proj.path())).await;
     // Every card write fails in this process: the run ends and its record says
     // so, while the one write that would tell the card never lands.
-    platform
-        .fail_update_count
-        .store(usize::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, ALWAYS);
 
     send_command_in(
         &app,
@@ -5427,9 +5425,7 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
         .lock()
         .unwrap()
         .extend(["msg_card_old".into(), "msg_card_new".into()]);
-    platform
-        .fail_update_count
-        .store(usize::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, ALWAYS);
 
     send_command_in(
         &app,
@@ -5450,9 +5446,7 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
 
     // The chat runs again before any restart: its pre-spawn write replaces the
     // per-chat record. That is precisely the write the obligation must survive.
-    platform
-        .fail_update_count
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    platform.clear_fail_update();
     send_command_in(
         &app,
         "/run printf 'new-run-827\\n'",
@@ -5616,9 +5610,7 @@ async fn an_owed_settle_is_repaired_even_when_the_current_record_is_unreadable()
     let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
-    platform
-        .fail_update_count
-        .store(usize::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, ALWAYS);
 
     send_command_in(
         &app,
@@ -6510,7 +6502,7 @@ async fn a_pull_whose_freeze_fails_is_undone() {
 
     // Both freeze attempts are refused; the undo (a live card, no 「已下移」)
     // still lands.
-    platform.fail_updates_containing("已下移", 2);
+    platform.fail_update(UpdateFailure::Content("已下移"), 2);
     send_command_in(
         &app,
         "/run",
@@ -6675,7 +6667,7 @@ async fn a_failed_freeze_past_the_cap_still_restores_the_run_card() {
     // The cap card: 已达时限, and 继续 is offered.
     live_card_with(&platform, "continue").await;
 
-    platform.fail_updates_containing("已下移", 2);
+    platform.fail_update(UpdateFailure::Content("已下移"), 2);
     send_command_in(
         &app,
         "/run",
