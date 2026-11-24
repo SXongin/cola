@@ -933,10 +933,8 @@ async fn restart_announce_topic_failure_falls_back_to_chat() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let platform = Arc::new(RecordingPlatform {
-        fail_reply_card: true,
-        ..RecordingPlatform::new()
-    });
+    let platform = Arc::new(RecordingPlatform::new());
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 100);
     let app = Arc::new(
         App::new(
             cfg,

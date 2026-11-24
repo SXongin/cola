@@ -6418,9 +6418,7 @@ async fn a_pull_that_cannot_post_the_new_card_changes_nothing() {
     // The "accepted remotely, response lost" shape: the create DID land, and cola
     // has no id to write to. `ReplyOutcome::Ambiguous` cannot model this (the
     // mock returns before recording the send); this seam records it.
-    platform
-        .fail_reply_card_after_send_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::AfterSend, 1);
     send_command_in(
         &app,
         "/run",

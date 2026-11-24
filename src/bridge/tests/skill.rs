@@ -686,9 +686,7 @@ async fn an_unknown_skill_id_shows_an_error_and_the_list_without_reaching_the_mo
 #[tokio::test]
 async fn a_failed_picker_card_falls_back_to_a_text_list() {
     let fx = SkillFixture::build().await;
-    fx.platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     fx.send("/skill").await;
 
@@ -857,9 +855,7 @@ async fn a_rejected_loaded_skill_card_falls_back_to_text_with_the_body() {
     let fx = SkillFixture::build().await;
     // The FIRST reply is the loaded-skill card; failing it forces the text
     // fallback (the Turn's own card is a later reply and is unaffected).
-    fx.platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     fx.send("/skill implement-spec").await;
 
@@ -902,9 +898,7 @@ async fn a_rejected_card_fallback_shows_the_same_body_extent_as_the_card() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_skills(vec![fixture_skill()]);
     let fx = SkillFixture::with(backend).await;
-    fx.platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
     fx.send("/skill long").await;
     let texts = fx.platform.texts().await;
     let fallback = texts
@@ -941,9 +935,7 @@ async fn a_large_picker_fallback_stays_bounded() {
     backend.with_skills(many);
     let fx = SkillFixture::with(backend).await;
     // Fail the first picker card so the bare `/skill` degrades to text.
-    fx.platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     fx.send("/skill").await;
 
@@ -964,9 +956,7 @@ async fn a_large_picker_fallback_stays_bounded() {
 #[tokio::test]
 async fn a_long_unknown_id_picker_fallback_is_bounded() {
     let fx = SkillFixture::build().await;
-    fx.platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     let long = "z".repeat(20_000);
     fx.send(&format!("/skill {long}")).await;

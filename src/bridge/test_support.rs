@@ -406,11 +406,22 @@ pub enum ReplyOutcome {
     Lands,
     /// An ambiguous transport failure: the create may have landed.
     Ambiguous,
+    /// A plain Feishu API error: a definite failure, no message created (the
+    /// restart-announce fallback, a continuation receipt that stays queued).
+    Failed,
     /// A definite card-content rejection (`230099`): no message was created.
     Rejected,
+    /// A card-content rejection whose attempt is recorded first — the
+    /// continuation-send tests count the refused create alongside its retry.
+    RejectedRecorded,
     /// A definite HTTP refusal with this status (a 4xx): no message was
     /// created.
     Refused(u16),
+    /// The send is recorded — as if Feishu accepted it — and then a
+    /// transport-class error is returned: the "accepted remotely, response
+    /// lost" shape a single-shot create must never repeat (spec #561, review
+    /// #569).
+    AfterSend,
 }
 
 /// "No count": a scripted failure stays until the test clears it.
@@ -446,16 +457,10 @@ pub struct RecordingPlatform {
     pub user_names: std::collections::HashMap<String, String>,
     /// chat_id → display name served by `chat_name` (absent = None).
     pub chat_names: std::collections::HashMap<String, String>,
-    /// When true, `send_card` fails (tests the topic-cover fallback path).
-    pub fail_send_card: bool,
-    /// The next N `send_card` calls fail definitely (a Location Form reopen's
-    /// failed send leaves the dismissal in place).
-    pub fail_send_card_count: std::sync::atomic::AtomicUsize,
-    /// When true, `reply_card` fails (tests the restart-announce fallback).
-    pub fail_reply_card: bool,
-    /// When true, `reply_in_thread` fails (tests that a failed in-topic
-    /// confirmation is propagated instead of adopting with no anchor).
-    pub fail_reply_in_thread: bool,
+    /// The next N `send_card` calls fail definitely (the topic cover falls
+    /// back to the command root; a Location Form reopen's failed send leaves
+    /// the dismissal in place). 0 = none, [`ALWAYS`] = until cleared.
+    pub fail_send_card: std::sync::atomic::AtomicUsize,
     /// When true, `list_messages` returns nothing: a topic with no reachable
     /// anchor (a Location Form push defers rather than falling back to the
     /// Chat lobby).
@@ -464,29 +469,20 @@ pub struct RecordingPlatform {
     /// must be bounded like every other sweep read.
     pub hang_topic_messages: std::sync::atomic::AtomicUsize,
     /// The next N `reply_in_thread` calls fail, then the call succeeds — a
-    /// transient failure a test can retry past.
-    pub fail_reply_in_thread_count: std::sync::atomic::AtomicUsize,
-    /// The next N `reply_card` calls fail (a CONTINUATION send that must be
-    /// retried without duplicating receipts, while the loading card's own
-    /// reply — if any — succeeds).
-    pub fail_reply_card_count: std::sync::atomic::AtomicUsize,
+    /// transient failure a test can retry past; [`ALWAYS`] never recovers, so
+    /// a failed in-topic confirmation is propagated instead of adopting with
+    /// no anchor.
+    pub fail_reply_in_thread: std::sync::atomic::AtomicUsize,
     /// The scripted `update_message` failure: `Some((failure, remaining))`,
     /// where `remaining` is how many calls it still applies to ([`ALWAYS`]
     /// keeps it until [`clear_fail_update`]). One field, one consequence per
     /// call: the five shapes all steer the same call, so a test names the
     /// consequence it means and nothing else.
     pub fail_update: std::sync::Mutex<Option<(UpdateFailure, usize)>>,
-    /// The next N `reply_card` calls fail with the same typed rejection, for
-    /// the continuation-send recovery path.
-    pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
-    /// The next N `reply_card` calls record the send — as if Feishu accepted
-    /// it — and then return a transport-class error: the "accepted remotely,
-    /// response lost" shape a single-shot create must never repeat (spec #561,
-    /// review #569).
-    pub fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize,
     /// Scripted `reply_card` outcomes, popped in call order; empty means every
-    /// send lands. Lets a test drive a projection create's exact failure class
-    /// (spec #561, review #569) or stop its chain at a known slice.
+    /// send lands. Lets a test drive a create's exact failure class (spec #561,
+    /// review #569), including one that records the send first, or stop its
+    /// chain at a known slice.
     pub reply_card_outcomes: std::sync::Mutex<std::collections::VecDeque<ReplyOutcome>>,
     /// When set, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
@@ -588,17 +584,11 @@ impl RecordingPlatform {
             calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             user_names: std::collections::HashMap::new(),
             chat_names: std::collections::HashMap::new(),
-            fail_send_card: false,
-            fail_send_card_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_reply_card: false,
-            fail_reply_in_thread: false,
+            fail_send_card: std::sync::atomic::AtomicUsize::new(0),
+            fail_reply_in_thread: std::sync::atomic::AtomicUsize::new(0),
             no_topic_messages: std::sync::atomic::AtomicBool::new(false),
             hang_topic_messages: std::sync::atomic::AtomicUsize::new(0),
-            fail_reply_in_thread_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_reply_card_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update: std::sync::Mutex::new(None),
-            fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
-            fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize::new(0),
             reply_card_outcomes: std::sync::Mutex::new(std::collections::VecDeque::new()),
             fail_instant_reminder: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
@@ -662,6 +652,28 @@ impl RecordingPlatform {
     /// recorded (it never reached Feishu).
     pub fn given_reply_card_outcome(&self, outcome: ReplyOutcome) {
         self.reply_card_outcomes.lock().unwrap().push_back(outcome);
+    }
+
+    /// Queue `times` copies of `outcome` — the per-call script's "the next N
+    /// sends fail this way".
+    pub fn given_reply_card_outcomes(&self, outcome: ReplyOutcome, times: usize) {
+        self.reply_card_outcomes
+            .lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(outcome, times));
+    }
+
+    /// Fail the next `times` `send_card` calls; [`ALWAYS`] keeps it until the
+    /// counter is reset to zero.
+    pub fn fail_send_card(&self, times: usize) {
+        self.fail_send_card
+            .store(times, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail the next `times` `reply_in_thread` calls; [`ALWAYS`] never recovers.
+    pub fn fail_reply_in_thread(&self, times: usize) {
+        self.fail_reply_in_thread
+            .store(times, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Script the next `times` `update_message` calls to fail with `failure`;
@@ -918,13 +930,17 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {
-        if self
-            .fail_reply_card_content_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
-            self.fail_reply_card_content_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // One scripted outcome per call drives the create's failure class (or
+        // lands it). A failed send is not recorded — it never reached Feishu —
+        // except the two shapes whose whole point is what the attempt left
+        // behind.
+        let outcome = self.reply_card_outcomes.lock().unwrap().pop_front();
+        if let Some(ReplyOutcome::Failed) = outcome {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated reply_card failure".into(),
+            ));
+        }
+        if let Some(ReplyOutcome::RejectedRecorded) = outcome {
             self.calls.lock().await.push(PlatformCall::ReplyCard {
                 reply_to: reply_to.into(),
                 card: card.clone(),
@@ -933,22 +949,6 @@ impl feishu::Platform for RecordingPlatform {
                 code: 230099,
                 detail: "simulated card content rejection".into(),
             });
-        }
-        if self.fail_reply_card {
-            return Err(crate::error::BridgeError::Feishu(
-                "simulated reply_card failure".into(),
-            ));
-        }
-        if self
-            .fail_reply_card_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
-            self.fail_reply_card_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            return Err(crate::error::BridgeError::Feishu(
-                "simulated reply_card failure".into(),
-            ));
         }
         // The scripted id is consumed when the call is MADE, before any gate
         // parks it: a create parked in flight must not let the next reply take
@@ -959,15 +959,7 @@ impl feishu::Platform for RecordingPlatform {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| "msg_reply".into());
-        // The "accepted remotely, response lost" shape: the send is recorded,
-        // then a transport error is returned (spec #561, review #569).
-        if self
-            .fail_reply_card_after_send_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
-            self.fail_reply_card_after_send_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(ReplyOutcome::AfterSend) = outcome {
             self.calls.lock().await.push(PlatformCall::ReplyCard {
                 reply_to: reply_to.into(),
                 card: card.clone(),
@@ -977,9 +969,7 @@ impl feishu::Platform for RecordingPlatform {
                 "simulated accepted-but-lost reply_card response",
             )));
         }
-        // A scripted outcome drives the create's failure class (or lands it):
-        // a failed send is not recorded — it never reached Feishu.
-        match self.reply_card_outcomes.lock().unwrap().pop_front() {
+        match outcome {
             None | Some(ReplyOutcome::Lands) => {}
             Some(ReplyOutcome::Ambiguous) => {
                 return Err(crate::error::BridgeError::Io(std::io::Error::new(
@@ -999,6 +989,9 @@ impl feishu::Platform for RecordingPlatform {
                     detail: "simulated reply_card refusal".into(),
                 });
             }
+            Some(ReplyOutcome::Failed)
+            | Some(ReplyOutcome::RejectedRecorded)
+            | Some(ReplyOutcome::AfterSend) => {}
         }
         if let Some(gate) = self.take_gate("reply", reply_to) {
             wait_gate(gate).await;
@@ -1019,15 +1012,12 @@ impl feishu::Platform for RecordingPlatform {
         if let Some(gate) = self.take_gate("send", receive_id) {
             wait_gate(gate).await;
         }
-        let scripted_failure = self
-            .fail_send_card_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0;
-        if scripted_failure {
-            self.fail_send_card_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        if self.fail_send_card || scripted_failure {
+        let remaining = self.fail_send_card.load(std::sync::atomic::Ordering::SeqCst);
+        if remaining > 0 {
+            if remaining != ALWAYS {
+                self.fail_send_card
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
             return Err(crate::error::BridgeError::Feishu(
                 "simulated send_card failure".into(),
             ));
@@ -1208,15 +1198,14 @@ impl feishu::Platform for RecordingPlatform {
         message_id: &str,
         text: &str,
     ) -> crate::error::Result<(String, Option<String>)> {
-        let transient = self
-            .fail_reply_in_thread_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0;
-        if transient {
-            self.fail_reply_in_thread_count
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        if self.fail_reply_in_thread || transient {
+        let remaining = self
+            .fail_reply_in_thread
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if remaining > 0 {
+            if remaining != ALWAYS {
+                self.fail_reply_in_thread
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
             return Err(crate::error::BridgeError::Feishu(
                 "simulated reply_in_thread failure".into(),
             ));

@@ -2561,9 +2561,7 @@ async fn shrunk_summary_fixture() -> (
 async fn an_inline_recovery_post_failure_keeps_the_old_block() {
     let _wd = test_work_dir();
     let (app, platform, replies, allow, _dir) = shrunk_summary_fixture().await;
-    platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     let result = app
         .host_action_on_message(allow, "om_live")
@@ -5239,9 +5237,7 @@ async fn a_failed_companion_and_failed_fallback_send_keep_the_request_retryable(
     platform
         .fail_send_message_definite_count
         .store(4, std::sync::atomic::Ordering::SeqCst);
-    platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
     seed_live_card(&app, "ses_test", "om_live").await;
 
     // The same `seen` set across both sweeps: a failed fallback must not retire
