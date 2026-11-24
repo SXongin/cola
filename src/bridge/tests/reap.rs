@@ -18,6 +18,7 @@ use super::drain::{
     assistant, ctx, script_transcript, scripted_app, settle_tool, spawn_sync, spawn_sync_with_timeout,
     spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text, wait_for_guard_release,
 };
+use super::wake::wait_for_any_card;
 use crate::backend::types::{SessionListInfo, SessionStatus};
 use crate::backend::{
     BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part,
@@ -2080,19 +2081,7 @@ async fn a_takeover_collect_releases_the_cache_only_when_its_write_lands() {
     takeover.await.unwrap();
     // The release follows the delivery in the detached continuation (spec #571
     // review).
-    wait_for(
-        &format!("{}'s cached presentation is released", "om_frozen"),
-        || async {
-            app.cards_handle()
-                .card_handles
-                .lock()
-                .await
-                .cached_card("om_frozen")
-                .is_none()
-                .then_some(())
-        },
-    )
-    .await;
+    wait_for_cache_release(&app, "om_frozen").await;
 }
 
 /// A collect that fails recoverably and is later delivered by the drain still
@@ -2136,19 +2125,7 @@ async fn a_recoverably_failed_collect_releases_the_cache() {
 
     // The write is owed — its delivery comes later, without this caller — and
     // the detached continuation releases the cache at the failure.
-    wait_for(
-        &format!("{}'s cached presentation is released", "om_frozen"),
-        || async {
-            app.cards_handle()
-                .card_handles
-                .lock()
-                .await
-                .cached_card("om_frozen")
-                .is_none()
-                .then_some(())
-        },
-    )
-    .await;
+    wait_for_cache_release(&app, "om_frozen").await;
 
     // The drain delivers the owed collect: the card is collected, and the
     // stale cache stays gone.
@@ -2370,11 +2347,7 @@ async fn a_stamp_over_a_seeding_takeover_collects_without_the_seeded_tail() {
     // The takeover's collect read the orphan's view (the stamp's own read was
     // the first): the observed proof it reached its composition — its PATCH
     // queues behind the parked stamp, which lands first.
-    wait_for(
-        &format!("{} reaches {} card-view reads", "om_frozen", 2),
-        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
-    )
-    .await;
+    wait_for_card_views(&platform, "om_frozen", 2).await;
     release.notify_one();
     // The collect is the orphan's second write: the parked stamp, then the
     // takeover's queued collect. Waiting for it pins the interleaving this
@@ -2486,11 +2459,7 @@ async fn a_stamp_over_an_empty_takeover_collects_without_the_ledger() {
     let turn = spawn_turn(&app, context);
     // The takeover's collect read the orphan's view (the stamp's own read was
     // the first): the observed proof it reached its composition.
-    wait_for(
-        &format!("{} reaches {} card-view reads", "om_frozen", 2),
-        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
-    )
-    .await;
+    wait_for_card_views(&platform, "om_frozen", 2).await;
     release.notify_one();
     wait_for_patches(&platform, "om_frozen", 2).await;
 
@@ -3057,11 +3026,7 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
-    wait_for(
-        &format!("{} reaches {} card-view reads", "om_frozen", 2),
-        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
-    )
-    .await;
+    wait_for_card_views(&platform, "om_frozen", 2).await;
     assert!(
         patches_to(&platform, "om_frozen").await.is_empty(),
         "no settle lands while the stamp write is in flight: {:?}",
@@ -3424,14 +3389,7 @@ async fn a_projection_announces_a_wake_newer_than_the_watermark() {
         successor_text.contains(resumed),
         "the resumed work lands: {successor}"
     );
-    wait_for(&format!("the Wake Watermark reaches {}", 3_600), || async {
-        app.cards_handle()
-            .chains
-            .announced("ses_test")
-            .is_some_and(|mark| mark.created_ms >= 3_600)
-            .then_some(())
-    })
-    .await;
+    wait_for_announced(&app, "ses_test", 3_600).await;
 }
 
 /// A record-carrying chain's Wake goes through the projection (spec #561,
@@ -3562,14 +3520,7 @@ async fn a_projection_announces_its_wake_across_a_second_restart() {
     let (_successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(successor_text.contains(resumed), "{successor_text}");
     wait_for_record_gone(&app, "ses_test").await;
-    wait_for(&format!("the Wake Watermark reaches {}", 2_900), || async {
-        app.cards_handle()
-            .chains
-            .announced("ses_test")
-            .is_some_and(|mark| mark.created_ms >= 2_900)
-            .then_some(())
-    })
-    .await;
+    wait_for_announced(&app, "ses_test", 2_900).await;
     drop(app); // life 1 ends
 
     // Life 2: the record is spent, so the chain is recordless and only the
@@ -4359,11 +4310,7 @@ async fn a_takeover_collect_is_not_dropped_behind_an_ordinary_collect() {
         })
     };
     // Both collects read the card (the ordinary one's read was the first).
-    wait_for(
-        &format!("{} reaches {} card-view reads", "om_frozen", 2),
-        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
-    )
-    .await;
+    wait_for_card_views(&platform, "om_frozen", 2).await;
 
     release.notify_one();
     ordinary.await.unwrap();
@@ -6420,7 +6367,7 @@ async fn a_failed_projection_create_advances_nothing() {
     let (app, platform, _backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     // Every successor create fails at the platform.
-    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 100);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, ALWAYS);
 
     spawn_sync(&app);
     // The next pass never re-posts: it settles the old card in place by
@@ -6933,14 +6880,7 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
         "the adoption follows the live run: {successor}"
     );
     assert!(successor_text.contains("CI 通过了。"), "{successor}");
-    wait_for(&format!("the Wake Watermark reaches {}", 2_900), || async {
-        app.cards_handle()
-            .chains
-            .announced("ses_test")
-            .is_some_and(|mark| mark.created_ms >= 2_900)
-            .then_some(())
-    })
-    .await;
+    wait_for_announced(&app, "ses_test", 2_900).await;
 }
 
 /// An Idle Session Card in the map is a read, not a chain card (ADR-0100), so
@@ -8280,8 +8220,9 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
 pub(crate) async fn wait_for_cursor(
     app: &Arc<App>,
     ready: impl Fn(&RenderedCursor) -> bool,
+    condition: &str,
 ) -> RenderedCursor {
-    wait_for("the record's cursor reaches the awaited shape", || async {
+    wait_for(condition, || async {
         app.cards_handle()
             .chains
             .cursor("ses_test")
@@ -8351,18 +8292,27 @@ async fn a_restart_does_not_re_render_a_settled_tool_delivered_after_the_text() 
     // as the old out-of-turn follow did.
     let _turn = spawn_turn(&app1, ctx("ses_test", "跑个长命令"));
     wait_for_card_text(&platform1, delivered).await;
-    wait_for_cursor(&app1, |cursor| cursor.live_calls.contains("call_sleep")).await;
+    wait_for_cursor(
+        &app1,
+        |cursor| cursor.live_calls.contains("call_sleep"),
+        "the cursor carries the live shell call",
+    )
+    .await;
 
     // The server settles the call: the next confirmed write's frontier must
     // name it (the live set empties and the extent stays the text's).
     settle_tool(&backend1, ToolStatus::Completed, "done").await;
-    wait_for_cursor(&app1, |cursor| {
-        cursor.live_calls.is_empty()
-            && cursor
-                .frontier
-                .as_ref()
-                .is_some_and(|frontier| frontier.delivered_chars == delivered.chars().count())
-    })
+    wait_for_cursor(
+        &app1,
+        |cursor| {
+            cursor.live_calls.is_empty()
+                && cursor
+                    .frontier
+                    .as_ref()
+                    .is_some_and(|frontier| frontier.delivered_chars == delivered.chars().count())
+        },
+        "the frontier reaches the delivered prefix with no live call",
+    )
     .await;
     // Life 1 ends here; a fresh process takes the sidecar over.
     drop(app1);
@@ -8700,12 +8650,16 @@ async fn a_mid_chain_projection_failure_keeps_only_the_landed_slices() {
     platform.given_reply_card_outcome(crate::bridge::test_support::ReplyOutcome::Ambiguous);
 
     spawn_sync(&app);
-    let cursor = wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.delivered_chars > delivered.chars().count())
-    })
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.delivered_chars > delivered.chars().count())
+        },
+        "the frontier advances past the delivered prefix",
+    )
     .await;
     let landed = cursor
         .frontier
@@ -9052,12 +9006,16 @@ async fn a_rewritten_part_persists_a_resolvable_cursor_for_the_restart() {
         // renders, then drops its own handle.
         let _turn = spawn_turn(&app1, ctx("ses_test", "问题"));
         wait_for_card_text(&platform1, first).await;
-        wait_for_cursor(&app1, |cursor| {
-            cursor
-                .frontier
-                .as_ref()
-                .is_some_and(|frontier| frontier.delivered_chars == first.chars().count())
-        })
+        wait_for_cursor(
+            &app1,
+            |cursor| {
+                cursor
+                    .frontier
+                    .as_ref()
+                    .is_some_and(|frontier| frontier.delivered_chars == first.chars().count())
+            },
+            "the frontier reaches the first part",
+        )
         .await;
 
         rewrite_scripted_part(&backend1, rewritten).await;
@@ -9065,12 +9023,16 @@ async fn a_rewritten_part_persists_a_resolvable_cursor_for_the_restart() {
         // The rewrite's confirmed write persists the replacement's digest at
         // its own full length — red before the fix, which accumulated the two
         // snapshots and left the cursor digestless.
-        let cursor = wait_for_cursor(&app1, |cursor| {
-            cursor.frontier.as_ref().is_some_and(|frontier| {
-                frontier.delivered_chars == rewritten.chars().count()
-                    && frontier.prefix_digest == Some(cursor_prefix_digest(rewritten))
-            })
-        })
+        let cursor = wait_for_cursor(
+            &app1,
+            |cursor| {
+                cursor.frontier.as_ref().is_some_and(|frontier| {
+                    frontier.delivered_chars == rewritten.chars().count()
+                        && frontier.prefix_digest == Some(cursor_prefix_digest(rewritten))
+                })
+            },
+            "the frontier reaches the rewritten part",
+        )
         .await;
         drop(cursor);
         // Life 1 ends here; a fresh process takes the sidecar over.
@@ -9381,12 +9343,16 @@ async fn a_live_rewrite_of_the_frontier_part_replaces_the_successors_run() {
         1,
         "the adoption shows the streamed tail once: {successor}"
     );
-    wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.delivered_chars == adopted.chars().count())
-    })
+    wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.delivered_chars == adopted.chars().count())
+        },
+        "the frontier reaches the adopted part",
+    )
     .await;
 
     // The run rewrites the frontier part in place under the live follow.
@@ -9414,12 +9380,16 @@ async fn a_live_rewrite_of_the_frontier_part_replaces_the_successors_run() {
         "the rewritten-away run leaves the successor's card: {update}"
     );
     // The cursor reflects the rewritten part.
-    wait_for_cursor(&app, |cursor| {
-        cursor.frontier.as_ref().is_some_and(|frontier| {
-            frontier.delivered_chars == rewritten.chars().count()
-                && frontier.prefix_digest == Some(cursor_prefix_digest(rewritten))
-        })
-    })
+    wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor.frontier.as_ref().is_some_and(|frontier| {
+                frontier.delivered_chars == rewritten.chars().count()
+                    && frontier.prefix_digest == Some(cursor_prefix_digest(rewritten))
+            })
+        },
+        "the frontier reaches the rewritten part",
+    )
     .await;
 }
 
@@ -9693,23 +9663,7 @@ async fn a_stopped_live_chain_after_a_failed_continuation_is_still_followed() {
             ])],
         )
         .await;
-    wait_for(
-        &format!("a card carries {:?}", "重启之后的尾巴。"),
-        || async {
-            let posted = platform
-                .replied_cards()
-                .await
-                .iter()
-                .any(|card| card_text(card).contains("重启之后的尾巴。"));
-            let updated = platform
-                .updated_cards()
-                .await
-                .iter()
-                .any(|card| card_text(card).contains("重启之后的尾巴。"));
-            (posted || updated).then_some(())
-        },
-    )
-    .await;
+    wait_for_any_card(&platform, "重启之后的尾巴。").await;
 }
 
 /// A live projection that stops at the CHAIN BOUND is still followed (spec
@@ -9759,23 +9713,7 @@ async fn a_chain_bound_stop_of_a_live_projection_is_still_followed() {
             ])],
         )
         .await;
-    wait_for(
-        &format!("a card carries {:?}", "重启之后的尾巴。"),
-        || async {
-            let posted = platform
-                .replied_cards()
-                .await
-                .iter()
-                .any(|card| card_text(card).contains("重启之后的尾巴。"));
-            let updated = platform
-                .updated_cards()
-                .await
-                .iter()
-                .any(|card| card_text(card).contains("重启之后的尾巴。"));
-            (posted || updated).then_some(())
-        },
-    )
-    .await;
+    wait_for_any_card(&platform, "重启之后的尾巴。").await;
 }
 
 /// The message-first race with an identical answer (spec #561, review #569):
@@ -10435,7 +10373,12 @@ async fn a_restart_re_renders_nothing_for_two_parts_at_one_server_time() {
     context.cola_message_id = Some("msg_cola_anchor".into());
     let turn = spawn_turn(&app, context);
     wait_for_card_text(&platform, second).await;
-    let cursor = wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| cursor.frontier.is_some(),
+        "the cursor has a frontier",
+    )
+    .await;
     assert_eq!(
         cursor.frontier.as_ref().map(|frontier| frontier.part_index),
         Some(1),
@@ -10720,7 +10663,12 @@ async fn a_restart_renders_a_long_reasoning_parts_undisclosed_suffix() {
     context.cola_message_id = Some("msg_cola_anchor".into());
     let turn = spawn_turn(&app, context);
     wait_for_card_text(&platform, shown).await;
-    let cursor = wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| cursor.frontier.is_some(),
+        "the cursor has a frontier",
+    )
+    .await;
     assert_eq!(
         cursor
             .frontier
@@ -11231,4 +11179,41 @@ async fn a_restart_successor_carries_the_shell_output_window() {
         vec!["sh_bg".to_string()],
         "one tail read for the successor's one live shell"
     );
+}
+
+/// Wait until the session's durable Wake Watermark covers `created_ms`.
+async fn wait_for_announced(app: &Arc<App>, session_id: &str, created_ms: i64) {
+    wait_for(&format!("the Wake Watermark reaches {created_ms}"), || async {
+        app.cards_handle()
+            .chains
+            .announced(session_id)
+            .is_some_and(|mark| mark.created_ms >= created_ms)
+            .then_some(())
+    })
+    .await;
+}
+
+/// Wait until the platform served `n` card-view reads for `message_id`.
+async fn wait_for_card_views(platform: &RecordingPlatform, message_id: &str, n: usize) {
+    wait_for(&format!("{message_id} reaches {n} card-view reads"), || async {
+        (card_views_to(platform, message_id) >= n).then_some(())
+    })
+    .await;
+}
+
+/// Wait until the registry no longer caches `message_id`.
+async fn wait_for_cache_release(app: &Arc<App>, message_id: &str) {
+    wait_for(
+        &format!("{message_id}'s cached presentation is released"),
+        || async {
+            app.cards_handle()
+                .card_handles
+                .lock()
+                .await
+                .cached_card(message_id)
+                .is_none()
+                .then_some(())
+        },
+    )
+    .await;
 }

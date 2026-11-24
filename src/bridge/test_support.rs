@@ -479,11 +479,15 @@ pub struct RecordingPlatform {
     /// call: the five shapes all steer the same call, so a test names the
     /// consequence it means and nothing else.
     pub fail_update: std::sync::Mutex<Option<(UpdateFailure, usize)>>,
-    /// Scripted `reply_card` outcomes, popped in call order; empty means every
-    /// send lands. Lets a test drive a create's exact failure class (spec #561,
-    /// review #569), including one that records the send first, or stop its
-    /// chain at a known slice.
+    /// Scripted `reply_card` outcomes, popped in call order; empty falls to
+    /// `reply_card_always`. Lets a test drive a create's exact failure class
+    /// (spec #561, review #569), including one that records the send first, or
+    /// stop its chain at a known slice.
     pub reply_card_outcomes: std::sync::Mutex<std::collections::VecDeque<ReplyOutcome>>,
+    /// The outcome every `reply_card` call takes after `reply_card_outcomes`
+    /// drains ([`ALWAYS`] in [`given_reply_card_outcomes`]); `None` = every
+    /// send lands. One repeat slot, so "forever" never queues copies.
+    pub reply_card_always: std::sync::Mutex<Option<ReplyOutcome>>,
     /// When set, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
     /// Atomic so a test can flip it mid-lifecycle and watch a recovery.
@@ -590,6 +594,7 @@ impl RecordingPlatform {
             hang_topic_messages: std::sync::atomic::AtomicUsize::new(0),
             fail_update: std::sync::Mutex::new(None),
             reply_card_outcomes: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            reply_card_always: std::sync::Mutex::new(None),
             fail_instant_reminder: std::sync::atomic::AtomicBool::new(false),
             fail_pin: std::sync::atomic::AtomicBool::new(false),
             reply_in_thread_thread_id: Some("omt_created_topic".into()),
@@ -655,8 +660,13 @@ impl RecordingPlatform {
     }
 
     /// Queue `times` copies of `outcome` — the per-call script's "the next N
-    /// sends fail this way".
+    /// sends fail this way". [`ALWAYS`] installs it as the repeat slot instead
+    /// of queueing copies, so "forever" costs no memory.
     pub fn given_reply_card_outcomes(&self, outcome: ReplyOutcome, times: usize) {
+        if times == ALWAYS {
+            *self.reply_card_always.lock().unwrap() = Some(outcome);
+            return;
+        }
         self.reply_card_outcomes
             .lock()
             .unwrap()
@@ -677,9 +687,10 @@ impl RecordingPlatform {
     }
 
     /// Script the next `times` `update_message` calls to fail with `failure`;
-    /// [`ALWAYS`] keeps it until [`clear_fail_update`].
+    /// `0` means none (and clears any script), [`ALWAYS`] keeps it until
+    /// [`clear_fail_update`].
     pub fn fail_update(&self, failure: UpdateFailure, times: usize) {
-        *self.fail_update.lock().unwrap() = Some((failure, times));
+        *self.fail_update.lock().unwrap() = (times > 0).then_some((failure, times));
     }
 
     /// Stop scripting `update_message` failures.
@@ -934,7 +945,12 @@ impl feishu::Platform for RecordingPlatform {
         // lands it). A failed send is not recorded — it never reached Feishu —
         // except the two shapes whose whole point is what the attempt left
         // behind.
-        let outcome = self.reply_card_outcomes.lock().unwrap().pop_front();
+        let outcome = self
+            .reply_card_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .or_else(|| *self.reply_card_always.lock().unwrap());
         if let Some(ReplyOutcome::Failed) = outcome {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated reply_card failure".into(),

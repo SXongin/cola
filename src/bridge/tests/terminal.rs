@@ -22,6 +22,94 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::time::Duration;
 
+/// Wait for the Terminal Log to be posted as a File Message.
+#[cfg(unix)]
+async fn wait_for_file_message(platform: &RecordingPlatform) -> PlatformCall {
+    wait_for("the Terminal Log is delivered as a File Message", || async {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .find(
+                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
+            )
+            .cloned()
+    })
+    .await
+}
+
+/// Wait for at least `count` Terminal Cards to be posted.
+#[cfg(unix)]
+async fn wait_for_replied_cards(platform: &RecordingPlatform, count: usize) {
+    wait_for(&format!("{count} Terminal Cards are posted"), || async {
+        (platform.replied_cards().await.len() >= count).then_some(())
+    })
+    .await;
+}
+
+/// Wait for the card the app replied with under `message_id`.
+#[cfg(unix)]
+async fn wait_for_reply_to(platform: &RecordingPlatform, message_id: &str) -> serde_json::Value {
+    wait_for(
+        &format!("the command replies with a card under {message_id}"),
+        || async {
+            platform
+                .replied_cards_with_targets()
+                .await
+                .into_iter()
+                .find(|(target, _)| target == message_id)
+                .map(|(_, card)| card)
+        },
+    )
+    .await
+}
+
+/// Wait for a plain text reply carrying `needle`.
+#[cfg(unix)]
+async fn wait_for_text_containing(platform: &RecordingPlatform, needle: &str) -> String {
+    wait_for(&format!("a text reply contains {needle:?}"), || async {
+        platform.calls.lock().await.iter().find_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } if text.contains(needle) => Some(text.clone()),
+            _ => None,
+        })
+    })
+    .await
+}
+
+/// Wait for a file to carry a decimal pid, then return it.
+#[cfg(target_os = "linux")]
+async fn wait_for_file_line(path: &std::path::Path) -> i32 {
+    wait_for(&format!("a pid is written to {path:?}"), || async {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+    })
+    .await
+}
+
+/// Wait until the killed child is gone (reaped after its group died).
+#[cfg(target_os = "linux")]
+async fn wait_for_pid_gone(pid: i32) {
+    wait_for(&format!("pid {pid} is gone"), || async {
+        (!pid_alive(pid)).then_some(())
+    })
+    .await;
+}
+
+/// Wait for the run's owed settlement to appear.
+#[cfg(unix)]
+async fn wait_for_owed(app: &std::sync::Arc<crate::bridge::App>, run_id: &str) -> TerminalRunRecord {
+    wait_for(
+        &format!("the run's owed settlement appears for {run_id}"),
+        || async {
+            let (owed, _) = app.terminal_records.owed().load_all();
+            owed.into_iter().find(|record| record.run_id == run_id)
+        },
+    )
+    .await
+}
+
 fn thread() -> ThreadKey {
     ThreadKey::new("chat_1".into(), "chat_1".into())
 }
@@ -1492,18 +1580,7 @@ async fn full_output_posts_the_terminal_log_as_a_file_message() {
     assert!(result.card.is_none(), "the upload never runs inside the callback");
     assert_eq!(result.toast.as_deref(), Some("正在发送完整输出…"));
 
-    let sent = wait_for("the Terminal Log is delivered as a File Message", || async {
-        platform
-            .calls
-            .lock()
-            .await
-            .iter()
-            .find(
-                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
-            )
-            .cloned()
-    })
-    .await;
+    let sent = wait_for_file_message(&platform).await;
     match sent {
         PlatformCall::SendMessageReply {
             message_id, msg_type, ..
@@ -1597,18 +1674,7 @@ async fn full_output_past_the_upload_cap_sends_a_truncated_bounded_copy_and_says
 
     let payload = full_output_payload(&platform).await;
     app.host_action_on_message(payload, "msg_reply").await;
-    wait_for("the Terminal Log is delivered as a File Message", || async {
-        platform
-            .calls
-            .lock()
-            .await
-            .iter()
-            .find(
-                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
-            )
-            .cloned()
-    })
-    .await;
+    wait_for_file_message(&platform).await;
 
     let uploads: Vec<_> = platform
         .calls
@@ -1693,18 +1759,7 @@ async fn full_output_delivery_runs_off_the_card_callback() {
         .expect("the upload starts on the spawned task");
     release.notify_one();
 
-    wait_for("the Terminal Log is delivered as a File Message", || async {
-        platform
-            .calls
-            .lock()
-            .await
-            .iter()
-            .find(
-                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
-            )
-            .cloned()
-    })
-    .await;
+    wait_for_file_message(&platform).await;
     wait_for_patch_containing(&platform, "msg_reply", "完整输出已作为文件消息发送").await;
 }
 
@@ -1748,18 +1803,7 @@ async fn full_output_reports_a_missing_log_instead_of_staying_silent() {
     let payload = full_output_payload(&platform).await;
     app.host_action_on_message(payload, "msg_reply").await;
 
-    let reply = wait_for(
-        &format!("a text reply contains {:?}", "无法读取终端日志"),
-        || async {
-            platform.calls.lock().await.iter().find_map(|call| match call {
-                PlatformCall::ReplyText { text, .. } if text.contains("无法读取终端日志") => {
-                    Some(text.clone())
-                }
-                _ => None,
-            })
-        },
-    )
-    .await;
+    let reply = wait_for_text_containing(&platform, "无法读取终端日志").await;
     assert!(
         reply.contains(&path),
         "the outcome names the path it could not read: {reply}"
@@ -2137,10 +2181,7 @@ async fn a_second_command_is_refused_and_a_stale_run_id_is_rejected() {
             send_command_in(&app, "/run sleep 30", key, "msg_first", ConversationKind::P2p).await;
         }
     });
-    wait_for(&format!("{} Terminal Cards are posted", 1), || async {
-        (!platform.replied_cards().await.is_empty()).then_some(())
-    })
-    .await;
+    wait_for_replied_cards(&platform, 1).await;
 
     send_command_in(&app, "/run echo second", key, "msg_second", ConversationKind::P2p).await;
     let texts = platform.texts().await;
@@ -2217,10 +2258,7 @@ async fn two_concurrent_commands_cannot_both_claim_one_chat() {
         }
     });
 
-    wait_for(&format!("{} Terminal Cards are posted", 1), || async {
-        (!platform.replied_cards().await.is_empty()).then_some(())
-    })
-    .await;
+    wait_for_replied_cards(&platform, 1).await;
     // One of the two owns the claim for seconds; the other must have been
     // refused by the time both dispatches have run.
     wait_for("the command replies with text", || async {
@@ -2448,19 +2486,8 @@ async fn aborting_a_run_keeps_the_slot_until_its_group_is_killed() {
             .await;
         }
     });
-    wait_for(&format!("{} Terminal Cards are posted", 1), || async {
-        (!platform.replied_cards().await.is_empty()).then_some(())
-    })
-    .await;
-    let pid = wait_for(
-        &format!("a pid is written to {:?}", proj.path().join("aborted.pid")),
-        || async {
-            std::fs::read_to_string(proj.path().join("aborted.pid"))
-                .ok()
-                .and_then(|raw| raw.trim().parse::<i32>().ok())
-        },
-    )
-    .await;
+    wait_for_replied_cards(&platform, 1).await;
+    let pid = wait_for_file_line(&proj.path().join("aborted.pid")).await;
     assert!(pid_alive(pid), "the run is live before the abort");
 
     running.abort();
@@ -2487,10 +2514,7 @@ async fn aborting_a_run_keeps_the_slot_until_its_group_is_killed() {
 
     // The reaper escalates to SIGKILL after the grace; only then does the slot
     // become available again.
-    wait_for(&format!("pid {} is gone", pid), || async {
-        (!pid_alive(pid)).then_some(())
-    })
-    .await;
+    wait_for_pid_gone(pid).await;
     let mut ran = false;
     for attempt in 0..100 {
         send_command_in(
@@ -2602,19 +2626,8 @@ async fn kill_ends_the_whole_process_group() {
             .await;
         }
     });
-    wait_for(&format!("{} Terminal Cards are posted", 1), || async {
-        (!platform.replied_cards().await.is_empty()).then_some(())
-    })
-    .await;
-    let pid = wait_for(
-        &format!("a pid is written to {:?}", proj.path().join("child.pid")),
-        || async {
-            std::fs::read_to_string(proj.path().join("child.pid"))
-                .ok()
-                .and_then(|raw| raw.trim().parse::<i32>().ok())
-        },
-    )
-    .await;
+    wait_for_replied_cards(&platform, 1).await;
+    let pid = wait_for_file_line(&proj.path().join("child.pid")).await;
     assert!(pid_alive(pid), "the child is running before the click");
 
     let card = live_card_with(&platform, "kill").await;
@@ -2625,10 +2638,7 @@ async fn kill_ends_the_whole_process_group() {
         .expect("the killed run ends")
         .unwrap();
 
-    wait_for(&format!("pid {} is gone", pid), || async {
-        (!pid_alive(pid)).then_some(())
-    })
-    .await;
+    wait_for_pid_gone(pid).await;
 }
 
 /// #825 acceptance: at the cap the tail stops but the wait continues — a
@@ -2900,10 +2910,7 @@ async fn the_claim_and_cap_are_per_chat_not_process_wide() {
         }
     });
 
-    wait_for(&format!("{} Terminal Cards are posted", 2), || async {
-        (platform.replied_cards().await.len() >= 2).then_some(())
-    })
-    .await;
+    wait_for_replied_cards(&platform, 2).await;
     wait_for_card_update(&platform, "A's cap", CardUpdates::Any, |card| {
         let text = card_text(card);
         text.contains("owner-A") && text.contains("已达时限")
@@ -3292,18 +3299,7 @@ async fn a_settled_run_and_the_full_output_button_submit_no_prompt() {
     // button: the retrieval is a File Message.
     let payload = full_output_payload(&platform).await;
     app.host_action_on_message(payload, "msg_reply").await;
-    wait_for("the Terminal Log is delivered as a File Message", || async {
-        platform
-            .calls
-            .lock()
-            .await
-            .iter()
-            .find(
-                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
-            )
-            .cloned()
-    })
-    .await;
+    wait_for_file_message(&platform).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         prompts.lock().await.is_empty(),
@@ -4041,18 +4037,7 @@ async fn a_failed_log_preflight_leaves_the_previous_runs_ask_ai_working() {
         ConversationKind::P2p,
     )
     .await;
-    wait_for(
-        &format!("a text reply contains {:?}", "无法创建终端日志"),
-        || async {
-            platform.calls.lock().await.iter().find_map(|call| match call {
-                PlatformCall::ReplyText { text, .. } if text.contains("无法创建终端日志") => {
-                    Some(text.clone())
-                }
-                _ => None,
-            })
-        },
-    )
-    .await;
+    wait_for_text_containing(&platform, "无法创建终端日志").await;
 
     // The durable current run is still the first one, and so is the published
     // in-memory identity: the failed run never became current.
@@ -4217,18 +4202,7 @@ async fn ask_ai_after_a_restart_refuses_an_unverifiable_record_but_full_output_s
         .expect("the click is acknowledged");
     let toast = result.toast.unwrap_or_default();
     assert!(toast.contains("完整输出"), "完整输出 still answers: {toast}");
-    wait_for("the Terminal Log is delivered as a File Message", || async {
-        platform2
-            .calls
-            .lock()
-            .await
-            .iter()
-            .find(
-                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
-            )
-            .cloned()
-    })
-    .await;
+    wait_for_file_message(&platform2).await;
 }
 
 /// #827 acceptance: a double-clicked 「↻ 重跑」 runs one command even when the
@@ -4429,18 +4403,7 @@ async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
 
     // 完整输出 still delivers the log, and the outcome leaves the card lost.
     app2.host_action_on_message(full, "msg_lost_card").await;
-    wait_for("the Terminal Log is delivered as a File Message", || async {
-        platform2
-            .calls
-            .lock()
-            .await
-            .iter()
-            .find(
-                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
-            )
-            .cloned()
-    })
-    .await;
+    wait_for_file_message(&platform2).await;
     let rebuilt = wait_for_patch_containing(&platform2, "msg_lost_card", "完整输出已作为文件消息发送").await;
     let text = card_text(&rebuilt);
     assert!(
@@ -4605,18 +4568,7 @@ async fn a_legacy_payload_cannot_submit_after_its_record_was_replaced() {
         result.toast.unwrap_or_default().contains("完整输出"),
         "the legacy payload is still routable"
     );
-    wait_for(
-        &format!("a text reply contains {:?}", "完整输出已作为文件消息发送"),
-        || async {
-            platform.calls.lock().await.iter().find_map(|call| match call {
-                PlatformCall::ReplyText { text, .. } if text.contains("完整输出已作为文件消息发送") => {
-                    Some(text.clone())
-                }
-                _ => None,
-            })
-        },
-    )
-    .await;
+    wait_for_text_containing(&platform, "完整输出已作为文件消息发送").await;
 
     // 问 AI: a payload with no run id cannot name a run, so it is refused — the
     // old output never reaches the model.
@@ -5327,8 +5279,9 @@ async fn wait_for_record(
     app: &std::sync::Arc<crate::bridge::App>,
     key: &ThreadKey,
     done: impl Fn(&TerminalRunRecord) -> bool,
+    condition: &str,
 ) -> TerminalRunRecord {
-    wait_for("the record reaches the expected state", || async {
+    wait_for(condition, || async {
         app.terminal_records.read(key).filter(|record| done(record))
     })
     .await
@@ -5360,16 +5313,15 @@ async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
     )
     .await;
 
-    let pending = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
-    let card_id = pending.card_id.clone();
-    let owed = wait_for(
-        &format!("the run's owed settlement appears for {}", pending.run_id),
-        || async {
-            let (owed, _) = app.terminal_records.owed().load_all();
-            owed.into_iter().find(|record| record.run_id == pending.run_id)
-        },
+    let pending = wait_for_record(
+        &app,
+        &key,
+        |record| record.state == TerminalRunState::Settled,
+        "the run record is settled",
     )
     .await;
+    let card_id = pending.card_id.clone();
+    let owed = wait_for_owed(&app, &pending.run_id).await;
     assert_eq!(
         owed.outcome.as_ref().and_then(|outcome| outcome.exit_code),
         Some(0),
@@ -5463,16 +5415,15 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
         ConversationKind::P2p,
     )
     .await;
-    let old = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
-    assert_eq!(old.card_id, "msg_card_old");
-    let owed = wait_for(
-        &format!("the run's owed settlement appears for {}", old.run_id),
-        || async {
-            let (owed, _) = app.terminal_records.owed().load_all();
-            owed.into_iter().find(|record| record.run_id == old.run_id)
-        },
+    let old = wait_for_record(
+        &app,
+        &key,
+        |record| record.state == TerminalRunState::Settled,
+        "the run record is settled",
     )
     .await;
+    assert_eq!(old.card_id, "msg_card_old");
+    let owed = wait_for_owed(&app, &old.run_id).await;
     assert_eq!(
         owed.outcome.as_ref().and_then(|outcome| outcome.exit_code),
         Some(0),
@@ -5490,9 +5441,12 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
         ConversationKind::P2p,
     )
     .await;
-    let new = wait_for_record(&app, &key, |record| {
-        record.run_id != old.run_id && record.state == TerminalRunState::Settled
-    })
+    let new = wait_for_record(
+        &app,
+        &key,
+        |record| record.run_id != old.run_id && record.state == TerminalRunState::Settled,
+        "the new run's record is settled",
+    )
     .await;
     assert_eq!(new.card_id, "msg_card_new");
     assert_eq!(new.command, "printf 'new-run-827\\n'");
@@ -5571,9 +5525,12 @@ async fn an_obligation_survives_a_record_write_failure_so_the_lost_sweep_cannot_
     // The child exists and its record is `running`: now the record directory
     // becomes unusable, so every later record write fails while the card PATCH
     // and the sibling owed store stay healthy.
-    let running = wait_for_record(&app, &key, |record| {
-        record.state == TerminalRunState::Running && !record.pids.is_empty()
-    })
+    let running = wait_for_record(
+        &app,
+        &key,
+        |record| record.state == TerminalRunState::Running && !record.pids.is_empty(),
+        "the running record carries its pid",
+    )
     .await;
     let records_dir = app.terminal_records.dir().to_path_buf();
     let backup = crate::state::StateLayout::beside(&records_dir, "terminal-runs.bak");
@@ -5655,15 +5612,14 @@ async fn an_owed_settle_is_repaired_even_when_the_current_record_is_unreadable()
         ConversationKind::P2p,
     )
     .await;
-    let pending = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
-    wait_for(
-        &format!("the run's owed settlement appears for {}", pending.run_id),
-        || async {
-            let (owed, _) = app.terminal_records.owed().load_all();
-            owed.into_iter().find(|record| record.run_id == pending.run_id)
-        },
+    let pending = wait_for_record(
+        &app,
+        &key,
+        |record| record.state == TerminalRunState::Settled,
+        "the run record is settled",
     )
     .await;
+    wait_for_owed(&app, &pending.run_id).await;
     // The current record is unreadable, and its run is still owed.
     std::fs::write(app.terminal_records.path(&key), b"{ not json").unwrap();
     let root = log_root(&app);
@@ -5847,7 +5803,13 @@ async fn a_probe_cycle_pending_at_a_natural_exit_signals_nothing() {
             .await;
         }
     });
-    let record = wait_for_record(&app, &key, |record| !record.pids.is_empty()).await;
+    let record = wait_for_record(
+        &app,
+        &key,
+        |record| !record.pids.is_empty(),
+        "the run record carries its pid",
+    )
+    .await;
     let child =
         rustix::process::Pid::from_raw(record.pids[0] as i32).expect("the recorded child id is a valid pid");
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -5951,9 +5913,12 @@ async fn a_spawn_failure_keeps_the_settled_buttons() {
         .expect("the click is acknowledged");
     let toast = result.toast.clone().unwrap_or_default();
     assert!(toast.contains("重跑"), "the rerun click is accepted: {toast}");
-    let next = wait_for_record(&app, &key, |record| {
-        record.run_id != first.run_id && record.state == TerminalRunState::Settled
-    })
+    let next = wait_for_record(
+        &app,
+        &key,
+        |record| record.run_id != first.run_id && record.state == TerminalRunState::Settled,
+        "the next run's record is settled",
+    )
     .await;
     assert_eq!(next.command, first.command, "the record's command replays");
     assert_eq!(next.cwd, first.cwd, "in the record's cwd");
@@ -6152,7 +6117,13 @@ async fn ask_ai_submits_once_across_a_restart() {
     wait_for_prompt_containing(&prompts, marker).await;
     assert_eq!(prompts.lock().await.len(), 1, "exactly one submission");
     // The submission is durable before the process ends.
-    wait_for_record(&app, &key, |record| record.ask_ai_submitted).await;
+    wait_for_record(
+        &app,
+        &key,
+        |record| record.ask_ai_submitted,
+        "the run record records the ask",
+    )
+    .await;
     let root = log_root(&app);
 
     // The restart: memory is empty, the record is not.
@@ -6239,18 +6210,7 @@ async fn a_bare_run_moves_a_live_run_card_to_the_newest_position() {
     )
     .await;
 
-    let pulled = wait_for(
-        &format!("the command replies with a card under {}", "msg_pull_command"),
-        || async {
-            platform
-                .replied_cards_with_targets()
-                .await
-                .into_iter()
-                .find(|(target, _)| target == "msg_pull_command")
-                .map(|(_, card)| card)
-        },
-    )
-    .await;
+    let pulled = wait_for_reply_to(&platform, "msg_pull_command").await;
     let placeholder = card_text(&pulled);
     assert!(
         placeholder.contains("正在移动") && !placeholder.contains("⏹ 终止"),
@@ -6282,7 +6242,13 @@ async fn a_bare_run_moves_a_live_run_card_to_the_newest_position() {
     );
 
     // The record follows the card: a restart would repair the right message.
-    let record = wait_for_record(&app, &key, |record| record.card_id == "om_pulled").await;
+    let record = wait_for_record(
+        &app,
+        &key,
+        |record| record.card_id == "om_pulled",
+        "the run record names the pulled card",
+    )
+    .await;
     assert_eq!(record.state, TerminalRunState::Running);
 
     tokio::time::timeout(Duration::from_secs(10), running)
@@ -6333,22 +6299,17 @@ async fn a_bare_run_reposts_a_settled_card_at_the_newest_position() {
         ConversationKind::P2p,
     )
     .await;
-    let record = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
+    let record = wait_for_record(
+        &app,
+        &key,
+        |record| record.state == TerminalRunState::Settled,
+        "the run record is settled",
+    )
+    .await;
 
     send_command_in(&app, "/run", key.clone(), "msg_show_again", ConversationKind::P2p).await;
 
-    let reposted = wait_for(
-        &format!("the command replies with a card under {}", "msg_show_again"),
-        || async {
-            platform
-                .replied_cards_with_targets()
-                .await
-                .into_iter()
-                .find(|(target, _)| target == "msg_show_again")
-                .map(|(_, card)| card)
-        },
-    )
-    .await;
+    let reposted = wait_for_reply_to(&platform, "msg_show_again").await;
     let text = card_text(&reposted);
     assert!(
         text.contains("退出码 0") && text.contains("settled-829"),
@@ -6403,18 +6364,7 @@ async fn a_bare_run_reposts_a_lost_card_from_its_record() {
 
     send_command_in(&app, "/run", key.clone(), "msg_show_lost", ConversationKind::P2p).await;
 
-    let reposted = wait_for(
-        &format!("the command replies with a card under {}", "msg_show_lost"),
-        || async {
-            platform
-                .replied_cards_with_targets()
-                .await
-                .into_iter()
-                .find(|(target, _)| target == "msg_show_lost")
-                .map(|(_, card)| card)
-        },
-    )
-    .await;
+    let reposted = wait_for_reply_to(&platform, "msg_show_lost").await;
     let text = card_text(&reposted);
     assert!(
         text.contains("已失去跟踪") && text.contains("lost-marker-829"),
@@ -6594,18 +6544,7 @@ async fn a_pull_whose_freeze_fails_is_undone() {
         bubble.is_empty(),
         "an aborted pull never renders the new message: {bubble:?}"
     );
-    let reply = wait_for(
-        &format!("the command replies with a card under {}", "msg_pull_failed"),
-        || async {
-            platform
-                .replied_cards_with_targets()
-                .await
-                .into_iter()
-                .find(|(target, _)| target == "msg_pull_failed")
-                .map(|(_, card)| card)
-        },
-    )
-    .await;
+    let reply = wait_for_reply_to(&platform, "msg_pull_failed").await;
     let reply_text = card_text(&reply);
     assert!(
         reply_text.contains("正在移动") && button_value(&reply, "kill").is_none(),
@@ -6827,10 +6766,7 @@ async fn the_terminal_control_clicks_carry_five_keys_and_ack_with_their_results(
             send_command_in(&app, "/run sleep 30", key, "msg_run", ConversationKind::P2p).await;
         }
     });
-    wait_for(&format!("{} Terminal Cards are posted", 1), || async {
-        (!platform.replied_cards().await.is_empty()).then_some(())
-    })
-    .await;
+    wait_for_replied_cards(&platform, 1).await;
 
     let card = live_card_with(&platform, "kill").await;
     let kill = button_value(&card, "kill").expect("the live card carries 终止");
@@ -7026,10 +6962,7 @@ async fn the_terminal_rerun_click_carries_five_keys_and_acks_or_refuses() {
 
     // The spawned rerun posts its own card under the card it was clicked on;
     // waiting for it keeps no live run outliving the test.
-    wait_for(&format!("{} Terminal Cards are posted", 2), || async {
-        (platform.replied_cards().await.len() >= 2).then_some(())
-    })
-    .await;
+    wait_for_replied_cards(&platform, 2).await;
 }
 
 /// A settled Terminal Card's 「📄 完整输出」 button carries the eight routing

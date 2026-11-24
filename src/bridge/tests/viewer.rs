@@ -4836,11 +4836,7 @@ async fn a_tool_panel_html_preview_sends_a_file_message_and_leaves_the_turn_card
     );
 
     let posts = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        wait_for("the preview's File Message lands", || async {
-            let posts = file_messages(&platform).await;
-            if !posts.is_empty() { Some(posts) } else { None }
-        })
-        .await
+        wait_for_preview_file_message(&platform).await
     })
     .await
     .expect("the preview's File Message lands");
@@ -5391,14 +5387,7 @@ async fn the_tool_panel_preview_click_pins_its_keys_exact_result_and_never_patch
     // duplicate click read `文件已发送` — that is the spawned task's end, so a
     // PATCH racing the send would already have been issued.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        wait_for("the preview's File Message lands", || async {
-            if !file_messages(&platform).await.is_empty() {
-                Some(())
-            } else {
-                None
-            }
-        })
-        .await
+        wait_for_preview_file_message(&platform).await
     })
     .await
     .expect("the preview's File Message lands");
@@ -5730,4 +5719,13 @@ async fn the_return_directory_click_pins_its_payload_keys_and_exact_result() {
         "the restore is silent: {:?}",
         result.toast
     );
+}
+
+/// Wait for the preview's File Message.
+async fn wait_for_preview_file_message(platform: &RecordingPlatform) -> Vec<PlatformCall> {
+    wait_for("the preview's File Message lands", || async {
+        let posts = file_messages(platform).await;
+        (!posts.is_empty()).then_some(posts)
+    })
+    .await
 }

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::bridge::test_support::wait_for;
 
 #[tokio::test]
-async fn wait_for_returns_what_the_probe_yielded() {
+async fn the_combinator_returns_what_its_probe_yields() {
     let polls = AtomicUsize::new(0);
     let value = wait_for("the probe yields on its third poll", || async {
         let poll = polls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -22,7 +22,7 @@ async fn wait_for_returns_what_the_probe_yielded() {
 
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "the probe never yields")]
-async fn wait_for_names_the_condition_it_timed_out_on() {
+async fn the_combinator_names_the_condition_it_timed_out_on() {
     // Paused time makes the shared deadline instant, so the bound costs no
     // wall-clock time.
     let _ = wait_for::<(), _, _>("the probe never yields", || async { None }).await;

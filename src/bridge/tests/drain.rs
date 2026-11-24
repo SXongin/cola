@@ -2339,17 +2339,7 @@ async fn a_never_promoted_submit_on_a_live_run_waits_out_the_grace_then_ends_unr
 
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for(
-            "the drain holds the guard while the message has not landed",
-            || async {
-                if !app.inflight.lock().await.contains("ses_test") {
-                    None
-                } else {
-                    Some(())
-                }
-            },
-        )
-        .await
+        wait_for_guard_held(&app).await;
     })
     .await
     .expect("the drain holds the guard while the message has not landed");
@@ -2418,17 +2408,7 @@ async fn the_unreceived_wait_captures_a_message_that_lands_after_the_grace() {
 
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for(
-            "the drain holds the guard while the message has not landed",
-            || async {
-                if !app.inflight.lock().await.contains("ses_test") {
-                    None
-                } else {
-                    Some(())
-                }
-            },
-        )
-        .await
+        wait_for_guard_held(&app).await;
     })
     .await
     .expect("the drain holds the guard while the message has not landed");
@@ -2993,19 +2973,13 @@ async fn a_final_part_landing_between_the_render_and_idle_read_still_lands() {
     // serves the tail-less snapshot: the render read genuinely predates the
     // tail.
     let gate = backend.hold_transcripts();
-    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
-        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
-    })
-    .await;
+    wait_for_parked_reads(&backend, 1).await;
     script_transcript(&backend, vec![SessionTranscript::new(rendered.clone())]).await;
     gate.add_permits(1);
 
     // Park the LATER read — the settle re-check. The tail lands now, AFTER the
     // render read, and the session idles: this later read carries the tail.
-    wait_for(&format!("the drain reaches parked read #{}", 2), || async {
-        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 2).then_some(())
-    })
-    .await;
+    wait_for_parked_reads(&backend, 2).await;
     script_transcript(&backend, vec![SessionTranscript::new(with_tail.clone())]).await;
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
@@ -3082,10 +3056,7 @@ async fn a_tail_landing_after_the_drain_settled_still_lands_on_the_card() {
     // reading Busy this is a settle candidate, and no permit is added until the
     // state below is staged.
     let gate = backend.hold_transcripts();
-    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
-        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
-    })
-    .await;
+    wait_for_parked_reads(&backend, 1).await;
     // The session goes Idle: the frozen read is the settle tick. Both it and the
     // drain's corroborating re-check are served the tail-less snapshot; the tail
     // is scripted only for the read AFTER them — finalization's own fresh read.
@@ -3170,10 +3141,7 @@ async fn a_delayed_but_successful_final_read_still_lands_the_tail() {
     // corroborating re-check serve tail-less, and finalization's own read serves
     // the tail. Disarm so the later reads flow.
     let gate = backend.hold_transcripts();
-    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
-        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
-    })
-    .await;
+    wait_for_parked_reads(&backend, 1).await;
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
@@ -3307,10 +3275,7 @@ async fn finalization_reads_use_the_full_per_read_timeout_and_stay_bounded() {
 
     // Time from the first hung transcript read: the drain's own read bound is
     // fixed, so the extra time to the guard release is what finalization spends.
-    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
-        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
-    })
-    .await;
+    wait_for_parked_reads(&backend, 1).await;
     let start = tokio::time::Instant::now();
     wait_for_guard_release(&app).await;
     let held = start.elapsed();
@@ -3377,10 +3342,7 @@ async fn a_settled_drain_whose_stream_keeps_growing_reopens_instead_of_stamping(
     // confirmation read — so the drain settles on a quiescent read and the
     // growth starts exactly on the read that must not be stamped on.
     let gate = backend.hold_transcripts();
-    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
-        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
-    })
-    .await;
+    wait_for_parked_reads(&backend, 1).await;
     {
         let stream = Arc::clone(&backend);
         let fired = std::sync::atomic::AtomicBool::new(false);
@@ -4642,4 +4604,21 @@ async fn the_resume_click_pins_its_payload_keys_and_exact_result() {
     assert_eq!(ack.toast.as_deref(), Some("正在重新发起..."));
 
     wait_for_card_header(&platform, "完成").await;
+}
+
+/// Wait until the drain has entered `target` transcript reads.
+async fn wait_for_parked_reads(backend: &Arc<MockBackend>, target: usize) {
+    wait_for(&format!("the drain reaches parked read #{target}"), || async {
+        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= target).then_some(())
+    })
+    .await;
+}
+
+/// Wait until the drain holds the in-flight guard for `ses_test`.
+async fn wait_for_guard_held(app: &Arc<App>) {
+    wait_for(
+        "the drain holds the guard while the message has not landed",
+        || async { app.inflight.lock().await.contains("ses_test").then_some(()) },
+    )
+    .await;
 }
