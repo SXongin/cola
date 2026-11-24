@@ -480,13 +480,10 @@ pub struct RecordingPlatform {
     /// consequence it means and nothing else.
     pub fail_update: std::sync::Mutex<Option<(UpdateFailure, usize)>>,
     /// Scripted `reply_card` outcomes, popped in call order; empty falls to
-    /// `reply_card_always`. Lets a test drive a create's exact failure class
-    /// (spec #561, review #569), including one that records the send first, or
-    /// stop its chain at a known slice.
+    /// `reply_card_always` (a create's failure class, spec #561 review #569).
     pub reply_card_outcomes: std::sync::Mutex<std::collections::VecDeque<ReplyOutcome>>,
-    /// The outcome every `reply_card` call takes after `reply_card_outcomes`
-    /// drains ([`ALWAYS`] in [`given_reply_card_outcomes`]); `None` = every
-    /// send lands. One repeat slot, so "forever" never queues copies.
+    /// Every `reply_card` call's outcome once the queue drains (one repeat
+    /// slot, so "forever" never queues copies); `None` = the send lands.
     pub reply_card_always: std::sync::Mutex<Option<ReplyOutcome>>,
     /// When set, `set_instant_reminder` fails after recording the attempt
     /// (tests the best-effort pin path: failures log and never affect a turn).
@@ -659,9 +656,8 @@ impl RecordingPlatform {
         self.reply_card_outcomes.lock().unwrap().push_back(outcome);
     }
 
-    /// Queue `times` copies of `outcome` — the per-call script's "the next N
-    /// sends fail this way". [`ALWAYS`] installs it as the repeat slot instead
-    /// of queueing copies, so "forever" costs no memory.
+    /// Queue `times` copies of `outcome`; [`ALWAYS`] installs it as the repeat
+    /// slot instead of queueing copies.
     pub fn given_reply_card_outcomes(&self, outcome: ReplyOutcome, times: usize) {
         if times == ALWAYS {
             *self.reply_card_always.lock().unwrap() = Some(outcome);
@@ -687,8 +683,7 @@ impl RecordingPlatform {
     }
 
     /// Script the next `times` `update_message` calls to fail with `failure`;
-    /// `0` means none (and clears any script), [`ALWAYS`] keeps it until
-    /// [`clear_fail_update`].
+    /// `0` clears, [`ALWAYS`] keeps it until [`clear_fail_update`].
     pub fn fail_update(&self, failure: UpdateFailure, times: usize) {
         *self.fail_update.lock().unwrap() = (times > 0).then_some((failure, times));
     }
@@ -945,12 +940,8 @@ impl feishu::Platform for RecordingPlatform {
         // lands it). A failed send is not recorded — it never reached Feishu —
         // except the two shapes whose whole point is what the attempt left
         // behind.
-        let outcome = self
-            .reply_card_outcomes
-            .lock()
-            .unwrap()
-            .pop_front()
-            .or_else(|| *self.reply_card_always.lock().unwrap());
+        let queued = self.reply_card_outcomes.lock().unwrap().pop_front();
+        let outcome = queued.or_else(|| *self.reply_card_always.lock().unwrap());
         if let Some(ReplyOutcome::Failed) = outcome {
             return Err(crate::error::BridgeError::Feishu(
                 "simulated reply_card failure".into(),
@@ -1005,9 +996,7 @@ impl feishu::Platform for RecordingPlatform {
                     detail: "simulated reply_card refusal".into(),
                 });
             }
-            Some(ReplyOutcome::Failed)
-            | Some(ReplyOutcome::RejectedRecorded)
-            | Some(ReplyOutcome::AfterSend) => {}
+            _ => {}
         }
         if let Some(gate) = self.take_gate("reply", reply_to) {
             wait_gate(gate).await;
@@ -5023,20 +5012,15 @@ pub(crate) enum CardUpdates {
     Latest,
 }
 
-/// The overall deadline a test gives an observable outcome — a spawned
-/// handler, a recorded card, a continuation. Generous on purpose: every wait
-/// polls the fact it needs, so this bounds a genuine regression instead of
-/// turning a loaded parallel suite into a flake.
-/// 180 s, not 60: a loaded macOS CI runner can take minutes to schedule a
-/// spawned handler's continuation, and the wait exists to catch a genuine
-/// regression, not to time a busy machine. It costs nothing when the outcome
-/// lands (the waits poll, so they return immediately).
+/// The overall deadline a test gives an observable outcome. Generous on
+/// purpose: every wait polls, so it bounds a genuine regression instead of a
+/// loaded runner, and costs nothing when the outcome lands. 180 s, not 60: a
+/// loaded macOS CI runner can take minutes to schedule a spawned continuation.
 pub(crate) const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Poll `probe` every 5 ms until it yields a value, then return it. `label`
 /// names the condition and is the failure message; a probe returns `Some` to
-/// finish, so a wait can also return what it observed. The bound is
-/// [`SETTLE_DEADLINE`], the one bound every fixture wait shares.
+/// finish, so a wait can also return what it observed. Bound: [`SETTLE_DEADLINE`].
 pub(crate) async fn wait_for<T, F, Fut>(label: &str, mut probe: F) -> T
 where
     F: FnMut() -> Fut,
@@ -5055,10 +5039,8 @@ where
         .unwrap_or_else(|_| panic!("timed out after {SETTLE_DEADLINE:?} waiting until {label}"))
 }
 
-/// Await a spawned handler by polling `is_finished`, not by racing a fixed
-/// timeout: the very next poll after the work lands sees it, so the wait cannot
-/// lose a race a longer timeout would merely postpone. The handle is the
-/// probe's condition, and its join is the value.
+/// Await a spawned handler by polling `is_finished`: the poll after the work
+/// lands sees it, so the wait cannot lose a race a timeout would postpone.
 pub(crate) async fn wait_for_handler<T>(
     handle: tokio::task::JoinHandle<T>,
     label: &str,
@@ -5074,12 +5056,8 @@ pub(crate) async fn wait_for_handler<T>(
 }
 
 /// Await `check` over every card the platform recorded — in-place updates and
-/// new/reply sends — within `within`. [`wait_for_card_update`] sees updates
-/// only; a continuation is a reply, so a wait for one must look at both.
-///
-/// A timeout names the headers that *were* recorded: if the expected outcome
-/// never arrived, the failure says whether the card was missing, still live, or
-/// carried different content, instead of only "timed out".
+/// new/reply sends — within `within`; a timeout names the headers it saw, so
+/// the failure says whether the card was missing, live, or differently worded.
 pub(crate) async fn wait_for_recorded_card(
     platform: &RecordingPlatform,
     label: &str,
@@ -5162,20 +5140,11 @@ pub(crate) async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, sessio
 }
 
 /// Wait until a background poll loop has completed `count` passes past
-/// `baseline` — the load-independent replacement for "spawn the loop, sleep,
-/// then assert" (issue #958).
-///
-/// A test asserting on what a pass did, or that it did nothing, is racing the
-/// loop's schedule, and a fixed sleep cannot settle that race: on a loaded
-/// runner the first pass can start after any short span, so the assertion sees
-/// the pre-pass world and fails. A completed pass is the invariant these tests
-/// actually need.
-///
-/// One pass is the unit: a flow decides inside a single pass, so "no card was
-/// sent" means *that* pass decided not to send one. A test asks for a later pass
-/// only when the flow does not consume the state it decided on — the external
-/// sync, for one, re-baselines a cleared watermark on its next pass, so that
-/// assertion is made after exactly one.
+/// `baseline` — the load-independent replacement for "spawn, sleep, assert".
+/// A flow decides inside one pass, so "no card was sent" means *that* pass
+/// decided not to; a later pass is asked for only when the flow does not
+/// consume the state it decided on (the external sync re-baselines a cleared
+/// watermark on its next pass, so that assertion waits for exactly one).
 pub(crate) async fn wait_for_poll_passes(
     passes: &std::sync::atomic::AtomicUsize,
     baseline: usize,
