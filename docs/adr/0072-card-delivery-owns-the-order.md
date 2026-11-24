@@ -1,5 +1,11 @@
 # Card delivery owns the order: keyed per-card submissions serialize every writer
 
+> **Amended by ADR-0112 (2026-11-24)**: the `submit_ordered` default that
+> delegated to `update_message` for an unwrapped platform is superseded — the
+> delivery contract now lives on `DeliveryObserver`, and a platform that does not
+> implement it fails an ordered write visibly instead. See the amendment at the
+> end.
+
 ## Context
 
 A cola restart could orphan a still-live Session's card (#443): the reap stamps
@@ -320,3 +326,16 @@ read) still bounds how stale such a writer can be.
 
 Related: #443, #522, #527, spec #571, ADR-0038, ADR-0063, ADR-0067, ADR-0068,
 ADR-0069, ADR-0071.
+
+## Amendment (2026-11-24): the unwrapped-platform fallback gives way to one observer (ADR-0112)
+
+ADR-0112 moves the eleven delivery methods off `Platform` onto the
+`DeliveryObserver` the decorator implements (exposed through
+`Platform::delivery`, `src/feishu/mod.rs:96`) and removes the `submit_ordered`
+default recorded above. An unwrapped platform no longer writes unordered: its
+ordered write fails visibly — a WARN plus
+`WriteOutcome::Failed(BridgeError::Feishu(…))`, never `Delivered`/`Superseded`
+— and its delivery reads report nothing owed. Everything else this ADR decided
+is unchanged: the decorator still owns per-card order, the key, the generation
+floor, the settled collapse, the owed retry and the keyless passthrough.
+
