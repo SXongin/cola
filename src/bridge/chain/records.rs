@@ -63,6 +63,7 @@ use crate::backend::runs::{
 use crate::backend::{MessageId, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
 use crate::bridge::sidecar;
+use crate::bridge::turn::next_cursor_stage;
 use crate::state::ClientScoped;
 
 /// The orphan gap a restart must still deliver (spec #561, review #569): the
@@ -251,6 +252,16 @@ pub(crate) struct ChainRecord {
     /// existing fallback behavior.
     #[serde(default)]
     pub(crate) cursor: Option<RenderedCursor>,
+    /// In-memory only: the stage stamp that wrote [`Self::cursor`] (issue
+    /// #1186), in the process-global space [`next_cursor_stage`]
+    /// mints. It is the durable half of the accumulator's own supersession
+    /// guard: the accepted live PATCH advances the record directly, before its
+    /// confirmation runs, so a stage the record has already overtaken must
+    /// never move it back — whatever order the two writers happen to finish in.
+    /// Never persisted: a stamp names an accumulator stage, and a fresh process
+    /// life has neither.
+    #[serde(skip)]
+    pub(crate) cursor_stage: Option<u64>,
 }
 
 impl ChainRecord {
@@ -271,6 +282,7 @@ impl ChainRecord {
             projection_intent: false,
             pending_gap: None,
             cursor: None,
+            cursor_stage: None,
         }
     }
 
@@ -1254,6 +1266,10 @@ impl ChainRecords {
         record.reply_to = resolved_reply_to(previous.as_ref(), reply_to);
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
+            // The stamp travels with the value it wrote (issue #1186): the
+            // re-point carries the SAME cursor, so a stage older than it stays
+            // superseded across the write.
+            record.cursor_stage = previous.cursor_stage;
             // The owed orphan gap is chain-level too (spec #561, review #569):
             // a split continuation, a Wake continuation or a fresh Turn's
             // takeover must not drop the tail a later read still owes. The
@@ -1307,6 +1323,10 @@ impl ChainRecords {
         record.reply_to = resolved_reply_to(previous.as_ref(), known_or_carry(reply_to));
         if let Some(previous) = &previous {
             record.cursor = previous.cursor.clone();
+            // The stamp travels with the value it wrote (issue #1186): the
+            // takeover carries the SAME cursor, so a stage older than it stays
+            // superseded across the write.
+            record.cursor_stage = previous.cursor_stage;
             record.pending_gap = previous.pending_gap.clone().or_else(|| {
                 Some(PendingGap {
                     cursor: previous.cursor.clone()?,
@@ -1427,6 +1447,12 @@ impl ChainRecords {
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
         record.reply_to = resolved_reply_to(previous.as_ref(), reply_to);
         record.cursor = Some(cursor.clone());
+        // This write sets a NEW cursor value from a create that landed, so it
+        // mints the record's stamp rather than naming a staged body (issue
+        // #1186): everything staged before this moment is older content, and a
+        // stage that confirms after the re-point may still flip its endings but
+        // must not move the cursor back.
+        record.cursor_stage = Some(next_cursor_stage());
         // The gap rides the re-point exactly as it does through [`Self::track`]
         // (spec #561, review #569), and the confirmed body's coverage settles
         // it in this SAME record write: the cursor and the gap can never be
@@ -1624,8 +1650,60 @@ impl ChainRecords {
     /// resumes after what a card showed and repeats nothing), and a body that
     /// reached the gap's end consumes the durable fact. Best-effort and
     /// atomic, like every record write.
+    ///
+    /// This is the **newest-now** form (issue #1186): the write is stamped as
+    /// the newest cursor write the process has handed out, which is right for a
+    /// body whose write was ACCEPTED here and now — the live PATCH's direct
+    /// advance and a create that landed. A value carried from a STAGED body,
+    /// whose confirmation may run after a newer body already wrote, uses
+    /// [`Self::advance_staged_cursor_and_gap`] instead.
     pub(crate) fn advance_cursor_and_gap(
         &self,
+        session_id: &str,
+        card_message_id: &str,
+        cursor: &RenderedCursor,
+        gap: Option<(&CursorFrontier, bool)>,
+        shown: &[EndingKey],
+    ) {
+        self.write_cursor_and_gap(
+            next_cursor_stage(),
+            session_id,
+            card_message_id,
+            cursor,
+            gap,
+            shown,
+        );
+    }
+
+    /// [`Self::advance_cursor_and_gap`] for a body this chain STAGED (spec #561,
+    /// issue #1186): the stamp is the body's own, so the record refuses the
+    /// write when a newer body — the accepted live PATCH's direct advance
+    /// included — has already overtaken it. The body did deliver its endings
+    /// either way, and those still land.
+    pub(crate) fn advance_staged_cursor_and_gap(
+        &self,
+        session_id: &str,
+        card_message_id: &str,
+        stage: u64,
+        cursor: &RenderedCursor,
+        gap: Option<(&CursorFrontier, bool)>,
+        shown: &[EndingKey],
+    ) {
+        self.write_cursor_and_gap(stage, session_id, card_message_id, cursor, gap, shown);
+    }
+
+    /// The one write both forms share: the record keeps the newest stamp it was
+    /// written with — even a write that changes no value re-affirms it, or a
+    /// stage minted before it could resurrect its own — and a stamped write it
+    /// has already overtaken moves neither the cursor nor the gap — skipped
+    /// together on purpose, because the gap is that body's coverage of the same
+    /// write, and an overtaken body reached no further than the one that won. The
+    /// comparison lives here, inside the one lock that also writes, because the
+    /// direct advance and a staged confirmation are two writers and only this
+    /// section orders them.
+    fn write_cursor_and_gap(
+        &self,
+        stage: u64,
         session_id: &str,
         card_message_id: &str,
         cursor: &RenderedCursor,
@@ -1637,24 +1715,35 @@ impl ChainRecords {
         let mut cursor_change = false;
         match state.records.get_mut(&client, session_id) {
             Some(card) if card.card_message_id == card_message_id => {
-                let cursor_current = card.cursor.as_ref() == Some(cursor);
-                let gap_change = match (card.pending_gap.as_mut(), gap) {
-                    (Some(recorded), Some((frontier, complete))) => {
-                        if complete {
-                            card.pending_gap = None;
-                            true
-                        } else if recorded.cursor.frontier.as_ref() == Some(frontier) {
-                            false
-                        } else {
-                            recorded.cursor.frontier = Some(frontier.clone());
-                            true
+                // The durable guard (issue #1186): a stamp older than the
+                // record's own is a body the record has already overtaken.
+                let superseded = card.cursor_stage.is_some_and(|written| stage < written);
+                if !superseded {
+                    let cursor_current = card.cursor.as_ref() == Some(cursor);
+                    let gap_change = match (card.pending_gap.as_mut(), gap) {
+                        (Some(recorded), Some((frontier, complete))) => {
+                            if complete {
+                                card.pending_gap = None;
+                                true
+                            } else if recorded.cursor.frontier.as_ref() == Some(frontier) {
+                                false
+                            } else {
+                                recorded.cursor.frontier = Some(frontier.clone());
+                                true
+                            }
                         }
+                        _ => false,
+                    };
+                    if !cursor_current || gap_change {
+                        card.cursor = Some(cursor.clone());
+                        cursor_change = true;
                     }
-                    _ => false,
-                };
-                if !cursor_current || gap_change {
-                    card.cursor = Some(cursor.clone());
-                    cursor_change = true;
+                    // An accepted write re-affirms the record's position at its
+                    // own stamp even when it changed NOTHING (the cursor equal,
+                    // the gap settled): every stage minted before it is
+                    // superseded by it, so a late confirmation cannot resurrect
+                    // its own. In-memory only, so this needs no record write.
+                    card.cursor_stage = Some(stage);
                 }
             }
             // No record naming this card: the cursor and the gap are
@@ -3365,6 +3454,53 @@ mod tests {
             ChainRecords::load(path).cursor("ses_a"),
             None,
             "the cursor is released with the record"
+        );
+    }
+
+    /// An accepted write supersedes every stage minted before it EVEN WHEN its
+    /// cursor is the one the record already holds (issue #1186, the gate's
+    /// finding on PR #1188): a transcript rewrite (ADR-0071) can land a body
+    /// whose cursor equals the record's, and that accepted PATCH changed
+    /// nothing to WRITE — but its stamp must still take, or a stage staged
+    /// before it resurrects its own cursor on its late confirmation.
+    #[test]
+    fn an_accepted_write_that_changes_nothing_still_supersedes_an_older_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains = ChainRecords::load(dir.path().join(FILE));
+        chains.track(
+            "ses_a",
+            "om_card_1",
+            MessageId::new("msg_cola_1"),
+            Some(1_000),
+            None,
+            None,
+        );
+        let text = |delivered_chars: usize| RenderedCursor {
+            frontier: Some(CursorFrontier {
+                message_id: MessageId::new("msg_a_1"),
+                part_index: 0,
+                kind: CursorPartKind::Text,
+                started_at: Some(2_000),
+                delivered_chars,
+                prefix_digest: Some(7),
+            }),
+            ..RenderedCursor::default()
+        };
+        let (recorded, stage_cursor) = (text(42), text(7));
+
+        chains.advance_cursor("ses_a", "om_card_1", &recorded);
+        // Staged AFTER that write, so this stage is the newer of the two.
+        let stage = next_cursor_stage();
+        // An accepted PATCH re-affirms the very cursor the record holds, with
+        // no gap riding it: nothing to write, everything to supersede.
+        chains.advance_cursor_and_gap("ses_a", "om_card_1", &recorded, None, &[]);
+        // The late confirmation of the older body names its own stage.
+        chains.advance_staged_cursor_and_gap("ses_a", "om_card_1", stage, &stage_cursor, None, &[]);
+
+        assert_eq!(
+            chains.cursor("ses_a"),
+            Some(recorded),
+            "the accepted write supersedes the stage, so its cursor is never resurrected"
         );
     }
 

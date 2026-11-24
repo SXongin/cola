@@ -873,6 +873,19 @@ fn next_chain_id() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Hands out the next **cursor stage stamp** (spec #561, review #569; issue
+/// #1186): the token minted when a card body is staged, in ONE process-global
+/// monotone space. The stamp — not a per-accumulator counter — is what orders
+/// the durable record's cursor writes, because every replacing accumulator (a
+/// new Turn, an external arm, a Wake continuation) restarts its own numbering,
+/// so a straggler stage from the replaced one would compare as NEWER than
+/// anything its replacement staged. A process life is the whole scope: the
+/// records keep the stamp in memory only, and a restart starts both afresh.
+pub(crate) fn next_cursor_stage() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl CardSession {
     /// New session card: the header signature starts empty so the first poll
     /// always flushes (stamping the progress timer). `card_message_id` is the
@@ -1130,10 +1143,10 @@ const MAX_STAGED_MARKS: usize = 4;
 /// In-memory only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct StagedCursor {
-    /// The stage generation, assigned by [`StreamAccumulator::stage_cursor`]:
-    /// a confirmation names the generation it confirms, so a body staged later
-    /// can never be advanced by an earlier write's confirmation (spec #561,
-    /// review #569).
+    /// The stage stamp, minted by [`next_cursor_stage`] in one process-global
+    /// monotone space: a confirmation names the stage it confirms, so a body
+    /// staged later is never advanced by an earlier write's confirmation, and
+    /// the Chain Record compares the same stamp durably (issue #1186).
     pub(super) id: u64,
     /// The card the body is written to; `None` for a create (the id is only
     /// known once the send lands, and creates are never outbox-retried).
@@ -1190,9 +1203,9 @@ pub(crate) struct StagedCursorId {
 /// Task Endings its timeline showed — the three facts that must land in ONE
 /// Chain Record write, so no crash can leave the card having shown content the
 /// durable record does not know about. A SUPERSEDED stage (a newer confirmation
-/// already won) hands back the base's own cursor — writing it is a no-op — and
-/// no gap, so its delivered endings still flip their bits in that same single
-/// write.
+/// already won) hands back the base's own cursor — which the record refuses as
+/// stale when its own stamp is newer (issue #1186) — and no gap, so its
+/// delivered endings still flip their bits in that same single write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ConfirmedBody {
     pub(super) cursor: RenderedCursor,
@@ -1696,13 +1709,12 @@ pub(super) struct StreamAccumulator {
     /// Bounded by [`MAX_STAGED_CURSORS`]. Private: staged and drained only by
     /// [`Self::stage_cursor`] / [`Self::take_staged_cursor`].
     staged_cursors: Vec<StagedCursor>,
-    /// The stage generation handed to the next [`StagedCursor`] (spec #561,
-    /// review #569): a confirmation names the generation it confirms, so a
-    /// body staged later is never advanced by an earlier write's confirmation.
-    cursor_stage_seq: u64,
-    /// The generation of the newest stage whose cursor the base reflects
-    /// (spec #561, review #569): a confirmation older than this is superseded
-    /// and may never move the cursor backwards.
+    /// The stamp of the newest stage whose cursor the base reflects (spec
+    /// #561, review #569): a confirmation stamped before it is superseded and
+    /// may never move the cursor backwards. The Chain Record keeps the durable
+    /// half of the same guard — a stamp minted by [`next_cursor_stage`] is
+    /// comparable across accumulators, so an accepted direct write that never
+    /// confirmed here is not overtaken from below (issue #1186).
     confirmed_cursor_stage: u64,
     /// The stage generation handed to the next [`StagedWatermark`] — the same
     /// identity rule for the Wake Watermark's drain.
@@ -3371,7 +3383,7 @@ impl StreamAccumulator {
     /// `card_message_id` is `None` for a create, whose id is only known once
     /// the send lands. Every stage is retained until its own write's outcome
     /// resolves it — a newer body staged since never loses an older stage's
-    /// delivered confirmation (review #569). Returns the stage generation a
+    /// delivered confirmation (review #569). Returns the stage stamp a
     /// confirmation must name (spec #561, review #569).
     ///
     /// `rendered_endings` is the Task Endings the body actually rendered
@@ -3384,9 +3396,13 @@ impl StreamAccumulator {
         gap: Option<GapCoverage>,
         rendered_endings: Vec<EndingKey>,
     ) -> u64 {
-        self.cursor_stage_seq = self.cursor_stage_seq.wrapping_add(1);
+        // The stamp comes from the process-global space (issue #1186): the
+        // accumulator's own numbering restarts with every replacement, while
+        // the record it writes to outlives them, so only a monotone token can
+        // order a straggler stage against a newer accumulator's write.
+        let id = next_cursor_stage();
         self.staged_cursors.push(StagedCursor {
-            id: self.cursor_stage_seq,
+            id,
             card_message_id: card_message_id.map(str::to_string),
             cursor,
             awaiting_seq: None,
@@ -3400,7 +3416,7 @@ impl StreamAccumulator {
             let excess = self.staged_cursors.len() - MAX_STAGED_CURSORS;
             self.staged_cursors.drain(..excess);
         }
-        self.cursor_stage_seq
+        id
     }
 
     /// Every staged cursor whose owed payload a drain may need to confirm
