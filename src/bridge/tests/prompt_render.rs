@@ -24,29 +24,6 @@ fn retry_ctx(session_id: &str, text: &str, cola_message_id: &str) -> crate::brid
         advisory_live: false,
     }
 }
-
-/// Await at least `len` recorded prompt message ids, or panic after 5 s. The
-/// retry's id is recorded at prompt entry, before any gate the test installed,
-/// so this stays deterministic when the prompt is held.
-async fn wait_for_prompt_ids(
-    ids: &Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
-    len: usize,
-) -> Vec<Option<String>> {
-    let wait = async {
-        loop {
-            let current = ids.lock().await.clone();
-            if current.len() >= len {
-                return current;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(5), wait).await {
-        Ok(ids) => ids,
-        Err(_) => panic!("the retry prompt was never recorded (wanted {len} ids)"),
-    }
-}
-
 /// Assert the retry click's immediate ack (spec #391): the generic toast, and
 /// no card replacement — the failed card must never be overwritten.
 fn assert_retry_ack(result: Option<crate::bridge::handler::CardActionResult>) {
@@ -727,7 +704,11 @@ async fn settled_failure_retry_submits_a_new_id_on_a_new_card() {
     // recorded: the decision read has happened (it saw the settled window) and
     // the failed card has been marked. Drop the script so the retry's own
     // render reads the mock's default transcript, which carries that fresh id.
-    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    let ids = wait_for(&format!("the retry prompt records {} ids", 2), || async {
+        let current = prompt_ids.lock().await.clone();
+        (current.len() >= 2).then_some(current)
+    })
+    .await;
     backend.transcript_scripts.lock().await.remove("ses_test");
     gate.add_permits(1);
 
@@ -814,7 +795,11 @@ async fn retry_after_a_failed_status_read_submits_a_new_id() {
         .await;
     assert!(retry.is_some(), "retry ack expected");
 
-    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    let ids = wait_for(&format!("the retry prompt records {} ids", 2), || async {
+        let current = prompt_ids.lock().await.clone();
+        (current.len() >= 2).then_some(current)
+    })
+    .await;
     assert_ne!(
         ids[0], ids[1],
         "an unknown decision must submit a fresh id (click must have an effect)"
@@ -870,7 +855,11 @@ async fn retry_after_a_timed_out_transcript_read_submits_a_new_id() {
         .await;
     assert!(retry.is_some(), "retry ack expected");
 
-    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    let ids = wait_for(&format!("the retry prompt records {} ids", 2), || async {
+        let current = prompt_ids.lock().await.clone();
+        (current.len() >= 2).then_some(current)
+    })
+    .await;
     assert_ne!(
         ids[0], ids[1],
         "a timed-out decision must submit a fresh id (click must have an effect)"
@@ -2083,7 +2072,11 @@ async fn v2_unfinished_retry_submits_a_new_id_and_never_replays_the_orphan() {
     // one. Swap in the full window before releasing it — the orphan stays in
     // it, still inside the fresh anchor's in-flight window, so only the render
     // baseline can keep it off the new card.
-    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    let ids = wait_for(&format!("the retry prompt records {} ids", 2), || async {
+        let current = prompt_ids.lock().await.clone();
+        (current.len() >= 2).then_some(current)
+    })
+    .await;
     let new_id = ids[1].clone().expect("the retry prompt carries an id");
     assert_ne!(
         ANCHOR,
@@ -2202,7 +2195,11 @@ async fn v2_retries_chain_under_fresh_ids() {
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;
     assert_retry_ack(retry);
-    let ids = wait_for_prompt_ids(&prompt_ids, 2).await;
+    let ids = wait_for(&format!("the retry prompt records {} ids", 2), || async {
+        let current = prompt_ids.lock().await.clone();
+        (current.len() >= 2).then_some(current)
+    })
+    .await;
     let retry1 = ids[1].clone().expect("retry 1's id");
     assert_ne!(ANCHOR, retry1.as_str(), "retry 1 must take a fresh id");
     let retry1_failed = failed_assistant_message("msg_v2_retry1", RETRY1_CREATED, "第一次重试：RETRY1_TEXT");
@@ -2228,7 +2225,11 @@ async fn v2_retries_chain_under_fresh_ids() {
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;
     assert_retry_ack(retry);
-    let ids = wait_for_prompt_ids(&prompt_ids, 3).await;
+    let ids = wait_for(&format!("the retry prompt records {} ids", 3), || async {
+        let current = prompt_ids.lock().await.clone();
+        (current.len() >= 3).then_some(current)
+    })
+    .await;
     let retry2 = ids[2].clone().expect("retry 2's id");
     assert_ne!(retry1, retry2, "retry 2 must take a fresh id too");
     assert_ne!(ANCHOR, retry2.as_str(), "nor re-post the original id");

@@ -5100,9 +5100,9 @@ pub(crate) async fn wait_for_card_update(
     wait_for_card_update_within(platform, label, SETTLE_DEADLINE, updates, check).await;
 }
 
-/// [`wait_for_card_update`] with an explicit bound: a test that must wait out
-/// real wall-clock time (a ledger minute turning over) stretches the default
-/// 5 s without loosening every other caller's bound.
+/// [`wait_for_card_update`] with an explicit bound: a test that watches a real
+/// timer (a ledger retry delay, say) caps its wait below the shared 180 s
+/// without tightening every other caller's bound.
 pub(crate) async fn wait_for_card_update_within(
     platform: &RecordingPlatform,
     label: &str,

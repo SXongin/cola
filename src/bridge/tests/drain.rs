@@ -210,14 +210,10 @@ async fn run_to_panel(app: &Arc<App>, platform: &RecordingPlatform) {
 /// Await the merged drain's guard release (the turn's true end), or panic: the
 /// guard is held for the WHOLE path and released only at the ending.
 pub(crate) async fn wait_for_guard_release(app: &Arc<App>) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while app.inflight.lock().await.contains("ses_test") {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the turn never released the guard"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the turn releases the guard", || async {
+        (!app.inflight.lock().await.contains("ses_test")).then_some(())
+    })
+    .await;
 }
 
 /// Settle the scenario's `bash` panel in the scripted transcript the follow
@@ -2916,20 +2912,6 @@ async fn a_retirement_inside_the_finalization_window_ends_the_turn_normally() {
         platform.calls.lock().await
     );
 }
-
-/// Wait until at least `target` transcript reads have reached the mock's hold
-/// gate, or panic after 5 s.
-async fn wait_for_parked_reads(backend: &Arc<MockBackend>, target: usize) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while backend.transcript_gate_entered.load(Ordering::SeqCst) < target {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the drain never reached parked read #{target}"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-}
-
 /// Spec #604: the final part lands BETWEEN the drain's render read and the
 /// later idle-status read, and still lands on the Card — the turn ends on that
 /// same rendered, quiescent snapshot, never finalizing the stale read into a
@@ -2975,13 +2957,19 @@ async fn a_final_part_landing_between_the_render_and_idle_read_still_lands() {
     // serves the tail-less snapshot: the render read genuinely predates the
     // tail.
     let gate = backend.hold_transcripts();
-    wait_for_parked_reads(&backend, 1).await;
+    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
+        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
     script_transcript(&backend, vec![SessionTranscript::new(rendered.clone())]).await;
     gate.add_permits(1);
 
     // Park the LATER read — the settle re-check. The tail lands now, AFTER the
     // render read, and the session idles: this later read carries the tail.
-    wait_for_parked_reads(&backend, 2).await;
+    wait_for(&format!("the drain reaches parked read #{}", 2), || async {
+        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 2).then_some(())
+    })
+    .await;
     script_transcript(&backend, vec![SessionTranscript::new(with_tail.clone())]).await;
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
@@ -3058,7 +3046,10 @@ async fn a_tail_landing_after_the_drain_settled_still_lands_on_the_card() {
     // reading Busy this is a settle candidate, and no permit is added until the
     // state below is staged.
     let gate = backend.hold_transcripts();
-    wait_for_parked_reads(&backend, 1).await;
+    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
+        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
     // The session goes Idle: the frozen read is the settle tick. Both it and the
     // drain's corroborating re-check are served the tail-less snapshot; the tail
     // is scripted only for the read AFTER them — finalization's own fresh read.
@@ -3143,7 +3134,10 @@ async fn a_delayed_but_successful_final_read_still_lands_the_tail() {
     // corroborating re-check serve tail-less, and finalization's own read serves
     // the tail. Disarm so the later reads flow.
     let gate = backend.hold_transcripts();
-    wait_for_parked_reads(&backend, 1).await;
+    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
+        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
@@ -3277,7 +3271,10 @@ async fn finalization_reads_use_the_full_per_read_timeout_and_stay_bounded() {
 
     // Time from the first hung transcript read: the drain's own read bound is
     // fixed, so the extra time to the guard release is what finalization spends.
-    wait_for_parked_reads(&backend, 1).await;
+    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
+        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
     let start = tokio::time::Instant::now();
     wait_for_guard_release(&app).await;
     let held = start.elapsed();
@@ -3344,7 +3341,10 @@ async fn a_settled_drain_whose_stream_keeps_growing_reopens_instead_of_stamping(
     // confirmation read — so the drain settles on a quiescent read and the
     // growth starts exactly on the read that must not be stamped on.
     let gate = backend.hold_transcripts();
-    wait_for_parked_reads(&backend, 1).await;
+    wait_for(&format!("the drain reaches parked read #{}", 1), || async {
+        (backend.transcript_gate_entered.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
     {
         let stream = Arc::clone(&backend);
         let fired = std::sync::atomic::AtomicBool::new(false);
@@ -4052,16 +4052,27 @@ async fn a_throttled_drain_read_keeps_the_unconfirmed_marker() {
 /// Await the Completion Notice or panic after 5 s: the notice is sent from a
 /// spawned task (after its repaint delay, #650), so it trails whatever call
 /// accepted the terminal write.
-pub(crate) async fn wait_for_notice(platform: &RecordingPlatform) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !noticed(platform).await {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no Completion Notice arrived: {:?}",
-            platform.calls.lock().await
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+pub(crate) async fn wait_for_notice(
+    platform: &RecordingPlatform,
+) -> Vec<(String, String, Option<String>, String)> {
+    let calls = std::sync::Mutex::new(String::new());
+    tokio::time::timeout(
+        SETTLE_DEADLINE,
+        wait_for("a Completion Notice arrives", || async {
+            let notices = platform.completion_notices().await;
+            if notices.is_empty() {
+                *calls.lock().unwrap() = format!("{:?}", platform.calls.lock().await);
+                None
+            } else {
+                Some(notices)
+            }
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        let calls = calls.lock().unwrap();
+        panic!("no Completion Notice arrived: {calls}")
+    })
 }
 
 /// Acceptance (#650, ADR-0074 §3's amendment): a terminal PATCH that lands

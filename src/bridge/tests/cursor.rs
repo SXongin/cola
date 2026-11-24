@@ -8,13 +8,15 @@
 //! cards sent/patched and the sidecar fact — never private internals.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::drain::{
     assistant, ctx, scripted_app, settle_tool, spawn_sync, spawn_turn, tool_assistant, user,
     wait_for_card_text,
 };
-use super::reap::{realistic_card_view, restarted_app_with_backend, wait_for_projection};
+use super::reap::{
+    realistic_card_view, restarted_app_with_backend, wait_for_cursor, wait_for_projection,
+    wait_for_update_attempts,
+};
 use crate::backend::types::SessionStatus;
 use crate::backend::{
     Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, Part, ReasoningPart,
@@ -22,64 +24,11 @@ use crate::backend::{
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, cursor_prefix_digest};
 use crate::bridge::test_support::{
-    ALWAYS, MockBackend, PlatformCall, UpdateFailure, card_text, patches_to, test_work_dir, text_part,
+    ALWAYS, MockBackend, UpdateFailure, card_text, patches_to, test_work_dir, text_part,
     two_parts_at_one_time, typed_message, wait_for_transcript_reads,
 };
 use crate::bridge::turn::Turn;
 use crate::feishu::card::tool_render::ToolPanel;
-
-/// Wait until the durable record's Rendered Cursor satisfies `ready`, or
-/// panic after 5 s.
-async fn wait_for_cursor(
-    app: &Arc<crate::bridge::App>,
-    mut ready: impl FnMut(&RenderedCursor) -> bool,
-) -> RenderedCursor {
-    let probe = async {
-        loop {
-            if let Some(cursor) = app.cards_handle().chains.cursor("ses_test")
-                && ready(&cursor)
-            {
-                return cursor;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .expect("the record's cursor must advance")
-}
-
-/// Wait until the platform observed at least `n` card-update attempts for
-/// `card_message_id` (failed attempts included), or panic after 5 s.
-async fn wait_for_update_attempts(
-    platform: &Arc<crate::bridge::test_support::RecordingPlatform>,
-    card_message_id: &str,
-    n: usize,
-) {
-    let probe = async {
-        loop {
-            let attempts = platform
-                .calls
-                .lock()
-                .await
-                .iter()
-                .filter(|call| {
-                    matches!(
-                        call,
-                        PlatformCall::UpdateMessage { message_id, .. } if message_id == card_message_id
-                    )
-                })
-                .count();
-            if attempts >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .expect("the platform must see the write attempts");
-}
 
 /// A live turn's confirmed card writes advance the record's Rendered Cursor
 /// (spec #561): the frontier names the newest delivered text part with its

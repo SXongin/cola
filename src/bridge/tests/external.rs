@@ -1,4 +1,5 @@
 use super::drain::{noticed, spawn_sync};
+use super::wake::wait_for_any_card;
 use crate::backend::{
     Compaction, CompactionReason, CompactionStatus, ContentBlock, FileContent, FinishReason, MessageId,
     MessageRole, Part, ReasoningPart, SessionTranscript, StepFinish, StepStart, ToolCall, ToolIdentity,
@@ -3345,32 +3346,6 @@ fn external_entry() -> crate::config::SessionEntry {
         topic_root: None,
         variant: None,
     }
-}
-
-/// Await any card — sent, replied or updated — carrying `needle`, or panic
-/// after 5 s: the external path's notification is a SEND and its render an
-/// in-place update, so a test must accept either call.
-async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
-    let probe = async {
-        loop {
-            let found = {
-                let calls = platform.calls.lock().await;
-                calls.iter().any(|call| match call {
-                    PlatformCall::ReplyCard { card, .. }
-                    | PlatformCall::SendCard { card, .. }
-                    | PlatformCall::UpdateMessage { card, .. } => card_text(card).contains(needle),
-                    _ => false,
-                })
-            };
-            if found {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("no card ever carried {needle:?}"));
 }
 
 /// #568: an external follow whose turn idles with a live Background Task
