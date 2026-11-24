@@ -1900,13 +1900,15 @@ async fn the_size_probe_fires_while_a_live_patch_is_stalled() {
     // The writer crosses the threshold while the PATCH is still parked, and the
     // probe kills it there.
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
+        wait_for("the producer crosses the threshold", || async {
             let log = only_log(&dir);
             if std::fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0) > cap {
-                return;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the producer crosses the threshold");
@@ -2087,19 +2089,15 @@ fn button_value(card: &serde_json::Value, op: &str) -> Option<serde_json::Value>
 /// test that means to click one waits for the first live PATCH.
 #[cfg(unix)]
 async fn live_card_with(platform: &RecordingPlatform, op: &str) -> serde_json::Value {
-    for _ in 0..500 {
-        if let Some(card) = platform
+    wait_for(&format!("a live card carries the {op:?} control"), || async {
+        platform
             .updated_cards()
             .await
             .into_iter()
             .rev()
             .find(|card| button_value(card, op).is_some())
-        {
-            return card;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("no live card ever carried the {op:?} control");
+    })
+    .await
 }
 
 /// The highest `tick-N` the card's output carries.
@@ -2225,12 +2223,14 @@ async fn two_concurrent_commands_cannot_both_claim_one_chat() {
     .await;
     // One of the two owns the claim for seconds; the other must have been
     // refused by the time both dispatches have run.
-    for _ in 0..100 {
-        if !platform.texts().await.is_empty() {
-            break;
+    wait_for("the command replies with text", || async {
+        if platform.texts().await.is_empty() {
+            None
+        } else {
+            Some(())
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await;
     assert_eq!(
         platform.replied_cards().await.len(),
         1,
@@ -4260,15 +4260,13 @@ async fn a_double_clicked_rerun_runs_one_command_even_when_the_first_finished_in
     // The first rerun finishes (instantly, by design), and the redelivered copy
     // of the same click arrives afterwards.
     let lines = async {
-        loop {
+        wait_for("the first rerun ran", || async {
             let count = std::fs::read_to_string(&counter)
                 .map(|raw| raw.lines().count())
                 .unwrap_or(0);
-            if count >= 2 {
-                return count;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+            if count >= 2 { Some(count) } else { None }
+        })
+        .await
     };
     tokio::time::timeout(Duration::from_secs(10), lines)
         .await
@@ -5773,9 +5771,14 @@ async fn a_probe_cycle_in_flight_when_the_run_ends_signals_nothing() {
     // One probe cycle parks before it takes the gate: it is in flight, but the
     // run can still end and stand it down.
     tokio::time::timeout(Duration::from_secs(10), async {
-        while hook.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for("a probe cycle reaches the park", || async {
+            if hook.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                None
+            } else {
+                Some(())
+            }
+        })
+        .await
     })
     .await
     .expect("a probe cycle reaches the park");
@@ -5848,9 +5851,14 @@ async fn a_probe_cycle_pending_at_a_natural_exit_signals_nothing() {
     let child =
         rustix::process::Pid::from_raw(record.pids[0] as i32).expect("the recorded child id is a valid pid");
     tokio::time::timeout(Duration::from_secs(10), async {
-        while hook.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for("a probe cycle reaches the park while the run is live", || async {
+            if hook.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                None
+            } else {
+                Some(())
+            }
+        })
+        .await
     })
     .await
     .expect("a probe cycle reaches the park while the run is live");
@@ -5858,15 +5866,17 @@ async fn a_probe_cycle_pending_at_a_natural_exit_signals_nothing() {
     // The child exits on its own; the loop reaps it under the gate and stands
     // the probe down. A reaped pid is what proves the loop got there.
     tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+        wait_for("the loop reaps the naturally exited child", || async {
             if matches!(
                 rustix::process::test_kill_process(child),
                 Err(rustix::io::Errno::SRCH)
             ) {
-                return;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the loop reaps the naturally exited child");
@@ -6753,15 +6763,17 @@ async fn a_failed_freeze_past_the_cap_still_restores_the_run_card() {
     // Past the cap only the survivor ticker runs; it must re-announce the cap
     // and re-paint the run's card with its controls.
     let restored = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+        wait_for("the abort re-paints the run's card past the cap", || async {
             let patches = patches_to(&platform, "om_original").await;
             if let Some(last) = patches.last()
                 && card_text(last).contains("已达时限")
             {
-                return last.clone();
+                Some(last.clone())
+            } else {
+                None
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the abort re-paints the run's card past the cap");

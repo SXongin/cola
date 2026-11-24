@@ -1311,18 +1311,19 @@ async fn an_abort_during_the_old_card_stamp_marks_the_sent_read() {
     // The command was cancelled after it stamped the previous card; the read it
     // had just sent must not stay indistinguishable from current.
     let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let calls = platform.calls.lock().await.clone();
-            if let Some(card) = calls.iter().rev().find_map(|call| match call {
-                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_follow" => {
-                    Some(card.clone())
-                }
-                _ => None,
-            }) {
-                return card;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        wait_for(
+            "the aborted command must still mark the sent read taken over",
+            || async {
+                let calls = platform.calls.lock().await.clone();
+                calls.iter().rev().find_map(|call| match call {
+                    PlatformCall::UpdateMessage { message_id, card } if message_id == "om_follow" => {
+                        Some(card.clone())
+                    }
+                    _ => None,
+                })
+            },
+        )
+        .await
     })
     .await
     .expect("the aborted command must still mark the sent read taken over");
@@ -1390,18 +1391,19 @@ async fn an_abort_during_an_idle_reads_old_card_stamp_marks_the_sent_read() {
         "the aborted command never recorded its read as current"
     );
     let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let calls = platform.calls.lock().await.clone();
-            if let Some(card) = calls.iter().rev().find_map(|call| match call {
-                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_2" => {
-                    Some(card.clone())
-                }
-                _ => None,
-            }) {
-                return card;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        wait_for(
+            "the aborted idle read must still mark its sent read taken over",
+            || async {
+                let calls = platform.calls.lock().await.clone();
+                calls.iter().rev().find_map(|call| match call {
+                    PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_2" => {
+                        Some(card.clone())
+                    }
+                    _ => None,
+                })
+            },
+        )
+        .await
     })
     .await
     .expect("the aborted idle read must still mark its sent read taken over");

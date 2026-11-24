@@ -2453,12 +2453,14 @@ async fn a_stalled_parent_walk_never_holds_the_sweep_card_lock() {
         seen
     });
     // Wait until the sweep has actually reached the stalled read.
-    for _ in 0..200 {
-        if !backend.session_info_calls.lock().await.is_empty() {
-            break;
+    wait_for("the sweep reached the parent-chain walk", || async {
+        if backend.session_info_calls.lock().await.is_empty() {
+            None
+        } else {
+            Some(())
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    })
+    .await;
     assert!(
         !backend.session_info_calls.lock().await.is_empty(),
         "the sweep reached the parent-chain walk"

@@ -405,17 +405,14 @@ async fn a_stalled_writer_does_not_stall_a_model_pick_callback() {
 
     // Releasing the writer lands it, in order, after the callback answered.
     pause.release();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    wait_for("the deferred mirror write landed after the callback", || async {
         if std::fs::read_to_string(&sessions).is_ok_and(|text| text.contains("\"openai/gpt-5.1\"")) {
-            break;
+            Some(())
+        } else {
+            None
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the deferred mirror write landed after the callback"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    })
+    .await
 }
 
 /// Spec #930 acceptance 2: a pick naming another provider is refused
@@ -960,14 +957,14 @@ async fn a_live_pick_becomes_neutral_if_its_provider_generation_changes() {
             )
             .await
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while lookup_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "variant lookup did not begin"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("variant lookup did not begin", || async {
+        if lookup_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     // The pick is paused after deciding `openai`; replace the fact generation
     // before its pending model is recorded.
@@ -1008,11 +1005,14 @@ async fn a_pending_that_materialises_is_not_reported_saved() {
 
     let app_for_pick = app.clone();
     let pick = tokio::spawn(async move { app_for_pick.host_action(model_pick(PROVIDER, MODEL)).await });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the lookup never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     app.sessions
         .lock()
         .await
@@ -1058,14 +1058,14 @@ async fn a_model_write_during_materialisation_fails_honestly() {
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the creation never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the creation never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     let step = app
         .host_action(model_pick(PROVIDER, MODEL))
@@ -1104,14 +1104,14 @@ async fn a_replacement_pending_survives_the_older_creation() {
     seed_pending(&app, PendingEntry::new(key(), "/work/first")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the creation never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the creation never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     let mut replacement = PendingEntry::new(key(), "/work/second");
     replacement.model = Some("deepseek/deepseek-v4-pro".into());
     app.sessions
@@ -1179,14 +1179,14 @@ async fn a_forget_during_a_parked_creation_is_not_undone() {
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the creation never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the creation never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     // The user forgets the thread while `thread/start` is in flight.
     send_command(&app, "/switch forget", "msg_forget").await;
@@ -1222,14 +1222,14 @@ async fn a_newer_selection_during_a_parked_creation_wins() {
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the creation never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the creation never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     // The user selects another session while `thread/start` is in flight.
     app.activate_session(crate::config::SessionEntry::new(
@@ -1411,11 +1411,14 @@ async fn a_model_pick_switches_the_session_outside_the_gate() {
             .await;
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(tokio::time::Instant::now() < deadline, "the switch never started");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the switch never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     // The pick is parked in its RPC; the state gate must still be free, so a
     // settings write on the same session completes instead of waiting for it.
@@ -1758,14 +1761,14 @@ async fn a_materialised_store_model_is_not_resent_when_the_adapter_holds_a_pendi
     seed_entry(&app, entry).await;
 
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the prompt never reached the backend"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the prompt never reached the backend", || async {
+        if prompt_models.lock().await.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     assert_eq!(
         prompt_models.lock().await.as_slice(),
         &[None],
@@ -1816,14 +1819,14 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
     );
 
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the prompt never reached the backend"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the prompt never reached the backend", || async {
+        if prompt_models.lock().await.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1889,24 +1892,24 @@ async fn two_competing_durable_picks_keep_the_server_and_mirror_in_step() {
         })
     };
     let first = spawn_pick("/model openai/model-a");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the first switch never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the first switch never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     let second = spawn_pick("/model openai/model-b");
     let switch = app.session_gates.gate("ses_test");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while switch.switch_waiting() == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the second pick never queued at the switch point"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the second pick never queued at the switch point", || async {
+        if switch.switch_waiting() == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     assert_eq!(
         entered.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -1914,14 +1917,14 @@ async fn two_competing_durable_picks_keep_the_server_and_mirror_in_step() {
     );
 
     gate.add_permits(1);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the second switch never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the second switch never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     gate.add_permits(1);
     first.await.expect("the first joins");
     second.await.expect("the second joins");
@@ -1993,14 +1996,14 @@ async fn a_pending_replaced_during_the_pick_is_not_overwritten() {
             .await;
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the pick's catalog lookup never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the pick's catalog lookup never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     // `/new` replaces the pending with one that carries the same model/variant:
     // only the identity tells them apart.
     let mut replacement = PendingEntry::new(key(), "/work/cola");
@@ -2082,25 +2085,25 @@ async fn a_prompt_waits_for_an_in_flight_durable_switch() {
             .await;
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the durable switch never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the durable switch never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     prompt(&app, "msg_prompt", "hi");
     let switch = app.session_gates.gate("ses_test");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while switch.switch_waiting() == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the pre-flight never queued at the switch point"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the pre-flight never queued at the switch point", || async {
+        if switch.switch_waiting() == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     assert!(
         prompt_models.lock().await.is_empty(),
         "the prompt is not submitted while the switch is in flight"
@@ -2108,14 +2111,17 @@ async fn a_prompt_waits_for_an_in_flight_durable_switch() {
 
     gate.add_permits(1);
     pick.await.expect("the pick joins");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the prompt was never submitted after the switch settled"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for(
+        "the prompt was never submitted after the switch settled",
+        || async {
+            if prompt_models.lock().await.is_empty() {
+                None
+            } else {
+                Some(())
+            }
+        },
+    )
+    .await;
     assert_eq!(
         prompt_models.lock().await.last().cloned().flatten(),
         Some("openai/model-b".to_string()),
@@ -2162,14 +2168,14 @@ async fn a_delayed_autoaccept_keeps_a_recorded_model() {
             .await;
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the approval sweep never reached the backend"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the approval sweep never reached the backend", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     // An ordinary `/model` pick lands while the command waits.
     let outcome = app
         .sessions_handle()
@@ -2272,14 +2278,14 @@ async fn an_unanswered_durable_switch_fails_by_name_and_releases_the_point() {
 
     // The point is released: the next prompt is submitted normally.
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the next prompt was wedged behind the dead switch"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the next prompt was wedged behind the dead switch", || async {
+        if prompt_models.lock().await.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     assert_eq!(
         prompt_models.lock().await.last().cloned().flatten(),
         Some("openai/gpt-5.1-codex".to_string()),
@@ -2317,14 +2323,14 @@ async fn a_switch_landing_during_a_submit_applies_from_the_next_turn() {
     // The first turn reaches the submit (the point is already released) and
     // parks there.
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the prompt never reached the submit"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the prompt never reached the submit", || async {
+        if prompt_models.lock().await.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     // A switch lands while the turn is in flight: it applies from the next
     // turn, and it is not blocked by the submit.
     send_command_in(
@@ -2356,14 +2362,14 @@ async fn a_switch_landing_during_a_submit_applies_from_the_next_turn() {
     // Releasing the submit ends the first turn; the next one runs the switch.
     prompt_gate.add_permits(1);
     prompt(&app, "msg_prompt2", "hi again");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the second turn was never submitted"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the second turn was never submitted", || async {
+        if prompt_models.lock().await.len() < 2 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     assert_eq!(
         prompt_models.lock().await.last().cloned().flatten(),
         Some("openai/model-b".to_string()),
@@ -2419,25 +2425,25 @@ async fn a_stalled_catalog_under_the_point_does_not_wedge_later_waiters() {
             .await;
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the pick's catalog read never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the pick's catalog read never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     // A prompt waits behind the point; the catalog bound releases it.
     prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the prompt was wedged behind the stalled catalog"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    wait_for("the prompt was wedged behind the stalled catalog", || async {
+        if prompt_models.lock().await.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     pick.await.expect("the pick joins");
     let switch = app.session_gates.gate("ses_test");
     assert_eq!(
@@ -2899,14 +2905,14 @@ async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
                 .await
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the earlier catalog lookup never started"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    wait_for("the earlier catalog lookup never started", || async {
+        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     // The later pick records while the earlier lookup is still parked.
     let later = sessions

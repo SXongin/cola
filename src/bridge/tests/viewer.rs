@@ -83,13 +83,15 @@ async fn drive_viewer_rebuild(
         .expect("the viewer rebuild callback is acknowledged");
     assert!(result.card.is_none(), "the rebuild stays off-callback");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the viewer page PATCH lands", || async {
             let patches = patches_to(platform, message_id).await;
             if patches.len() > previous_patches {
-                return patches.last().unwrap().clone();
+                Some(patches.last().unwrap().clone())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the viewer page PATCH lands")
@@ -3130,7 +3132,7 @@ async fn rich_text_messages(platform: &RecordingPlatform) -> Vec<PlatformCall> {
 /// and the text.
 async fn first_reply_text(platform: &RecordingPlatform) -> (String, String) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the viewer replies with text", || async {
             let replies: Vec<(String, String)> = platform
                 .calls
                 .lock()
@@ -3141,11 +3143,9 @@ async fn first_reply_text(platform: &RecordingPlatform) -> (String, String) {
                     _ => None,
                 })
                 .collect();
-            if let Some(reply) = replies.into_iter().next() {
-                break reply;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+            replies.into_iter().next()
+        })
+        .await
     })
     .await
     .expect("the reply lands")
@@ -3375,13 +3375,15 @@ async fn rereading_binary_content_sends_only_once_per_identity() {
             .await
             .expect("unchanged binary re-read acknowledges");
         current = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
+            wait_for("the same viewer card is refreshed", || async {
                 let patches = patches_to(&platform, "msg_reply").await;
                 if patches.len() > before {
-                    break patches.last().unwrap().clone();
+                    Some(patches.last().unwrap().clone())
+                } else {
+                    None
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+            })
+            .await
         })
         .await
         .expect("the same viewer card is refreshed");
@@ -3399,13 +3401,15 @@ async fn rereading_binary_content_sends_only_once_per_identity() {
         .await
         .expect("changed binary re-read acknowledges");
     let changed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the changed viewer card is refreshed", || async {
             let patches = patches_to(&platform, "msg_reply").await;
             if patches.len() > before {
-                break patches.last().unwrap().clone();
+                Some(patches.last().unwrap().clone())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the changed viewer card is refreshed");
@@ -3475,14 +3479,16 @@ async fn reread_rotates_the_text_transfer_once_guard() {
         .await
         .expect("the changed text re-read acknowledges");
     let refreshed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the refreshed text snapshot lands on the same card", || async {
             let patches = patches_to(&platform, "msg_reply").await;
             if patches.len() > before && card_text(patches.last().unwrap()).contains("changed text snapshot")
             {
-                break patches.last().unwrap().clone();
+                Some(patches.last().unwrap().clone())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the refreshed text snapshot lands on the same card");
@@ -3577,16 +3583,14 @@ async fn failed_reread_keeps_the_viewer_card_and_answers_with_the_failure() {
         "the callback acks first"
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the off-thread failure reply arrives", || async {
             let answered = platform.calls.lock().await.iter().any(|call| {
                 matches!(call, PlatformCall::ReplyText { message_id, text }
                     if message_id == "msg_reply" && text.contains("找不到路径"))
             });
-            if answered {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+            if answered { Some(()) } else { None }
+        })
+        .await
     })
     .await
     .expect("the off-thread failure reply arrives");
@@ -3634,16 +3638,14 @@ async fn reread_fifo_fails_promptly_without_replacing_the_viewer_card() {
         started.elapsed()
     );
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
+        wait_for("the FIFO read failure is answered promptly", || async {
             let answered = platform.calls.lock().await.iter().any(|call| {
                 matches!(call, PlatformCall::ReplyText { message_id, text }
                     if message_id == "msg_reply" && text.contains("not a regular file"))
             });
-            if answered {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+            if answered { Some(()) } else { None }
+        })
+        .await
     })
     .await
     .expect("the FIFO read failure is answered promptly");
@@ -3820,13 +3822,15 @@ async fn unchanged_reread_after_send_as_file_keeps_the_overflow_preview() {
         .await
         .expect("the unchanged re-read acknowledges");
     let reread = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the unchanged re-read refreshes the card", || async {
             let patches = patches_to(&platform, "msg_csv_card").await;
             if patches.len() > before {
-                break patches.last().unwrap().clone();
+                Some(patches.last().unwrap().clone())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the unchanged re-read refreshes the card");
@@ -4832,13 +4836,11 @@ async fn a_tool_panel_html_preview_sends_a_file_message_and_leaves_the_turn_card
     );
 
     let posts = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the preview's File Message lands", || async {
             let posts = file_messages(&platform).await;
-            if !posts.is_empty() {
-                break posts;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+            if !posts.is_empty() { Some(posts) } else { None }
+        })
+        .await
     })
     .await
     .expect("the preview's File Message lands");
@@ -4865,22 +4867,24 @@ async fn a_tool_panel_html_preview_sends_a_file_message_and_leaves_the_turn_card
     // drops its in-flight claim and remembers the send, so the refusal is the
     // observable completion. Either way no second File Message is posted.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the duplicate click reports 文件已发送", || async {
             let toast = app
                 .host_action(payload.clone())
                 .await
                 .expect("a duplicate click is acknowledged")
                 .toast;
             if toast.as_deref() == Some("文件已发送") {
-                break;
+                Some(())
+            } else {
+                assert_eq!(
+                    toast.as_deref(),
+                    Some("正在发送文件…"),
+                    "only a held claim or a remembered send answers here"
+                );
+                None
             }
-            assert_eq!(
-                toast.as_deref(),
-                Some("正在发送文件…"),
-                "only a held claim or a remembered send answers here"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the send is remembered, so a stale click is refused");
@@ -5387,27 +5391,31 @@ async fn the_tool_panel_preview_click_pins_its_keys_exact_result_and_never_patch
     // duplicate click read `文件已发送` — that is the spawned task's end, so a
     // PATCH racing the send would already have been issued.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the preview's File Message lands", || async {
             if !file_messages(&platform).await.is_empty() {
-                break;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the preview's File Message lands");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("a duplicate click is acknowledged", || async {
             let toast = app
                 .host_action(dispatch.clone())
                 .await
                 .expect("a duplicate click is acknowledged")
                 .toast;
             if toast.as_deref() == Some("文件已发送") {
-                break;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the send is remembered");
@@ -5455,17 +5463,19 @@ async fn the_tool_panel_open_click_pins_its_keys_and_exact_result() {
     assert_eq!(ack.toast.as_deref(), Some("正在打开文件…"));
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the standalone viewer reply lands", || async {
             if platform
                 .replied_cards()
                 .await
                 .iter()
                 .any(|card| card_text(card).contains("# notes"))
             {
-                break;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the standalone viewer reply lands");
@@ -5526,13 +5536,15 @@ async fn the_viewer_page_and_reread_clicks_pin_their_keys_and_exact_results() {
     assert!(ack.card.is_none(), "the rebuild stays off the callback");
     assert_eq!(ack.toast.as_deref(), Some("正在翻页…"));
     let page2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the pager's PATCH lands", || async {
             let patches = patches_to(&platform, "msg_long").await;
             if patches.len() > before {
-                break patches.last().unwrap().clone();
+                Some(patches.last().unwrap().clone())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the pager's PATCH lands");
@@ -5566,12 +5578,14 @@ async fn the_viewer_page_and_reread_clicks_pin_their_keys_and_exact_results() {
     assert!(ack.card.is_none(), "the re-read stays off the callback");
     assert_eq!(ack.toast.as_deref(), Some("正在重新读取…"));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the re-read's PATCH lands", || async {
             if patches_to(&platform, "msg_long").await.len() > before {
-                break;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the re-read's PATCH lands");

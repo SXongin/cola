@@ -2548,7 +2548,7 @@ mod tests {
     #[tokio::test]
     async fn an_idle_session_card_is_never_the_records_successor() {
         use crate::bridge::test_support::{
-            ALWAYS, MockBackend, UpdateFailure, build_app, seed_session, test_config,
+            ALWAYS, MockBackend, UpdateFailure, build_app, seed_session, test_config, wait_for,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -2641,13 +2641,14 @@ mod tests {
         // Once the outbox drains, the read is the documented orphan.
         platform.clear_fail_update();
         handles.cards.feishu.drain_pending_card_updates(true).await;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while handles.cards.feishu.has_pending_card_update("om_chain") {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        wait_for("the drain delivers the owed ending", || async {
+            if handles.cards.feishu.has_pending_card_update("om_chain") {
+                None
+            } else {
+                Some(())
             }
         })
-        .await
-        .expect("the drain delivers the owed ending");
+        .await;
         let reads = gather_reads(&handles, "ses_test", &record, Some("/work"), None).await;
         assert_eq!(
             reads.card,

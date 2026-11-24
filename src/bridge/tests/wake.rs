@@ -3209,18 +3209,16 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
         })
     };
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
+        wait_for("the new Turn must reply its own card to the message", || async {
             let replied = {
                 let calls = platform.calls.lock().await;
                 calls
                     .iter()
                     .any(|c| matches!(c, PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_next"))
             };
-            if replied {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+            if replied { Some(()) } else { None }
+        })
+        .await
     })
     .await
     .expect("the new Turn must reply its own card to the message");
@@ -3229,12 +3227,14 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
     // racing the Turn's work-context read that sits between the card and the
     // prompt (the held permit keeps the Turn in flight from here on).
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
+        wait_for("the new Turn's submit must be recorded", || async {
             if backend.prompt_calls.lock().await.iter().any(|t| t == "新问题") {
-                return;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the new Turn's submit must be recorded");
@@ -4582,12 +4582,14 @@ async fn a_wake_does_not_replace_a_bare_actionable_terminal_card() {
         .await;
         let cards = app.cards_handle();
         tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
+            wait_for("the failed Turn ends on an Error card", || async {
                 if Turn::card_state(&cards, "ses_test").await == Some(CardState::Error) {
-                    return;
+                    Some(())
+                } else {
+                    None
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            })
+            .await
         })
         .await
         .expect("the failed Turn ends on an Error card");

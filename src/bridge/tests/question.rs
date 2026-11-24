@@ -90,18 +90,14 @@ async fn question_poller_recovers_when_a_list_call_hangs() {
 
     // Without a bound on the list call the poller sits on the first hung
     // call forever and the question never surfaces.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let surfaced = Turn::has_interaction_in(&app.cards_handle(), "ses_test", "que_hung").await;
-        if surfaced {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "question poller never recovered from the hung list call"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    wait_for(
+        "question poller never recovered from the hung list call",
+        || async {
+            let surfaced = Turn::has_interaction_in(&app.cards_handle(), "ses_test", "que_hung").await;
+            if surfaced { Some(()) } else { None }
+        },
+    )
+    .await
 }
 
 #[tokio::test]
