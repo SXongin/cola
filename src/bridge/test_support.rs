@@ -5062,22 +5062,43 @@ pub(crate) enum CardUpdates {
 /// lands (the waits poll, so they return immediately).
 pub(crate) const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Poll `probe` every 5 ms until it yields a value, then return it. `label`
+/// names the condition and is the failure message; a probe returns `Some` to
+/// finish, so a wait can also return what it observed. The bound is
+/// [`SETTLE_DEADLINE`], the one bound every fixture wait shares.
+pub(crate) async fn wait_for<T, F, Fut>(label: &str, mut probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let wait = async {
+        loop {
+            if let Some(value) = probe().await {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(SETTLE_DEADLINE, wait)
+        .await
+        .unwrap_or_else(|_| panic!("timed out after {SETTLE_DEADLINE:?} waiting until {label}"))
+}
+
 /// Await a spawned handler by polling `is_finished`, not by racing a fixed
 /// timeout: the very next poll after the work lands sees it, so the wait cannot
-/// lose a race a longer timeout would merely postpone.
+/// lose a race a longer timeout would merely postpone. The handle is the
+/// probe's condition, and its join is the value.
 pub(crate) async fn wait_for_handler<T>(
     handle: tokio::task::JoinHandle<T>,
     label: &str,
     within: std::time::Duration,
 ) -> T {
-    let deadline = tokio::time::Instant::now() + within;
-    while !handle.is_finished() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label} did not finish within {within:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(
+        within,
+        wait_for(label, || async { handle.is_finished().then_some(()) }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{label} did not finish within {within:?}"));
     handle.await.expect("the handler joins")
 }
 
@@ -5094,20 +5115,21 @@ pub(crate) async fn wait_for_recorded_card(
     within: std::time::Duration,
     check: impl Fn(&serde_json::Value) -> bool,
 ) {
-    let deadline = tokio::time::Instant::now() + within;
-    loop {
-        let mut cards = platform.updated_cards().await;
-        cards.extend(platform.replied_cards().await);
-        if cards.iter().any(&check) {
-            return;
-        }
-        let headers: Vec<&str> = cards.iter().map(card_header).collect();
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{label} never appeared within {within:?}; recorded card headers: {headers:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    let headers = std::sync::Mutex::new(Vec::new());
+    tokio::time::timeout(
+        within,
+        wait_for(label, || async {
+            let mut cards = platform.updated_cards().await;
+            cards.extend(platform.replied_cards().await);
+            *headers.lock().unwrap() = cards.iter().map(card_header).map(str::to_string).collect();
+            cards.iter().any(&check).then_some(())
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        let headers = headers.lock().unwrap();
+        panic!("{label} never appeared within {within:?}; recorded card headers: {headers:?}")
+    });
 }
 
 /// Await a recorded in-place card update satisfying `check`, or panic after
@@ -5133,30 +5155,28 @@ pub(crate) async fn wait_for_card_update_within(
     updates: CardUpdates,
     check: impl Fn(&serde_json::Value) -> bool,
 ) {
-    let wait = async {
-        loop {
+    tokio::time::timeout(
+        timeout,
+        wait_for(label, || async {
             let cards = platform.updated_cards().await;
-            let matched = match updates {
+            match updates {
                 CardUpdates::Any => cards.iter().any(&check),
                 CardUpdates::Latest => cards.last().is_some_and(&check),
-            };
-            if matched {
-                return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(timeout, wait)
-        .await
-        .unwrap_or_else(|_| panic!("card never reached {label}"));
+            .then_some(())
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("card never reached {label}"));
 }
 
 /// Wait until `backend` has served `session_id`'s transcript at least `n`
 /// times — the proof-of-pass for a test whose flow (a restarted process's
 /// Session Sync, the reap) reads a session the test itself never drives.
 pub(crate) async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, session_id: &str, n: usize) {
-    let probe = async {
-        loop {
+    wait_for(
+        &format!("the flow reads {session_id}'s transcript {n} times"),
+        || async {
             let reads = backend
                 .transcript_calls
                 .lock()
@@ -5164,39 +5184,10 @@ pub(crate) async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, sessio
                 .iter()
                 .filter(|sid| sid.as_str() == session_id)
                 .count();
-            if reads >= n {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the flow never read {session_id}'s transcript {n} times"));
-}
-
-/// Wait until `condition` holds, polling every 5 ms — a state predicate used
-/// instead of a fixed sleep (issue #958). The bound is [`SETTLE_DEADLINE`], the
-/// same one every other fixture wait uses: a spawned task can take minutes to be
-/// scheduled on a loaded runner, and that risk is what these waits exist to
-/// absorb. The price is paid only when a fixture is genuinely broken — each such
-/// site then burns one deadline before reporting.
-pub(crate) async fn wait_until<F, Fut>(label: &str, mut condition: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let probe = async {
-        loop {
-            if condition().await {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(SETTLE_DEADLINE, probe)
-        .await
-        .unwrap_or_else(|_| panic!("timed out after {SETTLE_DEADLINE:?} waiting until {label}"));
+            (reads >= n).then_some(())
+        },
+    )
+    .await;
 }
 
 /// Wait until a background poll loop has completed `count` passes past
@@ -5220,8 +5211,8 @@ pub(crate) async fn wait_for_poll_passes(
     count: usize,
     label: &str,
 ) {
-    wait_until(&format!("{label} completes {count} pass(es)"), || async {
-        passes.load(std::sync::atomic::Ordering::Relaxed) >= baseline + count
+    wait_for(&format!("{label} completes {count} pass(es)"), || async {
+        (passes.load(std::sync::atomic::Ordering::Relaxed) >= baseline + count).then_some(())
     })
     .await;
 }
