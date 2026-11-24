@@ -1496,9 +1496,7 @@ async fn a_rejected_preserved_yield_retries_the_bare_one() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // The preserved attempt is refused as card content (230099): the bare ⏳
     // must still land.
-    platform
-        .fail_update_card_content_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 1);
 
     spawn_sync(&app);
     wait_for_card_update(&platform, "the bare ⏳", CardUpdates::Latest, |card| {
@@ -2066,9 +2064,7 @@ async fn a_failed_takeover_collect_warns_and_keeps_the_successor() {
     platform.given_card_view("om_frozen", live_tail_orphan_view());
     // Exactly the collect's PATCH fails: it is the first card write after the
     // new reply, and the failure must not touch anything else.
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
 
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
@@ -2208,9 +2204,7 @@ async fn a_recoverably_failed_collect_releases_the_cache() {
     );
     // The collect's first attempt fails recoverably: the queue keeps it owed
     // and retries it.
-    platform
-        .fail_update_transport_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, 1);
 
     Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
     Turn::set_turn_anchor(&app.cards_handle(), "ses_test", &turn_anchor(1_000)).await;
@@ -2900,9 +2894,7 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
     // not have landed, so the queue keeps it owed with its backoff. The reap's
     // per-tick re-decisions inherit that schedule (spec #571 review), so the
     // retry is the drain's — forced here, as the WS reconnect path does.
-    platform
-        .fail_update_transport_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, 1);
 
     spawn_sync(&app);
     wait_for_update_attempts(&platform, "om_frozen", 1).await;
@@ -2952,9 +2944,7 @@ async fn a_rejected_stamp_is_attempted_once_and_given_up() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // The one stamp attempt is refused as card content (230099): every later
     // tick would send the identical payload, so none may be made.
-    platform
-        .fail_update_card_content_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 1);
 
     spawn_sync(&app);
     // The refusal settles the queue's key — the fact every later tick reads
@@ -4147,9 +4137,7 @@ async fn a_rejected_preserved_ending_retries_the_bare_one() {
 
     let (app, platform) = restarted_app(&session_file, completed(1_000), None).await;
     platform.given_card_view("om_frozen", realistic_card_view());
-    platform
-        .fail_update_card_content_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 1);
 
     spawn_sync(&app);
     wait_for_card_update(&platform, "the bare retry", CardUpdates::Latest, |card| {
@@ -4237,9 +4225,7 @@ async fn a_permanently_refused_ending_releases_the_record() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // Both the preserved ending and its bare fallback are refused as card
     // content (230099): nothing can ever land for this key.
-    platform
-        .fail_update_card_content_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 2);
 
     spawn_sync_with_timeout(&app, 5_000);
     // The refusal spends the record: no later pass may bring the ending back.
@@ -4291,9 +4277,7 @@ async fn a_refused_waiting_yield_is_never_re_read() {
         .set_session_status("ses_other", Some(SessionStatus::Busy))
         .await;
     platform.given_card_view("om_frozen", realistic_card_view());
-    platform
-        .fail_update_card_content_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 2);
 
     spawn_sync_with_timeout(&app, 5_000);
     wait_for_status_reads(&backend, "ses_other", 4).await;
@@ -4332,9 +4316,7 @@ async fn a_rejected_preserved_collect_lands_the_bare_marker() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // The preserved collect is refused as card content (230099): its bare
     // marker must still land.
-    platform
-        .fail_update_card_content_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 1);
 
     // A successor takes the orphan over: the collect PATCHes the orphan card.
     Turn::seed_card(&app.cards_handle(), "ses_test", None).await;
@@ -4443,9 +4425,7 @@ async fn a_refused_preserved_ending_never_lands_over_a_newer_collect() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // The preserved ✅ ending is refused as card content (230099): its bare
     // fallback must still land — ordered under the ending's own key.
-    platform
-        .fail_update_card_content_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 1);
     // Park the preserved ending's PATCH: the refusal and the fallback are both
     // still outstanding when the takeover queues behind them.
     let (entered, release) = platform.pause("update", "om_frozen");
@@ -4494,9 +4474,7 @@ async fn a_transport_failed_settle_stays_owed_for_the_drain() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // A transport failure on every attempt, so each observed tick records what
     // it sent before failing.
-    platform
-        .fail_update_transport_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
 
     spawn_sync(&app);
     // Three observed status reads: at least two later passes re-decided the
@@ -4540,9 +4518,7 @@ async fn an_owed_settle_converges_through_the_pass_drain() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // The first keyed attempt fails at the transport; the queue keeps the
     // ending owed with its backoff.
-    platform
-        .fail_update_transport_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, 1);
 
     spawn_sync(&app);
     // The pass drain retries once the 5s backoff elapses; the reap then
@@ -4934,9 +4910,7 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
     // Every card write fails at the transport: nothing lands, and the turn's
     // ending is the newest failed payload.
-    platform
-        .fail_update_transport_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
         .await
@@ -4959,9 +4933,7 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
 
     // Feishu returns: a forced drain (the WS reconnect path) delivers the
     // newest payload.
-    platform
-        .fail_update_transport_count
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     assert!(
         !app.core.feishu.has_pending_card_update(&card_id),
@@ -4994,9 +4966,7 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
         assistant(2_000, "答复。"),
     ]);
     let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
-    platform
-        .fail_update_transport_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
         .await
@@ -5010,9 +4980,7 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
         .clone();
     assert!(app.core.feishu.has_pending_card_update(&card_id));
 
-    platform
-        .fail_update_transport_count
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    platform.clear_fail_update();
     spawn_sync(&app);
     // The pass drain retries once the 5s backoff elapses; the reap then drops
     // the confirmed record — both observed here, or the test times out.
@@ -5046,9 +5014,7 @@ async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
 
     // Life 1: the turn ends while every card write fails at the transport.
     let (app, platform, _backend) = turn_capable_app(&session_file, transcript.clone()).await;
-    platform
-        .fail_update_transport_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     Turn::run(&app.turn_handles(), ctx("ses_test", "你好"))
         .await
         .unwrap();
@@ -6998,9 +6964,7 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
     // No PATCH can confirm: every update fails at the transport, so the
     // adoption's own create is the only write that can carry the announcement
     // to the record.
-    platform
-        .fail_update_transport_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
 
     spawn_sync(&app);
     let (successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
@@ -10638,9 +10602,7 @@ async fn a_crash_after_a_resolved_seed_still_lands_the_orphan_tail() {
     // confirmed before the crash.
     let (app, platform, _backend, gate) = seeded_app(&session_file, transcript(), SessionStatus::Busy).await;
     platform.given_card_view("om_frozen", realistic_card_view());
-    platform
-        .fail_update_transport_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     gate.add_permits(1);
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
@@ -10743,9 +10705,7 @@ async fn one_confirmed_write_advances_cursor_and_gap_together() {
     let (app, platform, _backend, gate) = seeded_app(&session_file, transcript, SessionStatus::Busy).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     // Every card write fails at the transport until the drain.
-    platform
-        .fail_update_transport_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     gate.add_permits(1);
     let mut context = ctx("ses_test", "新问题");
     context.cola_message_id = Some("msg_cola_new".into());
@@ -10757,9 +10717,7 @@ async fn one_confirmed_write_advances_cursor_and_gap_together() {
     let writes0 = chains.writes();
     // Feishu returns: the drain delivers the failed body, and the reconcile
     // confirms it. Cursor and gap must move in the SAME record write.
-    platform
-        .fail_update_transport_count
-        .store(0, std::sync::atomic::Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
 

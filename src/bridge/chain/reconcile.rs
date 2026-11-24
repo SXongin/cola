@@ -2547,7 +2547,9 @@ mod tests {
     /// is not confused with "nothing happened".
     #[tokio::test]
     async fn an_idle_session_card_is_never_the_records_successor() {
-        use crate::bridge::test_support::{MockBackend, build_app, seed_session, test_config};
+        use crate::bridge::test_support::{
+            ALWAYS, MockBackend, UpdateFailure, build_app, seed_session, test_config,
+        };
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2595,9 +2597,7 @@ mod tests {
         );
         // The record's card still owes its terminal PATCH: stage one in the
         // outbox and fail its first transport attempt.
-        platform
-            .fail_update_transport_count
-            .store(100, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::Transport, ALWAYS);
         let stamp = crate::feishu::card::shell::CardBuilder::new()
             .with_state(CardState::Restarted)
             .build();
@@ -2639,9 +2639,7 @@ mod tests {
         );
 
         // Once the outbox drains, the read is the documented orphan.
-        platform
-            .fail_update_transport_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        platform.clear_fail_update();
         handles.cards.feishu.drain_pending_card_updates(true).await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while handles.cards.feishu.has_pending_card_update("om_chain") {

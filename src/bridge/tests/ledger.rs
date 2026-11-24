@@ -1576,7 +1576,7 @@ async fn a_quiet_settle_defers_the_notice_until_the_retry_drains() {
     // The settle PATCH fails recoverably: the ending is owed, so the notice
     // must wait. (BACKOFF_BASE is 5 s, so no sync-tick drain retries it within
     // this test's window — the count is not consumed behind the assertion.)
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
     script_quiet_true_end(&backend).await;
     spawn_sync(&app);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1597,7 +1597,7 @@ async fn a_quiet_settle_defers_the_notice_until_the_retry_drains() {
     );
 
     // Feishu returns: the drain delivers the owed update, and the notice fires.
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     let notices = wait_for_notice(&platform).await;
     assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
@@ -1879,7 +1879,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     )];
     // Feishu permanently refuses every write (a semantic refusal, not a
     // content rejection): the carrier never lands, so the entry stays owed.
-    platform.fail_update_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, ALWAYS);
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await
@@ -1938,7 +1938,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     // ... and the next card that CAN render it claims it exactly once: a new
     // Turn on the same session still reads the live task, the runtime still
     // confirms the end, and this accepted write lands the entry.
-    platform.fail_update_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     // Name the refused card, so its updates cannot be confused with the
     // successor's (the harness serves one id per send).
     Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_refused").await;
@@ -2024,7 +2024,7 @@ async fn a_queued_retirement_write_still_records() {
         },
     )];
     // A transport failure (recoverable): the delivery layer owns the retry.
-    platform.fail_update_transport_count.store(1, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, 1);
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await
@@ -2070,7 +2070,7 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
     )];
     // Every transport write fails: the retirement's entry is queued, never
     // delivered, in this pass.
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await
@@ -2086,7 +2086,7 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
     // Feishu returns: the queued payload delivers and the reconcile flips the
     // bit. The absence assertion above alone would pass with the whole shown
     // fact removed, so the delivered half is pinned here (ADR-0080).
-    platform.fail_update_transport_count.store(0, Ordering::SeqCst);
+    platform.clear_fail_update();
     app.core.feishu.drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
     assert!(
@@ -2124,7 +2124,7 @@ async fn a_refused_yielded_refresh_recovers_on_settlement() {
             completed_at: Some(now - 1_000),
         },
     )];
-    platform.fail_update_card_content_count.store(2, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::ContentRefused, 2);
     spawn_sync(&app);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2729,7 +2729,7 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
     // The release is best-effort and may fail, and the card write is refused:
     // the Cleanup ending must still be recorded, owed, before either await.
     backend.fail_release_count.store(1, Ordering::SeqCst);
-    platform.fail_update_transport_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Transport, ALWAYS);
 
     let ack = app
         .host_action(serde_json::json!({ "action": "cleanup", "session_id": "ses_test" }))
@@ -7812,7 +7812,7 @@ async fn a_restart_renders_the_owed_ending_the_read_no_longer_derives() {
             completed_at: Some(now - 1_000),
         },
     )];
-    platform.fail_update_count.store(100, Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, ALWAYS);
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await
         .unwrap();

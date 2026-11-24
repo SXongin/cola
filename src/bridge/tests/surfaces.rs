@@ -1627,9 +1627,7 @@ async fn a_failed_withdrawal_keeps_the_uncertain_companion_marker() {
     })
     .await;
     // Both the superseded withdrawal and its immediate neutralization fail.
-    platform
-        .fail_update_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 2);
     sweep(&app.permission, &app).await;
 
     assert!(
@@ -1693,9 +1691,7 @@ async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retrie
     .await;
     // The superseded withdrawal's PATCH fails once; the immediate
     // neutralization then lands with the "will retry" receipt.
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
 
     // One persistent `seen`, like the poll loop: a failure must not retire the
     // request, or the retry below could never happen.
@@ -1770,9 +1766,7 @@ async fn restart_previews_a_standalone_card_before_its_superseded_retry() {
         b.ask_permission(over_budget_perm("per_long", "ses_1"));
     })
     .await;
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
 
     sweep(&app.permission, &app).await;
 
@@ -1837,9 +1831,7 @@ async fn a_failed_standalone_preview_keeps_the_record_for_the_retry() {
     })
     .await;
     // The superseded PATCH and its preview both fail.
-    platform
-        .fail_update_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 2);
 
     sweep(&app.permission, &app).await;
 
@@ -1956,9 +1948,7 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
     })
     .await;
     // The withdrawal's PATCH fails once.
-    platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 1);
 
     sweep(&app.permission, &app).await;
 
@@ -2103,9 +2093,7 @@ async fn a_message_gone_withdrawal_is_terminated_not_retried() {
         b.ask_permission(over_budget_perm("per_long", "ses_1"));
     })
     .await;
-    platform
-        .fail_update_message_gone_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::MessageGone, 1);
     sweep(&app.permission, &app).await;
 
     assert_eq!(
@@ -2175,9 +2163,7 @@ async fn the_withdrawal_backlog_is_capped() {
         b.ask_permissions(requests);
     })
     .await;
-    platform
-        .fail_update_count
-        .store(REQUESTS * 2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, REQUESTS * 2);
     sweep(&app.permission, &app).await;
 
     assert_eq!(
@@ -2228,9 +2214,7 @@ async fn the_withdrawal_retry_attempts_are_budgeted_per_sweep() {
     .await;
     // Each request tries two PATCHes: the superseded withdrawal, then the
     // immediate "will retry" neutralization.
-    platform
-        .fail_update_count
-        .store(REQUESTS * 2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, REQUESTS * 2);
     sweep(&app.permission, &app).await;
     assert_eq!(app.permission.pending_withdrawal_count().await, REQUESTS);
 
@@ -2272,9 +2256,7 @@ async fn the_withdrawal_retry_phase_is_time_bounded() {
     .await;
     // Both the superseded withdrawal and its immediate neutralization fail, so
     // the old card stays live and the pending entry is retried.
-    platform
-        .fail_update_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 2);
     sweep(&app.permission, &app).await;
     assert_eq!(app.permission.pending_withdrawal_count().await, 1);
 
@@ -2328,9 +2310,7 @@ async fn a_bare_404_keeps_the_withdrawal_retryable() {
         b.ask_permission(over_budget_perm("per_long", "ses_1"));
     })
     .await;
-    platform
-        .fail_update_http_404_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Http404, 1);
     sweep(&app.permission, &app).await;
 
     assert_eq!(
@@ -2388,9 +2368,7 @@ async fn a_click_on_a_stale_allow_card_without_a_companion_is_refused() {
     // Worst window: both the superseded-card PATCH and its immediate
     // neutralization fail, so the old controls stay live and the withdrawal
     // waits for a retry.
-    platform
-        .fail_update_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_update(UpdateFailure::Permanent, 2);
     sweep(&app.permission, &app).await;
     assert!(
         backend.reply_permission_calls.lock().await.is_empty(),

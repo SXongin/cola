@@ -1385,10 +1385,7 @@ async fn a_failed_card_patch_still_commits_the_defer_and_releases_the_pin() {
         vec![("msg_sent".to_string(), true)]
     );
 
-    fixture
-        .platform
-        .fail_update_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fixture.platform.fail_update(UpdateFailure::Permanent, 1);
     let card = posted_card(&fixture.platform).await;
     let defer = button_with_reply(&card, "defer").expect("a 稍后 control");
     let result = fixture.app.host_action(defer).await.expect("a click result");

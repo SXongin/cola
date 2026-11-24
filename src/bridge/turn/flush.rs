@@ -1581,9 +1581,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_card_update_is_retried_fenced() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
-        platform
-            .fail_update_card_content_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 1);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
@@ -1631,9 +1629,7 @@ mod tests {
             .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
             .await;
         app.inflight.lock().await.insert("ses_test".to_string());
-        platform
-            .fail_update_card_content_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 1);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
@@ -1686,9 +1682,7 @@ mod tests {
             .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
             .await;
         app.inflight.lock().await.insert("ses_test".to_string());
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
@@ -1737,9 +1731,7 @@ mod tests {
             Some("/work"),
             None,
         );
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
         let (entered, release) = platform.pause("reply", "msg_1");
 
         let flush = tokio::spawn({
@@ -1868,9 +1860,7 @@ mod tests {
             Some("/work"),
             None,
         );
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
@@ -1919,9 +1909,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_rejection_continues_on_a_new_card() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
         assert_eq!(
@@ -1984,9 +1972,7 @@ mod tests {
                 .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
                 .await;
         }
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
         assert_eq!(
@@ -2019,9 +2005,7 @@ mod tests {
             let mut card = app.cards.card("ses_test").await.unwrap();
             card.acc.set_cola_message_id("msg_1");
         }
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
@@ -2110,9 +2094,7 @@ mod tests {
     #[tokio::test]
     async fn the_rejection_warn_records_the_payload_and_transition() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
 
         let (_, logs) = capture_logs(async {
             Turn::flush_card(&app.cards_handle(), "ses_test").await;
@@ -2145,9 +2127,7 @@ mod tests {
     async fn the_flush_stops_after_the_abandonment_budget() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         // The old card's plain + fenced attempt.
-        platform
-            .fail_update_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::ContentRefused, 2);
         // Two abandoned continuations, each refused plain and fenced.
         platform
             .fail_reply_card_content_count
@@ -2299,9 +2279,7 @@ mod tests {
         );
         let card = serde_json::json!({ "schema": "2.0" });
         // The write fails recoverably: the payload is owed...
-        platform
-            .fail_update_transport_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::Transport, 1);
         let error = cards
             .feishu
             .update_message("om_live", &card)
@@ -2363,9 +2341,7 @@ mod tests {
         );
         let card = serde_json::json!({ "schema": "2.0" });
         // The write fails recoverably: the payload is owed...
-        platform
-            .fail_update_transport_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::Transport, 1);
         let error = cards
             .feishu
             .update_message("om_live", &card)
@@ -2459,9 +2435,7 @@ mod tests {
 
         // Its PATCH fails recoverably: the payload is queued and the keys are
         // mirrored outside the stage.
-        platform
-            .fail_update_transport_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::Transport, 1);
         let error = cards
             .feishu
             .update_message("om_live", &built.card)
@@ -2491,9 +2465,7 @@ mod tests {
         // Feishu returns: the drain delivers the queued payload, and the
         // reconcile records the keys from the mirror even though the stage is
         // gone.
-        platform
-            .fail_update_transport_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        platform.clear_fail_update();
         cards.feishu.drain_pending_card_updates(true).await;
         crate::bridge::turn::reconcile_staged_cursors(&cards).await;
 
@@ -2623,9 +2595,7 @@ mod tests {
         .await;
         // A recoverable failure: the payload is queued and the keys are
         // mirrored, then the cap evicts the stage.
-        platform
-            .fail_update_transport_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::Transport, 1);
         let error = cards
             .feishu
             .update_message("om_live", &built.card)
@@ -2656,9 +2626,7 @@ mod tests {
 
         // Delivery arrives: the reconcile records the mark AND tells the chain
         // that is live now.
-        platform
-            .fail_update_transport_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        platform.clear_fail_update();
         cards.feishu.drain_pending_card_updates(true).await;
         // A chain committing in THIS window — after the payload delivered but
         // before the reconcile records — must already see the entry's key, or it
@@ -2728,9 +2696,7 @@ mod tests {
             built.rendered_endings.clone(),
         )
         .await;
-        platform
-            .fail_update_transport_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.fail_update(UpdateFailure::Transport, 1);
         let error = cards
             .feishu
             .update_message("om_live", &built.card)
@@ -2752,9 +2718,7 @@ mod tests {
 
         // Delivery arrives; the reconcile records the mark even though no
         // accumulator remains.
-        platform
-            .fail_update_transport_count
-            .store(0, std::sync::atomic::Ordering::SeqCst);
+        platform.clear_fail_update();
         cards.feishu.drain_pending_card_updates(true).await;
         crate::bridge::turn::reconcile_staged_cursors(&cards).await;
 
