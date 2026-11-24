@@ -506,7 +506,7 @@ async fn external_poller_recovers_when_messages_hangs() {
     // Without a bound on the per-session read the poller sits on the first
     // hung call forever and the notification never arrives.
     wait_for(
-        "external poller never recovered from the hung messages call",
+        "the external poller recovers from the hung messages call",
         || async {
             let notified = platform.calls.lock().await.iter().any(|c| {
                 matches!(
@@ -1541,7 +1541,7 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
     // (bounded), then leave ample time for the 30 ms idle bound to run out.
     let armed = async {
         wait_for(
-            "the poller must arm the renderer for the external message",
+            "the poller arms the renderer for the external message",
             || async {
                 if Turn::armed_turn_anchor(&app.cards_handle(), "ses_ext")
                     .await
@@ -1557,7 +1557,7 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), armed)
         .await
-        .expect("the poller must arm the renderer for the external message");
+        .expect("the poller arms the renderer for the external message");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // The renderer must have STOPPED at the bound — proven directly, not by
@@ -2968,7 +2968,7 @@ async fn session_sync_follows_a_moved_session_to_its_new_directory() {
         }
     });
 
-    wait_for("still mapped", || async {
+    wait_for("the thread stays mapped", || async {
         let moved = app
             .sessions
             .lock()
@@ -2986,7 +2986,7 @@ async fn session_sync_follows_a_moved_session_to_its_new_directory() {
         .await
         .entry_for_session("ses_moved")
         .cloned()
-        .expect("still mapped");
+        .expect("the thread stays mapped");
     assert_eq!(
         entry.model.as_deref(),
         Some("provider/model-a"),
@@ -3899,7 +3899,7 @@ async fn wait_for_card_work_context(
     session_id: &str,
     expected: &std::path::Path,
 ) {
-    wait_for("the card is still tracked", || async {
+    wait_for(&format!("the card's work context names {expected:?}"), || async {
         (Turn::card_work_context(cards, session_id)
             .await
             .and_then(|(directory, _, _, _)| directory)

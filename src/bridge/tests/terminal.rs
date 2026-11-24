@@ -2515,8 +2515,9 @@ async fn aborting_a_run_keeps_the_slot_until_its_group_is_killed() {
     // The reaper escalates to SIGKILL after the grace; only then does the slot
     // become available again.
     wait_for_pid_gone(pid).await;
-    let mut ran = false;
-    for attempt in 0..100 {
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    wait_for("the slot is released once the aborted group is gone", || async {
+        let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         send_command_in(
             &app,
             "/run echo after-abort-gone",
@@ -2525,16 +2526,17 @@ async fn aborting_a_run_keeps_the_slot_until_its_group_is_killed() {
             ConversationKind::P2p,
         )
         .await;
-        if platform.updated_cards().await.last().is_some_and(|card| {
-            let text = card_text(card);
-            text.contains("after-abort-gone") && text.contains("退出码 0")
-        }) {
-            ran = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(ran, "the slot is released once the aborted group is gone");
+        platform
+            .updated_cards()
+            .await
+            .last()
+            .is_some_and(|card| {
+                let text = card_text(card);
+                text.contains("after-abort-gone") && text.contains("退出码 0")
+            })
+            .then_some(())
+    })
+    .await;
 }
 
 /// #825 settle path: a live PATCH parked when the run ends must never land

@@ -965,7 +965,7 @@ async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
         .transcript_gate_entered
         .load(std::sync::atomic::Ordering::SeqCst);
     let wait_parked = async {
-        wait_for("the follow's read must reach the gate", || async {
+        wait_for("the follow's read reaches the gate", || async {
             if backend
                 .transcript_gate_entered
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -980,7 +980,7 @@ async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
     };
     tokio::time::timeout(Duration::from_secs(3), wait_parked)
         .await
-        .expect("the follow's read must reach the gate");
+        .expect("the follow's read reaches the gate");
 
     // The run settles while the tick is parked: without the re-check the
     // tick would classify it Done.
@@ -1261,7 +1261,7 @@ async fn pending_permission_app() -> (
     // accumulator arms, so it inlines on the card.
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     let armed = async {
-        wait_for("the accumulator must arm", || async {
+        wait_for("the accumulator arms", || async {
             if Turn::armed_turn_anchor(&app.cards_handle(), "ses_test")
                 .await
                 .is_none()
@@ -1275,7 +1275,7 @@ async fn pending_permission_app() -> (
     };
     tokio::time::timeout(Duration::from_secs(5), armed)
         .await
-        .expect("the accumulator must arm");
+        .expect("the accumulator arms");
     tokio::spawn({
         let app = Arc::clone(&app);
         async move {
@@ -1528,7 +1528,7 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
         })
     };
     let next_id = tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for("the new turn's prompt must be submitted", || async {
+        wait_for("the new turn's prompt is submitted", || async {
             if let Some(Some(id)) = backend.prompt_message_ids.lock().await.last().cloned()
                 && backend
                     .prompt_calls
@@ -1545,7 +1545,7 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
         .await
     })
     .await
-    .expect("the new turn's prompt must be submitted");
+    .expect("the new turn's prompt is submitted");
 
     assert!(
         backend.prompt_calls.lock().await.iter().any(|t| t == "接着问"),
@@ -1643,7 +1643,7 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
 
     // The prompt records its cola id before parking on the gate.
     let anchor_id = tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for("the handler's prompt must record its cola id", || async {
+        wait_for("the handler's prompt records its cola id", || async {
             if let Some(Some(id)) = backend.prompt_message_ids.lock().await.last().cloned() {
                 Some(id)
             } else {
@@ -1653,7 +1653,7 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
         .await
     })
     .await
-    .expect("the handler's prompt must record its cola id");
+    .expect("the handler's prompt records its cola id");
 
     // The first run ended; a cola-authored supplement missed it.
     backend.transcript_scripts.lock().await.insert(
@@ -2139,7 +2139,7 @@ async fn resume_on_v1_reuses_the_message_id_when_it_landed_in_between() {
     // The resubmitted Turn runs to its true end...
     wait_for_card_header(&platform, "完成").await;
     let wait_finished = async {
-        wait_for("the resubmitted turn must finish", || async {
+        wait_for("the resubmitted turn finishes", || async {
             if app.inflight.lock().await.contains("ses_test") {
                 None
             } else {
@@ -2150,7 +2150,7 @@ async fn resume_on_v1_reuses_the_message_id_when_it_landed_in_between() {
     };
     tokio::time::timeout(Duration::from_secs(5), wait_finished)
         .await
-        .expect("the resubmitted turn must finish");
+        .expect("the resubmitted turn finishes");
 
     // ...while the old Unreceived card is collected as retried: a new attempt
     // exists below, and the collected card keeps no 重新发起 button.
@@ -2220,17 +2220,17 @@ async fn a_failed_resume_leaves_the_unreceived_card_actionable() {
     // The failed write must give the claim back, so a later press can try
     // again; the scripted failure is consumed, so the retry succeeds.
     let second = tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for("a failed resume must leave the button actionable", || async {
+        wait_for("a failed resume leaves the button actionable", || async {
             app.host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
                 .await
         })
         .await
     })
     .await
-    .expect("a failed resume must leave the button actionable");
+    .expect("a failed resume leaves the button actionable");
     assert_eq!(second.toast.as_deref(), Some("正在重新发起..."));
     let wait_recorded = async {
-        wait_for("the retry's resume write must reach the backend", || async {
+        wait_for("the retry's resume write reaches the backend", || async {
             if backend.resume_calls.lock().await.len() < 2 {
                 None
             } else {
@@ -2241,7 +2241,7 @@ async fn a_failed_resume_leaves_the_unreceived_card_actionable() {
     };
     tokio::time::timeout(Duration::from_secs(5), wait_recorded)
         .await
-        .expect("the retry's resume write must reach the backend");
+        .expect("the retry's resume write reaches the backend");
     assert_eq!(
         backend.resume_calls.lock().await.clone(),
         vec!["ses_test".to_string(), "ses_test".to_string()],
@@ -3915,7 +3915,7 @@ async fn a_drain_whose_render_never_lands_records_nothing() {
     // Park the drain's next read.
     let gate = backend.hold_transcripts();
     let entered = backend.transcript_gate_entered.load(Ordering::SeqCst);
-    wait_for("the drain never reached the parked read", || async {
+    wait_for("the drain reaches the parked read", || async {
         if backend.transcript_gate_entered.load(Ordering::SeqCst) == entered {
             None
         } else {
@@ -3934,7 +3934,7 @@ async fn a_drain_whose_render_never_lands_records_nothing() {
 
     // The drain ended without a card to carry the retirement: nothing was
     // recorded, and the task stays live on every later read.
-    wait_for("the drain never ended on its vanished accumulator", || async {
+    wait_for("the drain ends on its vanished accumulator", || async {
         if app.inflight.lock().await.contains("ses_test") {
             None
         } else {

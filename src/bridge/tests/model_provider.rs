@@ -957,7 +957,7 @@ async fn a_live_pick_becomes_neutral_if_its_provider_generation_changes() {
             )
             .await
     });
-    wait_for("variant lookup did not begin", || async {
+    wait_for("the variant lookup begins", || async {
         if lookup_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -1005,7 +1005,7 @@ async fn a_pending_that_materialises_is_not_reported_saved() {
 
     let app_for_pick = app.clone();
     let pick = tokio::spawn(async move { app_for_pick.host_action(model_pick(PROVIDER, MODEL)).await });
-    wait_for("the lookup never started", || async {
+    wait_for("the lookup starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -1383,7 +1383,7 @@ async fn a_model_pick_switches_the_session_outside_the_gate() {
             .await;
         }
     });
-    wait_for("the switch never started", || async {
+    wait_for("the switch starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -1850,7 +1850,7 @@ async fn two_competing_durable_picks_keep_the_server_and_mirror_in_step() {
         })
     };
     let first = spawn_pick("/model openai/model-a");
-    wait_for("the first switch never started", || async {
+    wait_for("the first switch starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -1860,7 +1860,7 @@ async fn two_competing_durable_picks_keep_the_server_and_mirror_in_step() {
     .await;
     let second = spawn_pick("/model openai/model-b");
     let switch = app.session_gates.gate("ses_test");
-    wait_for("the second pick never queued at the switch point", || async {
+    wait_for("the second pick queues at the switch point", || async {
         if switch.switch_waiting() == 0 {
             None
         } else {
@@ -1875,7 +1875,7 @@ async fn two_competing_durable_picks_keep_the_server_and_mirror_in_step() {
     );
 
     gate.add_permits(1);
-    wait_for("the second switch never started", || async {
+    wait_for("the second switch starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
             None
         } else {
@@ -1954,7 +1954,7 @@ async fn a_pending_replaced_during_the_pick_is_not_overwritten() {
             .await;
         }
     });
-    wait_for("the pick's catalog lookup never started", || async {
+    wait_for("the pick's catalog lookup starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -2043,7 +2043,7 @@ async fn a_prompt_waits_for_an_in_flight_durable_switch() {
             .await;
         }
     });
-    wait_for("the durable switch never started", || async {
+    wait_for("the durable switch starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -2054,7 +2054,7 @@ async fn a_prompt_waits_for_an_in_flight_durable_switch() {
 
     prompt(&app, "msg_prompt", "hi");
     let switch = app.session_gates.gate("ses_test");
-    wait_for("the pre-flight never queued at the switch point", || async {
+    wait_for("the pre-flight queues at the switch point", || async {
         if switch.switch_waiting() == 0 {
             None
         } else {
@@ -2069,16 +2069,13 @@ async fn a_prompt_waits_for_an_in_flight_durable_switch() {
 
     gate.add_permits(1);
     pick.await.expect("the pick joins");
-    wait_for(
-        "the prompt was never submitted after the switch settled",
-        || async {
-            if prompt_models.lock().await.is_empty() {
-                None
-            } else {
-                Some(())
-            }
-        },
-    )
+    wait_for("the prompt is submitted after the switch settles", || async {
+        if prompt_models.lock().await.is_empty() {
+            None
+        } else {
+            Some(())
+        }
+    })
     .await;
     assert_eq!(
         prompt_models.lock().await.last().cloned().flatten(),
@@ -2126,7 +2123,7 @@ async fn a_delayed_autoaccept_keeps_a_recorded_model() {
             .await;
         }
     });
-    wait_for("the approval sweep never reached the backend", || async {
+    wait_for("the approval sweep reaches the backend", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -2236,7 +2233,7 @@ async fn an_unanswered_durable_switch_fails_by_name_and_releases_the_point() {
 
     // The point is released: the next prompt is submitted normally.
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the next prompt was wedged behind the dead switch", || async {
+    wait_for("the next prompt gets past the dead switch", || async {
         if prompt_models.lock().await.is_empty() {
             None
         } else {
@@ -2281,7 +2278,7 @@ async fn a_switch_landing_during_a_submit_applies_from_the_next_turn() {
     // The first turn reaches the submit (the point is already released) and
     // parks there.
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the prompt never reached the submit", || async {
+    wait_for("the prompt reaches the submit", || async {
         if prompt_models.lock().await.is_empty() {
             None
         } else {
@@ -2320,7 +2317,7 @@ async fn a_switch_landing_during_a_submit_applies_from_the_next_turn() {
     // Releasing the submit ends the first turn; the next one runs the switch.
     prompt_gate.add_permits(1);
     prompt(&app, "msg_prompt2", "hi again");
-    wait_for("the second turn was never submitted", || async {
+    wait_for("the second turn is submitted", || async {
         if prompt_models.lock().await.len() < 2 {
             None
         } else {
@@ -2383,7 +2380,7 @@ async fn a_stalled_catalog_under_the_point_does_not_wedge_later_waiters() {
             .await;
         }
     });
-    wait_for("the pick's catalog read never started", || async {
+    wait_for("the pick's catalog read starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -2394,7 +2391,7 @@ async fn a_stalled_catalog_under_the_point_does_not_wedge_later_waiters() {
 
     // A prompt waits behind the point; the catalog bound releases it.
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the prompt was wedged behind the stalled catalog", || async {
+    wait_for("the prompt gets past the stalled catalog", || async {
         if prompt_models.lock().await.is_empty() {
             None
         } else {
@@ -2863,7 +2860,7 @@ async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
                 .await
         }
     });
-    wait_for("the earlier catalog lookup never started", || async {
+    wait_for("the earlier catalog lookup starts", || async {
         if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             None
         } else {
@@ -3079,7 +3076,7 @@ async fn a_failed_mirror_write_keeps_the_applied_effort_for_a_retry() {
 
 /// Wait until a gate counter records an entry.
 async fn wait_for_creation_started(entered: &std::sync::atomic::AtomicUsize) {
-    wait_for("the creation never started", || async {
+    wait_for("the creation starts", || async {
         (entered.load(std::sync::atomic::Ordering::SeqCst) != 0).then_some(())
     })
     .await;
@@ -3087,7 +3084,7 @@ async fn wait_for_creation_started(entered: &std::sync::atomic::AtomicUsize) {
 
 /// Wait until the backend has received a prompt.
 async fn wait_for_prompt_submitted(prompt_models: &Arc<tokio::sync::Mutex<Vec<Option<String>>>>) {
-    wait_for("the prompt never reached the backend", || async {
+    wait_for("the prompt reaches the backend", || async {
         (!prompt_models.lock().await.is_empty()).then_some(())
     })
     .await;

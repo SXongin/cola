@@ -4877,7 +4877,7 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
     // The next Session Sync pass's reap drops the now-confirmed record.
     spawn_sync(&app);
     tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for("the reap must clean the confirmed record", || async {
+        wait_for("the reap cleans the confirmed record", || async {
             if app.cards_handle().chains.get("ses_test").is_none() {
                 Some(())
             } else {
@@ -4887,7 +4887,7 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
         .await
     })
     .await
-    .expect("the reap must clean the confirmed record");
+    .expect("the reap cleans the confirmed record");
 }
 
 /// The Session Sync pass itself retries a failed final PATCH once its backoff
@@ -5350,23 +5350,18 @@ async fn a_projection_falls_back_to_the_chat_when_every_reply_target_is_refused(
 
     spawn_sync(&app);
     // The successor lands at the Chat's top level.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let successor = loop {
-        if let Some(card) = platform
-            .sent_cards()
-            .await
-            .iter()
-            .find(|card| card_text(card).contains(missed))
-        {
-            break card.clone();
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no top-level fallback successor: {:?}",
-            platform.calls.lock().await
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    };
+    let successor = wait_for(
+        "a top-level fallback successor carries the missed tail",
+        || async {
+            platform
+                .sent_cards()
+                .await
+                .iter()
+                .find(|card| card_text(card).contains(missed))
+                .cloned()
+        },
+    )
+    .await;
     assert_eq!(card_header(&successor), "✅ 完成");
 }
 
@@ -5411,22 +5406,19 @@ async fn a_top_level_projection_landing_clears_the_reply_target_in_one_write() {
     // The top-level successor lands ⏳ and the landing's own write clears the
     // refused target. A carry would leave `om_withdrawn` on the record.
     let probe = async {
-        wait_for(
-            "the waiting successor never landed with the target cleared",
-            || async {
-                let landed = platform
-                    .sent_cards()
-                    .await
-                    .iter()
-                    .any(|card| card_header(card).contains("等待后台任务"));
-                let cleared = app
-                    .cards_handle()
-                    .chains
-                    .get("ses_test")
-                    .is_some_and(|record| record.reply_to.is_none());
-                if landed && cleared { Some(()) } else { None }
-            },
-        )
+        wait_for("the waiting successor lands with the target cleared", || async {
+            let landed = platform
+                .sent_cards()
+                .await
+                .iter()
+                .any(|card| card_header(card).contains("等待后台任务"));
+            let cleared = app
+                .cards_handle()
+                .chains
+                .get("ses_test")
+                .is_some_and(|record| record.reply_to.is_none());
+            if landed && cleared { Some(()) } else { None }
+        })
         .await
     };
     let observed = tokio::time::timeout(Duration::from_secs(5), probe).await.is_ok();
@@ -6520,7 +6512,7 @@ async fn a_record_with_no_deliverable_target_claims_nothing() {
     spawn_sync(&app);
     // Let several passes run: the record claims nothing, forever — no
     // projection create, no empty-id settle PATCH.
-    wait_for("the reap never observed the targetless record", || async {
+    wait_for("the reap observes the targetless record", || async {
         assert!(
             platform.replied_cards().await.is_empty(),
             "no projection without a deliverable target: {:?}",
@@ -9601,7 +9593,7 @@ async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
     );
     // The confirmed write that carried the gap clears the durable fact: a
     // restart renders it never again (spec #561, review #569).
-    wait_for("the durable gap is never cleared", || async {
+    wait_for("the durable gap clears", || async {
         let cleared = app
             .cards_handle()
             .chains
@@ -10178,7 +10170,7 @@ async fn a_fresh_turn_carries_a_pending_gap() {
     );
     // The write that carried the gap clears the durable fact: no later Turn
     // re-renders the tail.
-    wait_for("the carried gap is never cleared", || async {
+    wait_for("the carried gap clears", || async {
         let cleared = app
             .cards_handle()
             .chains
@@ -10393,7 +10385,7 @@ async fn a_restart_re_renders_nothing_for_two_parts_at_one_server_time() {
         restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
     platform2.given_card_view("msg_reply", realistic_card_view());
     spawn_sync(&app2);
-    wait_for("the in-place settle", || async {
+    wait_for("the card settles in place", || async {
         let settled = patches_to(&platform2, "msg_reply")
             .await
             .iter()
@@ -10408,7 +10400,7 @@ async fn a_restart_re_renders_nothing_for_two_parts_at_one_server_time() {
     .await;
     let settled = last_update_of(&platform2, "msg_reply")
         .await
-        .expect("the in-place settle");
+        .expect("the card settles in place");
     let text = card_text(&settled);
     assert!(
         !text.contains(first) && !text.contains(second),
@@ -10974,7 +10966,7 @@ async fn a_takeover_records_the_gap_before_its_read_completes() {
     platform2.given_card_view("msg_reply", realistic_card_view());
     spawn_sync(&app2);
     // The reap runs: the record must survive every pass.
-    wait_for("the reap never observed the kept record", || async {
+    wait_for("the reap observes the kept record", || async {
         let kept = app2.cards_handle().chains.get("ses_test");
         let reads = backend2
             .session_status_reads
@@ -11095,7 +11087,7 @@ async fn a_takeover_keeps_an_unresolved_projection_intent() {
     spawn_sync(&app2);
     // Either the old card is repaired in place (the fix) or a successor is
     // posted again (the bug this test forbids).
-    wait_for("the repaired card", || async {
+    wait_for("the card is repaired", || async {
         assert_eq!(
             card_posts(&platform2).await,
             0,
@@ -11113,7 +11105,7 @@ async fn a_takeover_keeps_an_unresolved_projection_intent() {
         !card_text(
             &last_update_of(&platform2, "msg_reply")
                 .await
-                .expect("the repaired card")
+                .expect("the card is repaired")
         )
         .contains(tail),
         "the late card's tail is never projected again"

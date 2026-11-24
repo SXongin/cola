@@ -656,11 +656,16 @@ impl RecordingPlatform {
         self.reply_card_outcomes.lock().unwrap().push_back(outcome);
     }
 
-    /// Queue `times` copies of `outcome`; [`ALWAYS`] installs it as the repeat
-    /// slot instead of queueing copies.
+    /// Queue `times` copies of `outcome`; `ALWAYS` repeats it, `0` clears both
+    /// the queue and the slot.
     pub fn given_reply_card_outcomes(&self, outcome: ReplyOutcome, times: usize) {
         if times == ALWAYS {
             *self.reply_card_always.lock().unwrap() = Some(outcome);
+            return;
+        }
+        if times == 0 {
+            self.reply_card_outcomes.lock().unwrap().clear();
+            *self.reply_card_always.lock().unwrap() = None;
             return;
         }
         self.reply_card_outcomes
@@ -5018,9 +5023,8 @@ pub(crate) enum CardUpdates {
 /// loaded macOS CI runner can take minutes to schedule a spawned continuation.
 pub(crate) const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// Poll `probe` every 5 ms until it yields a value, then return it. `label`
-/// names the condition and is the failure message; a probe returns `Some` to
-/// finish, so a wait can also return what it observed. Bound: [`SETTLE_DEADLINE`].
+/// Poll `probe` every 5 ms until it yields a value; `label` names the condition
+/// and is the failure message. A probe returns `Some` to finish. Bound: [`SETTLE_DEADLINE`].
 pub(crate) async fn wait_for<T, F, Fut>(label: &str, mut probe: F) -> T
 where
     F: FnMut() -> Fut,
@@ -5055,9 +5059,8 @@ pub(crate) async fn wait_for_handler<T>(
     handle.await.expect("the handler joins")
 }
 
-/// Await `check` over every card the platform recorded — in-place updates and
-/// new/reply sends — within `within`; a timeout names the headers it saw, so
-/// the failure says whether the card was missing, live, or differently worded.
+/// Await `check` over every card the platform recorded (updates and sends)
+/// within `within`; a timeout names the headers it saw.
 pub(crate) async fn wait_for_recorded_card(
     platform: &RecordingPlatform,
     label: &str,
@@ -5082,9 +5085,7 @@ pub(crate) async fn wait_for_recorded_card(
 }
 
 /// Await a recorded in-place card update satisfying `check`, or panic after
-/// [`SETTLE_DEADLINE`]. Keeps a test on an observed side effect instead of a
-/// fixed sleep; `updates` selects whether any update or only the newest one
-/// counts.
+/// [`SETTLE_DEADLINE`]; `updates` selects any update or only the newest.
 pub(crate) async fn wait_for_card_update(
     platform: &RecordingPlatform,
     label: &str,
@@ -5094,9 +5095,8 @@ pub(crate) async fn wait_for_card_update(
     wait_for_card_update_within(platform, label, SETTLE_DEADLINE, updates, check).await;
 }
 
-/// [`wait_for_card_update`] with an explicit bound: a test that watches a real
-/// timer (a ledger retry delay, say) caps its wait below the shared 180 s
-/// without tightening every other caller's bound.
+/// [`wait_for_card_update`] with an explicit bound: a test watching a real
+/// timer caps its wait below the shared 180 s without tightening the others.
 pub(crate) async fn wait_for_card_update_within(
     platform: &RecordingPlatform,
     label: &str,
