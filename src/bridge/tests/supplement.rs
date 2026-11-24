@@ -1022,9 +1022,7 @@ async fn a_failed_continuation_send_retries_without_duplicating_receipts() {
 
     // The first continuation send fails: its receipt was written and the split
     // stays queued for a retry.
-    platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
     app.handle_message(incoming(
         "msg_sup_1".into(),
         "chat_1".into(),
@@ -1151,9 +1149,7 @@ async fn a_failed_full_continuation_send_retries_the_same_slice() {
     Turn::push_text(&cards, "ses_test", &long).await;
     Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
     app.inflight.lock().await.insert("ses_test".to_string());
-    platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     app.handle_message(incoming(
         "msg_sup".into(),

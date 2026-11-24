@@ -5187,8 +5187,8 @@ mod tests {
     use crate::bridge::App;
     use crate::bridge::chain::EndingKey;
     use crate::bridge::test_support::{
-        MockBackend, RecordingPlatform, build_app, realistic_parts, seed_entry, test_config, test_work_dir,
-        turn_anchor,
+        MockBackend, RecordingPlatform, ReplyOutcome, build_app, realistic_parts, seed_entry, test_config,
+        test_work_dir, turn_anchor,
     };
 
     /// One delivered create's staged ending (ADR-0080), with the durable record
@@ -5690,8 +5690,8 @@ mod tests {
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
-        let mut platform = RecordingPlatform::new();
-        platform.fail_reply_card = true;
+        let platform = RecordingPlatform::new();
+        platform.given_reply_card_outcomes(ReplyOutcome::Failed, 100);
         let app = Arc::new(
             App::new(
                 cfg,

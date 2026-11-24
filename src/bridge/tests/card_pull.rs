@@ -1108,8 +1108,8 @@ async fn a_failed_card_create_records_and_stamps_nothing() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut platform = RecordingPlatform::new();
-    platform.fail_reply_card = true;
+    let platform = RecordingPlatform::new();
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 100);
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(idle_read_backend()), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;
@@ -3127,9 +3127,7 @@ async fn card_pull_migrates_a_pending_permission() {
 /// The queue and its reply target are the only record of that tail.
 async fn seed_done_card_owing_continuation(app: &Arc<App>, platform: &RecordingPlatform) {
     seed_live_card(app, "ses_test", "已完成但欠一段续卡。").await;
-    platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
     let cards = app.cards_handle();
     Turn::split_card_chain(
         &cards,

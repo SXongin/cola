@@ -683,8 +683,7 @@ async fn a_failed_location_form_push_retries_on_the_next_sweep() {
     .await;
     fixture
         .platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+        .given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     sweep(&fixture).await;
     assert!(posted_cards(&fixture.platform).await.is_empty());
@@ -2525,10 +2524,7 @@ async fn a_failed_reopen_leaves_the_form_dismissed_and_retryable() {
 
     let req = PendingRequest::Question(location_form("frm_failed_reopen"));
     let handles = fixture.app.flow_handles();
-    fixture
-        .platform
-        .fail_send_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fixture.platform.fail_send_card(1);
     assert_eq!(
         fixture
             .app
@@ -3369,10 +3365,7 @@ async fn mcp_reopen_failure_leaves_the_form_dismissed_and_retryable() {
         .expect("the /mcp card");
     let reopen = button_with_action_op(&listing, "mcp", "reopen").expect("a reopen control");
 
-    fixture
-        .platform
-        .fail_send_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fixture.platform.fail_send_card(1);
     let failed = fixture
         .app
         .host_action(reopen.clone())

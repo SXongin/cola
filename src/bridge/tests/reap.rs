@@ -6423,9 +6423,7 @@ async fn a_failed_projection_create_advances_nothing() {
     let (app, platform, _backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     // Every successor create fails at the platform.
-    platform
-        .fail_reply_card_count
-        .store(100, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 100);
 
     spawn_sync(&app);
     // The next pass never re-posts: it settles the old card in place by
@@ -7431,9 +7429,7 @@ async fn an_ambiguous_adoption_create_is_never_retried() {
     platform.given_card_view("om_frozen", realistic_card_view());
     // The first successor create fails; a retry would succeed — exactly the
     // duplicate a single-shot attempt must never post.
-    platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
 
     spawn_sync(&app);
     // One pass ran (the attempt happened): the record keeps the old card.
@@ -8485,9 +8481,7 @@ async fn an_ambiguous_create_after_a_lost_response_is_never_retried() {
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     platform.given_card_view("om_frozen", realistic_card_view());
     // The successor create is accepted remotely, but its response is lost.
-    platform
-        .fail_reply_card_after_send_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::AfterSend, 1);
 
     spawn_sync(&app);
     // The reap settles the old card in place — never a second successor.

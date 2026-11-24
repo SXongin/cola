@@ -500,8 +500,8 @@ async fn topic_cover_send_failure_falls_back_to_command_root() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
-    let mut platform = Arc::new(RecordingPlatform::new());
-    Arc::get_mut(&mut platform).unwrap().fail_send_card = true;
+    let platform = Arc::new(RecordingPlatform::new());
+    platform.fail_send_card(ALWAYS);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
     let proj = tempfile::tempdir().unwrap();
     let proj_dir = proj.path().to_string_lossy().to_string();
@@ -1915,8 +1915,8 @@ async fn a_failed_in_topic_confirmation_adopts_nothing() {
         "/work/ext",
         100,
     )]);
-    let mut platform = RecordingPlatform::new();
-    platform.fail_reply_in_thread = true;
+    let platform = RecordingPlatform::new();
+    platform.fail_reply_in_thread(ALWAYS);
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_fresh".into());
@@ -1966,9 +1966,7 @@ async fn a_failed_forced_topic_adoption_keeps_the_old_owner() {
         100,
     )]);
     let platform = RecordingPlatform::new();
-    platform
-        .fail_reply_in_thread_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.fail_reply_in_thread(1);
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(backend), platform.clone()).unwrap());
 

@@ -1769,9 +1769,7 @@ mod tests {
             card.card_is_live = false;
             card.acc.set_reply_target(Some("msg_1".into()));
         }
-        platform
-            .fail_reply_card_content_count
-            .store(1, std::sync::atomic::Ordering::SeqCst);
+        platform.given_reply_card_outcomes(ReplyOutcome::RejectedRecorded, 1);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
@@ -1804,9 +1802,7 @@ mod tests {
             card.card_is_live = false;
             card.acc.set_reply_target(Some("msg_1".into()));
         }
-        platform
-            .fail_reply_card_content_count
-            .store(2, std::sync::atomic::Ordering::SeqCst);
+        platform.given_reply_card_outcomes(ReplyOutcome::RejectedRecorded, 2);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
@@ -2129,9 +2125,7 @@ mod tests {
         // The old card's plain + fenced attempt.
         platform.fail_update(UpdateFailure::ContentRefused, 2);
         // Two abandoned continuations, each refused plain and fenced.
-        platform
-            .fail_reply_card_content_count
-            .store(4, std::sync::atomic::Ordering::SeqCst);
+        platform.given_reply_card_outcomes(ReplyOutcome::RejectedRecorded, 4);
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 

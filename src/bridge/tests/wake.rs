@@ -4229,9 +4229,7 @@ async fn an_unnamed_merged_wake_renders_the_bare_title() {
 /// The queue and its reply target are the only record of that tail.
 async fn seed_done_card_owing_a_continuation(app: &Arc<App>, platform: &RecordingPlatform) {
     seed_live_card(app, "ses_test", "om_live").await;
-    platform
-        .fail_reply_card_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 1);
     let cards = app.cards_handle();
     Turn::split_card_chain(
         &cards,

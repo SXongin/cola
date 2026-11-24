@@ -2983,9 +2983,7 @@ async fn a_rejected_loading_card_degrades_and_the_turn_still_runs() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let platform = Arc::new(RecordingPlatform::new());
-    platform
-        .fail_reply_card_content_count
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::RejectedRecorded, 1);
     let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
 
     app.handle_message(incoming(
@@ -3050,9 +3048,7 @@ async fn a_loading_card_that_cannot_be_created_at_all_says_so_in_text() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = Arc::new(MockBackend::new(realistic_parts()));
     let platform = Arc::new(RecordingPlatform::new());
-    platform
-        .fail_reply_card_content_count
-        .store(2, std::sync::atomic::Ordering::SeqCst);
+    platform.given_reply_card_outcomes(ReplyOutcome::RejectedRecorded, 2);
     let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
 
     app.handle_message(incoming(
