@@ -138,15 +138,18 @@ and the map from the old numbers.
   parent chain (`resolve_card_target`, `src/bridge/pollers.rs`), and carry the
   owning `directory` on the card so the reply routes without the map
   (`handle_card_action`, `src/bridge/request/flow.rs`).
-- **`card-budgets`** — `MAX_ELEMENT_TEXT_CHARS` and its neighbours
-  (`src/feishu/card/mod.rs`) are **cola's own** budgets, not Feishu limits, and
-  the doc comment there holds the evidence. A tool panel deliberately exceeds
-  3000 chars, so its size is not a bug and splitting it buys nothing.
+- **`card-budgets`** — the per-surface budgets (`feishu/card/budget.rs`:
+  `CARD_ELEMENT`, `TIMELINE_ENTRY`, `TOOL_PANEL`, …) are **cola's own** budgets,
+  not Feishu limits, and the doc comment there holds the evidence. Every clip
+  goes through `feishu/card/clip.rs` with one of them; never pass a bare
+  number. A tool panel deliberately exceeds 3000 chars, so its size is not a
+  bug and splitting it buys nothing.
   **A markdown split must stay construct-aware** (#1096): Feishu parses each
   card element on its own, so a fence or table crossing a budget goes through
-  `sanitize::chunk_markdown` (element splits) or the timeline entry's `lead`
-  plus `part_continuation_lead` (card splits), which close the construct on one
-  side and re-open it on the other. A bare continuation renders code as prose
+  `card::clip`'s markdown split (`sanitize::split_construct_aware` behind it;
+  element splits) or the timeline entry's `lead` plus `part_continuation_lead`
+  (card splits), which close the construct on one side and re-open it on the
+  other. A bare continuation renders code as prose
   and turns the original closer into a new opener, swallowing the prose after
   it. A fence resumes from its own opener line; a table that fits is moved
   whole to the next element, and one that outgrows an element is fenced (a

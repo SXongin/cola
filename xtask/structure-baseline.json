@@ -97,7 +97,7 @@
       "function": "new",
       "metric": "too_many_lines",
       "value": 118,
-      "body": "7686ce7ccceb2a62"
+      "body": "a4332e118556e679"
     },
     {
       "path": "src/bridge/external.rs",
@@ -223,14 +223,14 @@
       "function": "resolve_blocks",
       "metric": "cognitive_complexity",
       "value": 31,
-      "body": "9e02d15ed2edaef5"
+      "body": "9e193995eb3a5fc3"
     },
     {
       "path": "src/bridge/request/delivery.rs",
       "function": "resolve_blocks",
       "metric": "too_many_lines",
-      "value": 114,
-      "body": "9e02d15ed2edaef5"
+      "value": 113,
+      "body": "9e193995eb3a5fc3"
     },
     {
       "path": "src/bridge/request/flow.rs",
@@ -328,70 +328,70 @@
       "function": "flush_card_locked",
       "metric": "cognitive_complexity",
       "value": 120,
-      "body": "ae84079b298d5443"
+      "body": "24286e1bac824820"
     },
     {
       "path": "src/bridge/turn/flush.rs",
       "function": "flush_card_locked",
       "metric": "too_many_lines",
-      "value": 503,
-      "body": "ae84079b298d5443"
+      "value": 493,
+      "body": "24286e1bac824820"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "drain_state",
       "metric": "too_many_lines",
-      "value": 121,
-      "body": "108c5a7690074fe1"
+      "value": 120,
+      "body": "49cfd9f327143ae8"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "finish",
       "metric": "cognitive_complexity",
-      "value": 53,
-      "body": "9563e90d73778c21"
+      "value": 52,
+      "body": "df6a50cbe949712a"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "finish",
       "metric": "too_many_lines",
-      "value": 221,
-      "body": "9563e90d73778c21"
+      "value": 216,
+      "body": "df6a50cbe949712a"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "refresh_yielded_ledger",
       "metric": "too_many_lines",
-      "value": 113,
-      "body": "4463333416f5907d"
+      "value": 110,
+      "body": "84d197ca1ef6c3d0"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "start",
       "metric": "cognitive_complexity",
-      "value": 33,
-      "body": "a93e2040eee27269"
+      "value": 31,
+      "body": "4eba296e65ecfa68"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "start",
       "metric": "too_many_lines",
-      "value": 147,
-      "body": "a93e2040eee27269"
+      "value": 141,
+      "body": "4eba296e65ecfa68"
     },
     {
       "path": "src/bridge/turn/render.rs",
       "function": "render_and_flush_inner",
       "metric": "cognitive_complexity",
       "value": 31,
-      "body": "1a1a6596657ff03b"
+      "body": "9ee7dcaa4f346672"
     },
     {
       "path": "src/bridge/turn/render.rs",
       "function": "render_and_flush_inner",
       "metric": "too_many_lines",
-      "value": 164,
-      "body": "1a1a6596657ff03b"
+      "value": 158,
+      "body": "9ee7dcaa4f346672"
     },
     {
       "path": "src/bridge/turn/settle.rs",
@@ -434,13 +434,6 @@
       "metric": "too_many_lines",
       "value": 112,
       "body": "7bb7a877f762ecfb"
-    },
-    {
-      "path": "src/bridge/turn/wake.rs",
-      "function": "wake_continuation",
-      "metric": "too_many_lines",
-      "value": 106,
-      "body": "d7d2c39a54297243"
     },
     {
       "path": "src/codex/backend.rs",
@@ -531,14 +524,7 @@
       "function": "build_terminal_card",
       "metric": "too_many_lines",
       "value": 163,
-      "body": "5fccd117f1cb35e2"
-    },
-    {
-      "path": "src/feishu/card/tool_render.rs",
-      "function": "tool_panel_element",
-      "metric": "too_many_lines",
-      "value": 103,
-      "body": "b1f084b0cf814bea"
+      "body": "31cc77cab826feae"
     },
     {
       "path": "src/feishu/card/viewer.rs",
@@ -618,7 +604,7 @@
     },
     {
       "path": "src/bridge/chain/reconcile.rs",
-      "lines": 2199
+      "lines": 2188
     },
     {
       "path": "src/bridge/chain/records.rs",
@@ -634,7 +620,7 @@
     },
     {
       "path": "src/bridge/handler.rs",
-      "lines": 4840
+      "lines": 4837
     },
     {
       "path": "src/bridge/handles.rs",
@@ -654,7 +640,7 @@
     },
     {
       "path": "src/bridge/turn/mod.rs",
-      "lines": 4877
+      "lines": 4841
     },
     {
       "path": "src/bridge/turn/render.rs",
@@ -682,7 +668,7 @@
     },
     {
       "path": "src/feishu/card/tool_render.rs",
-      "lines": 2916
+      "lines": 2833
     },
     {
       "path": "src/feishu/delivery.rs",
@@ -1461,96 +1447,5 @@
       "count": 1
     }
   ],
-  "tag_probes": [
-    {
-      "path": "src/bridge/chain/reconcile.rs",
-      "lines": [
-        "&& element[\"header\"][\"title\"][\"tag\"] == \"plain_text\"",
-        ".all(|element| element[\"tag\"] != \"button\"),",
-        "assert_eq!(panel[\"tag\"], \"collapsible_panel\", \"{card}\");",
-        "element[\"tag\"] == \"collapsible_panel\"",
-        "elements[2][\"tag\"], \"collapsible_panel\",",
-        "elements[3][\"tag\"], \"hr\","
-      ]
-    },
-    {
-      "path": "src/bridge/tests/card_pull.rs",
-      "lines": [
-        "match element[\"tag\"].as_str() {"
-      ]
-    },
-    {
-      "path": "src/bridge/tests/ledger.rs",
-      "lines": [
-        "assert_eq!(panel[\"tag\"], \"collapsible_panel\", \"the live list folds: {panel}\");"
-      ]
-    },
-    {
-      "path": "src/bridge/tests/skill.rs",
-      "lines": [
-        "(e[\"tag\"] == \"column_set\"",
-        ".filter(|element| element[\"tag\"] == \"button\")",
-        ".filter(|element| element[\"tag\"] == \"collapsible_panel\")",
-        ".filter(|e| e[\"tag\"] == \"button\" && e[\"value\"].get(\"op\").is_none())",
-        ".find(|element| element[\"tag\"] == \"button\")",
-        ".find(|element| element[\"tag\"] == \"button\")",
-        ".find(|e| e[\"tag\"] == \"button\")",
-        ".find(|e| e[\"tag\"] == \"form\")"
-      ]
-    },
-    {
-      "path": "src/bridge/tests/subtask.rs",
-      "lines": [
-        ".find(|e| e[\"tag\"] == \"button\")",
-        ".find(|e| e[\"tag\"] == \"button\")"
-      ]
-    },
-    {
-      "path": "src/bridge/tests/viewer.rs",
-      "lines": [
-        "assert_eq!(content[\"zh_cn\"][\"content\"][0][0][\"tag\"], \"md\");"
-      ]
-    },
-    {
-      "path": "src/bridge/tests/wake.rs",
-      "lines": [
-        "element[\"tag\"], \"collapsible_panel\",",
-        "element[\"tag\"], \"collapsible_panel\","
-      ]
-    },
-    {
-      "path": "src/bridge/turn/render.rs",
-      "lines": [
-        ".all(|e| e[\"tag\"] != \"img\"),",
-        ".all(|e| e[\"tag\"] != \"img\"),",
-        ".all(|e| e[\"tag\"] != \"img\"),",
-        ".filter(|e| e[\"tag\"] == \"collapsible_panel\")",
-        ".filter(|e| e[\"tag\"] == \"collapsible_panel\")",
-        ".filter(|e| e[\"tag\"] == \"img\")",
-        ".filter(|e| e[\"tag\"] == \"img\")",
-        ".filter(|e| e[\"tag\"] == \"img\")",
-        ".filter(|e| e[\"tag\"] == \"img\")",
-        ".filter(|e| e[\"tag\"] == \"img\")",
-        ".find(|element| element[\"tag\"] == \"button\" && element[\"value\"][\"op\"] == \"turn_diff\")",
-        ".position(|e| e[\"tag\"] == \"collapsible_panel\")",
-        "assert_eq!(elements[footer_pos - 1][\"tag\"], \"hr\");",
-        "assert_eq!(image[\"tag\"], \"img\", \"the image follows the panel: {card}\");"
-      ]
-    },
-    {
-      "path": "src/bridge/turn/state.rs",
-      "lines": [
-        "elements[0][\"tag\"], \"collapsible_panel\",",
-        "if e[\"tag\"] == \"collapsible_panel\" {",
-        "let hr = position(&|element| element[\"tag\"] == \"hr\");"
-      ]
-    },
-    {
-      "path": "src/bridge/turn/timeline.rs",
-      "lines": [
-        ".filter(|e| e[\"tag\"] == \"collapsible_panel\")",
-        "if e[\"tag\"] == \"collapsible_panel\" {"
-      ]
-    }
-  ]
+  "tag_probes": []
 }
