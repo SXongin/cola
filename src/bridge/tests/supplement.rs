@@ -1795,7 +1795,7 @@ async fn failed_supplement_without_a_guard_after_the_steer_keeps_the_chain() {
     // The steer is inside the gate (recorded before it parks), so the test can
     // release the Turn's guard first: the settle then proves no writer.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        wait_for("the supplement's steer must reach the Backend", || async {
+        wait_for("the supplement's steer reaches the Backend", || async {
             if backend.prompt_calls.lock().await.iter().any(|t| t == "补充一下") {
                 Some(())
             } else {
@@ -1805,7 +1805,7 @@ async fn failed_supplement_without_a_guard_after_the_steer_keeps_the_chain() {
         .await
     })
     .await
-    .expect("the supplement's steer must reach the Backend");
+    .expect("the supplement's steer reaches the Backend");
     app.inflight.lock().await.remove("ses_test");
     gate.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(5), sup)

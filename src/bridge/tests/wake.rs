@@ -3209,7 +3209,7 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
         })
     };
     tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for("the new Turn must reply its own card to the message", || async {
+        wait_for("the new Turn replies its own card to the message", || async {
             let replied = {
                 let calls = platform.calls.lock().await;
                 calls
@@ -3221,13 +3221,13 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
         .await
     })
     .await
-    .expect("the new Turn must reply its own card to the message");
+    .expect("the new Turn replies its own card to the message");
 
     // The submit is recorded before the prompt gate, so wait for it instead of
     // racing the Turn's work-context read that sits between the card and the
     // prompt (the held permit keeps the Turn in flight from here on).
     tokio::time::timeout(Duration::from_secs(5), async {
-        wait_for("the new Turn's submit must be recorded", || async {
+        wait_for("the new Turn's submit is recorded", || async {
             if backend.prompt_calls.lock().await.iter().any(|t| t == "新问题") {
                 Some(())
             } else {
@@ -3237,7 +3237,7 @@ async fn a_message_in_the_waiting_window_starts_a_new_turn() {
         .await
     })
     .await
-    .expect("the new Turn's submit must be recorded");
+    .expect("the new Turn's submit is recorded");
     assert!(
         app.inflight.lock().await.contains("ses_test"),
         "the new Turn holds the guard while its prompt is in flight"

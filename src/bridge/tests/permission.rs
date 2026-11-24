@@ -671,7 +671,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
 
     // Without a bound on the list call the poller sits on the first hung
     // call forever and the permission never surfaces.
-    wait_for("poller never recovered from the hung list call", || async {
+    wait_for("the poller recovers from the hung list call", || async {
         let surfaced = Turn::has_interaction_in(&app.cards_handle(), "ses_test", "per_hung").await;
         if surfaced { Some(()) } else { None }
     })

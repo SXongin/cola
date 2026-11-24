@@ -1311,22 +1311,19 @@ async fn an_abort_during_the_old_card_stamp_marks_the_sent_read() {
     // The command was cancelled after it stamped the previous card; the read it
     // had just sent must not stay indistinguishable from current.
     let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        wait_for(
-            "the aborted command must still mark the sent read taken over",
-            || async {
-                let calls = platform.calls.lock().await.clone();
-                calls.iter().rev().find_map(|call| match call {
-                    PlatformCall::UpdateMessage { message_id, card } if message_id == "om_follow" => {
-                        Some(card.clone())
-                    }
-                    _ => None,
-                })
-            },
-        )
+        wait_for("the aborted command marks the sent read taken over", || async {
+            let calls = platform.calls.lock().await.clone();
+            calls.iter().rev().find_map(|call| match call {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_follow" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+        })
         .await
     })
     .await
-    .expect("the aborted command must still mark the sent read taken over");
+    .expect("the aborted command marks the sent read taken over");
     assert!(
         card_text(&marked).contains("已由新卡片接管"),
         "the sent read is marked superseded: {marked}"
@@ -1391,22 +1388,19 @@ async fn an_abort_during_an_idle_reads_old_card_stamp_marks_the_sent_read() {
         "the aborted command never recorded its read as current"
     );
     let marked = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        wait_for(
-            "the aborted idle read must still mark its sent read taken over",
-            || async {
-                let calls = platform.calls.lock().await.clone();
-                calls.iter().rev().find_map(|call| match call {
-                    PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_2" => {
-                        Some(card.clone())
-                    }
-                    _ => None,
-                })
-            },
-        )
+        wait_for("the aborted idle read marks its sent read taken over", || async {
+            let calls = platform.calls.lock().await.clone();
+            calls.iter().rev().find_map(|call| match call {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_idle_2" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+        })
         .await
     })
     .await
-    .expect("the aborted idle read must still mark its sent read taken over");
+    .expect("the aborted idle read marks its sent read taken over");
     assert!(
         card_text(&marked).contains("已由新卡片接管"),
         "the sent read is marked superseded: {marked}"

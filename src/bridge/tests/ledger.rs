@@ -1561,7 +1561,7 @@ async fn a_quiet_settle_defers_the_notice_until_the_retry_drains() {
     platform.fail_update(UpdateFailure::Transport, ALWAYS);
     script_quiet_true_end(&backend).await;
     spawn_sync(&app);
-    wait_for("the quiet true end never settled the card", || async {
+    wait_for("the quiet true end settles the card", || async {
         if Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Done) {
             None
         } else {
@@ -2109,16 +2109,13 @@ async fn a_refused_yielded_refresh_recovers_on_settlement() {
     platform.fail_update(UpdateFailure::ContentRefused, 2);
     spawn_sync(&app);
 
-    wait_for(
-        "the doubly-refused refresh never made its two attempts",
-        || async {
-            if patches_to(&platform, "om_waiting").await.len() < 2 {
-                None
-            } else {
-                Some(())
-            }
-        },
-    )
+    wait_for("the doubly-refused refresh makes its two attempts", || async {
+        if patches_to(&platform, "om_waiting").await.len() < 2 {
+            None
+        } else {
+            Some(())
+        }
+    })
     .await;
     // The old card takes the plain attempt and its fenced retry; the
     // SETTLEMENT then continues on a NEW card instead of suspending (issue
@@ -2724,27 +2721,24 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
 
     // The pipeline records the ending at derivation even though the refresh's
     // PATCH fails; poll the durable record rather than the card.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    let ending = loop {
+    let ending = wait_for("the cleanup ending is recorded at derivation", || async {
         let persisted = ChainRecords::load(
             crate::state::StateLayout::new(dir.path().join("sessions.json"), None).chain_records(),
         );
-        if let Some(ending) = persisted.endings("ses_test").iter().find_map(|record| {
-            record.run.names("thread_child").then(|| {
-                record
-                    .endings
-                    .iter()
-                    .find(|ending| ending.class == TaskEndingClass::Cleanup)
-            })?
-        }) {
-            break ending.clone();
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the cleanup ending was recorded at derivation"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    };
+        persisted
+            .endings("ses_test")
+            .iter()
+            .find_map(|record| {
+                record.run.names("thread_child").then(|| {
+                    record
+                        .endings
+                        .iter()
+                        .find(|ending| ending.class == TaskEndingClass::Cleanup)
+                })?
+            })
+            .cloned()
+    })
+    .await;
     assert_eq!(ending.state, TaskEndingState::Owed);
     assert_eq!(
         ending.identity.label.as_deref(),
@@ -3739,7 +3733,7 @@ async fn a_cleanup_click_whose_card_is_replaced_still_ends_the_tasks() {
         second
     };
     let next_turn = spawn_turn(&app, second);
-    wait_for("the new Turn never superseded the waiting card", || async {
+    wait_for("the new Turn supersedes the waiting card", || async {
         if Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Superseded) {
             None
         } else {
@@ -3917,7 +3911,7 @@ async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
     // longer knows the shell.
     let gate = backend.hold_transcripts();
     spawn_sync(&app);
-    wait_for("Session Sync never reached the parked read", || async {
+    wait_for("Session Sync reaches the parked read", || async {
         if backend.transcript_gate_entered.load(Ordering::SeqCst) == 0 {
             None
         } else {
@@ -7702,7 +7696,7 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
     // which is exactly the shape that used to lose the exactly-once fact. The
     // ending is session-scoped (ADR-0080): it and its shown bit outlive the
     // record, so a restart still knows the entry was shown.
-    wait_for("the settled chain never released its durable record", || async {
+    wait_for("the settled chain releases its durable record", || async {
         if app.cards_handle().chains.get("ses_test").is_some() {
             None
         } else {
