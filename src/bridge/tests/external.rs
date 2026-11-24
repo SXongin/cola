@@ -3066,15 +3066,7 @@ async fn a_followed_move_repoints_the_live_card_footer() {
         }
     });
 
-    wait_for("the card is still tracked", || async {
-        let followed = Turn::card_work_context(&cards, "ses_moved_card")
-            .await
-            .and_then(|(directory, _, _, _)| directory)
-            .as_deref()
-            == Some(new.to_string_lossy().as_ref());
-        if followed { Some(()) } else { None }
-    })
-    .await;
+    wait_for_card_work_context(&cards, "ses_moved_card", &new).await;
 
     let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_card")
         .await
@@ -3142,15 +3134,7 @@ async fn a_followed_move_to_a_plain_directory_clears_the_old_git_state() {
         }
     });
 
-    wait_for("the card is still tracked", || async {
-        let followed = Turn::card_work_context(&cards, "ses_moved_plain")
-            .await
-            .and_then(|(directory, _, _, _)| directory)
-            .as_deref()
-            == Some(new.to_string_lossy().as_ref());
-        if followed { Some(()) } else { None }
-    })
-    .await;
+    wait_for_card_work_context(&cards, "ses_moved_plain", &new).await;
 
     let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_plain")
         .await
@@ -3219,15 +3203,7 @@ async fn a_followed_move_to_a_vanished_target_still_moves_the_card() {
         }
     });
 
-    wait_for("the card is still tracked", || async {
-        let followed = Turn::card_work_context(&cards, "ses_moved_gone")
-            .await
-            .and_then(|(directory, _, _, _)| directory)
-            .as_deref()
-            == Some(new.to_string_lossy().as_ref());
-        if followed { Some(()) } else { None }
-    })
-    .await;
+    wait_for_card_work_context(&cards, "ses_moved_gone", &new).await;
 
     let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_gone")
         .await
@@ -3913,6 +3889,23 @@ async fn external_undecided_settlement_survives_timed_out_reads() {
         .await;
     wait_for_card_update(&platform, "the true end", CardUpdates::Latest, |card| {
         card_header(card).contains("✅")
+    })
+    .await;
+}
+
+/// Wait until the session's card names `expected` as its work context.
+async fn wait_for_card_work_context(
+    cards: &crate::bridge::handles::CardsHandle,
+    session_id: &str,
+    expected: &std::path::Path,
+) {
+    wait_for("the card is still tracked", || async {
+        (Turn::card_work_context(cards, session_id)
+            .await
+            .and_then(|(directory, _, _, _)| directory)
+            .as_deref()
+            == Some(expected.to_string_lossy().as_ref()))
+        .then_some(())
     })
     .await;
 }

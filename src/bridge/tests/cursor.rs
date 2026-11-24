@@ -50,12 +50,16 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
     wait_for_card_text(&platform, "第一段回答。").await;
     wait_for_card_text(&platform, "⏳ bash").await;
 
-    let cursor = wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.message_id.as_str() == "msg_a_2000")
-    })
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.message_id.as_str() == "msg_a_2000")
+        },
+        "the frontier names msg_a_2000",
+    )
     .await;
     assert_eq!(
         cursor.frontier,
@@ -81,13 +85,17 @@ async fn a_live_turn_advances_the_record_cursor_to_the_delivered_body() {
     // still carrying the text part's delivered extent (review #569).
     settle_tool(&backend, ToolStatus::Completed, "done").await;
     wait_for_card_text(&platform, "done").await;
-    let cursor = wait_for_cursor(&app, |cursor| {
-        cursor.live_calls.is_empty()
-            && cursor
-                .frontier
-                .as_ref()
-                .is_some_and(|frontier| frontier.kind == CursorPartKind::Tool)
-    })
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor.live_calls.is_empty()
+                && cursor
+                    .frontier
+                    .as_ref()
+                    .is_some_and(|frontier| frontier.kind == CursorPartKind::Tool)
+        },
+        "the frontier is the tool part with no live call",
+    )
     .await;
     assert_eq!(
         cursor.frontier,
@@ -127,7 +135,12 @@ async fn two_text_parts_at_one_server_time_confirm_their_own_frontier() {
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, second).await;
 
-    let cursor = wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| cursor.frontier.is_some(),
+        "the cursor has a frontier",
+    )
+    .await;
     assert_eq!(
         cursor.frontier,
         Some(CursorFrontier {
@@ -214,23 +227,31 @@ async fn a_grown_part_advances_the_cursor_to_its_own_extent() {
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, first).await;
-    wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.delivered_chars == first.chars().count())
-    })
+    wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.delivered_chars == first.chars().count())
+        },
+        "the frontier reaches the first part",
+    )
     .await;
 
     // The same part is re-sent, grown: the card takes only the tail and the
     // frontier stays the part's own extent.
     grow_scripted_part(&backend, &full).await;
-    let cursor = wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.delivered_chars == full.chars().count())
-    })
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.delivered_chars == full.chars().count())
+        },
+        "the frontier reaches the full part",
+    )
     .await;
     assert_eq!(
         cursor.frontier.as_ref().map(|f| f.message_id.as_str()),
@@ -277,7 +298,12 @@ async fn a_live_turn_persists_the_record_once_per_confirmed_write_not_per_poll()
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, "第一段回答。").await;
     wait_for_card_text(&platform, "⏳ bash").await;
-    wait_for_cursor(&app, |cursor| cursor.frontier.is_some()).await;
+    wait_for_cursor(
+        &app,
+        |cursor| cursor.frontier.is_some(),
+        "the cursor has a frontier",
+    )
+    .await;
     // The follow reads twice with nothing new before the baseline: any flush
     // the hand-off still owed has landed, so the window starts quiescent.
     let reads = backend.transcript_calls.lock().await.len();
@@ -292,15 +318,24 @@ async fn a_live_turn_persists_the_record_once_per_confirmed_write_not_per_poll()
     // moves). Each is persisted exactly once.
     settle_tool(&backend, ToolStatus::Completed, "done").await;
     wait_for_card_text(&platform, "done").await;
-    wait_for_cursor(&app, |cursor| cursor.live_calls.is_empty()).await;
+    wait_for_cursor(
+        &app,
+        |cursor| cursor.live_calls.is_empty(),
+        "no live call remains",
+    )
+    .await;
     grow_scripted_answer(&backend, 6_000, "第二段回答。").await;
     wait_for_card_text(&platform, "第二段回答。").await;
-    let grown = wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.message_id.as_str() == "msg_a_6000")
-    })
+    let grown = wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.message_id.as_str() == "msg_a_6000")
+        },
+        "the frontier names msg_a_6000",
+    )
     .await;
     assert_eq!(
         grown.frontier.as_ref().map(|frontier| frontier.delivered_chars),
@@ -886,12 +921,16 @@ async fn a_confirmed_write_on_a_compaction_advances_the_cursor_onto_it() {
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     wait_for_card_text(&platform, "已压缩上下文").await;
 
-    let cursor = wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.kind == CursorPartKind::Compaction)
-    })
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.kind == CursorPartKind::Compaction)
+        },
+        "the frontier is the compaction part",
+    )
     .await;
     assert_eq!(
         cursor.frontier,
@@ -956,12 +995,16 @@ async fn a_seeded_reasoning_replay_confirms_one_prefix() {
     spawn_sync(&app);
     super::reap::wait_for_projection(&platform, "om_frozen").await;
 
-    let cursor = wait_for_cursor(&app, |cursor| {
-        cursor
-            .frontier
-            .as_ref()
-            .is_some_and(|frontier| frontier.delivered_chars == cap)
-    })
+    let cursor = wait_for_cursor(
+        &app,
+        |cursor| {
+            cursor
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.delivered_chars == cap)
+        },
+        "the frontier reaches the reasoning cap",
+    )
     .await;
     let frontier = cursor.frontier.as_ref().expect("the reasoning frontier");
     assert_eq!(frontier.kind, CursorPartKind::Reasoning);

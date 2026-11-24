@@ -155,10 +155,7 @@ async fn one_click_uploads_once_and_posts_one_html_file_message() {
     assert!(ack.card.is_none(), "the click never rebuilds the card inline");
     assert_eq!(ack.toast.as_deref(), Some("正在生成完整 diff…"));
 
-    let message = wait_for("the Turn diff File Message is posted", || async {
-        file_messages(&platform).await.into_iter().next()
-    })
-    .await;
+    let message = wait_for_file_message(&platform).await;
     match message {
         PlatformCall::SendMessageReply {
             message_id,
@@ -241,10 +238,7 @@ async fn a_second_click_after_the_send_is_a_no_op() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the first click is acknowledged");
-    wait_for("the Turn diff File Message is posted", || async {
-        file_messages(&platform).await.into_iter().next()
-    })
-    .await;
+    wait_for_file_message(&platform).await;
 
     // The send is recorded before the delivery marks the Turn `Sent`; retry
     // the duplicate click until that terminal state is observable (each
@@ -276,17 +270,7 @@ async fn an_empty_turn_replies_text_once_and_sends_no_file() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for(
-        &format!("a reply contains {:?}", "本轮期间工作区没有留下净变化。"),
-        || async {
-            text_replies(&platform)
-                .await
-                .iter()
-                .any(|text| text.contains("本轮期间工作区没有留下净变化。"))
-                .then_some(())
-        },
-    )
-    .await;
+    wait_for_reply_containing(&platform, "本轮期间工作区没有留下净变化。").await;
 
     assert!(file_uploads(&platform).await.is_empty(), "no upload");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
@@ -323,17 +307,7 @@ async fn an_upload_failure_replies_an_error_and_stays_retryable() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for(
-        &format!("a reply contains {:?}", "生成完整 diff 失败"),
-        || async {
-            text_replies(&platform)
-                .await
-                .iter()
-                .any(|text| text.contains("生成完整 diff 失败"))
-                .then_some(())
-        },
-    )
-    .await;
+    wait_for_reply_containing(&platform, "生成完整 diff 失败").await;
 
     assert!(file_messages(&platform).await.is_empty(), "nothing was sent");
     assert!(
@@ -345,17 +319,8 @@ async fn an_upload_failure_replies_an_error_and_stays_retryable() {
     // The failed delivery's claim is released as its task returns, so retry
     // until one click actually re-enters the read (the reply being recorded
     // does not yet mean the claim was dropped).
-    wait_for("the retry re-enters the read", || async {
-        app.host_action_on_message(click(), CARD_MESSAGE)
-            .await
-            .expect("the retry is acknowledged");
-        (backend.session_diff_calls.lock().await.len() > 1).then_some(())
-    })
-    .await;
-    wait_for("the Turn diff File Message is posted", || async {
-        file_messages(&platform).await.into_iter().next()
-    })
-    .await;
+    wait_for_retry_read(&app, &backend).await;
+    wait_for_file_message(&platform).await;
     assert_eq!(file_messages(&platform).await.len(), 1);
     assert_eq!(
         backend.session_diff_calls.lock().await.len(),
@@ -384,14 +349,7 @@ async fn an_ambiguous_send_is_terminal_and_never_duplicated() {
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .expect("the spawned delivery reaches the File Message send");
-    wait_for(&format!("a reply contains {:?}", "发送结果未知"), || async {
-        text_replies(&platform)
-            .await
-            .iter()
-            .any(|text| text.contains("发送结果未知"))
-            .then_some(())
-    })
-    .await;
+    wait_for_reply_containing(&platform, "发送结果未知").await;
 
     assert_eq!(
         file_messages(&platform).await.len(),
@@ -432,14 +390,7 @@ async fn a_post_accept_send_error_is_terminal_and_never_duplicated() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for(&format!("a reply contains {:?}", "发送结果未知"), || async {
-        text_replies(&platform)
-            .await
-            .iter()
-            .any(|text| text.contains("发送结果未知"))
-            .then_some(())
-    })
-    .await;
+    wait_for_reply_containing(&platform, "发送结果未知").await;
     assert_eq!(file_uploads(&platform).await.len(), 1, "one upload");
 
     let repeated = app
@@ -473,10 +424,7 @@ async fn a_failed_transcript_still_delivers_with_an_unknown_time() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for("the Turn diff File Message is posted", || async {
-        file_messages(&platform).await.into_iter().next()
-    })
-    .await;
+    wait_for_file_message(&platform).await;
 
     let uploads = file_uploads(&platform).await;
     match &uploads[0] {
@@ -524,10 +472,7 @@ async fn the_click_acks_before_the_delivery_runs() {
         .await
         .expect("the spawned delivery reaches the upload");
     release.notify_one();
-    wait_for("the Turn diff File Message is posted", || async {
-        file_messages(&platform).await.into_iter().next()
-    })
-    .await;
+    wait_for_file_message(&platform).await;
     assert_eq!(file_uploads(&platform).await.len(), 1, "one upload");
     assert_eq!(file_messages(&platform).await.len(), 1, "one File Message");
 }
@@ -680,33 +625,14 @@ async fn a_failed_read_speaks_the_read_failure_and_stays_retryable() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for(
-        &format!("a reply contains {:?}", "暂时读不到终态改动，请稍后再试。"),
-        || async {
-            text_replies(&platform)
-                .await
-                .iter()
-                .any(|text| text.contains("暂时读不到终态改动，请稍后再试。"))
-                .then_some(())
-        },
-    )
-    .await;
+    wait_for_reply_containing(&platform, "暂时读不到终态改动，请稍后再试。").await;
     assert!(file_messages(&platform).await.is_empty(), "nothing was sent");
 
     backend
         .fail_session_diff
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    wait_for("the retry re-enters the read", || async {
-        app.host_action_on_message(click(), CARD_MESSAGE)
-            .await
-            .expect("the retry is acknowledged");
-        (backend.session_diff_calls.lock().await.len() > 1).then_some(())
-    })
-    .await;
-    wait_for("the Turn diff File Message is posted", || async {
-        file_messages(&platform).await.into_iter().next()
-    })
-    .await;
+    wait_for_retry_read(&app, &backend).await;
+    wait_for_file_message(&platform).await;
     assert_eq!(file_uploads(&platform).await.len(), 1, "one retried upload");
 }
 
@@ -721,17 +647,7 @@ async fn a_generation_without_the_endpoint_answers_the_read_failure() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for(
-        &format!("a reply contains {:?}", "暂时读不到终态改动，请稍后再试。"),
-        || async {
-            text_replies(&platform)
-                .await
-                .iter()
-                .any(|text| text.contains("暂时读不到终态改动，请稍后再试。"))
-                .then_some(())
-        },
-    )
-    .await;
+    wait_for_reply_containing(&platform, "暂时读不到终态改动，请稍后再试。").await;
 
     assert!(file_uploads(&platform).await.is_empty(), "no upload");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
@@ -888,10 +804,7 @@ async fn the_turn_diff_click_carries_no_action_and_pins_its_exact_result() {
     assert!(ack.card.is_none(), "the click never rebuilds the card inline");
     assert_eq!(ack.toast.as_deref(), Some("正在生成完整 diff…"));
 
-    wait_for("the Turn diff File Message is posted", || async {
-        file_messages(&platform).await.into_iter().next()
-    })
-    .await;
+    wait_for_file_message(&platform).await;
 }
 
 /// The `diffs` capability is the DISPATCH's gate, not the body's (#1124): a
@@ -915,4 +828,35 @@ async fn the_turn_diff_click_is_omitted_when_the_attachment_lost_the_surface() {
         "the omitted click never guesses a diff read"
     );
     assert!(file_messages(&platform).await.is_empty(), "nothing is sent");
+}
+
+/// Wait for the Turn diff's File Message.
+async fn wait_for_file_message(platform: &RecordingPlatform) -> PlatformCall {
+    wait_for("the Turn diff File Message is posted", || async {
+        file_messages(platform).await.into_iter().next()
+    })
+    .await
+}
+
+/// Wait for a text reply containing `needle`.
+async fn wait_for_reply_containing(platform: &RecordingPlatform, needle: &str) {
+    wait_for(&format!("a reply contains {needle:?}"), || async {
+        text_replies(platform)
+            .await
+            .iter()
+            .any(|text| text.contains(needle))
+            .then_some(())
+    })
+    .await;
+}
+
+/// Retry the click until it re-enters the diff read.
+async fn wait_for_retry_read(app: &Arc<App>, backend: &MockBackend) {
+    wait_for("the retry re-enters the read", || async {
+        app.host_action_on_message(click(), CARD_MESSAGE)
+            .await
+            .expect("the retry is acknowledged");
+        (backend.session_diff_calls.lock().await.len() > 1).then_some(())
+    })
+    .await;
 }

@@ -1109,7 +1109,7 @@ async fn a_failed_card_create_records_and_stamps_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let platform = RecordingPlatform::new();
-    platform.given_reply_card_outcomes(ReplyOutcome::Failed, 100);
+    platform.given_reply_card_outcomes(ReplyOutcome::Failed, ALWAYS);
     let platform = Arc::new(platform);
     let app = Arc::new(App::new(cfg, Arc::new(idle_read_backend()), platform.clone()).unwrap());
     seed_session(&app, "ses_test", "/work").await;

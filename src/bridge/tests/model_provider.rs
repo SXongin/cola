@@ -1058,14 +1058,7 @@ async fn a_model_write_during_materialisation_fails_honestly() {
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the creation never started", || async {
-        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            None
-        } else {
-            Some(())
-        }
-    })
-    .await;
+    wait_for_creation_started(&entered).await;
 
     let step = app
         .host_action(model_pick(PROVIDER, MODEL))
@@ -1104,14 +1097,7 @@ async fn a_replacement_pending_survives_the_older_creation() {
     seed_pending(&app, PendingEntry::new(key(), "/work/first")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the creation never started", || async {
-        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            None
-        } else {
-            Some(())
-        }
-    })
-    .await;
+    wait_for_creation_started(&entered).await;
     let mut replacement = PendingEntry::new(key(), "/work/second");
     replacement.model = Some("deepseek/deepseek-v4-pro".into());
     app.sessions
@@ -1179,14 +1165,7 @@ async fn a_forget_during_a_parked_creation_is_not_undone() {
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the creation never started", || async {
-        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            None
-        } else {
-            Some(())
-        }
-    })
-    .await;
+    wait_for_creation_started(&entered).await;
 
     // The user forgets the thread while `thread/start` is in flight.
     send_command(&app, "/switch forget", "msg_forget").await;
@@ -1222,14 +1201,7 @@ async fn a_newer_selection_during_a_parked_creation_wins() {
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the creation never started", || async {
-        if entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            None
-        } else {
-            Some(())
-        }
-    })
-    .await;
+    wait_for_creation_started(&entered).await;
 
     // The user selects another session while `thread/start` is in flight.
     app.activate_session(crate::config::SessionEntry::new(
@@ -1761,14 +1733,7 @@ async fn a_materialised_store_model_is_not_resent_when_the_adapter_holds_a_pendi
     seed_entry(&app, entry).await;
 
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the prompt never reached the backend", || async {
-        if prompt_models.lock().await.is_empty() {
-            None
-        } else {
-            Some(())
-        }
-    })
-    .await;
+    wait_for_prompt_submitted(&prompt_models).await;
     assert_eq!(
         prompt_models.lock().await.as_slice(),
         &[None],
@@ -1819,14 +1784,7 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
     );
 
     prompt(&app, "msg_prompt", "hi");
-    wait_for("the prompt never reached the backend", || async {
-        if prompt_models.lock().await.is_empty() {
-            None
-        } else {
-            Some(())
-        }
-    })
-    .await;
+    wait_for_prompt_submitted(&prompt_models).await;
     assert_eq!(
         app.sessions
             .lock()
@@ -3117,4 +3075,20 @@ async fn a_failed_mirror_write_keeps_the_applied_effort_for_a_retry() {
         Some("high"),
         "the retry persisted the applied level"
     );
+}
+
+/// Wait until a gate counter records an entry.
+async fn wait_for_creation_started(entered: &std::sync::atomic::AtomicUsize) {
+    wait_for("the creation never started", || async {
+        (entered.load(std::sync::atomic::Ordering::SeqCst) != 0).then_some(())
+    })
+    .await;
+}
+
+/// Wait until the backend has received a prompt.
+async fn wait_for_prompt_submitted(prompt_models: &Arc<tokio::sync::Mutex<Vec<Option<String>>>>) {
+    wait_for("the prompt never reached the backend", || async {
+        (!prompt_models.lock().await.is_empty()).then_some(())
+    })
+    .await;
 }

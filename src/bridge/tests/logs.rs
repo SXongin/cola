@@ -541,41 +541,10 @@ async fn an_external_reply_render_carries_its_session() {
             let _ = poller.external.poll_loop(&poller.flow_handles()).await;
         });
         // The notification arms the renderer; only then does the reply exist.
-        wait_for(
-            &format!("a card carrying {:?} reaches Feishu", "有新消息"),
-            || async {
-                platform
-                    .calls
-                    .lock()
-                    .await
-                    .iter()
-                    .any(|call| match call {
-                        PlatformCall::SendCard { card, .. }
-                        | PlatformCall::UpdateMessage { card, .. }
-                        | PlatformCall::ReplyCard { card, .. } => card_text(card).contains("有新消息"),
-                        _ => false,
-                    })
-                    .then_some(())
-            },
-        )
-        .await;
+        wait_for_card(&platform, "有新消息").await;
         reply_ready.store(true, Ordering::SeqCst);
         // The Done card is flushed just before the renderer logs its exit.
-        wait_for(&format!("a card carrying {:?} reaches Feishu", "✅"), || async {
-            platform
-                .calls
-                .lock()
-                .await
-                .iter()
-                .any(|call| match call {
-                    PlatformCall::SendCard { card, .. }
-                    | PlatformCall::UpdateMessage { card, .. }
-                    | PlatformCall::ReplyCard { card, .. } => card_text(card).contains("✅"),
-                    _ => false,
-                })
-                .then_some(())
-        })
-        .await;
+        wait_for_card(&platform, "✅").await;
         // Let the render task finish its last line before the capture closes.
         tokio::time::sleep(Duration::from_millis(20)).await;
     })
@@ -860,4 +829,23 @@ async fn a_pending_inbound_claim_alone_still_routes_a_new_turn() {
         !logs.contains(text),
         "the message body must never be logged:\n{logs}"
     );
+}
+
+/// Wait until a card carrying `needle` reaches Feishu.
+async fn wait_for_card(platform: &Arc<RecordingPlatform>, needle: &str) {
+    wait_for(&format!("a card carrying {needle:?} reaches Feishu"), || async {
+        platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .any(|call| match call {
+                PlatformCall::SendCard { card, .. }
+                | PlatformCall::UpdateMessage { card, .. }
+                | PlatformCall::ReplyCard { card, .. } => card_text(card).contains(needle),
+                _ => false,
+            })
+            .then_some(())
+    })
+    .await;
 }
