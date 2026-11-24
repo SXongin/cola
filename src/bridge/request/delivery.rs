@@ -357,11 +357,10 @@ pub(crate) async fn resolve_blocks(
         // receipt would wait for a content flush. `mark_header_shown` fences
         // the card id again under its own lock, so a re-point in between
         // cannot make the cache describe a card that never got it.
-        let current = {
-            let live = cards.cards.lock().await;
-            live.get(session)
-                .and_then(|card| card.card_message_id().map(str::to_string))
-        };
+        let current = cards
+            .card(session)
+            .await
+            .and_then(|card| card.card_message_id().map(str::to_string));
         if let Some(current) = current
             && (written.contains(&current) || clicked_written.as_deref() == Some(&current))
         {

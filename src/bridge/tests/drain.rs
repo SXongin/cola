@@ -3928,7 +3928,7 @@ async fn a_drain_whose_render_never_lands_records_nothing() {
     // While it is parked, the runtime misses the shell and the accumulator is
     // collected from under it.
     backend.task_runtime.lock().unwrap().shells = vec![("sh_bg".into(), ShellRuntime::Missing)];
-    app.cards_handle().cards.lock().await.remove("ses_test");
+    app.cards_handle().remove("ses_test").await;
     // Disarm so no later read parks, then release the tick: its reconcile
     // retires the shell, and its render finds no accumulator.
     *backend.transcript_gate.lock().unwrap() = None;

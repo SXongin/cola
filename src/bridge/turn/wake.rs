@@ -265,10 +265,8 @@ impl Turn {
     /// so the time alone cannot tell two turns apart.
     pub(crate) async fn armed_turn_anchor(cards: &CardsHandle, session_id: &str) -> Option<TurnAnchor> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .and_then(|c| c.acc.turn_anchor().cloned())
     }
 
@@ -342,109 +340,109 @@ impl Turn {
         if let Some(gap) = gap {
             acc.set_pending_gap(gap.clone());
         }
-        let mut plans = {
-            let live = cards.cards.lock().await;
-            // A chain card that appeared meanwhile owns the session. An Idle
-            // Session Card does not: it is a one-shot read (ADR-0100) that
-            // joins no chain, so the projection replaces it in the map while
-            // the read's message stays untouched in the chat.
-            if live
-                .get(session_id)
-                .is_some_and(state::CardSession::is_chain_card)
-            {
-                return None;
-            }
-            // The durable seed is read HERE, in the same critical section that
-            // checks the session is still chain-card-less (issue #671, ticket
-            // #672): `read_planned_outputs` below awaits outside the lock, so a
-            // seed read before it could miss a fact a landed body wrote
-            // meanwhile. Together with the check the two are one decision — no
-            // chain card, so no chain writer — and the second check guards the
-            // install.
-            Self::seed_durable_announcements(cards, session_id, &mut acc);
-            render::plan_ledger_entries(
-                &acc,
-                transcript,
-                Some(anchor),
-                render::Endings::of(cards, session_id),
-            )
-        };
+        let mut plans = cards
+            .with_map(|live| {
+                if live
+                    .get(session_id)
+                    .is_some_and(state::CardSession::is_chain_card)
+                {
+                    return None;
+                }
+                // The durable seed is read HERE, in the same critical section that
+                // checks the session is still chain-card-less (issue #671, ticket
+                // #672): `read_planned_outputs` below awaits outside the lock, so a
+                // seed read before it could miss a fact a landed body wrote
+                // meanwhile. Together with the check the two are one decision — no
+                // chain card, so no chain writer — and the second check guards the
+                // install.
+                Self::seed_durable_announcements(cards, session_id, &mut acc);
+                Some(render::plan_ledger_entries(
+                    &acc,
+                    transcript,
+                    Some(anchor),
+                    render::Endings::of(cards, session_id),
+                ))
+            })
+            .await?;
         render::read_planned_outputs(backend, &mut plans).await;
-        let mut live = cards.cards.lock().await;
-        if live
-            .get(session_id)
-            .is_some_and(state::CardSession::is_chain_card)
-        {
-            return None;
-        }
-        // `read_planned_outputs` awaited outside the lock: a queued card update
-        // can have delivered and flipped an ending's shown bit in that window
-        // (ADR-0080), which the seed above predates. Re-read the durable endings
-        // here, under the install lock, and hand them to the commit, which drops
-        // any planned entry they now cover — so the successor never re-shows one
-        // the delivered body already showed.
-        let endings = render::Endings::of(cards, session_id);
-        let bound = render::rendered_bound(cards, session_id, transcript);
-        let rendered = render::render_turn_parts(&mut acc, transcript, bound);
-        render::apply_ledger_read(
-            &mut acc,
-            transcript,
-            &std::collections::HashMap::new(),
-            &std::collections::HashSet::new(),
-            chrono::Utc::now().timestamp_millis(),
-            state::LedgerCadence::Minute,
-            endings,
-            plans,
-            backend.reports_live_runs(),
-        );
-        match ending {
-            Some(ending) => acc.apply_ending(ending),
-            None => {
-                // A live adoption follows a run already in flight: the
-                // successor is a working card from its first send, never an
-                // initial 「waiting」.
-                acc.mark_adopted_live();
-            }
-        }
-        // The successor's body goes through the SAME splitter the flush uses
-        // (spec #561, review #569): an oversized missed delta must become a
-        // bounded chain of cards, never one over-limit create that fails and
-        // loses the tail. A finalized slice wears 「部分完成」 even when the
-        // ending is terminal; the final slice wears the ending.
-        let built = acc.build_card_with_info();
-        // Stage the body's cursor exactly like a flush does: only the
-        // confirmed create drains it into the Chain Record. The stage
-        // identities travel on the [`ProjectedCard`], so the confirmation can
-        // name the exact body the create carried (spec #561, review #569).
-        let cursor_stage = state::StagedCursorId {
-            id: acc.stage_cursor(
-                None,
-                built.cursor.clone(),
-                built.gap.clone(),
-                built.rendered_endings.clone(),
-            ),
-            awaiting_seq: None,
-        };
-        let watermark_stage = acc.pending_watermark_id();
-        let mut session = state::CardSession::new(acc, None);
-        // A finalized first slice is not the chain's live card: the caller
-        // continues the chain on a new card.
-        session.card_is_live = !built.full;
-        session.fallback_chat = fallback_chat.map(str::to_string);
-        // The caller re-checks this identity after its awaited create: a fresh
-        // Turn that replaced the armed session meanwhile owns the chain (spec
-        // #561, review #569).
-        let chain_id = session.chain_id();
-        live.insert(session_id.to_string(), session);
-        Some(ProjectedCard {
-            card: built.card,
-            rendered,
-            chain_id,
-            cursor_stage,
-            rendered_endings: built.rendered_endings,
-            watermark_stage,
-            full: built.full,
-        })
+        cards
+            .with_map(|live| {
+                if live
+                    .get(session_id)
+                    .is_some_and(state::CardSession::is_chain_card)
+                {
+                    return None;
+                }
+                // `read_planned_outputs` awaited outside the lock: a queued card update
+                // can have delivered and flipped an ending's shown bit in that window
+                // (ADR-0080), which the seed above predates. Re-read the durable endings
+                // here, under the install lock, and hand them to the commit, which drops
+                // any planned entry they now cover — so the successor never re-shows one
+                // the delivered body already showed.
+                let endings = render::Endings::of(cards, session_id);
+                let bound = render::rendered_bound(cards, session_id, transcript);
+                let rendered = render::render_turn_parts(&mut acc, transcript, bound);
+                render::apply_ledger_read(
+                    &mut acc,
+                    transcript,
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashSet::new(),
+                    chrono::Utc::now().timestamp_millis(),
+                    state::LedgerCadence::Minute,
+                    endings,
+                    plans,
+                    backend.reports_live_runs(),
+                );
+                match ending {
+                    Some(ending) => acc.apply_ending(ending),
+                    None => {
+                        // A live adoption follows a run already in flight: the
+                        // successor is a working card from its first send, never an
+                        // initial 「waiting」.
+                        acc.mark_adopted_live();
+                    }
+                }
+                // The successor's body goes through the SAME splitter the flush uses
+                // (spec #561, review #569): an oversized missed delta must become a
+                // bounded chain of cards, never one over-limit create that fails and
+                // loses the tail. A finalized slice wears 「部分完成」 even when the
+                // ending is terminal; the final slice wears the ending.
+                let built = acc.build_card_with_info();
+                // Stage the body's cursor exactly like a flush does: only the
+                // confirmed create drains it into the Chain Record. The stage
+                // identities travel on the [`ProjectedCard`], so the confirmation can
+                // name the exact body the create carried (spec #561, review #569).
+                let cursor_stage = state::StagedCursorId {
+                    id: acc.stage_cursor(
+                        None,
+                        built.cursor.clone(),
+                        built.gap.clone(),
+                        built.rendered_endings.clone(),
+                    ),
+                    awaiting_seq: None,
+                };
+                let watermark_stage = acc.pending_watermark_id();
+                let mut session = state::CardSession::new(acc, None);
+                // A finalized first slice is not the chain's live card: the caller
+                // continues the chain on a new card.
+                session.card_is_live = !built.full;
+                session.fallback_chat = fallback_chat.map(str::to_string);
+                // The caller re-checks this identity after its awaited create: a fresh
+                // Turn that replaced the armed session meanwhile owns the chain (spec
+                // #561, review #569).
+                let chain_id = session.chain_id();
+                live.insert(session_id.to_string(), session);
+                Some(ProjectedCard {
+                    card: built.card,
+                    rendered,
+                    chain_id,
+                    cursor_stage,
+                    rendered_endings: built.rendered_endings,
+                    watermark_stage,
+                    full: built.full,
+                })
+            })
+            .await
     }
 
     /// Arm an external renderer's card: build the turn's accumulator, attach
@@ -565,25 +563,30 @@ impl Turn {
         // The durable seed and the insert share ONE cards-map critical section
         // (issue #671, ticket #672): a landed mark must not slip past a seed
         // read taken before it, leaving this render to re-show the retirement.
-        let mut live = cards.cards.lock().await;
-        // The render-owned arm's commit is also a compare-and-swap for the
-        // `/card` post (ADR-0100): a Turn installed during the send owns the
-        // card, a terminal card that still carries a live Permission/Question
-        // must keep its answerable controls, and a card that still owes a
-        // continuation must keep that queue and its reply target, so none of
-        // them is overwritten.
-        if refuse_if_running
-            && live.get(session_id).is_some_and(|card| {
-                card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation()
+        cards
+            .with_map(|live| {
+                // The render-owned arm's commit is also a compare-and-swap for the
+                // `/card` post (ADR-0100): a Turn installed during the send owns the
+                // card, a terminal card that still carries a live Permission/Question
+                // must keep its answerable controls, and a card that still owes a
+                // continuation must keep that queue and its reply target, so none of
+                // them is overwritten.
+                if refuse_if_running
+                    && live.get(session_id).is_some_and(|card| {
+                        card.is_running()
+                            || !card.acc.live_request_ids().is_empty()
+                            || card.owes_continuation()
+                    })
+                {
+                    return None;
+                }
+                Self::seed_durable_announcements(cards, session_id, &mut prepared.acc);
+                let session = state::CardSession::new(prepared.acc, Some(card_id.to_string()));
+                let chain_id = session.chain_id();
+                live.insert(session_id.to_string(), session);
+                Some((chain_id, session_dir))
             })
-        {
-            return None;
-        }
-        Self::seed_durable_announcements(cards, session_id, &mut prepared.acc);
-        let session = state::CardSession::new(prepared.acc, Some(card_id.to_string()));
-        let chain_id = session.chain_id();
-        live.insert(session_id.to_string(), session);
-        Some((chain_id, session_dir))
+            .await
     }
 
     /// The record half of [`Self::commit_external_render_locked`], split out so
@@ -664,14 +667,13 @@ impl Turn {
         // topic anchor or top level, where a split cannot go. Its Wake-less
         // residual tails still take the chain's residual arms, on the card
         // that holds the chain's own reply target.
-        let not_live;
         // The read's content positions and the chain's durable delivered
         // frontier, both read once: the Fresh floor below and the chain arms
         // judge the same read, and the bound is a sync read of the store.
         let positions = render::read_position_map(transcript);
         let bound = render::rendered_bound(cards, session_id, transcript);
-        {
-            let mut live = cards.cards.lock().await;
+        let mut not_live = false;
+        if let Some(mut card) = cards.card(session_id).await {
             // Issue #1087's floor: a terminal chain card that already SHOWS the
             // newest COMPLETION Wake's work was handed it over when that work
             // rendered ([`render::hand_over_absorbed_wakes`]); re-asking the
@@ -682,8 +684,7 @@ impl Turn {
             // resumption and the Fresh arm would re-post work the card already
             // carries. A restart/interrupt Wake is deliberately outside this
             // floor: ADR-0066 keeps its 承接 split, rendered work or not.
-            if let Some(card) = live.get_mut(session_id)
-                && card.is_chain_card()
+            if card.is_chain_card()
                 && !card.is_running()
                 && let Some(wake) = newest_wake
                 && wake.source.is_completion()
@@ -692,20 +693,16 @@ impl Turn {
             {
                 card.acc.hand_over_wake(wake.id.as_str());
             }
-            let entry = live.get(session_id);
-            not_live = entry.is_some_and(|card| !card.is_running());
+            not_live = !card.is_running();
             // A terminal card with a genuine un-handed-over Wake is not the
             // chain this Wake continues: skip the chain arms and let the Fresh
             // gate below open the continuation.
-            let fresh_wake = entry.is_some_and(|card| {
-                card.is_chain_card()
-                    && !card.is_running()
-                    && newest_wake.is_some_and(|wake| {
-                        wake.source.is_genuine_resumption()
-                            && !card.acc.has_handed_over_wake(wake.id.as_str())
-                    })
-            });
-            if let Some(card) = entry.filter(|card| card.is_chain_card() && !fresh_wake) {
+            let fresh_wake = card.is_chain_card()
+                && !card.is_running()
+                && newest_wake.is_some_and(|wake| {
+                    wake.source.is_genuine_resumption() && !card.acc.has_handed_over_wake(wake.id.as_str())
+                });
+            if card.is_chain_card() && !fresh_wake {
                 // The probe judges the chain's OWN rendered scope, not the
                 // newest user message's: a restart continuation is anchored at
                 // the Wake (`arm_wake_continuation`), and the pre-Wake content
@@ -729,7 +726,7 @@ impl Turn {
                 //    card's ledger refresh places the completion entry while the
                 //    Wake's work is still unrendered (live 2026-10-01), and that
                 //    entry must not masquerade as a handoff.
-                if ownership::admits_ledger_refresh(card)
+                if ownership::admits_ledger_refresh(&card)
                     && let Some(wake) = newest_wake
                     && matches!(wake.source, WakeSource::Shell | WakeSource::Subagent)
                     && !card.acc.has_handed_over_wake(wake.id.as_str())
@@ -771,7 +768,7 @@ impl Turn {
                 //    already handed over, so re-marking it is a no-op; a Wake-less
                 //    tail (`None`) marks nothing. This is also why a Wake-less
                 //    tail is not dropped: an open yielded card renders it.
-                if ownership::admits_ledger_refresh(card) {
+                if ownership::admits_ledger_refresh(&card) {
                     return Some(WakeContinuation::ResumeInPlace {
                         wake_id: newest_wake.map(|wake| wake.id.to_string()),
                     });
@@ -883,10 +880,8 @@ impl Turn {
     #[cfg(test)]
     pub(crate) async fn has_handed_over_wake(cards: &CardsHandle, session_id: &str, wake_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|card| card.acc.has_handed_over_wake(wake_id))
     }
 
@@ -897,10 +892,8 @@ impl Turn {
     /// render's, a Wake continuation's): the watch has nothing to look for.
     pub(crate) async fn submitted_message_id(cards: &CardsHandle, session_id: &str) -> Option<String> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .and_then(|card| card.acc.cola_message_id().map(str::to_string))
     }
 
@@ -928,8 +921,9 @@ impl Turn {
         capabilities: crate::backend::AgentCapabilities,
     ) -> Option<serde_json::Value> {
         let work_context = StreamAccumulator::capture_work_context(facts.directory).await;
-        let mut live = cards.cards.lock().await;
-        // The same not-supersedable predicate as the follow CAS and
+        cards
+            .with_map(|live| {
+                // The same not-supersedable predicate as the follow CAS and
         // `record_idle_card` (ADR-0100): a card that is still running, still
         // carries a live Permission/Question, still owes a queued
         // continuation, or still offers a recovery action (`Error`/
@@ -993,7 +987,9 @@ impl Turn {
         // overflows one card (there is no reply target to hand over to).
         session.fallback_chat = Some(facts.chat_id.to_string());
         live.insert(session_id.to_string(), session);
-        Some(card)
+                Some(card)
+            })
+            .await
     }
 
     /// Run the Wake continuation's out-of-turn settle loop (ADR-0059) on the
@@ -1045,10 +1041,8 @@ impl Turn {
     /// run from here, so the resumed work counts toward the threshold.
     pub(crate) async fn turn_started_at(cards: &CardsHandle, session_id: &str) -> Option<std::time::Instant> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .and_then(|card| card.acc.turn_started_at())
     }
 
@@ -1057,13 +1051,16 @@ impl Turn {
     /// armed anchor is dropped — a newer session that took over meanwhile is
     /// never removed.
     pub(crate) async fn drop_armed_card(cards: &CardsHandle, session_id: &str, anchor: &TurnAnchor) {
-        let mut live = cards.cards.lock().await;
-        if live
-            .get(session_id)
-            .is_some_and(|card| card.acc.turn_anchor() == Some(anchor))
-        {
-            live.remove(session_id);
-        }
+        cards
+            .with_map(|live| {
+                if live
+                    .get(session_id)
+                    .is_some_and(|card| card.acc.turn_anchor() == Some(anchor))
+                {
+                    live.remove(session_id);
+                }
+            })
+            .await;
     }
 
     /// Drop an armed projection's phantom session — its card never sent — only
@@ -1072,14 +1069,17 @@ impl Turn {
     /// the session takes this same lock to insert its own card, so it can
     /// never be removed here. Returns whether the armed session was dropped.
     pub(crate) async fn drop_armed_session(cards: &CardsHandle, session_id: &str, chain_id: u64) -> bool {
-        let mut live = cards.cards.lock().await;
-        let is_armed = live
-            .get(session_id)
-            .is_some_and(|card| card.chain_id() == chain_id && card.card_message_id.is_none());
-        if is_armed {
-            live.remove(session_id);
-        }
-        is_armed
+        cards
+            .with_map(|live| {
+                let is_armed = live
+                    .get(session_id)
+                    .is_some_and(|card| card.chain_id() == chain_id && card.card_message_id.is_none());
+                if is_armed {
+                    live.remove(session_id);
+                }
+                is_armed
+            })
+            .await
     }
 
     /// Take an armed projection's successor over — verify, attach and re-point
@@ -1197,150 +1197,155 @@ impl Turn {
         cursor_stage: state::StagedCursorId,
         rendered: &[EndingKey],
     ) -> Option<Option<Box<ChainRecord>>> {
-        let mut live = cards.cards.lock().await;
-        let Some(card) = live.get_mut(session_id) else {
-            // The session is gone entirely: no record to re-point, but the
-            // create landed, so the endings it rendered still get their shown
-            // bits (ADR-0080) — session-scoped, independent of the record.
-            record_landed_rendered(cards, None, session_id, rendered);
-            return None;
-        };
-        if card.chain_id() != chain_id || (require_unattached && card.card_message_id.is_some()) {
-            // A fresh Turn owns the session now: its record is not ours to
-            // re-point, but this body's create DID land, so its endings' shown
-            // bits are still flipped — the successor card showed them — and the
-            // Turn's own accumulator is told, so it cannot re-render them
-            // (ADR-0080).
-            record_landed_rendered(cards, Some(card), session_id, rendered);
-            return None;
-        }
-        if let Some(card_is_live) = card_is_live {
-            card.card_is_live = card_is_live;
-        }
-        // The armed successor's landing reply target (#580/#582): the target
-        // its create actually reached — the durable reply target, or the
-        // recorded card a refused target fell back to — and `None` when every
-        // target was refused and the create landed at the Chat's top level.
-        // Applied unconditionally so the accumulator and the record write
-        // below agree on the rung, and an explicit None CLEARS both: the
-        // landing adopts its rung in ONE write, never a second clear (which a
-        // crash could lose, leaving a refused target persisted).
-        card.acc.set_reply_target(reply_to.map(str::to_string));
-        let (message_id, created_ms, context_directory, reply_to) = (
-            card.acc
-                .cola_message_id()
-                .map(MessageId::new)
-                .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
-            card.acc.turn_anchor().map(|anchor| anchor.created_ms),
-            card.acc.directory().map(str::to_string),
-            card.acc.reply_to_message_id().map(str::to_string),
-        );
-        card.card_message_id = Some(card_message_id.to_string());
-        // The create landed: take its exact staged Rendered Cursor NOW, inside
-        // this critical section (review #569). A confirmation after this lock —
-        // however soon after — would leave the record naming the successor card
-        // while it still carried the predecessor's frontier; a fresh Turn
-        // snapshotting the record in that window seeds the already-delivered
-        // tail onto its own card while the collected successor keeps its body:
-        // the same text twice.
-        let confirmed = card.acc.take_staged_cursor(card_message_id, cursor_stage);
-        // The orphan gap this projection rendered is consumed with the
-        // re-point; one it could NOT place stays owed and rides onto the new
-        // record (spec #561, review #569), so a later read can still deliver
-        // it.
-        // The gap this projection's create carried (spec #561, review #569):
-        // the re-point already carried it onto the new record, and its coverage
-        // now consumes the fact (a body that reached the gap's end) or advances
-        // it past what the successor card shows — so neither the continuation
-        // nor a restart repeats delivered gap content. No coverage at all
-        // leaves the durable fact untouched.
-        // A card with no Turn message to scope a settle decision with cannot
-        // be reaped: attached, but no record — `track_live_card`'s own rule. The
-        // create still DELIVERED, though, so its endings are flipped and the
-        // session's gate told (ADR-0080).
-        let Some(message_id) = message_id else {
-            record_landed_rendered(cards, Some(card), session_id, rendered);
-            return Some(None);
-        };
-        let directory = directory
-            .map(str::to_string)
-            .filter(|directory| !directory.is_empty())
-            .or(context_directory);
-        let previous = match &confirmed {
-            // The confirmed body's cursor rides the re-point in ONE chains
-            // write, so the record is never observable as (successor card,
-            // predecessor cursor) — not even between two chains operations —
-            // and the landing's reply target rides the same write (#582). The
-            // body's completion entries ride it too (ADR-0080), so the
-            // successor's arrival cannot make an entry re-render on a later
-            // card.
-            // A SUPERSEDED stage carries the base's own cursor (a no-op write),
-            // so its delivered endings still ride this one landing write.
-            Some(confirmed) => cards.chains.track_carrying_cursor_landing(
-                session_id,
-                card_message_id,
-                message_id,
-                created_ms,
-                directory.as_deref(),
-                reply_to.as_deref(),
-                &confirmed.cursor,
-                confirmed
-                    .gap
-                    .as_ref()
-                    .map(|coverage| (&coverage.frontier, coverage.complete)),
-                &confirmed.rendered_endings,
-            ),
-            // No staged cursor matched the create's stage (the cap evicted it,
-            // or a raced write consumed it): the body still DELIVERED, so its
-            // keys are written in the SAME one write as the re-point — with the
-            // base cursor as a no-op advance — so a crash cannot leave the mark
-            // apart from the cursor, and the successor's arrival never lets the
-            // entry re-render on a later card (issue #671, ticket #672).
-            _ => {
-                // No staged cursor matched the create's stage (the cap evicted
-                // it, or a raced write consumed it): the body still DELIVERED,
-                // so its endings ride the SAME one write as the re-point — a
-                // crash can never leave the bits apart from the cursor, and the
-                // successor's arrival never lets the entry re-render on a later
-                // card (ADR-0080).
-                let previous = cards.chains.track_landing(
-                    session_id,
-                    card_message_id,
-                    message_id,
-                    created_ms,
-                    directory.as_deref(),
-                    reply_to.as_deref(),
-                    rendered,
-                );
-                // The successor's own accumulator seeded before this landing:
-                // take the delivered keys into its gate too, or its next read
-                // re-plans the entry.
-                for (run, class) in rendered {
-                    card.acc.announce_ending(run, *class);
+        cards
+            .with_map(|live| {
+                let Some(card) = live.get_mut(session_id) else {
+                    // The session is gone entirely: no record to re-point, but the
+                    // create landed, so the endings it rendered still get their shown
+                    // bits (ADR-0080) — session-scoped, independent of the record.
+                    record_landed_rendered(cards, None, session_id, rendered);
+                    return None;
+                };
+                if card.chain_id() != chain_id || (require_unattached && card.card_message_id.is_some()) {
+                    // A fresh Turn owns the session now: its record is not ours to
+                    // re-point, but this body's create DID land, so its endings' shown
+                    // bits are still flipped — the successor card showed them — and the
+                    // Turn's own accumulator is told, so it cannot re-render them
+                    // (ADR-0080).
+                    record_landed_rendered(cards, Some(card), session_id, rendered);
+                    return None;
                 }
-                previous
-            }
-        };
-        // The projection's take-over CONSUMES the write-ahead intent (spec
-        // #561, review #569): the create the mark covered has landed — this
-        // re-point is its confirmation — so no later life may treat it as
-        // ambiguous. `track_carrying_cursor` builds a fresh record without the
-        // mark (a no-op clear); the plain re-point branch must clear it, and
-        // the clear is skipped when there is nothing to clear.
-        cards.chains.clear_projection_intent(session_id, card_message_id);
-        // A re-point within the chain carries the Rendered Cursor (spec #561):
-        // seed the accumulator's empty base with the carried fact, so the
-        // successor's first body does not clear the chain's frontier.
-        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
-            let card = live
-                .get_mut(session_id)
-                .expect("the cards map still holds the session");
-            card.acc.seed_cursor_if_empty(cursor);
-        }
-        match previous {
-            Some(previous) if previous.card_message_id != card_message_id => Some(Some(Box::new(previous))),
-            _ => Some(None),
-        }
+                if let Some(card_is_live) = card_is_live {
+                    card.card_is_live = card_is_live;
+                }
+                // The armed successor's landing reply target (#580/#582): the target
+                // its create actually reached — the durable reply target, or the
+                // recorded card a refused target fell back to — and `None` when every
+                // target was refused and the create landed at the Chat's top level.
+                // Applied unconditionally so the accumulator and the record write
+                // below agree on the rung, and an explicit None CLEARS both: the
+                // landing adopts its rung in ONE write, never a second clear (which a
+                // crash could lose, leaving a refused target persisted).
+                card.acc.set_reply_target(reply_to.map(str::to_string));
+                let (message_id, created_ms, context_directory, reply_to) = (
+                    card.acc
+                        .cola_message_id()
+                        .map(MessageId::new)
+                        .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
+                    card.acc.turn_anchor().map(|anchor| anchor.created_ms),
+                    card.acc.directory().map(str::to_string),
+                    card.acc.reply_to_message_id().map(str::to_string),
+                );
+                card.card_message_id = Some(card_message_id.to_string());
+                // The create landed: take its exact staged Rendered Cursor NOW, inside
+                // this critical section (review #569). A confirmation after this lock —
+                // however soon after — would leave the record naming the successor card
+                // while it still carried the predecessor's frontier; a fresh Turn
+                // snapshotting the record in that window seeds the already-delivered
+                // tail onto its own card while the collected successor keeps its body:
+                // the same text twice.
+                let confirmed = card.acc.take_staged_cursor(card_message_id, cursor_stage);
+                // The orphan gap this projection rendered is consumed with the
+                // re-point; one it could NOT place stays owed and rides onto the new
+                // record (spec #561, review #569), so a later read can still deliver
+                // it.
+                // The gap this projection's create carried (spec #561, review #569):
+                // the re-point already carried it onto the new record, and its coverage
+                // now consumes the fact (a body that reached the gap's end) or advances
+                // it past what the successor card shows — so neither the continuation
+                // nor a restart repeats delivered gap content. No coverage at all
+                // leaves the durable fact untouched.
+                // A card with no Turn message to scope a settle decision with cannot
+                // be reaped: attached, but no record — `track_live_card`'s own rule. The
+                // create still DELIVERED, though, so its endings are flipped and the
+                // session's gate told (ADR-0080).
+                let Some(message_id) = message_id else {
+                    record_landed_rendered(cards, Some(card), session_id, rendered);
+                    return Some(None);
+                };
+                let directory = directory
+                    .map(str::to_string)
+                    .filter(|directory| !directory.is_empty())
+                    .or(context_directory);
+                let previous = match &confirmed {
+                    // The confirmed body's cursor rides the re-point in ONE chains
+                    // write, so the record is never observable as (successor card,
+                    // predecessor cursor) — not even between two chains operations —
+                    // and the landing's reply target rides the same write (#582). The
+                    // body's completion entries ride it too (ADR-0080), so the
+                    // successor's arrival cannot make an entry re-render on a later
+                    // card.
+                    // A SUPERSEDED stage carries the base's own cursor (a no-op write),
+                    // so its delivered endings still ride this one landing write.
+                    Some(confirmed) => cards.chains.track_carrying_cursor_landing(
+                        session_id,
+                        card_message_id,
+                        message_id,
+                        created_ms,
+                        directory.as_deref(),
+                        reply_to.as_deref(),
+                        &confirmed.cursor,
+                        confirmed
+                            .gap
+                            .as_ref()
+                            .map(|coverage| (&coverage.frontier, coverage.complete)),
+                        &confirmed.rendered_endings,
+                    ),
+                    // No staged cursor matched the create's stage (the cap evicted it,
+                    // or a raced write consumed it): the body still DELIVERED, so its
+                    // keys are written in the SAME one write as the re-point — with the
+                    // base cursor as a no-op advance — so a crash cannot leave the mark
+                    // apart from the cursor, and the successor's arrival never lets the
+                    // entry re-render on a later card (issue #671, ticket #672).
+                    _ => {
+                        // No staged cursor matched the create's stage (the cap evicted
+                        // it, or a raced write consumed it): the body still DELIVERED,
+                        // so its endings ride the SAME one write as the re-point — a
+                        // crash can never leave the bits apart from the cursor, and the
+                        // successor's arrival never lets the entry re-render on a later
+                        // card (ADR-0080).
+                        let previous = cards.chains.track_landing(
+                            session_id,
+                            card_message_id,
+                            message_id,
+                            created_ms,
+                            directory.as_deref(),
+                            reply_to.as_deref(),
+                            rendered,
+                        );
+                        // The successor's own accumulator seeded before this landing:
+                        // take the delivered keys into its gate too, or its next read
+                        // re-plans the entry.
+                        for (run, class) in rendered {
+                            card.acc.announce_ending(run, *class);
+                        }
+                        previous
+                    }
+                };
+                // The projection's take-over CONSUMES the write-ahead intent (spec
+                // #561, review #569): the create the mark covered has landed — this
+                // re-point is its confirmation — so no later life may treat it as
+                // ambiguous. `track_carrying_cursor` builds a fresh record without the
+                // mark (a no-op clear); the plain re-point branch must clear it, and
+                // the clear is skipped when there is nothing to clear.
+                cards.chains.clear_projection_intent(session_id, card_message_id);
+                // A re-point within the chain carries the Rendered Cursor (spec #561):
+                // seed the accumulator's empty base with the carried fact, so the
+                // successor's first body does not clear the chain's frontier.
+                if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
+                    let card = live
+                        .get_mut(session_id)
+                        .expect("the cards map still holds the session");
+                    card.acc.seed_cursor_if_empty(cursor);
+                }
+                match previous {
+                    Some(previous) if previous.card_message_id != card_message_id => {
+                        Some(Some(Box::new(previous)))
+                    }
+                    _ => Some(None),
+                }
+            })
+            .await
     }
 
     /// Build a projection successor chain's next slice (spec #561, review
@@ -1353,8 +1358,7 @@ impl Turn {
         session_id: &str,
         chain_id: u64,
     ) -> Option<ProjectedSlice> {
-        let mut live = cards.cards.lock().await;
-        let card = live.get_mut(session_id)?;
+        let mut card = cards.card(session_id).await?;
         if card.chain_id() != chain_id {
             return None;
         }
@@ -1389,8 +1393,7 @@ impl Turn {
         session_id: &str,
         chain_id: u64,
     ) -> Option<ProjectedSlice> {
-        let mut live = cards.cards.lock().await;
-        let card = live.get_mut(session_id)?;
+        let mut card = cards.card(session_id).await?;
         if card.chain_id() != chain_id {
             return None;
         }
@@ -1487,13 +1490,14 @@ mod tests {
             &crate::bridge::test_support::turn_anchor(1_000),
         )
         .await;
-        let chain_id = {
-            let live = cards.cards.lock().await;
-            live.get("ses_test").expect("the armed session").chain_id()
-        };
+        let chain_id = cards
+            .card("ses_test")
+            .await
+            .expect("the armed session")
+            .chain_id();
 
         // Hold the map lock so both tasks queue on it, in spawn order.
-        let held = cards.cards.lock().await;
+        let held = cards.card("ses_test").await.expect("the armed session");
         let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let takeover = {
             let cards = cards.clone();
@@ -1524,7 +1528,7 @@ mod tests {
                 ready.send(()).expect("the test is receiving");
                 let card = state::CardSession::new(state::StreamAccumulator::new("turn"), None);
                 let chain_id = card.chain_id();
-                cards.cards.lock().await.insert("ses_test".to_string(), card);
+                cards.insert("ses_test".to_string(), card).await;
                 chain_id
             })
         };
@@ -1543,8 +1547,7 @@ mod tests {
             replacement_chain_id, chain_id,
             "the replacement really is a different chain"
         );
-        let live = cards.cards.lock().await;
-        let fresh = live.get("ses_test").expect("the replacement session");
+        let fresh = cards.card("ses_test").await.expect("the replacement session");
         assert_eq!(
             fresh.chain_id(),
             replacement_chain_id,
@@ -1554,7 +1557,9 @@ mod tests {
             fresh.card_message_id.is_none(),
             "the takeover never attached its card to a session it does not own"
         );
-        drop(live);
+        // The record assertion reads the chain store, not the map: release the
+        // guard first (the base test's explicit `drop(live)` scope).
+        drop(fresh);
         assert_eq!(
             cards
                 .chains
@@ -1586,10 +1591,11 @@ mod tests {
             &crate::bridge::test_support::turn_anchor(1_000),
         )
         .await;
-        let chain_id = {
-            let live = cards.cards.lock().await;
-            live.get("ses_test").expect("the armed session").chain_id()
-        };
+        let chain_id = cards
+            .card("ses_test")
+            .await
+            .expect("the armed session")
+            .chain_id();
         // The chain the previous life left: the fresh Turn owns it now.
         cards.chains.track(
             "ses_test",
@@ -1602,10 +1608,12 @@ mod tests {
 
         // A fresh Turn replaced the armed session — its own insert, exactly as
         // `Turn::start` performs it.
-        cards.cards.lock().await.insert(
-            "ses_test".to_string(),
-            state::CardSession::new(state::StreamAccumulator::new("turn"), None),
-        );
+        cards
+            .insert(
+                "ses_test".to_string(),
+                state::CardSession::new(state::StreamAccumulator::new("turn"), None),
+            )
+            .await;
 
         assert!(
             matches!(
@@ -1636,8 +1644,7 @@ mod tests {
                 .ending_shown("ses_test", &landed("call_1").0, TaskEndingClass::Evidence),
             "a lost takeover still flips its landed create's endings"
         );
-        let live = cards.cards.lock().await;
-        let fresh = live.get("ses_test").expect("the replacement session");
+        let fresh = cards.card("ses_test").await.expect("the replacement session");
         assert!(
             fresh.card_message_id.is_none(),
             "a replaced session is never attached"
@@ -1657,7 +1664,9 @@ mod tests {
                 .ending_announced(&landed("call_1").0, TaskEndingClass::Evidence),
             "a replaced chain's gate takes the landed create's keys"
         );
-        drop(live);
+        // The record assertion reads the chain store, not the map: release the
+        // guard first (the base test's explicit `drop(live)` scope).
+        drop(fresh);
         assert_eq!(
             cards
                 .chains
@@ -1690,10 +1699,11 @@ mod tests {
             &crate::bridge::test_support::turn_anchor(1_000),
         )
         .await;
-        let chain_id = {
-            let live = cards.cards.lock().await;
-            live.get("ses_test").expect("the armed session").chain_id()
-        };
+        let chain_id = cards
+            .card("ses_test")
+            .await
+            .expect("the armed session")
+            .chain_id();
 
         // The create landed, but no stage matches (id 0 names none): the
         // takeover must still record the delivered keys.
@@ -1723,11 +1733,9 @@ mod tests {
                 .ending_shown("ses_test", &landed("call_1").0, TaskEndingClass::Evidence),
             "a takeover without its stage still flips its endings"
         );
-        let live = cards.cards.lock().await;
+        let card = cards.card("ses_test").await.expect("the taken-over session");
         assert!(
-            live.get("ses_test")
-                .expect("the taken-over session")
-                .acc
+            card.acc
                 .ending_announced(&landed("call_1").0, TaskEndingClass::Evidence),
             "its gate takes the delivered endings"
         );

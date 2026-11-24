@@ -32,13 +32,14 @@ use indexmap::IndexMap;
 use tokio::sync::Mutex;
 
 use crate::bridge::card_handles::CardHandles;
+pub(crate) mod card_map;
 use crate::bridge::core::{CoverTitle, SESSION_INFO_TIMEOUT, SETTLING_CLAIM_TTL, SessionListCache};
 use crate::bridge::message_pins::MessagePins;
 use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::flow::RequestFlow;
 use crate::bridge::request::kind::InteractionKind;
 use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore, WorktreeAdjust};
-use crate::bridge::turn::{CardSession, CollectReason, Turn};
+use crate::bridge::turn::{CollectReason, Turn};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
 
@@ -2211,17 +2212,16 @@ pub(crate) type FileMessageSends =
 /// handle: every card path (flush, split, resolution, cover sync) reaches
 /// Feishu through it rather than through the aggregate.
 ///
-/// **Locks owned:** `cards` (the per-session accumulator + card identity),
-/// `card_handles` (ADR-0038's registry), `cover_titles`, and the private
-/// per-session `write_locks`. Ordering:
+/// **Locks owned:** [`card_map::CardMap`] (per-session accumulator + identity,
+/// through [`Self::card`]), `card_handles`, `cover_titles`, and `write_locks`. Ordering:
 ///
 /// 1. A card write takes the session's [`Self::write_lock`] FIRST and holds it
 ///    across the whole read-send-record sequence (`flush_card`,
 ///    `split_card_chain`, `resolve_blocks`); everything else is taken inside
 ///    that sequence. The `write_locks` map is only the lookup from a session id
 ///    to its lock, held for that step alone.
-/// 2. Inside the sequence, `cards` and `card_handles` are each taken for one
-///    step and released. The resolution path (`resolve_blocks`) also snapshots
+/// 2. Inside the sequence, [`Self::card`] and `card_handles` are each taken for
+///    one step and released. The resolution path (`resolve_blocks`) also snapshots
 ///    the request flow's `sent_cards`, briefly, while it holds `write_lock`: the
 ///    documented order is `write_lock` → `sent_cards` → `card_handles`, with no
 ///    two of `cards`, `sent_cards` and `card_handles` ever held at the same
@@ -2242,7 +2242,7 @@ pub(crate) type FileMessageSends =
 #[derive(Clone)]
 pub(crate) struct CardsHandle {
     /// session_id → the session's one live card (accumulator + card id chain).
-    pub(crate) cards: Arc<Mutex<HashMap<String, CardSession>>>,
+    cards: card_map::CardMap,
     /// The card handles (ADR-0038, rule 2): `request_id → message_id` plus, for
     /// every card that shows a live interaction block, the card JSON as last
     /// rendered.
@@ -2299,7 +2299,7 @@ pub(crate) struct CardsHandle {
 impl CardsHandle {
     #[allow(clippy::too_many_arguments)] // the card handle's wiring list is flat
     pub(crate) fn new(
-        cards: Arc<Mutex<HashMap<String, CardSession>>>,
+        cards: card_map::CardMap,
         card_handles: Arc<Mutex<CardHandles>>,
         cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
         feishu: Arc<dyn feishu::Platform>,

@@ -56,10 +56,7 @@ async fn log_card_rejection(
     to: usize,
 ) {
     let (bytes, components) = card_payload_metrics(card);
-    let fallback = {
-        let live = cards.cards.lock().await;
-        live.get(session_id).map(|card| card.acc.card_fallback())
-    };
+    let fallback = { cards.card(session_id).await.map(|card| card.acc.card_fallback()) };
     tracing::warn!(
         "Card update failed: {error} ({transition}; fallback {fallback:?}; session {session_id}; {bytes} bytes, {components} components, slice {from}..{to})"
     );
@@ -82,8 +79,7 @@ async fn abandon_rejected_payload(
     slice_end: usize,
     expected: SliceFingerprint,
 ) -> bool {
-    let mut live = cards.cards.lock().await;
-    let Some(card) = live.get_mut(session_id) else {
+    let Some(mut card) = cards.card(session_id).await else {
         return false;
     };
     // A streaming text/reasoning part merges into an EXISTING entry, so the
@@ -114,8 +110,7 @@ async fn abandon_rejected_payload(
 /// Return a delivered write's card to the plain renderer (issue #886): the
 /// fenced fallback covers the payload Feishu refused, never the ones after it.
 async fn reset_card_fallback(cards: &CardsHandle, session_id: &str) {
-    let mut live = cards.cards.lock().await;
-    if let Some(card) = live.get_mut(session_id) {
+    if let Some(mut card) = cards.card(session_id).await {
         card.acc.reset_card_fallback();
         card.acc.clear_card_abandonments();
     }
@@ -205,8 +200,7 @@ fn flush_outcome(wrote: bool, refused: bool) -> FlushOutcome {
 /// flush's **terminal slice** (spec #602, ticket #607). A later flush overwrites
 /// it, and `announce_completion` reads it.
 async fn set_ending_write(cards: &CardsHandle, session_id: &str, ending: super::state::EndingWrite) {
-    let mut live = cards.cards.lock().await;
-    if let Some(card) = live.get_mut(session_id) {
+    if let Some(mut card) = cards.card(session_id).await {
         card.acc.set_ending_write(ending);
     }
 }
@@ -240,8 +234,7 @@ async fn advance_sent_signatures(
     card_id: &str,
     sent: &SentSignatures,
 ) {
-    let mut live = cards.cards.lock().await;
-    if let Some(card) = live.get_mut(session_id)
+    if let Some(mut card) = cards.card(session_id).await
         && card.card_message_id.as_deref() == Some(card_id)
     {
         card.last_header_sig = sent.header.clone();
@@ -302,8 +295,7 @@ pub(super) enum SplitPolicy {
 
 /// Advance the turn's [`CardFallback`] after Feishu rejected a card it built.
 async fn advance_card_fallback(cards: &CardsHandle, session_id: &str) -> FallbackAdvance {
-    let mut live = cards.cards.lock().await;
-    let Some(card) = live.get_mut(session_id) else {
+    let Some(mut card) = cards.card(session_id).await else {
         return FallbackAdvance::Stop;
     };
     if card.acc.advance_card_fallback() {
@@ -329,9 +321,8 @@ async fn stage_rendered_cursor(
     gap: Option<&crate::bridge::turn::state::GapCoverage>,
     rendered: Vec<EndingKey>,
 ) -> crate::bridge::turn::state::StagedCursorId {
-    let mut live = cards.cards.lock().await;
-    match live.get_mut(session_id) {
-        Some(card) => {
+    match cards.card(session_id).await {
+        Some(mut card) => {
             let id = card
                 .acc
                 .stage_cursor(card_message_id, cursor.clone(), gap.cloned(), rendered);
@@ -381,17 +372,16 @@ async fn confirm_staged_cursor(
     // Record and, when a session is live, that session's accumulator gate
     // (ADR-0080): the same rule a lost projection takeover follows, and the only
     // thing that stops an already-seeded chain from re-planning the entry.
-    let mut live = cards.cards.lock().await;
-    let Some(card) = live.get_mut(session_id) else {
+    let Some(mut card) = cards.card(session_id).await else {
         record_landed_rendered(cards, None, session_id, rendered);
         return;
     };
     if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
-        record_landed_rendered(cards, Some(card), session_id, rendered);
+        record_landed_rendered(cards, Some(&mut card), session_id, rendered);
         return;
     }
     let Some(confirmed) = card.acc.take_staged_cursor(card_message_id, expected) else {
-        record_landed_rendered(cards, Some(card), session_id, rendered);
+        record_landed_rendered(cards, Some(&mut card), session_id, rendered);
         return;
     };
     // ONE record write (spec #561, review #569): this very body carried the
@@ -452,8 +442,7 @@ async fn note_cursor_write_failure(
             cards
                 .chains
                 .note_owed_rendered(card_message_id, session_id, seq, rendered);
-            let mut live = cards.cards.lock().await;
-            if let Some(session) = live.get_mut(session_id) {
+            if let Some(mut session) = cards.card(session_id).await {
                 session.acc.await_cursor_write(stage, card_message_id, seq);
             }
             return;
@@ -473,8 +462,7 @@ async fn note_cursor_write_failure(
             return;
         }
     }
-    let mut live = cards.cards.lock().await;
-    if let Some(session) = live.get_mut(session_id) {
+    if let Some(mut session) = cards.card(session_id).await {
         session.acc.discard_staged_cursor(stage);
     }
 }
@@ -488,20 +476,21 @@ async fn note_cursor_write_failure(
 /// delivering it (a refusal, or a superseded payload) is dropped; a still-owed
 /// one stays for its own confirmation.
 pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
-    let due: Vec<(String, String, u64, crate::bridge::turn::state::StagedCursorId)> = {
-        let live = cards.cards.lock().await;
-        live.iter()
-            .flat_map(|(session_id, session)| {
-                session
-                    .acc
-                    .staged_cursor_due()
-                    .into_iter()
-                    .map(|(card_message_id, seq, expected)| {
-                        (session_id.clone(), card_message_id, seq, expected)
-                    })
-            })
-            .collect()
-    };
+    let due: Vec<(String, String, u64, crate::bridge::turn::state::StagedCursorId)> = cards
+        .with_map(|live| {
+            live.iter()
+                .flat_map(|(session_id, session)| {
+                    session
+                        .acc
+                        .staged_cursor_due()
+                        .into_iter()
+                        .map(|(card_message_id, seq, expected)| {
+                            (session_id.clone(), card_message_id, seq, expected)
+                        })
+                })
+                .collect()
+        })
+        .await;
     for (session_id, card_message_id, seq, expected) in due {
         if cards.feishu.card_write_delivered(&card_message_id, seq) {
             // Only the stage whose delivery was just verified is confirmed: a
@@ -536,14 +525,18 @@ pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
             // none interleaves after). A chain that SEEDED before the delivery
             // holds the older, empty announce set, so the gate insert is what
             // stops its next read re-planning the entry.
-            let mut live = cards.cards.lock().await;
-            if let Some((session_id, shown)) = cards.chains.confirm_owed_rendered(&card_message_id, owed.seq)
-                && let Some(card) = live.get_mut(&session_id)
-            {
-                for (run, class) in shown {
-                    card.acc.announce_ending(&run, class);
-                }
-            }
+            cards
+                .with_map(|live| {
+                    if let Some((session_id, shown)) =
+                        cards.chains.confirm_owed_rendered(&card_message_id, owed.seq)
+                        && let Some(card) = live.get_mut(&session_id)
+                    {
+                        for (run, class) in shown {
+                            card.acc.announce_ending(&run, class);
+                        }
+                    }
+                })
+                .await;
         } else if cards
             .feishu
             .settled_card_write_delivered(&card_message_id)
@@ -561,8 +554,7 @@ async fn discard_staged_cursor(
     session_id: &str,
     expected: crate::bridge::turn::state::StagedCursorId,
 ) {
-    let mut live = cards.cards.lock().await;
-    if let Some(session) = live.get_mut(session_id) {
+    if let Some(mut session) = cards.card(session_id).await {
         session.acc.discard_staged_cursor(expected);
     }
 }
@@ -596,8 +588,7 @@ pub(super) async fn flush_card_locked(
     // between a finalize and its continuation, must be picked up where it
     // stopped, never restarted by overwriting the finalized slice.
     let (pending_split, mut card_is_live, suspended, is_read) = {
-        let cards = cards.cards.lock().await;
-        let Some(card) = cards.get(session_id) else {
+        let Some(card) = cards.card(session_id).await else {
             return FlushOutcome::Unwritten;
         };
         (
@@ -631,8 +622,7 @@ pub(super) async fn flush_card_locked(
         // tail that may have caused the refusal can have changed too. Retry
         // from a clean fallback instead of refusing every later write for the
         // rest of the Turn.
-        let mut cards = cards.cards.lock().await;
-        if let Some(card) = cards.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             tracing::info!("Card fallback recovered after a suspended payload: {session_id}");
             card.acc.reset_card_fallback();
         }
@@ -666,16 +656,17 @@ pub(super) async fn flush_card_locked(
         // flush after the id lands serve it — including a Supplement split
         // requested in that window.
         let card_id = {
-            let cards = cards.cards.lock().await;
-            cards.get(session_id).and_then(|c| c.card_message_id.clone())
+            cards
+                .card(session_id)
+                .await
+                .and_then(|c| c.card_message_id.clone())
         };
         let Some(card_id) = card_id else {
             return FlushOutcome::Unwritten;
         };
 
         let (built, rendered, slice_from, slice_to, sent_sigs) = {
-            let mut cards = cards.cards.lock().await;
-            let Some(card) = cards.get_mut(session_id) else {
+            let Some(mut card) = cards.card(session_id).await else {
                 return FlushOutcome::Unwritten;
             };
             // `build_card_with_info` advances `render_from` when the built
@@ -908,8 +899,7 @@ pub(super) async fn flush_card_locked(
                 // anyway: finalize the slice here and HAND IT OFF — the
                 // continuation carries only the receipts queued below and the
                 // content that arrives after them, exactly like a size split.
-                let mut cards = cards.cards.lock().await;
-                let Some(card) = cards.get_mut(session_id) else {
+                let Some(mut card) = cards.card(session_id).await else {
                     return FlushOutcome::Unwritten;
                 };
                 // A cause that continues an ENDED card (a Wake) advances the
@@ -939,8 +929,7 @@ pub(super) async fn flush_card_locked(
             // send must not leave the next flush thinking this card still
             // grows — it would overwrite the finalized slice.
             {
-                let mut cards = cards.cards.lock().await;
-                if let Some(card) = cards.get_mut(session_id) {
+                if let Some(mut card) = cards.card(session_id).await {
                     card.card_is_live = false;
                     if continues_an_ended_card {
                         // The continuation card is a fresh live card: the
@@ -1027,8 +1016,7 @@ pub(super) async fn flush_card_locked(
                                 // and re-send it fenced on the same card, instead of
                                 // losing it to a rejection that would repeat verbatim.
                                 {
-                                    let mut live = cards.cards.lock().await;
-                                    if let Some(card) = live.get_mut(session_id)
+                                    if let Some(mut card) = cards.card(session_id).await
                                         && card.acc.restore_render_boundary(slice_from, slice_to)
                                     {
                                         card.card_is_live = true;
@@ -1087,8 +1075,7 @@ pub(super) async fn flush_card_locked(
                             // boundary the finalized build advanced: the next
                             // flush must re-render what no card ever received.
                             {
-                                let mut live = cards.cards.lock().await;
-                                if let Some(card) = live.get_mut(session_id) {
+                                if let Some(mut card) = cards.card(session_id).await {
                                     card.acc.restore_render_boundary(slice_from, finalized.end);
                                 }
                             }
@@ -1184,15 +1171,15 @@ pub(super) async fn flush_card_locked(
         // was sent to. Only when neither is known does the chain stop: nothing
         // can reach a card that answers nowhere.
         let (reply_to, fallback_chat) = {
-            let live = cards.cards.lock().await;
-            let card = live.get(session_id);
+            let card = cards.card(session_id).await;
             match pending_split.last() {
                 // A supplement split anchors its chain at the NEWEST
                 // supplement: one continuation serves the whole queued batch.
                 Some(split) => (Some(split.reply_to.clone()), None),
                 None => (
-                    card.and_then(|c| c.acc.reply_to_message_id().map(str::to_string)),
-                    card.and_then(|c| c.fallback_chat.clone()),
+                    card.as_ref()
+                        .and_then(|card| card.acc.reply_to_message_id().map(str::to_string)),
+                    card.as_ref().and_then(|card| card.fallback_chat.clone()),
                 ),
             }
         };
@@ -1235,8 +1222,7 @@ pub(super) async fn flush_card_locked(
                 // with (issue #671, ticket #672).
                 wrote = true;
                 {
-                    let mut cards = cards.cards.lock().await;
-                    if let Some(card) = cards.get_mut(session_id) {
+                    if let Some(mut card) = cards.card(session_id).await {
                         // This continuation create is the flush's terminal
                         // carrier only when no further slice is owed (spec #602
                         // review, finding B): a create that is itself over the
@@ -1344,12 +1330,10 @@ pub(super) async fn flush_card_locked(
                     // boundary moved elsewhere (defensive; the card-write lock
                     // serializes flushes) from being rewound. The retry
                     // overwrites the Failed mark on its next send.
-                    let mut live = cards.cards.lock().await;
-                    if let Some(card) = live.get_mut(session_id) {
+                    if let Some(mut card) = cards.card(session_id).await {
                         card.acc.set_ending_write(super::state::EndingWrite::Failed);
                         card.acc.restore_render_boundary(slice_from, slice_to);
                     }
-                    drop(live);
                     // This failed create's stage can never confirm — the fenced
                     // rebuild stages its own — so drop it (issue #671, ticket
                     // #672).
@@ -1368,15 +1352,13 @@ pub(super) async fn flush_card_locked(
                 // A create is never outbox-retried (ADR-0067), so a failed one
                 // proves no write landed here: the slice stays owed to a later
                 // flush, never accepted (review, PR #595).
-                let mut live = cards.cards.lock().await;
-                if let Some(card) = live.get_mut(session_id) {
+                if let Some(mut card) = cards.card(session_id).await {
                     // The continuation create reached no card: the terminal
                     // slice never landed, so the notice must be suppressed
                     // (#607).
                     card.acc.set_ending_write(super::state::EndingWrite::Failed);
                     card.acc.restore_render_boundary(slice_from, slice_to);
                 }
-                drop(live);
                 return flush_outcome(wrote, refused);
             }
         }
@@ -1389,8 +1371,7 @@ pub(super) async fn flush_card_locked(
 /// the queue, so a flush retried after a failed continuation send re-applies
 /// nothing — and a supplement queued after that attempt still gets its line.
 async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
-    let mut cards = cards.cards.lock().await;
-    let Some(card) = cards.get_mut(session_id) else {
+    let Some(mut card) = cards.card(session_id).await else {
         return;
     };
     for i in 0..card.pending_split.len() {
@@ -1430,10 +1411,8 @@ async fn push_queued_receipts(cards: &CardsHandle, session_id: &str) {
 /// staged after a write is never drained by it.
 async fn staged_watermark_id(cards: &CardsHandle, session_id: &str) -> Option<u64> {
     cards
-        .cards
-        .lock()
+        .card(session_id)
         .await
-        .get(session_id)
         .and_then(|card| card.acc.pending_watermark_id())
 }
 
@@ -1473,8 +1452,7 @@ async fn drain_staged_watermark(
     chain_id: Option<u64>,
     expected: Option<u64>,
 ) {
-    let mut live = cards.cards.lock().await;
-    let Some(card) = live.get_mut(session_id) else {
+    let Some(mut card) = cards.card(session_id).await else {
         return;
     };
     if chain_id.is_some_and(|chain_id| card.chain_id() != chain_id) {
@@ -1576,9 +1554,8 @@ mod tests {
         acc.push_text(text);
         acc.set_reply_target(Some("msg_1".into()));
         app.cards
-            .lock()
-            .await
-            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+            .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
+            .await;
         app.inflight.lock().await.insert("ses_test".to_string());
     }
 
@@ -1626,9 +1603,9 @@ mod tests {
             retry.starts_with("```") && retry.contains("<number_tag>"),
             "the retry fences the model markdown: {retry}"
         );
-        let cards = app.cards.lock().await;
+        let card = app.cards.card("ses_test").await.unwrap();
         assert_eq!(
-            cards.get("ses_test").unwrap().acc.card_fallback(),
+            card.acc.card_fallback(),
             CardFallback::None,
             "a delivered fenced write resets the fallback: it covered ONE payload, not the turn (#886)"
         );
@@ -1651,9 +1628,8 @@ mod tests {
         acc.push_text(&slice(1));
         acc.set_reply_target(Some("msg_1".into()));
         app.cards
-            .lock()
-            .await
-            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+            .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
+            .await;
         app.inflight.lock().await.insert("ses_test".to_string());
         platform
             .fail_update_card_content_count
@@ -1707,9 +1683,8 @@ mod tests {
         acc.push_text(&slice(1));
         acc.set_reply_target(Some("msg_1".into()));
         app.cards
-            .lock()
-            .await
-            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+            .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
+            .await;
         app.inflight.lock().await.insert("ses_test".to_string());
         platform
             .fail_update_card_content_count
@@ -1751,9 +1726,8 @@ mod tests {
         acc.set_reply_target(Some("msg_1".into()));
         acc.set_cola_message_id("msg_1");
         app.cards
-            .lock()
-            .await
-            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+            .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
+            .await;
         app.inflight.lock().await.insert("ses_test".to_string());
         app.cards_handle().chains.track(
             "ses_test",
@@ -1799,10 +1773,9 @@ mod tests {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         // The tracked card is already finalized, so this flush owes a continuation.
         {
-            let mut cards = app.cards.lock().await;
-            let session = cards.get_mut("ses_test").unwrap();
-            session.card_is_live = false;
-            session.acc.set_reply_target(Some("msg_1".into()));
+            let mut card = app.cards.card("ses_test").await.unwrap();
+            card.card_is_live = false;
+            card.acc.set_reply_target(Some("msg_1".into()));
         }
         platform
             .fail_reply_card_content_count
@@ -1822,13 +1795,7 @@ mod tests {
             cards[1]
         );
         assert_eq!(
-            app.cards
-                .lock()
-                .await
-                .get("ses_test")
-                .unwrap()
-                .acc
-                .card_fallback(),
+            app.cards.card("ses_test").await.unwrap().acc.card_fallback(),
             CardFallback::None,
             "the delivered create resets the fallback for the new card (#886)"
         );
@@ -1841,10 +1808,9 @@ mod tests {
     async fn a_second_rejection_of_the_continuation_send_continues_on_the_next_slice() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         {
-            let mut cards = app.cards.lock().await;
-            let session = cards.get_mut("ses_test").unwrap();
-            session.card_is_live = false;
-            session.acc.set_reply_target(Some("msg_1".into()));
+            let mut card = app.cards.card("ses_test").await.unwrap();
+            card.card_is_live = false;
+            card.acc.set_reply_target(Some("msg_1".into()));
         }
         platform
             .fail_reply_card_content_count
@@ -1887,8 +1853,8 @@ mod tests {
     async fn a_refused_terminal_ending_continues_on_a_new_card() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         {
-            let mut cards = app.cards.lock().await;
-            let acc = &mut cards.get_mut("ses_test").unwrap().acc;
+            let mut card = app.cards.card("ses_test").await.unwrap();
+            let acc = &mut card.acc;
             acc.set_card_state(CardState::Done);
             // The Turn's own message scopes the durable record a continuation
             // re-points (`track_continuation_card`).
@@ -1927,8 +1893,7 @@ mod tests {
             app.cards_handle().chains.get("ses_test").is_some(),
             "the ending's record follows the continuation"
         );
-        let cards = app.cards.lock().await;
-        let card = cards.get("ses_test").unwrap();
+        let card = app.cards.card("ses_test").await.unwrap();
         assert_eq!(
             card.card_message_id.as_deref(),
             Some("msg_reply"),
@@ -1973,8 +1938,7 @@ mod tests {
             "the continuation names the dropped content: {continuation}"
         );
         {
-            let cards = app.cards.lock().await;
-            let card = cards.get("ses_test").unwrap();
+            let card = app.cards.card("ses_test").await.unwrap();
             assert_eq!(
                 card.card_message_id.as_deref(),
                 Some("msg_reply"),
@@ -2017,9 +1981,8 @@ mod tests {
             acc.set_card_state(CardState::Streaming);
             acc.set_reply_target(Some("msg_1".into()));
             app.cards
-                .lock()
-                .await
-                .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+                .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
+                .await;
         }
         platform
             .fail_update_card_content_count
@@ -2053,12 +2016,8 @@ mod tests {
     async fn an_abandoned_slice_does_not_confirm_its_cursor() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         {
-            let mut cards = app.cards.lock().await;
-            cards
-                .get_mut("ses_test")
-                .unwrap()
-                .acc
-                .set_cola_message_id("msg_1");
+            let mut card = app.cards.card("ses_test").await.unwrap();
+            card.acc.set_cola_message_id("msg_1");
         }
         platform
             .fail_update_card_content_count
@@ -2094,19 +2053,16 @@ mod tests {
             acc.push_text_at(Some(1_000), "回答");
             acc.set_reply_target(Some("msg_1".into()));
             app.cards
-                .lock()
-                .await
-                .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+                .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
+                .await;
         }
         let cards = app.cards_handle();
         let built = {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").unwrap();
+            let mut card = cards.card("ses_test").await.unwrap();
             card.acc.build_card_with_info()
         };
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").unwrap();
+            let mut card = cards.card("ses_test").await.unwrap();
             card.acc.push_text_at(Some(1_000), " 新到的内容。");
             assert_eq!(
                 card.acc.timeline_len(),
@@ -2117,8 +2073,7 @@ mod tests {
 
         let skipped = super::abandon_rejected_payload(&cards, "ses_test", 0, built.end, built.slice).await;
         assert!(!skipped, "content that arrived in flight is never dropped unseen");
-        let live = cards.cards.lock().await;
-        let card = live.get("ses_test").unwrap();
+        let card = cards.card("ses_test").await.unwrap();
         assert_eq!(
             card.acc.render_from(),
             0,
@@ -2246,8 +2201,7 @@ mod tests {
 
         // A read stages the Wake Watermark while the write is in flight.
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").expect("the seeded card");
+            let mut card = cards.card("ses_test").await.expect("the seeded card");
             assert!(card.acc.announce_wake("wake_1", 1_000));
         }
         let staged = staged_watermark_id(&cards, "ses_test")
@@ -2294,8 +2248,7 @@ mod tests {
         Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
 
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").expect("the seeded card");
+            let mut card = cards.card("ses_test").await.expect("the seeded card");
             assert!(card.acc.announce_wake("wake_1", 1_000));
         }
         let delivered = staged_watermark_id(&cards, "ses_test")
@@ -2303,8 +2256,7 @@ mod tests {
             .expect("a staged watermark");
         // A newer Wake stages while the delivered write's drain has not run.
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").expect("the seeded card");
+            let mut card = cards.card("ses_test").await.expect("the seeded card");
             assert!(card.acc.announce_wake("wake_2", 2_000));
         }
 
@@ -2474,8 +2426,7 @@ mod tests {
 
         // The body renders a synthetic retirement, so it claims the entry's key.
         let built = {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").expect("the live card");
+            let mut card = cards.card("ses_test").await.expect("the live card");
             card.acc.push_ledger_entry_at(
                 None,
                 TaskCompletionEntry {
@@ -2554,11 +2505,9 @@ mod tests {
         );
         // The live chain's gate takes the delivered endings too, so a chain that
         // SEEDED before this delivery was observed cannot re-plan the entry.
-        let live = cards.cards.lock().await;
+        let card = cards.card("ses_test").await.expect("the live card");
         assert!(
-            live.get("ses_test")
-                .expect("the live card")
-                .acc
+            card.acc
                 .ending_announced(&run("call_1"), TaskEndingClass::Evidence),
             "the delivered endings reach the live accumulator's gate"
         );
@@ -2579,8 +2528,7 @@ mod tests {
         // The delivered body's stage, on the chain the confirmation will find
         // replaced.
         let stage = {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").expect("the live card");
+            let mut card = cards.card("ses_test").await.expect("the live card");
             let id = card.acc.stage_cursor(
                 Some("om_live"),
                 Default::default(),
@@ -2598,7 +2546,7 @@ mod tests {
         fresh.set_card_state(CardState::Streaming);
         let replacement = CardSession::new(fresh, Some("om_new".into()));
         let replacement_chain = replacement.chain_id();
-        cards.cards.lock().await.insert("ses_test".into(), replacement);
+        cards.insert("ses_test", replacement).await;
 
         // The confirmation cannot take the replaced stage, but the body
         // DELIVERED: the bit lands and the replacement's gate is told.
@@ -2621,8 +2569,7 @@ mod tests {
                 .ending_shown("ses_test", &run("call_1"), TaskEndingClass::Evidence),
             "a replaced chain's delivered endings are still shown"
         );
-        let live = cards.cards.lock().await;
-        let fresh = live.get("ses_test").expect("the replacement session");
+        let fresh = cards.card("ses_test").await.expect("the replacement session");
         assert_eq!(fresh.chain_id(), replacement_chain);
         assert!(
             fresh
@@ -2649,8 +2596,7 @@ mod tests {
             .chains
             .record_ending("ses_test", &run("call_1"), owed_ending(TaskEndingClass::Evidence));
         let built = {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").expect("the live card");
+            let mut card = cards.card("ses_test").await.expect("the live card");
             card.acc.push_ledger_entry_at(
                 None,
                 TaskCompletionEntry {
@@ -2701,8 +2647,11 @@ mod tests {
         // and seeds an empty durable-mark set, all before the payload delivers.
         Turn::install_fresh_session(&cards, "ses_test", StreamAccumulator::new("回合")).await;
         let replacement_chain = {
-            let live = cards.cards.lock().await;
-            live.get("ses_test").expect("the fresh session").chain_id()
+            cards
+                .card("ses_test")
+                .await
+                .expect("the fresh session")
+                .chain_id()
         };
 
         // Delivery arrives: the reconcile records the mark AND tells the chain
@@ -2729,8 +2678,7 @@ mod tests {
                 .ending_shown("ses_test", &run("call_1"), TaskEndingClass::Evidence),
             "the delivered ending's bit is flipped"
         );
-        let live = cards.cards.lock().await;
-        let fresh = live.get("ses_test").expect("the fresh session");
+        let fresh = cards.card("ses_test").await.expect("the fresh session");
         assert_eq!(fresh.chain_id(), replacement_chain);
         assert!(
             fresh
@@ -2755,8 +2703,7 @@ mod tests {
             .chains
             .record_ending("ses_test", &run("call_1"), owed_ending(TaskEndingClass::Evidence));
         let built = {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut("ses_test").expect("the live card");
+            let mut card = cards.card("ses_test").await.expect("the live card");
             card.acc.push_ledger_entry_at(
                 None,
                 TaskCompletionEntry {
@@ -2834,7 +2781,7 @@ mod tests {
         // cannot be attempted, so the terminal tail never lands.
         let mut session = CardSession::new(acc, Some("om_live".into()));
         session.fallback_chat = None;
-        app.cards.lock().await.insert("ses_test".into(), session);
+        app.cards.insert("ses_test", session).await;
         app.inflight.lock().await.insert("ses_test".to_string());
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
@@ -2846,7 +2793,7 @@ mod tests {
         );
         // ...but the terminal tail never landed, so the ending write must not
         // read Delivered.
-        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write();
+        let ending = app.cards.card("ses_test").await.unwrap().acc.ending_write();
         assert_eq!(
             ending,
             EndingWrite::Failed,
@@ -2867,14 +2814,13 @@ mod tests {
         acc.push_text(&"很长的回答。".repeat(12000));
         acc.set_reply_target(Some("msg_1".into()));
         app.cards
-            .lock()
-            .await
-            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+            .insert("ses_test", CardSession::new(acc, Some("om_live".into())))
+            .await;
         app.inflight.lock().await.insert("ses_test".to_string());
 
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
 
-        let ending = app.cards.lock().await.get("ses_test").unwrap().acc.ending_write();
+        let ending = app.cards.card("ses_test").await.unwrap().acc.ending_write();
         assert_eq!(
             ending,
             EndingWrite::Failed,

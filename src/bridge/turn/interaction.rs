@@ -25,21 +25,16 @@ impl Turn {
     /// already-surfaced probe, ADR-0038).
     pub(crate) async fn has_interaction(cards: &CardsHandle, request_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .with_map(|live| live.values().any(|c| c.acc.interaction(request_id).is_some()))
             .await
-            .values()
-            .any(|c| c.acc.interaction(request_id).is_some())
     }
 
     /// Whether `session_id`'s card carries a block (live or tombstone) for
     /// `request_id` — the re-host's "nothing to move" probe (ADR-0038, rule 1).
     pub(crate) async fn has_interaction_in(cards: &CardsHandle, session_id: &str, request_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|c| c.acc.interaction(request_id).is_some())
     }
 
@@ -52,12 +47,9 @@ impl Turn {
         session_id: &str,
         request_id: &str,
     ) -> Option<i64> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .and_then(|card| card.acc.interaction(request_id))
+        let card = cards.card(session_id).await?;
+        card.acc
+            .interaction(request_id)
             .and_then(|block| block.asked_at())
     }
 
@@ -65,8 +57,7 @@ impl Turn {
     /// `None` when no cola turn registered one — an external turn, or a request
     /// pending across a restart.
     pub(crate) async fn pin_source(cards: &CardsHandle, session_id: &str) -> Option<TurnPinSource> {
-        let live = cards.cards.lock().await;
-        let card = live.get(session_id)?;
+        let card = cards.card(session_id).await?;
         let generation = card.acc.turn_generation()?;
         let requester_open_id = card.acc.requester_open_id().map(str::to_string)?;
         if requester_open_id.is_empty() {
@@ -140,8 +131,8 @@ impl Turn {
                 .map(|_| crate::bridge::request::companion::patterns_target_digest(p)),
             asked_at,
         });
-        match cards.cards.lock().await.get_mut(session_id) {
-            Some(card) => card.acc.add_interaction(block),
+        match cards.card(session_id).await {
+            Some(mut card) => card.acc.add_interaction(block),
             None => false,
         }
     }
@@ -188,8 +179,8 @@ impl Turn {
             drafts: paint.drafts.clone(),
             asked_at,
         });
-        match cards.cards.lock().await.get_mut(session_id) {
-            Some(card) => card.acc.add_interaction(block),
+        match cards.card(session_id).await {
+            Some(mut card) => card.acc.add_interaction(block),
             None => false,
         }
     }
@@ -203,8 +194,8 @@ impl Turn {
         request_id: &str,
         paint: &crate::bridge::question::QuestionPaint,
     ) -> bool {
-        match cards.cards.lock().await.get_mut(session_id) {
-            Some(card) => card.acc.update_question_state(request_id, paint),
+        match cards.card(session_id).await {
+            Some(mut card) => card.acc.update_question_state(request_id, paint),
             None => false,
         }
     }
@@ -255,18 +246,21 @@ impl Turn {
         cola_claimed: &HashSet<String>,
     ) -> Vec<(String, String)> {
         let own = move |block: &state::InteractionBlock| state::block_of_kind(kind, block);
-        let live = cards.cards.lock().await;
-        let mut sessions = Vec::new();
-        for card in live.values() {
-            sessions.extend(state::vanished_block_sessions(
-                &card.acc,
-                pending,
-                failed_dirs,
-                cola_claimed,
-                own,
-            ));
-        }
-        sessions
+        cards
+            .with_map(|live| {
+                let mut sessions = Vec::new();
+                for card in live.values() {
+                    sessions.extend(state::vanished_block_sessions(
+                        &card.acc,
+                        pending,
+                        failed_dirs,
+                        cola_claimed,
+                        own,
+                    ));
+                }
+                sessions
+            })
+            .await
     }
 
     /// The shared sweep body: resolve every live block `own` accepts whose
@@ -281,23 +275,32 @@ impl Turn {
         dead: &HashSet<String>,
         own: impl Fn(&state::InteractionBlock) -> bool,
     ) -> Vec<String> {
-        let mut live = cards.cards.lock().await;
-        let mut affected = Vec::new();
-        for (session_id, card) in live.iter_mut() {
-            let line = |block: &state::InteractionBlock| {
-                crate::bridge::request::delivery::vanished_receipt(
-                    block.session_id(),
-                    &block.receipt_target(),
-                    dead,
-                )
-            };
-            if state::resolve_vanished_blocks(&mut card.acc, pending, failed_dirs, cola_claimed, &own, line)
-                > 0
-            {
-                affected.push(session_id.clone());
-            }
-        }
-        affected
+        cards
+            .with_map(|live| {
+                let mut affected = Vec::new();
+                for (session_id, card) in live.iter_mut() {
+                    let line = |block: &state::InteractionBlock| {
+                        crate::bridge::request::delivery::vanished_receipt(
+                            block.session_id(),
+                            &block.receipt_target(),
+                            dead,
+                        )
+                    };
+                    if state::resolve_vanished_blocks(
+                        &mut card.acc,
+                        pending,
+                        failed_dirs,
+                        cola_claimed,
+                        &own,
+                        line,
+                    ) > 0
+                    {
+                        affected.push(session_id.clone());
+                    }
+                }
+                affected
+            })
+            .await
     }
 
     /// Reserve the timeline key `request_id`'s Interaction Receipt will take,
@@ -339,11 +342,9 @@ impl Turn {
             return None;
         };
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get_mut(session_id)
-            .and_then(|card| reserve(&mut card.acc))
+            .and_then(|mut card| reserve(&mut card.acc))
     }
 
     /// Drop a click's reservation for `request_id` without writing its receipt
@@ -360,7 +361,7 @@ impl Turn {
         let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
             return;
         };
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.forget_reservation(request_id, token);
         }
     }
@@ -379,7 +380,7 @@ impl Turn {
         let Ok(_guard) = tokio::time::timeout(RESERVATION_LOCK_BUDGET, write_lock.lock()).await else {
             return;
         };
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             for request_id in request_ids {
                 card.acc.consume_reservation(request_id);
             }
@@ -399,8 +400,8 @@ impl Turn {
         residue: &InlineResidue<'_>,
         reuse_reservation: bool,
     ) -> Option<(String, &'static str)> {
-        let mut live = cards.cards.lock().await;
-        let acc = &mut live.get_mut(session_id)?.acc;
+        let mut card = cards.card(session_id).await?;
+        let acc = &mut card.acc;
         let mut resolved_here = false;
         // The latest ask among the blocks a mode change resolves: its receipt
         // sits after every one of them, so content written after this click is
@@ -482,8 +483,7 @@ impl Turn {
     /// Only the header: a surgical edit re-renders a block and the header, not
     /// the footer's context segment, so that half's cache stays the flush's.
     pub(crate) async fn mark_header_shown(cards: &CardsHandle, session_id: &str, card_id: &str) {
-        let mut live = cards.cards.lock().await;
-        if let Some(card) = live.get_mut(session_id)
+        if let Some(mut card) = cards.card(session_id).await
             && card.card_message_id.as_deref() == Some(card_id)
         {
             card.last_header_sig = card.acc.header_sig();
@@ -496,10 +496,8 @@ impl Turn {
     /// card needs a split or no accumulator exists.
     pub(crate) async fn ack_card(cards: &CardsHandle, session_id: &str) -> Option<serde_json::Value> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get_mut(session_id)
             .map(|card| {
                 let mut probe = card.acc.clone();
                 probe.build_card_with_split()

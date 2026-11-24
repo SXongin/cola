@@ -63,7 +63,7 @@
 //!   (the yielded write-readiness), `acc.turn_anchor`, `card_message_id` and
 //!   `chain_id()`.
 
-use tokio::sync::{MappedMutexGuard, MutexGuard};
+use tokio::sync::MappedMutexGuard;
 
 use crate::backend::{TurnAnchor, TurnDiffStats};
 use crate::bridge::handles::{CardsHandle, WaitsHandle};
@@ -175,8 +175,7 @@ impl CardOwnership {
         } else {
             Claim::None
         };
-        let live = cards.cards.lock().await;
-        let Some(card) = live.get(session_id) else {
+        let Some(card) = cards.card(session_id).await else {
             return Self {
                 claim,
                 card_class: CardClass::Absent,
@@ -188,7 +187,7 @@ impl CardOwnership {
         };
         Self {
             claim,
-            card_class: classify(card),
+            card_class: classify(&card),
             card_message_id: card.card_message_id.clone(),
             chain_card: card.is_chain_card(),
             turn_anchor: card.acc.turn_anchor().cloned(),
@@ -331,8 +330,7 @@ impl CardOwnership {
         cards: &'a CardsHandle,
         session_id: &str,
     ) -> Option<MappedMutexGuard<'a, CardSession>> {
-        let live = cards.cards.lock().await;
-        let card = MutexGuard::try_map(live, |map| map.get_mut(session_id)).ok()?;
+        let card = cards.card(session_id).await?;
         admits_ledger_refresh(&card).then_some(card)
     }
 }
@@ -417,9 +415,8 @@ impl Ticket {
         // this is what tells "my own flush split the card onto a continuation"
         // (same chain) from "a new Turn replaced it" (new chain).
         let chain = {
-            let mut live = cards.cards.lock().await;
-            match live.get_mut(session_id) {
-                Some(card) if self.matches(card.acc.turn_anchor(), Some(card.chain_id())) => {
+            match cards.card(session_id).await {
+                Some(mut card) if self.matches(card.acc.turn_anchor(), Some(card.chain_id())) => {
                     card.acc.set_turn_diff_stats(index.unwrap_or_default());
                     card.acc.apply_ending(disposition);
                     card.chain_id()
@@ -436,8 +433,7 @@ impl Ticket {
         // "newer Turn replaced the card", that would suppress the notice). A new
         // Turn's fresh chain means the ending's card is gone: stay silent rather
         // than announce over the replacement.
-        let live = cards.cards.lock().await;
-        match live.get(session_id) {
+        match cards.card(session_id).await {
             Some(card) if card.chain_id() == chain => card.card_message_id.clone(),
             _ => None,
         }
@@ -813,15 +809,18 @@ mod tests {
         );
 
         // A queued split the chain has not served: the handoff is owed.
-        cards.cards.lock().await.get_mut(SID).unwrap().pending_split.push(
-            crate::bridge::turn::state::PendingSplit {
+        cards
+            .card(SID)
+            .await
+            .unwrap()
+            .pending_split
+            .push(crate::bridge::turn::state::PendingSplit {
                 reply_to: "om_user".into(),
                 kind: SplitKind::Supplement,
                 receipt_pushed: false,
                 line: None,
                 handover: false,
-            },
-        );
+            });
         let owed = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(
             owed.card_class(),
@@ -837,7 +836,7 @@ mod tests {
         );
 
         // A card a split already finalized is no longer the live one.
-        cards.cards.lock().await.get_mut(SID).unwrap().card_is_live = false;
+        cards.card(SID).await.unwrap().card_is_live = false;
         let finalized = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(
             finalized.card_class(),
@@ -874,18 +873,35 @@ mod tests {
         let mut card = CardOwnership::admit_ledger_write(cards, SID)
             .await
             .expect("the open yielded card admits its in-place writes");
+        // The admission hands the card back still under the card map's lock:
+        // a second per-session acquisition cannot proceed while it is held, and
+        // resolves once it drops. (A `try_lock` probe would need a test-only
+        // re-export of the raw map, which is exactly what this ticket removes.)
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
+        let probe_cards = cards.clone();
+        let probe = tokio::spawn(async move {
+            started_tx.send(()).expect("the test is waiting");
+            let guard = probe_cards.card(SID).await;
+            assert!(guard.is_some(), "the seeded card stays in the map");
+            acquired_tx.send(()).expect("the test is waiting");
+        });
+        started_rx.await.expect("the map probe starts");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
         assert!(
-            cards.cards.try_lock().is_err(),
+            !probe.is_finished(),
             "the admitted card is handed back still under the card map's lock"
         );
         card.card_is_live = false;
         drop(card);
+        acquired_rx
+            .await
+            .expect("releasing the admitted guard releases the card map");
+        probe.await.expect("the map probe task");
         assert!(
-            cards.cards.try_lock().is_ok(),
-            "releasing the admitted guard releases the card map"
-        );
-        assert!(
-            !cards.cards.lock().await.get(SID).unwrap().card_is_live,
+            !cards.card(SID).await.unwrap().card_is_live,
             "the write through the admitted card landed"
         );
 
@@ -905,19 +921,22 @@ mod tests {
         // A queued split closes the yielded card: the handoff is owed.
         Turn::seed_card(cards, SID, Some("om_live")).await;
         Turn::set_card_state(cards, SID, CardState::Waiting).await;
-        cards.cards.lock().await.get_mut(SID).unwrap().pending_split.push(
-            crate::bridge::turn::state::PendingSplit {
+        cards
+            .card(SID)
+            .await
+            .unwrap()
+            .pending_split
+            .push(crate::bridge::turn::state::PendingSplit {
                 reply_to: "om_user".into(),
                 kind: SplitKind::Supplement,
                 receipt_pushed: false,
                 line: None,
                 handover: false,
-            },
-        );
+            });
         assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
 
         // A split already finalized the card: it is no longer the live one.
-        cards.cards.lock().await.get_mut(SID).unwrap().card_is_live = false;
+        cards.card(SID).await.unwrap().card_is_live = false;
         assert!(CardOwnership::admit_ledger_write(cards, SID).await.is_none());
     }
 
@@ -934,7 +953,7 @@ mod tests {
         Turn::seed_card(cards, SID, Some("om_live")).await;
         Turn::set_card_state(cards, SID, CardState::Streaming).await;
         Turn::set_turn_anchor(cards, SID, &anchor).await;
-        let chain = cards.cards.lock().await.get(SID).expect("seeded card").chain_id();
+        let chain = cards.card(SID).await.expect("seeded card").chain_id();
 
         let ownership = CardOwnership::read(cards, waits, SID).await;
         assert_eq!(ownership.card_message_id(), Some("om_live"));
@@ -1013,7 +1032,7 @@ mod tests {
         let anchor = turn_anchor(1);
         Turn::seed_card(cards, SID, Some("om_live")).await;
         Turn::set_turn_anchor(cards, SID, &anchor).await;
-        let chain = cards.cards.lock().await.get(SID).expect("seeded card").chain_id();
+        let chain = cards.card(SID).await.expect("seeded card").chain_id();
         let unlanded = |chain| Ticket::Unlanded {
             chain,
             submitted: "om_user".into(),
@@ -1061,17 +1080,15 @@ mod tests {
     /// The card's recorded failure line, read under the cards lock.
     async fn card_error(cards: &CardsHandle, session_id: &str) -> Option<String> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .and_then(|card| card.acc.error().map(str::to_string))
     }
 
     /// Seed a recorded failure on the live card, so an ending that clears it
     /// (Stopped) is visible as a change.
     async fn set_card_error(cards: &CardsHandle, session_id: &str, error: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.set_error(Some(error.to_string()));
         }
     }
@@ -1139,7 +1156,7 @@ mod tests {
         let cards = &fx.cards;
 
         Turn::seed_card(cards, SID, Some("om_live")).await;
-        let chain = cards.cards.lock().await.get(SID).expect("seeded card").chain_id();
+        let chain = cards.card(SID).await.expect("seeded card").chain_id();
         let owns = Ticket::Chain {
             chain,
             anchor: turn_anchor(3),

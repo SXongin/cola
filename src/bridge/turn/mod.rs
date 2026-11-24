@@ -564,11 +564,8 @@ impl Turn {
         // unfinished message can still fall inside the fresh anchor's in-flight
         // window); inert on the settled fresh-id case. A fresh prompt starts
         // clean.
-        if is_retry {
-            let live = handles.cards.cards.lock().await;
-            if let Some(previous) = live.get(&session_id) {
-                acc.carry_attempt_baseline(&previous.acc);
-            }
+        if is_retry && let Some(previous) = handles.cards.card(&session_id).await {
+            acc.carry_attempt_baseline(&previous.acc);
         }
         // Instant Reminder (ADR-0043): register this turn's generation for
         // the Chat/Topic, so the pending-request pollers pin towards THIS
@@ -612,7 +609,7 @@ impl Turn {
                 // The turn never started: drop the just-inserted card
                 // session and release the guard, so nothing leaks and the
                 // session does not look busy until a restart.
-                handles.cards.cards.lock().await.remove(&session_id);
+                handles.cards.remove(&session_id).await;
                 release_inflight(handles, &session_id).await;
                 // No card exists to carry the failure, so say it in plain text:
                 // a refused create must never leave the message unanswered
@@ -664,13 +661,11 @@ impl Turn {
             // record, and the accumulator mirrors it so the first render read
             // that can place it lands it here. The seed below never invents a
             // gap over it (its own failure path defers to a carried one).
-            if let Some(gap) = orphan.pending_gap.clone() {
-                let mut live = handles.cards.cards.lock().await;
-                if let Some(card) = live.get_mut(&session_id)
-                    && card.card_message_id.as_deref() == Some(new_card_id.as_str())
-                {
-                    card.acc.set_pending_gap(gap);
-                }
+            if let Some(gap) = orphan.pending_gap.clone()
+                && let Some(mut card) = handles.cards.card(&session_id).await
+                && card.card_message_id.as_deref() == Some(new_card_id.as_str())
+            {
+                card.acc.set_pending_gap(gap);
             }
             let resolved = Self::seed_orphan_delta(handles, &session_id, &new_card_id, &orphan).await;
             crate::bridge::chain::collect_orphan_after_takeover(
@@ -688,8 +683,7 @@ impl Turn {
         // the cards lock.
         let work_context = StreamAccumulator::capture_work_context(&session_dir).await;
         {
-            let mut cards = handles.cards.cards.lock().await;
-            if let Some(card) = cards.get_mut(&session_id) {
+            if let Some(mut card) = handles.cards.card(&session_id).await {
                 card.acc.apply_work_context(work_context);
             }
         }
@@ -913,8 +907,7 @@ impl Turn {
     /// Turn.
     async fn abandon_with_error(&self, handles: &TurnHandles, error: &crate::error::BridgeError) {
         {
-            let mut cards = handles.cards.cards.lock().await;
-            if let Some(card) = cards.get_mut(&self.session_id) {
+            if let Some(mut card) = handles.cards.card(&self.session_id).await {
                 card.acc.apply_ending(&Disposition::Failed(error.to_string()));
             }
         }
@@ -970,20 +963,24 @@ impl Turn {
         // and never awaited, so holding the cards guard across them is the
         // documented `cards` → task state order (see `CardsHandle`'s lock doc).
         {
-            let mut cards = handles.cards.cards.lock().await;
-            if let Some(mut card) = cards.remove(&self.session_id) {
-                card.acc.set_session(&fresh_id);
-                cards.insert(fresh_id.clone(), card);
-            }
-            // The live-card record is a fact about the card, not the session id
-            // it was filed under: re-key it so the fresh session's card is
-            // reap-able.
-            handles.cards.chains.rename(&self.session_id, &fresh_id);
-            // The Background Task State binding is a fact about the card too:
-            // move it to the fresh session, re-keyed at the fresh session's
-            // current chain generation. The `from` session's binding goes with
-            // the card, so the store never keeps a cell under a dead session.
-            handles.cards.tasks.rekey(&self.session_id, &fresh_id);
+            handles
+                .cards
+                .with_map(|cards| {
+                    if let Some(mut card) = cards.remove(&self.session_id) {
+                        card.acc.set_session(&fresh_id);
+                        cards.insert(fresh_id.clone(), card);
+                    }
+                    // The live-card record is a fact about the card, not the session id
+                    // it was filed under: re-key it so the fresh session's card is
+                    // reap-able.
+                    handles.cards.chains.rename(&self.session_id, &fresh_id);
+                    // The Background Task State binding is a fact about the card too:
+                    // move it to the fresh session, re-keyed at the fresh session's
+                    // current chain generation. The `from` session's binding goes with
+                    // the card, so the store never keeps a cell under a dead session.
+                    handles.cards.tasks.rekey(&self.session_id, &fresh_id);
+                })
+                .await;
         }
         {
             let mut inflight = handles.waits.inflight.lock().await;
@@ -1188,7 +1185,7 @@ impl Turn {
         // The Turn Footer's variant is a fact of THIS turn (captured at send
         // time, ADR-0019). The model/token halves are captured from the
         // transcript's messages themselves.
-        if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id) {
+        if let Some(mut card) = handles.cards.card(&self.session_id).await {
             card.acc.set_variant(self.turn_variant.clone());
         }
 
@@ -1215,21 +1212,19 @@ impl Turn {
         // its tail (or 「输出已不可用」) instead of a bare entry. The plan is
         // pure and the commit's announce gate keeps the entry exactly once.
         let mut plans = Vec::new();
-        if let Some(transcript) = &final_transcript {
-            let mut cards = handles.cards.cards.lock().await;
-            if let Some(card) = cards.get_mut(&self.session_id) {
-                plans = render::plan_finalization_entries(
-                    &mut card.acc,
-                    transcript,
-                    render::Endings::of(&handles.cards, &self.session_id),
-                );
-            }
+        if let Some(transcript) = &final_transcript
+            && let Some(mut card) = handles.cards.card(&self.session_id).await
+        {
+            plans = render::plan_finalization_entries(
+                &mut card.acc,
+                transcript,
+                render::Endings::of(&handles.cards, &self.session_id),
+            );
         }
         render::read_planned_outputs(&handles.backend, &mut plans).await;
         let mut settled_chain = None;
         {
-            let mut cards = handles.cards.cards.lock().await;
-            if let Some(card) = cards.get_mut(&self.session_id) {
+            if let Some(mut card) = handles.cards.card(&self.session_id).await {
                 let chain = card.chain_id();
                 let acc = &mut card.acc;
                 settled_chain = Some(chain);
@@ -1306,9 +1301,8 @@ impl Turn {
         // (footer refreshes, flush, notice) belongs to nobody: abort it and
         // release the guard.
         let still_owned = {
-            let mut live = handles.cards.cards.lock().await;
-            match live.get_mut(&self.session_id) {
-                Some(card) if settled_chain == Some(card.chain_id()) => {
+            match handles.cards.card(&self.session_id).await {
+                Some(mut card) if settled_chain == Some(card.chain_id()) => {
                     card.acc.set_turn_diff_stats(stats);
                     true
                 }
@@ -1351,10 +1345,8 @@ impl Turn {
         // one lock inside `announce_completion`.
         let stamped_card = handles
             .cards
-            .cards
-            .lock()
+            .card(&self.session_id)
             .await
-            .get(&self.session_id)
             .and_then(|card| card.card_message_id.clone());
 
         // Topic cover card (ADR-0023): once the server holds a real title for
@@ -1843,9 +1835,8 @@ impl Turn {
     /// Seeded/gap content the probe cannot place is rendered by finalization's
     /// own reconcile.
     async fn drain_owes_render(&self, handles: &TurnHandles, transcript: &SessionTranscript) -> bool {
-        let mut cards = handles.cards.cards.lock().await;
-        match cards.get_mut(&self.session_id) {
-            Some(card) => {
+        match handles.cards.card(&self.session_id).await {
+            Some(mut card) => {
                 card.acc.capture_turn_anchor(transcript);
                 // The durable delivered frontier (ADR-0082 §3): the compaction
                 // walk's bound on this card, so a row an earlier card surfaced is
@@ -1873,9 +1864,8 @@ impl Turn {
         handles: &TurnHandles,
         transcript: &SessionTranscript,
     ) -> Option<TurnAnchor> {
-        let mut cards = handles.cards.cards.lock().await;
-        match cards.get_mut(&self.session_id) {
-            Some(card) => {
+        match handles.cards.card(&self.session_id).await {
+            Some(mut card) => {
                 card.acc.capture_turn_anchor(transcript);
                 card.acc.turn_anchor().cloned()
             }
@@ -1919,9 +1909,8 @@ impl Turn {
         // and a short turn's first poll only ever runs here. The anchor is one
         // fact: the message's identity together with its server time.
         let anchor = {
-            let mut cards = handles.cards.cards.lock().await;
-            match cards.get_mut(&self.session_id) {
-                Some(card) => {
+            match handles.cards.card(&self.session_id).await {
+                Some(mut card) => {
                     card.acc.capture_turn_anchor(transcript);
                     card.acc.turn_anchor().cloned()
                 }
@@ -2416,10 +2405,8 @@ impl Turn {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         if cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|card| card.acc.awaits_typed_answer())
         {
             return FlushOutcome::Unwritten;
@@ -2460,8 +2447,7 @@ impl Turn {
         directory: Option<&str>,
     ) -> Option<ChainRecord> {
         let (message_id, created_ms, context_directory, reply_to) = {
-            let live = cards.cards.lock().await;
-            match live.get(session_id) {
+            match cards.card(session_id).await {
                 Some(card) => (
                     card.acc
                         .cola_message_id()
@@ -2512,11 +2498,10 @@ impl Turn {
         // Turn's or a takeover's card must not clear the chain's frontier —
         // while a split continuation's accumulator already carries the same
         // value and keeps its own.
-        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
-            let mut live = cards.cards.lock().await;
-            if let Some(card) = live.get_mut(session_id) {
-                card.acc.seed_cursor_if_empty(cursor);
-            }
+        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone())
+            && let Some(mut card) = cards.card(session_id).await
+        {
+            card.acc.seed_cursor_if_empty(cursor);
         }
         if collect == PredecessorCollect::Never {
             return None;
@@ -2549,8 +2534,7 @@ impl Turn {
         rendered: &[EndingKey],
     ) {
         let (message_id, created_ms, context_directory, reply_to, confirmed) = {
-            let mut live = cards.cards.lock().await;
-            let Some(card) = live.get_mut(session_id) else {
+            let Some(mut card) = cards.card(session_id).await else {
                 // The session is gone, but the create DELIVERED: flip its
                 // endings' shown bits — session-scoped, and there is no live
                 // chain to tell (ADR-0080).
@@ -2618,8 +2602,7 @@ impl Turn {
             // into its gate (ADR-0080): a chain that SEEDED before this landing
             // holds the older, empty set, and without the insert its next read
             // would re-plan the entry.
-            let mut live = cards.cards.lock().await;
-            if let Some(card) = live.get_mut(session_id) {
+            if let Some(mut card) = cards.card(session_id).await {
                 for (run, class) in &keys {
                     card.acc.announce_ending(run, *class);
                 }
@@ -2629,11 +2612,10 @@ impl Turn {
         // seed a fresh accumulator's empty base with the carried fact, while a
         // split continuation's accumulator already carries the same value (the
         // stage's take advanced it) and keeps its own.
-        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
-            let mut live = cards.cards.lock().await;
-            if let Some(card) = live.get_mut(session_id) {
-                card.acc.seed_cursor_if_empty(cursor);
-            }
+        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone())
+            && let Some(mut card) = cards.card(session_id).await
+        {
+            card.acc.seed_cursor_if_empty(cursor);
         }
     }
 
@@ -2683,25 +2665,23 @@ impl Turn {
         chain_id: u64,
         directory: Option<&str>,
     ) -> bool {
-        let mut live = cards.cards.lock().await;
-        let (message_id, created_ms, context_directory, reply_to) = {
-            let Some(card) = live.get_mut(session_id) else {
-                return false;
-            };
-            if card.chain_id() != chain_id {
-                return false;
-            }
-            card.card_message_id = Some(card_message_id.to_string());
-            (
-                card.acc
-                    .cola_message_id()
-                    .map(MessageId::new)
-                    .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
-                card.acc.turn_anchor().map(|anchor| anchor.created_ms),
-                card.acc.directory().map(str::to_string),
-                card.acc.reply_to_message_id().map(str::to_string),
-            )
+        let mut card = match cards.card(session_id).await {
+            Some(card) => card,
+            None => return false,
         };
+        if card.chain_id() != chain_id {
+            return false;
+        }
+        card.card_message_id = Some(card_message_id.to_string());
+        let (message_id, created_ms, context_directory, reply_to) = (
+            card.acc
+                .cola_message_id()
+                .map(MessageId::new)
+                .or_else(|| card.acc.turn_anchor().map(|anchor| anchor.message_id.clone())),
+            card.acc.turn_anchor().map(|anchor| anchor.created_ms),
+            card.acc.directory().map(str::to_string),
+            card.acc.reply_to_message_id().map(str::to_string),
+        );
         // A card with no Turn message to scope a settle decision with cannot be
         // reaped: no record, no reap attempt after a restart.
         let Some(message_id) = message_id else {
@@ -2723,12 +2703,10 @@ impl Turn {
             reply_to.as_deref(),
         );
         // A re-point within the chain carries the Rendered Cursor (spec #561).
-        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone())
-            && let Some(card) = live.get_mut(session_id)
-        {
+        if let Some(cursor) = previous.as_ref().and_then(|record| record.cursor.clone()) {
             card.acc.seed_cursor_if_empty(cursor);
         }
-        drop(live);
+        drop(card);
         if let Some(previous) = previous
             && previous.card_message_id != card_message_id
         {
@@ -2768,7 +2746,7 @@ impl Turn {
     /// Attach `card_message_id` to the session's in-memory card, when it still
     /// has one (a card replaced in the released moment is never touched).
     async fn attach_card_message_id(cards: &CardsHandle, session_id: &str, card_message_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.card_message_id = Some(card_message_id.to_string());
         }
     }
@@ -2859,35 +2837,37 @@ impl Turn {
         // The cursor the seed derives from: the orphan's confirmed one, or the
         // default a cursorless record starts from.
         let cursor = orphan.cursor.clone().unwrap_or_default();
-        let applied = {
-            let mut live = handles.cards.cards.lock().await;
-            let landed = Self::apply_orphan_seed(&mut live, session_id, successor_card_id, &cursor, seed);
-            // A gap the takeover already carried is the more accurate fact
-            // (the record's own cursor may have moved past it): the carry
-            // already noted it durably and seeded the accumulator.
-            if landed
-                && let Some(gap_cursor) = orphan.cursor.clone()
-                && orphan.pending_gap.is_none()
-                && let Some(card) = live.get_mut(session_id)
-            {
-                // The same session/card check `apply_orphan_seed` just made.
-                let gap = crate::bridge::chain::PendingGap {
-                    cursor: gap_cursor,
-                    anchor: anchor.clone(),
-                    bound: bound.clone(),
-                };
-                handles
-                    .cards
-                    .chains
-                    .note_pending_gap(session_id, successor_card_id, &gap);
-                // The resolved seed's scope walk renders the tail in-process
-                // (tagging it as gap content and marking `gap_rendered`), so
-                // the durable fact — cleared only by a confirmed write that
-                // covers the gap's end — never double-renders it here.
-                card.acc.set_pending_gap(gap);
-            }
-            landed
-        };
+        let applied = handles
+            .cards
+            .with_map(|live| {
+                let landed = Self::apply_orphan_seed(live, session_id, successor_card_id, &cursor, seed);
+                // A gap the takeover already carried is the more accurate fact
+                // (the record's own cursor may have moved past it): the carry
+                // already noted it durably and seeded the accumulator.
+                if landed
+                    && let Some(gap_cursor) = orphan.cursor.clone()
+                    && orphan.pending_gap.is_none()
+                    && let Some(card) = live.get_mut(session_id)
+                {
+                    // The same session/card check `apply_orphan_seed` just made.
+                    let gap = crate::bridge::chain::PendingGap {
+                        cursor: gap_cursor,
+                        anchor: anchor.clone(),
+                        bound: bound.clone(),
+                    };
+                    handles
+                        .cards
+                        .chains
+                        .note_pending_gap(session_id, successor_card_id, &gap);
+                    // The resolved seed's scope walk renders the tail in-process
+                    // (tagging it as gap content and marking `gap_rendered`), so
+                    // the durable fact — cleared only by a confirmed write that
+                    // covers the gap's end — never double-renders it here.
+                    card.acc.set_pending_gap(gap);
+                }
+                landed
+            })
+            .await;
         tracing::info!(
             "restart seed: session {session_id} resolved {} live calls (applied {applied})",
             resolved.len()
@@ -2899,8 +2879,10 @@ impl Turn {
     /// live card's own cola message, which bounds an orphan gap's window. `None`
     /// when the card cannot name one — the gap then falls back to the read.
     async fn current_turn_message(handles: &TurnHandles, session_id: &str) -> Option<MessageId> {
-        let live = handles.cards.cards.lock().await;
-        live.get(session_id)
+        handles
+            .cards
+            .card(session_id)
+            .await
             .and_then(|card| card.acc.cola_message_id().map(str::to_string))
             .map(MessageId::new)
     }
@@ -2936,8 +2918,7 @@ impl Turn {
             .cards
             .chains
             .note_pending_gap(session_id, successor_card_id, &gap);
-        let mut live = handles.cards.cards.lock().await;
-        if let Some(card) = live.get_mut(session_id)
+        if let Some(mut card) = handles.cards.card(session_id).await
             && card.card_message_id.as_deref() == Some(successor_card_id)
         {
             card.acc.set_pending_gap(gap);
@@ -2994,8 +2975,7 @@ impl Turn {
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
         {
-            let mut live = cards.cards.lock().await;
-            let Some(card) = live.get_mut(session_id) else {
+            let Some(mut card) = cards.card(session_id).await else {
                 return false;
             };
             // An idle Session Card is a one-shot read (ADR-0100), never the
@@ -3038,8 +3018,7 @@ impl Turn {
     /// line was pushed now (the caller flushes it); false when the line is
     /// already shown or the card is gone.
     pub(crate) async fn show_receive_hint(cards: &CardsHandle, session_id: &str) -> bool {
-        let mut live = cards.cards.lock().await;
-        let Some(card) = live.get_mut(session_id) else {
+        let Some(mut card) = cards.card(session_id).await else {
             return false;
         };
         if card.acc.receive_hint_shown() {
@@ -3115,8 +3094,7 @@ impl Turn {
         // throughout — this sequence's own serialization — while the cards
         // lock is released for the reads.
         let mut plans = {
-            let live = cards.cards.lock().await;
-            match live.get(session_id) {
+            match cards.card(session_id).await {
                 // A chain card only: an idle Session Card is a one-shot read
                 // (ADR-0100) and must never be handed a continuation or have a
                 // Chain Record written for it. It is terminal, so
@@ -3134,8 +3112,7 @@ impl Turn {
         };
         render::read_planned_outputs(backend, &mut plans).await;
         let handover = {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut(session_id)?;
+            let mut card = cards.card(session_id).await?;
             if !card.is_chain_card() || card.acc.card_state().is_render_owned() {
                 return None;
             }
@@ -3219,8 +3196,7 @@ impl Turn {
         // card, then spend their one output read each OUTSIDE the cards lock
         // (spec #593; the reads are network).
         let mut plans = {
-            let live = cards.cards.lock().await;
-            match live.get(session_id) {
+            match cards.card(session_id).await {
                 Some(card) => render::plan_ledger_entries(
                     &card.acc,
                     transcript,
@@ -3315,20 +3291,20 @@ impl Turn {
         // no reachable reply target to split onto — the first Wake-less tail on
         // an existing card, which must never be dropped (#606). A card a live
         // renderer owns, or one a new Turn replaced, is left alone.
-        let Some((ending_state, ending_error)) = ({
-            let live = cards.cards.lock().await;
-            live.get(session_id)
-                // A chain card only: an idle Session Card is a one-shot read
-                // (ADR-0100), never the chain's residual card. It is terminal,
-                // so `is_render_owned` alone would admit it.
-                .filter(|card| card.is_chain_card() && !card.acc.card_state().is_render_owned())
-                .map(|card| {
-                    (
-                        card.acc.card_state().clone(),
-                        card.acc.error().map(str::to_string),
-                    )
-                })
-        }) else {
+        let Some((ending_state, ending_error)) = cards
+            .card(session_id)
+            .await
+            // A chain card only: an idle Session Card is a one-shot read
+            // (ADR-0100), never the chain's residual card. It is terminal,
+            // so `is_render_owned` alone would admit it.
+            .filter(|card| card.is_chain_card() && !card.acc.card_state().is_render_owned())
+            .map(|card| {
+                (
+                    card.acc.card_state().clone(),
+                    card.acc.error().map(str::to_string),
+                )
+            })
+        else {
             return false;
         };
         // Render the read into the card WITHOUT its own flush: rendering the
@@ -3349,8 +3325,7 @@ impl Turn {
         // re-deciding `Residual`; when the residual instead split onto its own
         // neutral card, `push_queued_receipts` set the same marker at the send.
         {
-            let mut live = cards.cards.lock().await;
-            let Some(card) = live.get_mut(session_id) else {
+            let Some(mut card) = cards.card(session_id).await else {
                 return false;
             };
             // The FIRST in-place residual gains the neutral residual receipt
@@ -3448,9 +3423,8 @@ impl Turn {
         // child reads nor any output read — and their one output read each
         // runs outside the cards lock below.
         let (admitted, mut plans) = {
-            let live = cards.cards.lock().await;
-            match live.get(session_id) {
-                Some(card) if ownership::admits_ledger_refresh(card) => {
+            match cards.card(session_id).await {
+                Some(card) if ownership::admits_ledger_refresh(&card) => {
                     // A card rendering an unanswered free-text answer field is
                     // not refreshed: Feishu rebuilds the body on every update,
                     // so the read would wipe what the Host is typing (issue
@@ -3577,10 +3551,8 @@ impl Turn {
             // slice names itself — the pre-flush card would read as replaced
             // and suppress the notice.
             let settled_card = cards
-                .cards
-                .lock()
+                .card(session_id)
                 .await
-                .get(session_id)
                 .and_then(|card| card.card_message_id.clone());
             // The settle answer is the write's (review, PR #595): a
             // permanently refused ending never reached the card, so the caller
@@ -3911,7 +3883,7 @@ impl Turn {
     /// (ADR-0100), while assertions often need the raw map fact.
     #[cfg(test)]
     pub(crate) async fn has_card(cards: &CardsHandle, session_id: &str) -> bool {
-        cards.cards.lock().await.contains_key(session_id)
+        cards.has(session_id).await
     }
 
     /// Whether the session's card is still running (not terminal: Done, Error,
@@ -3920,11 +3892,9 @@ impl Turn {
     /// until the next Turn replaces it.
     pub(crate) async fn is_running(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
-            .is_some_and(state::CardSession::is_running)
+            .is_some_and(|card| state::CardSession::is_running(&card))
     }
 
     /// Whether the session's map entry is a **Card Chain's** card rather than an
@@ -3935,20 +3905,16 @@ impl Turn {
     /// readers ask [`Self::is_running`] instead.
     pub(crate) async fn is_chain_card(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
-            .is_some_and(state::CardSession::is_chain_card)
+            .is_some_and(|card| state::CardSession::is_chain_card(&card))
     }
 
     /// The session's tracked card message id, if a card has been sent.
     pub(crate) async fn card_message_id(cards: &CardsHandle, session_id: &str) -> Option<String> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .and_then(|c| c.card_message_id.clone())
     }
 
@@ -3971,8 +3937,9 @@ impl Turn {
     /// replacing it would drop the owed continuation. `/card` leaves it current
     /// and stamps its own read taken over, exactly like a live block.
     pub(crate) async fn card_to_supersede(cards: &CardsHandle, session_id: &str) -> Option<String> {
-        let live = cards.cards.lock().await;
-        live.get(session_id)
+        cards
+            .card(session_id)
+            .await
             .filter(|card| {
                 let state = card.acc.card_state();
                 // A terminal card can still carry an unanswered
@@ -4023,18 +3990,21 @@ impl Turn {
         acc.set_capabilities(capabilities);
         acc.mark_idle_read();
         let session = state::CardSession::new(acc, Some(card_message_id.to_string()));
-        let mut live = cards.cards.lock().await;
-        if live.get(session_id).is_some_and(|card| {
-            // A chain card that still owes a continuation keeps the session:
-            // replacing it would discard the queue, its reply target and the
-            // content it owes (ADR-0100). `/card` then stamps its own read
-            // taken over instead.
-            card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation()
-        }) {
-            return false;
-        }
-        live.insert(session_id.to_string(), session);
-        true
+        cards
+            .with_map(|live| {
+                if live.get(session_id).is_some_and(|card| {
+                    // A chain card that still owes a continuation keeps the session:
+                    // replacing it would discard the queue, its reply target and the
+                    // content it owes (ADR-0100). `/card` then stamps its own read
+                    // taken over instead.
+                    card.is_running() || !card.acc.live_request_ids().is_empty() || card.owes_continuation()
+                }) {
+                    return false;
+                }
+                live.insert(session_id.to_string(), session);
+                true
+            })
+            .await
     }
 
     /// The message a card for this session replies to, when it has one: the
@@ -4044,10 +4014,8 @@ impl Turn {
     /// [`Self::is_running`] instead (ADR-0100).
     pub(crate) async fn reply_target(cards: &CardsHandle, session_id: &str) -> Option<String> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .and_then(|c| c.acc.reply_to_message_id().map(str::to_string))
     }
 
@@ -4093,9 +4061,12 @@ impl Turn {
         // lock here.
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        let mut live = cards.cards.lock().await;
-        Self::seed_durable_announcements(cards, session_id, &mut acc);
-        live.insert(session_id.to_string(), state::CardSession::new(acc, None));
+        cards
+            .with_map(|live| {
+                Self::seed_durable_announcements(cards, session_id, &mut acc);
+                live.insert(session_id.to_string(), state::CardSession::new(acc, None));
+            })
+            .await;
     }
 
     /// Test seam: run the same write-lock-first install a real `Turn::start`
@@ -4112,22 +4083,15 @@ impl Turn {
     /// rendered into (issue #1023); tests also use it for
     /// [`Self::take_over_card_if_current`].
     pub(crate) async fn card_chain_id(cards: &CardsHandle, session_id: &str) -> Option<u64> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .map(|card| card.chain_id())
+        cards.card(session_id).await.map(|card| card.chain_id())
     }
 
     /// Whether the session's card has rendered any part — the external
     /// renderer's "partial reply" probe before it finalizes on timeout.
     pub(crate) async fn has_rendered_content(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|c| c.acc.has_rendered_content())
     }
 
@@ -4138,12 +4102,7 @@ impl Turn {
     /// advances; reading the card (not a pass's return value) means progress a
     /// timed-out pass had already rendered still counts.
     pub(crate) async fn progress_mark(cards: &CardsHandle, session_id: &str) -> Option<u64> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .map(|c| c.acc.progress_mark())
+        cards.card(session_id).await.map(|c| c.acc.progress_mark())
     }
 
     /// Whether the session's card still carries an unfinished Tool Panel the
@@ -4159,10 +4118,8 @@ impl Turn {
     /// as before.
     pub(crate) async fn has_live_tools(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|c| c.acc.has_live_tool())
     }
 
@@ -4171,10 +4128,8 @@ impl Turn {
     /// owns; a live launch panel yields with its run.
     pub(crate) async fn has_live_orphan_tools(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|c| c.acc.has_live_orphan_tool())
     }
 
@@ -4272,9 +4227,8 @@ impl Turn {
         // checked stamp.
         let index = terminal_change_index(backend, session_id, disposition, Some(anchor)).await;
         let stamped = {
-            let mut live = cards.cards.lock().await;
-            match live.get_mut(session_id) {
-                Some(card) if card.acc.turn_anchor() == Some(anchor) => {
+            match cards.card(session_id).await {
+                Some(mut card) if card.acc.turn_anchor() == Some(anchor) => {
                     card.acc.set_turn_diff_stats(index.unwrap_or_default());
                     card.acc.apply_ending(disposition);
                     true
@@ -4335,9 +4289,10 @@ impl Turn {
         reason: CollectReason,
     ) -> bool {
         let collected = {
-            let mut live = cards.cards.lock().await;
-            live.get_mut(session_id)
-                .is_some_and(|card| card.acc.collect_waiting(reason.collected()))
+            cards
+                .card(session_id)
+                .await
+                .is_some_and(|mut card| card.acc.collect_waiting(reason.collected()))
         };
         if !collected {
             return false;
@@ -4363,17 +4318,20 @@ impl Turn {
     /// accumulator still owns. The sweep uses it to leave those blocks to their
     /// own flush (ADR-0038, rule 2).
     pub(crate) async fn flush_owned_blocks(cards: &CardsHandle) -> HashMap<String, String> {
-        let live = cards.cards.lock().await;
-        let mut owned = HashMap::new();
-        for card in live.values() {
-            let Some(message_id) = card.card_message_id.as_deref() else {
-                continue;
-            };
-            for id in card.acc.live_request_ids() {
-                owned.insert(id.to_string(), message_id.to_string());
-            }
-        }
-        owned
+        cards
+            .with_map(|live| {
+                let mut owned = HashMap::new();
+                for card in live.values() {
+                    let Some(message_id) = card.card_message_id.as_deref() else {
+                        continue;
+                    };
+                    for id in card.acc.live_request_ids() {
+                        owned.insert(id.to_string(), message_id.to_string());
+                    }
+                }
+                owned
+            })
+            .await
     }
 
     /// Claim a terminal card's recovery action exactly once: spec #391's Error
@@ -4395,8 +4353,7 @@ impl Turn {
         if !from.offers_recovery() {
             return None;
         }
-        let mut live = cards.cards.lock().await;
-        let card = live.get_mut(session_id)?;
+        let mut card = cards.card(session_id).await?;
         if *card.acc.card_state() != from
             || card.acc.recovery_claimed()
             // A Wake continuation carries no question to re-ask (ADR-0059):
@@ -4441,8 +4398,7 @@ impl Turn {
     /// second cleanup; [`Self::release_recovery_claim`] gives it back when the
     /// pipeline is done (or could not proceed).
     pub(crate) async fn claim_cleanup(cards: &CardsHandle, session_id: &str) -> bool {
-        let mut live = cards.cards.lock().await;
-        let Some(card) = live.get_mut(session_id) else {
+        let Some(mut card) = cards.card(session_id).await else {
             return false;
         };
         if *card.acc.card_state() != crate::feishu::card::CardState::Waiting
@@ -4470,7 +4426,7 @@ impl Turn {
     /// session/thread) gives the claim back, so a later click can try again
     /// instead of finding a dead button.
     pub(crate) async fn release_recovery_claim(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.release_recovery_claim();
         }
     }
@@ -4502,8 +4458,11 @@ impl Turn {
         rearm: CardRearm,
     ) -> bool {
         let Some((anchor, directory)) = ({
-            let mut live = handles.cards.cards.lock().await;
-            live.get_mut(session_id).and_then(|card| rearm(card, directory))
+            handles
+                .cards
+                .card(session_id)
+                .await
+                .and_then(|mut card| rearm(&mut card, directory))
         }) else {
             return false;
         };
@@ -4593,7 +4552,7 @@ impl Turn {
     /// PATCH only warns inside the flush — the retry proceeds on its new card
     /// regardless.
     async fn mark_retried(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.mark_retried();
         }
         Self::flush_card(cards, session_id).await;
@@ -4683,8 +4642,7 @@ pub(crate) async fn announce_completion(
     // refused — the tail never reached Feishu; `Owed(seq)` when delivery still
     // owes that exact write.
     let captured = {
-        let live = cards.cards.lock().await;
-        match live.get(session_id) {
+        match cards.card(session_id).await {
             Some(card) if card.card_message_id.as_deref() == expected_card => Some(CapturedNotice {
                 card_message_id: card.card_message_id.clone(),
                 ending: card.acc.ending_write(),
@@ -4883,8 +4841,9 @@ fn spawn_notice(
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         let current = {
-            let live = cards.cards.lock().await;
-            live.get(&notice.session_id)
+            cards
+                .card(&notice.session_id)
+                .await
                 .and_then(|c| c.card_message_id.clone())
         };
         if current.as_deref() != Some(notice.card_message_id.as_str()) {
@@ -4907,28 +4866,28 @@ fn spawn_notice(
 impl Turn {
     /// Drop the session's card session (a test teardown).
     pub(crate) async fn drop_card(cards: &CardsHandle, session_id: &str) {
-        cards.cards.lock().await.remove(session_id);
+        cards.remove(session_id).await;
     }
 
     /// Seed an empty card session for `session_id`.
     pub(crate) async fn seed_card(cards: &CardsHandle, session_id: &str, card_message_id: Option<&str>) {
-        cards.cards.lock().await.insert(
-            session_id.to_string(),
-            state::CardSession::new(
-                state::StreamAccumulator::new("test"),
-                card_message_id.map(str::to_string),
-            ),
-        );
+        cards
+            .insert(
+                session_id.to_string(),
+                state::CardSession::new(
+                    state::StreamAccumulator::new("test"),
+                    card_message_id.map(str::to_string),
+                ),
+            )
+            .await;
     }
 
     /// The session's staged Rendered Cursor (spec #561, review #569): the body
     /// most recently built and not yet confirmed.
     pub(crate) async fn staged_cursor(cards: &CardsHandle, session_id: &str) -> Option<RenderedCursor> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .and_then(|card| card.acc.last_staged_cursor().map(|staged| staged.cursor.clone()))
     }
 
@@ -4941,8 +4900,8 @@ impl Turn {
         card_message_id: Option<&str>,
         cursor: &RenderedCursor,
     ) -> state::StagedCursorId {
-        match cards.cards.lock().await.get_mut(session_id) {
-            Some(card) => state::StagedCursorId {
+        match cards.card(session_id).await {
+            Some(mut card) => state::StagedCursorId {
                 id: card
                     .acc
                     .stage_cursor(card_message_id, cursor.clone(), None, Vec::new()),
@@ -4961,7 +4920,7 @@ impl Turn {
         session_id: &str,
         state: crate::feishu::card::CardState,
     ) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.set_card_state(state);
         }
     }
@@ -4969,7 +4928,7 @@ impl Turn {
     /// Set the owning Session on a seeded test card, so its Tool Panel controls
     /// render the same `session_id` routing as a production Turn card.
     pub(crate) async fn set_session(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.set_session(session_id);
         }
     }
@@ -4977,21 +4936,21 @@ impl Turn {
     /// Clear the card's phase timer (a fixture that needs a frozen header: a
     /// live card's timer otherwise ticks the header once a second).
     pub(crate) async fn clear_phase(cards: &CardsHandle, session_id: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.reset_phase();
         }
     }
 
     /// Set the card's subtitle/title.
     pub(crate) async fn set_title(cards: &CardsHandle, session_id: &str, title: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.set_title(title);
         }
     }
 
     /// Set the card's reply target.
     pub(crate) async fn set_reply_target(cards: &CardsHandle, session_id: &str, reply_to: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.set_reply_target(Some(reply_to.to_string()));
         }
     }
@@ -5000,7 +4959,7 @@ impl Turn {
     /// seam); production fills it from the transcript via
     /// `capture_turn_anchor`.
     pub(crate) async fn set_turn_anchor(cards: &CardsHandle, session_id: &str, anchor: &TurnAnchor) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.repoint_turn_anchor(anchor);
         }
     }
@@ -5013,7 +4972,7 @@ impl Turn {
         is_group: bool,
         generation: u64,
     ) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.set_requester(Some(requester_open_id.to_string()));
             card.acc.set_is_group(is_group);
             card.acc.set_turn_generation(generation);
@@ -5022,28 +4981,28 @@ impl Turn {
 
     /// Record the answering model and its provider.
     pub(crate) async fn set_model(cards: &CardsHandle, session_id: &str, provider: &str, model: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.apply_footer_model(model, provider, None);
         }
     }
 
     /// Append text to the card's timeline.
     pub(crate) async fn push_text(cards: &CardsHandle, session_id: &str, text: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.push_text(text);
         }
     }
 
     /// Append reasoning to the card's timeline.
     pub(crate) async fn push_reasoning(cards: &CardsHandle, session_id: &str, text: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.push_reasoning(text);
         }
     }
 
     /// Append reasoning keyed at a server time.
     pub(crate) async fn push_reasoning_at(cards: &CardsHandle, session_id: &str, at_ms: i64, text: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.push_reasoning_at(Some(at_ms), text);
         }
     }
@@ -5055,7 +5014,7 @@ impl Turn {
     /// hand.
     #[cfg(test)]
     pub(crate) async fn set_message_floor(cards: &CardsHandle, session_id: &str, created: Option<i64>) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.script_message(created);
         }
     }
@@ -5064,7 +5023,7 @@ impl Turn {
     /// later read delivers with its own server clock).
     #[cfg(test)]
     pub(crate) async fn push_text_at(cards: &CardsHandle, session_id: &str, at_ms: i64, text: &str) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.push_text_at(Some(at_ms), text);
         }
     }
@@ -5076,7 +5035,7 @@ impl Turn {
         call_id: &str,
         panel: crate::feishu::card::tool_render::ToolPanel,
     ) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.push_tool(call_id, panel);
         }
     }
@@ -5090,7 +5049,7 @@ impl Turn {
         call_id: &str,
         panel: crate::feishu::card::tool_render::ToolPanel,
     ) {
-        if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             card.acc.push_tool_at(Some(at_ms), call_id, panel);
         }
     }
@@ -5100,12 +5059,7 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
     ) -> Option<crate::feishu::card::CardState> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .map(|c| c.acc.card_state().clone())
+        cards.card(session_id).await.map(|c| c.acc.card_state().clone())
     }
 
     /// The stored card's installed capability declaration (ADR-0106): a test
@@ -5116,12 +5070,7 @@ impl Turn {
         cards: &CardsHandle,
         session_id: &str,
     ) -> Option<crate::backend::AgentCapabilities> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .map(|card| card.acc.capabilities())
+        cards.card(session_id).await.map(|card| card.acc.capabilities())
     }
 
     /// Whether the card's fallback reached the suspended state (the fenced
@@ -5130,20 +5079,16 @@ impl Turn {
     /// always did.
     pub(crate) async fn card_is_suspended(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|c| c.acc.card_fallback() == state::CardFallback::Suspended)
     }
 
     /// The live permission blocks' `(request_id, session_id)`, in render order.
     pub(crate) async fn live_permissions(cards: &CardsHandle, session_id: &str) -> Vec<(String, String)> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .map(|c| {
                 c.acc
                     .live_permissions()
@@ -5160,10 +5105,8 @@ impl Turn {
         session_id: &str,
     ) -> Vec<(String, Vec<Option<Vec<String>>>)> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .map(|c| {
                 c.acc
                     .live_questions()
@@ -5176,22 +5119,12 @@ impl Turn {
 
     /// The card as it would render now.
     pub(crate) async fn rendered_card(cards: &CardsHandle, session_id: &str) -> Option<serde_json::Value> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .map(|c| c.acc.build_card())
+        cards.card(session_id).await.map(|c| c.acc.build_card())
     }
 
     /// The timeline index the card currently renders from.
     pub(crate) async fn render_from(cards: &CardsHandle, session_id: &str) -> Option<usize> {
-        cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .map(|c| c.acc.render_from())
+        cards.card(session_id).await.map(|c| c.acc.render_from())
     }
 
     /// Whether the card session is the growing live card. A read-only Session
@@ -5199,30 +5132,24 @@ impl Turn {
     /// read never grows or flushes (ADR-0100), so it is not a live chain card.
     pub(crate) async fn card_is_live(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|c| c.card_is_live && c.is_chain_card())
     }
 
     /// Whether the session owes a split continuation.
     pub(crate) async fn has_pending_split(cards: &CardsHandle, session_id: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|c| !c.pending_split.is_empty())
     }
 
     /// The queued splits' `(reply_to, receipt_pushed)`, in arrival order.
     pub(crate) async fn pending_splits(cards: &CardsHandle, session_id: &str) -> Vec<(String, bool)> {
         cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .map(|c| {
                 c.pending_split
                     .iter()
@@ -5234,21 +5161,22 @@ impl Turn {
 
     /// Whether any card carries a LIVE interaction block for `request_id`.
     pub(crate) async fn has_live_interaction(cards: &CardsHandle, request_id: &str) -> bool {
-        cards.cards.lock().await.values().any(|c| {
-            c.acc
-                .interaction(request_id)
-                .is_some_and(state::InteractionBlock::is_live)
-        })
+        cards
+            .with_map(|live| {
+                live.values().any(|c| {
+                    c.acc
+                        .interaction(request_id)
+                        .is_some_and(state::InteractionBlock::is_live)
+                })
+            })
+            .await
     }
 
     /// Whether any card carries an Interaction Receipt starting with `prefix`.
     pub(crate) async fn has_receipt_prefix(cards: &CardsHandle, prefix: &str) -> bool {
         cards
-            .cards
-            .lock()
+            .with_map(|live| live.values().any(|c| c.acc.has_receipt_prefix(prefix)))
             .await
-            .values()
-            .any(|c| c.acc.has_receipt_prefix(prefix))
     }
 }
 
@@ -5361,10 +5289,8 @@ mod tests {
         );
         assert!(
             cards
-                .cards
-                .lock()
+                .card("ses_test")
                 .await
-                .get("ses_test")
                 .expect("the continuation session")
                 .acc
                 .ending_announced(&landed("call_1").0, TaskEndingClass::Evidence),
@@ -5555,7 +5481,7 @@ mod tests {
 
         // Hold the map lock so the announce and the replacement queue on it in
         // spawn order: the announce first, the newer Turn's replacement second.
-        let held = cards.cards.lock().await;
+        let held = cards.card("ses_test").await.expect("the seeded card");
         let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let announce = {
             let cards = cards.clone();
@@ -5590,7 +5516,7 @@ mod tests {
                 card.acc.set_reply_target(Some("msg_new".to_string()));
                 card.acc.set_requester(Some("ou_new_requester".to_string()));
                 card.acc.set_is_group(true);
-                cards.cards.lock().await.insert("ses_test".to_string(), card);
+                cards.insert("ses_test".to_string(), card).await;
             })
         };
         ready_rx.recv().await.expect("the announce queued");
@@ -5633,8 +5559,10 @@ mod tests {
 
         // Hold the map lock so the install queues on it while the durable
         // watermark lands — the window a landed projection body's confirmation
-        // writes in.
-        let held = cards.cards.lock().await;
+        // writes in. A donor session keeps the guard without touching the
+        // session under test.
+        Turn::seed_card(&cards, "ses_hold", None).await;
+        let held = cards.card("ses_hold").await.expect("the donor session");
         let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let install = {
             let cards = cards.clone();
@@ -5651,8 +5579,7 @@ mod tests {
         drop(held);
         install.await.expect("the install task");
 
-        let live = cards.cards.lock().await;
-        let card = live.get("ses_test").expect("the fresh Turn's session");
+        let card = cards.card("ses_test").await.expect("the fresh Turn's session");
         assert_eq!(
             card.acc.wake_floor(),
             Some(1_000),
@@ -5698,11 +5625,7 @@ mod tests {
         replacement.acc.set_reply_target(Some("msg_new".to_string()));
         replacement.acc.set_requester(Some("ou_new".to_string()));
         replacement.acc.set_is_group(true);
-        cards
-            .cards
-            .lock()
-            .await
-            .insert("ses_test".to_string(), replacement);
+        cards.insert("ses_test".to_string(), replacement).await;
 
         announce_completion(
             &cards,
@@ -5828,9 +5751,10 @@ mod tests {
             &[Some("high".to_string())],
             "the attempt sends the session's variant"
         );
-        let cards = app.cards.lock().await;
-        let footer_variant = cards
-            .get("ses_a")
+        let footer_variant = app
+            .cards
+            .card("ses_a")
+            .await
             .and_then(|c| c.acc.variant().map(str::to_string));
         assert_eq!(footer_variant.as_deref(), Some("high"));
     }
@@ -5889,8 +5813,7 @@ mod tests {
             &[None],
             "the durable generation sends no per-prompt variant"
         );
-        let cards = app.cards.lock().await;
-        let acc = cards.get("ses_a").expect("the turn's card");
+        let acc = app.cards.card("ses_a").await.expect("the turn's card");
         assert_eq!(
             acc.acc.variant(),
             Some("high"),
@@ -5938,10 +5861,10 @@ mod tests {
             &[None],
             "the stale mirror's variant must not ride the prompt"
         );
-        let cards = app.cards.lock().await;
         assert!(
-            cards
-                .get("ses_a")
+            app.cards
+                .card("ses_a")
+                .await
                 .and_then(|c| c.acc.variant().map(str::to_string))
                 .is_none(),
             "nor tag the footer"

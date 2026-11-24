@@ -128,7 +128,7 @@ async fn restart_readopts_a_pending_inline_permission() {
     })
     .await;
     assert!(
-        app.cards.lock().await.is_empty(),
+        app.cards.with_map(|live| live.is_empty()).await,
         "no accumulator survives the restart"
     );
     assert_eq!(

@@ -2278,8 +2278,7 @@ impl RunEndingStore for ChainRecords {
 /// reap's same-card probe; the rule lives here, beside the record it releases.
 pub(crate) async fn release_spent(cards: &CardsHandle, session_id: &str) {
     let card_message_id = {
-        let cards = cards.cards.lock().await;
-        let Some(card) = cards.get(session_id) else {
+        let Some(card) = cards.card(session_id).await else {
             return;
         };
         if !card.is_terminal() || card.owes_pending_gap() {

@@ -863,7 +863,7 @@ async fn viewer_card_joins_no_chain_and_is_never_reaped() {
         "and nothing is recorded for the session either"
     );
     assert!(
-        cards.cards.lock().await.is_empty(),
+        cards.with_map(|live| live.is_empty()).await,
         "no live CardSession is installed for a command card"
     );
     assert!(prompts.lock().await.is_empty(), "the viewer dispatches no Turn");
