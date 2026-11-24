@@ -271,7 +271,11 @@ impl ExternalFlow {
         // The decorator owns the per-entry backoff; the WS loop forces an
         // immediate drain on reconnect, since REST and WS reachability are
         // independent.
-        handles.platform.drain_pending_card_updates(false).await;
+        handles
+            .platform
+            .delivery()
+            .drain_pending_card_updates(false)
+            .await;
         // The drain may have delivered a failed card body whose staged Rendered
         // Cursor (spec #561) was waiting on exactly that payload: confirm those
         // now, so a late delivery advances the chain's record exactly once. A

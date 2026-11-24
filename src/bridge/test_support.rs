@@ -918,14 +918,85 @@ fn collect_button_values(value: &serde_json::Value, out: &mut Vec<serde_json::Va
     }
 }
 
+/// The recorder's delivery surface: the transport-recording fake is always
+/// wrapped by [`CardDelivery`](crate::feishu::delivery::CardDelivery) in a
+/// production-shaped app, so only the ticket bound is injectable — every other
+/// answer is the documented no-op (charter C7, ticket #1139).
+#[async_trait::async_trait]
+impl feishu::delivery::DeliveryObserver for RecordingPlatform {
+    async fn submit_ordered(
+        &self,
+        submission: feishu::delivery::KeyedSubmission<'_>,
+    ) -> feishu::delivery::CardWriteTicket {
+        feishu::delivery::UNOBSERVED.submit_ordered(submission).await
+    }
+
+    fn keyed_write_covered(
+        &self,
+        message_id: &str,
+        generation: u64,
+        intent: feishu::delivery::CardWriteIntent,
+    ) -> bool {
+        feishu::delivery::UNOBSERVED.keyed_write_covered(message_id, generation, intent)
+    }
+
+    fn keyed_ticket_await(&self) -> std::time::Duration {
+        *self.keyed_ticket_await.lock().unwrap()
+    }
+
+    fn keyed_write_settled(
+        &self,
+        message_id: &str,
+        generation: u64,
+        intent: feishu::delivery::CardWriteIntent,
+    ) -> Option<bool> {
+        feishu::delivery::UNOBSERVED.keyed_write_settled(message_id, generation, intent)
+    }
+
+    async fn drain_pending_card_updates(&self, force: bool) {
+        feishu::delivery::UNOBSERVED
+            .drain_pending_card_updates(force)
+            .await
+    }
+
+    fn has_pending_card_update(&self, message_id: &str) -> bool {
+        feishu::delivery::UNOBSERVED.has_pending_card_update(message_id)
+    }
+
+    fn pending_card_write(&self, message_id: &str, card: &serde_json::Value) -> Option<u64> {
+        feishu::delivery::UNOBSERVED.pending_card_write(message_id, card)
+    }
+
+    fn card_write_delivered(&self, message_id: &str, seq: u64) -> bool {
+        feishu::delivery::UNOBSERVED.card_write_delivered(message_id, seq)
+    }
+
+    fn failed_card_write(&self, message_id: &str, card: &serde_json::Value) -> Option<u64> {
+        feishu::delivery::UNOBSERVED.failed_card_write(message_id, card)
+    }
+
+    fn settled_card_write_delivered(&self, message_id: &str) -> Option<bool> {
+        feishu::delivery::UNOBSERVED.settled_card_write_delivered(message_id)
+    }
+
+    fn defer_notice_until_delivered(
+        &self,
+        message_id: &str,
+        seq: u64,
+        notice: feishu::DeferredNotice,
+    ) -> feishu::NoticeGate {
+        feishu::delivery::UNOBSERVED.defer_notice_until_delivered(message_id, seq, notice)
+    }
+}
+
 #[async_trait::async_trait]
 impl feishu::Platform for RecordingPlatform {
     async fn get_ws_endpoint(&self) -> crate::error::Result<String> {
         Ok("wss://example.test".into())
     }
 
-    fn keyed_ticket_await(&self) -> std::time::Duration {
-        *self.keyed_ticket_await.lock().unwrap()
+    fn delivery(&self) -> &dyn feishu::delivery::DeliveryObserver {
+        self
     }
 
     async fn reply_card(&self, reply_to: &str, card: &serde_json::Value) -> crate::error::Result<String> {

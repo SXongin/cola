@@ -219,7 +219,7 @@ async fn connect_and_listen(
     // not awaited: a slow or hung retry must not delay event processing.
     let drain_feishu = Arc::clone(feishu);
     tokio::spawn(async move {
-        drain_feishu.drain_pending_card_updates(true).await;
+        drain_feishu.delivery().drain_pending_card_updates(true).await;
     });
     handle_connection(ws_stream, sink, feishu, state).await
 }

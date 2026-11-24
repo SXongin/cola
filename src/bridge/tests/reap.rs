@@ -1094,6 +1094,7 @@ async fn a_collect_submits_the_live_generation_after_its_card_view_read() {
         .build();
     let outcome = cards
         .feishu
+        .delivery()
         .submit_ordered(crate::feishu::delivery::KeyedSubmission {
             message_id: "om_frozen",
             generation: 1,
@@ -1132,6 +1133,7 @@ async fn a_collect_submits_the_live_generation_after_its_card_view_read() {
         .build();
     let outcome = cards
         .feishu
+        .delivery()
         .submit_ordered(crate::feishu::delivery::KeyedSubmission {
             message_id: "om_frozen",
             generation: 0,
@@ -2131,7 +2133,7 @@ async fn a_recoverably_failed_collect_releases_the_cache() {
 
     // The drain delivers the owed collect: the card is collected, and the
     // stale cache stays gone.
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     wait_for_patches(&platform, "om_frozen", 2).await;
     let patches = patches_to(&platform, "om_frozen").await;
     assert_eq!(
@@ -2813,7 +2815,7 @@ async fn a_failed_stamp_patch_retries_until_it_lands() {
 
     spawn_sync(&app);
     wait_for_update_attempts(&platform, "om_frozen", 1).await;
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     wait_for_card_update(&platform, "the retried restart stamp", CardUpdates::Any, |card| {
         card_header(card).contains("已重启，等待运行结束")
     })
@@ -2871,7 +2873,7 @@ async fn a_rejected_stamp_is_attempted_once_and_given_up() {
                 .chains
                 .get("ses_test")
                 .is_some_and(|record| {
-                    app.cards_handle().feishu.keyed_write_covered(
+                    app.cards_handle().feishu.delivery().keyed_write_covered(
                         "om_frozen",
                         record.generation,
                         crate::feishu::delivery::CardWriteIntent::Stamp,
@@ -3688,6 +3690,7 @@ async fn a_released_lagged_handover_collects_at_the_handover_generation() {
     let outcome = app
         .cards_handle()
         .feishu
+        .delivery()
         .submit_ordered(crate::feishu::delivery::KeyedSubmission {
             message_id: "om_frozen",
             generation: lagging,
@@ -3754,6 +3757,7 @@ async fn a_repointed_lagged_handover_collects_at_the_handover_generation() {
     let outcome = app
         .cards_handle()
         .feishu
+        .delivery()
         .submit_ordered(crate::feishu::delivery::KeyedSubmission {
             message_id: "om_frozen",
             generation: lagging,
@@ -4106,6 +4110,7 @@ async fn a_rejected_preserved_ending_retries_the_bare_one() {
     let ticket = app
         .cards_handle()
         .feishu
+        .delivery()
         .submit_ordered(crate::feishu::delivery::KeyedSubmission {
             message_id: "om_frozen",
             generation: 0,
@@ -4427,7 +4432,10 @@ async fn a_transport_failed_settle_stays_owed_for_the_drain() {
         "a failed settle keeps the record for the queue's retry"
     );
     assert!(
-        app.cards_handle().feishu.has_pending_card_update("om_frozen"),
+        app.cards_handle()
+            .feishu
+            .delivery()
+            .has_pending_card_update("om_frozen"),
         "the ending is still owed"
     );
 }
@@ -4460,7 +4468,11 @@ async fn an_owed_settle_converges_through_the_pass_drain() {
             "the pass drain converges the ending and the reap releases the record",
             || async {
                 if app.cards_handle().chains.get("ses_test").is_none()
-                    && !app.cards_handle().feishu.has_pending_card_update("om_frozen")
+                    && !app
+                        .cards_handle()
+                        .feishu
+                        .delivery()
+                        .has_pending_card_update("om_frozen")
                 {
                     Some(())
                 } else {
@@ -4513,7 +4525,7 @@ async fn a_hung_keyed_write_does_not_block_the_pass() {
     // The write is still in flight and owned by the queue: the ending stays
     // owed — the record waits for it — and no re-decision PATCHes behind it.
     assert!(
-        app.cards_handle().feishu.keyed_write_covered(
+        app.cards_handle().feishu.delivery().keyed_write_covered(
             "om_frozen",
             0,
             crate::feishu::delivery::CardWriteIntent::Settle
@@ -4521,7 +4533,7 @@ async fn a_hung_keyed_write_does_not_block_the_pass() {
         "the hung write still owns its key"
     );
     assert!(
-        app.core.feishu.has_pending_card_update("om_frozen"),
+        app.core.feishu.delivery().has_pending_card_update("om_frozen"),
         "the hung ending is still owed"
     );
     assert!(
@@ -4863,16 +4875,16 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
         .expect("a failed ending write keeps the record");
     let card_id = record.card_message_id.clone();
     assert!(
-        app.core.feishu.has_pending_card_update(&card_id),
+        app.core.feishu.delivery().has_pending_card_update(&card_id),
         "the ending is still owed"
     );
 
     // Feishu returns: a forced drain (the WS reconnect path) delivers the
     // newest payload.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     assert!(
-        !app.core.feishu.has_pending_card_update(&card_id),
+        !app.core.feishu.delivery().has_pending_card_update(&card_id),
         "the drain delivered the ending"
     );
 
@@ -4916,7 +4928,7 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
         .expect("a failed ending write keeps the record")
         .card_message_id
         .clone();
-    assert!(app.core.feishu.has_pending_card_update(&card_id));
+    assert!(app.core.feishu.delivery().has_pending_card_update(&card_id));
 
     platform.clear_fail_update();
     spawn_sync(&app);
@@ -4927,7 +4939,7 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
             "the pass drain converges the card and the reap cleans the record",
             || async {
                 if app.cards_handle().chains.get("ses_test").is_none()
-                    && !app.core.feishu.has_pending_card_update(&card_id)
+                    && !app.core.feishu.delivery().has_pending_card_update(&card_id)
                 {
                     Some(())
                 } else {
@@ -10591,7 +10603,7 @@ async fn one_confirmed_write_advances_cursor_and_gap_together() {
     // Feishu returns: the drain delivers the failed body, and the reconcile
     // confirms it. Cursor and gap must move in the SAME record write.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
 
     assert_eq!(

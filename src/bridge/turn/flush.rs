@@ -264,8 +264,9 @@ fn ending_write_for_patch(
         EndingWrite::Failed
     } else if let Some(seq) = cards
         .feishu
+        .delivery()
         .pending_card_write(message_id, card)
-        .or_else(|| cards.feishu.failed_card_write(message_id, card))
+        .or_else(|| cards.feishu.delivery().failed_card_write(message_id, card))
     {
         EndingWrite::Owed(seq)
     } else {
@@ -432,7 +433,7 @@ async fn note_cursor_write_failure(
     if error.is_recoverable_card_write()
         && let Some(card_message_id) = card_message_id
     {
-        if let Some(seq) = cards.feishu.pending_card_write(card_message_id, card) {
+        if let Some(seq) = cards.feishu.delivery().pending_card_write(card_message_id, card) {
             // Still owed: the drain reconcile confirms the cursor once that
             // payload delivers. The body's endings are mirrored on the Chain
             // Records, keyed by this card (ADR-0080) — held there, not on the
@@ -452,8 +453,8 @@ async fn note_cursor_write_failure(
         // success — a cached repaint that may omit this body's delta — must
         // never advance the cursor, so the sequence asked about is the one
         // THIS payload failed at, not the entry's newest.
-        if let Some(seq) = cards.feishu.failed_card_write(card_message_id, card)
-            && cards.feishu.card_write_delivered(card_message_id, seq)
+        if let Some(seq) = cards.feishu.delivery().failed_card_write(card_message_id, card)
+            && cards.feishu.delivery().card_write_delivered(card_message_id, seq)
         {
             // The drain delivered this payload first: the write landed, so
             // confirm the exact stage this body carried — the mark and the
@@ -492,13 +493,18 @@ pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
         })
         .await;
     for (session_id, card_message_id, seq, expected) in due {
-        if cards.feishu.card_write_delivered(&card_message_id, seq) {
+        if cards
+            .feishu
+            .delivery()
+            .card_write_delivered(&card_message_id, seq)
+        {
             // Only the stage whose delivery was just verified is confirmed: a
             // body staged since (a fresh flush whose PATCH is still pending) is
             // left for its own confirmation (review #569).
             confirm_staged_cursor(cards, &session_id, &card_message_id, None, expected, &[]).await;
         } else if cards
             .feishu
+            .delivery()
             .settled_card_write_delivered(&card_message_id)
             .is_some()
         {
@@ -517,7 +523,11 @@ pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
     // lifecycle; the Session it names is corrected by a rename.
     let owed = cards.chains.owed_rendered();
     for (card_message_id, owed) in owed {
-        if cards.feishu.card_write_delivered(&card_message_id, owed.seq) {
+        if cards
+            .feishu
+            .delivery()
+            .card_write_delivered(&card_message_id, owed.seq)
+        {
             // Flip the bits and tell the live session's gate in ONE chains
             // critical section: `confirm_owed_rendered` re-reads the entry, so a
             // rename that moved it before this moment is honored (the cards lock
@@ -539,6 +549,7 @@ pub(crate) async fn reconcile_staged_cursors(cards: &CardsHandle) {
                 .await;
         } else if cards
             .feishu
+            .delivery()
             .settled_card_write_delivered(&card_message_id)
             .is_some()
         {
@@ -2288,7 +2299,7 @@ mod tests {
             .await
             .expect("the repaint lands");
         assert_eq!(
-            cards.feishu.settled_card_write_delivered("om_live"),
+            cards.feishu.delivery().settled_card_write_delivered("om_live"),
             Some(true),
             "the newest write settled delivered"
         );
@@ -2342,14 +2353,14 @@ mod tests {
             .await
             .expect_err("the transport failure");
         assert!(
-            cards.feishu.has_pending_card_update("om_live"),
+            cards.feishu.delivery().has_pending_card_update("om_live"),
             "a recoverable failure leaves the payload owed"
         );
         // ...and the drain delivers it before the failure note runs.
-        cards.feishu.drain_pending_card_updates(true).await;
-        assert!(!cards.feishu.has_pending_card_update("om_live"));
+        cards.feishu.delivery().drain_pending_card_updates(true).await;
+        assert!(!cards.feishu.delivery().has_pending_card_update("om_live"));
         assert_eq!(
-            cards.feishu.settled_card_write_delivered("om_live"),
+            cards.feishu.delivery().settled_card_write_delivered("om_live"),
             Some(true),
             "the settled write delivered"
         );
@@ -2460,7 +2471,7 @@ mod tests {
         // reconcile records the keys from the mirror even though the stage is
         // gone.
         platform.clear_fail_update();
-        cards.feishu.drain_pending_card_updates(true).await;
+        cards.feishu.delivery().drain_pending_card_updates(true).await;
         crate::bridge::turn::reconcile_staged_cursors(&cards).await;
 
         assert!(
@@ -2621,7 +2632,7 @@ mod tests {
         // Delivery arrives: the reconcile records the mark AND tells the chain
         // that is live now.
         platform.clear_fail_update();
-        cards.feishu.drain_pending_card_updates(true).await;
+        cards.feishu.delivery().drain_pending_card_updates(true).await;
         // A chain committing in THIS window — after the payload delivered but
         // before the reconcile records — must already see the entry's key, or it
         // would render the retirement the delivered card already showed (issue
@@ -2713,7 +2724,7 @@ mod tests {
         // Delivery arrives; the reconcile records the mark even though no
         // accumulator remains.
         platform.clear_fail_update();
-        cards.feishu.drain_pending_card_updates(true).await;
+        cards.feishu.delivery().drain_pending_card_updates(true).await;
         crate::bridge::turn::reconcile_staged_cursors(&cards).await;
 
         assert!(

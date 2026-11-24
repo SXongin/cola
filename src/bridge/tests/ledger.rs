@@ -1584,7 +1584,7 @@ async fn a_quiet_settle_defers_the_notice_until_the_retry_drains() {
 
     // Feishu returns: the drain delivers the owed update, and the notice fires.
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     let notices = wait_for_notice(&platform).await;
     assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
     assert!(
@@ -2073,7 +2073,7 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
     // bit. The absence assertion above alone would pass with the whole shown
     // fact removed, so the delivered half is pinned here (ADR-0080).
     platform.clear_fail_update();
-    app.core.feishu.drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
     crate::bridge::turn::reconcile_staged_cursors(&app.cards_handle()).await;
     assert!(
         app.cards_handle()

@@ -811,7 +811,7 @@ impl<'a> Endings<'a> {
         // A queued/owed payload whose delivery is verified is already on the
         // card: a plan built before that delivery must not re-show its entry.
         for (card, owed) in owed {
-            if cards.feishu.card_write_delivered(&card, owed.seq) {
+            if cards.feishu.delivery().card_write_delivered(&card, owed.seq) {
                 facts.note_owed(&owed.shown);
             }
         }
