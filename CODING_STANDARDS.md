@@ -95,8 +95,12 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
 - **Card JSON lives in `feishu/card`**: a `["tag"]` probe elsewhere needs an
   allowlist entry, and the `CardElement` type layer (`feishu/card/element.rs`)
   owns element construction and reading — build and probe an element through it.
-  A clip asks `feishu/card/clip.rs` for its surface's `budget::SurfaceBudget`
-  rather than passing a bare number. Run lifecycle has one owner, not four homes.
+  A clip asks `feishu/card/clip.rs` for its surface's `budget::SurfaceBudget`; a
+  whole surface's budget lives in `budget.rs`, while a width that is not a
+  whole surface (a picker row, a task label, a receipt residue, a per-line
+  field) stays its module's own constant and is wrapped at the call site as
+  `SurfaceBudget::chars(…)` — never a bare number. Run lifecycle has one owner,
+  not four homes.
 - **A comment carries an invariant, a wire/why trap, or an API contract the
   signature cannot express.** A bare pointer (an issue, an ADR) is fine; a
   retelling of the code is not — the docs contract found ~38% pure restatement

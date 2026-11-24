@@ -141,9 +141,12 @@ and the map from the old numbers.
 - **`card-budgets`** — the per-surface budgets (`feishu/card/budget.rs`:
   `CARD_ELEMENT`, `TIMELINE_ENTRY`, `TOOL_PANEL`, …) are **cola's own** budgets,
   not Feishu limits, and the doc comment there holds the evidence. Every clip
-  goes through `feishu/card/clip.rs` with one of them; never pass a bare
-  number. A tool panel deliberately exceeds 3000 chars, so its size is not a
-  bug and splitting it buys nothing.
+  goes through `feishu/card/clip.rs`, and a whole surface's budget lives in
+  `budget.rs`. A width that is NOT a whole surface — a picker row, a task
+  label, a receipt residue, a per-line field — stays its module's own constant,
+  wrapped at the call site as `SurfaceBudget::chars(…)`; never pass a bare
+  number to a clip. A tool panel deliberately exceeds 3000 chars, so its size
+  is not a bug and splitting it buys nothing.
   **A markdown split must stay construct-aware** (#1096): Feishu parses each
   card element on its own, so a fence or table crossing a budget goes through
   `card::clip`'s markdown split (`sanitize::split_construct_aware` behind it;

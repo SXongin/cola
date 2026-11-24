@@ -740,6 +740,21 @@ mod tests {
             }
         }
 
+        /// A zero or one-character plain budget still terminates and yields the
+        /// whole text: the split clamps like the markdown walker, so a shrunk
+        /// surface budget (`…less(n)`) can never spin.
+        #[test]
+        fn a_degenerate_plain_budget_still_terminates() {
+            assert_eq!(
+                clip("abc").split(budget::SurfaceBudget::plain(0)),
+                ["a", "b", "c"]
+            );
+            assert_eq!(
+                clip("abc").split(budget::SurfaceBudget::plain(1)),
+                ["a", "b", "c"]
+            );
+        }
+
         /// The fenced cut charges the fence and the language token against its
         /// escaped-byte budget: a body whose text fits can still clip once the
         /// block around it is counted, and the tail rule keeps the newest bytes.

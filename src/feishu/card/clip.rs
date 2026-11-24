@@ -86,6 +86,9 @@ impl<'a> Clip<'a> {
         if self.text.is_empty() {
             return Vec::new();
         }
+        // Clamp like the markdown walker: a zero budget (a `…less(n)` surface)
+        // must still advance one character per chunk, never spin.
+        let max = max.max(1);
         let mut chunks = Vec::new();
         let mut rest = self.text;
         while !rest.is_empty() {
