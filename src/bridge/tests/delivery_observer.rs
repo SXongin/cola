@@ -11,6 +11,7 @@ use crate::bridge::test_support::{
 };
 use crate::config::FeishuConfig;
 use crate::error::BridgeError;
+use crate::feishu::NoticeGate;
 use crate::feishu::Platform;
 use crate::feishu::client::Client;
 use crate::feishu::delivery::{
@@ -174,5 +175,67 @@ async fn a_platform_without_an_observer_fails_the_ordered_write_visibly() {
     assert!(
         !raw.delivery().card_write_delivered("om_unobserved", 1),
         "the no-op never claims a delivery"
+    );
+}
+
+/// The same no-op, read side: without an observer every delivery query says
+/// "nothing owed / never delivered", the notice gate keeps its documented
+/// ungated answer, and a drain has no queue to write from.
+#[tokio::test]
+async fn a_platform_without_an_observer_reports_no_delivery_state() {
+    let raw: Arc<dyn Platform> = Arc::new(Client::new(FeishuConfig {
+        app_id: "cli_test".into(),
+        app_secret: "secret".into(),
+    }));
+    let card = serde_json::json!({ "body": "never written" });
+    let delivery = raw.delivery();
+
+    assert!(
+        !delivery.keyed_write_covered("om_unobserved", 1, CardWriteIntent::Stamp),
+        "the no-op covers no key"
+    );
+    assert_eq!(
+        delivery.keyed_write_settled("om_unobserved", 1, CardWriteIntent::Stamp),
+        None,
+        "the no-op remembers no settled key"
+    );
+    assert_eq!(
+        delivery.failed_card_write("om_unobserved", &card),
+        None,
+        "the no-op remembers no failure"
+    );
+    assert!(
+        !delivery.card_write_delivered("om_unobserved", 1),
+        "no sequence is ever delivered"
+    );
+    assert_eq!(
+        delivery.settled_card_write_delivered("om_unobserved"),
+        None,
+        "no write ever settled"
+    );
+    assert_eq!(
+        delivery.defer_notice_until_delivered("om_unobserved", 1, Box::new(|| {})),
+        NoticeGate::Delivered,
+        "the no-queue answer is the ungated notice"
+    );
+
+    // The drain has no queue: the card owes nothing afterwards and no write
+    // leaves. The recorder's observer is the same documented no-op by
+    // delegation, so a drain that wrote would show up as a PATCH.
+    delivery.drain_pending_card_updates(true).await;
+    assert!(
+        !delivery.has_pending_card_update("om_unobserved"),
+        "the no-op drain leaves nothing owed"
+    );
+    assert_eq!(
+        delivery.pending_card_write("om_unobserved", &card),
+        None,
+        "the no-op drain retains no payload"
+    );
+    let recorder = Arc::new(RecordingPlatform::new());
+    recorder.delivery().drain_pending_card_updates(true).await;
+    assert!(
+        patches_to(&recorder, "om_unobserved").await.is_empty(),
+        "the no-op drain writes nothing"
     );
 }
