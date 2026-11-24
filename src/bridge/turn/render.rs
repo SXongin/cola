@@ -107,7 +107,7 @@ async fn refresh_session_title(
     session_id: &str,
 ) -> bool {
     // Only meaningful while a turn is actively streaming on a live card.
-    let acc_present = cards.cards.lock().await.contains_key(session_id);
+    let acc_present = cards.has(session_id).await;
     if !acc_present {
         return false;
     }
@@ -121,8 +121,7 @@ async fn refresh_session_title(
     if fresh.is_empty() {
         return false;
     }
-    let mut live = cards.cards.lock().await;
-    let Some(card) = live.get_mut(session_id) else {
+    let Some(mut card) = cards.card(session_id).await else {
         return false;
     };
     if card.acc.title() == fresh {
@@ -135,7 +134,7 @@ async fn refresh_session_title(
         fresh
     );
     card.acc.set_title(&fresh);
-    drop(live);
+    drop(card);
     Turn::flush_card(cards, session_id).await;
     // The topic cover card is the chat-list topic entry — sync it the MOMENT
     // the server title changes mid-turn (not only at turn end), so the list
@@ -1256,8 +1255,7 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
     //    same critical section as the live-panel revalidation (see
     //    `live_file_reply_target`).
     let pending = {
-        let live = cards.cards.lock().await;
-        let Some(card) = live.get(session_id) else {
+        let Some(card) = cards.card(session_id).await else {
             return false;
         };
         card.acc.pending_file_deliveries()
@@ -1335,8 +1333,7 @@ async fn resolve_file_deliveries(cards: &CardsHandle, session_id: &str) -> bool 
     //    under yet) is simply skipped and retried on a later poll.
     let mut changed = false;
     {
-        let mut live = cards.cards.lock().await;
-        if let Some(card) = live.get_mut(session_id) {
+        if let Some(mut card) = cards.card(session_id).await {
             for delivery in pending {
                 let Some(outcome) = resolved.get(&delivery.hash) else {
                     continue;
@@ -1470,8 +1467,7 @@ async fn live_file_reply_target(
     session_id: &str,
     upload: &InFlightUpload,
 ) -> Option<String> {
-    let live = cards.cards.lock().await;
-    let card = live.get(session_id)?;
+    let card = cards.card(session_id).await?;
     if !card
         .acc
         .file_delivery_current(&upload.call_id, upload.index, upload.hash)
@@ -3030,8 +3026,7 @@ async fn render_and_flush_inner(
         refresh_session_title(cards, sessions, backend, session_id).await;
     }
     let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans, typing) = {
-        let mut live = cards.cards.lock().await;
-        let card = live.get_mut(session_id)?;
+        let mut card = cards.card(session_id).await?;
         // The attachment's surface declaration, re-read each pass so a
         // reattach's new value governs the next render (ADR-0106). A change is
         // content the body owes (a stored plan/diff/usage/compaction surface
@@ -3169,10 +3164,8 @@ async fn render_and_flush_inner(
     };
     if mode.guards_forms()
         && cards
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|card| card.acc.awaits_typed_answer())
     {
         return Some(RenderPass {
@@ -3186,9 +3179,8 @@ async fn render_and_flush_inner(
         });
     }
     let entries_changed = {
-        let mut live = cards.cards.lock().await;
-        match live.get_mut(session_id) {
-            Some(card) => {
+        match cards.card(session_id).await {
+            Some(mut card) => {
                 let inserted = commit_planned_entries(&mut card.acc, plans, Endings::of(cards, session_id));
                 if inserted {
                     // An inserted entry is rendered content, not clock churn:
@@ -3204,9 +3196,8 @@ async fn render_and_flush_inner(
     // second changed: the 📊 segment is footer state the header signature
     // cannot see, and a silently-stale percentage is the bug this fixes.
     let context_changed = {
-        let mut live = cards.cards.lock().await;
-        match live.get_mut(session_id) {
-            Some(card) => {
+        match cards.card(session_id).await {
+            Some(mut card) => {
                 // The write advances the cache with the body it sends
                 // (`advance_sent_signatures`): advancing it here would record a
                 // footer a suppressed or refused write never sent, and this pass
@@ -3232,9 +3223,8 @@ async fn render_and_flush_inner(
                 finished,
                 clear_missing,
             } = liveness;
-            let mut live = cards.cards.lock().await;
-            match live.get_mut(session_id) {
-                Some(card) => {
+            match cards.card(session_id).await {
+                Some(mut card) => {
                     let ledger = refresh_ledger(
                         &mut card.acc,
                         transcript,
@@ -3421,8 +3411,7 @@ pub(super) fn background_subagent_children(transcript: &SessionTranscript) -> Ve
 /// pairs (ADR-0054), snapshotted under a short lock: the gather they feed is
 /// network and never runs under it.
 async fn live_panel_children(cards: &CardsHandle, session_id: &str) -> Vec<(String, String)> {
-    let live = cards.cards.lock().await;
-    match live.get(session_id) {
+    match cards.card(session_id).await {
         Some(card) => card.acc.live_task_children(),
         None => Vec::new(),
     }
@@ -10560,8 +10549,7 @@ Index: /x/src/main.rs
         // The transcript re-read replaced the panel's file (same call, same
         // index, different bytes) while the upload was in flight.
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut(sid).expect("the live card exists");
+            let mut card = cards.card(sid).await.expect("the live card exists");
             card.acc.push_tool(
                 "call_read",
                 ToolPanel::for_test_with_files("read", &[("other.bin", b"OTHER")]),
@@ -10608,8 +10596,7 @@ Index: /x/src/main.rs
             unreachable!("read_file_part builds a tool part");
         };
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut(sid).expect("the live card exists");
+            let mut card = cards.card(sid).await.expect("the live card exists");
             card.acc.push_tool("call_read", ToolPanel::new(call));
         }
 
@@ -10626,8 +10613,7 @@ Index: /x/src/main.rs
         // The transcript re-read replaced the panel's file (same call, same
         // index, different bytes) while the send was parked.
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut(sid).expect("the live card exists");
+            let mut card = cards.card(sid).await.expect("the live card exists");
             card.acc.push_tool(
                 "call_read",
                 ToolPanel::for_test_with_files("read", &[("other.bin", b"OTHER")]),
@@ -10646,8 +10632,8 @@ Index: /x/src/main.rs
             !changed,
             "the replaced panel's delivery is not attached, so the pass owes no flush"
         );
-        let live = cards.cards.lock().await;
-        let panel = live.get(sid).unwrap().acc.tools().get("call_read").unwrap();
+        let card = cards.card(sid).await.unwrap();
+        let panel = card.acc.tools().get("call_read").unwrap();
         assert_eq!(
             panel.files()[0].delivery,
             FileDelivery::Unresolved,
@@ -11476,8 +11462,7 @@ Index: /x/src/main.rs
         // The live card is re-pointed (a split / re-adopt) mid-upload; its panel
         // still holds the file, so the send proceeds.
         {
-            let mut live = cards.cards.lock().await;
-            let card = live.get_mut(sid).expect("the live card exists");
+            let mut card = cards.card(sid).await.expect("the live card exists");
             card.repoint("om_after");
         }
 
@@ -11991,10 +11976,8 @@ Index: /x/src/main.rs
     async fn cards_live_question(app: &Arc<App>, session_id: &str) -> bool {
         app.core
             .cards_handle()
-            .cards
-            .lock()
+            .card(session_id)
             .await
-            .get(session_id)
             .is_some_and(|card| card.acc.awaits_typed_answer())
     }
 
@@ -12041,8 +12024,8 @@ Index: /x/src/main.rs
 
         // A live `task` panel on the card names the same child as the ledger.
         {
-            let mut live = cards.cards.lock().await;
-            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            let mut card = cards.card(sid).await.expect("the seeded card");
+            let acc = &mut card.acc;
             acc.push_tool_at(
                 Some(now - 20_000),
                 "call_panel",
@@ -12180,8 +12163,8 @@ Index: /x/src/main.rs
         Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
         Turn::clear_phase(&cards, sid).await;
         {
-            let mut live = cards.cards.lock().await;
-            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            let mut card = cards.card(sid).await.expect("the seeded card");
+            let acc = &mut card.acc;
             acc.push_tool_at(
                 Some(now - 5_000),
                 "call_panel",
@@ -12356,8 +12339,8 @@ Index: /x/src/main.rs
         Turn::seed_card(&cards, sid, Some("om_lost_form")).await;
         Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
         {
-            let mut live = cards.cards.lock().await;
-            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            let mut card = cards.card(sid).await.expect("the seeded card");
+            let acc = &mut card.acc;
             assert!(acc.add_interaction(InteractionBlock::Question(PendingQuestion {
                 request_id: "q_form".into(),
                 session_id: "s".into(),
@@ -12490,8 +12473,8 @@ Index: /x/src/main.rs
             )])
         };
         {
-            let mut live = cards.cards.lock().await;
-            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            let mut card = cards.card(sid).await.expect("the seeded card");
+            let acc = &mut card.acc;
             acc.push_tool_at(Some(now - 10_000), "call_launch", ToolPanel::new(launch()));
         }
 
@@ -12653,8 +12636,8 @@ Index: /x/src/main.rs
             ..crate::backend::ToolCall::default()
         };
         {
-            let mut live = cards.cards.lock().await;
-            let acc = &mut live.get_mut(sid).expect("the seeded card").acc;
+            let mut card = cards.card(sid).await.expect("the seeded card");
+            let acc = &mut card.acc;
             acc.push_tool_at(Some(now - 10_000), "call_launch", ToolPanel::new(launch.clone()));
         }
         let transcript = SessionTranscript::new(vec![message(
@@ -13272,11 +13255,12 @@ Index: /x/src/main.rs
         acc.set_reply_target(Some("msg_1".into()));
         acc.set_session("ses_test");
         {
-            let mut cards = app.cards.lock().await;
-            cards.insert(
-                "ses_test".into(),
-                crate::bridge::turn::state::CardSession::new(acc, None),
-            );
+            app.cards
+                .insert(
+                    "ses_test",
+                    crate::bridge::turn::state::CardSession::new(acc, None),
+                )
+                .await;
         }
 
         // The server's live title differs → refresh must update the card subtitle.
@@ -13288,15 +13272,7 @@ Index: /x/src/main.rs
         )
         .await;
         assert!(refreshed, "a server rename must refresh the card title");
-        let title = app
-            .cards
-            .lock()
-            .await
-            .get("ses_test")
-            .unwrap()
-            .acc
-            .title()
-            .to_string();
+        let title = app.cards.card("ses_test").await.unwrap().acc.title().to_string();
         assert_eq!(title, "修复登录鉴权问题 · test");
         // A second refresh with no further change must be a no-op (no churn).
         assert!(
@@ -13310,7 +13286,7 @@ Index: /x/src/main.rs
             "no change when the title already matches"
         );
         // No accumulator (a finished turn) → refresh is a no-op.
-        app.cards.lock().await.remove("ses_test");
+        app.cards.remove("ses_test").await;
         assert!(
             !refresh_session_title(
                 &app.cards_handle(),
@@ -13359,11 +13335,12 @@ Index: /x/src/main.rs
         acc.set_reply_target(Some("msg_1".into()));
         acc.set_session("ses_test");
         {
-            let mut cards = app.cards.lock().await;
-            cards.insert(
-                "ses_test".into(),
-                crate::bridge::turn::state::CardSession::new(acc, None),
-            );
+            app.cards
+                .insert(
+                    "ses_test",
+                    crate::bridge::turn::state::CardSession::new(acc, None),
+                )
+                .await;
         }
 
         let refreshed = refresh_session_title(

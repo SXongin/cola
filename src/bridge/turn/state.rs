@@ -6038,14 +6038,10 @@ pub(super) fn resolve_vanished_blocks(
 /// lock only wraps the field swap. Best effort: a missing card or directory is
 /// a no-op, and a failed read keeps the start capture (`apply_git_state`).
 pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) {
-    let dir = {
-        let live = cards.cards.lock().await;
-        live.get(session_id).and_then(|c| c.acc.directory.clone())
-    };
+    let dir = { cards.card(session_id).await.and_then(|c| c.acc.directory.clone()) };
     let Some(dir) = dir else { return };
     let state = crate::git::read_state(&dir).await;
-    let mut live = cards.cards.lock().await;
-    if let Some(card) = live.get_mut(session_id)
+    if let Some(mut card) = cards.card(session_id).await
         // The move-follow may have re-pointed the card while the git read was
         // in flight (#450): applying this read's state then would restore the
         // pre-move branch. Only the card still captured at the directory this
@@ -6068,16 +6064,12 @@ pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) 
 /// Session's location: the card moves there with no git facts rather than
 /// keeping the previous checkout's branch and 🌲.
 pub(super) async fn follow_work_context(cards: &CardsHandle, session_id: &str, from: &str, to: &str) {
-    let captured = {
-        let live = cards.cards.lock().await;
-        live.get(session_id).and_then(|c| c.acc.directory.clone())
-    };
+    let captured = { cards.card(session_id).await.and_then(|c| c.acc.directory.clone()) };
     if captured.as_deref() != Some(from) {
         return;
     }
     let ctx = followed_context(to).await;
-    let mut live = cards.cards.lock().await;
-    if let Some(card) = live.get_mut(session_id)
+    if let Some(mut card) = cards.card(session_id).await
         && card.acc.directory.as_deref() == Some(from)
     {
         card.acc.replace_work_context(ctx);
@@ -6109,7 +6101,7 @@ async fn followed_context(directory: &str) -> WorkContext {
 #[cfg(test)]
 pub(super) async fn seed_work_context(cards: &CardsHandle, session_id: &str, directory: &str) {
     let ctx = StreamAccumulator::capture_work_context(directory).await;
-    if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+    if let Some(mut card) = cards.card(session_id).await {
         card.acc.apply_work_context(ctx);
     }
 }
@@ -6121,8 +6113,7 @@ pub(super) async fn card_work_context(
     cards: &CardsHandle,
     session_id: &str,
 ) -> Option<(Option<String>, Option<String>, bool, Option<String>)> {
-    let live = cards.cards.lock().await;
-    live.get(session_id).map(|card| {
+    cards.card(session_id).await.map(|card| {
         (
             card.acc.directory.clone(),
             card.acc.branch.clone(),
@@ -6146,10 +6137,10 @@ pub(super) async fn refresh_context_window(
     session_id: &str,
 ) {
     let key = {
-        let live = cards.cards.lock().await;
-        let Some(acc) = live.get(session_id).map(|c| &c.acc) else {
+        let Some(card) = cards.card(session_id).await else {
             return;
         };
+        let acc = &card.acc;
         // Before the first usage there is nothing any card could show.
         if acc.context_tokens <= 0 {
             return;
@@ -6166,17 +6157,17 @@ pub(super) async fn refresh_context_window(
     let Ok(window) = backend.model_context_window(&key.0, &key.1).await else {
         return;
     };
-    let mut live = cards.cards.lock().await;
-    if let Some(acc) = live.get_mut(session_id).map(|c| &mut c.acc)
+    if let Some(mut card) = cards.card(session_id).await
         // A concurrent refresh may have moved the memo to a newer model while
         // this request was in flight; never clobber it with a stale answer.
-        && acc
+        && card
+            .acc
             .context_window_key
             .as_ref()
             .is_none_or(|current| current == &key)
     {
-        acc.context_window_key = Some(key);
-        acc.context_window = window;
+        card.acc.context_window_key = Some(key);
+        card.acc.context_window = window;
     }
 }
 

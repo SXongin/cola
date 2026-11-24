@@ -938,7 +938,8 @@ async fn a_card_read_cancelled_inside_the_commit_publishes_no_map_entry_or_secon
     // the cards map so the commit's insert cannot run, release the send, then
     // abort the future while it waits for the map.
     let cards_handle = app.cards_handle();
-    let cards_guard = cards_handle.cards.lock().await;
+    Turn::seed_card(&cards_handle, "ses_donor", None).await;
+    let cards_guard = cards_handle.card("ses_donor").await.expect("the donor card");
     release.notify_one();
     for _ in 0..20 {
         tokio::task::yield_now().await;

@@ -2548,7 +2548,7 @@ async fn a_cancel_during_read_back_leaves_the_applied_effort_for_the_next_turn()
     let _ = cancelled.await;
     app.waits_handle().inflight.lock().await.remove(THREAD);
     app.waits_handle().inbound.lock().await.remove(THREAD);
-    app.cards.lock().await.clear();
+    app.cards.with_map(|live| live.clear()).await;
     // Two legitimate orderings: the read-back completed and the bridge committed
     // before the abort landed, or the abort won and the adapter's applied record
     // is still waiting. Either way the fact must not be lost.

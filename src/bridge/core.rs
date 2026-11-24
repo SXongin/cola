@@ -67,7 +67,10 @@ pub struct SharedCore {
     /// the pid record and the restart notice — is read from here.
     pub layout: crate::state::StateLayout,
     /// session_id → the session's one live card (accumulator + card id chain).
-    pub cards: Arc<Mutex<HashMap<String, crate::bridge::turn::CardSession>>>,
+    /// [`crate::bridge::handles::card_map::CardMap`]'s private map is the raw
+    /// state; the per-session and whole-map doors are its accessors (ticket
+    /// #1136).
+    pub cards: crate::bridge::handles::card_map::CardMap,
     /// The card handles (ADR-0038, rule 2): `request_id → message_id` plus, for
     /// every card that shows a live interaction block, the card JSON as last
     /// rendered. Lets any card showing a block be repainted — a click's ack, a
@@ -362,7 +365,7 @@ impl SharedCore {
         tasks.attach_chains(Arc::clone(&chains));
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
-            cards: Arc::new(Mutex::new(HashMap::new())),
+            cards: crate::bridge::handles::card_map::CardMap::new(),
             card_handles: Arc::new(Mutex::new(
                 crate::bridge::card_handles::CardHandles::with_surfaces(Arc::clone(&surfaces)),
             )),
@@ -544,7 +547,7 @@ impl SharedCore {
     /// cover records and the platform as a narrow handle.
     pub(crate) fn cards_handle(&self) -> crate::bridge::handles::CardsHandle {
         crate::bridge::handles::CardsHandle::new(
-            Arc::clone(&self.cards),
+            self.cards.clone(),
             Arc::clone(&self.card_handles),
             Arc::clone(&self.cover_titles),
             Arc::clone(&self.feishu),

@@ -4610,12 +4610,11 @@ impl App {
         // (`None` is also the zero-live-task case: there is nothing to clear.)
         // The waiting card's Turn is the run scope: a supplement is not a new
         // Turn (ADR-0043), so the newest user message cannot stand in for it.
-        let anchor = {
-            let cards = handles.cards.cards.lock().await;
-            cards
-                .get(&session_id)
-                .and_then(|card| card.card_turn_anchor().cloned())
-        };
+        let anchor = handles
+            .cards
+            .card(&session_id)
+            .await
+            .and_then(|card| card.card_turn_anchor().cloned());
         let verdict = crate::bridge::runtime::reconcile_now(
             &handles.backend,
             &session_id,
