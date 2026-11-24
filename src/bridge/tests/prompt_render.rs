@@ -1153,7 +1153,7 @@ async fn busy_retry_without_an_anchor_leaves_the_card_retryable() {
     // Let the spawned decision run: it must not submit, and it must give the
     // claim back (the no-anchor fallback leaves the button usable).
     let retryable = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
+        wait_for("the fallback releases the retry claim", || async {
             if crate::bridge::turn::Turn::claim_recovery(
                 &app.cards_handle(),
                 "ses_test",
@@ -1162,10 +1162,12 @@ async fn busy_retry_without_an_anchor_leaves_the_card_retryable() {
             .await
             .is_some()
             {
-                return;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await;
     assert!(retryable.is_ok(), "the fallback must release the claim");

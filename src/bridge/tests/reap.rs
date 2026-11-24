@@ -4507,14 +4507,19 @@ async fn an_owed_settle_converges_through_the_pass_drain() {
     // confirms the ending and releases the record — both observed here, or the
     // test times out.
     tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            if app.cards_handle().chains.get("ses_test").is_none()
-                && !app.cards_handle().feishu.has_pending_card_update("om_frozen")
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for(
+            "the pass drain converges the ending and the reap releases the record",
+            || async {
+                if app.cards_handle().chains.get("ses_test").is_none()
+                    && !app.cards_handle().feishu.has_pending_card_update("om_frozen")
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+        )
+        .await
     })
     .await
     .expect("the pass drain converges the ending and the reap releases the record");
@@ -4925,12 +4930,14 @@ async fn a_failed_final_patch_keeps_the_record_until_delivery() {
     // The next Session Sync pass's reap drops the now-confirmed record.
     spawn_sync(&app);
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
+        wait_for("the reap must clean the confirmed record", || async {
             if app.cards_handle().chains.get("ses_test").is_none() {
-                return;
+                Some(())
+            } else {
+                None
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the reap must clean the confirmed record");
@@ -4967,14 +4974,19 @@ async fn the_session_sync_pass_retries_a_failed_final_patch() {
     // The pass drain retries once the 5s backoff elapses; the reap then drops
     // the confirmed record — both observed here, or the test times out.
     tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            if app.cards_handle().chains.get("ses_test").is_none()
-                && !app.core.feishu.has_pending_card_update(&card_id)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for(
+            "the pass drain converges the card and the reap cleans the record",
+            || async {
+                if app.cards_handle().chains.get("ses_test").is_none()
+                    && !app.core.feishu.has_pending_card_update(&card_id)
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+        )
+        .await
     })
     .await
     .expect("the pass drain converges the card and the reap cleans the record");
@@ -5025,18 +5037,23 @@ async fn a_restart_after_a_failed_final_patch_reaps_the_card() {
 
     spawn_sync(&restarted);
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let settled = platform2.calls.lock().await.iter().any(|call| match call {
-                PlatformCall::UpdateMessage { message_id, card } => {
-                    message_id == &card_id && card_header(card).contains("✅")
+        wait_for(
+            "the reap settles the orphaned card and drops its record",
+            || async {
+                let settled = platform2.calls.lock().await.iter().any(|call| match call {
+                    PlatformCall::UpdateMessage { message_id, card } => {
+                        message_id == &card_id && card_header(card).contains("✅")
+                    }
+                    _ => false,
+                });
+                if settled && restarted.cards_handle().chains.get("ses_test").is_none() {
+                    Some(())
+                } else {
+                    None
                 }
-                _ => false,
-            });
-            if settled && restarted.cards_handle().chains.get("ses_test").is_none() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+            },
+        )
+        .await
     })
     .await
     .expect("the reap settles the orphaned card and drops its record");
@@ -5447,22 +5464,23 @@ async fn a_top_level_projection_landing_clears_the_reply_target_in_one_write() {
     // The top-level successor lands ⏳ and the landing's own write clears the
     // refused target. A carry would leave `om_withdrawn` on the record.
     let probe = async {
-        loop {
-            let landed = platform
-                .sent_cards()
-                .await
-                .iter()
-                .any(|card| card_header(card).contains("等待后台任务"));
-            let cleared = app
-                .cards_handle()
-                .chains
-                .get("ses_test")
-                .is_some_and(|record| record.reply_to.is_none());
-            if landed && cleared {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for(
+            "the waiting successor never landed with the target cleared",
+            || async {
+                let landed = platform
+                    .sent_cards()
+                    .await
+                    .iter()
+                    .any(|card| card_header(card).contains("等待后台任务"));
+                let cleared = app
+                    .cards_handle()
+                    .chains
+                    .get("ses_test")
+                    .is_some_and(|record| record.reply_to.is_none());
+                if landed && cleared { Some(()) } else { None }
+            },
+        )
+        .await
     };
     let observed = tokio::time::timeout(Duration::from_secs(5), probe).await.is_ok();
     assert!(
@@ -6555,22 +6573,19 @@ async fn a_record_with_no_deliverable_target_claims_nothing() {
     spawn_sync(&app);
     // Let several passes run: the record claims nothing, forever — no
     // projection create, no empty-id settle PATCH.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_for("the reap never observed the targetless record", || async {
         assert!(
             platform.replied_cards().await.is_empty(),
             "no projection without a deliverable target: {:?}",
             platform.calls.lock().await
         );
         if backend.transcript_calls.lock().await.len() >= 3 {
-            break;
+            Some(())
+        } else {
+            None
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the reap never observed the targetless record"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    })
+    .await;
     assert!(
         patches_to(&platform, "").await.is_empty(),
         "nothing ever PATCHes an empty card id: {:?}",
@@ -7129,12 +7144,17 @@ async fn an_adoption_carries_a_pending_request_onto_the_successor() {
     // ...and its cache release lands with it: the old card's cached JSON is
     // dropped so no later edit may repaint the pre-collect presentation.
     let released = async {
-        loop {
-            if app.card_handles.lock().await.cached_card("om_frozen").is_none() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for(
+            "the collect released the old card's stale handle cache",
+            || async {
+                if app.card_handles.lock().await.cached_card("om_frozen").is_none() {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+        )
+        .await
     };
     tokio::time::timeout(Duration::from_secs(5), released)
         .await
@@ -9443,21 +9463,21 @@ async fn an_unplaceable_cursor_keeps_an_ended_records_record() {
     spawn_sync(&app);
     // The reap either releases the record on its first pass (the loss this
     // test forbids) or keeps it and keeps observing it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        assert!(
-            app.cards_handle().chains.get("ses_test").is_some(),
-            "an unplaceable cursor must never settle and release the record"
-        );
-        if backend.transcript_calls.lock().await.len() >= 3 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the reap never observed the kept record"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for(
+        "the record is kept for a later read that places the cursor",
+        || async {
+            assert!(
+                app.cards_handle().chains.get("ses_test").is_some(),
+                "an unplaceable cursor must never settle and release the record"
+            );
+            if backend.transcript_calls.lock().await.len() >= 3 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await;
 
     assert!(
         patches_to(&platform, "om_frozen").await.is_empty(),
@@ -9611,22 +9631,15 @@ async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
     );
     // The confirmed write that carried the gap clears the durable fact: a
     // restart renders it never again (spec #561, review #569).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_for("the durable gap is never cleared", || async {
         let cleared = app
             .cards_handle()
             .chains
             .get("ses_test")
             .is_none_or(|record| record.pending_gap.is_none());
-        if cleared {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the durable gap is never cleared"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        if cleared { Some(()) } else { None }
+    })
+    .await;
     drop(turn);
 }
 /// A live projection whose CONTINUATION create failed still gets followed
@@ -9996,21 +10009,18 @@ async fn a_truncated_read_never_settles_an_ended_record_as_complete() {
     spawn_sync(&app);
     // The reap either settles and releases the record (the bug this test
     // forbids) or keeps it and keeps observing.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_for("the record waits for a complete read", || async {
         assert!(
             app.cards_handle().chains.get("ses_test").is_some(),
             "a truncated read must never settle and release the record"
         );
         if backend.transcript_calls.lock().await.len() >= 3 {
-            break;
+            Some(())
+        } else {
+            None
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the reap never observed the kept record"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    })
+    .await;
 
     assert!(
         patches_to(&platform, "om_frozen").await.is_empty(),
@@ -10230,22 +10240,15 @@ async fn a_fresh_turn_carries_a_pending_gap() {
     );
     // The write that carried the gap clears the durable fact: no later Turn
     // re-renders the tail.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_for("the carried gap is never cleared", || async {
         let cleared = app
             .cards_handle()
             .chains
             .get("ses_test")
             .is_none_or(|record| record.pending_gap.is_none());
-        if cleared {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the carried gap is never cleared"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        if cleared { Some(()) } else { None }
+    })
+    .await;
     drop(turn);
 }
 
@@ -10447,26 +10450,19 @@ async fn a_restart_re_renders_nothing_for_two_parts_at_one_server_time() {
         restarted_app_with_backend(&session_file, transcript(), Some(SessionStatus::Idle)).await;
     platform2.given_card_view("msg_reply", realistic_card_view());
     spawn_sync(&app2);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_for("the in-place settle", || async {
+        let settled = patches_to(&platform2, "msg_reply")
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("✅"));
         assert!(
             platform2.replied_cards().await.is_empty(),
             "a restart re-renders nothing the old card showed: {:?}",
             platform2.calls.lock().await
         );
-        let settled = patches_to(&platform2, "msg_reply")
-            .await
-            .iter()
-            .any(|card| card_header(card).contains("✅"));
-        if settled {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the recorded card never settles in place"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        if settled { Some(()) } else { None }
+    })
+    .await;
     let settled = last_update_of(&platform2, "msg_reply")
         .await
         .expect("the in-place settle");
@@ -11030,13 +11026,8 @@ async fn a_takeover_records_the_gap_before_its_read_completes() {
     platform2.given_card_view("msg_reply", realistic_card_view());
     spawn_sync(&app2);
     // The reap runs: the record must survive every pass.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_for("the reap never observed the kept record", || async {
         let kept = app2.cards_handle().chains.get("ses_test");
-        assert!(
-            kept.as_ref().is_some_and(|record| record.pending_gap.is_some()),
-            "an Unreceived ending never releases an owed gap: {kept:?}"
-        );
         let reads = backend2
             .session_status_reads
             .lock()
@@ -11044,15 +11035,13 @@ async fn a_takeover_records_the_gap_before_its_read_completes() {
             .iter()
             .filter(|sid| sid.as_str() == "ses_test")
             .count();
-        if reads >= 2 {
-            break;
-        }
         assert!(
-            tokio::time::Instant::now() < deadline,
-            "the reap never observed the kept record"
+            kept.as_ref().is_some_and(|record| record.pending_gap.is_some()),
+            "an Unreceived ending never releases an owed gap: {kept:?}"
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        if reads >= 2 { Some(()) } else { None }
+    })
+    .await;
     drop(app2);
 
     // Life 3: the next user Turn takes the chain over and lands the tail
@@ -11158,8 +11147,7 @@ async fn a_takeover_keeps_an_unresolved_projection_intent() {
     spawn_sync(&app2);
     // Either the old card is repaired in place (the fix) or a successor is
     // posted again (the bug this test forbids).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
+    wait_for("the repaired card", || async {
         assert_eq!(
             card_posts(&platform2).await,
             0,
@@ -11170,15 +11158,9 @@ async fn a_takeover_keeps_an_unresolved_projection_intent() {
             .await
             .iter()
             .any(|card| card_header(card).contains("✅"));
-        if repaired {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the record never repairs the old card in place"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        if repaired { Some(()) } else { None }
+    })
+    .await;
     assert!(
         !card_text(
             &last_update_of(&platform2, "msg_reply")

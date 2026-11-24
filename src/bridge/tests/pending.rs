@@ -117,17 +117,14 @@ async fn a_stalled_writer_does_not_stall_the_dir_pick_callback() {
 
     // Releasing the writer lands it, in order, after the callback answered.
     pause.release();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    wait_for("the deferred write landed after the callback", || async {
         if std::fs::read_to_string(&sessions).is_ok_and(|text| text.contains("/work/b")) {
-            break;
+            Some(())
+        } else {
+            None
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the deferred write landed after the callback"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    })
+    .await
 }
 
 /// ADR-0089's documented price: a write still in flight at the deadline
@@ -285,17 +282,14 @@ async fn a_stalled_writer_does_not_stall_the_browse_pick_callback() {
 
     pause.release();
     let expected = expected.to_string_lossy().to_string();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    wait_for("the deferred write landed after the callback", || async {
         if saved_pending_dirs(&sessions) == vec![expected.clone()] {
-            break;
+            Some(())
+        } else {
+            None
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the deferred write landed after the callback"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    })
+    .await
 }
 
 /// The same bound on the `/switch` card's 新建, which declares through
@@ -354,17 +348,14 @@ async fn a_stalled_writer_does_not_stall_the_switch_new_callback() {
     );
 
     pause.release();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    wait_for("the deferred write landed after the callback", || async {
         if std::fs::read_to_string(&sessions).is_ok_and(|text| text.contains("/work/proj")) {
-            break;
+            Some(())
+        } else {
+            None
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the deferred write landed after the callback"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    })
+    .await
 }
 
 /// The click's card refresh is bounded by the same deadline as its store write:

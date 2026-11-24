@@ -1561,14 +1561,14 @@ async fn a_quiet_settle_defers_the_notice_until_the_retry_drains() {
     platform.fail_update(UpdateFailure::Transport, ALWAYS);
     script_quiet_true_end(&backend).await;
     spawn_sync(&app);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Done) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the quiet true end never settled the card"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the quiet true end never settled the card", || async {
+        if Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Done) {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     // Let the settle's own announce land (it trails the PATCH it gates): with
     // the gate armed nothing is sent, but a send outside the gate would surface.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2109,14 +2109,17 @@ async fn a_refused_yielded_refresh_recovers_on_settlement() {
     platform.fail_update(UpdateFailure::ContentRefused, 2);
     spawn_sync(&app);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while patches_to(&platform, "om_waiting").await.len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the doubly-refused refresh never made its two attempts"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for(
+        "the doubly-refused refresh never made its two attempts",
+        || async {
+            if patches_to(&platform, "om_waiting").await.len() < 2 {
+                None
+            } else {
+                Some(())
+            }
+        },
+    )
+    .await;
     // The old card takes the plain attempt and its fenced retry; the
     // SETTLEMENT then continues on a NEW card instead of suspending (issue
     // #886), and the refused slice's entry stays owed.
@@ -3715,16 +3718,16 @@ async fn a_cleanup_click_whose_card_is_replaced_still_ends_the_tasks() {
     // The click's own pass ran: only the click's verdict path is unthrottled,
     // so these counters can have moved for it alone — and everything it
     // records happens here, before its refresh reaches the held lock.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while backend.task_runtime_calls.lock().await.len() <= runtime_reads
-        || backend.child_evidence_calls.lock().await.len() <= evidence_reads
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the cleanup pipeline never spent its own reads"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the cleanup pipeline spent its own reads", || async {
+        if backend.task_runtime_calls.lock().await.len() <= runtime_reads
+            || backend.child_evidence_calls.lock().await.len() <= evidence_reads
+        {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
 
     // The chain moves under the parked refresh: the new Turn's supersede
     // collects the waiting card (the mark, `CardState::Superseded`, never
@@ -3736,30 +3739,30 @@ async fn a_cleanup_click_whose_card_is_replaced_still_ends_the_tasks() {
         second
     };
     let next_turn = spawn_turn(&app, second);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Superseded) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the new Turn never superseded the waiting card"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the new Turn never superseded the waiting card", || async {
+        if Turn::card_state(&app.cards_handle(), "ses_test").await != Some(CardState::Superseded) {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     drop(guard);
     // The refused refresh submits nothing, so the collect is the old card's
     // only write left: wait for it to land — a condition, never a count or a
     // sleep — before freezing the world again.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !patches_to(&platform, "om_waiting")
-        .await
-        .iter()
-        .any(|card| card_header(card).contains("已由新消息接管"))
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the takeover's collect never landed on the old card"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the takeover's collect landed on the old card", || async {
+        if patches_to(&platform, "om_waiting")
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("已由新消息接管"))
+        {
+            Some(())
+        } else {
+            None
+        }
+    })
+    .await;
     // Every earlier writer has finished (the write lock is FIFO), so the
     // assertions below read a still world.
     let guard2 = write_lock.lock().await;
@@ -3914,14 +3917,14 @@ async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
     // longer knows the shell.
     let gate = backend.hold_transcripts();
     spawn_sync(&app);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while backend.transcript_gate_entered.load(Ordering::SeqCst) == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Session Sync never reached the parked read"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("Session Sync never reached the parked read", || async {
+        if backend.transcript_gate_entered.load(Ordering::SeqCst) == 0 {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     backend.task_runtime.lock().unwrap().shells = vec![("sh_call_bg".into(), ShellRuntime::Missing)];
     script_transcript(
         &backend,
@@ -7699,14 +7702,14 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
     // which is exactly the shape that used to lose the exactly-once fact. The
     // ending is session-scoped (ADR-0080): it and its shown bit outlive the
     // record, so a restart still knows the entry was shown.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while app.cards_handle().chains.get("ses_test").is_some() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the settled chain never released its durable record"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the settled chain never released its durable record", || async {
+        if app.cards_handle().chains.get("ses_test").is_some() {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     let persisted = ChainRecords::load(crate::state::StateLayout::beside(
         &session_file,
         "chain_records.json",

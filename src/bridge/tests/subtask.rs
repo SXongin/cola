@@ -156,7 +156,7 @@ async fn subtask_permission_whose_host_goes_idle_before_insert_surfaces_standalo
         })
     };
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
+        wait_for("the sweep walks the parent chain to resolve the host", || async {
             // `prepare`'s auto-accept walk, `resolve_card_target` and then
             // `inline_host_session` each read the child's parent; the THIRD
             // `session_info(child)` means the host walk is evaluating the
@@ -167,11 +167,9 @@ async fn subtask_permission_whose_host_goes_idle_before_insert_surfaces_standalo
                 .iter()
                 .filter(|id| id.as_str() == child)
                 .count();
-            if walked >= 3 {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+            if walked >= 3 { Some(()) } else { None }
+        })
+        .await
     })
     .await
     .expect("the sweep must walk the parent chain to resolve the host");

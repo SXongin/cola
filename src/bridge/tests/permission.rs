@@ -671,18 +671,11 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
 
     // Without a bound on the list call the poller sits on the first hung
     // call forever and the permission never surfaces.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    wait_for("poller never recovered from the hung list call", || async {
         let surfaced = Turn::has_interaction_in(&app.cards_handle(), "ses_test", "per_hung").await;
-        if surfaced {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "poller never recovered from the hung list call"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+        if surfaced { Some(()) } else { None }
+    })
+    .await
 }
 
 /// Clicking "开启自动授权" on a permission card turns on the session's

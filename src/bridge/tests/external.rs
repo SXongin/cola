@@ -505,24 +505,20 @@ async fn external_poller_recovers_when_messages_hangs() {
 
     // Without a bound on the per-session read the poller sits on the first
     // hung call forever and the notification never arrives.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let notified = platform.calls.lock().await.iter().any(|c| {
-            matches!(
-                c,
-                PlatformCall::SendCard { card, .. }
-                    if card_text(card).contains("有新消息")
-            )
-        });
-        if notified {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "external poller never recovered from the hung messages call"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    wait_for(
+        "external poller never recovered from the hung messages call",
+        || async {
+            let notified = platform.calls.lock().await.iter().any(|c| {
+                matches!(
+                    c,
+                    PlatformCall::SendCard { card, .. }
+                        if card_text(card).contains("有新消息")
+                )
+            });
+            if notified { Some(()) } else { None }
+        },
+    )
+    .await
 }
 
 /// Completion detection reads the Session Transcript's turn projection: the
@@ -1544,15 +1540,20 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
     // The renderer only arms after the poller's first pass; wait for the arm
     // (bounded), then leave ample time for the 30 ms idle bound to run out.
     let armed = async {
-        loop {
-            if Turn::armed_turn_anchor(&app.cards_handle(), "ses_ext")
-                .await
-                .is_some()
-            {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        wait_for(
+            "the poller must arm the renderer for the external message",
+            || async {
+                if Turn::armed_turn_anchor(&app.cards_handle(), "ses_ext")
+                    .await
+                    .is_some()
+                {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+        )
+        .await
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), armed)
         .await
@@ -2967,8 +2968,7 @@ async fn session_sync_follows_a_moved_session_to_its_new_directory() {
         }
     });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    wait_for("still mapped", || async {
         let moved = app
             .sessions
             .lock()
@@ -2976,15 +2976,9 @@ async fn session_sync_follows_a_moved_session_to_its_new_directory() {
             .directory_for_session("ses_moved")
             .as_deref()
             == Some("/work/.worktrees/zh-user-guide");
-        if moved {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the sync pass must follow the server-reported location"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+        if moved { Some(()) } else { None }
+    })
+    .await;
 
     let entry = app
         .sessions
@@ -3072,22 +3066,15 @@ async fn a_followed_move_repoints_the_live_card_footer() {
         }
     });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    wait_for("the card is still tracked", || async {
         let followed = Turn::card_work_context(&cards, "ses_moved_card")
             .await
             .and_then(|(directory, _, _, _)| directory)
             .as_deref()
             == Some(new.to_string_lossy().as_ref());
-        if followed {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the live card must follow the move to {new:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+        if followed { Some(()) } else { None }
+    })
+    .await;
 
     let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_card")
         .await
@@ -3155,22 +3142,15 @@ async fn a_followed_move_to_a_plain_directory_clears_the_old_git_state() {
         }
     });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    wait_for("the card is still tracked", || async {
         let followed = Turn::card_work_context(&cards, "ses_moved_plain")
             .await
             .and_then(|(directory, _, _, _)| directory)
             .as_deref()
             == Some(new.to_string_lossy().as_ref());
-        if followed {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the live card must follow the move to {new:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+        if followed { Some(()) } else { None }
+    })
+    .await;
 
     let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_plain")
         .await
@@ -3239,22 +3219,15 @@ async fn a_followed_move_to_a_vanished_target_still_moves_the_card() {
         }
     });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
+    wait_for("the card is still tracked", || async {
         let followed = Turn::card_work_context(&cards, "ses_moved_gone")
             .await
             .and_then(|(directory, _, _, _)| directory)
             .as_deref()
             == Some(new.to_string_lossy().as_ref());
-        if followed {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the live card must follow the move to {new:?}, even though it is gone"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+        if followed { Some(()) } else { None }
+    })
+    .await;
 
     let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_gone")
         .await

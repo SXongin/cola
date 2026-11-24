@@ -249,18 +249,15 @@ async fn a_second_click_after_the_send_is_a_no_op() {
     // The send is recorded before the delivery marks the Turn `Sent`; retry
     // the duplicate click until that terminal state is observable (each
     // intermediate click is itself a harmless no-op).
-    let mut toast = None;
-    for _ in 0..200 {
-        let repeated = app
+    let toast = wait_for("the repeated click reports 已发送", || async {
+        let toast = app
             .host_action_on_message(click(), CARD_MESSAGE)
             .await
-            .expect("a repeated click is acknowledged");
-        toast = repeated.toast;
-        if toast.as_deref() == Some("已发送") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+            .expect("a repeated click is acknowledged")
+            .toast;
+        (toast.as_deref() == Some("已发送")).then_some(toast)
+    })
+    .await;
     assert_eq!(toast.as_deref(), Some("已发送"));
     assert_eq!(file_uploads(&platform).await.len(), 1, "no second upload");
     assert_eq!(file_messages(&platform).await.len(), 1, "no second File Message");
@@ -348,15 +345,13 @@ async fn an_upload_failure_replies_an_error_and_stays_retryable() {
     // The failed delivery's claim is released as its task returns, so retry
     // until one click actually re-enters the read (the reply being recorded
     // does not yet mean the claim was dropped).
-    for _ in 0..200 {
+    wait_for("the retry re-enters the read", || async {
         app.host_action_on_message(click(), CARD_MESSAGE)
             .await
             .expect("the retry is acknowledged");
-        if backend.session_diff_calls.lock().await.len() > 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        (backend.session_diff_calls.lock().await.len() > 1).then_some(())
+    })
+    .await;
     wait_for("the Turn diff File Message is posted", || async {
         file_messages(&platform).await.into_iter().next()
     })
@@ -701,15 +696,13 @@ async fn a_failed_read_speaks_the_read_failure_and_stays_retryable() {
     backend
         .fail_session_diff
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    for _ in 0..200 {
+    wait_for("the retry re-enters the read", || async {
         app.host_action_on_message(click(), CARD_MESSAGE)
             .await
             .expect("the retry is acknowledged");
-        if backend.session_diff_calls.lock().await.len() > 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+        (backend.session_diff_calls.lock().await.len() > 1).then_some(())
+    })
+    .await;
     wait_for("the Turn diff File Message is posted", || async {
         file_messages(&platform).await.into_iter().next()
     })

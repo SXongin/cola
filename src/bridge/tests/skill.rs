@@ -192,13 +192,10 @@ fn collapsible_panels(card: &serde_json::Value) -> Vec<&serde_json::Value> {
 /// Wait until `recorder` holds at least `n` entries (a submission off the ack
 /// path runs on a spawned task), or fail loudly.
 async fn wait_for<T>(recorder: &Arc<tokio::sync::Mutex<Vec<T>>>, n: usize) {
-    for _ in 0..500 {
-        if recorder.lock().await.len() >= n {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("the pipeline submitted fewer than {n} prompts");
+    crate::bridge::test_support::wait_for(&format!("the pipeline submits {n} prompts"), || async {
+        (recorder.lock().await.len() >= n).then_some(())
+    })
+    .await;
 }
 
 /// `/skill <id> <text>`: the named skill is attached — as its CANONICAL

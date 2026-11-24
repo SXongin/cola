@@ -965,13 +965,18 @@ async fn a_stop_landing_mid_tick_finalizes_stopped_not_done() {
         .transcript_gate_entered
         .load(std::sync::atomic::Ordering::SeqCst);
     let wait_parked = async {
-        while backend
-            .transcript_gate_entered
-            .load(std::sync::atomic::Ordering::SeqCst)
-            == entered
-        {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        wait_for("the follow's read must reach the gate", || async {
+            if backend
+                .transcript_gate_entered
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == entered
+            {
+                None
+            } else {
+                Some(())
+            }
+        })
+        .await
     };
     tokio::time::timeout(Duration::from_secs(3), wait_parked)
         .await
@@ -1256,12 +1261,17 @@ async fn pending_permission_app() -> (
     // accumulator arms, so it inlines on the card.
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     let armed = async {
-        while Turn::armed_turn_anchor(&app.cards_handle(), "ses_test")
-            .await
-            .is_none()
-        {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        wait_for("the accumulator must arm", || async {
+            if Turn::armed_turn_anchor(&app.cards_handle(), "ses_test")
+                .await
+                .is_none()
+            {
+                None
+            } else {
+                Some(())
+            }
+        })
+        .await
     };
     tokio::time::timeout(Duration::from_secs(5), armed)
         .await
@@ -1518,7 +1528,7 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
         })
     };
     let next_id = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
+        wait_for("the new turn's prompt must be submitted", || async {
             if let Some(Some(id)) = backend.prompt_message_ids.lock().await.last().cloned()
                 && backend
                     .prompt_calls
@@ -1527,10 +1537,12 @@ async fn a_message_after_the_release_becomes_a_normal_new_turn() {
                     .last()
                     .is_some_and(|text| text == "接着问")
             {
-                return id;
+                Some(id)
+            } else {
+                None
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the new turn's prompt must be submitted");
@@ -1631,12 +1643,14 @@ async fn a_handler_started_turn_drains_the_new_turns_reply() {
 
     // The prompt records its cola id before parking on the gate.
     let anchor_id = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
+        wait_for("the handler's prompt must record its cola id", || async {
             if let Some(Some(id)) = backend.prompt_message_ids.lock().await.last().cloned() {
-                return id;
+                Some(id)
+            } else {
+                None
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("the handler's prompt must record its cola id");
@@ -2125,9 +2139,14 @@ async fn resume_on_v1_reuses_the_message_id_when_it_landed_in_between() {
     // The resubmitted Turn runs to its true end...
     wait_for_card_header(&platform, "完成").await;
     let wait_finished = async {
-        while app.inflight.lock().await.contains("ses_test") {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for("the resubmitted turn must finish", || async {
+            if app.inflight.lock().await.contains("ses_test") {
+                None
+            } else {
+                Some(())
+            }
+        })
+        .await
     };
     tokio::time::timeout(Duration::from_secs(5), wait_finished)
         .await
@@ -2201,23 +2220,24 @@ async fn a_failed_resume_leaves_the_unreceived_card_actionable() {
     // The failed write must give the claim back, so a later press can try
     // again; the scripted failure is consumed, so the retry succeeds.
     let second = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(result) = app
-                .host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
+        wait_for("a failed resume must leave the button actionable", || async {
+            app.host_action(serde_json::json!({ "action": "resume", "session_id": "ses_test" }))
                 .await
-            {
-                return result;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await
     })
     .await
     .expect("a failed resume must leave the button actionable");
     assert_eq!(second.toast.as_deref(), Some("正在重新发起..."));
     let wait_recorded = async {
-        while backend.resume_calls.lock().await.len() < 2 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_for("the retry's resume write must reach the backend", || async {
+            if backend.resume_calls.lock().await.len() < 2 {
+                None
+            } else {
+                Some(())
+            }
+        })
+        .await
     };
     tokio::time::timeout(Duration::from_secs(5), wait_recorded)
         .await
@@ -2319,9 +2339,17 @@ async fn a_never_promoted_submit_on_a_live_run_waits_out_the_grace_then_ends_unr
 
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !app.inflight.lock().await.contains("ses_test") {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        wait_for(
+            "the drain holds the guard while the message has not landed",
+            || async {
+                if !app.inflight.lock().await.contains("ses_test") {
+                    None
+                } else {
+                    Some(())
+                }
+            },
+        )
+        .await
     })
     .await
     .expect("the drain holds the guard while the message has not landed");
@@ -2390,9 +2418,17 @@ async fn the_unreceived_wait_captures_a_message_that_lands_after_the_grace() {
 
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !app.inflight.lock().await.contains("ses_test") {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        wait_for(
+            "the drain holds the guard while the message has not landed",
+            || async {
+                if !app.inflight.lock().await.contains("ses_test") {
+                    None
+                } else {
+                    Some(())
+                }
+            },
+        )
+        .await
     })
     .await
     .expect("the drain holds the guard while the message has not landed");
@@ -3917,14 +3953,14 @@ async fn a_drain_whose_render_never_lands_records_nothing() {
     // Park the drain's next read.
     let gate = backend.hold_transcripts();
     let entered = backend.transcript_gate_entered.load(Ordering::SeqCst);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while backend.transcript_gate_entered.load(Ordering::SeqCst) == entered {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the drain never reached the parked read"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the drain never reached the parked read", || async {
+        if backend.transcript_gate_entered.load(Ordering::SeqCst) == entered {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     // While it is parked, the runtime misses the shell and the accumulator is
     // collected from under it.
     backend.task_runtime.lock().unwrap().shells = vec![("sh_bg".into(), ShellRuntime::Missing)];
@@ -3936,14 +3972,14 @@ async fn a_drain_whose_render_never_lands_records_nothing() {
 
     // The drain ended without a card to carry the retirement: nothing was
     // recorded, and the task stays live on every later read.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while app.inflight.lock().await.contains("ses_test") {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the drain never ended on its vanished accumulator"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for("the drain never ended on its vanished accumulator", || async {
+        if app.inflight.lock().await.contains("ses_test") {
+            None
+        } else {
+            Some(())
+        }
+    })
+    .await;
     assert!(
         backend.overlay.runs().retired_ids("ses_test").is_empty(),
         "a render that never landed records nothing: {:?}",
