@@ -1,9 +1,20 @@
 //! The card's text budgets as data.
 //!
-//! Every clip asks for its surface's [`SurfaceBudget`] — one value naming the
-//! cap AND the rule the clip follows — instead of passing a bare number, so the
-//! call site reads `clip(text).cut(budget::CARD_ELEMENT)` and the number, the
-//! unit and the rule live here.
+//! Every clip asks for a [`SurfaceBudget`] — one value naming the cap AND the
+//! rule the clip follows — instead of passing a bare number, so the call site
+//! reads `clip(text).cut(budget::CARD_ELEMENT)`.
+//!
+//! ## The boundary: whole surfaces live here, per-line widths do not
+//!
+//! A **surface** is one rendered card region with its own cap and clip rule —
+//! one markdown element, one timeline entry, a tool panel's body/diff/input, one
+//! reasoning entry, a session title. Every surface budget is a constant in this
+//! module. A width that is NOT a whole surface — a picker row's label, a task
+//! label, a receipt residue, a per-line metadata field — stays the owning
+//! module's own constant and is wrapped at the call site as
+//! `SurfaceBudget::chars(SOME_LABEL_CHARS)`: it borrows the type and the rule,
+//! not a home here. Adding a surface means a constant here; adding a label
+//! width does not.
 //!
 //! ## These are cola's budgets, not Feishu's
 //!

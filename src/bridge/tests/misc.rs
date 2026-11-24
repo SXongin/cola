@@ -920,9 +920,9 @@ async fn restart_announce_lobby_sends_to_the_chat() {
     match &calls[0] {
         PlatformCall::SendCard { receive_id, card } => {
             assert_eq!(receive_id, "oc_1");
-            assert!(card_text(card).contains("已重启完成"));
             // A lobby restart's announcement is the exact shell card, byte for
-            // byte: title, template and one markdown body.
+            // byte: title, template and one markdown body (the body text
+            // included, so no separate prose assertion is needed).
             assert_eq!(
                 card,
                 &serde_json::json!({
