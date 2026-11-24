@@ -2888,10 +2888,10 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
         "switching back makes the old session active again"
     );
 
-    wait_until(
+    wait_for(
         "the reactivated session's watermark is re-baselined after a completed pass",
         || async {
-            app.external
+            (app.external
                 .poll_passes
                 .load(std::sync::atomic::Ordering::Relaxed)
                 > baseline
@@ -2900,7 +2900,8 @@ async fn new_pending_stops_syncing_and_switch_back_resyncs_silently() {
                     .last_user_msg_epoch
                     .lock()
                     .await
-                    .contains_key("ses_old")
+                    .contains_key("ses_old"))
+            .then_some(())
         },
     )
     .await;
