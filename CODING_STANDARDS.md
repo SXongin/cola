@@ -93,8 +93,10 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
   (ADR-0110). `check-structure` fails only on new or worse, so touching a
   function that can fit is the moment to cut it — not a separate ticket.
 - **Card JSON lives in `feishu/card`**: a `["tag"]` probe elsewhere needs an
-  allowlist entry, and the `CardElement` type layer is the segment that will own
-  the schema. Run lifecycle has one owner, not four homes.
+  allowlist entry, and the `CardElement` type layer (`feishu/card/element.rs`)
+  owns element construction and reading — build and probe an element through it.
+  A clip asks `feishu/card/clip.rs` for its surface's `budget::SurfaceBudget`
+  rather than passing a bare number. Run lifecycle has one owner, not four homes.
 - **A comment carries an invariant, a wire/why trap, or an API contract the
   signature cannot express.** A bare pointer (an issue, an ADR) is fine; a
   retelling of the code is not — the docs contract found ~38% pure restatement
