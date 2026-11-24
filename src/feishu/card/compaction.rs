@@ -12,9 +12,9 @@
 //! is never rendered: it is history the reader already has.
 
 use crate::backend::{Compaction, CompactionReason, CompactionStatus};
-use crate::feishu::card::sanitize::{CardMarkdown, chunk_markdown, serialized_len};
+use crate::feishu::card::sanitize::{CardMarkdown, serialized_len};
 use crate::feishu::card::shell::collapsible_panel_chunks;
-use crate::feishu::card::{MAX_CARD_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS, fenced_overhead, format_tokens};
+use crate::feishu::card::{MAX_CARD_TEXT_CHARS, budget, clip, fenced_overhead, format_tokens};
 use serde_json::json;
 
 /// The card elements one Compaction row is made of (ADR-0082), shared by every
@@ -92,8 +92,9 @@ pub(crate) fn compaction_title(compaction: &Compaction) -> String {
         CompactionStatus::Failed => {
             // One element, one budget: the prefix, the error — the clip's marker
             // included — and the usage suffix all share
-            // [`MAX_ELEMENT_TEXT_CHARS`], measured rather than reserved.
-            let budget = MAX_ELEMENT_TEXT_CHARS
+            // [`budget::CARD_ELEMENT`], measured rather than reserved.
+            let budget = budget::CARD_ELEMENT
+                .max
                 .saturating_sub(FAILED_TITLE_PREFIX.chars().count() + suffix.chars().count());
             let error = compaction
                 .error
@@ -161,7 +162,7 @@ pub(crate) const ERROR_TRUNCATED_MARKER: &str = "…（错误已截断）";
 /// The fold body one Compaction row renders, chunked at the card's per-element
 /// budget: the summary clipped to [`MAX_COMPACTION_SUMMARY_CHARS`] with an
 /// explicit [`SUMMARY_TRUNCATED_MARKER`] element when it was cut. The chunks are
-/// [`chunk_markdown`]'s, so a construct crossing the budget is closed on one
+/// the markdown split's, so a construct crossing the budget is closed on one
 /// element and re-opened on the next — this is a RAW-markdown caller, with no
 /// card cleaner in front of it, so the chunker fences an oversized table itself
 /// (issue #1098). `None` when there is nothing to fold — a running or failed
@@ -178,7 +179,7 @@ pub(crate) fn compaction_fold_body(compaction: &Compaction) -> Option<Vec<String
         return None;
     }
     let (clipped, truncated) = clipped_summary(summary);
-    let mut chunks = chunk_markdown(&clipped, MAX_ELEMENT_TEXT_CHARS);
+    let mut chunks = clip::clip(&clipped).split(budget::CARD_ELEMENT);
     if truncated {
         chunks.push(SUMMARY_TRUNCATED_MARKER.to_string());
     }
@@ -230,12 +231,13 @@ fn body_bytes(text: &str) -> usize {
 
 /// What one text costs the body budget once the element chunker has split it:
 /// every element's own [`body_bytes`] summed, so the construct markers the split
-/// adds — a re-opened fence opener, a closer, the fence [`chunk_markdown`] wraps
+/// adds — a re-opened fence opener, a closer, the fence the markdown split wraps
 /// an oversized table in, AND each element's own fallback fence (a marker line is
 /// itself a backtick run) all count. The cap therefore bounds what the card
 /// actually writes, not just the text before the chunker touches it.
 fn fold_body_bytes(text: &str) -> usize {
-    chunk_markdown(text, MAX_ELEMENT_TEXT_CHARS)
+    clip::clip(text)
+        .split(budget::CARD_ELEMENT)
         .iter()
         .map(|chunk| body_bytes(chunk))
         .sum()
@@ -446,7 +448,7 @@ mod tests {
     #[test]
     fn the_measure_covers_what_the_card_carries_for_any_content() {
         for (label, atom) in atoms() {
-            for length in [1, 10, MAX_ELEMENT_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS * 5] {
+            for length in [1, 10, budget::CARD_ELEMENT.max, budget::CARD_ELEMENT.max * 5] {
                 let text = atom.repeat(length);
                 let mut md = CardMarkdown::new();
                 let sanitized = md.element(&text);
@@ -511,21 +513,21 @@ mod tests {
         let mut cases: Vec<(String, String)> = vec![
             (
                 "prose at the cap".to_string(),
-                "字".repeat(MAX_ELEMENT_TEXT_CHARS),
+                "字".repeat(budget::CARD_ELEMENT.max),
             ),
             (
                 "prose far past the cap".to_string(),
-                "字".repeat(MAX_ELEMENT_TEXT_CHARS * 100),
+                "字".repeat(budget::CARD_ELEMENT.max * 100),
             ),
             (
                 "a stack trace far past the cap".to_string(),
-                "Error: boom\n    at src/main.rs:1\n".repeat(MAX_ELEMENT_TEXT_CHARS),
+                "Error: boom\n    at src/main.rs:1\n".repeat(budget::CARD_ELEMENT.max),
             ),
         ];
         for (label, atom) in atoms() {
             for (scale, length) in [
-                ("at the cap", MAX_ELEMENT_TEXT_CHARS),
-                ("far past the cap", MAX_ELEMENT_TEXT_CHARS * 100),
+                ("at the cap", budget::CARD_ELEMENT.max),
+                ("far past the cap", budget::CARD_ELEMENT.max * 100),
             ] {
                 cases.push((format!("{label} {scale}"), atom.repeat(length)));
             }
@@ -540,7 +542,7 @@ mod tests {
             );
             let title = compaction_title(&fact);
             assert!(
-                title.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                title.chars().count() <= budget::CARD_ELEMENT.max,
                 "{label}: the title must stay one budgeted element, got {} chars",
                 title.chars().count()
             );
@@ -583,8 +585,8 @@ mod tests {
                 ));
             }
             for (scale, length) in [
-                ("at the cap", MAX_ELEMENT_TEXT_CHARS),
-                ("past the cap", MAX_ELEMENT_TEXT_CHARS * 5),
+                ("at the cap", budget::CARD_ELEMENT.max),
+                ("past the cap", budget::CARD_ELEMENT.max * 5),
             ] {
                 cases.push((format!("{label} error {scale}"), failed(&atom.repeat(length))));
             }
@@ -646,7 +648,7 @@ mod tests {
         );
         assert!(
             body.iter()
-                .all(|chunk| chunk.chars().count() <= MAX_ELEMENT_TEXT_CHARS),
+                .all(|chunk| chunk.chars().count() <= budget::CARD_ELEMENT.max),
             "the marker rides its own element: {} chunks",
             body.len()
         );
@@ -705,7 +707,7 @@ mod tests {
 
     /// Issue #1098: the fold body is a raw-markdown caller, so the chunker must
     /// keep a fence self-contained across the element split. A fenced block
-    /// crossing `MAX_ELEMENT_TEXT_CHARS` renders as code in every element, and
+    /// crossing `budget::CARD_ELEMENT.max` renders as code in every element, and
     /// the prose after the original closer is rendered as prose — never
     /// swallowed by a fence left open.
     #[test]
@@ -721,7 +723,7 @@ mod tests {
         );
         for chunk in &body {
             assert!(
-                chunk.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                chunk.chars().count() <= budget::CARD_ELEMENT.max,
                 "chunk over the element budget: {} chars",
                 chunk.chars().count()
             );
@@ -823,7 +825,7 @@ mod tests {
         );
         for chunk in &body {
             assert!(
-                chunk.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                chunk.chars().count() <= budget::CARD_ELEMENT.max,
                 "chunk over the element budget: {} chars",
                 chunk.chars().count()
             );
@@ -845,7 +847,7 @@ mod tests {
     /// and keeps the usage suffix on the row.
     #[test]
     fn a_clipped_error_keeps_the_head_and_names_the_truncation() {
-        let error = "字".repeat(MAX_ELEMENT_TEXT_CHARS * 3);
+        let error = "字".repeat(budget::CARD_ELEMENT.max * 3);
         let mut fact = failed(&error);
         fact.usage = Some(crate::backend::TokenUsage {
             total: 20_000_000,
@@ -853,7 +855,7 @@ mod tests {
         });
         let title = compaction_title(&fact);
         assert!(
-            title.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+            title.chars().count() <= budget::CARD_ELEMENT.max,
             "the widest title must stay one budgeted element, got {} chars",
             title.chars().count()
         );
@@ -946,8 +948,8 @@ mod tests {
     #[test]
     fn a_backtick_heavy_error_stays_inside_the_budget_once_fenced() {
         for (label, error) in [
-            ("at the cap", "`".repeat(MAX_ELEMENT_TEXT_CHARS)),
-            ("far past the cap", "`".repeat(MAX_ELEMENT_TEXT_CHARS * 20)),
+            ("at the cap", "`".repeat(budget::CARD_ELEMENT.max)),
+            ("far past the cap", "`".repeat(budget::CARD_ELEMENT.max * 20)),
         ] {
             let fact = failed(&error);
             let fenced = card_with(&fact, true);
@@ -972,7 +974,7 @@ mod tests {
     #[test]
     fn the_charge_is_a_ceiling_over_the_measurable_cost() {
         for (label, atom) in atoms() {
-            for length in [1, 10, MAX_ELEMENT_TEXT_CHARS, MAX_ELEMENT_TEXT_CHARS * 5] {
+            for length in [1, 10, budget::CARD_ELEMENT.max, budget::CARD_ELEMENT.max * 5] {
                 let text = atom.repeat(length);
                 let measured = serialized_len(&text) + fenced_overhead(&text);
                 assert!(
@@ -1065,7 +1067,7 @@ mod tests {
         );
         assert_eq!(
             compaction_components(&at_cap),
-            3 + MAX_COMPACTION_SUMMARY_CHARS.div_ceil(MAX_ELEMENT_TEXT_CHARS),
+            3 + MAX_COMPACTION_SUMMARY_CHARS.div_ceil(budget::CARD_ELEMENT.max),
             "the panel plus one element per chunk"
         );
         assert!(
@@ -1076,8 +1078,8 @@ mod tests {
         // A failure row is a plain line, and its charge is the CLIPPED title's: an
         // error far past the caps costs the marker more than one at the cap, never
         // more.
-        let failed_at_cap = failed(&"字".repeat(MAX_ELEMENT_TEXT_CHARS));
-        let failed_past_cap = failed(&"字".repeat(MAX_ELEMENT_TEXT_CHARS * 100));
+        let failed_at_cap = failed(&"字".repeat(budget::CARD_ELEMENT.max));
+        let failed_past_cap = failed(&"字".repeat(budget::CARD_ELEMENT.max * 100));
         assert_eq!(
             compaction_components(&failed_past_cap),
             1,

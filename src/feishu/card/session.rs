@@ -6,6 +6,7 @@ use crate::bridge::snapshot::SnapshotData;
 use super::CardState;
 use super::sanitize::CardMarkdown;
 use super::shell::{CardBuilder, card_shell};
+use super::{budget, clip};
 
 /// The `/switch` card's list scope (ADR-0022). `Directory` filters the list to
 /// the active session's directory (the card's default view); `All` shows the
@@ -1852,10 +1853,7 @@ impl SessionCardBody<'_> {
             // closed and re-opened, so each fold body renders as the content it
             // is (#1096).
             let body = md.clean(&tail_body(message));
-            let chunks = crate::feishu::card::sanitize::chunk_markdown(
-                &body,
-                crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
-            );
+            let chunks = clip::clip(&body).split(budget::CARD_ELEMENT);
             panels.push(super::shell::collapsible_panel_chunks(
                 &title,
                 &chunks,

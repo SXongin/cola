@@ -16,11 +16,11 @@ use crate::bridge::pollers::result_card;
 use crate::bridge::question::{MultiOutcome, action_toast, qa_completion_body, question_replay_card};
 use crate::bridge::surfaces::CompanionDelivery;
 use crate::bridge::turn::Turn;
+use crate::feishu::card::budget::{self, SurfaceBudget};
+use crate::feishu::card::clip;
 use crate::feishu::card::lang::language_for_path;
 use crate::feishu::card::question::FallbackLoss;
-use crate::feishu::card::tool_render::{
-    DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_from_metadata, parse_edit_diff,
-};
+use crate::feishu::card::tool_render::{DIFF_TRUNCATION_NOTE, diff_from_metadata, parse_edit_diff};
 use crate::feishu::card::tool_view::{PermissionView, permission_view};
 
 use super::companion::{
@@ -30,7 +30,7 @@ use super::companion::{
 use super::delivery::{
     DENIED_PREFIX, Origin, RECEIPT_MAX_CHARS, Residue, ack_inline_card, already_handled_result,
     denied_receipt, failed_result_card, handled_elsewhere_receipt, receipt_line, refresh_question_block,
-    resolve_blocks, settle_ack, truncate,
+    resolve_blocks, settle_ack,
 };
 use super::flow::{RequestFlow, session_belongs_to};
 
@@ -1506,7 +1506,7 @@ fn log_unshowable_auto_accept(p: &crate::backend::types::PermissionRequest) {
         rendered_permission_chars(p),
         p.total_target_len(),
         budget,
-        truncate(first_line, AUTO_ACCEPT_TARGET_LOG_CHARS)
+        clip::clip(first_line).cut(SurfaceBudget::chars(AUTO_ACCEPT_TARGET_LOG_CHARS))
     );
 }
 
@@ -1543,7 +1543,7 @@ fn permission_receipt(target: &str, reply: &str) -> String {
         }
         _ => return receipt_line(DENIED_PREFIX, target),
     };
-    truncate(&line, RECEIPT_MAX_CHARS)
+    clip::clip(&line).cut(SurfaceBudget::chars(RECEIPT_MAX_CHARS))
 }
 
 /// Build the second step's confirmation card from the summary the fallback
@@ -1781,7 +1781,7 @@ fn question_receipt(
     if parts.is_empty() {
         return "✅ 已回答".to_string();
     }
-    truncate(&format!("✅ 已回答：{}", parts.join("；")), RECEIPT_MAX_CHARS)
+    clip::clip(&format!("✅ 已回答：{}", parts.join("；"))).cut(SurfaceBudget::chars(RECEIPT_MAX_CHARS))
 }
 
 /// Compact one-line target for a permission's receipt: the action plus the
@@ -1798,14 +1798,14 @@ pub(crate) fn permission_target(p: &crate::backend::types::PermissionRequest) ->
         .first()
         .map(|s| s.trim().replace('`', "'"))
         .filter(|s| !s.is_empty())
-        .map(|s| truncate(&s, 60));
+        .map(|s| clip::clip(&s).cut(SurfaceBudget::chars(60)));
     let file = p
         .metadata
         .as_ref()
         .and_then(|m| m.get("filepath"))
         .and_then(|v| v.as_str())
         .filter(|f| !f.is_empty())
-        .map(|f| truncate(f, 60));
+        .map(|f| clip::clip(f).cut(SurfaceBudget::chars(60)));
     // An edit/patch is about the file (the body shows its diff); every other
     // action is about its first pattern.
     let object = if permission_view(action).renders_diff_body {
@@ -1828,15 +1828,13 @@ pub(crate) fn permission_receipt_target(
     companion: Option<&CompanionDelivery>,
 ) -> String {
     match companion {
-        Some(delivery) => truncate(
-            &format!(
-                "{} · {} 字符 · {}",
-                permission_target(p),
-                p.total_target_len(),
-                delivery.lane.short_label()
-            ),
-            RECEIPT_MAX_CHARS,
-        ),
+        Some(delivery) => clip::clip(&format!(
+            "{} · {} 字符 · {}",
+            permission_target(p),
+            p.total_target_len(),
+            delivery.lane.short_label()
+        ))
+        .cut(SurfaceBudget::chars(RECEIPT_MAX_CHARS)),
         None => permission_target(p),
     }
 }
@@ -2992,7 +2990,7 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     {
         s.push_str(&format!(
             "**原因**: {}\n",
-            truncate(reason, PERMISSION_REASON_MAX_CHARS)
+            clip::clip(reason).cut(SurfaceBudget::chars(PERMISSION_REASON_MAX_CHARS))
         ));
     }
 
@@ -3005,7 +3003,10 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
         // on a button a user can approve.
         let budget = crate::backend::PERMISSION_TARGET_MAX_CHARS;
         for r in &p.patterns {
-            s.push_str(&format!("- `{}`\n", truncate(r, budget)));
+            s.push_str(&format!(
+                "- `{}`\n",
+                clip::clip(r).cut(SurfaceBudget::chars(budget))
+            ));
         }
     }
 
@@ -3025,14 +3026,13 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
             .or_else(|| parsed.as_ref().and_then(|d| d.path.as_deref()))
             .or_else(|| p.patterns.first().map(String::as_str))
             .unwrap_or("?");
+        let shown_path = clip::clip(path).cut(SurfaceBudget::chars(200));
         match parsed.as_ref() {
             Some(d) => s.push_str(&format!(
-                "**改动**: 📄 `{}` (+{} −{})\n",
-                truncate(path, 200),
-                d.additions,
-                d.deletions
+                "**改动**: 📄 `{shown_path}` (+{} −{})\n",
+                d.additions, d.deletions
             )),
-            None => s.push_str(&format!("**改动**: 📄 `{}`\n", truncate(path, 200))),
+            None => s.push_str(&format!("**改动**: 📄 `{shown_path}`\n")),
         }
         // The fence language follows the ONE path the card already selected for
         // its header — metadata `filepath`, else the diff's own path, else the
@@ -3040,7 +3040,7 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
         // file, so a multi-file patch fences with the selected file's grammar.
         let language = language_for_path(path);
         let body = parsed.map(|d| d.body).unwrap_or_else(|| diff.to_string());
-        // Clip BARE, then say so outside the fence: the `…` `truncate_md`
+        // Clip BARE, then say so outside the fence: the `…` a marked cut
         // appends immediately before the closing fence stops Feishu rendering
         // the block as code at all (#788) — and this is the card where a reader
         // decides whether to approve the change, so losing the code block is
@@ -3049,7 +3049,7 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
         // surfaces, and bytes are what the card's JSON budget counts. The
         // language passed here is the same one the fence below is given, so the
         // opening tag's bytes are inside the cap, not beside it.
-        let clipped = clip_fenced_body(&body, Some(language), DIFF_MAX_ESCAPED_BYTES);
+        let clipped = clip::clip(&body).cut_fenced(Some(language), budget::DIFF_FENCED);
         let was_clipped = clipped.len() != body.len();
         s.push_str(&crate::feishu::card::fenced_code(&clipped, Some(language)));
         s.push('\n');
@@ -3069,7 +3069,11 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
         ] {
             if let Some(v) = meta.get(key) {
                 let val = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
-                s.push_str(&format!("**{}**: `{}`\n", label, truncate(&val, 200)));
+                s.push_str(&format!(
+                    "**{}**: `{}`\n",
+                    label,
+                    clip::clip(&val).cut(SurfaceBudget::chars(200))
+                ));
                 shown += 1;
                 if shown >= 3 {
                     break;
@@ -3079,7 +3083,10 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
         if shown == 0 {
             let compact = serde_json::to_string(meta).unwrap_or_default();
             if compact.len() > 300 {
-                s.push_str(&format!("**详情**: `{}`", truncate(&compact, 300)));
+                s.push_str(&format!(
+                    "**详情**: `{}`",
+                    clip::clip(&compact).cut(SurfaceBudget::chars(300))
+                ));
             } else if !compact.is_empty() && compact != "{}" {
                 s.push_str(&format!("**详情**: `{}`", compact));
             }
@@ -3140,7 +3147,7 @@ fn renders_diff_body(p: &crate::backend::types::PermissionRequest) -> bool {
 ///
 /// A request that renders a unified diff is exempt from the **summed-target**
 /// budget: `describe_permission` shows the diff under its own escaped-byte cap
-/// (`DIFF_MAX_ESCAPED_BYTES`) with a truncation note, so the target-overflow
+/// (`budget::DIFF_FENCED`) with a truncation note, so the target-overflow
 /// companion (paths only) would deliver the diff nowhere. It is **not**
 /// exempt from the rendered-body ceiling: the body still carries every pattern
 /// before the diff, and a body past `PERMISSION_BODY_MAX_CHARS` must take the
@@ -3726,7 +3733,7 @@ Index: /proj/src/main.rs
         assert_eq!(parsed.body.len(), 11_990, "the fixture sits at the tag edge");
         assert_eq!(
             parsed.body,
-            clip_fenced_body(&parsed.body, None, DIFF_MAX_ESCAPED_BYTES),
+            clip::clip(&parsed.body).cut_fenced(None, budget::DIFF_FENCED),
             "the body and its fence fit without a language tag"
         );
         let p = perm(
@@ -3963,5 +3970,38 @@ Index: /proj/src/main.rs
                 "{action:?}: the permission body"
             );
         }
+    }
+
+    /// A resolved inline click restamps the cached card's header title and
+    /// template from the accumulator's post-resolution state and leaves the
+    /// subtitle (and everything below the header) untouched — the exact JSON
+    /// the PATCH carries.
+    #[test]
+    fn a_resolved_click_restamps_only_the_header_title_and_template() {
+        let card = serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "title": { "tag": "plain_text", "content": "⏳ 等待你的授权" },
+                "template": "blue",
+                "subtitle": { "tag": "plain_text", "content": "会话" }
+            },
+            "body": { "elements": [{ "tag": "markdown", "content": "正文" }] }
+        });
+        let restamped = crate::bridge::request::delivery::restamped_header(
+            card,
+            Some(&("✅ 已完成".to_string(), "green")),
+        );
+        assert_eq!(
+            restamped,
+            serde_json::json!({
+                "schema": "2.0",
+                "header": {
+                    "title": { "tag": "plain_text", "content": "✅ 已完成" },
+                    "template": "green",
+                    "subtitle": { "tag": "plain_text", "content": "会话" }
+                },
+                "body": { "elements": [{ "tag": "markdown", "content": "正文" }] }
+            })
+        );
     }
 }

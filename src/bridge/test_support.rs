@@ -5195,7 +5195,7 @@ pub(crate) fn click_value(card: &serde_json::Value, op: &str, session_id: Option
 /// nest in forms, panels and column sets, so a top-level scan misses most
 /// controls. The shared typed walker: `tag` is an [`ElementTag`], so a test
 /// cannot ask for a tag the schema does not have.
-pub(crate) fn card_tags<'a>(card: &'a serde_json::Value, tag: ElementTag) -> Vec<&'a serde_json::Value> {
+pub(crate) fn card_tags(card: &serde_json::Value, tag: ElementTag) -> Vec<&serde_json::Value> {
     fn walk<'a>(value: &'a serde_json::Value, tag: ElementTag, out: &mut Vec<&'a serde_json::Value>) {
         if crate::feishu::card::element::is(value, tag) {
             out.push(value);

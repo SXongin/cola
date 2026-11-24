@@ -1827,13 +1827,13 @@ fn push_record_cell(record: &mut Vec<String>, cell: &mut BoundedCell, max_column
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feishu::card::{MAX_ELEMENT_TEXT_CHARS, chunk_text};
+    use crate::feishu::card::{budget, clip};
 
     /// The per-chunk size `ViewerKind::Text` fenced before #769 (the removed
     /// `PREVIEW_CHUNK_CHARS`): the old render split anything longer into several
     /// elements, so a card rendering such a fixture as ONE element is a shape
     /// the old code could not produce.
-    const OLD_PREVIEW_CHUNK_CHARS: usize = MAX_ELEMENT_TEXT_CHARS - 64;
+    const OLD_PREVIEW_CHUNK_CHARS: usize = budget::CARD_ELEMENT.max - 64;
 
     fn key() -> ThreadKey {
         ThreadKey::new("chat_1".into(), "chat_1".into())
@@ -3309,7 +3309,11 @@ mod tests {
                 .map(|i| format!("line {i}: {}\n", "x".repeat(16)))
                 .collect();
             assert!(
-                body.len() >= 4_000 && chunk_text(&body, OLD_PREVIEW_CHUNK_CHARS).len() >= 2,
+                body.len() >= 4_000
+                    && clip::clip(&body)
+                        .split(budget::SurfaceBudget::plain(OLD_PREVIEW_CHUNK_CHARS))
+                        .len()
+                        >= 2,
                 "{lines} lines: a 4000-char file the old per-chunk render split, got {} chars",
                 body.len()
             );

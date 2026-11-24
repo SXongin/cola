@@ -39,7 +39,7 @@
 
 use std::borrow::Cow;
 
-use super::{MAX_ELEMENT_TEXT_CHARS, fenced_code};
+use super::{budget, fenced_code};
 
 /// Markdown tables Feishu accepts on one card, counted across the whole card
 /// (elements and panels alike): a 6th table fails with `230099/11310 card
@@ -288,8 +288,10 @@ fn fence_oversized_tables(text: &str, max: usize) -> Cow<'_, str> {
     }
 }
 
-/// Split `text` into chunks of at most `max` characters for separate card
-/// elements (issue #1096), each **self-contained** as markdown: a chunk that
+/// The construct-aware markdown split behind [`super::clip::Clip::split`]
+/// (reach it there, never directly): split `text` into chunks of at most `max`
+/// characters for separate card elements (issue #1096), each
+/// **self-contained** as markdown: a chunk that
 /// starts inside a construct the previous chunk left open re-establishes it
 /// with the lead [`neutralize_tail`] gives a cut tail, and a chunk that ends
 /// inside a fenced block closes it. The platform parses every element on its
@@ -306,7 +308,7 @@ fn fence_oversized_tables(text: &str, max: usize) -> Cow<'_, str> {
 /// mid-token); a line longer than the budget falls back to a character cut.
 /// The added lines are markdown, not content: callers that account for the
 /// text's own characters must use the timeline's `lead` mechanism instead.
-pub(crate) fn chunk_markdown(text: &str, max: usize) -> Vec<String> {
+pub(super) fn split_construct_aware(text: &str, max: usize) -> Vec<String> {
     let max = max.max(1);
     let text = fence_oversized_tables(text, max);
     let mut chunks = Vec::new();
@@ -491,7 +493,7 @@ impl CardMarkdown {
                     // header is another table against the per-card cap (#1096).
                     // The chunker fences such a table itself for raw callers
                     // (#1098); this keeps the cleaner's own budget in step.
-                    || native_table_len(&region) > MAX_ELEMENT_TEXT_CHARS
+                    || native_table_len(&region) > budget::CARD_ELEMENT.max
                 {
                     out.push(fenced_code(&region, None));
                 } else {
@@ -860,7 +862,7 @@ mod tests {
     fn a_fence_crossing_the_element_budget_stays_self_contained() {
         let code: String = (0..200).map(|i| format!("print(<{i}>)  # 一行代码\n")).collect();
         let text = format!("说明\n```python\n{code}```\n后的 <文字>");
-        let chunks = chunk_markdown(&text, 3000);
+        let chunks = split_construct_aware(&text, 3000);
         assert!(chunks.len() > 1, "the fixture must cross the budget");
         for chunk in &chunks {
             assert!(
@@ -891,7 +893,7 @@ mod tests {
     #[test]
     fn chunking_prefers_line_boundaries() {
         let text = format!("第一行\n第二行\n{}", "长".repeat(30));
-        let chunks = chunk_markdown(&text, 6);
+        let chunks = split_construct_aware(&text, 6);
         assert_eq!(
             chunks[0], "第一行\n",
             "a cut lands on the line end, not mid-token"
@@ -909,10 +911,10 @@ mod tests {
         let row = format!("| {} | 值 |\n", "长".repeat(100));
         let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(30));
         assert!(
-            native_table_len(&table) > MAX_ELEMENT_TEXT_CHARS,
+            native_table_len(&table) > budget::CARD_ELEMENT.max,
             "the fixture must be too long for one element"
         );
-        let chunks = chunk_markdown(&table, MAX_ELEMENT_TEXT_CHARS);
+        let chunks = split_construct_aware(&table, budget::CARD_ELEMENT.max);
         assert!(chunks.len() > 1, "the fixture must cross the budget");
         assert!(
             chunks[0].starts_with("```\n| 名称 | 值 |"),
@@ -949,7 +951,7 @@ mod tests {
             native_table_len(table) <= 30,
             "the escaped measure must still fit"
         );
-        let chunks = chunk_markdown(table, 30);
+        let chunks = split_construct_aware(table, 30);
         assert!(chunks[0].starts_with("```\n"), "the table is fenced: {chunks:?}");
         assert_eq!(
             chunks.iter().filter(|chunk| chunk.contains("|a|")).count(),
@@ -965,7 +967,7 @@ mod tests {
         let row = format!("| {} | 值 |\n", "长".repeat(100));
         let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(30));
         let fenced = fenced_code(&table, None);
-        let chunks = chunk_markdown(&fenced, MAX_ELEMENT_TEXT_CHARS);
+        let chunks = split_construct_aware(&fenced, budget::CARD_ELEMENT.max);
         assert!(chunks.len() > 1, "the fixture must cross the budget");
         for chunk in &chunks {
             assert!(
@@ -984,7 +986,7 @@ mod tests {
     fn a_table_too_long_for_one_element_is_fenced() {
         let row = format!("| {} | 值 |\n", "长".repeat(100));
         let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(30));
-        assert!(table.chars().count() > MAX_ELEMENT_TEXT_CHARS);
+        assert!(table.chars().count() > budget::CARD_ELEMENT.max);
         let cleaned = CardMarkdown::new().clean(&table);
         assert!(
             cleaned.starts_with("```\n"),
@@ -1001,7 +1003,7 @@ mod tests {
         let row = format!("| {} | 值 |\n", "x".repeat(50));
         let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(10));
         let text = format!("{prose}{table}尾注");
-        let chunks = chunk_markdown(&text, 1500);
+        let chunks = split_construct_aware(&text, 1500);
         assert!(
             chunks
                 .iter()
@@ -1029,7 +1031,7 @@ mod tests {
         let long = format!("| 长表 | 值 |\n|---|---|\n{}", row.repeat(30));
         let text = format!("{small}\n\n{small}\n\n{small}\n\n{small}\n\n{long}\n\n尾注");
         let cleaned = CardMarkdown::new().clean(&text);
-        let chunks = chunk_markdown(&cleaned, MAX_ELEMENT_TEXT_CHARS);
+        let chunks = split_construct_aware(&cleaned, budget::CARD_ELEMENT.max);
         let native: usize = chunks
             .iter()
             .map(|chunk| chunk.lines().filter(|line| *line == "| a | b |").count())
@@ -1069,7 +1071,7 @@ mod tests {
         let prose = format!("{}参见 a | b 的说明\n", "说明。\n".repeat(300));
         let row = format!("| {} | 值 |\n", "x".repeat(50));
         let table = format!("| 名称 | 值 |\n|---|---|\n{}", row.repeat(10));
-        let chunks = chunk_markdown(&format!("{prose}{table}尾注"), 1500);
+        let chunks = split_construct_aware(&format!("{prose}{table}尾注"), 1500);
         assert!(
             chunks.iter().any(|chunk| chunk.contains("| 名称 | 值 |")),
             "the table must render: {chunks:?}"

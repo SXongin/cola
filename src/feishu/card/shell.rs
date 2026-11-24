@@ -1,6 +1,5 @@
 use serde_json::json;
 
-use super::MAX_ELEMENT_TEXT_CHARS;
 use super::compaction::compaction_elements;
 use super::element::CardElement;
 use super::ledger::{
@@ -12,9 +11,7 @@ use super::tool_render::{
     TodoPanel, ToolPanel, file_image_elements, todo_panel_element, tool_display_name, tool_panel_element,
 };
 use super::vocab::{self, phase_token};
-use super::{
-    CardActionButton, CardState, HeaderProgress, chunk_text, fenced_code, fmt_local_time, truncate_md,
-};
+use super::{CardActionButton, CardState, HeaderProgress, budget, clip, fenced_code, fmt_local_time};
 use crate::backend::{Compaction, Phase};
 
 /// Format a duration in seconds for the header's live timer (ADR-0014):
@@ -197,7 +194,7 @@ impl CardBuilder {
 
     pub fn with_text(mut self, text: &str) -> Self {
         // Long text is split across multiple elements, each within cola's
-        // per-element budget (MAX_ELEMENT_TEXT_CHARS), while the card splitter
+        // per-element budget (`budget::CARD_ELEMENT`), while the card splitter
         // bounds how much text one card carries. The split is a size budget,
         // not a workaround for a Feishu truncation. The text is sanitized as
         // one blob (per-card table budget), then chunked self-containedly: a
@@ -206,15 +203,15 @@ impl CardBuilder {
         if self.markdown.is_fenced() {
             // Fallback mode: fence each chunk separately, so no element holds
             // an unclosed fence.
-            for chunk in chunk_text(text, MAX_ELEMENT_TEXT_CHARS) {
+            for chunk in clip::clip(text).split(budget::PLAIN_ELEMENT) {
                 self.body
-                    .push(json!({ "tag": "markdown", "content": fenced_code(&chunk, None) }));
+                    .push(CardElement::markdown(fenced_code(&chunk, None)).into_value());
             }
             return self;
         }
         let text = self.markdown.clean(text);
-        for chunk in super::sanitize::chunk_markdown(&text, MAX_ELEMENT_TEXT_CHARS) {
-            self.body.push(json!({ "tag": "markdown", "content": chunk }));
+        for chunk in clip::clip(&text).split(budget::CARD_ELEMENT) {
+            self.body.push(CardElement::markdown(chunk).into_value());
         }
         self
     }
@@ -233,7 +230,7 @@ impl CardBuilder {
         if !reasoning.is_empty() {
             let body = self
                 .markdown
-                .element(&truncate_md(reasoning, crate::feishu::card::REASONING_TEXT_CAP));
+                .element(&clip::clip(reasoning).cut(budget::REASONING_ELEMENT));
             self.body.push(collapsible_panel(
                 &format!("💭 推理过程{}", panel_time_suffix(at_ms)),
                 &body,
@@ -595,7 +592,7 @@ pub(super) fn panel_time_suffix(at_ms: Option<i64>) -> String {
 /// Build a collapsible panel (v2) holding several markdown chunks, folded by
 /// default. Used when one logical section (e.g. an idle card tail entry's full
 /// text) needs splitting across multiple markdown elements to stay within
-/// cola's per-element budget ([`MAX_ELEMENT_TEXT_CHARS`]) — Feishu does not
+/// cola's per-element budget ([`budget::CARD_ELEMENT`]) — Feishu does not
 /// truncate a long element itself; the budget keeps the card's total size and
 /// element count bounded.
 ///
@@ -1758,7 +1755,7 @@ mod tests {
 
     #[test]
     fn long_text_splits_across_multiple_elements() {
-        let long = "x".repeat(MAX_ELEMENT_TEXT_CHARS * 2 + 100);
+        let long = "x".repeat(budget::CARD_ELEMENT.max * 2 + 100);
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_text(&long)
@@ -1776,7 +1773,7 @@ mod tests {
         for el in &text_els {
             let content = el["content"].as_str().unwrap();
             assert!(
-                content.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                content.chars().count() <= budget::CARD_ELEMENT.max,
                 "element over cap: {} chars",
                 content.chars().count()
             );

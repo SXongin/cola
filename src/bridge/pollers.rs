@@ -523,6 +523,25 @@ mod tests {
     use crate::bridge::test_support::{MockBackend, RecordingPlatform, core_with, test_config};
     use std::sync::Arc;
 
+    /// A card-action result is the shared shell around one markdown body — the
+    /// exact JSON every permission/question/retry ack hands Feishu.
+    #[test]
+    fn a_result_card_is_the_shell_around_one_markdown_body() {
+        let result = result_card("⚠️ 处理失败", "orange", "**已处理**");
+        assert_eq!(
+            result.card.expect("a result card"),
+            serde_json::json!({
+                "schema": "2.0",
+                "config": { "wide_screen_mode": true },
+                "header": {
+                    "title": { "tag": "plain_text", "content": "⚠️ 处理失败" },
+                    "template": "orange",
+                },
+                "body": { "elements": [{ "tag": "markdown", "content": "**已处理**" }] },
+            })
+        );
+    }
+
     /// The poll loop's seam, driven by a client with no lifecycle of its own:
     /// it reports "attached, nothing to do", so the pass is a clean success
     /// and this test names no adapter symbol (spec #860, ticket #875).

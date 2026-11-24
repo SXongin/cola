@@ -456,11 +456,11 @@ async fn a_failed_compaction_renders_a_row_carrying_the_backends_error() {
 /// vanish with the turn's update, and a failure is what the reader most needs.
 #[tokio::test]
 async fn a_long_failed_error_is_clipped_on_the_card() {
-    use crate::feishu::card::MAX_ELEMENT_TEXT_CHARS;
+    use crate::feishu::card::budget::CARD_ELEMENT;
     use crate::feishu::card::compaction::ERROR_TRUNCATED_MARKER;
 
     let _wd = test_work_dir();
-    let error = "字".repeat(MAX_ELEMENT_TEXT_CHARS * 100);
+    let error = "字".repeat(CARD_ELEMENT.max * 100);
     let timeline = vec![
         user("msg_cola_anchor", 1_000, "第一条消息"),
         compaction("msg_comp", 2_000, failed(CompactionReason::Auto, &error)),
@@ -477,7 +477,7 @@ async fn a_long_failed_error_is_clipped_on_the_card() {
     );
     let rows = compaction_rows(&card);
     assert!(
-        rows[0].0.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+        rows[0].0.chars().count() <= CARD_ELEMENT.max,
         "the clipped title stays one budgeted element: {} chars",
         rows[0].0.chars().count()
     );
@@ -768,7 +768,7 @@ async fn the_summary_is_chunked_and_the_recent_tail_never_renders() {
     );
     for chunk in &chunks {
         assert!(
-            chunk.chars().count() <= crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
+            chunk.chars().count() <= crate::feishu::card::budget::CARD_ELEMENT.max,
             "no chunk may exceed the card's per-element budget: {}",
             chunk.chars().count()
         );
@@ -864,7 +864,7 @@ async fn a_summary_past_the_cap_is_clipped_with_a_marker() {
     );
     for chunk in &chunks {
         assert!(
-            chunk.chars().count() <= crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
+            chunk.chars().count() <= crate::feishu::card::budget::CARD_ELEMENT.max,
             "no chunk may exceed the card's per-element budget: {}",
             chunk.chars().count()
         );

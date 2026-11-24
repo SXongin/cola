@@ -1207,7 +1207,7 @@ impl Timeline {
         let key = slot.key;
         let mut target =
             self.source_entry(key, source.as_ref(), |kind| matches!(kind, TimelineKind::Text(_)));
-        let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
+        let max = crate::feishu::card::budget::TIMELINE_ENTRY.max;
         let mut remaining = chunk;
         let mut lead = lead;
         let mut first = Some(slot);
@@ -1525,7 +1525,11 @@ impl Timeline {
     /// carries, plus every same-source entry's own model characters. Only a
     /// part's FIRST entry may carry a nonzero offset, so it is counted once.
     pub(super) fn source_extent_in(&self, source: &PartSource, end: usize) -> usize {
-        self.source_chars_in(source, end, Some(crate::feishu::card::REASONING_TEXT_CAP))
+        self.source_chars_in(
+            source,
+            end,
+            Some(crate::feishu::card::budget::REASONING_ELEMENT.max),
+        )
     }
 
     /// The part CONTENT pushed for `source`, counted from the part's start —

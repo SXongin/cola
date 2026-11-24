@@ -271,7 +271,7 @@ fn render_part(
                     acc,
                     source,
                     &reasoning.text,
-                    Some(crate::feishu::card::REASONING_TEXT_CAP),
+                    Some(crate::feishu::card::budget::REASONING_ELEMENT.max),
                 );
                 acc.push_reasoning_at_key(order_at, reasoning.started_at, source, &chunk, None);
             }
@@ -371,7 +371,7 @@ fn render_part_scoped(
                 let rewritten = acc.rewrite_source(
                     &source,
                     &reasoning.text,
-                    Some(crate::feishu::card::REASONING_TEXT_CAP),
+                    Some(crate::feishu::card::budget::REASONING_ELEMENT.max),
                 );
                 let facts = PartFacts {
                     form: PartForm::Reasoning,
@@ -386,7 +386,7 @@ fn render_part_scoped(
                     acc,
                     Some(source),
                     &reasoning.text,
-                    Some(crate::feishu::card::REASONING_TEXT_CAP),
+                    Some(crate::feishu::card::budget::REASONING_ELEMENT.max),
                 );
                 let facts = PartFacts {
                     form: PartForm::Reasoning,
@@ -456,7 +456,7 @@ fn render_seeded_part_scoped(
     let source = PartSource::at(message_id.clone(), index);
     let held = acc.source_held_chars(&source);
     let extent = acc.source_extent(&source);
-    let cap = (!is_text).then_some(crate::feishu::card::REASONING_TEXT_CAP);
+    let cap = (!is_text).then_some(crate::feishu::card::budget::REASONING_ELEMENT.max);
     if held > 0 && !acc.source_prefix_holds(&source, full, extent) {
         acc.mark_delivered_part(&message_id, part);
         let key = acc.entry_key_of(&source).or(order_at);
@@ -7970,7 +7970,7 @@ Index: /x/src/main.rs
             .delivered_chars;
         assert_eq!(
             delivered,
-            crate::feishu::card::REASONING_TEXT_CAP,
+            crate::feishu::card::budget::REASONING_ELEMENT.max,
             "the frontier counts only the characters the card displayed"
         );
 
@@ -8006,8 +8006,8 @@ Index: /x/src/main.rs
         // The growth crosses the cap: the marker sits past it, where only the
         // recovery may show it.
         let grown = format!("{first}{}{beyond}", "跨".repeat(200));
-        assert!(first.chars().count() <= crate::feishu::card::REASONING_TEXT_CAP);
-        assert!(grown.chars().count() > crate::feishu::card::REASONING_TEXT_CAP);
+        assert!(first.chars().count() <= crate::feishu::card::budget::REASONING_ELEMENT.max);
+        assert!(grown.chars().count() > crate::feishu::card::budget::REASONING_ELEMENT.max);
         let build = |reasoning: &str| {
             SessionTranscript::new(vec![
                 typed_message(
@@ -8035,7 +8035,7 @@ Index: /x/src/main.rs
             .delivered_chars;
         assert_eq!(
             delivered,
-            crate::feishu::card::REASONING_TEXT_CAP,
+            crate::feishu::card::budget::REASONING_ELEMENT.max,
             "the grown frontier is the cap, not the part's full length"
         );
 
@@ -8156,7 +8156,7 @@ Index: /x/src/main.rs
         let frontier = confirmed.frontier.as_ref().expect("the reasoning frontier");
         assert_eq!(
             frontier.delivered_chars,
-            crate::feishu::card::REASONING_TEXT_CAP,
+            crate::feishu::card::budget::REASONING_ELEMENT.max,
             "the cursor counts only what the card displays"
         );
         assert_eq!(
@@ -8178,7 +8178,7 @@ Index: /x/src/main.rs
     #[test]
     fn a_capped_reasoning_frontier_renders_its_suffix_once() {
         let full = format!("{}{}", "隐".repeat(900), "尾巴");
-        let delivered = crate::feishu::card::REASONING_TEXT_CAP;
+        let delivered = crate::feishu::card::budget::REASONING_ELEMENT.max;
         let transcript = SessionTranscript::new(vec![
             typed_message(
                 "msg_cola_anchor",
@@ -8268,7 +8268,7 @@ Index: /x/src/main.rs
         let frontier = confirmed.frontier.as_ref().expect("the reasoning frontier");
         assert_eq!(
             frontier.delivered_chars,
-            crate::feishu::card::REASONING_TEXT_CAP,
+            crate::feishu::card::budget::REASONING_ELEMENT.max,
             "the rewrite's cursor counts only what the card displays"
         );
         assert_eq!(

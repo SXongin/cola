@@ -1,8 +1,9 @@
 use serde_json::json;
 
 use super::MAX_CARD_JSON_CHARS;
+use super::budget::SurfaceBudget;
+use super::clip;
 use super::shell::card_shell;
-use super::truncate_md;
 use super::with_callback_field;
 
 /// One picker option: the button's label and the callback value a click sends.
@@ -764,11 +765,9 @@ const SKILL_CARD_CHROME_BYTES: usize = 1_200;
 /// single button stays one bounded line.
 fn skill_row_label(skill: &crate::backend::SkillInfo) -> String {
     match skill_description_line(skill) {
-        Some(description) => truncate_md(
-            &format!("{} — {}", skill.name, description),
-            SKILL_ROW_LABEL_CHARS,
-        ),
-        None => truncate_md(&skill.name, SKILL_ROW_LABEL_CHARS),
+        Some(description) => clip::clip(&format!("{} — {}", skill.name, description))
+            .cut(SurfaceBudget::chars(SKILL_ROW_LABEL_CHARS)),
+        None => clip::clip(&skill.name).cut(SurfaceBudget::chars(SKILL_ROW_LABEL_CHARS)),
     }
 }
 

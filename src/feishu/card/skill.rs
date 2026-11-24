@@ -9,11 +9,12 @@
 use crate::backend::SkillInfo;
 use serde_json::json;
 
+use super::budget::{self, SurfaceBudget};
+use super::clip;
 use super::picker::SKILL_ROW_LABEL_CHARS;
 use super::sanitize::{CardMarkdown, sanitize_markdown};
 use super::shell::{card_shell, collapsible_panel};
-use super::tool_render::{TOOL_OUTPUT_MAX_CHARS, parse_skill_envelope};
-use super::truncate_md;
+use super::tool_render::parse_skill_envelope;
 
 /// The bytes one loaded-skill card's folds may spend in total — every fold's
 /// JSON structure, its title AND its **sanitized** body (spec #652, ticket
@@ -118,7 +119,7 @@ pub(crate) fn loaded_skill_folds(
 /// [`sanitize_markdown`] path the card renders through, because a `char × 3`
 /// estimate is wrong in both directions (ASCII bodies charged as CJK over-blocks;
 /// a `<` expands to `&#60;` and under-charges) — capped per fold at
-/// [`TOOL_OUTPUT_MAX_CHARS`] characters BEFORE sanitizing, until
+/// [`budget::TOOL_PANEL`](super::budget::TOOL_PANEL) characters BEFORE sanitizing, until
 /// [`SKILL_FOLDS_TOTAL_BYTES`] is spent — after which a fold keeps its title
 /// with an omission body.
 pub(crate) fn plan_skill_folds(skills: &[SkillInfo]) -> (Vec<usize>, usize) {
@@ -134,7 +135,7 @@ pub(crate) fn plan_skill_folds(skills: &[SkillInfo]) -> (Vec<usize>, usize) {
             allowed.push(0);
             continue;
         }
-        let full = body_chars.min(TOOL_OUTPUT_MAX_CHARS);
+        let full = body_chars.min(budget::TOOL_PANEL.max);
         let bytes = sanitize_markdown(&fold_body(skill, full)).len();
         if bytes <= bytes_left {
             bytes_left -= bytes;
@@ -170,7 +171,10 @@ pub(crate) fn build_loaded_skill_card(skills: &[SkillInfo], error: Option<&str>)
 /// body budget never bounds its title, so an unbounded name could alone push the
 /// card past Feishu's 30 KB limit (AGENTS.md pitfall `card-budgets`).
 fn fold_title(name: &str) -> String {
-    format!("🧩 已加载技能：{}", truncate_md(name, SKILL_ROW_LABEL_CHARS))
+    format!(
+        "🧩 已加载技能：{}",
+        clip::clip(name).cut(SurfaceBudget::chars(SKILL_ROW_LABEL_CHARS))
+    )
 }
 
 /// The skill's own markdown, with any server `<skill_content>` envelope and
@@ -199,7 +203,7 @@ pub(crate) fn fold_body(skill: &SkillInfo, allowed: usize) -> String {
     } else if allowed == 0 {
         OMITTED_BODY.to_string()
     } else {
-        truncate_md(&body, allowed)
+        clip::clip(&body).cut(SurfaceBudget::chars(allowed))
     }
 }
 
@@ -376,13 +380,13 @@ mod tests {
     /// the dedicated card, not the removed many-message tail.
     #[test]
     fn an_ordinary_skill_shows_its_full_body() {
-        let body = "x".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let body = "x".repeat(budget::TOOL_PANEL.max);
         let card = build_loaded_skill_card(&[skill("implement-spec", Some(&body))], None);
         let fold = &card["body"]["elements"][0];
         let shown = fold["elements"][0]["content"].as_str().unwrap();
         assert_eq!(
             shown.chars().count(),
-            TOOL_OUTPUT_MAX_CHARS,
+            budget::TOOL_PANEL.max,
             "the whole body is shown, not clipped"
         );
         assert!(!shown.ends_with('…'), "no truncation marker: {}", shown.len());
@@ -411,7 +415,7 @@ mod tests {
     /// under the aggregate, so ALL render in full — the fixed over-block.
     #[test]
     fn several_large_ascii_bodies_all_render_in_full() {
-        let body = "x".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let body = "x".repeat(budget::TOOL_PANEL.max);
         let skills = [
             skill("a", Some(&body)),
             skill("b", Some(&body)),
@@ -421,7 +425,7 @@ mod tests {
         assert_eq!(hidden, 0, "three bodies fit the aggregate");
         assert_eq!(
             allowed,
-            vec![TOOL_OUTPUT_MAX_CHARS; 3],
+            vec![budget::TOOL_PANEL.max; 3],
             "every 3,000-char ASCII body is shown in full"
         );
 
@@ -433,7 +437,7 @@ mod tests {
             .map(|f| f["elements"][0]["content"].as_str().unwrap())
             .collect();
         assert!(
-            bodies.iter().all(|b| b.chars().count() == TOOL_OUTPUT_MAX_CHARS),
+            bodies.iter().all(|b| b.chars().count() == budget::TOOL_PANEL.max),
             "no body is clipped: {:?}",
             bodies.iter().map(|b| b.chars().count()).collect::<Vec<_>>()
         );
@@ -445,7 +449,7 @@ mod tests {
     /// `chars × 3` estimate would have under-charged it.
     #[test]
     fn a_heavy_markup_body_set_stays_within_the_byte_limit() {
-        let body = "<".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let body = "<".repeat(budget::TOOL_PANEL.max);
         let skills: Vec<SkillInfo> = (0..10)
             .map(|i| skill(&format!("skill-{i}"), Some(&body)))
             .collect();

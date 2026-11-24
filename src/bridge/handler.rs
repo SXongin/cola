@@ -1439,16 +1439,14 @@ fn unknown_skill_error(unknown: &[String]) -> Option<String> {
     if unknown.is_empty() {
         return None;
     }
-    let clip = crate::feishu::card::picker::SKILL_ROW_LABEL_CHARS;
+    use crate::feishu::card::{budget::SurfaceBudget, clip};
+    let label = SurfaceBudget::chars(crate::feishu::card::picker::SKILL_ROW_LABEL_CHARS);
     let named = unknown
         .iter()
-        .map(|id| format!("`{}`", crate::feishu::card::truncate_md(id, clip)))
+        .map(|id| format!("`{}`", clip::clip(id).cut(label)))
         .collect::<Vec<_>>()
         .join("、");
-    Some(crate::feishu::card::truncate_md(
-        &format!("⚠️ 未找到技能：{named}"),
-        UNKNOWN_IDS_LINE_CHARS,
-    ))
+    Some(clip::clip(&format!("⚠️ 未找到技能：{named}")).cut(SurfaceBudget::chars(UNKNOWN_IDS_LINE_CHARS)))
 }
 
 /// The user-facing refusal for a denied action (ADR-0035), shared by the

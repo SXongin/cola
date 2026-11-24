@@ -7,6 +7,8 @@ use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, RequestsHandle};
 use crate::bridge::pollers::result_card;
 use crate::bridge::turn::Turn;
+use crate::feishu::card::budget::SurfaceBudget;
+use crate::feishu::card::clip;
 
 use super::flow::RequestFlow;
 
@@ -38,7 +40,7 @@ pub(super) fn receipt_line(prefix: &str, detail: &str) -> String {
     if detail.is_empty() {
         prefix.to_string()
     } else {
-        truncate(&format!("{prefix}：{detail}"), RECEIPT_MAX_CHARS)
+        clip::clip(&format!("{prefix}：{detail}")).cut(SurfaceBudget::chars(RECEIPT_MAX_CHARS))
     }
 }
 
@@ -387,7 +389,7 @@ pub(crate) async fn resolve_blocks(
 /// line) untouched. The cached card's own header was captured while the block
 /// was still live, so without this a click would leave the "等待你的授权 /
 /// 回答" title showing until the next render-poll flush.
-fn restamped_header(
+pub(super) fn restamped_header(
     mut card: serde_json::Value,
     header: Option<&(String, &'static str)>,
 ) -> serde_json::Value {
@@ -510,15 +512,4 @@ pub(super) async fn ack_inline_card(
 /// state. Same reason the question paths flush explicitly.
 async fn flush_inline_card(cards: &CardsHandle, host: &Option<String>, session_id: &str) {
     Turn::flush_card(cards, host.as_deref().unwrap_or(session_id)).await;
-}
-
-/// Clip `s` to at most `max` characters, appending a "…" marker when it was
-/// cut. Character-counted (not bytes) so CJK paths/values truncate at the same
-/// visual length as ASCII — mirrors `card::truncate_md`.
-pub(super) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", s.chars().take(max).collect::<String>())
-    }
 }
