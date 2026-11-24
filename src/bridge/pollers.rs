@@ -427,7 +427,7 @@ pub(crate) fn result_card(title: &str, template: &str, body: &str) -> CardAction
         card: Some(crate::feishu::card::shell::card_shell(
             title,
             template,
-            vec![serde_json::json!({ "tag": "markdown", "content": body })],
+            vec![crate::feishu::card::element::CardElement::markdown(body).into_value()],
         )),
         toast: None,
     }

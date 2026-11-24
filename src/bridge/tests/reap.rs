@@ -294,7 +294,9 @@ fn assert_preserved_body(card: &serde_json::Value) {
         "no preserved button survives: {card}"
     );
     assert!(
-        !card_has_tag(card, "action") && !card_has_tag(card, "form") && !card_has_tag(card, "input"),
+        !card_has_tag(card, ElementTag::Action)
+            && !card_has_tag(card, ElementTag::Form)
+            && !card_has_tag(card, ElementTag::Input),
         "no preserved control or control container survives: {card}"
     );
     assert_eq!(
@@ -5981,7 +5983,7 @@ async fn the_cleanup_click_carries_two_keys_and_acks_with_the_cleaning_toast() {
     })
     .await;
     let marked = last_update_of(&platform, "msg_reply").await.unwrap();
-    let button = card_tags(&marked, "button")
+    let button = card_tags(&marked, ElementTag::Button)
         .into_iter()
         .find(|button| button["value"]["action"] == "cleanup")
         .expect("the unconfirmed successor offers the cleanup button");

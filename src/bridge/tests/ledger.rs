@@ -263,7 +263,11 @@ async fn one_live_task_rides_the_live_cards_tail() {
         .collect();
     assert_eq!(panels.len(), 1, "exactly one ledger panel: {card}");
     let panel = panels[0];
-    assert_eq!(panel["tag"], "collapsible_panel", "the live list folds: {panel}");
+    assert_eq!(
+        crate::feishu::card::element::tag(panel),
+        Some(ElementTag::Panel),
+        "the live list folds: {panel}"
+    );
     assert_eq!(panel["expanded"], false, "folded by default: {panel}");
     assert_eq!(
         panel["element_id"], "task_ledger",

@@ -3642,7 +3642,7 @@ fn loading_fallback_card(subtitle: &str) -> serde_json::Value {
     serde_json::json!({
         "schema": "2.0",
         "config": { "wide_screen_mode": true },
-        "body": { "elements": [{ "tag": "markdown", "content": content }] }
+        "body": { "elements": [crate::feishu::card::element::CardElement::markdown(content).into_value()] }
     })
 }
 

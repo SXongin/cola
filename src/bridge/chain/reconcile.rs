@@ -106,7 +106,7 @@ use crate::bridge::chain::RenderedCursor;
 use crate::bridge::handles::{CardsHandle, FlowHandles};
 use crate::bridge::turn::{ArmedTakeover, CardOwnership, Disposition, Turn};
 use crate::feishu::card::{
-    CardState, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
+    CardState, element, error_line, ledger::TASK_LEDGER_ELEMENT_ID, move_line, shell::CardBuilder,
 };
 use crate::feishu::delivery::{CardWriteIntent, CardWriteTicket, KeyedSubmission, WriteOutcome};
 use std::sync::Arc;
@@ -2053,7 +2053,7 @@ impl KeepBody {
                 if is_task_ledger_element(element) {
                     return false;
                 }
-                !is_running_panel_element(element) || !names_resolved_call(element, resolved_calls)
+                !element::is_running_panel(element) || !names_resolved_call(element, resolved_calls)
             }
             Self::Nothing => false,
         }
@@ -2078,17 +2078,6 @@ fn names_resolved_call(element: &serde_json::Value, resolved_calls: &[String]) -
 /// successor's own reads rebuild the live list, so a collect never keeps it.
 fn is_task_ledger_element(element: &serde_json::Value) -> bool {
     element.get("element_id").and_then(|id| id.as_str()) == Some(TASK_LEDGER_ELEMENT_ID)
-}
-
-/// Whether `element` is a running tool panel as a whole-card read returns it
-/// (ADR-0068): a `collapsible_panel` whose plain-text title begins `⏳`. The
-/// ledger shares the glyph and is matched by its element id first.
-fn is_running_panel_element(element: &serde_json::Value) -> bool {
-    element["tag"] == "collapsible_panel"
-        && element["header"]["title"]["tag"] == "plain_text"
-        && element["header"]["title"]["content"]
-            .as_str()
-            .is_some_and(|title| title.starts_with('⏳'))
 }
 
 /// The bare card — an ending, or the still-live orphan's restart stamp (#443)
@@ -2200,6 +2189,7 @@ fn stripped_of_controls(element: &serde_json::Value) -> Option<serde_json::Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feishu::card::element::ElementTag;
 
     /// The reap's card vocabulary is one state + one optional line (plus the
     /// move line when the Session relocated): the ending's header, the failure
@@ -2225,7 +2215,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|element| element["tag"] != "button"),
+                .all(|element| !element::is(element, ElementTag::Button)),
             "the reap offers no recovery action: {unreceived}"
         );
 
@@ -2336,9 +2326,13 @@ mod tests {
             card_buttons(&card).is_empty(),
             "no preserved button survives, nested or not: {card}"
         );
-        assert!(!card_has_tag(&card, "action"), "no action block survives: {card}");
+        assert!(
+            !card_has_tag(&card, ElementTag::Action),
+            "no action block survives: {card}"
+        );
         assert_eq!(
-            elements[2]["tag"], "collapsible_panel",
+            element::tag(&elements[2]),
+            Some(ElementTag::Panel),
             "the panel itself survives: {card}"
         );
         assert_eq!(
@@ -2347,7 +2341,8 @@ mod tests {
             "the panel's nested control is stripped: {card}"
         );
         assert_eq!(
-            elements[3]["tag"], "hr",
+            element::tag(&elements[3]),
+            Some(ElementTag::Hr),
             "non-interactive elements keep their order: {card}"
         );
 
@@ -2405,8 +2400,19 @@ mod tests {
         });
 
         let card = restamped_keeping_body(&bare, &view);
-        for tag in ["form", "input", "button", "checker", "select_img"] {
-            assert!(!card_has_tag(&card, tag), "{tag} must be stripped whole: {card}");
+        for tag in [ElementTag::Form, ElementTag::Input, ElementTag::Button] {
+            assert!(
+                !card_has_tag(&card, tag),
+                "{tag:?} must be stripped whole: {card}"
+            );
+        }
+        // Their tags are the fixture's stand-ins, not platform elements: a
+        // stand-in control must be stripped exactly like a named one.
+        for tag in ["checker", "select_img"] {
+            assert!(
+                !card.to_string().contains(&format!(r#""tag":"{tag}""#)),
+                "{tag} must be stripped whole: {card}"
+            );
         }
         assert!(
             !contains_null(&card),
@@ -2417,7 +2423,7 @@ mod tests {
             "the display content around the controls survives: {card}"
         );
         let panel = &card["body"]["elements"][0];
-        assert_eq!(panel["tag"], "collapsible_panel", "{card}");
+        assert_eq!(element::tag(panel), Some(ElementTag::Panel), "{card}");
         assert!(
             panel.get("button_area").is_none(),
             "the object-valued control's key is dropped, never nulled: {card}"

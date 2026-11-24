@@ -3239,10 +3239,7 @@ async fn structural_overflow_goes_out_as_one_rich_text_message() {
         } => {
             assert_eq!(message_id, "m_csv", "the reply targets the card's own command");
             assert_eq!(msg_type, "post");
-            assert_eq!(content["zh_cn"]["content"][0][0]["tag"], "md");
-            let md = content["zh_cn"]["content"][0][0]["text"]
-                .as_str()
-                .expect("the md text");
+            let md = rich_post_markdown(content).expect("the md text");
             assert!(md.contains("| name | age |"), "the header: {md}");
             assert!(md.contains("| r59 | 59 |"), "every row, none cut: {md}");
         }

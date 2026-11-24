@@ -13,6 +13,7 @@ use crate::backend::{FinishReason, MessageId, MessageRole, Part, SessionTranscri
 use crate::bridge::snapshot::SnapshotData;
 use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
+use crate::feishu::card::element;
 use crate::feishu::card::session::{BUSY_CHIP, FOLLOW_HINT, IDLE_CHIP, LEAD_COMPACTION_PREFIX};
 
 /// A child Session that is a genuine busy-follow candidate: a live Busy status
@@ -3353,8 +3354,8 @@ fn idle_card_body(card: &serde_json::Value) -> RenderedBody {
     let mut body = RenderedBody::default();
     let mut in_tail = false;
     for element in card["body"]["elements"].as_array().expect("card body") {
-        match element["tag"].as_str() {
-            Some("markdown") => {
+        match element::tag(element) {
+            Some(ElementTag::Markdown) => {
                 let content = element["content"].as_str().expect("markdown content");
                 if content == "**最近对话**" {
                     in_tail = true;
@@ -3367,7 +3368,7 @@ fn idle_card_body(card: &serde_json::Value) -> RenderedBody {
                     body.markers.push((content.to_string(), String::new()));
                 }
             }
-            Some("collapsible_panel") => {
+            Some(ElementTag::Panel) => {
                 let title = element["header"]["title"]["content"]
                     .as_str()
                     .expect("panel title");

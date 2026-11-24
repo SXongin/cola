@@ -2090,6 +2090,7 @@ mod tests {
         CursorSeed, InteractionBlock, PendingPermission, PendingQuestion, StreamAccumulator,
     };
     use crate::feishu::card::MAX_CARD_TEXT_CHARS;
+    use crate::feishu::card::element::{self, ElementTag};
     use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind};
     use crate::feishu::card::tool_render::ToolPanel;
 
@@ -2255,7 +2256,7 @@ mod tests {
         let order: Vec<&str> = elements
             .iter()
             .map(|e| {
-                if e["tag"] == "collapsible_panel" {
+                if element::is(e, ElementTag::Panel) {
                     "tool"
                 } else {
                     e["content"].as_str().unwrap_or_default()
@@ -2281,7 +2282,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|e| e["tag"] == "collapsible_panel")
+                .filter(|e| element::is(e, ElementTag::Panel))
                 .map(|e| e["element_id"].as_str().unwrap().to_string())
                 .collect()
         };

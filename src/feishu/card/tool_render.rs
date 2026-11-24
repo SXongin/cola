@@ -293,7 +293,7 @@ impl ToolPanel {
             return "❌";
         }
         match self.status() {
-            ToolStatus::Running | ToolStatus::Pending => "⏳",
+            ToolStatus::Running | ToolStatus::Pending => vocab::RUNNING_ICON,
             ToolStatus::Completed => "✅",
             // OpenCode marks failed tools as status "error" (the typed arm
             // above); a status this build does not model keeps its own name,
@@ -2312,7 +2312,7 @@ pub(super) fn program_output(
 /// vocabulary the nested tool's own panel would show.
 fn nested_status_icon(status: &ToolStatus) -> &'static str {
     match status {
-        ToolStatus::Pending | ToolStatus::Running => "⏳",
+        ToolStatus::Pending | ToolStatus::Running => vocab::RUNNING_ICON,
         ToolStatus::Completed => "✅",
         status if status.is_failure() => "❌",
         _ => "🔧",

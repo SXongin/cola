@@ -1579,7 +1579,7 @@ impl App {
         let card = crate::feishu::card::shell::card_shell(
             &title,
             template,
-            vec![serde_json::json!({ "tag": "markdown", "content": body })],
+            vec![crate::feishu::card::element::CardElement::markdown(body).into_value()],
         );
         // A topic command carries its `thread_id`; the command message itself
         // lives inside the topic, so replying to it keeps the card there.

@@ -396,7 +396,7 @@ fn restamped_header(
     {
         h.insert(
             "title".to_string(),
-            serde_json::json!({ "tag": "plain_text", "content": title }),
+            crate::feishu::card::element::CardElement::plain_text(title).into_value(),
         );
         h.insert("template".to_string(), serde_json::json!(template));
     }

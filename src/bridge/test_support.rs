@@ -5,6 +5,7 @@ pub(crate) use std::sync::Arc;
 pub(crate) use crate::bridge::handler::App;
 pub(crate) use crate::bridge::turn::Turn;
 pub(crate) use crate::feishu;
+pub(crate) use crate::feishu::card::element::ElementTag;
 
 use crate::backend::{
     BackgroundTask, ChildEvidence, Compaction, CompactionReason, CompactionStatus, ContentBlock, Execution,
@@ -910,23 +911,10 @@ async fn wait_gate(gate: CallGate) {
 /// Walk a card and collect every button's `value` payload (buttons nest in
 /// column sets and action blocks, so the walk is recursive).
 fn collect_button_values(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if map.get("tag").and_then(|t| t.as_str()) == Some("button")
-                && let Some(value) = map.get("value")
-            {
-                out.push(value.clone());
-            }
-            for v in map.values() {
-                collect_button_values(v, out);
-            }
+    for button in card_tags(value, ElementTag::Button) {
+        if let Some(value) = button.get("value") {
+            out.push(value.clone());
         }
-        serde_json::Value::Array(items) => {
-            for v in items {
-                collect_button_values(v, out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -5173,7 +5161,7 @@ pub(crate) fn card_is_done(card: &serde_json::Value) -> bool {
 /// and action blocks) — for assertions on a button's `value` payload or label
 /// without string-matching the card's JSON dump.
 pub(crate) fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
-    card_tags(card, "button")
+    card_tags(card, ElementTag::Button)
 }
 
 /// A button payload's keys, sorted: the wire contract a click carries,
@@ -5203,23 +5191,24 @@ pub(crate) fn click_value(card: &serde_json::Value, op: &str, session_id: Option
         .clone()
 }
 
-/// Every element anywhere on the card carrying `tag`, in document order —
-/// elements nest in forms, panels and column sets, so a top-level scan misses
-/// most controls.
-pub(crate) fn card_tags<'a>(card: &'a serde_json::Value, tag: &str) -> Vec<&'a serde_json::Value> {
-    fn walk<'a>(value: &'a serde_json::Value, tag: &str, out: &mut Vec<&'a serde_json::Value>) {
+/// Every element anywhere on the card of `tag`, in document order — elements
+/// nest in forms, panels and column sets, so a top-level scan misses most
+/// controls. The shared typed walker: `tag` is an [`ElementTag`], so a test
+/// cannot ask for a tag the schema does not have.
+pub(crate) fn card_tags<'a>(card: &'a serde_json::Value, tag: ElementTag) -> Vec<&'a serde_json::Value> {
+    fn walk<'a>(value: &'a serde_json::Value, tag: ElementTag, out: &mut Vec<&'a serde_json::Value>) {
+        if crate::feishu::card::element::is(value, tag) {
+            out.push(value);
+        }
         match value {
             serde_json::Value::Object(map) => {
-                if map.get("tag").and_then(|t| t.as_str()) == Some(tag) {
-                    out.push(value);
-                }
-                for v in map.values() {
-                    walk(v, tag, out);
+                for child in map.values() {
+                    walk(child, tag, out);
                 }
             }
             serde_json::Value::Array(items) => {
-                for v in items {
-                    walk(v, tag, out);
+                for child in items {
+                    walk(child, tag, out);
                 }
             }
             _ => {}
@@ -5234,7 +5223,7 @@ pub(crate) fn card_tags<'a>(card: &'a serde_json::Value, tag: &str) -> Vec<&'a s
 /// card's boxes sit inside its one root-level form (issue #917 part 3), so a
 /// top-level scan would miss them.
 pub(crate) fn card_inputs(card: &serde_json::Value) -> Vec<&serde_json::Value> {
-    card_tags(card, "input")
+    card_tags(card, ElementTag::Input)
 }
 
 /// A card's header title, for Done/Streaming/topic assertions.
@@ -5244,17 +5233,21 @@ pub(crate) fn card_header(card: &serde_json::Value) -> &str {
 
 /// Whether any element anywhere on the card carries `tag` — elements nest in
 /// panels, column sets and action blocks, so a top-level scan is not enough.
-pub(crate) fn card_has_tag(card: &serde_json::Value, tag: &str) -> bool {
-    fn walk(value: &serde_json::Value, tag: &str) -> bool {
-        match value {
-            serde_json::Value::Object(map) => {
-                map.get("tag").and_then(|t| t.as_str()) == Some(tag) || map.values().any(|v| walk(v, tag))
-            }
-            serde_json::Value::Array(items) => items.iter().any(|v| walk(v, tag)),
-            _ => false,
-        }
+pub(crate) fn card_has_tag(card: &serde_json::Value, tag: ElementTag) -> bool {
+    !card_tags(card, tag).is_empty()
+}
+
+/// The markdown a Rich Text Message (`msg_type: "post"`) carries in its one
+/// `md` node, if `content` has that lane's shape — the shared reader for a test
+/// inspecting the sent message. A post node is not a card element (its tag is
+/// `md`, outside [`ElementTag`]), and the post envelope is the viewer's to
+/// write, so the test walker reads it here rather than spelling the envelope.
+pub(crate) fn rich_post_markdown(content: &serde_json::Value) -> Option<&str> {
+    let node = content.get("zh_cn")?.get("content")?.get(0)?.get(0)?;
+    if node.get("tag").and_then(serde_json::Value::as_str) != Some("md") {
+        return None;
     }
-    walk(card, tag)
+    node.get("text").and_then(serde_json::Value::as_str)
 }
 
 /// The last card the app flushed in place — the finalized card.

@@ -15,6 +15,7 @@
 
 use crate::backend::{PromptSkill, SkillInfo};
 use crate::bridge::test_support::*;
+use crate::feishu::card::element;
 use std::sync::Arc;
 
 /// The registered skills the standard fixture serves: `implement-spec` with a
@@ -149,7 +150,7 @@ fn card_buttons(card: &serde_json::Value) -> Vec<(String, String)> {
         .as_array()
         .expect("card body elements")
         .iter()
-        .filter(|element| element["tag"] == "button")
+        .filter(|element| element::is(element, ElementTag::Button))
         .map(|element| {
             (
                 element["text"]["content"]
@@ -185,7 +186,7 @@ fn collapsible_panels(card: &serde_json::Value) -> Vec<&serde_json::Value> {
         .as_array()
         .expect("card body elements")
         .iter()
-        .filter(|element| element["tag"] == "collapsible_panel")
+        .filter(|element| element::is(element, ElementTag::Panel))
         .collect()
 }
 
@@ -732,7 +733,7 @@ async fn a_picker_row_tap_submits_the_skill_command() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|element| element["tag"] == "button")
+        .find(|element| element::is(element, ElementTag::Button))
         .expect("a picker row")["value"]
         .clone();
     // The picker row carries the ORIGINAL user message the picker was sent
@@ -1080,7 +1081,7 @@ async fn a_picker_row_with_a_whitespace_id_still_loads() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|element| element["tag"] == "button")
+        .find(|element| element::is(element, ElementTag::Button))
         .expect("a picker row")["value"]
         .clone();
 
@@ -1181,12 +1182,12 @@ async fn a_skill_search_rebuilds_the_picker_card_in_place() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["tag"] == "form")
+        .find(|e| element::is(e, ElementTag::Form))
         .expect("a >page list shows the search box")["elements"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["tag"] == "button")
+        .find(|e| element::is(e, ElementTag::Button))
         .expect("the search submit")["value"]
         .clone();
     assert_eq!(
@@ -1295,14 +1296,14 @@ fn row_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
         .as_array()
         .expect("card body elements")
         .iter()
-        .filter(|e| e["tag"] == "button" && e["value"].get("op").is_none())
+        .filter(|e| element::is(e, ElementTag::Button) && e["value"].get("op").is_none())
         .collect()
 }
 
 /// The 下一页 button's callback value (the pager's third column), if any.
 fn pager_next_value(card: &serde_json::Value) -> Option<serde_json::Value> {
     card["body"]["elements"].as_array()?.iter().find_map(|e| {
-        (e["tag"] == "column_set"
+        (element::is(e, ElementTag::ColumnSet)
             && e["columns"]
                 .as_array()
                 .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "page")))

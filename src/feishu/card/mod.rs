@@ -1,5 +1,6 @@
 pub(crate) mod command;
 pub(crate) mod compaction;
+pub(crate) mod element;
 pub(crate) mod help;
 pub(crate) mod lang;
 pub(crate) mod ledger;

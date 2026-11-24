@@ -50,6 +50,7 @@ use crate::backend::{
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{CardOwnership, ContinuationFacts, Turn};
 use crate::feishu::card::CardState;
+use crate::feishu::card::element;
 
 /// A finished assistant turn whose newest message recorded a failure.
 fn failed_assistant(created: i64, text: &str, error: &str) -> TranscriptMessage {
@@ -3688,7 +3689,8 @@ async fn a_merged_shell_wake_leaves_one_entry_on_the_live_turn_card() {
     let entry = body_index(&last, "shell 完成").expect("the entry renders");
     let element = &last["body"]["elements"][entry];
     assert_eq!(
-        element["tag"], "collapsible_panel",
+        element::tag(element),
+        Some(ElementTag::Panel),
         "the entry is folded: {element}"
     );
     assert_eq!(
@@ -3926,7 +3928,8 @@ async fn a_merged_subagent_wake_labels_the_entry_with_its_description() {
     let entry = body_index(&last, "subagent 完成").expect("the entry renders");
     let element = &last["body"]["elements"][entry];
     assert_eq!(
-        element["tag"], "collapsible_panel",
+        element::tag(element),
+        Some(ElementTag::Panel),
         "the entry is folded: {element}"
     );
     assert!(
