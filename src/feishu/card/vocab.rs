@@ -59,6 +59,12 @@ pub(crate) const ALL_TOKENS: &[&str] = &[
     TOOL_ASK,
 ];
 
+/// A run's running glyph: the tool panel's status slot, the nested call's row
+/// and the running fold's title prefix. One home, so a whole-card read that
+/// identifies the running panel (`element::is_running_panel`) cannot drift from
+/// the render that writes it.
+pub(crate) const RUNNING_ICON: &str = "⏳";
+
 /// The live phase slot's three tokens (ADR-0107 §3). They serve the card
 /// header and the child-agent activity line, so one run cannot read as two
 /// different phases on two surfaces.

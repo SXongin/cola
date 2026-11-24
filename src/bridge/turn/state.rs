@@ -6182,6 +6182,7 @@ pub(super) use crate::bridge::tasks::{task_kind, task_label};
 mod tests {
     use super::*;
     use crate::backend::{BackgroundTask, FileAction, FileEdit, ToolIdentity, ToolStatus};
+    use crate::feishu::card::element::{self, ElementTag};
     use std::collections::HashSet;
 
     /// A terminal run launched before the Turn this card renders is history:
@@ -7704,7 +7705,8 @@ mod tests {
         let (card, _) = acc.build_card_with_split();
         let elements = card["body"]["elements"].as_array().unwrap();
         assert_eq!(
-            elements[0]["tag"], "collapsible_panel",
+            element::tag(&elements[0]),
+            Some(ElementTag::Panel),
             "the arrangement the test pins: the panel is the card's first item"
         );
         let continuation = elements
@@ -8451,7 +8453,7 @@ mod tests {
         let kinds: Vec<&str> = elements
             .iter()
             .map(|e| {
-                if e["tag"] == "collapsible_panel" {
+                if element::is(e, ElementTag::Panel) {
                     "tool"
                 } else {
                     "text"
@@ -9447,7 +9449,7 @@ mod tests {
             elements.iter().position(predicate).expect("element renders")
         };
         let index = position(&|element| element["value"]["op"] == "turn_diff");
-        let hr = position(&|element| element["tag"] == "hr");
+        let hr = position(&|element| element::is(element, ElementTag::Hr));
         let footer = position(&|element| {
             element["content"]
                 .as_str()

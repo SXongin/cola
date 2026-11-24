@@ -493,7 +493,7 @@ pub fn merge_patch(
 
 /// The markdown element one Interaction Receipt renders as.
 fn receipt_element(line: &str) -> serde_json::Value {
-    serde_json::json!({ "tag": "markdown", "content": line })
+    crate::feishu::card::element::CardElement::markdown(line).into_value()
 }
 
 /// Replace the elements at `span` on `card` with `replacement`, shifting every

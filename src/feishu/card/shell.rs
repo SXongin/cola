@@ -2,6 +2,7 @@ use serde_json::json;
 
 use super::MAX_ELEMENT_TEXT_CHARS;
 use super::compaction::compaction_elements;
+use super::element::CardElement;
 use super::ledger::{
     TASK_LEDGER_ELEMENT_ID, TaskCompletionEntry, TaskLedgerRow, task_entry_body, task_entry_title,
     task_ledger_text, task_ledger_title,
@@ -112,7 +113,7 @@ fn card_with_header(header: serde_json::Value, elements: Vec<serde_json::Value>)
 pub(crate) fn card_shell(title: &str, template: &str, elements: Vec<serde_json::Value>) -> serde_json::Value {
     card_with_header(
         json!({
-            "title": { "tag": "plain_text", "content": title },
+            "title": CardElement::plain_text(title).into_value(),
             "template": template
         }),
         elements,
@@ -421,8 +422,8 @@ impl CardBuilder {
         if let Some(ref footer) = self.footer
             && self.state.carries_turn_footer()
         {
-            elements.push(json!({"tag": "hr"}));
-            elements.push(json!({ "tag": "markdown", "content": footer }));
+            elements.push(CardElement::hr().into_value());
+            elements.push(CardElement::markdown(footer).into_value());
         }
 
         // Terminal-card recovery actions: the Error card's retry (spec #391)
@@ -431,12 +432,7 @@ impl CardBuilder {
         // states that own one — a live, Done or collected card renders none.
         if self.state.offers_recovery() {
             for btn in &self.recovery_buttons {
-                elements.push(json!({
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": btn.text },
-                    "type": btn.kind,
-                    "value": btn.value,
-                }));
+                elements.push(CardElement::button(&btn.text, btn.kind, btn.value.clone()).into_value());
             }
         }
 
@@ -453,7 +449,7 @@ impl CardBuilder {
         let running = self.header_running_tool.as_ref().or(slice_running.as_ref());
         let (header_title, template) = header_title_and_template(&self.state, running, &self.progress);
         let mut header = serde_json::json!({
-            "title": { "tag": "plain_text", "content": header_title },
+            "title": CardElement::plain_text(header_title).into_value(),
             "template": template
         });
         if let Some(subtitle) = match (self.subtitle.as_deref(), self.date.as_deref()) {
@@ -462,10 +458,7 @@ impl CardBuilder {
             (None, Some(date)) => Some(date.to_string()),
             (None, None) => None,
         } {
-            header["subtitle"] = serde_json::json!({
-                "tag": "plain_text",
-                "content": subtitle
-            });
+            header["subtitle"] = CardElement::plain_text(subtitle).into_value();
         }
         card_with_header(header, elements)
     }
@@ -622,7 +615,7 @@ pub(crate) fn collapsible_panel_chunks(
 ) -> serde_json::Value {
     let elements = chunks
         .iter()
-        .map(|c| json!({ "tag": "markdown", "content": c }))
+        .map(|c| CardElement::markdown(c).into_value())
         .collect::<Vec<_>>();
     collapsible_panel_elements(title, elements, element_id)
 }
@@ -638,20 +631,7 @@ pub(crate) fn collapsible_panel_elements(
     elements: Vec<serde_json::Value>,
     element_id: Option<&str>,
 ) -> serde_json::Value {
-    let mut panel = json!({
-        "tag": "collapsible_panel",
-        "expanded": false,
-        "header": {
-            "title": { "tag": "plain_text", "content": title },
-            "icon": { "tag": "standard_icon", "token": "down-small-ccm_outlined" },
-            "icon_position": "right"
-        },
-        "elements": elements,
-    });
-    if let Some(id) = element_id {
-        panel["element_id"] = json!(id);
-    }
-    panel
+    CardElement::panel(title, elements, element_id).into_value()
 }
 
 #[cfg(test)]

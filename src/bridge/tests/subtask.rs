@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::bridge::test_support::*;
+use crate::feishu::card::element;
 
 #[tokio::test]
 async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory() {
@@ -69,7 +70,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["tag"] == "button")
+        .find(|e| element::is(e, ElementTag::Button))
         .expect("permission buttons present");
     let value = first_button["value"].clone();
     assert_eq!(value["session_id"], child);
@@ -296,7 +297,7 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|e| e["tag"] == "button")
+        .find(|e| element::is(e, ElementTag::Button))
         .expect("permission card has buttons");
     let value = first_button["value"].clone();
     assert_eq!(value["session_id"], child);

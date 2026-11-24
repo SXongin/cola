@@ -3714,6 +3714,7 @@ impl RenderPoll {
 mod tests {
     use super::*;
     use crate::backend::runs::{RetireCause, RetireRead, RunLifecycle};
+    use crate::feishu::card::element::{self, ElementTag};
 
     /// Issue #910 (the CI hang): a poll parked in a transcript read must not
     /// stall `RenderPoll::stop` — and therefore the turn's finalization — when
@@ -9162,7 +9163,7 @@ Index: /x/src/main.rs
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|e| e["tag"] == "collapsible_panel")
+                .filter(|e| element::is(e, ElementTag::Panel))
                 .map(|e| {
                     format!(
                         "{}({})",
@@ -9738,10 +9739,14 @@ Index: /x/src/main.rs
         let elements = card["body"]["elements"].as_array().unwrap();
         let panel_at = elements
             .iter()
-            .position(|e| e["tag"] == "collapsible_panel")
+            .position(|e| element::is(e, ElementTag::Panel))
             .expect("the read panel is on the card");
         let image = &elements[panel_at + 1];
-        assert_eq!(image["tag"], "img", "the image follows the panel: {card}");
+        assert_eq!(
+            element::tag(image),
+            Some(ElementTag::Image),
+            "the image follows the panel: {card}"
+        );
         assert_eq!(image["img_key"], "img_v2_shot");
         assert_eq!(image["title"]["content"], "📎 shot.png");
         assert_eq!(image["preview"], true);
@@ -9804,7 +9809,7 @@ Index: /x/src/main.rs
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["tag"] == "img")
+            .filter(|e| element::is(e, ElementTag::Image))
             .collect();
         assert_eq!(images.len(), 2, "both reads show their image: {card}");
         assert!(images.iter().all(|img| img["img_key"] == "img_v2_same"));
@@ -10065,7 +10070,7 @@ Index: /x/src/main.rs
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|e| e["tag"] != "img"),
+                .all(|e| !element::is(e, ElementTag::Image)),
             "no image element: {card}"
         );
         let body = card["body"]["elements"][0]["elements"][0]["content"]
@@ -10195,7 +10200,7 @@ Index: /x/src/main.rs
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|e| e["tag"] != "img"),
+                .all(|e| !element::is(e, ElementTag::Image)),
             "no embed without a key: {card}"
         );
         let body = card["body"]["elements"][0]["elements"][0]["content"]
@@ -10293,7 +10298,7 @@ Index: /x/src/main.rs
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|e| e["tag"] != "img"),
+                .all(|e| !element::is(e, ElementTag::Image)),
             "no image is embedded: {card}"
         );
         let body = card["body"]["elements"][0]["elements"][0]["content"]
@@ -10382,7 +10387,7 @@ Index: /x/src/main.rs
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["tag"] == "collapsible_panel")
+            .filter(|e| element::is(e, ElementTag::Panel))
             .filter(|e| {
                 e["elements"][0]["content"]
                     .as_str()
@@ -11068,7 +11073,7 @@ Index: /x/src/main.rs
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["tag"] == "img")
+            .filter(|e| element::is(e, ElementTag::Image))
             .count();
         assert_eq!(images, total, "every image renders an img: {card}");
         let body = card["body"]["elements"][0]["elements"][0]["content"]
@@ -11141,7 +11146,7 @@ Index: /x/src/main.rs
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["tag"] == "img")
+            .filter(|e| element::is(e, ElementTag::Image))
             .count();
         assert_eq!(
             imgs, 27,
@@ -11176,7 +11181,7 @@ Index: /x/src/main.rs
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["tag"] == "img")
+            .filter(|e| element::is(e, ElementTag::Image))
             .count();
         assert_eq!(imgs, 28, "the later panel embeds the shared content too: {card}");
     }
@@ -11239,7 +11244,7 @@ Index: /x/src/main.rs
             .as_array()
             .unwrap()
             .iter()
-            .filter(|e| e["tag"] == "img")
+            .filter(|e| element::is(e, ElementTag::Image))
             .count();
         assert_eq!(imgs, 26, "every image renders: {card}");
         let rendered = card.to_string();
@@ -14045,7 +14050,7 @@ Index: /x/src/main.rs
         card["body"]["elements"]
             .as_array()?
             .iter()
-            .find(|element| element["tag"] == "button" && element["value"]["op"] == "turn_diff")
+            .find(|element| element::is(element, ElementTag::Button) && element["value"]["op"] == "turn_diff")
     }
 
     /// Acceptance: a terminal card renders the settled index — line and button
@@ -14090,7 +14095,7 @@ Index: /x/src/main.rs
             .position(|element| element == button)
             .expect("the button is a body element");
         let footer_pos = elements.len() - 1;
-        assert_eq!(elements[footer_pos - 1]["tag"], "hr");
+        assert_eq!(element::tag(&elements[footer_pos - 1]), Some(ElementTag::Hr));
         assert!(
             elements[footer_pos]["content"]
                 .as_str()
