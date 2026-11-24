@@ -2721,24 +2721,28 @@ async fn a_failed_child_only_run_evidence_offers_cleanup_and_cleans_it() {
 
     // The pipeline records the ending at derivation even though the refresh's
     // PATCH fails; poll the durable record rather than the card.
-    let ending = wait_for("the cleanup ending is recorded at derivation", || async {
-        let persisted = ChainRecords::load(
-            crate::state::StateLayout::new(dir.path().join("sessions.json"), None).chain_records(),
-        );
-        persisted
-            .endings("ses_test")
-            .iter()
-            .find_map(|record| {
-                record.run.names("thread_child").then(|| {
-                    record
-                        .endings
-                        .iter()
-                        .find(|ending| ending.class == TaskEndingClass::Cleanup)
-                })?
-            })
-            .cloned()
-    })
-    .await;
+    let ending = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for("the cleanup ending is recorded at derivation", || async {
+            let persisted = ChainRecords::load(
+                crate::state::StateLayout::new(dir.path().join("sessions.json"), None).chain_records(),
+            );
+            persisted
+                .endings("ses_test")
+                .iter()
+                .find_map(|record| {
+                    record.run.names("thread_child").then(|| {
+                        record
+                            .endings
+                            .iter()
+                            .find(|ending| ending.class == TaskEndingClass::Cleanup)
+                    })?
+                })
+                .cloned()
+        }),
+    )
+    .await
+    .expect("the cleanup ending is recorded at derivation");
     assert_eq!(ending.state, TaskEndingState::Owed);
     assert_eq!(
         ending.identity.label.as_deref(),

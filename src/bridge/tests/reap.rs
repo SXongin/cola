@@ -5350,18 +5350,22 @@ async fn a_projection_falls_back_to_the_chat_when_every_reply_target_is_refused(
 
     spawn_sync(&app);
     // The successor lands at the Chat's top level.
-    let successor = wait_for(
-        "a top-level fallback successor carries the missed tail",
-        || async {
-            platform
-                .sent_cards()
-                .await
-                .iter()
-                .find(|card| card_text(card).contains(missed))
-                .cloned()
-        },
+    let successor = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for(
+            "a top-level fallback successor carries the missed tail",
+            || async {
+                platform
+                    .sent_cards()
+                    .await
+                    .iter()
+                    .find(|card| card_text(card).contains(missed))
+                    .cloned()
+            },
+        ),
     )
-    .await;
+    .await
+    .expect("a top-level fallback successor carries the missed tail");
     assert_eq!(card_header(&successor), "✅ 完成");
 }
 
