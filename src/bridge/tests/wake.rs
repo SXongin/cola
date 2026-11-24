@@ -374,28 +374,19 @@ fn is_continuation(card: &serde_json::Value) -> bool {
     card_text(card).contains(WAKE_LEAD)
 }
 
-/// Await any card — sent, replied or updated — carrying `needle`, or panic
-/// after 5 s. The external-message path sends its notification, then renders
-/// into it in place, so a test must accept either call.
-async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
-    let probe = async {
-        loop {
-            let found = {
-                let calls = platform.calls.lock().await;
-                calls
-                    .iter()
-                    .filter_map(call_card)
-                    .any(|card| card_text(card).contains(needle))
-            };
-            if found {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("no card ever carried {needle:?}"));
+/// Await any card — sent, replied or updated — carrying `needle`. The
+/// external-message path sends its notification, then renders into it in
+/// place, so a test must accept either call.
+pub(crate) async fn wait_for_any_card(platform: &RecordingPlatform, needle: &str) {
+    wait_for(&format!("a card carries {needle:?}"), || async {
+        let calls = platform.calls.lock().await;
+        calls
+            .iter()
+            .filter_map(call_card)
+            .any(|card| card_text(card).contains(needle))
+            .then_some(())
+    })
+    .await;
 }
 
 /// Give `ses_test`'s tracked card the explicit id `om_waiting`: the harness

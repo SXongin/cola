@@ -449,29 +449,6 @@ async fn a_permission_card_action_carries_the_session() {
         "the request id must not be labelled a session: {reply}"
     );
 }
-
-/// Bounded wait for a card carrying `needle` to reach the fake Feishu, so a
-/// captured body can advance on an observed side effect instead of a sleep.
-async fn wait_for_card(platform: &Arc<RecordingPlatform>, needle: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let seen = platform.calls.lock().await.iter().any(|call| match call {
-            PlatformCall::SendCard { card, .. }
-            | PlatformCall::UpdateMessage { card, .. }
-            | PlatformCall::ReplyCard { card, .. } => card_text(card).contains(needle),
-            _ => false,
-        });
-        if seen {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no card carrying {needle:?} reached Feishu"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 /// The external-message poll runs inside that Session's `external` span
 /// (ADR-0048): the observation that notifies Feishu is retrievable by the
 /// Session, and by its Chat/Topic.
@@ -554,10 +531,41 @@ async fn an_external_reply_render_carries_its_session() {
             let _ = poller.external.poll_loop(&poller.flow_handles()).await;
         });
         // The notification arms the renderer; only then does the reply exist.
-        wait_for_card(&platform, "有新消息").await;
+        wait_for(
+            &format!("a card carrying {:?} reaches Feishu", "有新消息"),
+            || async {
+                platform
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|call| match call {
+                        PlatformCall::SendCard { card, .. }
+                        | PlatformCall::UpdateMessage { card, .. }
+                        | PlatformCall::ReplyCard { card, .. } => card_text(card).contains("有新消息"),
+                        _ => false,
+                    })
+                    .then_some(())
+            },
+        )
+        .await;
         reply_ready.store(true, Ordering::SeqCst);
         // The Done card is flushed just before the renderer logs its exit.
-        wait_for_card(&platform, "✅").await;
+        wait_for(&format!("a card carrying {:?} reaches Feishu", "✅"), || async {
+            platform
+                .calls
+                .lock()
+                .await
+                .iter()
+                .any(|call| match call {
+                    PlatformCall::SendCard { card, .. }
+                    | PlatformCall::UpdateMessage { card, .. }
+                    | PlatformCall::ReplyCard { card, .. } => card_text(card).contains("✅"),
+                    _ => false,
+                })
+                .then_some(())
+        })
+        .await;
         // Let the render task finish its last line before the capture closes.
         tokio::time::sleep(Duration::from_millis(20)).await;
     })

@@ -184,8 +184,9 @@ async fn last_update_of(platform: &RecordingPlatform, message_id: &str) -> Optio
 /// negative assertion ("no card was touched") follow observed work instead of
 /// racing a bare sleep.
 async fn wait_for_status_reads(backend: &Arc<MockBackend>, session_id: &str, n: usize) {
-    let probe = async {
-        loop {
+    wait_for(
+        &format!("the reap reads {session_id}'s status {n} times"),
+        || async {
             let reads = backend
                 .session_status_reads
                 .lock()
@@ -193,79 +194,34 @@ async fn wait_for_status_reads(backend: &Arc<MockBackend>, session_id: &str, n: 
                 .iter()
                 .filter(|sid| sid.as_str() == session_id)
                 .count();
-            if reads >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the reap never read {session_id}'s status {n} times"));
+            (reads >= n).then_some(())
+        },
+    )
+    .await;
 }
 
 /// Wait until the session's record names `card_message_id`, or panic after
 /// 5 s.
 async fn wait_for_record_card(app: &Arc<App>, session_id: &str, card_message_id: &str) {
-    let probe = async {
-        loop {
-            if app
-                .cards_handle()
-                .chains
-                .get(session_id)
-                .is_some_and(|record| record.card_message_id == card_message_id)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the record never named {card_message_id}"));
+    wait_for(&format!("the record names {card_message_id}"), || async {
+        app.cards_handle()
+            .chains
+            .get(session_id)
+            .is_some_and(|record| record.card_message_id == card_message_id)
+            .then_some(())
+    })
+    .await;
 }
 
 /// Wait until `message_id` has at least `n` recorded in-place PATCHes, or
 /// panic after 5 s — the observation a takeover test needs before it asserts
 /// on the writes a parked stamp let queue up behind it.
 async fn wait_for_patches(platform: &RecordingPlatform, message_id: &str, n: usize) {
-    let probe = async {
-        loop {
-            if patches_to(platform, message_id).await.len() >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("{message_id} never reached {n} PATCHes"));
+    wait_for(&format!("{message_id} reaches {n} PATCHes"), || async {
+        (patches_to(platform, message_id).await.len() >= n).then_some(())
+    })
+    .await;
 }
-
-/// Wait until the registry no longer caches `message_id`, or panic after 5 s.
-/// The collect's cache release now runs in a **detached continuation** (spec
-/// #571 review), so a test observes it instead of racing it.
-async fn wait_for_cache_release(app: &Arc<App>, message_id: &str) {
-    let probe = async {
-        loop {
-            if app
-                .cards_handle()
-                .card_handles
-                .lock()
-                .await
-                .cached_card(message_id)
-                .is_none()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("{message_id}'s cached presentation was never released"));
-}
-
 /// How many `get_card_view` reads the platform served for `message_id` — the
 /// count the settled-key churn test pins (spec #571, ticket #575): a stamp that
 /// already settled must never make the reap read the card again.
@@ -278,50 +234,6 @@ fn card_views_to(platform: &RecordingPlatform, message_id: &str) -> usize {
         .filter(|mid| mid.as_str() == message_id)
         .count()
 }
-
-/// Wait until the platform served at least `n` card-view reads for
-/// `message_id`, or panic after 5 s — the observation the stamp-ordering tests
-/// need before they release a parked write, so the interleaving they create is
-/// proven rather than raced (spec #571, ticket #575).
-async fn wait_for_card_views(platform: &RecordingPlatform, message_id: &str, n: usize) {
-    let probe = async {
-        loop {
-            if card_views_to(platform, message_id) >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("{message_id} never reached {n} card-view reads"));
-}
-
-/// Wait until `message_id`'s stamp key is covered in the card-delivery queue —
-/// settled (delivered, or permanently refused by Feishu, #522) — or panic
-/// after 5 s. The observation a "#522 is given up" test needs before it asserts
-/// on the ticks that must not touch the card again.
-async fn wait_for_covered_stamp(app: &Arc<App>, session_id: &str, card_message_id: &str) {
-    let probe = async {
-        loop {
-            let covered = app.cards_handle().chains.get(session_id).is_some_and(|record| {
-                app.cards_handle().feishu.keyed_write_covered(
-                    card_message_id,
-                    record.generation,
-                    crate::feishu::delivery::CardWriteIntent::Stamp,
-                )
-            });
-            if covered {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the stamp key for {card_message_id} was never covered"));
-}
-
 /// The transcript that has finished while cola was down: the submitted
 /// message and a clean assistant answer.
 fn completed(created_ms: i64) -> SessionTranscript {
@@ -2168,7 +2080,19 @@ async fn a_takeover_collect_releases_the_cache_only_when_its_write_lands() {
     takeover.await.unwrap();
     // The release follows the delivery in the detached continuation (spec #571
     // review).
-    wait_for_cache_release(&app, "om_frozen").await;
+    wait_for(
+        &format!("{}'s cached presentation is released", "om_frozen"),
+        || async {
+            app.cards_handle()
+                .card_handles
+                .lock()
+                .await
+                .cached_card("om_frozen")
+                .is_none()
+                .then_some(())
+        },
+    )
+    .await;
 }
 
 /// A collect that fails recoverably and is later delivered by the drain still
@@ -2212,7 +2136,19 @@ async fn a_recoverably_failed_collect_releases_the_cache() {
 
     // The write is owed — its delivery comes later, without this caller — and
     // the detached continuation releases the cache at the failure.
-    wait_for_cache_release(&app, "om_frozen").await;
+    wait_for(
+        &format!("{}'s cached presentation is released", "om_frozen"),
+        || async {
+            app.cards_handle()
+                .card_handles
+                .lock()
+                .await
+                .cached_card("om_frozen")
+                .is_none()
+                .then_some(())
+        },
+    )
+    .await;
 
     // The drain delivers the owed collect: the card is collected, and the
     // stale cache stays gone.
@@ -2434,7 +2370,11 @@ async fn a_stamp_over_a_seeding_takeover_collects_without_the_seeded_tail() {
     // The takeover's collect read the orphan's view (the stamp's own read was
     // the first): the observed proof it reached its composition — its PATCH
     // queues behind the parked stamp, which lands first.
-    wait_for_card_views(&platform, "om_frozen", 2).await;
+    wait_for(
+        &format!("{} reaches {} card-view reads", "om_frozen", 2),
+        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
+    )
+    .await;
     release.notify_one();
     // The collect is the orphan's second write: the parked stamp, then the
     // takeover's queued collect. Waiting for it pins the interleaving this
@@ -2546,7 +2486,11 @@ async fn a_stamp_over_an_empty_takeover_collects_without_the_ledger() {
     let turn = spawn_turn(&app, context);
     // The takeover's collect read the orphan's view (the stamp's own read was
     // the first): the observed proof it reached its composition.
-    wait_for_card_views(&platform, "om_frozen", 2).await;
+    wait_for(
+        &format!("{} reaches {} card-view reads", "om_frozen", 2),
+        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
+    )
+    .await;
     release.notify_one();
     wait_for_patches(&platform, "om_frozen", 2).await;
 
@@ -2949,7 +2893,23 @@ async fn a_rejected_stamp_is_attempted_once_and_given_up() {
     spawn_sync(&app);
     // The refusal settles the queue's key — the fact every later tick reads
     // before it does anything.
-    wait_for_covered_stamp(&app, "ses_test", "om_frozen").await;
+    wait_for(
+        &format!("the stamp key for {} is covered", "om_frozen"),
+        || async {
+            app.cards_handle()
+                .chains
+                .get("ses_test")
+                .is_some_and(|record| {
+                    app.cards_handle().feishu.keyed_write_covered(
+                        "om_frozen",
+                        record.generation,
+                        crate::feishu::delivery::CardWriteIntent::Stamp,
+                    )
+                })
+                .then_some(())
+        },
+    )
+    .await;
     // Several observed passes after the rejection: the key holds.
     wait_for_status_reads(&backend, "ses_test", 6).await;
 
@@ -3097,7 +3057,11 @@ async fn a_terminal_waits_for_an_in_flight_stamp() {
     backend
         .set_session_status("ses_test", Some(SessionStatus::Idle))
         .await;
-    wait_for_card_views(&platform, "om_frozen", 2).await;
+    wait_for(
+        &format!("{} reaches {} card-view reads", "om_frozen", 2),
+        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
+    )
+    .await;
     assert!(
         patches_to(&platform, "om_frozen").await.is_empty(),
         "no settle lands while the stamp write is in flight: {:?}",
@@ -3460,7 +3424,14 @@ async fn a_projection_announces_a_wake_newer_than_the_watermark() {
         successor_text.contains(resumed),
         "the resumed work lands: {successor}"
     );
-    wait_for_announced(&app, "ses_test", 3_600).await;
+    wait_for(&format!("the Wake Watermark reaches {}", 3_600), || async {
+        app.cards_handle()
+            .chains
+            .announced("ses_test")
+            .is_some_and(|mark| mark.created_ms >= 3_600)
+            .then_some(())
+    })
+    .await;
 }
 
 /// A record-carrying chain's Wake goes through the projection (spec #561,
@@ -3591,7 +3562,14 @@ async fn a_projection_announces_its_wake_across_a_second_restart() {
     let (_successor, successor_text) = wait_for_projection(&platform, "om_frozen").await;
     assert!(successor_text.contains(resumed), "{successor_text}");
     wait_for_record_gone(&app, "ses_test").await;
-    wait_for_announced(&app, "ses_test", 2_900).await;
+    wait_for(&format!("the Wake Watermark reaches {}", 2_900), || async {
+        app.cards_handle()
+            .chains
+            .announced("ses_test")
+            .is_some_and(|mark| mark.created_ms >= 2_900)
+            .then_some(())
+    })
+    .await;
     drop(app); // life 1 ends
 
     // Life 2: the record is spent, so the chain is recordless and only the
@@ -4381,7 +4359,11 @@ async fn a_takeover_collect_is_not_dropped_behind_an_ordinary_collect() {
         })
     };
     // Both collects read the card (the ordinary one's read was the first).
-    wait_for_card_views(&platform, "om_frozen", 2).await;
+    wait_for(
+        &format!("{} reaches {} card-view reads", "om_frozen", 2),
+        || async { (card_views_to(&platform, "om_frozen") >= 2).then_some(()) },
+    )
+    .await;
 
     release.notify_one();
     ordinary.await.unwrap();
@@ -5143,23 +5125,20 @@ pub(super) async fn wait_for_projection(
     platform: &RecordingPlatform,
     reply_to: &str,
 ) -> (serde_json::Value, String) {
-    let wait = async {
-        loop {
+    wait_for(
+        &format!("the projection posts a successor for {reply_to}"),
+        || async {
             let calls = platform.calls.lock().await;
-            if let Some(card) = calls.iter().find_map(|call| match call {
-                PlatformCall::ReplyCard { reply_to: to, card } if to == reply_to => Some(card.clone()),
+            calls.iter().find_map(|call| match call {
+                PlatformCall::ReplyCard { reply_to: to, card } if to == reply_to => {
+                    let text = card_text(card);
+                    Some((card.clone(), text))
+                }
                 _ => None,
-            }) {
-                let text = card_text(&card);
-                return (card, text);
-            }
-            drop(calls);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), wait)
-        .await
-        .unwrap_or_else(|_| panic!("the projection never posted a successor for {reply_to}"))
+            })
+        },
+    )
+    .await
 }
 
 /// The successor's header as issue #561 requires it: the same session (the
@@ -6630,56 +6609,24 @@ async fn wait_for_update(
     label: &str,
     check: impl Fn(&serde_json::Value) -> bool,
 ) {
-    let probe = async {
-        loop {
-            if patches_to(platform, message_id).await.iter().any(&check) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("{message_id} never reached {label}"));
+    wait_for(&format!("{message_id} reaches {label}"), || async {
+        patches_to(platform, message_id)
+            .await
+            .iter()
+            .any(&check)
+            .then_some(())
+    })
+    .await;
 }
 
 /// Wait until the session's record is gone (a terminal settle released it),
 /// or panic after 5 s.
 async fn wait_for_record_gone(app: &Arc<App>, session_id: &str) {
-    let probe = async {
-        loop {
-            if app.cards_handle().chains.get(session_id).is_none() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the record was never released"));
+    wait_for("the record is released", || async {
+        app.cards_handle().chains.get(session_id).is_none().then_some(())
+    })
+    .await;
 }
-
-/// Wait until the session's durable Wake Watermark covers `created_ms`, or
-/// panic after 5 s.
-async fn wait_for_announced(app: &Arc<App>, session_id: &str, created_ms: i64) {
-    let probe = async {
-        loop {
-            if app
-                .cards_handle()
-                .chains
-                .announced(session_id)
-                .is_some_and(|mark| mark.created_ms >= created_ms)
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("the Wake Watermark never reached {created_ms}"));
-}
-
 /// The headline acceptance (spec #561, ticket #564): a restart while the run
 /// is still live arms a successor at the confirmed cursor and FOLLOWS the run
 /// — content produced after the seed lands on the successor, the old card is
@@ -6971,7 +6918,14 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
         "the adoption follows the live run: {successor}"
     );
     assert!(successor_text.contains("CI 通过了。"), "{successor}");
-    wait_for_announced(&app, "ses_test", 2_900).await;
+    wait_for(&format!("the Wake Watermark reaches {}", 2_900), || async {
+        app.cards_handle()
+            .chains
+            .announced("ses_test")
+            .is_some_and(|mark| mark.created_ms >= 2_900)
+            .then_some(())
+    })
+    .await;
 }
 
 /// An Idle Session Card in the map is a read, not a chain card (ADR-0100), so
@@ -8303,20 +8257,17 @@ async fn a_turn_winning_the_create_window_keeps_the_chain_when_the_run_ended_whi
 
 /// Wait until the session's durable cursor satisfies `ready`, or panic after
 /// 5 s.
-async fn wait_for_cursor(app: &Arc<App>, mut ready: impl FnMut(&RenderedCursor) -> bool) -> RenderedCursor {
-    let probe = async {
-        loop {
-            if let Some(cursor) = app.cards_handle().chains.cursor("ses_test")
-                && ready(&cursor)
-            {
-                return cursor;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .expect("the record's cursor must reach the awaited shape")
+pub(crate) async fn wait_for_cursor(
+    app: &Arc<App>,
+    ready: impl Fn(&RenderedCursor) -> bool,
+) -> RenderedCursor {
+    wait_for("the record's cursor reaches the awaited shape", || async {
+        app.cards_handle()
+            .chains
+            .cursor("ses_test")
+            .filter(|cursor| ready(cursor))
+    })
+    .await
 }
 
 /// The restart's read: an in-flight answer plus the `shell` call it made,
@@ -8788,40 +8739,27 @@ async fn a_mid_chain_projection_failure_keeps_only_the_landed_slices() {
 
 /// Wait until the platform observed at least `n` PATCH attempts for
 /// `card_message_id` (failed ones included), or panic after 5 s.
-async fn wait_for_update_attempts(platform: &RecordingPlatform, card_message_id: &str, n: usize) {
-    let probe = async {
-        loop {
-            if patches_to(platform, card_message_id).await.len() >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .expect("the platform must see the write attempts");
+pub(crate) async fn wait_for_update_attempts(platform: &RecordingPlatform, card_message_id: &str, n: usize) {
+    wait_for(
+        &format!("the platform sees {n} write attempts on {card_message_id}"),
+        || async { (patches_to(platform, card_message_id).await.len() >= n).then_some(()) },
+    )
+    .await;
 }
 
 /// Wait until a successfully POSTED (created) card carries `needle`, or panic
 /// after 5 s — a projection's chain slices are creates, not PATCHes, so
 /// [`wait_for_card_text`] (which reads updates) never sees them.
 async fn wait_for_posted_text(platform: &RecordingPlatform, needle: &str) {
-    let probe = async {
-        loop {
-            if platform
-                .replied_cards()
-                .await
-                .iter()
-                .any(|card| card_text(card).contains(needle))
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("no posted card ever carried {needle:?}"));
+    wait_for(&format!("a posted card carries {needle:?}"), || async {
+        platform
+            .replied_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains(needle))
+            .then_some(())
+    })
+    .await;
 }
 
 /// An oversized LIVE delta (spec #561, review #569): the chain's last card is
@@ -9691,34 +9629,6 @@ async fn a_failed_seed_read_keeps_a_cursor_bearing_tail_pending() {
     }
     drop(turn);
 }
-
-/// Wait until ANY card — a projection/create or an in-place update — carries
-/// `needle`, or panic after 5 s. A stopped live chain's follow may post
-/// continuations instead of PATCHing the last slice.
-async fn wait_for_any_card_text(platform: &RecordingPlatform, needle: &str) {
-    let probe = async {
-        loop {
-            let posted = platform
-                .replied_cards()
-                .await
-                .iter()
-                .any(|card| card_text(card).contains(needle));
-            let updated = platform
-                .updated_cards()
-                .await
-                .iter()
-                .any(|card| card_text(card).contains(needle));
-            if posted || updated {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap_or_else(|_| panic!("no card ever carried {needle:?}"));
-}
-
 /// A live projection whose CONTINUATION create failed still gets followed
 /// (spec #561, review #569): the last landed slice's card is handed to the
 /// follow, whose normal flush/continuation machinery carries the remaining
@@ -9770,7 +9680,23 @@ async fn a_stopped_live_chain_after_a_failed_continuation_is_still_followed() {
             ])],
         )
         .await;
-    wait_for_any_card_text(&platform, "重启之后的尾巴。").await;
+    wait_for(
+        &format!("a card carries {:?}", "重启之后的尾巴。"),
+        || async {
+            let posted = platform
+                .replied_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains("重启之后的尾巴。"));
+            let updated = platform
+                .updated_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains("重启之后的尾巴。"));
+            (posted || updated).then_some(())
+        },
+    )
+    .await;
 }
 
 /// A live projection that stops at the CHAIN BOUND is still followed (spec
@@ -9820,7 +9746,23 @@ async fn a_chain_bound_stop_of_a_live_projection_is_still_followed() {
             ])],
         )
         .await;
-    wait_for_any_card_text(&platform, "重启之后的尾巴。").await;
+    wait_for(
+        &format!("a card carries {:?}", "重启之后的尾巴。"),
+        || async {
+            let posted = platform
+                .replied_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains("重启之后的尾巴。"));
+            let updated = platform
+                .updated_cards()
+                .await
+                .iter()
+                .any(|card| card_text(card).contains("重启之后的尾巴。"));
+            (posted || updated).then_some(())
+        },
+    )
+    .await;
 }
 
 /// The message-first race with an identical answer (spec #561, review #569):

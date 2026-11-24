@@ -32,19 +32,6 @@ fn question_request(id: &str, session_id: &str) -> crate::backend::types::Questi
         ..Default::default()
     }
 }
-
-/// The card accumulator the in-flight turn streams into, or a panic when the
-/// turn never got that far.
-async fn wait_for_turn_card(app: &Arc<App>, session_id: &str) {
-    for _ in 0..200 {
-        if Turn::has_card(&app.cards_handle(), session_id).await {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("the turn's card never appeared");
-}
-
 /// One turn whose prompt is held at the backend's gate until the test releases
 /// it; the scripted outcome is the caller's `prompt_error` (an abort, in
 /// production's `/stop` shape).
@@ -83,7 +70,12 @@ async fn aborted_turn_rejects_its_pending_permission() {
     let (app, platform) = build_app(cfg, backend).await;
 
     let turn = gated_abort(&app);
-    wait_for_turn_card(&app, "ses_test").await;
+    wait_for("the turn's card appears", || async {
+        Turn::has_card(&app.cards_handle(), "ses_test")
+            .await
+            .then_some(())
+    })
+    .await;
     // The poller inlines the permission on the live card, exactly as it does
     // while the server blocks the prompt.
     let mut seen = std::collections::HashSet::new();
@@ -218,7 +210,12 @@ async fn aborted_turn_rejects_its_pending_question() {
     let (app, platform) = build_app(cfg, backend).await;
 
     let turn = gated_abort(&app);
-    wait_for_turn_card(&app, "ses_test").await;
+    wait_for("the turn's card appears", || async {
+        Turn::has_card(&app.cards_handle(), "ses_test")
+            .await
+            .then_some(())
+    })
+    .await;
     let mut seen = std::collections::HashSet::new();
     app.question.sweep(&app.flow_handles(), &mut seen).await;
 

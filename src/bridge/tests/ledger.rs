@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use super::drain::{
     assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_prepared, scripted_app_with,
-    spawn_sync, spawn_turn, user, wait_for_card_text,
+    spawn_sync, spawn_turn, user, wait_for_card_text, wait_for_notice,
 };
 use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
 use crate::backend::types::SessionStatus;
@@ -1466,24 +1466,6 @@ async fn script_quiet_true_end(backend: &Arc<MockBackend>) {
         ],
     )
     .await;
-}
-
-/// Await the Completion Notice — sent right after the settle PATCH, so it can
-/// trail the card update — or panic after 5 s.
-async fn wait_for_notice(platform: &RecordingPlatform) -> Vec<(String, String, Option<String>, String)> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let notices = platform.completion_notices().await;
-        if !notices.is_empty() {
-            return notices;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no Completion Notice arrived: {:?}",
-            platform.calls.lock().await
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
 }
 
 /// Acceptance 1 (#420): the last task retires with nothing to render, so the
@@ -3891,29 +3873,6 @@ async fn a_cleanup_click_whose_card_is_replaced_still_ends_the_tasks() {
         "the durable endings keep the tasks out of later reads: {later:?}"
     );
 }
-
-/// Await the External Message notification (the 有新消息 card) or panic after
-/// 10 s — the condition the supersede below is observed by, never a sleep.
-async fn wait_for_external_notify(platform: &RecordingPlatform) -> serde_json::Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let mut cards = platform.sent_cards().await;
-        cards.extend(platform.replied_cards().await);
-        if let Some(card) = cards
-            .into_iter()
-            .find(|card| card_text(card).contains("有新消息"))
-        {
-            return card;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no external-message notification arrived: {:?}",
-            platform.calls.lock().await
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
 /// Review (spec #588 / #589, PR #595; reopened trade ADR-0080, ticket #701):
 /// Session Sync commits its reconcile pass's process-local cache only after the
 /// flush that carried its entries was accepted — the same gate the cleanup click
@@ -3983,7 +3942,14 @@ async fn an_external_supersede_records_no_overlay_but_keeps_the_ending() {
     // notify path collects it and arms the fresh renderer. The next reads stay
     // parked on the same gate, so the world is frozen at the supersede while
     // the assertions below read it.
-    let notify = wait_for_external_notify(&platform).await;
+    let notify = wait_for("the external-message notification arrives", || async {
+        let mut cards = platform.sent_cards().await;
+        cards.extend(platform.replied_cards().await);
+        cards
+            .into_iter()
+            .find(|card| card_text(card).contains("有新消息"))
+    })
+    .await;
     assert!(
         card_text(&notify).contains("新问题"),
         "the notification previews the newer message: {notify}"

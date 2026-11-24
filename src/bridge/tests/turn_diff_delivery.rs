@@ -111,33 +111,6 @@ async fn text_replies(platform: &RecordingPlatform) -> Vec<String> {
         })
         .collect()
 }
-
-/// Poll until the spawned delivery posts its File Message, or fail the test.
-async fn wait_for_file_message(platform: &RecordingPlatform) -> PlatformCall {
-    for _ in 0..400 {
-        if let Some(message) = file_messages(platform).await.into_iter().next() {
-            return message;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("timed out waiting for the Turn diff File Message");
-}
-
-/// Wait for a text reply containing `needle`.
-async fn wait_for_reply_containing(platform: &RecordingPlatform, needle: &str) {
-    for _ in 0..400 {
-        if text_replies(platform)
-            .await
-            .iter()
-            .any(|text| text.contains(needle))
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("timed out waiting for a reply containing {needle:?}");
-}
-
 fn app_config() -> (tempfile::TempDir, crate::config::Config) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -182,7 +155,10 @@ async fn one_click_uploads_once_and_posts_one_html_file_message() {
     assert!(ack.card.is_none(), "the click never rebuilds the card inline");
     assert_eq!(ack.toast.as_deref(), Some("正在生成完整 diff…"));
 
-    let message = wait_for_file_message(&platform).await;
+    let message = wait_for("the Turn diff File Message is posted", || async {
+        file_messages(&platform).await.into_iter().next()
+    })
+    .await;
     match message {
         PlatformCall::SendMessageReply {
             message_id,
@@ -265,7 +241,10 @@ async fn a_second_click_after_the_send_is_a_no_op() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the first click is acknowledged");
-    wait_for_file_message(&platform).await;
+    wait_for("the Turn diff File Message is posted", || async {
+        file_messages(&platform).await.into_iter().next()
+    })
+    .await;
 
     // The send is recorded before the delivery marks the Turn `Sent`; retry
     // the duplicate click until that terminal state is observable (each
@@ -300,7 +279,17 @@ async fn an_empty_turn_replies_text_once_and_sends_no_file() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "本轮期间工作区没有留下净变化。").await;
+    wait_for(
+        &format!("a reply contains {:?}", "本轮期间工作区没有留下净变化。"),
+        || async {
+            text_replies(&platform)
+                .await
+                .iter()
+                .any(|text| text.contains("本轮期间工作区没有留下净变化。"))
+                .then_some(())
+        },
+    )
+    .await;
 
     assert!(file_uploads(&platform).await.is_empty(), "no upload");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
@@ -337,7 +326,17 @@ async fn an_upload_failure_replies_an_error_and_stays_retryable() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "生成完整 diff 失败").await;
+    wait_for(
+        &format!("a reply contains {:?}", "生成完整 diff 失败"),
+        || async {
+            text_replies(&platform)
+                .await
+                .iter()
+                .any(|text| text.contains("生成完整 diff 失败"))
+                .then_some(())
+        },
+    )
+    .await;
 
     assert!(file_messages(&platform).await.is_empty(), "nothing was sent");
     assert!(
@@ -358,7 +357,10 @@ async fn an_upload_failure_replies_an_error_and_stays_retryable() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    wait_for_file_message(&platform).await;
+    wait_for("the Turn diff File Message is posted", || async {
+        file_messages(&platform).await.into_iter().next()
+    })
+    .await;
     assert_eq!(file_messages(&platform).await.len(), 1);
     assert_eq!(
         backend.session_diff_calls.lock().await.len(),
@@ -387,7 +389,14 @@ async fn an_ambiguous_send_is_terminal_and_never_duplicated() {
     tokio::time::timeout(Duration::from_secs(2), entered.notified())
         .await
         .expect("the spawned delivery reaches the File Message send");
-    wait_for_reply_containing(&platform, "发送结果未知").await;
+    wait_for(&format!("a reply contains {:?}", "发送结果未知"), || async {
+        text_replies(&platform)
+            .await
+            .iter()
+            .any(|text| text.contains("发送结果未知"))
+            .then_some(())
+    })
+    .await;
 
     assert_eq!(
         file_messages(&platform).await.len(),
@@ -428,7 +437,14 @@ async fn a_post_accept_send_error_is_terminal_and_never_duplicated() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "发送结果未知").await;
+    wait_for(&format!("a reply contains {:?}", "发送结果未知"), || async {
+        text_replies(&platform)
+            .await
+            .iter()
+            .any(|text| text.contains("发送结果未知"))
+            .then_some(())
+    })
+    .await;
     assert_eq!(file_uploads(&platform).await.len(), 1, "one upload");
 
     let repeated = app
@@ -462,7 +478,10 @@ async fn a_failed_transcript_still_delivers_with_an_unknown_time() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_file_message(&platform).await;
+    wait_for("the Turn diff File Message is posted", || async {
+        file_messages(&platform).await.into_iter().next()
+    })
+    .await;
 
     let uploads = file_uploads(&platform).await;
     match &uploads[0] {
@@ -510,7 +529,10 @@ async fn the_click_acks_before_the_delivery_runs() {
         .await
         .expect("the spawned delivery reaches the upload");
     release.notify_one();
-    wait_for_file_message(&platform).await;
+    wait_for("the Turn diff File Message is posted", || async {
+        file_messages(&platform).await.into_iter().next()
+    })
+    .await;
     assert_eq!(file_uploads(&platform).await.len(), 1, "one upload");
     assert_eq!(file_messages(&platform).await.len(), 1, "one File Message");
 }
@@ -663,7 +685,17 @@ async fn a_failed_read_speaks_the_read_failure_and_stays_retryable() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "暂时读不到终态改动，请稍后再试。").await;
+    wait_for(
+        &format!("a reply contains {:?}", "暂时读不到终态改动，请稍后再试。"),
+        || async {
+            text_replies(&platform)
+                .await
+                .iter()
+                .any(|text| text.contains("暂时读不到终态改动，请稍后再试。"))
+                .then_some(())
+        },
+    )
+    .await;
     assert!(file_messages(&platform).await.is_empty(), "nothing was sent");
 
     backend
@@ -678,7 +710,10 @@ async fn a_failed_read_speaks_the_read_failure_and_stays_retryable() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    wait_for_file_message(&platform).await;
+    wait_for("the Turn diff File Message is posted", || async {
+        file_messages(&platform).await.into_iter().next()
+    })
+    .await;
     assert_eq!(file_uploads(&platform).await.len(), 1, "one retried upload");
 }
 
@@ -693,7 +728,17 @@ async fn a_generation_without_the_endpoint_answers_the_read_failure() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "暂时读不到终态改动，请稍后再试。").await;
+    wait_for(
+        &format!("a reply contains {:?}", "暂时读不到终态改动，请稍后再试。"),
+        || async {
+            text_replies(&platform)
+                .await
+                .iter()
+                .any(|text| text.contains("暂时读不到终态改动，请稍后再试。"))
+                .then_some(())
+        },
+    )
+    .await;
 
     assert!(file_uploads(&platform).await.is_empty(), "no upload");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
@@ -850,7 +895,10 @@ async fn the_turn_diff_click_carries_no_action_and_pins_its_exact_result() {
     assert!(ack.card.is_none(), "the click never rebuilds the card inline");
     assert_eq!(ack.toast.as_deref(), Some("正在生成完整 diff…"));
 
-    wait_for_file_message(&platform).await;
+    wait_for("the Turn diff File Message is posted", || async {
+        file_messages(&platform).await.into_iter().next()
+    })
+    .await;
 }
 
 /// The `diffs` capability is the DISPATCH's gate, not the body's (#1124): a
