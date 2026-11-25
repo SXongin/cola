@@ -1873,10 +1873,10 @@ pub struct MockBackend {
     /// One-shot: `steer` reports `SteerOutcome::StartedTurn` (an adapter
     /// breaking the merge-only contract, ADR-0109) after submitting.
     pub steer_started_turn: Arc<std::sync::atomic::AtomicBool>,
-    /// One-shot: `steer` reports `SteerOutcome::RefusedNoLiveRun` — the typed
-    /// refusal (#1086, ADR-0113) that submits NOTHING, so the bridge can re-route
-    /// the same message.
-    pub steer_refused_no_live_run: Arc<std::sync::atomic::AtomicBool>,
+    /// The next N `steer` calls report `SteerOutcome::RefusedNoLiveRun` — the
+    /// typed refusal (#1086, ADR-0113) that submits NOTHING, so the bridge can
+    /// re-route the same message.
+    pub steer_refused_no_live_run: Arc<std::sync::atomic::AtomicUsize>,
     /// A callback run at the top of `steer` — before any outcome — so a test
     /// can release a seeded render lease exactly when the Supplement's steer
     /// begins (the handshake's retirement point, ADR-0113).
@@ -2335,7 +2335,7 @@ impl MockBackend {
             omitted_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
             steer_started_turn: std::sync::atomic::AtomicBool::new(false).into(),
-            steer_refused_no_live_run: std::sync::atomic::AtomicBool::new(false).into(),
+            steer_refused_no_live_run: std::sync::atomic::AtomicUsize::new(0).into(),
             on_steer: None,
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_interrupt_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -2587,8 +2587,15 @@ impl MockBackend {
     /// [`crate::backend::SteerOutcome::RefusedNoLiveRun`] **without submitting
     /// anything** — the typed refusal the handshake re-routes (#1086).
     pub(crate) fn refuse_steer_no_live_run_once(&mut self) -> &mut Self {
+        self.refuse_steer_no_live_run(1)
+    }
+
+    /// Scenario: the next `times` `steer` calls report the typed refusal. The
+    /// handshake retries once after its bound expires, so a test that wants
+    /// both attempts refused arms two (#1086, ADR-0113).
+    pub(crate) fn refuse_steer_no_live_run(&mut self, times: usize) -> &mut Self {
         self.steer_refused_no_live_run
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .store(times, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3828,10 +3835,15 @@ impl crate::backend::Backend for MockBackend {
         if let Some(hook) = &self.on_steer {
             hook();
         }
-        if self
+        let refused = self
             .steer_refused_no_live_run
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok();
+        if refused {
             return Ok(crate::backend::SteerOutcome::RefusedNoLiveRun);
         }
         let started = self

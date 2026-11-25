@@ -2404,18 +2404,19 @@ async fn a_retiring_renderer_with_a_terminal_card_still_starts_the_turn() {
     );
 }
 
-/// A typed refusal whose guard never clears inside the handshake bound is
-/// reported honestly: the message was NOT submitted, so the notice says so and
-/// invites a resend — never the ambiguity-preserving "unconfirmed" copy, and
-/// never a continuation handed to a renderer that does not exist (#1086,
-/// ADR-0113).
+/// A typed refusal whose guard never clears inside the handshake bound and whose
+/// last-chance merge refuses too is reported honestly: the message was NOT
+/// submitted, so the notice says so and invites a resend — never the
+/// ambiguity-preserving "unconfirmed" copy, and never a continuation handed to a
+/// renderer that does not exist (#1086, ADR-0113).
 #[tokio::test]
 async fn a_typed_refusal_with_a_guard_that_never_clears_reports_no_submission() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.refuse_steer_no_live_run_once();
+    // The first steer refuses; so does the last-chance merge after the bound.
+    backend.refuse_steer_no_live_run(2);
     let backend = Arc::new(backend);
     let (app, platform) = app_over(cfg, backend.clone());
     seed_session(&app, "ses_test", "/work").await;
@@ -2507,6 +2508,55 @@ async fn an_ambiguous_steer_failure_under_a_lease_keeps_the_chain() {
             .as_deref(),
         Some("om_live"),
         "the chain did not move"
+    );
+    app.waits_handle().release_render_lease("ses_test").await;
+}
+
+/// #1086 acceptance 3 — "submitted exactly once on every path" — for the
+/// concurrent handshake: a message whose merge was refused while the guard was
+/// held gets a last-chance merge when the bound expires with a writer still
+/// holding it. The refusal submitted nothing, so this retry is the message's
+/// first (and only) submission: it splits the chain and is never reported
+/// unsubmitted.
+#[tokio::test]
+async fn a_wait_that_finds_a_held_writer_re_merges_instead_of_reporting_unsubmitted() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // The first steer refuses; the last-chance merge after the bound merges.
+    backend.refuse_steer_no_live_run_once();
+    let backend = Arc::new(backend);
+    let (app, platform) = app_over(cfg, backend.clone());
+    seed_session(&app, "ses_test", "/work").await;
+    // The guard is still held at the bound (the writer never released it).
+    seed_leased_renderer(&app, CardState::Streaming).await;
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["补充一下".to_string()],
+        "the message reaches the Backend exactly once"
+    );
+    let (reply_to, card) = continuation(&platform).await;
+    assert_eq!(reply_to, "msg_sup", "the retry splits the chain at the message");
+    assert!(has(&card, "📨 已收到补充"), "the merge is claimed: {card}");
+    assert!(
+        !sent_texts(&platform)
+            .await
+            .iter()
+            .any(|t| t.contains("这条消息未被提交")),
+        "the message was submitted; no unsubmitted notice: {:?}",
+        platform.calls.lock().await
     );
     app.waits_handle().release_render_lease("ses_test").await;
 }
