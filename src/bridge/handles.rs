@@ -2532,10 +2532,10 @@ impl WaitsHandle {
 
     /// Ask the renderers currently in their window for `session_id` to yield
     /// (ADR-0113): a waiting user message proved no run can be steered, so the
-    /// in-process renderer holds a guard it cannot use for that message. Both
-    /// out-of-turn loops check [`Self::render_lease_retire_requested`] at the top
-    /// of a tick and stop BEFORE writing, so the chain transfers to the waiting
-    /// Turn without a double writer. A request with no lease is a no-op.
+    /// in-process renderer holds a guard it cannot use for that message. The
+    /// holder observes it through [`Self::should_yield`] before every write on
+    /// every path, so the chain transfers to the waiting Turn without a double
+    /// writer. A request with no lease is a no-op.
     pub(crate) async fn retire_render_lease(&self, session_id: &str) {
         if let Some(lease) = self.render_leases.lock().await.get_mut(session_id) {
             lease.retire = true;
@@ -2551,6 +2551,17 @@ impl WaitsHandle {
             .await
             .get(session_id)
             .is_some_and(|lease| lease.retire)
+    }
+
+    /// [`Self::render_lease_retire_requested`] with the yield logged once,
+    /// `label` naming the loop that stops. The out-of-turn loops use this; a
+    /// test reads the bare predicate.
+    pub(crate) async fn should_yield(&self, session_id: &str, label: &str) -> bool {
+        let yield_now = self.render_lease_retire_requested(session_id).await;
+        if yield_now {
+            tracing::info!("{label}: session {session_id} yielding its chain to a waiting message");
+        }
+        yield_now
     }
 
     /// Give the Session's inflight guard back, unless an out-of-turn renderer

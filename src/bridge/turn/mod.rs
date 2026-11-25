@@ -4171,6 +4171,24 @@ impl Turn {
         cards.card(session_id).await.map(|card| card.chain_id())
     }
 
+    /// The session's card, only while it is still `chain`'s (ADR-0113): an
+    /// out-of-turn renderer's pass must never render into a successor's
+    /// accumulator. The check runs under the same cards lock the takeover
+    /// installs under (the guard the map hands out), so the card read cannot be
+    /// replaced between the check and the pass's first write. `None` means the
+    /// session has no card, or the chain moved.
+    pub(crate) async fn card_in_chain<'a>(
+        cards: &'a CardsHandle,
+        session_id: &str,
+        chain: Option<u64>,
+    ) -> Option<tokio::sync::MappedMutexGuard<'a, state::CardSession>> {
+        let card = cards.card(session_id).await?;
+        if chain.is_some_and(|chain| card.chain_id() != chain) {
+            return None;
+        }
+        Some(card)
+    }
+
     /// Whether the session's card has rendered any part — the external
     /// renderer's "partial reply" probe before it finalizes on timeout.
     pub(crate) async fn has_rendered_content(cards: &CardsHandle, session_id: &str) -> bool {

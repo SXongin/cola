@@ -2,189 +2,144 @@
 
 > **Amends ADR-0109**: its Supplement routing key and its "a merge-only steer is
 > refused" trade. The refusal becomes a **typed** answer that re-routes the same
-> message, and the Turn's guard is claimed *before* its context is consumed, so
-> the router's decision and the admission cannot disagree. ADR-0109's guard key,
-> its `SteerOutcome` contract, its lease rules and its in-place Wake resumption
-> all stand.
+> message, the Turn's guard is claimed *before* its context is consumed, and an
+> out-of-turn renderer that cannot steer is asked to **yield**. ADR-0109's guard
+> key, its `SteerOutcome` contract, its lease rules and its in-place Wake
+> resumption stand.
 
 ## Context
 
-ADR-0109 made a held in-flight guard the one Supplement routing key and gave a
-merge-only steer the power to refuse rather than start a run cola cannot render.
-That closed #1056, but it left the router and the Turn reading the guard at
-**different instants**, with nothing to retry the message on the other route:
+ADR-0109 made a held in-flight guard the one Supplement routing key and let a
+merge-only steer refuse rather than start a run cola cannot render. It left the
+router and the Turn reading the guard at different instants, with nothing to
+retry the message on the other route:
 
-- **Retiring renderer.** An out-of-turn renderer has stamped its card terminal
-  but still holds its lease. The router sees the guard and chooses Supplement;
-  the steer fails (no live run) and the terminal card refuses the split, so the
-  prompt gets only a notice instead of the Turn that would render it.
-- **Acquiring renderer.** A renderer leases the guard after the router's last
-  ownership read but before `Turn::start`. The router chose a Turn; admission
-  sees the guard and refuses it busy, so the message is never submitted.
-- **The restart-armed continuation** (seen live 2026-11-24, `#1086`). A Wake
-  continuation rehydrated from durable state is a **card-state claim, not a
-  writer**: it holds the guard until its settle loop finalizes it, while no run
-  exists behind the card. The router saw the guard, steered into nothing, and
-  the typed-but-unread refusal was treated as an ambiguous failure — the card
-  split as `SupplementFailed`, the user saw
-  「⚠️ 补充消息未确认送达」, and their question was silently dropped. This
-  variant was message **loss**, not a spurious notice.
+- a renderer **acquires** its lease after the router's last read: the router
+  chose a Turn, `Turn::start` sees the guard and refuses it busy;
+- a renderer **retires** with its card already terminal: the steer fails and the
+  terminal card refuses the split, leaving only a notice;
+- a **restart-armed Wake continuation** holds a rehydrated lease with no run
+  behind it (live 2026-11-24): the steer went into nothing, the card split as
+  `SupplementFailed`, and the user's question was silently dropped.
 
-Re-reading ownership after each awaited step (the ADR-0109 implementation did
-it twice) only moves the window: an await remains between the last read and
-`Turn::start`, and a lease taken there still loses the message.
+Re-reading ownership after each awaited step only moved the window. And the
+guard can be held for an unbounded time: the Wake settle loop deliberately waits
+for an Execution boundary with no time bound (ADR-0059/#568), so a message behind
+it could wait forever — unusable.
 
 ## Decision
 
 **1. The guard claim is the admission.** `Turn::try_admit` takes the Session's
-in-flight guard and returns an opaque `Admission` — or `None` when another
-writer holds it (`src/bridge/turn/mod.rs:422`). The coordinator takes it
-**before** it builds the Turn's context, so the message facts are still owned
-and can be submitted on the other route. `Turn::start` skips its busy check when
-handed an admission, because the same lock acquisition that minted it proved the
-session free (`Turn::claim_start_guard`, `src/bridge/turn/mod.rs:490`). The
-self-admitting callers (an error-card retry, the V1 resume resubmit, low-level
-seams) keep ADR-0109's refusal and its busy notice.
+in-flight guard and returns an opaque `Admission`, or `None` when another writer
+holds it (`src/bridge/turn/mod.rs:422`). The coordinator takes it **before** the
+Turn's context is consumed (`admit_turn`, `src/bridge/handler.rs`), so a refused
+claim can still submit the same message on the other route. `Turn::start` skips
+its busy check when handed an admission (`Turn::claim_start_guard`,
+`src/bridge/turn/mod.rs:490`); the self-admitting callers (an error-card retry,
+the V1 resume resubmit) keep ADR-0109's refusal and its busy notice.
 
 **2. A merge-only refusal is typed.** `SteerOutcome::RefusedNoLiveRun` means the
-adapter observed no run to steer into and refused **before submitting**
+adapter saw no run to steer into and refused **before submitting**
 (`src/backend/mod.rs:204`): nothing reached the Backend and nothing may still
-land, so the caller may route the same message elsewhere. An `Err` stays
-ambiguous (`ADR-0092`): a lost response may have landed, and it is never
-re-routed. Both the generation-neutral default (`src/backend/mod.rs:409`) and
-Codex's `turn/steer` adapter (`src/codex/backend.rs:3231`) answer this way.
+land, so the message may be routed elsewhere. `Err` stays ambiguous (ADR-0092)
+and is never re-routed. Both the generation-neutral default
+(`src/backend/mod.rs:409`) and Codex's `turn/steer` (`src/codex/backend.rs:3231`)
+answer this way.
 
-**3. A typed refusal re-routes the same message.** Nothing was submitted, so
-the message becomes the Turn it could not merge into,
-`settle_refused_supplement` (`src/bridge/handler.rs:2749`):
+**3. A typed refusal re-routes the same message.** `settle_refused_supplement`
+(`src/bridge/handler.rs:2749`) resolves it by what actually holds the guard:
 
-- **The guard is free**: claim it (`Turn::try_admit`) and run the Turn.
-- **A writer holds it** — another message's Turn, or a renderer that began its
-  run: retry the merge on a coarse cadence so the message joins that run as soon
-  as the adapter can see it (`src/bridge/handler.rs:2795`). Every attempt is
-  merge-only and every earlier one refused before submitting, so the retry is
-  the message's first submission; it reuses the message's `cola_msg_id`, so it
-  stays one logical message.
-- **An out-of-turn renderer's lease owns it**: the renderer is asked to
-  **yield** (§3b). It stops before its next write and releases its lease, so the
-  message's next poll admits the Turn — no user-facing deadline and no second
-  writer.
+- **free**: claim it and run the Turn;
+- **a writer** (another message's Turn, or a renderer that began its run): retry
+  the merge on a coarse cadence so the message joins that run as soon as the
+  adapter can see it. Every try is merge-only, every earlier one refused before
+  submitting, and the retry reuses the message's `cola_msg_id`, so this is one
+  logical message's first submission;
+- **an out-of-turn renderer's lease**: ask it to **yield** (§3b).
 
-The wait has **no user-facing deadline**: the message's own task is the same one
-a Turn lives in for minutes, and reporting it unsubmitted while a writer exists
-is the loss this record fixes. `SUPPLEMENT_WAIT_WARN_AFTER` is a diagnostic:
-past it a WARN records an unexpectedly long wait (a Turn whose run never
-becomes steerable); the message keeps waiting. A typed refusal therefore never
-opens a `SupplementFailed` continuation either — that receipt survives only for
-genuinely ambiguous failures and the broken `StartedTurn` contract.
+The wait has no user-facing deadline — the message's task is the same one a Turn
+lives in for minutes, and reporting it unsubmitted while a writer exists is the
+loss this record fixes. `SUPPLEMENT_WAIT_WARN_AFTER` (3 s) is a diagnostic: past
+it a WARN records an unexpectedly long wait and the poll slows
+(`SUPPLEMENT_HANDSHAKE_POLL_COARSE`). A typed refusal never opens a
+`SupplementFailed` continuation; that receipt survives for ambiguous failures and
+the broken `StartedTurn` contract.
 
-**3b. A guard a waiting message cannot use is yielded, not waited out.** The
-guard's holder writes the chain, so a message may not take the chain by force
-(its own render pass would race a stale one). It asks instead:
-`WaitsHandle::retire_render_lease` marks the lease currently held, both
-out-of-turn loops check the mark at the top of a tick and stop **before**
-writing (`external_render_loop_inner`, the shared settle loop), and only the
-holder releases — so the reference-counted guard is never broken from outside.
-The request targets the **current window**: the first acquire of a replacement
-window clears it, so a late request never kills a successor renderer.
-
-The chain transfer is protected by an identity check, not by the timing of the
-yield: every out-of-turn render pass is scoped to the chain it was armed for
-(`render_and_flush_in_chain`), and a pass whose chain has moved writes nothing
-and stops. The check runs under the same cards lock the successor's install runs
-under, so a renderer that loses the race between its yield check and its write
-cannot inject its own transcript's parts into the successor's card.
-
-This is what makes the unbounded Wake settle wait safe. That loop may wait for
-an Execution boundary with no time bound (ADR-0059/#568); its lease no longer
-wedges the Session, because a user message proves through the typed refusal that
-no run can be steered and asks the loop to yield. The successor Turn takes the
-chain (the takeover seeds the orphan's undelivered delta and collects the old
-card), so the user's message is submitted and the stuck card is resolved.
-
-**3a. A renderer's lease is not proof of a writer either.** The
-`SupplementFailed` continuation requires a **Turn's own** guard: a lease can own
-the guard (`RenderLease::owns_guard`) and still have no run behind it, which is
-exactly the restart-armed continuation. When only a lease owns the guard, an
+**3a. A renderer's lease is not proof of a writer.** `SupplementFailed` requires
+a **Turn's own** guard: a lease can own the guard and have no run behind it, which
+is exactly the restart-armed continuation. When only a lease owns the guard, an
 ambiguous steer failure keeps the chain and reports the unconfirmed notice
-(`finish_supplement`, `src/bridge/handler.rs:2835`), so the continuation is
-never handed to a renderer that cannot continue it. A renderer that joined a
-Turn's guard records `owns_guard = false` and is unaffected.
+(`finish_supplement`, `src/bridge/handler.rs:2835`); a renderer that joined a
+Turn's guard records `owns_guard = false` and still gets its continuation. The
+ownership read and the lease read are two acquisitions, so a lease releasing
+between them reads as a writer for one instant — strictly narrower than the
+pre-handshake race, and the split's own admission re-checks the card under the
+cards lock.
 
-The ownership read and the lease read are two acquisitions, so a lease that
-releases between them reads as a writer for one instant. That window is
-strictly narrower than the pre-handshake one (where the release could happen
-across the split's awaited lock), and the split's own admission still re-checks
-the card under the cards lock; the chain is never left pointing at a card that
-was replaced.
+**3b. A guard a waiting message cannot use is yielded, not waited out.** Waiting
+cannot end an unbounded Wake lease and taking it by force would race the
+renderer's own pass. The message asks instead: `retire_render_lease` marks the
+lease currently held (`src/bridge/handles.rs`); both out-of-turn loops check it
+before every write on every path (`render_or_yield`/`stalled_poll` in the
+external renderer, `render_pass` in the shared settle loop) and stop, releasing
+their own lease. The request targets the **current window**: the first acquire of
+a replacement window clears it, so a stale request never kills a successor
+renderer.
+
+Safety comes from the guard's release ordering, not from timing: the lease is
+released only after the holder's in-flight pass returns, and the successor's
+install needs the guard, so a pass never overlaps a takeover. In addition every
+out-of-turn pass is chain-scoped (`render_and_flush_in_chain`,
+`src/bridge/turn/render.rs`): it takes the Session's card only while it is still
+the pass's chain (`Turn::card_in_chain`), so a pass that starts after the chain
+moved writes nothing. The takeover seeds the orphan's undelivered delta and
+collects the old card, so a run still producing renders on the successor rather
+than being lost.
 
 **4. Every path submits exactly once.** A Turn route submits one prompt; a
-Supplement route submits one steer (merged); a typed refusal submitted nothing
-and submits the message as either a merged retry or the Turn it waits for. No
-path can submit twice, and no path reports a message unsubmitted while any
-writer exists. The single exception is the ambiguity rule's own: an `Err` may
-have landed, and it is never resubmitted (ADR-0092).
+Supplement route submits one steer (merged); a typed refusal submits nothing and
+then submits the message as either a merged retry or the Turn the yield admits.
+No path submits twice. The single exception is the ambiguity rule's own: an `Err`
+may have landed and is never resubmitted (ADR-0092).
 
-**5. The user sees no spurious busy notice, and no unsubmitted notice either.**
-The busy notice is spoken only by the self-admitting callers that cannot
-re-route. A message that merges through the handshake never shows it, and a
-message waiting out a typed refusal shows nothing until it is submitted: it is
-not reported unsubmitted while any writer exists. ADR-0092's "unconfirmed"
-wording stays reserved for responses that may have landed.
+**5. No spurious busy notice, and no unsubmitted notice.** The busy notice is
+spoken only by the self-admitting callers that cannot re-route. A message that
+merges or waits through the handshake shows nothing until it is submitted;
+ADR-0092's "unconfirmed" wording stays reserved for responses that may have
+landed.
 
 ## Why
 
 - Route and admission were two reads of one fact; making the claim *be* the
-  admission removes the fact's ability to change between them, instead of
-  narrowing the interval between two reads.
+  admission removes the fact's ability to change between them.
 - The typed refusal is the adapter's own knowledge ("I did not submit") reaching
-  the router. Without it, "no live run" and "the response was lost" are
-  indistinguishable, and the ambiguity rule must treat both as possibly-landed.
-- The restart-armed continuation proves that `holds_guard() && RenderOwned` is
-  still only a claim about the *card*: a rehydrated card can hold a lease and
-  cannot render a new message. The handshake makes the message's fate depend on
-  a writer that can actually take it, not on the claim's display state.
+  the router; without it, "no live run" and "the response was lost" are
+  indistinguishable.
+- A lease proves a renderer is in its window, not that a run exists. The yield
+  turns that into a cooperative transfer, so an unbounded Wake wait cannot wedge
+  a user's session.
 
 ## Consequences
 
 - `route_prompt` no longer re-reads ownership after the advisory status read or
-  the orphan collect (`src/bridge/handler.rs:2284`): both await, and the
-  admission taken afterwards covers them. The routing decision is one read; the
-  admission is one claim.
-- The handshake polls the guard every 25 ms and retries a merge against a
-  writer every 500 ms (`SUPPLEMENT_HANDSHAKE_POLL`, `SUPPLEMENT_MERGE_RETRY`,
-  `src/bridge/handler.rs`). `SUPPLEMENT_WAIT_WARN_AFTER` (3 s) is a **WARN**
-  threshold, not a deadline; once it fires the poll slows to
-  `SUPPLEMENT_HANDSHAKE_POLL_COARSE` (250 ms) so a long wait does not spin.
-- The handshake serves the **retiring / restart-armed** holder and every
-  out-of-turn renderer: a typed refusal asks it to yield (§3b), and the holder
-  releases at its next tick. A Turn-owned guard ends on its own, and the merge
-  retry joins its run as soon as the run is visible. The WARN makes an
-  unexpectedly long wait visible; it is not a deadline.
-- Every out-of-turn render pass is chain-scoped (`render_and_flush_in_chain`,
-  `src/bridge/turn/render.rs`): a superseded renderer writes nothing, so the
-  chain transfer cannot produce two writers even in the tick the yield races.
-- A message waiting on a lease holds its inbound claim for that window
-  (`INBOUND_CLAIM_TTL` degrades it to absent after 120 s, so Session Sync is
-  never wedged by a long wait).
-- A renderer that leases the guard between routing and admission now results in
-  a Supplement regardless of whether the router had chosen a Turn. The
-  message's *route* follows the writer, which is the property ADR-0109 wanted.
-- ADR-0109's consequence "the instant between the router's final ownership read
-  and `Turn::start` is not atomic … deferred to #1086" is closed by decision 1.
-- A merge-only steer can now be answered three ways (`Merged`,
-  `StartedTurn`, `RefusedNoLiveRun`) instead of two, and an adapter that folds a
-  start into its merge keeps reporting `Merged` as before.
-- The failed-steer continuation (`SupplementFailed`) narrows to a **Turn's own**
-  guard. An out-of-turn renderer whose steer failed ambiguously keeps its chain
-  and shows the unconfirmed notice instead of receiving a continuation; a run
-  that did merge the message still renders it in that renderer's own card, so no
-  content is lost.
-- The out-of-turn renderer lease is unchanged: acquiring while a Turn holds the
-  guard still joins it without owning it, and only the last release gives it
-  back.
+  the orphan collect (`src/bridge/handler.rs:2284`): the admission taken after
+  both covers them.
+- `SUPPLEMENT_WAIT_WARN_AFTER` (3 s) and `SUPPLEMENT_MERGE_RETRY` (500 ms) are
+  constants, not injectable knobs; the WARN path is diagnostic.
+- Every out-of-turn render pass is chain-scoped. A renderer that loses the chain
+  stops; its old card is collected by the successor's takeover. An **external
+  message arming a new card mid-pass** remains the pre-existing exposure (its
+  install needs no guard), unchanged by this record.
+- The `SupplementFailed` continuation narrows to a Turn's own guard. An
+  out-of-turn renderer whose steer failed ambiguously keeps its chain and shows
+  the unconfirmed notice; a run that did merge the message still renders in that
+  renderer's own card.
+- A message waiting on a lease holds its inbound claim
+  (`INBOUND_CLAIM_TTL` degrades it to absent after 120 s).
+- A render loop that panics without releasing its lease parks the message's task
+  (WARN after 3 s) where the pre-ADR code reported a notice; the leak path is
+  unchanged code and the trade is recorded here.
 
-Origins: #1086 (the handshake and the live message loss), #1056 and ADR-0109
-(the guard key and the merge-only contract), #1082 (the failed-supplement
-admission), #1089 (the restart-armed Wake family), ADR-0092 (the ambiguity
-rule).
+Origins: #1086 (the handshake, the yield, and the live message loss), #1056 and
+ADR-0109 (the guard key and the merge-only contract), #1082 (the failed-supplement
+admission), #1089 (the restart-armed Wake family), ADR-0092 (the ambiguity rule).

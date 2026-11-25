@@ -1796,8 +1796,7 @@ async fn external_render_loop_inner(
         // A waiting user message asked this renderer to yield its chain
         // (ADR-0113): stop BEFORE writing, so its Turn takes the chain over
         // without a second writer. The lease release is the caller's.
-        if handles.waits.render_lease_retire_requested(&session_id).await {
-            tracing::info!("external render: session {session_id} yielding its chain to a waiting message");
+        if handles.waits.should_yield(&session_id, "external render").await {
             break;
         }
         // Completion, the newer-turn boundary and the streaming render all
@@ -2001,8 +2000,7 @@ async fn render_or_yield(
     transcript: &crate::backend::SessionTranscript,
     chain: u64,
 ) -> PassYield {
-    if handles.waits.render_lease_retire_requested(session_id).await {
-        tracing::info!("external render: session {session_id} yielding its chain to a waiting message");
+    if handles.waits.should_yield(session_id, "external render").await {
         return PassYield::Yielded;
     }
     match Turn::render_and_flush_in_chain(
@@ -2097,8 +2095,7 @@ async fn stalled_poll(
     }
     // A waiting message asked this renderer to yield (ADR-0113): a failed read
     // is no reason to keep the chain another tick.
-    if handles.waits.render_lease_retire_requested(session_id).await {
-        tracing::info!("external render: session {session_id} yielding its chain to a waiting message");
+    if handles.waits.should_yield(session_id, "external render").await {
         return false;
     }
     if !undecided && last_progress.elapsed() >= idle_bound {

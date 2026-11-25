@@ -103,15 +103,15 @@
       "path": "src/bridge/external.rs",
       "function": "external_render_loop_inner",
       "metric": "cognitive_complexity",
-      "value": 35,
-      "body": "40c22c8a3a8d66c9"
+      "value": 34,
+      "body": "cddb5a297e8a81f3"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "external_render_loop_inner",
       "metric": "too_many_lines",
-      "value": 117,
-      "body": "40c22c8a3a8d66c9"
+      "value": 116,
+      "body": "cddb5a297e8a81f3"
     },
     {
       "path": "src/bridge/external.rs",
@@ -384,14 +384,14 @@
       "function": "render_and_flush_inner",
       "metric": "cognitive_complexity",
       "value": 30,
-      "body": "0c96c89a1f547ff0"
+      "body": "ec9d39a794fe345d"
     },
     {
       "path": "src/bridge/turn/render.rs",
       "function": "render_and_flush_inner",
       "metric": "too_many_lines",
       "value": 156,
-      "body": "0c96c89a1f547ff0"
+      "body": "ec9d39a794fe345d"
     },
     {
       "path": "src/bridge/turn/settle.rs",
