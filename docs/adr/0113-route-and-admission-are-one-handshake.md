@@ -58,10 +58,10 @@ Codex's `turn/steer` adapter (`src/codex/backend.rs:3231`) answer this way.
 the message becomes the Turn it could not merge into. `settle_refused_supplement`
 waits for the guard and claims it the instant it clears, starting that Turn
 (`src/bridge/handler.rs:2757`). Every guard holder is finite — a Turn ends, and
-an out-of-turn renderer's lease is scoped to its own loop (the external
-renderer's idle bound, the Wake settle loop's finalize) — so the wait ends with
-the message **admitted and submitted exactly once**. This is the path for a
-retiring renderer (terminal card, lease still held), the restart-armed
+an out-of-turn renderer's lease is scoped to its own loop (`idle_timeout_ms` in
+`external_render_loop_inner`, and the Wake settle loop's finalize) — so the wait
+ends with the message **admitted and submitted exactly once**. This is the path
+for a retiring renderer (terminal card, lease still held), the restart-armed
 continuation, and the loser of two simultaneous refusals.
 
 While a **writer** holds the guard — another message's Turn whose run has not
