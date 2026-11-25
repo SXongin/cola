@@ -194,7 +194,7 @@ impl Turn {
                     // arrival already owed keeps its remaining budget instead
                     // of re-arming, so a run of questions cannot hold the
                     // freeze open.
-                    card.acc.owe_block_arrival();
+                    card.acc.owe_block_arrival(&q.id);
                 }
                 added
             }
