@@ -24,6 +24,20 @@ fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
     matches!(e, crate::error::BridgeError::CardContentRejected { .. })
 }
 
+/// The transition a refused card write logs (issue #886): one vocabulary for
+/// the three write sites, and the per-message frequency limit is never called a
+/// permanent refusal (issue #1103) — nothing was written, so the identical body
+/// can land once the window passes.
+fn refusal_transition(site: &str, e: &crate::error::BridgeError) -> String {
+    if is_card_content_rejected(e) {
+        format!("{site}content refused; fallback None/Fenced -> Fenced/Suspended")
+    } else if e.is_rate_limited() {
+        format!("{site}rate limited; nothing written")
+    } else {
+        format!("{site}permanent refusal; fallback unchanged")
+    }
+}
+
 /// The serialized size and element count of a card body — the two numbers
 /// Feishu's `230099` / `11310` refusal is about (issue #886; #279).
 fn card_payload_metrics(card: &serde_json::Value) -> (usize, usize) {
@@ -756,11 +770,7 @@ pub(super) async fn flush_card_locked(
                             cards,
                             session_id,
                             &e,
-                            if content_rejected {
-                                "content refused; fallback None/Fenced -> Fenced/Suspended"
-                            } else {
-                                "permanent refusal; fallback unchanged"
-                            },
+                            &refusal_transition("", &e),
                             &built.card,
                             slice_from,
                             built.end,
@@ -1008,11 +1018,7 @@ pub(super) async fn flush_card_locked(
                             cards,
                             session_id,
                             &e,
-                            if content_rejected {
-                                "finalized content refused; fallback None/Fenced -> Fenced/Suspended"
-                            } else {
-                                "finalized permanent refusal; fallback unchanged"
-                            },
+                            &refusal_transition("finalized ", &e),
                             &finalized.card,
                             slice_from,
                             finalized.end,
@@ -1306,11 +1312,7 @@ pub(super) async fn flush_card_locked(
                     cards,
                     session_id,
                     &e,
-                    if content_rejected {
-                        "continuation content refused; fallback None/Fenced -> Fenced/Suspended"
-                    } else {
-                        "continuation permanent refusal; fallback unchanged"
-                    },
+                    &refusal_transition("continuation ", &e),
                     &built.card,
                     slice_from,
                     built.end,
@@ -1497,13 +1499,43 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{drain_wake_watermark, note_cursor_write_failure, staged_watermark_id};
+    use super::{drain_wake_watermark, note_cursor_write_failure, refusal_transition, staged_watermark_id};
     use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
     use crate::bridge::chain::EndingKey;
     use crate::bridge::test_support::*;
     use crate::bridge::turn::Turn;
     use crate::bridge::turn::state::{CardFallback, CardSession, EndingWrite, StreamAccumulator};
     use crate::feishu::card::CardState;
+
+    /// The refusal log names what happened (issue #1103): the frequency limit
+    /// says "nothing written" — it is retryable, never "permanent" — while a
+    /// content rejection still names the fenced fallback and any other refusal
+    /// stays permanent.
+    #[test]
+    fn a_refused_write_logs_its_own_transition() {
+        let rate = crate::error::BridgeError::FeishuRateLimited {
+            code: 230429,
+            detail: "update error 230429".into(),
+        };
+        assert_eq!(refusal_transition("", &rate), "rate limited; nothing written");
+        assert_eq!(
+            refusal_transition("finalized ", &rate),
+            "finalized rate limited; nothing written"
+        );
+        let content = crate::error::BridgeError::CardContentRejected {
+            code: 230099,
+            detail: "refused".into(),
+        };
+        assert_eq!(
+            refusal_transition("", &content),
+            "content refused; fallback None/Fenced -> Fenced/Suspended"
+        );
+        let permanent = crate::error::BridgeError::Feishu("update error 230002: message not found".into());
+        assert_eq!(
+            refusal_transition("continuation ", &permanent),
+            "continuation permanent refusal; fallback unchanged"
+        );
+    }
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).
     fn run(call_id: &str) -> RunKey {

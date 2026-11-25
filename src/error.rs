@@ -25,6 +25,21 @@ pub enum BridgeError {
     #[error("feishu error: {detail}")]
     FeishuHttp { status: u16, detail: String },
 
+    /// Feishu refused a message write with its **frequency limit** — the
+    /// per-message update window, reported as a business code inside the
+    /// response body (`230020` "Update the single messages too frequently",
+    /// `230429`), on a 200 or a 400 alike.
+    ///
+    /// Typed apart from [`Self::Feishu`] because nothing was written and the
+    /// same body succeeds once the window passes: a caller can retry it, and a
+    /// log line must not call it a permanent refusal (issue #1103). It is
+    /// deliberately **not** [`Self::is_recoverable_card_write`]: that predicate
+    /// answers "the delivery layer still owes this write a retry", and a direct
+    /// card PATCH is never queued there — the bridge retries a live block's
+    /// arrival itself.
+    #[error("feishu rate limited ({code}): {detail}")]
+    FeishuRateLimited { code: i64, detail: String },
+
     /// Feishu rejected the CARD CONTENT itself (HTTP 400 `code: 230099`,
     /// "Failed to create card content"): the platform's parser or a card limit
     /// refused the JSON, so re-sending the same content never succeeds. The
@@ -113,10 +128,25 @@ impl BridgeError {
         }
     }
 
+    /// Whether Feishu refused the write with its per-message **frequency
+    /// limit** (issue #1103): nothing was written, and the identical body
+    /// succeeds later, so the refusal proves a retry is both safe (no
+    /// unsubmitted text was replaced) and worthwhile.
+    pub(crate) fn is_rate_limited(&self) -> bool {
+        matches!(self, BridgeError::FeishuRateLimited { .. })
+    }
+
     /// Whether a failed card write may succeed on a retry (ADR-0067): transport
     /// errors, timeouts, 5xx, 429 and 408 are recoverable; a content rejection
     /// or any other refusal is permanent. `Feishu(String)` covers API-level
     /// errors reported inside a 2xx body — a semantic refusal, never retried.
+    ///
+    /// A rate limit is retryable in principle but answers **false** here: this
+    /// predicate means "the delivery layer still owes the write", and the call
+    /// sites that ask are queued writes plus the flush's own accounting. A
+    /// direct card PATCH is never queued, so reading the limit as owed would
+    /// claim a retry nobody holds; the bridge retries a live block's arrival on
+    /// its own ([`Self::is_rate_limited`], issue #1103).
     pub(crate) fn is_recoverable_card_write(&self) -> bool {
         match self {
             BridgeError::Http(_) | BridgeError::Io(_) => true,
@@ -147,6 +177,32 @@ impl BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frequency limit is its own refusal (issue #1103): nothing was
+    /// written, so a caller may retry the identical body — but it is not a
+    /// queued delivery the delivery layer owes, and it is not a content
+    /// rejection, so reading it as either would misreport the card.
+    #[test]
+    fn the_frequency_limit_is_its_own_retryable_refusal() {
+        let rate = BridgeError::FeishuRateLimited {
+            code: 230429,
+            detail: "update error 230429: This operation triggers the frequency limit.".into(),
+        };
+        assert!(rate.is_rate_limited());
+        assert!(
+            !rate.is_recoverable_card_write(),
+            "no queued write holds the retry"
+        );
+        assert!(!rate.is_message_gone());
+        assert!(!BridgeError::Feishu("update error 230002: message not found".into()).is_rate_limited());
+        assert!(
+            !BridgeError::CardContentRejected {
+                code: 230099,
+                detail: "refused".into(),
+            }
+            .is_rate_limited()
+        );
+    }
 
     /// Only the platform's specific message-missing response is terminal: a
     /// bare 404 or a NotFound can come from a proxy or an endpoint outage and
