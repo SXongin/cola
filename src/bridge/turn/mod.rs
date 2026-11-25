@@ -485,22 +485,17 @@ impl Turn {
 
     /// Take the Session's in-flight guard for `start`: a caller-claimed
     /// [`Admission`] already IS the claim (the same lock acquisition proved the
-    /// session free), so only a self-admitting caller locks and probes here
-    /// (#1086, ADR-0113). `false` means another prompt holds the session.
+    /// session free), so only a self-admitting caller claims here (#1086,
+    /// ADR-0113). `false` means another prompt holds the session.
     async fn claim_start_guard(
         handles: &TurnHandles,
         session_id: &str,
         admission: Option<Admission>,
     ) -> bool {
-        if admission.is_some() {
-            return true;
+        match admission {
+            Some(_) => true,
+            None => Self::try_admit(&handles.waits, session_id).await.is_some(),
         }
-        let mut inflight = handles.waits.inflight.lock().await;
-        if inflight.contains(session_id) {
-            return false;
-        }
-        inflight.insert(session_id.to_string());
-        true
     }
 
     /// The busy guard, the Loading card (a fresh reply below the user's

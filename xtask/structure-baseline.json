@@ -180,15 +180,15 @@
       "path": "src/bridge/handler.rs",
       "function": "submit_prompt",
       "metric": "cognitive_complexity",
-      "value": 29,
-      "body": "ab5492795c594ea9"
+      "value": 26,
+      "body": "65e1139b8ed2a627"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "submit_prompt",
       "metric": "too_many_lines",
-      "value": 144,
-      "body": "ab5492795c594ea9"
+      "value": 132,
+      "body": "65e1139b8ed2a627"
     },
     {
       "path": "src/bridge/handles.rs",
