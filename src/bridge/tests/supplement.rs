@@ -2402,6 +2402,7 @@ async fn a_retiring_renderer_with_a_terminal_card_still_starts_the_turn() {
         "no failed continuation over a message that ran: {:?}",
         platform.calls.lock().await
     );
+    assert_no_busy_notice(&platform).await;
 }
 
 /// #1086 acceptance 3 through a lease that outlives the handshake's diagnostic
@@ -2409,7 +2410,7 @@ async fn a_retiring_renderer_with_a_terminal_card_still_starts_the_turn() {
 /// moment the renderer's lease retires it starts the Turn that submits it —
 /// exactly once, with no "not submitted" notice anywhere.
 #[tokio::test]
-async fn a_refusal_waits_out_a_lease_that_outlives_the_bound_and_then_submits() {
+async fn a_refusal_waits_out_a_long_lease_and_then_submits() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));

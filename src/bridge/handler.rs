@@ -2649,7 +2649,7 @@ impl App {
     /// held by a renderer that cannot drive a run (a retiring one, or a
     /// restart-armed Wake continuation), so this waits for its window to close
     /// and becomes the Turn it could not merge into (see
-    /// [`Self::settle_refused_supplement`]). Every path submits at most once.
+    /// [`Self::settle_refused_supplement`]). Every path submits exactly once.
     async fn submit_supplement(
         self: &Arc<Self>,
         message: PromptMessage,
@@ -2738,22 +2738,14 @@ impl App {
             .await
     }
 
-    /// Resolve a message whose merge-only steer refused (ADR-0113). Nothing was
-    /// submitted, so the message must become the Turn it could not merge into —
-    /// this waits for the guard instead of ever reporting it unsubmitted.
-    ///
-    /// Every guard holder is finite: a Turn ends, and an out-of-turn renderer's
-    /// lease is scoped to its own loop (the external renderer's idle bound, the
-    /// Wake settle loop's finalize), so the wait ends with the message admitted.
-    /// While a **writer** holds the guard — another message's Turn whose run has
-    /// not registered yet, or a renderer that begins its run — the merge is
-    /// retried on a coarse cadence, so the message joins that run as soon as the
-    /// adapter can see it. Every attempt is merge-only and every earlier one
-    /// refused before submitting, so the message reaches the Backend exactly
-    /// once. The wait has no user-facing deadline: the message's own task is the
-    /// same one a Turn lives in for minutes, and reporting it unsubmitted while
-    /// a writer exists is the loss #1086 is about. A WARN past
-    /// [`SUPPLEMENT_WAIT_WARN_AFTER`] makes a holder that never clears visible.
+    /// Resolve a message whose merge-only steer refused (ADR-0113): nothing was
+    /// submitted, so this waits for the guard and admits the Turn it could not
+    /// merge into — never reporting the message unsubmitted while any writer
+    /// exists. While a writer holds the guard, the merge is retried so the
+    /// message joins that run as soon as the adapter can see it; the retry and
+    /// the Turn are the message's first submission. The wait has no user-facing
+    /// deadline (ADR-0113 §3): [`SUPPLEMENT_WAIT_WARN_AFTER`] only logs, and
+    /// coarsens the poll, so a wedged holder is visible.
     async fn settle_refused_supplement(
         self: &Arc<Self>,
         message: PromptMessage,
