@@ -2458,6 +2458,7 @@ async fn a_refusal_waits_out_a_lease_that_outlives_the_bound_and_then_submits() 
         Some(CardState::Done),
         "the Turn rendered and settled the message"
     );
+    assert_no_busy_notice(&platform).await;
 }
 
 /// #1086's "stop counting a restart-armed continuation as a writer": an
@@ -2567,5 +2568,6 @@ async fn a_refusal_retries_the_merge_while_a_writer_holds_the_guard() {
         "the message was submitted; no unsubmitted notice: {:?}",
         platform.calls.lock().await
     );
+    assert_no_busy_notice(&platform).await;
     app.inflight.lock().await.remove("ses_test");
 }

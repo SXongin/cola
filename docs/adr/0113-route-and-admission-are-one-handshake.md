@@ -57,7 +57,7 @@ Codex's `turn/steer` adapter (`src/codex/backend.rs:3231`) answer this way.
 **3. A typed refusal re-routes the same message.** Nothing was submitted, so
 the message becomes the Turn it could not merge into. `settle_refused_supplement`
 waits for the guard and claims it the instant it clears, starting that Turn
-(`src/bridge/handler.rs:2729`). Every guard holder is finite — a Turn ends, and
+(`src/bridge/handler.rs:2757`). Every guard holder is finite — a Turn ends, and
 an out-of-turn renderer's lease is scoped to its own loop (the external
 renderer's idle bound, the Wake settle loop's finalize) — so the wait ends with
 the message **admitted and submitted exactly once**. This is the path for a
@@ -67,13 +67,13 @@ continuation, and the loser of two simultaneous refusals.
 While a **writer** holds the guard — another message's Turn whose run has not
 registered yet, or a renderer that begins its run — the merge is retried on a
 coarse cadence, so the message joins that run as soon as the adapter can see it
-(`src/bridge/handler.rs:2767`). Every attempt is merge-only and every earlier
+(`src/bridge/handler.rs:2795`). Every attempt is merge-only and every earlier
 one refused before submitting, so the retry is the message's first submission,
 and it reuses the message's `cola_msg_id` so it stays one logical message.
 
 The wait has **no user-facing deadline**: the message's own task is the same one
 a Turn lives in for minutes, and reporting it unsubmitted while a writer exists
-is the loss this record fixes. `SUPPLEMENT_HANDSHAKE_BOUND` is a diagnostic:
+is the loss this record fixes. `SUPPLEMENT_WAIT_WARN_AFTER` is a diagnostic:
 past it a WARN records the long wait so a holder that never clears is visible;
 the message keeps waiting. A typed refusal therefore never opens a
 `SupplementFailed` continuation either — that receipt survives only for
@@ -84,7 +84,7 @@ genuinely ambiguous failures and the broken `StartedTurn` contract.
 the guard (`RenderLease::owns_guard`) and still have no run behind it, which is
 exactly the restart-armed continuation. When only a lease owns the guard, an
 ambiguous steer failure keeps the chain and reports the unconfirmed notice
-(`finish_supplement`, `src/bridge/handler.rs:2811`), so the continuation is
+(`finish_supplement`, `src/bridge/handler.rs:2835`), so the continuation is
 never handed to a renderer that cannot continue it. A renderer that joined a
 Turn's guard records `owns_guard = false` and is unaffected.
 
@@ -102,11 +102,12 @@ path can submit twice, and no path reports a message unsubmitted while any
 writer exists. The single exception is the ambiguity rule's own: an `Err` may
 have landed, and it is never resubmitted (ADR-0092).
 
-**5. The user sees no spurious busy notice.** The busy notice is spoken only by
-the self-admitting callers that cannot re-route. A message that merges through
-the handshake never shows it, and a typed refusal whose guard never clears
-inside the bound gets the honest copy 「这条消息未被提交，请重发」 — not ADR-0092's
-"unconfirmed" wording, which is reserved for responses that may have landed.
+**5. The user sees no spurious busy notice, and no unsubmitted notice either.**
+The busy notice is spoken only by the self-admitting callers that cannot
+re-route. A message that merges through the handshake never shows it, and a
+message waiting out a typed refusal shows nothing until it is submitted: it is
+not reported unsubmitted while any writer exists. ADR-0092's "unconfirmed"
+wording stays reserved for responses that may have landed.
 
 ## Why
 
@@ -124,12 +125,12 @@ inside the bound gets the honest copy 「这条消息未被提交，请重发」
 ## Consequences
 
 - `route_prompt` no longer re-reads ownership after the advisory status read or
-  the orphan collect (`src/bridge/handler.rs:2246`): both await, and the
+  the orphan collect (`src/bridge/handler.rs:2284`): both await, and the
   admission taken afterwards covers them. The routing decision is one read; the
   admission is one claim.
 - The handshake polls the guard every 25 ms and retries a merge against a
-  writer every 500 ms (`SUPPLEMENT_HANDSHAKE_POLL`, `SUPPLEMENT_MERGE_RETRY`,
-  `src/bridge/handler.rs`). `SUPPLEMENT_HANDSHAKE_BOUND` (3 s) is a **WARN**
+  writer every 500 ms (`SUPPLEMENT_HANDSHAKE_POLL`, `SUPPLEMENT_HANDSHAKE_POLL_COARSE`, `SUPPLEMENT_MERGE_RETRY`,
+  `src/bridge/handler.rs`). `SUPPLEMENT_WAIT_WARN_AFTER` (3 s) is a **WARN**
   threshold, not a deadline.
 - The handshake serves the **retiring / restart-armed** holder, whose lease
   clears in under a second, and a Turn that owns the guard, which ends. A
