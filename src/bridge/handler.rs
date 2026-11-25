@@ -2631,9 +2631,9 @@ impl App {
         } = &message.context;
         // Each supplement is its own logical user message: fresh cola-authored
         // id (ADR-0026), never reused. The id is minted ONCE and rides every
-        // attempt of this handshake, so a retried merge is still the same
-        // logical message and the server's id dedupe covers an ambiguous first
-        // response.
+        // attempt of this handshake, so the last-chance retry is still the same
+        // logical message — and if an adapter ever broke the typed-refusal
+        // contract, the server's id dedupe would still cover the re-send.
         let cola_msg_id = crate::backend::parsing::cola_message_id();
         let submitted = match self.steer_supplement(&message.context, &cola_msg_id).await {
             Ok(crate::backend::SteerOutcome::Merged) => {
