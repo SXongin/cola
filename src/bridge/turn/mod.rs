@@ -4173,9 +4173,10 @@ impl Turn {
 
     /// The session's card, only while it is still `chain`'s (ADR-0113): an
     /// out-of-turn renderer's pass must never render into a successor's
-    /// accumulator. The check runs under the same cards lock the takeover
-    /// installs under (the guard the map hands out), so the card read cannot be
-    /// replaced between the check and the pass's first write. `None` means the
+    /// accumulator. The check and the read are ONE map lock, so the pass scope
+    /// and the card it starts from cannot disagree; the pass's later write
+    /// acquisitions re-read the current card, which is why the guard, not this
+    /// read, is what makes a takeover impossible mid-pass. `None` means the
     /// session has no card, or the chain moved.
     pub(crate) async fn card_in_chain<'a>(
         cards: &'a CardsHandle,

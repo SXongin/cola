@@ -80,21 +80,23 @@ cards lock.
 cannot end an unbounded Wake lease and taking it by force would race the
 renderer's own pass. The message asks instead: `retire_render_lease` marks the
 lease currently held (`src/bridge/handles.rs`); both out-of-turn loops check it
-before every write on every path (`render_or_yield`/`stalled_poll` in the
-external renderer, `render_pass` in the shared settle loop) and stop, releasing
-their own lease. The request targets the **current window**: the first acquire of
-a replacement window clears it, so a stale request never kills a successor
-renderer.
+before their render passes and on the failed-read path (`render_or_yield` /
+`stalled_poll` in the external renderer, `render_pass` in the shared settle
+loop) and stop, releasing their own lease. A stop terminal's single reconcile
+pass still lands — on the holder's own chain, before its release. The request
+targets the **current window**: the first acquire of a replacement window clears
+it, so a stale request never kills a successor renderer.
 
-Safety comes from the guard's release ordering, not from timing: the lease is
-released only after the holder's in-flight pass returns, and the successor's
-install needs the guard, so a pass never overlaps a takeover. In addition every
-out-of-turn pass is chain-scoped (`render_and_flush_in_chain`,
-`src/bridge/turn/render.rs`): it takes the Session's card only while it is still
-the pass's chain (`Turn::card_in_chain`), so a pass that starts after the chain
-moved writes nothing. The takeover seeds the orphan's undelivered delta and
-collects the old card, so a run still producing renders on the successor rather
-than being lost.
+Safety comes from the guard's release ordering, not from timing: the guard stays
+the lease's until the **last** holder releases (a Turn that ends while a lease
+lives transfers it, `release_guard`), and each holder releases only after its
+in-flight pass returns — so no pass, the owner's or a joiner's, can overlap a
+takeover. In addition every out-of-turn pass is chain-scoped
+(`render_and_flush_in_chain`, `src/bridge/turn/render.rs`): it takes the
+Session's card only while it is still the pass's chain (`Turn::card_in_chain`),
+so a pass that starts after the chain moved writes nothing. The takeover seeds
+the orphan's undelivered delta and collects the old card, so a run still
+producing renders on the successor rather than being lost.
 
 **4. Every path submits exactly once.** A Turn route submits one prompt; a
 Supplement route submits one steer (merged); a typed refusal submits nothing and
