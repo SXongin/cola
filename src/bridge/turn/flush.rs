@@ -24,6 +24,16 @@ fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
     matches!(e, crate::error::BridgeError::CardContentRejected { .. })
 }
 
+/// Whether a failed card write proves the card did **not** receive the body
+/// (issue #1103): a typed content rejection, a typed frequency limit or any
+/// other definite business refusal wrote nothing, so a live block is still off
+/// the card and may retry. An ambiguous failure — transport, timeout, 5xx, 408 —
+/// may have landed it, and then the freeze must close over whatever the card
+/// shows.
+fn refusal_proves_nothing_written(e: &crate::error::BridgeError) -> bool {
+    !e.is_recoverable_card_write()
+}
+
 /// The transition a refused card write logs (issue #886): one vocabulary for
 /// the three write sites, and the per-message frequency limit is never called a
 /// permanent refusal (issue #1103) — nothing was written, so the identical body
@@ -459,12 +469,26 @@ async fn note_cursor_write_failure(
     stage: crate::bridge::turn::state::StagedCursorId,
     rendered: &[EndingKey],
 ) {
-    // One attempt to land an owed live block was refused (issue #1103): spend
-    // the bounded arrival retry, so a card Feishu refuses for good cannot keep
-    // the typed-answer freeze lifted for the rest of the Turn. A delivered
-    // write settles the retry instead (see [`advance_sent_signatures`]).
+    // The arrival retry's bookkeeping (issue #1103). A refused write either
+    // proves nothing was written or leaves it unknown:
+    //
+    // - a DEFINITE refusal (a typed rate limit, a content rejection, a business
+    //   error) wrote nothing, so the block is still off the card: spend one
+    //   retry, and a card Feishu refuses for good cannot keep the freeze lifted
+    //   for the rest of the Turn;
+    // - an AMBIGUOUS failure (transport, timeout, 5xx) may have landed the body.
+    //   The card might be showing the box right now, so the freeze must close
+    //   over it: safety over liveness — a stranded block is visible, an erased
+    //   draft is not.
     if let Some(mut session) = cards.card(session_id).await {
-        session.acc.spend_block_arrival();
+        if refusal_proves_nothing_written(error) {
+            session.acc.spend_block_arrival();
+        } else {
+            session
+                .acc
+                .block_arrival_handle()
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if error.is_recoverable_card_write()
         && let Some(card_message_id) = card_message_id
@@ -1626,6 +1650,57 @@ mod tests {
             !freeze_armed().await,
             "the delivered body carried the block, so the freeze is back"
         );
+    }
+
+    /// The arrival retry is spent only by a refusal that PROVES nothing was
+    /// written (issue #1103, gate round 4): an ambiguous failure may have
+    /// landed the body, so the freeze closes over the card instead of leaving a
+    /// window where the box is visible and the next pass could repaint it.
+    #[test]
+    fn only_a_definite_refusal_spends_the_arrival_retry() {
+        use crate::error::BridgeError;
+        let definite = [
+            BridgeError::CardContentRejected {
+                code: 230099,
+                detail: "refused".into(),
+            },
+            BridgeError::FeishuRateLimited {
+                code: 230429,
+                detail: "update error 230429".into(),
+            },
+            BridgeError::Feishu("update error 230002: message not found".into()),
+            BridgeError::FeishuHttp {
+                status: 400,
+                detail: "bad request".into(),
+            },
+        ];
+        for error in definite {
+            assert!(
+                super::refusal_proves_nothing_written(&error),
+                "a definite refusal may retry: {error}"
+            );
+        }
+        let ambiguous = [
+            BridgeError::Io(std::io::Error::other("connection reset")),
+            BridgeError::FeishuHttp {
+                status: 503,
+                detail: "unavailable".into(),
+            },
+            BridgeError::FeishuHttp {
+                status: 408,
+                detail: "timeout".into(),
+            },
+            BridgeError::FeishuHttp {
+                status: 429,
+                detail: "proxy rate limit".into(),
+            },
+        ];
+        for error in ambiguous {
+            assert!(
+                !super::refusal_proves_nothing_written(&error),
+                "an ambiguous failure closes the freeze instead: {error}"
+            );
+        }
     }
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).

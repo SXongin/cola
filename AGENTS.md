@@ -186,7 +186,9 @@ and the map from the old numbers.
   owed — the freeze guards a box the card **shows**, and this one is not there.
   A delivered body that renders the block settles it — in the write's own `Ok`
   arm, before any await (`block_arrival_handle`), so a cancellation cannot leave
-  the freeze lifted over a box the card shows. A card already guarding a sibling
+  the freeze lifted over a box the card shows — and only a refusal that
+  **proves** nothing was written spends a retry (an ambiguous transport/5xx
+  failure closes the freeze instead: the card may already show the box). A card already guarding a sibling
   question's box arms nothing (typed text outranks a second block), and a second
   insert while an arrival is already owed joins the remaining budget rather than
   re-arming it. Feishu's frequency limit
