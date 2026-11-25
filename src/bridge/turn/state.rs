@@ -1105,6 +1105,16 @@ const MAX_CARD_ABANDONMENTS: u8 = 2;
 /// budget leaves the card exactly as it was before the retry existed.
 const BLOCK_ARRIVAL_RETRIES: u8 = 4;
 
+/// The line logged when that budget runs out: it names the block still missing
+/// from the card, because with several Sessions refused in one window this is
+/// the only pointer to it (ADR-0114).
+fn block_arrival_exhausted_line(request: &str) -> String {
+    format!(
+        "a live block's arrival is still undelivered after {BLOCK_ARRIVAL_RETRIES} refusals \
+         (request {request}); the card keeps its previous body"
+    )
+}
+
 /// A retry's render baseline (#387, restated by spec #391 and the
 /// generation-aware correction). It keeps the failed attempt's messages out of
 /// the fresh card's turn window, and is load-bearing wherever those messages
@@ -1289,6 +1299,10 @@ pub(super) struct StreamAccumulator {
     /// the refusal is the card's own shell rather than its content: cleared by
     /// any delivered write, never by an abandonment.
     card_abandonments: u8,
+    /// The block whose arrival the retry budget was armed for (issue #1103):
+    /// the request that never reached the card, so the exhausted-budget WARN
+    /// names that block rather than whichever question happens to sort first.
+    block_arrival_request: Option<String>,
     /// Refused attempts left to land a live block's arrival (issue #1103).
     /// Private to this module: armed by [`Self::owe_block_arrival`] when a
     /// block is inserted, spent one refusal at a time
@@ -3770,8 +3784,9 @@ impl StreamAccumulator {
     /// write may be refused by Feishu's frequency limit, and nothing else
     /// writes a block once it exists (issue #1103). Arms the bounded retry the
     /// later render passes spend; a delivered write settles it.
-    pub(super) fn owe_block_arrival(&mut self) {
+    pub(super) fn owe_block_arrival(&mut self, request_id: &str) {
         self.block_arrival_retries = BLOCK_ARRIVAL_RETRIES;
+        self.block_arrival_request = Some(request_id.to_string());
     }
 
     /// One attempt to land an owed block was refused: spend one retry, so a
@@ -3783,10 +3798,12 @@ impl StreamAccumulator {
         }
         self.block_arrival_retries -= 1;
         if self.block_arrival_retries == 0 {
-            tracing::warn!(
-                "a live block's arrival is still undelivered after {BLOCK_ARRIVAL_RETRIES} refusals; \
-                 the card keeps its previous body"
-            );
+            // Name the block: with several Sessions refusing arrivals in one
+            // window this line is the only pointer to the undelivered one
+            // (ADR-0114's consequence — the WARN names it). It is the request
+            // the budget was armed for, never whichever question sorts first.
+            let request = self.block_arrival_request.as_deref().unwrap_or("-");
+            tracing::warn!("{}", block_arrival_exhausted_line(request));
         }
     }
 
@@ -3794,6 +3811,7 @@ impl StreamAccumulator {
     /// the arrival retry is over and the typed-answer freeze applies again.
     pub(super) fn settle_block_arrival(&mut self) {
         self.block_arrival_retries = 0;
+        self.block_arrival_request = None;
     }
 
     /// Whether a block's arrival is still owed a retry. A second block inserted
@@ -8864,7 +8882,7 @@ mod tests {
         }));
         assert!(acc.awaits_typed_answer(), "the box protects what the Host types");
 
-        acc.owe_block_arrival();
+        acc.owe_block_arrival("q");
         assert!(
             !acc.awaits_typed_answer(),
             "a refused arrival is not on the card, so nothing is being typed into it"
@@ -8872,7 +8890,7 @@ mod tests {
         acc.settle_block_arrival();
         assert!(acc.awaits_typed_answer(), "a delivered write ends the retry");
 
-        acc.owe_block_arrival();
+        acc.owe_block_arrival("q");
         for _ in 0..BLOCK_ARRIVAL_RETRIES {
             assert!(!acc.awaits_typed_answer(), "the retry is still owed");
             acc.spend_block_arrival();
@@ -8883,6 +8901,58 @@ mod tests {
         );
         acc.spend_block_arrival();
         assert!(acc.awaits_typed_answer(), "spending past zero is a no-op");
+    }
+
+    /// The exhausted-budget warning names the block still missing from the card
+    /// — the request the budget was armed for, not the first question on the
+    /// card: with several Sessions refused in one window, that id is the only
+    /// pointer to it (ADR-0114, review round 2).
+    #[tokio::test]
+    async fn the_exhausted_arrival_warning_names_the_block() {
+        let block = |id: &str| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: id.into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "备注?".into(),
+                    header: "备注".into(),
+                    kind: crate::backend::types::FormFieldKind::String,
+                    custom: Some(true),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![false],
+                open: 0,
+                drafts: vec![String::new()],
+                asked_at: None,
+            })
+        };
+        let mut acc = StreamAccumulator::new("test");
+        // A first question on the card, then the one whose arrival is owed.
+        acc.add_interaction(block("que_first"));
+        acc.add_interaction(block("que_named"));
+        acc.owe_block_arrival("que_named");
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {
+            for _ in 0..BLOCK_ARRIVAL_RETRIES {
+                acc.spend_block_arrival();
+            }
+        })
+        .await;
+        assert!(
+            logs.contains("que_named"),
+            "the warning names the missing block: {logs}"
+        );
+        assert!(
+            !logs.contains("que_first"),
+            "not merely the first question on the card: {logs}"
+        );
+        assert!(
+            logs.contains("previous body"),
+            "and says the card kept its old body: {logs}"
+        );
     }
 
     /// Issue #917: the card folds every question but the first unanswered one,

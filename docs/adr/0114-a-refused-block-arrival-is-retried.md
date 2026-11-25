@@ -58,7 +58,8 @@ obligation (`settle_block_arrival`, from `advance_sent_signatures` gated on
 `body_carries_question`) — a finalized prefix renders no tail, so its PATCH
 settles nothing and the blocks stay owed until the continuation carries them.
 Spending the budget returns the card to the pre-fix behaviour: the freeze holds,
-and a WARN names the undelivered block.
+and a WARN names the request the budget was armed for — the block that never
+reached the card, not whichever question happens to sort first.
 
 **3. Typed text wins over a sibling block.** An insertion that lands on a card
 already guarding another question's box arms nothing: the flow's own out-of-band
