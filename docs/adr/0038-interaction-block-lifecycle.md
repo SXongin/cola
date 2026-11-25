@@ -8,6 +8,10 @@
 > **Amended by ADR-0104**: where a synthetic entry lands — how it is keyed, the
 > equal-key tie-break and the read floor — is the Timeline module's rule, and
 > #1040 carries the exact rules and their tests.
+>
+> **Amended by ADR-0114** (issue #1103): the typed-answer freeze below has one
+> bounded exception — a live block whose carrying write was refused is not on
+> the card, so it guards nothing and the next pass may write it.
 
 A pending Permission/Question is rendered inline on the card the Host is already
 reading (an **Interaction Block**). It stays inline and follows the live card,
@@ -454,6 +458,21 @@ request is still replied to, but that card may not repaint.
 - The persisted record is written through on every registry mutation, so a crash
   between a card write and its mirror leaves the record one surface stale; the
   sweep's reconciliation heals it on the next start.
+
+## Amendment (ADR-0114, issue #1103)
+
+The typed-answer freeze above gains **one bounded exception**, and it reads the
+freeze's own premise: a card that does not **render** the box guards nothing.
+A live block is written by exactly one write — the flow's arrival flush — and
+every later pass stands down while the block renders a typed answer, so a
+refused arrival used to strand the block forever (live 2026-11-20: the header
+said 「等待你的回答」 and the card carried the question's prose with no
+controls). A question block's insert therefore arms
+`BLOCK_ARRIVAL_RETRIES` attempts (`owe_block_arrival`), `awaits_typed_answer()`
+is false while one is owed, each refused attempt spends one, and a delivered
+write settles the obligation (`settle_block_arrival`). A card already guarding
+a sibling question's box arms nothing. The freeze's rule is otherwise unchanged:
+a card that shows a box is never written by the render pass.
 
 ## Domain note
 

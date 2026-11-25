@@ -2,6 +2,10 @@
 
 > **Supersedes ADR-0028** (the Session Snapshot card). **Amends ADR-0043's
 > `/card` rule**: the pull gains a second state.
+>
+> **Amended by ADR-0114** (issue #1103): the typed-answer freeze below no longer
+> guards a box the card does not show, so a refused block arrival can be retried
+> by the next pass.
 
 ## Context
 
@@ -345,3 +349,13 @@ standing.
   follows the live card or the standalone card.
 
 Source: #945, #999.
+
+## Amendment (ADR-0114, issue #1103)
+
+"A typed input sits at the card's end" and the draft rules stand unchanged, and
+so does the freeze's rule: a card that **shows** an unanswered typed answer is
+not written by the render pass. What changes is its premise — a live block whose
+carrying write Feishu refused is not on the card at all, so the next pass may
+write it (bounded, `BLOCK_ARRIVAL_RETRIES` attempts, settled by a delivered
+write). Without it a refused arrival left the card titled 「等待你的回答」 with
+the question's prose and no control to answer with.

@@ -176,6 +176,22 @@ and the map from the old numbers.
   form's own writes (its arrival, a click's ack, the answer) and the
   settlement are not the render pass and still land.
 
+  **A refused arrival is the one exception** (ADR-0114, issue #1103): a live
+  block is written by exactly one write — the flow's arrival flush — so a card
+  that renders its box and then never receives it has no control at all (a card
+  titled 「等待你的回答」 showing only the prose). A question block's insert
+  arms a bounded retry (`BLOCK_ARRIVAL_RETRIES` attempts,
+  `owe_block_arrival` / `spend_block_arrival` / `settle_block_arrival`,
+  `src/bridge/turn/state.rs`) and `awaits_typed_answer` is false while one is
+  owed — the freeze guards a box the card **shows**, and this one is not there.
+  A delivered body that renders the block settles it; a card already guarding a
+  sibling question's box arms nothing (typed text outranks a second block), and
+  a second insert while an arrival is already owed joins the remaining budget
+  rather than re-arming it. Feishu's frequency limit
+  (`230020`/`230429`, a business code inside the body) is typed
+  `BridgeError::FeishuRateLimited` for exactly this reason — never log it as a
+  permanent refusal.
+
   One user-initiated repaint is allowed while a box holds text: switching to
   another question (ADR-0100). It is a form **submit**, so the text arrives with
   it (keyed `custom_<i>`), the handler records it as that question's draft
