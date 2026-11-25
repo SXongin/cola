@@ -2404,56 +2404,60 @@ async fn a_retiring_renderer_with_a_terminal_card_still_starts_the_turn() {
     );
 }
 
-/// A typed refusal whose guard never clears inside the handshake bound and whose
-/// last-chance merge refuses too is reported honestly: the message was NOT
-/// submitted, so the notice says so and invites a resend — never the
-/// ambiguity-preserving "unconfirmed" copy, and never a continuation handed to a
-/// renderer that does not exist (#1086, ADR-0113).
+/// #1086 acceptance 3 through a lease that outlives the handshake's diagnostic
+/// horizon: the message waits instead of being reported unsubmitted, and the
+/// moment the renderer's lease retires it starts the Turn that submits it —
+/// exactly once, with no "not submitted" notice anywhere.
 #[tokio::test]
-async fn a_typed_refusal_with_a_guard_that_never_clears_reports_no_submission() {
+async fn a_refusal_waits_out_a_lease_that_outlives_the_bound_and_then_submits() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    // The first steer refuses; so does the last-chance merge after the bound.
-    backend.refuse_steer_no_live_run(2);
+    backend.refuse_steer_no_live_run_once();
     let backend = Arc::new(backend);
     let (app, platform) = app_over(cfg, backend.clone());
     seed_session(&app, "ses_test", "/work").await;
     seed_leased_renderer(&app, CardState::Streaming).await;
 
-    app.handle_message(incoming(
-        "msg_sup".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "补充一下".into(),
-        None,
-    ))
-    .await;
-
-    let texts = sent_texts(&platform).await;
-    assert!(
-        texts.iter().any(|t| t.contains("这条消息未被提交")),
-        "the notice states nothing was submitted: {texts:?}"
-    );
-    assert!(
-        backend.prompt_calls.lock().await.is_empty(),
-        "nothing was submitted"
-    );
-    let calls = platform.calls.lock().await.clone();
-    assert!(
-        !calls.iter().any(|c| matches!(
-            c,
-            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_sup"
-        )),
-        "no continuation may be handed to nobody: {calls:?}"
-    );
-    assert!(
-        !app.waits_handle().inbound.lock().await.contains_key("ses_test"),
-        "the message's inbound claim is released"
-    );
+    let handler = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_sup".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "补充一下".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    // The lease outlives the 3 s diagnostic horizon: the message must keep
+    // waiting, not report itself unsubmitted.
+    tokio::time::sleep(std::time::Duration::from_millis(3_200)).await;
     app.waits_handle().release_render_lease("ses_test").await;
+    wait_for_handler(handler, "the waiting message", std::time::Duration::from_secs(5)).await;
+
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["补充一下".to_string()],
+        "the message is submitted exactly once when the lease retires"
+    );
+    assert!(
+        !sent_texts(&platform)
+            .await
+            .iter()
+            .any(|t| t.contains("这条消息未被提交")),
+        "a waiting message is never reported unsubmitted: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the Turn rendered and settled the message"
+    );
 }
 
 /// #1086's "stop counting a restart-armed continuation as a writer": an
@@ -2512,25 +2516,30 @@ async fn an_ambiguous_steer_failure_under_a_lease_keeps_the_chain() {
     app.waits_handle().release_render_lease("ses_test").await;
 }
 
-/// #1086 acceptance 3 — "submitted exactly once on every path" — for the
-/// concurrent handshake: a message whose merge was refused while the guard was
-/// held gets a last-chance merge when the bound expires with a writer still
-/// holding it. The refusal submitted nothing, so this retry is the message's
-/// first (and only) submission: it splits the chain and is never reported
-/// unsubmitted.
+/// #1086 acceptance 3 for the concurrent handshake: while a **writer** holds
+/// the guard (another message's Turn, whose run has not registered yet), the
+/// refused message retries the merge until it lands, so it joins that run
+/// instead of being reported unsubmitted. Submitted exactly once — every
+/// refusal before the merge submitted nothing.
 #[tokio::test]
-async fn a_wait_that_finds_a_held_writer_re_merges_instead_of_reporting_unsubmitted() {
+async fn a_refusal_retries_the_merge_while_a_writer_holds_the_guard() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    // The first steer refuses; the last-chance merge after the bound merges.
+    // The first steer refuses; the retry (a writer holds the guard) merges.
     backend.refuse_steer_no_live_run_once();
     let backend = Arc::new(backend);
     let (app, platform) = app_over(cfg, backend.clone());
     seed_session(&app, "ses_test", "/work").await;
-    // The guard is still held at the bound (the writer never released it).
-    seed_leased_renderer(&app, CardState::Streaming).await;
+
+    // A Turn's own guard: no out-of-turn renderer OWNS a lease, so the guard
+    // proves a writer the message can merge into (ADR-0113 §3a).
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    app.inflight.lock().await.insert("ses_test".into());
 
     app.handle_message(incoming(
         "msg_sup".into(),
@@ -2558,5 +2567,5 @@ async fn a_wait_that_finds_a_held_writer_re_merges_instead_of_reporting_unsubmit
         "the message was submitted; no unsubmitted notice: {:?}",
         platform.calls.lock().await
     );
-    app.waits_handle().release_render_lease("ses_test").await;
+    app.inflight.lock().await.remove("ses_test");
 }
