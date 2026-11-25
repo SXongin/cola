@@ -1098,6 +1098,13 @@ impl CardFallback {
 /// write clears the budget.
 const MAX_CARD_ABANDONMENTS: u8 = 2;
 
+/// How many refused attempts may retry a live block's **arrival** (issue
+/// #1103). One per render tick, so this counts ticks, not time: a block whose
+/// carrying write Feishu refused has no other writer, and the typed-answer
+/// freeze would otherwise stand every later pass down for good. Spending the
+/// budget leaves the card exactly as it was before the retry existed.
+const BLOCK_ARRIVAL_RETRIES: u8 = 4;
+
 /// A retry's render baseline (#387, restated by spec #391 and the
 /// generation-aware correction). It keeps the failed attempt's messages out of
 /// the fresh card's turn window, and is load-bearing wherever those messages
@@ -1282,6 +1289,13 @@ pub(super) struct StreamAccumulator {
     /// the refusal is the card's own shell rather than its content: cleared by
     /// any delivered write, never by an abandonment.
     card_abandonments: u8,
+    /// Refused attempts left to land a live block's arrival (issue #1103).
+    /// Private to this module: armed by [`Self::owe_block_arrival`] when a
+    /// block is inserted, spent one refusal at a time
+    /// ([`Self::spend_block_arrival`]) and cleared by any delivered write
+    /// ([`Self::settle_block_arrival`]). Non-zero lifts the typed-answer
+    /// freeze, because a block that never reached the card holds no text.
+    block_arrival_retries: u8,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
@@ -3737,11 +3751,56 @@ impl StreamAccumulator {
     /// ledger read (ADR-0060) or a clock tick would eat the answer as the
     /// Host types it. A permission block has no input, and a receipt is
     /// already settled, so neither counts.
+    ///
+    /// A live block whose carrying write Feishu **rate limited** is not on the
+    /// card at all (issue #1103), so its box holds nothing and the freeze must
+    /// not guard it: the block's arrival write is its only writer, and standing
+    /// the later passes down would leave a card that says it waits for an
+    /// answer no one can give. [`Self::block_arrival_retries`] keeps that
+    /// carve-out bounded.
     pub(super) fn awaits_typed_answer(&self) -> bool {
-        self.interactions.iter().any(|block| match block {
-            InteractionBlock::Question(q) => q.awaits_typed_answer(),
-            InteractionBlock::Permission(_) | InteractionBlock::Receipt(_) => false,
-        })
+        self.block_arrival_retries == 0
+            && self.interactions.iter().any(|block| match block {
+                InteractionBlock::Question(q) => q.awaits_typed_answer(),
+                InteractionBlock::Permission(_) | InteractionBlock::Receipt(_) => false,
+            })
+    }
+
+    /// A live block was just inserted and must reach the card: its arrival
+    /// write may be refused by Feishu's frequency limit, and nothing else
+    /// writes a block once it exists (issue #1103). Arms the bounded retry the
+    /// later render passes spend; a delivered write settles it.
+    pub(super) fn owe_block_arrival(&mut self) {
+        self.block_arrival_retries = BLOCK_ARRIVAL_RETRIES;
+    }
+
+    /// One attempt to land an owed block was refused: spend one retry, so a
+    /// card Feishu refuses for good cannot keep the typed-answer freeze lifted
+    /// for the rest of the Turn.
+    pub(super) fn spend_block_arrival(&mut self) {
+        if self.block_arrival_retries == 0 {
+            return;
+        }
+        self.block_arrival_retries -= 1;
+        if self.block_arrival_retries == 0 {
+            tracing::warn!(
+                "a live block's arrival is still undelivered after {BLOCK_ARRIVAL_RETRIES} refusals; \
+                 the card keeps its previous body"
+            );
+        }
+    }
+
+    /// A card write landed: whatever block it carried is on the card now, so
+    /// the arrival retry is over and the typed-answer freeze applies again.
+    pub(super) fn settle_block_arrival(&mut self) {
+        self.block_arrival_retries = 0;
+    }
+
+    /// Whether a block's arrival is still owed a retry. A second block inserted
+    /// during that window joins the SAME budget instead of re-arming it, so a
+    /// stream of questions cannot keep the freeze lifted indefinitely.
+    pub(super) fn block_arrival_owed(&self) -> bool {
+        self.block_arrival_retries > 0
     }
 
     /// Progress inputs for the header (ADR-0014): which request kinds await the
@@ -8774,6 +8833,56 @@ mod tests {
         // Resolving the request leaves its receipt behind — no controls.
         assert!(acc.dismiss_interaction("q"));
         assert!(!acc.awaits_typed_answer());
+    }
+
+    /// Issue #1103: a live block whose carrying write Feishu refused is not on
+    /// the card, so its box holds nothing and the freeze must not guard it —
+    /// otherwise no pass ever writes the block again. The carve-out is bounded:
+    /// each refused attempt spends one retry and the freeze comes back, and a
+    /// delivered write settles it at once.
+    #[test]
+    fn an_owed_block_arrival_lifts_the_typed_answer_freeze_until_settled() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q".into(),
+            session_id: "s".into(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "备注?".into(),
+                header: "备注".into(),
+                kind: crate::backend::types::FormFieldKind::String,
+                custom: Some(true),
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: "/w".into(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+            asked_at: None,
+        }));
+        assert!(acc.awaits_typed_answer(), "the box protects what the Host types");
+
+        acc.owe_block_arrival();
+        assert!(
+            !acc.awaits_typed_answer(),
+            "a refused arrival is not on the card, so nothing is being typed into it"
+        );
+        acc.settle_block_arrival();
+        assert!(acc.awaits_typed_answer(), "a delivered write ends the retry");
+
+        acc.owe_block_arrival();
+        for _ in 0..BLOCK_ARRIVAL_RETRIES {
+            assert!(!acc.awaits_typed_answer(), "the retry is still owed");
+            acc.spend_block_arrival();
+        }
+        assert!(
+            acc.awaits_typed_answer(),
+            "the spent budget hands the card back to the freeze, never to a repaint loop"
+        );
+        acc.spend_block_arrival();
+        assert!(acc.awaits_typed_answer(), "spending past zero is a no-op");
     }
 
     /// Issue #917: the card folds every question but the first unanswered one,

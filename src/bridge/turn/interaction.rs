@@ -180,7 +180,24 @@ impl Turn {
             asked_at,
         });
         match cards.card(session_id).await {
-            Some(mut card) => card.acc.add_interaction(block),
+            Some(mut card) => {
+                // A card already guarding another question's typed box must
+                // keep the freeze: this block's arrival write still runs (the
+                // flow flushes it out of band), but a retry would repaint the
+                // box the Host is typing into (#917).
+                let guarded = card.acc.awaits_typed_answer();
+                let added = card.acc.add_interaction(block);
+                if added && !guarded && !card.acc.block_arrival_owed() {
+                    // The block is in the card's next build but not on the
+                    // card: its arrival write is the only writer, so arm the
+                    // bounded retry a refused write spends (issue #1103). An
+                    // arrival already owed keeps its remaining budget instead
+                    // of re-arming, so a run of questions cannot hold the
+                    // freeze open.
+                    card.acc.owe_block_arrival();
+                }
+                added
+            }
             None => false,
         }
     }

@@ -444,6 +444,9 @@ pub enum UpdateFailure {
     /// A transport-class error (`BridgeError::Io`): ambiguous, the PATCH may
     /// have landed.
     Transport,
+    /// A `230429`-class refusal: the per-message frequency limit. Nothing was
+    /// written, so the identical body may land later (issue #1103).
+    RateLimited,
     /// A plain Feishu error only for a card whose JSON contains this needle.
     /// The live patch loop rewrites its card on its own cadence, so a global
     /// count cannot aim at one write under test (a pull's freeze, say); a
@@ -1174,6 +1177,10 @@ impl feishu::Platform for RecordingPlatform {
             Some(UpdateFailure::Http404) => Err(crate::error::BridgeError::FeishuHttp {
                 status: 404,
                 detail: "simulated bare 404".into(),
+            }),
+            Some(UpdateFailure::RateLimited) => Err(crate::error::BridgeError::FeishuRateLimited {
+                code: 230429,
+                detail: "simulated frequency limit".into(),
             }),
             Some(UpdateFailure::Content(_)) => Err(crate::error::BridgeError::Feishu(
                 "simulated card update failure".into(),
