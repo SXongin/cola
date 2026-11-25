@@ -58,10 +58,22 @@ async fn render_pass(
     // (ADR-0113): stop BEFORE writing, so the successor's Turn takes the chain
     // over without a second writer. The caller's `?` turns this into the loop's
     // clean exit; the lease release belongs to the caller that owns it.
-    if flow.waits.render_lease_retire_requested(session_id).await {
-        tracing::info!("{label}: session {session_id} yielding its chain to a waiting message");
+    if flow.waits.should_yield(session_id, label).await {
         return None;
     }
+    render_final(flow, session_id, transcript, chain).await
+}
+
+/// The render itself, without the yield check: the ordinary pass reaches it
+/// through [`render_pass`], and the stop terminal's one reconcile pass calls it
+/// directly — its settled tool states must reach the card before ⏹ is stamped
+/// (ADR-0113).
+async fn render_final(
+    flow: &FlowHandles,
+    session_id: &str,
+    transcript: &crate::backend::SessionTranscript,
+    chain: Option<u64>,
+) -> Option<super::render::RenderPass> {
     match chain {
         Some(chain) => {
             Turn::render_and_flush_in_chain(
@@ -105,7 +117,7 @@ async fn render_once(
     )
     .await
     {
-        render_pass(flow, session_id, &transcript, chain, label).await;
+        render_final(flow, session_id, &transcript, chain).await;
     }
 }
 

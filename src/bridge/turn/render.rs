@@ -2928,21 +2928,6 @@ impl RenderMode {
     }
 }
 
-/// [`render_and_flush`] for a drain tick that is settling (#604): it renders the
-/// read into the accumulator but does not flush — finalization's own render on
-/// the same read owns the card write, so the settle tick adds no second durable
-/// write and no out-of-order flush (a pending split still serves on
-/// finalization, exactly as before).
-/// How one render pass is scoped (ADR-0113): the session-facing behaviour and,
-/// for an out-of-turn renderer, the card chain the pass must still own.
-#[derive(Clone, Copy)]
-struct PassScope {
-    mode: RenderMode,
-    /// `Some(chain)` for a renderer that owns a lease: the pass writes nothing
-    /// and stops when the Session's card has moved to a successor's chain.
-    chain: Option<u64>,
-}
-
 /// Follow the server's live title when this pass has side effects (OpenCode
 /// auto-renames a session after a turn).
 async fn refresh_title_if(
@@ -2957,10 +2942,19 @@ async fn refresh_title_if(
     }
 }
 
-/// Whether a scoped pass's card is stale: a successor owns the accumulator now,
-/// so this pass must never render into it (ADR-0113).
-fn stale(card: &super::state::CardSession, chain: Option<u64>) -> bool {
-    chain.is_some_and(|chain| card.chain_id() != chain)
+/// [`render_and_flush`] for a drain tick that is settling (#604): it renders the
+/// read into the accumulator but does not flush — finalization's own render on
+/// the same read owns the card write, so the settle tick adds no second durable
+/// write and no out-of-order flush (a pending split still serves on
+/// finalization, exactly as before).
+/// How one render pass is scoped (ADR-0113): the session-facing behaviour and,
+/// for an out-of-turn renderer, the card chain the pass must still own.
+#[derive(Clone, Copy)]
+struct PassScope {
+    mode: RenderMode,
+    /// `Some(chain)` for a renderer that owns a lease: the pass writes nothing
+    /// and stops when the Session's card has moved to a successor's chain.
+    chain: Option<u64>,
 }
 
 pub(super) async fn render_and_flush_settling(
@@ -3094,9 +3088,8 @@ async fn render_and_flush_inner(
     refresh_title_if(scope.mode, cards, sessions, backend, session_id).await;
     let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans, typing) = {
         // A scoped pass (an out-of-turn renderer's) stops the moment the chain
-        // it was armed for is gone; the check runs under the same cards lock
-        // the successor's install runs under (ADR-0113).
-        let mut card = cards.card(session_id).await.filter(|c| !stale(c, scope.chain))?;
+        // it was armed for is gone (ADR-0113).
+        let mut card = Turn::card_in_chain(cards, session_id, scope.chain).await?;
         // The attachment's surface declaration, re-read each pass so a
         // reattach's new value governs the next render (ADR-0106). A change is
         // content the body owes (a stored plan/diff/usage/compaction surface
