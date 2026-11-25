@@ -58,19 +58,30 @@ Codex's `turn/steer` adapter (`src/codex/backend.rs:3231`) answer this way.
 bounded moment for the guard to clear — the holders that answer this way retire
 within their settle pass — and claims it the instant it does, starting the Turn
 that renders the message (`submit_supplement`,
-`src/bridge/handler.rs:2607`; `admit_after_guard_release`,
-`src/bridge/handler.rs:2799`). This is the path for both a retiring renderer
+`src/bridge/handler.rs:2623`; `admit_after_guard_release`,
+`src/bridge/handler.rs:2885`). This is the path for both a retiring renderer
 (terminal card, lease still held) and the restart-armed continuation. A typed
 refusal therefore never opens a `SupplementFailed` continuation — that receipt
 survives only for genuinely ambiguous failures and the broken
 `StartedTurn` contract.
+
+If the guard is **still held** at the bound, a writer took it while the message
+waited — another message's Turn, or a renderer that began its run — so the
+message gets one last **merge-only** attempt and joins that run
+(`re_route_after_refusal`, `src/bridge/handler.rs:2734`). This is the concurrent
+handshake's route: without it, the loser of two simultaneous refusals would be
+reported unsubmitted although a live writer could merge it. The retry reuses the
+message's `cola_msg_id`, so it stays one logical message; every refusal before
+it submitted nothing, so it is also the message's first submission. Only when
+the last-chance merge refuses too (a lease-only renderer still holds the guard)
+is the message reported as not submitted.
 
 **3a. A renderer's lease is not proof of a writer either.** The
 `SupplementFailed` continuation requires a **Turn's own** guard: a lease can own
 the guard (`RenderLease::owns_guard`) and still have no run behind it, which is
 exactly the restart-armed continuation. When only a lease owns the guard, an
 ambiguous steer failure keeps the chain and reports the unconfirmed notice
-(`finish_supplement`, `src/bridge/handler.rs:2728`), so the continuation is
+(`finish_supplement`, `src/bridge/handler.rs:2806`), so the continuation is
 never handed to a renderer that cannot continue it. A renderer that joined a
 Turn's guard records `owns_guard = false` and is unaffected.
 
@@ -113,15 +124,16 @@ inside the bound gets the honest copy 「这条消息未被提交，请重发」
   admission is one claim.
 - The handshake bound is three seconds, polled every 25 ms
   (`SUPPLEMENT_HANDSHAKE_BOUND`, `SUPPLEMENT_HANDSHAKE_POLL`,
-  `src/bridge/handler.rs`). Past it the message is reported as not submitted;
-  it is never silently dropped and never claimed as delivered.
+  `src/bridge/handler.rs`). At the bound the message gets one last merge-only
+  attempt: if a writer holds the guard, it merges (the concurrent handshake's
+  route); if a lease-only renderer still holds it, the message is reported as
+  not submitted. It is never silently dropped and never claimed as delivered.
 - The handshake serves the **retiring / restart-armed** holder, whose lease
-  clears in under a second. A Turn's own guard is not one: it clears only when
-  the Turn ends, so a Supplement that reaches the typed refusal inside a Turn's
-  pre-registration window (its prompt not yet visible to the status read) times
-  out into 「这条消息未被提交，请重发」. That window lost the message under
-  ADR-0109 too — it is reported now, not silently dropped — and closing it
-  would need the Turn to expose its own admission, not another guard wait.
+  clears in under a second. A Turn's own guard clears only when the Turn ends, so
+  a Supplement that reached the typed refusal inside a Turn's pre-registration
+  window rides the last-chance merge as soon as the run registers. A guard that
+  never becomes steerable — a lease-only renderer that outlives the bound — ends
+  in 「这条消息未被提交，请重发」.
 - A renderer that leases the guard between routing and admission now results in
   a Supplement regardless of whether the router had chosen a Turn. The
   message's *route* follows the writer, which is the property ADR-0109 wanted.

@@ -231,23 +231,25 @@ impl PromptMessage {
 /// clear before it starts the Turn that renders the message (ADR-0113). The
 /// holders that answer this way are out-of-turn renderers retiring or rehydrated
 /// by a restart, and both release their lease in well under a second (the live
-/// #1086 report: 100 ms). Past the bound the message is reported as not
-/// submitted, never silently dropped.
+/// #1086 report: 100 ms). When the guard is still held at the bound, a writer
+/// took it while the message waited (another message's Turn, a renderer that
+/// began its run): the message gets one last merge-only attempt, so it is
+/// submitted exactly once on that path too. Only if that attempt refuses as
+/// well is it reported as not submitted — never silently dropped.
 ///
-/// A Turn's own guard is not one of these holders: it clears only when the Turn
-/// ends, so a Supplement that reaches the typed refusal inside a Turn's
-/// pre-registration window (its prompt not yet visible to the status read) is
-/// reported as not submitted after the bound. That window lost the same message
-/// before this change; it is now said out loud instead of dropped.
+/// A Turn's own guard is not a holder the wait can serve: it clears only when
+/// the Turn ends. A Supplement refused inside a Turn's pre-registration window
+/// therefore rides the last-chance merge, which succeeds as soon as the run
+/// registers; only a guard that never becomes steerable reaches the notice.
 const SUPPLEMENT_HANDSHAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The handshake's re-read cadence while it waits for that guard to clear.
 const SUPPLEMENT_HANDSHAKE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// The notice when a merge-only steer refused (nothing was submitted) and the
-/// guard never cleared inside [`SUPPLEMENT_HANDSHAKE_BOUND`]. This one MAY
-/// invite a resend: the adapter refused BEFORE submitting, so unlike the
-/// ambiguous failure (ADR-0092) nothing can still land.
+/// The notice when a merge-only steer refused, the handshake's wait found no
+/// guard to start a Turn, and the last-chance merge refused too. This one MAY
+/// invite a resend: every attempt was a typed refusal (nothing was submitted),
+/// so unlike the ambiguous failure (ADR-0092) nothing can still land.
 const SUPPLEMENT_REFUSED_NOTICE: &str = "⚠️ 当前会话没有可合并的运行，这条消息未被提交，请重发。";
 
 /// The notice for a merged Supplement whose chain cannot continue (the card
@@ -2624,47 +2626,16 @@ impl App {
     ) -> crate::error::Result<Option<PromptSubmission>> {
         let PromptContext {
             session_id,
-            text,
-            files,
-            skills,
             message_id,
             ..
         } = &message.context;
         // Each supplement is its own logical user message: fresh cola-authored
-        // id (ADR-0026), never reused.
+        // id (ADR-0026), never reused. The id is minted ONCE and rides every
+        // attempt of this handshake, so a retried merge is still the same
+        // logical message and the server's id dedupe covers an ambiguous first
+        // response.
         let cola_msg_id = crate::backend::parsing::cola_message_id();
-        // A thread-provider client (Codex) owns the next-turn pick in its
-        // adapter (spec #922): a steer carries no model field, and its fallback
-        // `turn/start` reads the adapter's pending. Sending the stored mirror
-        // here would re-send a consumed pick.
-        let next_turn_pending = self.client.owns_next_turn_pending();
-        let model = if next_turn_pending {
-            None
-        } else {
-            self.session_model_override(session_id).await
-        };
-        let variant = if next_turn_pending {
-            None
-        } else {
-            self.session_variant_override(session_id).await
-        };
-        let submitted = match self
-            .client
-            .steer(
-                session_id,
-                text,
-                files,
-                skills,
-                model.as_ref(),
-                variant.as_deref(),
-                self.session_agent_override(session_id).await.as_deref(),
-                Some(&cola_msg_id),
-                // A Supplement must merge: a run this process does not render
-                // must never be started here (ADR-0109).
-                false,
-            )
-            .await
-        {
+        let submitted = match self.steer_supplement(&message.context, &cola_msg_id).await {
             Ok(crate::backend::SteerOutcome::Merged) => {
                 tracing::info!(
                     "supplement: session {} in-flight, message queued to merge into current turn",
@@ -2675,34 +2646,9 @@ impl App {
             Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => {
                 // Typed refusal: the adapter observed no run to steer into and
                 // refused BEFORE submitting, so the message may be re-routed
-                // (ADR-0113). The held guard cannot render it — this is #1086's
-                // restart-armed continuation and its retiring sibling — so wait
-                // for that window to close and admit the Turn it needs.
-                if let Some(admission) = self.admit_after_guard_release(session_id).await {
-                    tracing::info!(
-                        "supplement: session {} refused the merge; the guard cleared and the message starts a Turn",
-                        session_id
-                    );
-                    let outcome = self
-                        .run_prompt_admitted(message.into_context(false), admission)
-                        .await?;
-                    return Ok(Some(match outcome {
-                        crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
-                        crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
-                    }));
-                }
-                // Nothing will render the message and nothing was submitted:
-                // say exactly that, and allow a resend (the refusal is typed,
-                // unlike ADR-0092's ambiguous failure).
-                tracing::info!(
-                    "supplement: session {session_id} refused the merge and the guard never cleared; reporting it"
-                );
-                let _ = self
-                    .feishu
-                    .reply_text(message_id, SUPPLEMENT_REFUSED_NOTICE)
-                    .await;
-                self.waits_handle().clear_inbound(session_id).await;
-                return Ok(Some(PromptSubmission::NotAccepted));
+                // (ADR-0113). Nothing was submitted, so the handshake's
+                // resolution below is still this message's first submission.
+                return self.re_route_after_refusal(message, &cola_msg_id).await;
             }
             Ok(crate::backend::SteerOutcome::StartedTurn) => {
                 // The caller forbade it, so an adapter reporting this broke the
@@ -2726,6 +2672,124 @@ impl App {
         // card. There is NO separate acknowledgement message.
         Ok(Some(
             self.finish_supplement(session_id, message_id, submitted).await,
+        ))
+    }
+
+    /// One merge-only submission of `message` (ADR-0109, ADR-0113): the steer
+    /// carries the caller's model/variant/agent axes and forbids a start. A
+    /// helper rather than an inline call because the typed-refusal handshake may
+    /// retry the merge with the **same** `cola_msg_id` — the retry must be the
+    /// same logical message, and the refusal proved the earlier attempt sent
+    /// nothing.
+    async fn steer_supplement(
+        &self,
+        ctx: &PromptContext,
+        cola_msg_id: &str,
+    ) -> crate::error::Result<crate::backend::SteerOutcome> {
+        // A thread-provider client (Codex) owns the next-turn pick in its
+        // adapter (spec #922): a steer carries no model field, and its fallback
+        // `turn/start` reads the adapter's pending. Sending the stored mirror
+        // here would re-send a consumed pick.
+        let next_turn_pending = self.client.owns_next_turn_pending();
+        let model = if next_turn_pending {
+            None
+        } else {
+            self.session_model_override(&ctx.session_id).await
+        };
+        let variant = if next_turn_pending {
+            None
+        } else {
+            self.session_variant_override(&ctx.session_id).await
+        };
+        self.client
+            .steer(
+                &ctx.session_id,
+                &ctx.text,
+                &ctx.files,
+                &ctx.skills,
+                model.as_ref(),
+                variant.as_deref(),
+                self.session_agent_override(&ctx.session_id).await.as_deref(),
+                Some(cola_msg_id),
+                // A Supplement must merge: a run this process does not render
+                // must never be started here (ADR-0109).
+                false,
+            )
+            .await
+    }
+
+    /// Resolve a message whose merge-only steer refused (ADR-0113). Nothing was
+    /// submitted, so it goes wherever it can actually land:
+    ///
+    /// - the guard clears within [`SUPPLEMENT_HANDSHAKE_BOUND`] (a retiring
+    ///   renderer, or a restart-armed continuation finalizing): claim it and run
+    ///   the Turn;
+    /// - the guard is still held at the bound — a **writer** took it while the
+    ///   message waited (another message's Turn, or a renderer that began its
+    ///   run): retry the merge ONCE. This is the concurrent handshake's route:
+    ///   the waiting message must merge into the winner's run, not be reported
+    ///   unsubmitted (the acceptance's "submitted exactly once on every path");
+    /// - the retry refuses too (a lease-only renderer still holds it): nothing
+    ///   can render the message, so report it as not submitted, honestly.
+    async fn re_route_after_refusal(
+        self: &Arc<Self>,
+        message: PromptMessage,
+        cola_msg_id: &str,
+    ) -> crate::error::Result<Option<PromptSubmission>> {
+        if let Some(admission) = self.admit_after_guard_release(&message.context.session_id).await {
+            tracing::info!(
+                "supplement: session {} refused the merge; the guard cleared and the message starts a Turn",
+                message.context.session_id
+            );
+            let outcome = self
+                .run_prompt_admitted(message.into_context(false), admission)
+                .await?;
+            return Ok(Some(match outcome {
+                crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
+                crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
+            }));
+        }
+        let submitted = match self.steer_supplement(&message.context, cola_msg_id).await {
+            Ok(crate::backend::SteerOutcome::Merged) => {
+                tracing::info!(
+                    "supplement: session {} refused the merge while it waited; merged into the writer that took the guard",
+                    message.context.session_id
+                );
+                true
+            }
+            Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => {
+                tracing::info!(
+                    "supplement: session {} refused the merge twice and the guard never cleared; reporting it",
+                    message.context.session_id
+                );
+                let _ = self
+                    .feishu
+                    .reply_text(&message.context.message_id, SUPPLEMENT_REFUSED_NOTICE)
+                    .await;
+                self.waits_handle()
+                    .clear_inbound(&message.context.session_id)
+                    .await;
+                return Ok(Some(PromptSubmission::NotAccepted));
+            }
+            Ok(crate::backend::SteerOutcome::StartedTurn) => {
+                tracing::warn!(
+                    "supplement: adapter started a new turn for a merge-only steer on session {}",
+                    message.context.session_id
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!("supplement: prompt failed: {}", e);
+                false
+            }
+        };
+        Ok(Some(
+            self.finish_supplement(
+                &message.context.session_id,
+                &message.context.message_id,
+                submitted,
+            )
+            .await,
         ))
     }
 

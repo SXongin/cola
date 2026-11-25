@@ -277,7 +277,9 @@ A merge-only steer's refusal is now **typed**:
 `SteerOutcome::RefusedNoLiveRun` means nothing was submitted
 (`src/backend/mod.rs:204`), so the message is re-routed rather than reported.
 The router waits a bounded moment for the refusing guard to clear and starts the
-Turn that renders the message (`src/bridge/handler.rs:2607`). This is what makes
+Turn that renders the message; when a writer took the guard meanwhile, it
+retries the merge so the message joins that run instead of being reported
+unsubmitted (`src/bridge/handler.rs:2623`, `src/bridge/handler.rs:2734`). This is what makes
 a **restart-armed continuation** safe: it holds a lease rehydrated from durable
 state and cannot render a new message, and the signal that it cannot is the
 adapter's typed refusal, not the card's display class. A typed refusal therefore
