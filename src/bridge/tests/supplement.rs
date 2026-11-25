@@ -2625,3 +2625,36 @@ async fn a_refusal_retries_the_merge_while_a_writer_holds_the_guard() {
     assert_no_busy_notice(&platform).await;
     app.inflight.lock().await.remove("ses_test");
 }
+
+/// ADR-0113: the lease is RAII, so a renderer that panics without ever
+/// observing a yield request releases it on unwind. A waiting message is not
+/// stranded by a dead loop: the guard comes back and the next poll admits it.
+#[tokio::test]
+async fn a_panicking_renderer_releases_its_lease() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let waits = app.waits_handle();
+
+    let lease = waits.lease_render("ses_test").await;
+    assert!(
+        app.inflight.lock().await.contains("ses_test"),
+        "the lease owns the guard while held"
+    );
+    // A renderer dying mid-window: the guard value is dropped during unwind.
+    let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _lease = lease;
+        panic!("renderer task died");
+    }));
+    assert!(died.is_err(), "the simulated renderer panicked");
+
+    wait_for("the dead renderer's lease to be released", || async {
+        (!app.inflight.lock().await.contains("ses_test")).then_some(())
+    })
+    .await;
+    assert!(
+        !waits.render_lease_retire_requested("ses_test").await,
+        "no lease entry survives the panic"
+    );
+}

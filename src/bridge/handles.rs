@@ -2489,6 +2489,33 @@ pub(crate) struct WaitsHandle {
 /// continuations for the process lifetime.
 const INBOUND_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The out-of-turn renderer's lease, owned for its window (ADR-0109, ADR-0113).
+/// Dropping it releases the lease — **including on a panic unwind** — so a
+/// renderer that dies without observing a yield request cannot leave a waiting
+/// user message without a guard forever.
+pub(crate) struct RenderLeaseOwner {
+    waits: WaitsHandle,
+    session_id: String,
+}
+
+impl Drop for RenderLeaseOwner {
+    fn drop(&mut self) {
+        let waits = self.waits.clone();
+        let session_id = std::mem::take(&mut self.session_id);
+        // The release is async and a `Drop` cannot await: hand it to the
+        // runtime. A panic during shutdown must not abort the process from a
+        // Drop, so the spawn is best-effort.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle.spawn(async move {
+                    waits.release_render_lease(&session_id).await;
+                });
+            }));
+            let _ = spawned;
+        }
+    }
+}
+
 /// One Session's out-of-turn renderer lease (ADR-0109): how many renderers are
 /// in their window, whether the FIRST of them claimed the inflight guard (a
 /// guard a Turn already held is not ours to release), and whether a waiting
@@ -2563,6 +2590,17 @@ impl WaitsHandle {
             tracing::info!("{label}: session {session_id} yielding its chain to a waiting message");
         }
         yield_now
+    }
+
+    /// Take (or join) the Session's renderer lease and return its owner
+    /// (ADR-0109, ADR-0113): the lease is released when the returned value
+    /// drops, so a render loop's panic unwind cannot strand the guard.
+    pub(crate) async fn lease_render(&self, session_id: &str) -> RenderLeaseOwner {
+        self.acquire_render_lease(session_id).await;
+        RenderLeaseOwner {
+            waits: self.clone(),
+            session_id: session_id.to_string(),
+        }
     }
 
     /// Give the Session's inflight guard back, unless an out-of-turn renderer

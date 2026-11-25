@@ -1523,10 +1523,12 @@ impl ExternalFlow {
                 // it is a Supplement (ADR-0066) and a card with no loop is not
                 // mistaken for one (#1056). Reference-counted, so a
                 // replacement renderer keeps the guard with the survivor.
-                flow.waits.acquire_render_lease(&session_id).await;
+                let lease = flow.waits.lease_render(&session_id).await;
                 let ending =
                     Turn::wake_settle_loop(&flow, &session_id, &directory, &anchor, chain, timing).await;
-                flow.waits.release_render_lease(&session_id).await;
+                // The settle window is over: release BEFORE the notice, so a
+                // message arriving during the announcement is not a Supplement.
+                drop(lease);
                 let Some((disposition, card_id)) = ending else {
                     // The loop stopped owning the card (a new Turn, another
                     // arm) or its accumulator vanished: nothing ended here, so
@@ -1724,13 +1726,14 @@ async fn external_render_loop(
     read_timeout_ms: u64,
     idle_timeout_ms: u64,
 ) {
-    handles.waits.acquire_render_lease(&session_id).await;
+    // RAII: a panic in the renderer releases the lease (ADR-0113), so a
+    // waiting message is never stranded by a dead loop.
+    let lease = handles.waits.lease_render(&session_id).await;
     // The chain this renderer owns, captured with the lease held (ADR-0113): a
     // takeover can only land after this lease yields, so every render pass is
     // scoped to the chain that was here when the window opened. A card that has
     // no chain left to render ends the loop instead.
     let Some(chain) = Turn::card_chain_id(&handles.cards, &session_id).await else {
-        handles.waits.release_render_lease(&session_id).await;
         return;
     };
     external_render_loop_inner(
@@ -1743,7 +1746,7 @@ async fn external_render_loop(
         idle_timeout_ms,
     )
     .await;
-    handles.waits.release_render_lease(&session_id).await;
+    drop(lease);
 }
 
 /// Renew the renderer's idle clock when the last pass advanced the card's
