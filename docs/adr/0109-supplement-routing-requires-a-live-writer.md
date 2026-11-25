@@ -1,5 +1,10 @@
 # A live writer owns the Supplement, and a completion Wake resumes in place
 
+> **Amended by ADR-0113 (2026-11-25)**: the route and the Turn's admission are
+> now one handshake — the guard claim IS the admission, and a merge-only steer's
+> refusal is the typed `SteerOutcome::RefusedNoLiveRun` that re-routes the same
+> message instead of dropping it. See the amendment at the end.
+
 > **Amends**: ADR-0043 (a failed Supplement's continuation). **Supersedes**
 > ADR-0062 (the card-only arm is no longer a Supplement routing key) and
 > ADR-0066 (the mid-resume message's proof is the Wake loop's guard lease);
@@ -252,3 +257,32 @@ still answers honestly. The durable Wake Watermark
 Origins: #1056 and #1055 (the guard key), #1083 (the steer contract), #428 and
 #409 (routing at all), #434 (the Unreceived ending), #426 (in-place resumption), #568 (external follows), #602
 (the residual card and the same-snapshot ending), #1087 (the third taker).
+
+## Amendment (2026-11-25): the route's decision and the Turn's admission are one handshake (ADR-0113)
+
+ADR-0113 closes this ADR's own deferred consequence — "the instant between the
+router's final ownership read and `Turn::start` is not atomic; a renderer
+retiring or acquiring its lease in that instant is not re-routed" (#1086).
+
+The guard is still the one routing key, and its holders and leases are
+unchanged. What moved is the **admission**: `Turn::try_admit` claims the guard
+before the coordinator builds the Turn's context, so a busy claim re-routes the
+same message as a Supplement and a renderer's lease taken after the route can no
+longer make `Turn::start` refuse a message the router chose a Turn for
+(`src/bridge/turn/mod.rs:422`, `src/bridge/handler.rs:2252`). The ownership
+re-reads this ADR's implementation placed after the advisory status read and the
+orphan collect are gone; the claim taken after them covers both.
+
+A merge-only steer's refusal is now **typed**:
+`SteerOutcome::RefusedNoLiveRun` means nothing was submitted
+(`src/backend/mod.rs:204`), so the message is re-routed rather than reported.
+The router waits a bounded moment for the refusing guard to clear and starts the
+Turn that renders the message (`src/bridge/handler.rs:2607`). This is what makes
+a **restart-armed continuation** safe: it holds a lease rehydrated from durable
+state and cannot render a new message, and the signal that it cannot is the
+adapter's typed refusal, not the card's display class. A typed refusal therefore
+never opens a `SupplementFailed` continuation; that receipt remains for
+ambiguous failures and an adapter breaking the merge-only contract. Every path
+submits the message at most once, and the busy notice is spoken only by the
+self-admitting callers (an error-card retry, the V1 resume resubmit), never by a
+message that then merges.
