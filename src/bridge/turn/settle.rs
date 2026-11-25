@@ -61,14 +61,14 @@ async fn render_pass(
     if flow.waits.should_yield(session_id, label).await {
         return None;
     }
-    render_final(flow, session_id, transcript, chain).await
+    render_without_yield(flow, session_id, transcript, chain).await
 }
 
 /// The render itself, without the yield check: the ordinary pass reaches it
 /// through [`render_pass`], and the stop terminal's one reconcile pass calls it
-/// directly — its settled tool states must reach the card before ⏹ is stamped
-/// (ADR-0113).
-async fn render_final(
+/// directly — its settled tool states must reach the card before ⏹ is stamped,
+/// which is the one write a pending yield does not skip (ADR-0113).
+async fn render_without_yield(
     flow: &FlowHandles,
     session_id: &str,
     transcript: &crate::backend::SessionTranscript,
@@ -117,7 +117,7 @@ async fn render_once(
     )
     .await
     {
-        render_final(flow, session_id, &transcript, chain).await;
+        render_without_yield(flow, session_id, &transcript, chain).await;
     }
 }
 
