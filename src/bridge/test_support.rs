@@ -2590,9 +2590,9 @@ impl MockBackend {
         self.refuse_steer_no_live_run(1)
     }
 
-    /// Scenario: the next `times` `steer` calls report the typed refusal. The
-    /// handshake retries once after its bound expires, so a test that wants
-    /// both attempts refused arms two (#1086, ADR-0113).
+    /// Scenario: the next `times` `steer` calls report the typed refusal
+    /// (#1086, ADR-0113). The handshake retries a merge only while a writer
+    /// holds the guard, so a lease-only holder sees exactly one attempt.
     pub(crate) fn refuse_steer_no_live_run(&mut self, times: usize) -> &mut Self {
         self.steer_refused_no_live_run
             .store(times, std::sync::atomic::Ordering::SeqCst);

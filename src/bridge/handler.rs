@@ -227,6 +227,38 @@ impl PromptMessage {
     }
 }
 
+/// What a merge-only steer answered, with the shared logging (#1056, ADR-0109,
+/// ADR-0113). Only [`Self::Merged`] submitted something; an adapter that breaks
+/// the merge-only contract has already started a run, and an `Err` may still
+/// have landed (ADR-0092) — both are unconfirmed and never retried.
+enum SteerAnswer {
+    Merged,
+    /// The adapter refused before submitting: nothing reached the Backend, so
+    /// the message may be routed again.
+    Refused,
+    Unconfirmed,
+}
+
+fn classify_steer(
+    session_id: &str,
+    outcome: crate::error::Result<crate::backend::SteerOutcome>,
+) -> SteerAnswer {
+    match outcome {
+        Ok(crate::backend::SteerOutcome::Merged) => SteerAnswer::Merged,
+        Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => SteerAnswer::Refused,
+        Ok(crate::backend::SteerOutcome::StartedTurn) => {
+            tracing::warn!(
+                "supplement: adapter started a new turn for a merge-only steer on session {session_id}"
+            );
+            SteerAnswer::Unconfirmed
+        }
+        Err(e) => {
+            tracing::warn!("supplement: prompt failed: {}", e);
+            SteerAnswer::Unconfirmed
+        }
+    }
+}
+
 /// How long a Supplement's typed "no live run" refusal may wait before the
 /// handshake logs the long wait (ADR-0113). This is a **diagnostic**, not a
 /// deadline: the wait ends when the guard clears — a Turn ends, and an
@@ -234,10 +266,16 @@ impl PromptMessage {
 /// report: the Wake settled 100 ms after the refusal). Past it the message
 /// keeps waiting, because reporting it unsubmitted while a writer exists is
 /// exactly the message loss #1086 fixes.
-const SUPPLEMENT_HANDSHAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+const SUPPLEMENT_WAIT_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The handshake's re-read cadence while it waits for that guard to clear.
+/// The handshake's re-read cadence while it waits for that guard to clear: fast
+/// while a real renderer is expected to retire (the live #1086 report: 100 ms).
 const SUPPLEMENT_HANDSHAKE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The re-read cadence after [`SUPPLEMENT_WAIT_WARN_AFTER`]: a wait that long is
+/// a Turn running, not a renderer retiring, so the poll slows to a tick that
+/// still notices the guard clearing promptly without spinning.
+const SUPPLEMENT_HANDSHAKE_POLL_COARSE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How often the handshake re-tries the merge while a **writer** holds the guard
 /// (a Turn whose run has not registered yet). Coarser than the poll: each
@@ -2610,8 +2648,8 @@ impl App {
     /// was submitted**. The message is then not lost to a notice — the guard is
     /// held by a renderer that cannot drive a run (a retiring one, or a
     /// restart-armed Wake continuation), so this waits for its window to close
-    /// and starts the Turn that renders the message the moment it does. Every
-    /// path submits at most once: a merge, one fallback Turn, or a notice.
+    /// and becomes the Turn it could not merge into (see
+    /// [`Self::settle_refused_supplement`]). Every path submits at most once.
     async fn submit_supplement(
         self: &Arc<Self>,
         message: PromptMessage,
@@ -2627,34 +2665,24 @@ impl App {
         // logical message — and if an adapter ever broke the typed-refusal
         // contract, the server's id dedupe would still cover the re-send.
         let cola_msg_id = crate::backend::parsing::cola_message_id();
-        let submitted = match self.steer_supplement(&message.context, &cola_msg_id).await {
-            Ok(crate::backend::SteerOutcome::Merged) => {
+        let answer = classify_steer(
+            session_id,
+            self.steer_supplement(&message.context, &cola_msg_id).await,
+        );
+        let submitted = match answer {
+            SteerAnswer::Merged => {
                 tracing::info!(
                     "supplement: session {} in-flight, message queued to merge into current turn",
                     session_id
                 );
                 true
             }
-            Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => {
-                // Typed refusal: the adapter observed no run to steer into and
-                // refused BEFORE submitting, so the message may be re-routed
-                // (ADR-0113). Nothing was submitted, so the handshake's
-                // resolution below is still this message's first submission.
-                return self.settle_refused_supplement(message, &cola_msg_id).await;
-            }
-            Ok(crate::backend::SteerOutcome::StartedTurn) => {
-                // The caller forbade it, so an adapter reporting this broke the
-                // merge-only contract. The run has already started; treat the
-                // delivery as unconfirmed so the visible failure path runs.
-                tracing::warn!(
-                    "supplement: adapter started a new turn for a merge-only steer on session {session_id}"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::warn!("supplement: prompt failed: {}", e);
-                false
-            }
+            // Typed refusal: the adapter observed no run to steer into and
+            // refused BEFORE submitting, so the message may be re-routed
+            // (ADR-0113). Nothing was submitted, so the handshake's resolution
+            // is still this message's first submission.
+            SteerAnswer::Refused => return self.settle_refused_supplement(message, &cola_msg_id).await,
+            SteerAnswer::Unconfirmed => false,
         };
         // The supplement landed below the live card: split the Card Chain at
         // this message (ADR-0043). The previous card is finalized with the
@@ -2725,7 +2753,7 @@ impl App {
     /// once. The wait has no user-facing deadline: the message's own task is the
     /// same one a Turn lives in for minutes, and reporting it unsubmitted while
     /// a writer exists is the loss #1086 is about. A WARN past
-    /// [`SUPPLEMENT_HANDSHAKE_BOUND`] makes a holder that never clears visible.
+    /// [`SUPPLEMENT_WAIT_WARN_AFTER`] makes a holder that never clears visible.
     async fn settle_refused_supplement(
         self: &Arc<Self>,
         message: PromptMessage,
@@ -2764,37 +2792,33 @@ impl App {
                     .as_ref()
                     .expect("the refused message is still pending")
                     .context;
-                match self.steer_supplement(context, cola_msg_id).await {
-                    Ok(crate::backend::SteerOutcome::Merged) => {
+                match classify_steer(&session_id, self.steer_supplement(context, cola_msg_id).await) {
+                    SteerAnswer::Merged => {
                         tracing::info!(
                             "supplement: session {session_id} merged into the writer that held the guard"
                         );
                         return Ok(Some(self.finish_supplement(&session_id, &message_id, true).await));
                     }
-                    Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => {}
-                    Ok(crate::backend::SteerOutcome::StartedTurn) => {
-                        tracing::warn!(
-                            "supplement: adapter started a new turn for a merge-only steer on session {session_id}"
-                        );
-                        return Ok(Some(
-                            self.finish_supplement(&session_id, &message_id, false).await,
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::warn!("supplement: prompt failed: {}", e);
+                    SteerAnswer::Refused => {}
+                    SteerAnswer::Unconfirmed => {
                         return Ok(Some(
                             self.finish_supplement(&session_id, &message_id, false).await,
                         ));
                     }
                 }
             }
-            if !warned && started.elapsed() >= SUPPLEMENT_HANDSHAKE_BOUND {
+            if !warned && started.elapsed() >= SUPPLEMENT_WAIT_WARN_AFTER {
                 warned = true;
                 tracing::warn!(
                     "supplement: session {session_id} refused the merge and the guard is still held; waiting for it to clear"
                 );
             }
-            tokio::time::sleep(SUPPLEMENT_HANDSHAKE_POLL).await;
+            let poll = if warned {
+                SUPPLEMENT_HANDSHAKE_POLL_COARSE
+            } else {
+                SUPPLEMENT_HANDSHAKE_POLL
+            };
+            tokio::time::sleep(poll).await;
         }
     }
 
