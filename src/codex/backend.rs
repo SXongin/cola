@@ -3209,8 +3209,10 @@ impl Backend for CodexClient {
     /// that permits a start falls back to `turn/start` (the server folds it into
     /// the active turn or starts a fresh one, never a second competing turn) and
     /// is told [`SteerOutcome::StartedTurn`]; a caller that must merge — the
-    /// bridge's Supplement, which owns no renderer for a fresh run — gets an
-    /// error instead, so a message never starts a run nobody renders.
+    /// bridge's Supplement, which owns no renderer for a fresh run — is refused
+    /// with [`SteerOutcome::RefusedNoLiveRun`] **before** anything is submitted,
+    /// so a message never starts a run nobody renders and the caller may
+    /// re-route it (#1086, ADR-0113).
     #[allow(clippy::too_many_arguments)]
     async fn steer(
         &self,
@@ -3226,10 +3228,7 @@ impl Backend for CodexClient {
     ) -> Result<SteerOutcome> {
         let Some(turn_id) = self.projections.live_turn(session_id) else {
             if !may_start_turn {
-                return Err(BridgeError::Client {
-                    client: "codex",
-                    detail: "no live turn to steer; the message was not submitted".into(),
-                });
+                return Ok(SteerOutcome::RefusedNoLiveRun);
             }
             return self
                 .prompt(session_id, text, files, skills, model, variant, agent, message_id)
@@ -6422,10 +6421,11 @@ mod tests {
         );
     }
 
-    /// ADR-0109: a Supplement must merge. With no live turn to steer, a
-    /// merge-only steer is refused BEFORE anything is submitted — no
-    /// `turn/steer`, no fallback `turn/start`, so no run is started without a
-    /// renderer.
+    /// ADR-0109 / ADR-0113: a Supplement must merge. With no live turn to
+    /// steer, a merge-only steer is refused BEFORE anything is submitted — no
+    /// `turn/steer`, no fallback `turn/start` — and the answer is the typed
+    /// `RefusedNoLiveRun`, so the caller knows the message never landed and may
+    /// re-route it.
     #[tokio::test]
     async fn a_merge_only_steer_refuses_instead_of_starting_a_turn() {
         let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
@@ -6440,7 +6440,7 @@ mod tests {
         client.transcript("thread-1").await.expect("subscribe");
         server.wait_for_subscribers("thread-1", 1).await;
 
-        let error = client
+        let outcome = client
             .steer(
                 "thread-1",
                 "a supplement",
@@ -6453,11 +6453,12 @@ mod tests {
                 false,
             )
             .await
-            .expect_err("no live turn: a merge-only steer is refused");
+            .expect("a merge-only refusal is an answer, not an error");
 
-        assert!(
-            error.to_string().contains("no live turn to steer"),
-            "the refusal names why: {error}"
+        assert_eq!(
+            outcome,
+            crate::backend::SteerOutcome::RefusedNoLiveRun,
+            "the caller is told the message was not submitted"
         );
         assert!(server.steer_params().is_empty(), "nothing was steered");
         assert_eq!(server.turn_starts(), 0, "no fallback turn/start was sent");

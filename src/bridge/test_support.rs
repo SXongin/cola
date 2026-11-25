@@ -1873,6 +1873,14 @@ pub struct MockBackend {
     /// One-shot: `steer` reports `SteerOutcome::StartedTurn` (an adapter
     /// breaking the merge-only contract, ADR-0109) after submitting.
     pub steer_started_turn: Arc<std::sync::atomic::AtomicBool>,
+    /// One-shot: `steer` reports `SteerOutcome::RefusedNoLiveRun` — the typed
+    /// refusal (#1086, ADR-0113) that submits NOTHING, so the bridge can re-route
+    /// the same message.
+    pub steer_refused_no_live_run: Arc<std::sync::atomic::AtomicBool>,
+    /// A callback run at the top of `steer` — before any outcome — so a test
+    /// can release a seeded render lease exactly when the Supplement's steer
+    /// begins (the handshake's retirement point, ADR-0113).
+    pub on_steer: Option<Box<dyn Fn() + Send + Sync>>,
     /// Number of initial `prompt` calls to fail (for testing retry-after-error).
     pub fail_prompt_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Number of initial `interrupt` calls to fail with a genuine error (the
@@ -2207,6 +2215,13 @@ pub struct MockBackend {
     /// (the retry's status leg, spec #391). Separate from
     /// [`Self::session_status_error`], which is fixed at construction.
     pub session_status_fails: Arc<std::sync::atomic::AtomicBool>,
+    /// Holds ONLY the next `session_status` read until the returned semaphore is
+    /// released, counting it in [`Self::status_gate_entered`] — the routing
+    /// read's own window, where a test leases the guard between the route
+    /// decision and the Turn's admission (ADR-0113).
+    pub status_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Counts `session_status` reads that reached [`Self::status_gate`].
+    pub status_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
     /// When set, every `transcript` read rewrites its last assistant text part
     /// with a fresh, numbered body (spec #602 review): a deterministic
     /// ever-changing stream, so each read carries content the card has not
@@ -2320,6 +2335,8 @@ impl MockBackend {
             omitted_questions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             prompt_error: None,
             steer_started_turn: std::sync::atomic::AtomicBool::new(false).into(),
+            steer_refused_no_live_run: std::sync::atomic::AtomicBool::new(false).into(),
+            on_steer: None,
             fail_prompt_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_interrupt_count: std::sync::atomic::AtomicUsize::new(0).into(),
             fail_interrupt_message: None,
@@ -2417,6 +2434,8 @@ impl MockBackend {
             overlay: crate::bridge::tasks::TasksHandle::new(),
             session_status_error: None,
             session_status_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            status_gate: std::sync::Mutex::new(None),
+            status_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             growing_transcript: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             growing_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             delay_reads_with_tail: std::sync::Mutex::new(None),
@@ -2561,6 +2580,21 @@ impl MockBackend {
     pub(crate) fn report_started_turn_once(&mut self) -> &mut Self {
         self.steer_started_turn
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the next `steer` reports
+    /// [`crate::backend::SteerOutcome::RefusedNoLiveRun`] **without submitting
+    /// anything** — the typed refusal the handshake re-routes (#1086).
+    pub(crate) fn refuse_steer_no_live_run_once(&mut self) -> &mut Self {
+        self.steer_refused_no_live_run
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Run `hook` at the top of every `steer`, before any outcome.
+    pub(crate) fn on_steer(&mut self, hook: impl Fn() + Send + Sync + 'static) -> &mut Self {
+        self.on_steer = Some(Box::new(hook));
         self
     }
 
@@ -2843,6 +2877,17 @@ impl MockBackend {
     pub(crate) fn hold_prompts(&mut self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         self.prompt_gate = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Hold **only the next** `session_status` read until the returned
+    /// semaphore is released, counting it in [`Self::status_gate_entered`]. The
+    /// parking point is the routing read (ADR-0113): a test leases the guard
+    /// there and releases the read, so the router decides a Turn and the
+    /// admission refuses it — the exact window the handshake re-routes.
+    pub(crate) fn hold_next_status_read(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.status_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -3764,7 +3809,9 @@ impl crate::backend::Backend for MockBackend {
     }
 
     /// The mock's steer: submit (like the default) and report a merge, unless
-    /// the scenario arms [`Self::report_started_turn_once`].
+    /// the scenario arms [`Self::report_started_turn_once`] or
+    /// [`Self::refuse_steer_no_live_run_once`] (the latter submits nothing —
+    /// the typed refusal ADR-0113 re-routes).
     #[allow(clippy::too_many_arguments)]
     async fn steer(
         &self,
@@ -3778,6 +3825,15 @@ impl crate::backend::Backend for MockBackend {
         message_id: Option<&str>,
         _may_start_turn: bool,
     ) -> crate::error::Result<crate::backend::SteerOutcome> {
+        if let Some(hook) = &self.on_steer {
+            hook();
+        }
+        if self
+            .steer_refused_no_live_run
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(crate::backend::SteerOutcome::RefusedNoLiveRun);
+        }
         let started = self
             .steer_started_turn
             .swap(false, std::sync::atomic::Ordering::SeqCst);
@@ -4456,6 +4512,16 @@ impl crate::backend::Backend for MockBackend {
             .lock()
             .await
             .push(session_id.to_string());
+        // One-shot routing-window gate (ADR-0113): parked AFTER the read is
+        // recorded, so a test sees the routing read arrive and can lease the
+        // guard before the handler's admission runs.
+        let gated = self.status_gate.lock().unwrap().take();
+        if let Some(gate) = gated {
+            self.status_gate_entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let permit = gate.acquire().await.expect("status test gate closed");
+            permit.forget();
+        }
         if let Some(err) = &self.session_status_error {
             return Err(crate::error::BridgeError::OpenCode(err.clone()));
         }

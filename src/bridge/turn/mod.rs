@@ -299,6 +299,12 @@ pub(crate) struct PromptContext {
     pub(crate) advisory_live: bool,
 }
 
+/// Proof that the caller already claimed the Session's in-flight guard for the
+/// Turn it is about to start (#1086, ADR-0113): [`Turn::start`] must not
+/// re-check it, because the claim and the admission are one instant. Opaque,
+/// minted only by [`Turn::try_admit`].
+pub(crate) struct Admission(());
+
 /// One user→assistant exchange (GLOSSARY.md: Turn). Owns the per-turn state and
 /// carries it through the phases in [`Turn::run`]:
 ///
@@ -391,15 +397,58 @@ impl Turn {
         handles: &TurnHandles,
         ctx: PromptContext,
     ) -> crate::error::Result<PromptOutcome> {
+        Self::lifecycle(handles, ctx, None).await
+    }
+
+    /// Run a Turn whose in-flight guard this caller already claimed with
+    /// [`Self::try_admit`] (#1086, ADR-0113). The claim and the admission are
+    /// one instant, so no guard can appear between the router's decision and
+    /// this Turn: the message the router chose a Turn for can never be refused
+    /// busy here. Used by the one coordinator that routes prompts.
+    pub(crate) async fn run_admitted(
+        handles: &TurnHandles,
+        ctx: PromptContext,
+        admission: Admission,
+    ) -> crate::error::Result<PromptOutcome> {
+        Self::lifecycle(handles, ctx, Some(admission)).await
+    }
+
+    /// Claim the Session's in-flight guard for a Turn about to start (#1086,
+    /// ADR-0113), unless another prompt holds it — `None` means busy, nothing
+    /// claimed, and the caller still owns the message. This is the router's
+    /// admission step: taking the guard HERE, before the context is consumed,
+    /// is what lets a busy answer re-route the same message as a Supplement
+    /// instead of losing it to [`Self::start`]'s refusal.
+    pub(crate) async fn try_admit(
+        waits: &crate::bridge::handles::WaitsHandle,
+        session_id: &str,
+    ) -> Option<Admission> {
+        let mut inflight = waits.inflight.lock().await;
+        if inflight.contains(session_id) {
+            return None;
+        }
+        inflight.insert(session_id.to_string());
+        Some(Admission(()))
+    }
+
+    async fn lifecycle(
+        handles: &TurnHandles,
+        ctx: PromptContext,
+        admission: Option<Admission>,
+    ) -> crate::error::Result<PromptOutcome> {
         let span = span::turn(&ctx.session_id, &ctx.thread_key, tracing::Span::current().id());
-        Self::run_inner(handles, ctx).instrument(span).await
+        Self::run_inner(handles, ctx, admission).instrument(span).await
     }
 
     /// The lifecycle body, wrapped by [`Turn::run`]'s span. A separate fn so
     /// the instrumentation wraps every phase — `start` included — and the span
     /// stays alive across each await.
-    async fn run_inner(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<PromptOutcome> {
-        let Some(mut turn) = Self::start(handles, ctx).await? else {
+    async fn run_inner(
+        handles: &TurnHandles,
+        ctx: PromptContext,
+        admission: Option<Admission>,
+    ) -> crate::error::Result<PromptOutcome> {
+        let Some(mut turn) = Self::start(handles, ctx, admission).await? else {
             // Busy: start already answered, and this message was not submitted.
             return Ok(PromptOutcome::NotAccepted);
         };
@@ -434,11 +483,41 @@ impl Turn {
         Ok(PromptOutcome::from_submit(&prompt_resp))
     }
 
+    /// Take the Session's in-flight guard for `start`: a caller-claimed
+    /// [`Admission`] already IS the claim (the same lock acquisition proved the
+    /// session free), so only a self-admitting caller locks and probes here
+    /// (#1086, ADR-0113). `false` means another prompt holds the session.
+    async fn claim_start_guard(
+        handles: &TurnHandles,
+        session_id: &str,
+        admission: Option<Admission>,
+    ) -> bool {
+        if admission.is_some() {
+            return true;
+        }
+        let mut inflight = handles.waits.inflight.lock().await;
+        if inflight.contains(session_id) {
+            return false;
+        }
+        inflight.insert(session_id.to_string());
+        true
+    }
+
     /// The busy guard, the Loading card (a fresh reply below the user's
     /// message — including a retry, which replies a new card) and the fresh
     /// accumulator this turn streams into. `Ok(None)` means another prompt
     /// holds the session — already answered.
-    async fn start(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<Option<Turn>> {
+    ///
+    /// `admission` is the guard a caller already claimed with
+    /// [`Self::try_admit`] (#1086): with it the busy check is skipped, because
+    /// the same lock acquisition that minted it proved the session free. Without
+    /// one this is the self-admitting path retries and the resume flow still
+    /// take, and a held guard is refused here.
+    async fn start(
+        handles: &TurnHandles,
+        ctx: PromptContext,
+        admission: Option<Admission>,
+    ) -> crate::error::Result<Option<Turn>> {
         let PromptContext {
             session_id,
             thread_key,
@@ -460,31 +539,26 @@ impl Turn {
         // Serialize prompts per session: if one is already in flight, don't let
         // a second message overwrite its accumulator (the two would race on the
         // same card). Reply with a notice only when we own a fresh message.
-        {
-            let mut inflight = handles.waits.inflight.lock().await;
-            if inflight.contains(&session_id) {
-                drop(inflight);
-                // The message was refused, not admitted: drop the inbound
-                // claim with it (#424) — the inflight guard blocks the Fresh
-                // path anyway, and a lingering claim would only outlive its
-                // message.
-                handles.waits.clear_inbound(&session_id).await;
-                if is_retry {
-                    // The retry lost the guard: nothing was submitted, so
-                    // nothing may be marked. Its user message is the failed
-                    // turn's and the running prompt already answered it; give
-                    // the claim back so the still-Error card keeps a working
-                    // retry button (spec #391).
-                    Self::release_recovery_claim(&handles.cards, &session_id).await;
-                } else {
-                    let _ = handles
-                        .platform
-                        .reply_text(&message_id, "⏳ 上一条消息还在处理中，请稍等它完成后重发。")
-                        .await;
-                }
-                return Ok(None);
+        // An already-claimed admission IS that serialization (#1086): the
+        // caller took the guard for this Turn, so it is free by construction.
+        if !Self::claim_start_guard(handles, &session_id, admission).await {
+            // The message was refused, not admitted: drop the inbound claim
+            // with it (#424) — the inflight guard blocks the Fresh path anyway,
+            // and a lingering claim would only outlive its message.
+            handles.waits.clear_inbound(&session_id).await;
+            if is_retry {
+                // The retry lost the guard: nothing was submitted, so nothing
+                // may be marked. Its user message is the failed turn's and the
+                // running prompt already answered it; give the claim back so
+                // the still-Error card keeps a working retry button (spec #391).
+                Self::release_recovery_claim(&handles.cards, &session_id).await;
+            } else {
+                let _ = handles
+                    .platform
+                    .reply_text(&message_id, "⏳ 上一条消息还在处理中，请稍等它完成后重发。")
+                    .await;
             }
-            inflight.insert(session_id.clone());
+            return Ok(None);
         }
         // This Turn is the inbound message's admission: the pre-guard claim
         // (#424) is superseded by the inflight guard it just became.

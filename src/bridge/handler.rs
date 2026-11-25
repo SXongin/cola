@@ -185,7 +185,7 @@ async fn read_session_status(
     }
 }
 
-/// The prompt route (ADR-0062, ADR-0109). A **held guard** — the
+/// The prompt route (ADR-0062, ADR-0109, ADR-0113). A **held guard** — the
 /// [`crate::bridge::turn::CardOwnership`] verdict's in-process claim — is the
 /// routing key; the Backend's status read only picks the new card's opening
 /// line. A card-only chain is a display state, never a routing key.
@@ -203,6 +203,62 @@ enum PromptRoute {
         advisory_live: bool,
     },
 }
+
+/// One routed user message (ADR-0113): everything either route's submission
+/// needs, owned from classification until the route has actually taken it. The
+/// route is decided first and submitted second, and a handshake that changes
+/// the route must submit the SAME message — never a copy or a second id.
+struct PromptMessage {
+    session_id: String,
+    thread_key: ThreadKey,
+    text: String,
+    message_id: String,
+    subtitle: String,
+    requester_open_id: Option<String>,
+    is_group: bool,
+    files: Vec<PromptFile>,
+    skills: Vec<PromptSkill>,
+}
+
+impl PromptMessage {
+    /// The Turn's context, taken only once the Turn's guard is claimed. The
+    /// `cola_message_id` stays for the Turn to mint (a retry's carries its
+    /// failed attempt's; a fresh message never reuses one across routes).
+    fn into_context(self, advisory_live: bool) -> PromptContext {
+        PromptContext {
+            session_id: self.session_id,
+            thread_key: self.thread_key,
+            text: self.text,
+            message_id: self.message_id,
+            subtitle: self.subtitle,
+            is_retry: false,
+            requester_open_id: self.requester_open_id,
+            is_group: self.is_group,
+            cola_message_id: None,
+            files: self.files,
+            skills: self.skills,
+            advisory_live,
+        }
+    }
+}
+
+/// How long a Supplement's typed "no live run" refusal waits for the guard to
+/// clear before it starts the Turn that renders the message (ADR-0113). The
+/// holders that answer this way are out-of-turn renderers retiring or rehydrated
+/// by a restart — both release their lease in well under a second (the live
+/// #1086 report: 100 ms) — and a Turn whose run has not registered yet, which
+/// registers in seconds. Past the bound the message is reported as not
+/// submitted, never silently dropped.
+const SUPPLEMENT_HANDSHAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The handshake's re-read cadence while it waits for that guard to clear.
+const SUPPLEMENT_HANDSHAKE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The notice when a merge-only steer refused (nothing was submitted) and the
+/// guard never cleared inside [`SUPPLEMENT_HANDSHAKE_BOUND`]. This one MAY
+/// invite a resend: the adapter refused BEFORE submitting, so unlike the
+/// ambiguous failure (ADR-0092) nothing can still land.
+const SUPPLEMENT_REFUSED_NOTICE: &str = "⚠️ 当前会话没有可合并的运行，这条消息未被提交，请重发。";
 
 /// What the prompt pipeline did with a submission, for the one caller that must
 /// report the outcome on a card of its own (the Terminal Card's 「问 AI」,
@@ -2184,6 +2240,13 @@ impl App {
     /// genuinely live run merges the message exactly as a Supplement would,
     /// while a stale read gets a card that owns and settles the message.
     ///
+    /// This function DECIDES; it does not admit (ADR-0113). The status read and
+    /// the orphan collect both await, so a renderer can lease the guard after
+    /// any read here — which is why the caller claims the Turn's guard with
+    /// [`crate::bridge::turn::Turn::try_admit`] and re-routes a refused claim as
+    /// a Supplement. Re-reading here would only move the unguarded window, not
+    /// close it.
+    ///
     /// One INFO line records every decision (ADR-0048): the session, the
     /// ownership verdict and the advisory status — never chat content.
     async fn route_prompt(&self, session_id: &str) -> PromptRoute {
@@ -2216,48 +2279,19 @@ impl App {
             Some(_) => (false, "idle"),
             None => (false, "unreadable"),
         };
-        // The status read awaited, so an out-of-turn renderer may have leased
-        // the guard meanwhile (the Session Sync's external/Wake loop): the
-        // initial no-guard snapshot must not start a Turn against a live chain
-        // (#1056). Re-read before deciding; a guard that appeared routes the
-        // message as the Supplement it is.
-        let ownership =
-            crate::bridge::turn::CardOwnership::read(&self.cards_handle(), &self.waits_handle(), session_id)
-                .await;
-        if ownership.holds_guard() {
-            tracing::info!(
-                "prompt routing: session={session_id} ownership=guard advisory={advisory} route=supplement"
-            );
-            return PromptRoute::Supplement;
-        }
         let label = ownership.routing_label().unwrap_or("none");
         // Reap the orphaned card BEFORE this message is classified (#1056): a
         // card-only chain is render-owned on screen but no in-process renderer
         // drives it (every renderer leases the guard), so the recorded card is
         // exactly the orphan a failed Supplement leaves. Collecting it here
-        // keeps the stale card from lingering under the new Turn's card.
+        // keeps the stale card from lingering under the new Turn's card. A
+        // renderer that leases the guard while the collect awaits is caught by
+        // the caller's admission, which re-routes the message as a Supplement.
         if ownership.card_class() == crate::bridge::turn::CardClass::RenderOwned
             && let Some(card_id) = ownership.card_message_id().map(str::to_string)
             && self.cards_handle().chains.has_record(session_id)
         {
             crate::bridge::chain::collect_orphan(&self.cards_handle(), session_id, &card_id).await;
-            // The collect awaited Feishu: a renderer may have leased the guard
-            // while it ran, so re-check before the Turn is started. A guard
-            // that appeared routes the message as a Supplement instead of
-            // losing it to Turn admission's busy refusal.
-            if crate::bridge::turn::CardOwnership::read(
-                &self.cards_handle(),
-                &self.waits_handle(),
-                session_id,
-            )
-            .await
-            .holds_guard()
-            {
-                tracing::info!(
-                    "prompt routing: session={session_id} ownership=guard advisory={advisory} route=supplement"
-                );
-                return PromptRoute::Supplement;
-            }
         }
         // The card-only chain (a render-owned card holding no guard: the
         // external snapshot follow, a Wake continuation) starts a new Turn like
@@ -2507,184 +2541,285 @@ impl App {
         )
         .await;
 
-        // Prompt routing (ADR-0062): cola's own live ownership decides a
-        // Supplement, never the Backend's read. With no owned chain the message
-        // starts a new Turn — whose card owns and settles it — opening with the
-        // merge line only when the advisory read said live; a genuinely live
-        // run still merges it through the prompt's merge delivery (V2's steer).
-        match self.route_prompt(&session_id).await {
+        // Prompt routing (ADR-0062, ADR-0109): cola's own live ownership decides
+        // a Supplement, never the Backend's read. The message's facts are owned
+        // from here, so a route that changes during admission (ADR-0113)
+        // submits the SAME message — never a copy, never twice.
+        let message = PromptMessage {
+            session_id,
+            thread_key,
+            text,
+            message_id,
+            subtitle,
+            requester_open_id,
+            is_group,
+            files: attachments,
+            skills,
+        };
+        match self.route_prompt(&message.session_id).await {
             PromptRoute::NewTurn { advisory_live } => {
+                // ADMISSION is the guard claim itself (#1086, ADR-0113), taken
+                // before the context is consumed: a renderer that leases the
+                // guard after the route's awaits (the advisory status read,
+                // the orphan collect) re-routes this message as the Supplement
+                // it is, instead of letting `Turn::start` refuse it busy after
+                // the router chose a Turn for it.
+                let Some(admission) =
+                    crate::bridge::turn::Turn::try_admit(&self.waits_handle(), &message.session_id).await
+                else {
+                    tracing::info!(
+                        "prompt routing: session={} ownership=guard route=supplement (admission handshake)",
+                        message.session_id
+                    );
+                    return self.submit_supplement(message).await;
+                };
                 let outcome = self
-                    .run_prompt(PromptContext {
-                        session_id,
-                        thread_key,
-                        text,
-                        message_id,
-                        subtitle,
-                        is_retry: false,
-                        requester_open_id,
-                        is_group,
-                        cola_message_id: None,
-                        files: attachments,
-                        skills,
-                        advisory_live,
-                    })
+                    .run_prompt_admitted(message.into_context(advisory_live), admission)
                     .await?;
                 Ok(Some(match outcome {
                     crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
                     crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
                 }))
             }
-            // Supplement path (ADR-0043, owned routing per ADR-0062): cola
-            // holds the Session's live Execution, so the message does not start
-            // a competing run_prompt (it would overwrite the running turn's
-            // accumulator and race on the same card). Instead submit the
-            // message to the backend without starting a Turn — OpenCode
-            // persists it and the running loop picks it up at the next tool
-            // boundary, merging it into the current turn (original message
-            // preserved; model sees full history). This is what lets the user
-            // append context mid-turn without /stop and without interrupting a
-            // tool call. The message landed below the live card, so the Card
-            // Chain splits at it (ADR-0043) — the split is requested even when
-            // the send failed, never for commands (they are dispatched above
-            // this path). The out-of-turn follow inherits the inflight guard
-            // for its whole window (ADR-0059), so a message during a run that
-            // outlived the drain bound keeps merging into the still-live chain
-            // instead of freezing its card.
-            PromptRoute::Supplement => {
-                // Each supplement is its own logical user message: fresh
-                // cola-authored id (ADR-0026), never reused.
-                let cola_msg_id = crate::backend::parsing::cola_message_id();
-                // A thread-provider client (Codex) owns the next-turn pick in
-                // its adapter (spec #922): a steer carries no model field, and
-                // its fallback `turn/start` reads the adapter's pending. Sending
-                // the stored mirror here would re-send a consumed pick.
-                let next_turn_pending = self.client.owns_next_turn_pending();
-                let model = if next_turn_pending {
-                    None
-                } else {
-                    self.session_model_override(&session_id).await
-                };
-                let variant = if next_turn_pending {
-                    None
-                } else {
-                    self.session_variant_override(&session_id).await
-                };
-                let submitted = match self
-                    .client
-                    .steer(
-                        &session_id,
-                        &text,
-                        &attachments,
-                        &skills,
-                        model.as_ref(),
-                        variant.as_deref(),
-                        self.session_agent_override(&session_id).await.as_deref(),
-                        Some(&cola_msg_id),
-                        // A Supplement must merge: a run this process does not
-                        // render must never be started here (ADR-0109).
-                        false,
-                    )
-                    .await
-                {
-                    Ok(crate::backend::SteerOutcome::Merged) => {
-                        tracing::info!(
-                            "supplement: session {} in-flight, message queued to merge into current turn",
-                            session_id
-                        );
-                        true
-                    }
-                    Ok(crate::backend::SteerOutcome::StartedTurn) => {
-                        // The caller forbade it, so an adapter reporting this
-                        // broke the merge-only contract. The run has already
-                        // started; treat the delivery as unconfirmed so the
-                        // visible failure path runs.
-                        tracing::warn!(
-                            "supplement: adapter started a new turn for a merge-only steer on session {session_id}"
-                        );
-                        false
-                    }
-                    Err(e) => {
-                        tracing::warn!("supplement: prompt failed: {}", e);
-                        false
-                    }
-                };
-                // The supplement landed below the live card: split the Card
-                // Chain at this message (ADR-0043). The previous card is
-                // finalized with the standard split header and keeps everything
-                // before the split; the continuation — a reply to the
-                // supplement — carries the receipt (and only the content that
-                // arrives after it) and becomes the tracked live card. There is
-                // NO separate acknowledgement message.
-                //
-                // A FAILED steer did not CONFIRM a merge: the continuation may
-                // only be opened while a held guard proves a live in-process
-                // writer will render and settle it (#1056). Without one, the
-                // chain's owner is only a card-state claim, and the split would
-                // hand a live card to nobody — every later message would then
-                // be absorbed as a supplement of a run that does not exist. In
-                // that case the plain notice is the visible failure. Neither
-                // message claims the steer was lost: an ambiguous response may
-                // still have landed (ADR-0092 keeps its marker), so the copy
-                // says unconfirmed and never tells the user to resend.
-                let owned_by_writer = !submitted && {
-                    let ownership = crate::bridge::turn::CardOwnership::read(
-                        &self.cards_handle(),
-                        &self.waits_handle(),
-                        &session_id,
-                    )
-                    .await;
-                    ownership.holds_guard()
-                        && ownership.card_class() == crate::bridge::turn::CardClass::RenderOwned
-                };
-                let admitted = if submitted {
-                    crate::bridge::turn::Turn::split_card_chain(
-                        &self.cards_handle(),
-                        &session_id,
-                        &message_id,
-                        crate::bridge::turn::SplitKind::Supplement,
-                    )
-                    .await
-                } else {
-                    // The split's admission re-checks the card under the same
-                    // lock an ending is applied with, so a Turn that settles in
-                    // this window refuses it: the chain keeps its card and the
-                    // plain notice is the one visible failure.
-                    owned_by_writer
-                        && crate::bridge::turn::Turn::split_card_chain(
-                            &self.cards_handle(),
-                            &session_id,
-                            &message_id,
-                            crate::bridge::turn::SplitKind::SupplementFailed,
-                        )
-                        .await
-                };
-                if !admitted {
-                    // A merged message with no card to continue on (the card
-                    // ended in the window) and a failed steer without a writer
-                    // both end here; the copy must not claim a delivery that
-                    // did not happen (ADR-0092).
-                    let copy = if submitted {
-                        "⚠️ 补充消息已提交，但当前卡片无法继续，请留意后续回复。"
-                    } else {
-                        "⚠️ 补充消息未确认送达，请先确认当前回复是否继续。"
-                    };
-                    tracing::info!(
-                        "supplement: no continuation for session {session_id} (submitted={submitted}); reporting it"
-                    );
-                    let _ = self.feishu.reply_text(&message_id, copy).await;
-                }
-                // The message merged into the live Execution: the claim's job
-                // is done — once the prompt is visible in the transcript, the
-                // Sync's own staleness rule takes over (#424).
-                self.waits_handle().clear_inbound(&session_id).await;
-                Ok(Some(if submitted {
-                    PromptSubmission::Supplement
-                } else {
-                    PromptSubmission::NotAccepted
-                }))
-            }
+            PromptRoute::Supplement => self.submit_supplement(message).await,
         }
+    }
+
+    /// Submit `message` as a Supplement (ADR-0043, owned routing per ADR-0062):
+    /// cola holds the Session's live Execution, so the message does not start a
+    /// competing Turn (it would overwrite the running turn's accumulator and
+    /// race on the same card). The message goes to the Backend without starting
+    /// a Turn — OpenCode persists it and the running loop picks it up at the
+    /// next tool boundary, merging it into the current turn (original message
+    /// preserved; model sees full history). This is what lets the user append
+    /// context mid-turn without `/stop` and without interrupting a tool call.
+    /// The message landed below the live card, so the Card Chain splits at it
+    /// (ADR-0043) — the split is requested even when the send failed, never for
+    /// commands (they are dispatched above this path).
+    ///
+    /// This is also one half of the route/admission handshake (ADR-0113): a
+    /// merge-only steer may answer `RefusedNoLiveRun`, which proves **nothing
+    /// was submitted**. The message is then not lost to a notice — the guard is
+    /// held by a renderer that cannot drive a run (a retiring one, or a
+    /// restart-armed Wake continuation), so this waits for its window to close
+    /// and starts the Turn that renders the message the moment it does. Every
+    /// path submits at most once: a merge, one fallback Turn, or a notice.
+    async fn submit_supplement(
+        self: &Arc<Self>,
+        message: PromptMessage,
+    ) -> crate::error::Result<Option<PromptSubmission>> {
+        let PromptMessage {
+            session_id,
+            text,
+            files,
+            skills,
+            message_id,
+            ..
+        } = &message;
+        // Each supplement is its own logical user message: fresh cola-authored
+        // id (ADR-0026), never reused.
+        let cola_msg_id = crate::backend::parsing::cola_message_id();
+        // A thread-provider client (Codex) owns the next-turn pick in its
+        // adapter (spec #922): a steer carries no model field, and its fallback
+        // `turn/start` reads the adapter's pending. Sending the stored mirror
+        // here would re-send a consumed pick.
+        let next_turn_pending = self.client.owns_next_turn_pending();
+        let model = if next_turn_pending {
+            None
+        } else {
+            self.session_model_override(session_id).await
+        };
+        let variant = if next_turn_pending {
+            None
+        } else {
+            self.session_variant_override(session_id).await
+        };
+        let submitted = match self
+            .client
+            .steer(
+                session_id,
+                text,
+                files,
+                skills,
+                model.as_ref(),
+                variant.as_deref(),
+                self.session_agent_override(session_id).await.as_deref(),
+                Some(&cola_msg_id),
+                // A Supplement must merge: a run this process does not render
+                // must never be started here (ADR-0109).
+                false,
+            )
+            .await
+        {
+            Ok(crate::backend::SteerOutcome::Merged) => {
+                tracing::info!(
+                    "supplement: session {} in-flight, message queued to merge into current turn",
+                    session_id
+                );
+                true
+            }
+            Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => {
+                // Typed refusal: the adapter observed no run to steer into and
+                // refused BEFORE submitting, so the message may be re-routed
+                // (ADR-0113). The held guard cannot render it — this is #1086's
+                // restart-armed continuation and its retiring sibling — so wait
+                // for that window to close and admit the Turn it needs.
+                if let Some(admission) = self.admit_after_guard_release(session_id).await {
+                    tracing::info!(
+                        "supplement: session {} refused the merge; the guard cleared and the message starts a Turn",
+                        session_id
+                    );
+                    let outcome = self
+                        .run_prompt_admitted(message.into_context(false), admission)
+                        .await?;
+                    return Ok(Some(match outcome {
+                        crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
+                        crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
+                    }));
+                }
+                // Nothing will render the message and nothing was submitted:
+                // say exactly that, and allow a resend (the refusal is typed,
+                // unlike ADR-0092's ambiguous failure).
+                tracing::info!(
+                    "supplement: session {session_id} refused the merge and the guard never cleared; reporting it"
+                );
+                let _ = self
+                    .feishu
+                    .reply_text(message_id, SUPPLEMENT_REFUSED_NOTICE)
+                    .await;
+                self.waits_handle().clear_inbound(session_id).await;
+                return Ok(Some(PromptSubmission::NotAccepted));
+            }
+            Ok(crate::backend::SteerOutcome::StartedTurn) => {
+                // The caller forbade it, so an adapter reporting this broke the
+                // merge-only contract. The run has already started; treat the
+                // delivery as unconfirmed so the visible failure path runs.
+                tracing::warn!(
+                    "supplement: adapter started a new turn for a merge-only steer on session {session_id}"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!("supplement: prompt failed: {}", e);
+                false
+            }
+        };
+        // The supplement landed below the live card: split the Card Chain at
+        // this message (ADR-0043). The previous card is finalized with the
+        // standard split header and keeps everything before the split; the
+        // continuation — a reply to the supplement — carries the receipt (and
+        // only the content that arrives after it) and becomes the tracked live
+        // card. There is NO separate acknowledgement message.
+        Ok(Some(
+            self.finish_supplement(session_id, message_id, submitted).await,
+        ))
+    }
+
+    /// Close out a Supplement that has no fallback left (#1056, ADR-0109): split
+    /// the chain when a writer can continue it, else report the one visible
+    /// failure. A FAILED steer did not CONFIRM a merge: the continuation may
+    /// only be opened while a held guard proves a live in-process writer will
+    /// render and settle it. Without one, the chain's owner is only a card-state
+    /// claim, and the split would hand a live card to nobody — every later
+    /// message would then be absorbed as a supplement of a run that does not
+    /// exist. Neither message claims the steer was lost: an ambiguous response
+    /// may still have landed (ADR-0092 keeps its marker), so the copy says
+    /// unconfirmed and never tells the user to resend.
+    async fn finish_supplement(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        submitted: bool,
+    ) -> PromptSubmission {
+        let owned_by_writer = !submitted && {
+            let ownership = crate::bridge::turn::CardOwnership::read(
+                &self.cards_handle(),
+                &self.waits_handle(),
+                session_id,
+            )
+            .await;
+            ownership.holds_guard() && ownership.card_class() == crate::bridge::turn::CardClass::RenderOwned
+        };
+        let admitted = if submitted {
+            crate::bridge::turn::Turn::split_card_chain(
+                &self.cards_handle(),
+                session_id,
+                message_id,
+                crate::bridge::turn::SplitKind::Supplement,
+            )
+            .await
+        } else {
+            // The split's admission re-checks the card under the same lock an
+            // ending is applied with, so a Turn that settles in this window
+            // refuses it: the chain keeps its card and the plain notice is the
+            // one visible failure.
+            owned_by_writer
+                && crate::bridge::turn::Turn::split_card_chain(
+                    &self.cards_handle(),
+                    session_id,
+                    message_id,
+                    crate::bridge::turn::SplitKind::SupplementFailed,
+                )
+                .await
+        };
+        if !admitted {
+            // A merged message with no card to continue on (the card ended in
+            // the window) and a failed steer without a writer both end here;
+            // the copy must not claim a delivery that did not happen
+            // (ADR-0092).
+            let copy = if submitted {
+                "⚠️ 补充消息已提交，但当前卡片无法继续，请留意后续回复。"
+            } else {
+                "⚠️ 补充消息未确认送达，请先确认当前回复是否继续。"
+            };
+            tracing::info!(
+                "supplement: no continuation for session {session_id} (submitted={submitted}); reporting it"
+            );
+            let _ = self.feishu.reply_text(message_id, copy).await;
+        }
+        // The message merged into the live Execution: the claim's job is done —
+        // once the prompt is visible in the transcript, the Sync's own staleness
+        // rule takes over (#424).
+        self.waits_handle().clear_inbound(session_id).await;
+        if submitted {
+            PromptSubmission::Supplement
+        } else {
+            PromptSubmission::NotAccepted
+        }
+    }
+
+    /// The handshake's second half (ADR-0113): claim the Session's in-flight
+    /// guard for a Turn that will render a message a merge-only steer refused,
+    /// waiting a bounded moment for the guard's holder to release it. The
+    /// holders that answer a merge-only steer this way are retiring renderers
+    /// and restart-armed Wake continuations — both release within their settle
+    /// pass — so this returns as soon as the window closes. `None` means the
+    /// bound expired with the guard still held; the caller reports the message
+    /// as not submitted (it genuinely was not).
+    async fn admit_after_guard_release(&self, session_id: &str) -> Option<crate::bridge::turn::Admission> {
+        let waits = self.waits_handle();
+        let deadline = std::time::Instant::now() + SUPPLEMENT_HANDSHAKE_BOUND;
+        loop {
+            if let Some(admission) = crate::bridge::turn::Turn::try_admit(&waits, session_id).await {
+                return Some(admission);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(SUPPLEMENT_HANDSHAKE_POLL).await;
+        }
+    }
+
+    /// [`Self::run_prompt`] for a Turn whose guard the caller already claimed
+    /// with [`crate::bridge::turn::Turn::try_admit`] (ADR-0113): the claim and
+    /// the admission are one instant, so the busy refusal cannot fire here.
+    async fn run_prompt_admitted(
+        self: &Arc<Self>,
+        ctx: PromptContext,
+        admission: crate::bridge::turn::Admission,
+    ) -> crate::error::Result<crate::bridge::turn::PromptOutcome> {
+        let handles = self.turn_handles();
+        crate::bridge::turn::Turn::run_admitted(&handles, ctx, admission).await
     }
 
     /// Run one prompt end-to-end: show a Loading card (either a fresh reply or a

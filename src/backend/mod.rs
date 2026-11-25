@@ -192,9 +192,16 @@ pub enum SteerOutcome {
     Merged,
     /// The adapter could not merge and the caller allowed a new turn; the
     /// message may have started one. A caller that must merge passes
-    /// `may_start_turn = false` and receives an error instead, so no run is
-    /// left without a renderer.
+    /// `may_start_turn = false` and is refused instead, so no run is left
+    /// without a renderer.
     StartedTurn,
+    /// The adapter observed no run it could steer into and the caller forbade a
+    /// start, so it refused **before submitting**: nothing reached the Backend,
+    /// nothing may still land, and the caller is free to route the same message
+    /// another way (#1086, ADR-0113). A typed answer on purpose — an `Err` stays
+    /// ambiguous (a lost response may have landed, ADR-0092) and must never be
+    /// re-routed.
+    RefusedNoLiveRun,
 }
 
 /// The backend, abstracted so tests can drive the bridge with canned responses
@@ -368,7 +375,8 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// `may_start_turn` is the caller's contract (ADR-0109): a Supplement is
     /// only routed while an in-process guard proves a writer, and the bridge
     /// passes `false` — the steer must merge and must not start a run nobody
-    /// renders. An adapter with a fallback start respects it; one whose plain
+    /// renders. An adapter with a fallback start respects it and reports
+    /// [`SteerOutcome::RefusedNoLiveRun`] before submitting; one whose plain
     /// prompt merges-or-starts reports [`SteerOutcome::Merged`] because the
     /// caller's Turn owns the submitted message either way.
     ///
@@ -390,16 +398,15 @@ pub trait Backend: ServerLifecycle + Send + Sync {
             // This generation's prompt starts an Execution when the session is
             // idle. A merge-only steer must not leave that run without a
             // renderer (#1056, ADR-0109): refuse before submitting when the
-            // status read says no run is live.
+            // status read says no run is live. Typed, because nothing was
+            // submitted — the caller re-routes the message instead of showing
+            // the ambiguous-failure notice (#1086).
             let live = self
                 .session_status(session_id, None)
                 .await?
                 .is_some_and(|status| status.is_live());
             if !live {
-                return Err(crate::error::BridgeError::Client {
-                    client: "steer",
-                    detail: "no live run to steer; the message was not submitted".into(),
-                });
+                return Ok(SteerOutcome::RefusedNoLiveRun);
             }
         }
         self.prompt(session_id, text, files, skills, model, variant, agent, message_id)
