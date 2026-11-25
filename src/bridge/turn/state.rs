@@ -1306,10 +1306,14 @@ pub(super) struct StreamAccumulator {
     /// Refused attempts left to land a live block's arrival (issue #1103).
     /// Private to this module: armed by [`Self::owe_block_arrival`] when a
     /// block is inserted, spent one refusal at a time
-    /// ([`Self::spend_block_arrival`]) and cleared by any delivered write
-    /// ([`Self::settle_block_arrival`]). Non-zero lifts the typed-answer
-    /// freeze, because a block that never reached the card holds no text.
-    block_arrival_retries: u8,
+    /// ([`Self::spend_block_arrival`]) and cleared by the delivered write that
+    /// carries the block, **inside the write's `Ok` arm** before any await
+    /// ([`Self::block_arrival_handle`]) — a cancellation between the PATCH and
+    /// its bookkeeping must not leave the freeze lifted over a box the card
+    /// already shows. Non-zero lifts the typed-answer freeze, because a block
+    /// that never reached the card holds no text. Shared across clones: it
+    /// names a fact about the CARD, not about the accumulator that mirrors it.
+    block_arrival_retries: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
@@ -3773,7 +3777,7 @@ impl StreamAccumulator {
     /// answer no one can give. [`Self::block_arrival_retries`] keeps that
     /// carve-out bounded.
     pub(super) fn awaits_typed_answer(&self) -> bool {
-        self.block_arrival_retries == 0
+        !self.block_arrival_owed()
             && self.interactions.iter().any(|block| match block {
                 InteractionBlock::Question(q) => q.awaits_typed_answer(),
                 InteractionBlock::Permission(_) | InteractionBlock::Receipt(_) => false,
@@ -3785,19 +3789,31 @@ impl StreamAccumulator {
     /// writes a block once it exists (issue #1103). Arms the bounded retry the
     /// later render passes spend; a delivered write settles it.
     pub(super) fn owe_block_arrival(&mut self, request_id: &str) {
-        self.block_arrival_retries = BLOCK_ARRIVAL_RETRIES;
+        self.block_arrival_retries
+            .store(BLOCK_ARRIVAL_RETRIES, std::sync::atomic::Ordering::Relaxed);
         self.block_arrival_request = Some(request_id.to_string());
+    }
+
+    /// The arrival budget's synchronous handle, for the flush's `Ok` arm: a
+    /// delivered body that carries the block settles it before any await, so a
+    /// cancellation cannot leave the freeze lifted over a box the card shows.
+    pub(super) fn block_arrival_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+        self.block_arrival_retries.clone()
     }
 
     /// One attempt to land an owed block was refused: spend one retry, so a
     /// card Feishu refuses for good cannot keep the typed-answer freeze lifted
     /// for the rest of the Turn.
     pub(super) fn spend_block_arrival(&mut self) {
-        if self.block_arrival_retries == 0 {
-            return;
-        }
-        self.block_arrival_retries -= 1;
-        if self.block_arrival_retries == 0 {
+        let before = self
+            .block_arrival_retries
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |left| (left > 0).then(|| left - 1),
+            )
+            .unwrap_or(0);
+        if before == 1 {
             // Name the block: with several Sessions refusing arrivals in one
             // window this line is the only pointer to the undelivered one
             // (ADR-0114's consequence — the WARN names it). It is the request
@@ -3807,18 +3823,13 @@ impl StreamAccumulator {
         }
     }
 
-    /// A card write landed: whatever block it carried is on the card now, so
-    /// the arrival retry is over and the typed-answer freeze applies again.
-    pub(super) fn settle_block_arrival(&mut self) {
-        self.block_arrival_retries = 0;
-        self.block_arrival_request = None;
-    }
-
     /// Whether a block's arrival is still owed a retry. A second block inserted
     /// during that window joins the SAME budget instead of re-arming it, so a
     /// stream of questions cannot keep the freeze lifted indefinitely.
     pub(super) fn block_arrival_owed(&self) -> bool {
-        self.block_arrival_retries > 0
+        self.block_arrival_retries
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
     }
 
     /// Progress inputs for the header (ADR-0014): which request kinds await the
@@ -8887,7 +8898,8 @@ mod tests {
             !acc.awaits_typed_answer(),
             "a refused arrival is not on the card, so nothing is being typed into it"
         );
-        acc.settle_block_arrival();
+        acc.block_arrival_handle()
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(acc.awaits_typed_answer(), "a delivered write ends the retry");
 
         acc.owe_block_arrival("q");

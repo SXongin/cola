@@ -53,13 +53,15 @@ false while an arrival is owed — the freeze's own premise is what the carve-ou
 reads, so a block the card does not carry does not guard text it does not show,
 and the next pass writes it. Every **refused card write** spends one retry
 (`spend_block_arrival`, from `note_cursor_write_failure` — the one seam all
-three write sites share); a delivered body that **renders** the block settles the
-obligation (`settle_block_arrival`, from `advance_sent_signatures` gated on
-`body_carries_question`) — a finalized prefix renders no tail, so its PATCH
-settles nothing and the blocks stay owed until the continuation carries them.
-Spending the budget returns the card to the pre-fix behaviour: the freeze holds,
-and a WARN names the request the budget was armed for — the block that never
-reached the card, not whichever question happens to sort first.
+three write sites share). A delivered body that **renders** the block settles the
+obligation in the write's own `Ok` arm, synchronously, through the budget's
+shared handle (`block_arrival_handle`) — before the awaits that follow, because a
+cancellation between the PATCH and its bookkeeping must never leave the freeze
+lifted over a box the card already shows. A finalized prefix renders no tail, so
+its PATCH settles nothing: the blocks stay owed until the continuation carries
+them. Spending the budget returns the card to the pre-fix behaviour: the freeze
+holds, and a WARN names the request the budget was armed for — the block that
+never reached the card, not whichever question happens to sort first.
 
 **3. Typed text wins over a sibling block.** An insertion that lands on a card
 already guarding another question's box arms nothing: the flow's own out-of-band
@@ -85,7 +87,10 @@ card holds no unsubmitted text.
   step with the retry, and a mixed turn can spend a retry or two early — the
   bound is the guarantee, not a per-arrival count.
 - The freeze keeps its one hard rule: a card that shows a box is never written by
-  the render pass, so a draft cannot be eaten.
+  the render pass, so a draft cannot be eaten. The carve-out's bookkeeping is
+  cancellation-safe in both directions: the budget is spent on a refusal (where
+  nothing was written) and cleared by the successful write itself, so the window
+  where the card shows the box but the freeze is still lifted does not exist.
 
 ## Alternatives considered
 
