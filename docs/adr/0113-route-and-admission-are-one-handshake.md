@@ -138,9 +138,11 @@ landed.
   renderer's own card.
 - A message waiting on a lease holds its inbound claim
   (`INBOUND_CLAIM_TTL` degrades it to absent after 120 s).
-- A render loop that panics without releasing its lease parks the message's task
-  (WARN after 3 s) where the pre-ADR code reported a notice; the leak path is
-  unchanged code and the trade is recorded here.
+- The lease is **RAII** (`RenderLeaseOwner`): a render loop that panics without
+  observing a yield releases its lease on unwind, so a dead renderer cannot
+  strand a waiting message. A renderer that is wedged but alive keeps its guard
+  until its own loop ends or its next check sees the yield request; the 3 s WARN
+  makes that wait visible.
 
 Origins: #1086 (the handshake, the yield, and the live message loss), #1056 and
 ADR-0109 (the guard key and the merge-only contract), #1082 (the failed-supplement
