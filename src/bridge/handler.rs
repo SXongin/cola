@@ -227,30 +227,22 @@ impl PromptMessage {
     }
 }
 
-/// How long a Supplement's typed "no live run" refusal waits for the guard to
-/// clear before it starts the Turn that renders the message (ADR-0113). The
-/// holders that answer this way are out-of-turn renderers retiring or rehydrated
-/// by a restart, and both release their lease in well under a second (the live
-/// #1086 report: 100 ms). When the guard is still held at the bound, a writer
-/// took it while the message waited (another message's Turn, a renderer that
-/// began its run): the message gets one last merge-only attempt, so it is
-/// submitted exactly once on that path too. Only if that attempt refuses as
-/// well is it reported as not submitted — never silently dropped.
-///
-/// A Turn's own guard is not a holder the wait can serve: it clears only when
-/// the Turn ends. A Supplement refused inside a Turn's pre-registration window
-/// therefore rides the last-chance merge, which succeeds as soon as the run
-/// registers; only a guard that never becomes steerable reaches the notice.
+/// How long a Supplement's typed "no live run" refusal may wait before the
+/// handshake logs the long wait (ADR-0113). This is a **diagnostic**, not a
+/// deadline: the wait ends when the guard clears — a Turn ends, and an
+/// out-of-turn renderer's lease is scoped to its own loop (the live #1086
+/// report: the Wake settled 100 ms after the refusal). Past it the message
+/// keeps waiting, because reporting it unsubmitted while a writer exists is
+/// exactly the message loss #1086 fixes.
 const SUPPLEMENT_HANDSHAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The handshake's re-read cadence while it waits for that guard to clear.
 const SUPPLEMENT_HANDSHAKE_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// The notice when a merge-only steer refused, the handshake's wait found no
-/// guard to start a Turn, and the last-chance merge refused too. This one MAY
-/// invite a resend: every attempt was a typed refusal (nothing was submitted),
-/// so unlike the ambiguous failure (ADR-0092) nothing can still land.
-const SUPPLEMENT_REFUSED_NOTICE: &str = "⚠️ 当前会话没有可合并的运行，这条消息未被提交，请重发。";
+/// How often the handshake re-tries the merge while a **writer** holds the guard
+/// (a Turn whose run has not registered yet). Coarser than the poll: each
+/// attempt is a Backend call, and the merge lands as soon as the run is visible.
+const SUPPLEMENT_MERGE_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The notice for a merged Supplement whose chain cannot continue (the card
 /// ended inside the split's admission): the message DID reach the Backend, so
@@ -2648,7 +2640,7 @@ impl App {
                 // refused BEFORE submitting, so the message may be re-routed
                 // (ADR-0113). Nothing was submitted, so the handshake's
                 // resolution below is still this message's first submission.
-                return self.re_route_after_refusal(message, &cola_msg_id).await;
+                return self.settle_refused_supplement(message, &cola_msg_id).await;
             }
             Ok(crate::backend::SteerOutcome::StartedTurn) => {
                 // The caller forbade it, so an adapter reporting this broke the
@@ -2719,78 +2711,91 @@ impl App {
     }
 
     /// Resolve a message whose merge-only steer refused (ADR-0113). Nothing was
-    /// submitted, so it goes wherever it can actually land:
+    /// submitted, so the message must become the Turn it could not merge into —
+    /// this waits for the guard instead of ever reporting it unsubmitted.
     ///
-    /// - the guard clears within [`SUPPLEMENT_HANDSHAKE_BOUND`] (a retiring
-    ///   renderer, or a restart-armed continuation finalizing): claim it and run
-    ///   the Turn;
-    /// - the guard is still held at the bound — a **writer** took it while the
-    ///   message waited (another message's Turn, or a renderer that began its
-    ///   run): retry the merge ONCE. This is the concurrent handshake's route:
-    ///   the waiting message must merge into the winner's run, not be reported
-    ///   unsubmitted (the acceptance's "submitted exactly once on every path");
-    /// - the retry refuses too (a lease-only renderer still holds it): nothing
-    ///   can render the message, so report it as not submitted, honestly.
-    async fn re_route_after_refusal(
+    /// Every guard holder is finite: a Turn ends, and an out-of-turn renderer's
+    /// lease is scoped to its own loop (the external renderer's idle bound, the
+    /// Wake settle loop's finalize), so the wait ends with the message admitted.
+    /// While a **writer** holds the guard — another message's Turn whose run has
+    /// not registered yet, or a renderer that begins its run — the merge is
+    /// retried on a coarse cadence, so the message joins that run as soon as the
+    /// adapter can see it. Every attempt is merge-only and every earlier one
+    /// refused before submitting, so the message reaches the Backend exactly
+    /// once. The wait has no user-facing deadline: the message's own task is the
+    /// same one a Turn lives in for minutes, and reporting it unsubmitted while
+    /// a writer exists is the loss #1086 is about. A WARN past
+    /// [`SUPPLEMENT_HANDSHAKE_BOUND`] makes a holder that never clears visible.
+    async fn settle_refused_supplement(
         self: &Arc<Self>,
         message: PromptMessage,
         cola_msg_id: &str,
     ) -> crate::error::Result<Option<PromptSubmission>> {
-        if let Some(admission) = self.admit_after_guard_release(&message.context.session_id).await {
-            tracing::info!(
-                "supplement: session {} refused the merge; the guard cleared and the message starts a Turn",
-                message.context.session_id
-            );
-            let outcome = self
-                .run_prompt_admitted(message.into_context(false), admission)
-                .await?;
-            return Ok(Some(match outcome {
-                crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
-                crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
-            }));
-        }
-        let submitted = match self.steer_supplement(&message.context, cola_msg_id).await {
-            Ok(crate::backend::SteerOutcome::Merged) => {
+        let session_id = message.context.session_id.clone();
+        let message_id = message.context.message_id.clone();
+        let waits = self.waits_handle();
+        let mut pending = Some(message);
+        let mut last_merge: Option<std::time::Instant> = None;
+        let started = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            // The guard is free: claim it for the Turn that renders the message.
+            if let Some(admission) = crate::bridge::turn::Turn::try_admit(&waits, &session_id).await {
                 tracing::info!(
-                    "supplement: session {} refused the merge while it waited; merged into the writer that took the guard",
-                    message.context.session_id
+                    "supplement: session {session_id} refused the merge; the guard cleared and the message starts a Turn"
                 );
-                true
+                let message = pending.take().expect("the refused message is still pending");
+                let outcome = self
+                    .run_prompt_admitted(message.into_context(false), admission)
+                    .await?;
+                return Ok(Some(match outcome {
+                    crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
+                    crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
+                }));
             }
-            Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => {
-                tracing::info!(
-                    "supplement: session {} refused the merge twice and the guard never cleared; reporting it",
-                    message.context.session_id
-                );
-                let _ = self
-                    .feishu
-                    .reply_text(&message.context.message_id, SUPPLEMENT_REFUSED_NOTICE)
-                    .await;
-                self.waits_handle()
-                    .clear_inbound(&message.context.session_id)
-                    .await;
-                return Ok(Some(PromptSubmission::NotAccepted));
+            // A held guard is a writer when no out-of-turn renderer OWNS a
+            // lease (a lease alone is not proof of a run, ADR-0113 §3a): the
+            // message can merge the moment that writer's run is visible.
+            let writer = !waits.owns_render_lease(&session_id).await;
+            let due = last_merge.is_none_or(|at| at.elapsed() >= SUPPLEMENT_MERGE_RETRY);
+            if writer && due {
+                last_merge = Some(std::time::Instant::now());
+                let context = &pending
+                    .as_ref()
+                    .expect("the refused message is still pending")
+                    .context;
+                match self.steer_supplement(context, cola_msg_id).await {
+                    Ok(crate::backend::SteerOutcome::Merged) => {
+                        tracing::info!(
+                            "supplement: session {session_id} merged into the writer that held the guard"
+                        );
+                        return Ok(Some(self.finish_supplement(&session_id, &message_id, true).await));
+                    }
+                    Ok(crate::backend::SteerOutcome::RefusedNoLiveRun) => {}
+                    Ok(crate::backend::SteerOutcome::StartedTurn) => {
+                        tracing::warn!(
+                            "supplement: adapter started a new turn for a merge-only steer on session {session_id}"
+                        );
+                        return Ok(Some(
+                            self.finish_supplement(&session_id, &message_id, false).await,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!("supplement: prompt failed: {}", e);
+                        return Ok(Some(
+                            self.finish_supplement(&session_id, &message_id, false).await,
+                        ));
+                    }
+                }
             }
-            Ok(crate::backend::SteerOutcome::StartedTurn) => {
+            if !warned && started.elapsed() >= SUPPLEMENT_HANDSHAKE_BOUND {
+                warned = true;
                 tracing::warn!(
-                    "supplement: adapter started a new turn for a merge-only steer on session {}",
-                    message.context.session_id
+                    "supplement: session {session_id} refused the merge and the guard is still held; waiting for it to clear"
                 );
-                false
             }
-            Err(e) => {
-                tracing::warn!("supplement: prompt failed: {}", e);
-                false
-            }
-        };
-        Ok(Some(
-            self.finish_supplement(
-                &message.context.session_id,
-                &message.context.message_id,
-                submitted,
-            )
-            .await,
-        ))
+            tokio::time::sleep(SUPPLEMENT_HANDSHAKE_POLL).await;
+        }
     }
 
     /// Close out a Supplement that has no fallback left (#1056, ADR-0109): split
@@ -2871,28 +2876,6 @@ impl App {
             PromptSubmission::Supplement
         } else {
             PromptSubmission::NotAccepted
-        }
-    }
-
-    /// The handshake's second half (ADR-0113): claim the Session's in-flight
-    /// guard for a Turn that will render a message a merge-only steer refused,
-    /// waiting a bounded moment for the guard's holder to release it. The
-    /// holders that answer a merge-only steer this way are retiring renderers
-    /// and restart-armed Wake continuations — both release within their settle
-    /// pass — so this returns as soon as the window closes. `None` means the
-    /// bound expired with the guard still held; the caller reports the message
-    /// as not submitted (it genuinely was not).
-    async fn admit_after_guard_release(&self, session_id: &str) -> Option<crate::bridge::turn::Admission> {
-        let waits = self.waits_handle();
-        let deadline = std::time::Instant::now() + SUPPLEMENT_HANDSHAKE_BOUND;
-        loop {
-            if let Some(admission) = crate::bridge::turn::Turn::try_admit(&waits, session_id).await {
-                return Some(admission);
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(SUPPLEMENT_HANDSHAKE_POLL).await;
         }
     }
 
