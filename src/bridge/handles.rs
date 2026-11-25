@@ -2554,6 +2554,23 @@ impl WaitsHandle {
         }
     }
 
+    /// Whether an out-of-turn renderer's lease is the only thing holding
+    /// `session_id`'s in-flight guard — the lease CLAIMED it, so no Turn owns
+    /// the chain (a Turn cannot start while a lease owns the guard, and a
+    /// renderer that joins a Turn's guard records `owns_guard = false`).
+    ///
+    /// A lease is not proof of a writer (#1086, ADR-0113): a restart-armed Wake
+    /// continuation rehydrates a card and holds the guard while no run is live,
+    /// so a continuation handed to it is never rendered. The failed-steer
+    /// continuation requires a Turn's own guard, never this.
+    pub(crate) async fn owns_render_lease(&self, session_id: &str) -> bool {
+        self.render_leases
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|lease| lease.owns_guard)
+    }
+
     /// Whether this session's run was stopped with `/stop` — the sticky marker
     /// the drain rule (ADR-0043) and the stop terminal (#394) read. One
     /// accessor so the lock-and-check exists in one place, and every reader

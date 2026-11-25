@@ -2154,6 +2154,54 @@ async fn sent_texts(platform: &RecordingPlatform) -> Vec<String> {
         .collect()
 }
 
+/// No message may be answered as merely busy (#1086 acceptance): the busy
+/// notice is for the self-admitting callers the handshake cannot serve.
+async fn assert_no_busy_notice(platform: &RecordingPlatform) {
+    assert!(
+        !sent_texts(platform)
+            .await
+            .iter()
+            .any(|t| t.contains("上一条消息还在处理中")),
+        "no spurious busy notice: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// A restart-armed / retiring renderer: a backend whose next merge-only steer
+/// answers the typed refusal, and the signal that fires as that steer begins so
+/// a test retires the lease at the exact point.
+fn backend_with_typed_refusal() -> (MockBackend, Arc<tokio::sync::Notify>) {
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.refuse_steer_no_live_run_once();
+    let refused = Arc::new(tokio::sync::Notify::new());
+    backend.on_steer({
+        let refused = Arc::clone(&refused);
+        move || refused.notify_one()
+    });
+    (backend, refused)
+}
+
+/// The app over an owned mock, with the completion notice's delay zeroed (the
+/// tests here assert the Turn's own card, not the notice).
+fn app_over(cfg: crate::config::Config, backend: Arc<MockBackend>) -> (Arc<App>, Arc<RecordingPlatform>) {
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    app.completion_notice_delay_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    (app, platform)
+}
+
+/// Seed the restart-armed shape: a non-terminal chain card whose guard is a
+/// render LEASE, not a Turn's own claim (ADR-0113).
+async fn seed_leased_renderer(app: &Arc<App>, state: CardState) {
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", state).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    app.inflight.lock().await.remove("ses_test");
+    app.waits_handle().acquire_render_lease("ses_test").await;
+}
+
 /// #1086 window 2, the acquiring renderer: a renderer that leases the guard
 /// BETWEEN the router's decision and the Turn's admission captures the message
 /// as a Supplement — it is never answered busy, and it reaches the Backend
@@ -2216,14 +2264,7 @@ async fn a_lease_taken_between_routing_and_admission_merges_as_a_supplement() {
         "the message was captured as a Supplement, not refused busy"
     );
     assert!(has(&card, "📨 已收到补充"), "the merge is claimed: {card}");
-    assert!(
-        !sent_texts(&platform)
-            .await
-            .iter()
-            .any(|t| t.contains("上一条消息还在处理中")),
-        "no spurious busy notice: {:?}",
-        platform.calls.lock().await
-    );
+    assert_no_busy_notice(&platform).await;
     assert_eq!(
         backend.prompt_calls.lock().await.clone(),
         vec!["补充一下".to_string()],
@@ -2242,24 +2283,11 @@ async fn a_typed_steer_refusal_starts_the_turn_that_renders_the_message() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.refuse_steer_no_live_run_once();
-    let refused = Arc::new(tokio::sync::Notify::new());
-    backend.on_steer({
-        let refused = Arc::clone(&refused);
-        move || refused.notify_one()
-    });
+    let (backend, refused) = backend_with_typed_refusal();
     let backend = Arc::new(backend);
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
-    app.completion_notice_delay_ms
-        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let (app, platform) = app_over(cfg, backend.clone());
     seed_session(&app, "ses_test", "/work").await;
-    seed_live_turn(&app, "ses_test", "第一段进度。").await;
-    // A restart-armed continuation: the card is a display claim, the guard is a
-    // render lease with no Turn behind it.
-    app.inflight.lock().await.remove("ses_test");
-    app.waits_handle().acquire_render_lease("ses_test").await;
+    seed_leased_renderer(&app, CardState::Streaming).await;
 
     let handler = {
         let app = Arc::clone(&app);
@@ -2310,13 +2338,7 @@ async fn a_typed_steer_refusal_starts_the_turn_that_renders_the_message() {
         )),
         "no failed-supplement receipt over a message that ran: {calls:?}"
     );
-    assert!(
-        !sent_texts(&platform)
-            .await
-            .iter()
-            .any(|t| t.contains("上一条消息还在处理中")),
-        "no spurious busy notice: {calls:?}"
-    );
+    assert_no_busy_notice(&platform).await;
 }
 
 /// #1086 window 1, the retiring renderer: its card is already TERMINAL but the
@@ -2327,25 +2349,11 @@ async fn a_retiring_renderer_with_a_terminal_card_still_starts_the_turn() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.refuse_steer_no_live_run_once();
-    let refused = Arc::new(tokio::sync::Notify::new());
-    backend.on_steer({
-        let refused = Arc::clone(&refused);
-        move || refused.notify_one()
-    });
+    let (backend, refused) = backend_with_typed_refusal();
     let backend = Arc::new(backend);
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
-    app.completion_notice_delay_ms
-        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let (app, platform) = app_over(cfg, backend.clone());
     seed_session(&app, "ses_test", "/work").await;
-
-    let cards = app.cards_handle();
-    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
-    Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
-    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
-    app.waits_handle().acquire_render_lease("ses_test").await;
+    seed_leased_renderer(&app, CardState::Done).await;
 
     let handler = {
         let app = Arc::clone(&app);
@@ -2409,14 +2417,9 @@ async fn a_typed_refusal_with_a_guard_that_never_clears_reports_no_submission() 
     let mut backend = MockBackend::new(realistic_parts());
     backend.refuse_steer_no_live_run_once();
     let backend = Arc::new(backend);
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
-    app.completion_notice_delay_ms
-        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let (app, platform) = app_over(cfg, backend.clone());
     seed_session(&app, "ses_test", "/work").await;
-    seed_live_turn(&app, "ses_test", "第一段进度。").await;
-    app.inflight.lock().await.remove("ses_test");
-    app.waits_handle().acquire_render_lease("ses_test").await;
+    seed_leased_renderer(&app, CardState::Streaming).await;
 
     app.handle_message(incoming(
         "msg_sup".into(),
@@ -2448,6 +2451,62 @@ async fn a_typed_refusal_with_a_guard_that_never_clears_reports_no_submission() 
     assert!(
         !app.waits_handle().inbound.lock().await.contains_key("ses_test"),
         "the message's inbound claim is released"
+    );
+    app.waits_handle().release_render_lease("ses_test").await;
+}
+
+/// #1086's "stop counting a restart-armed continuation as a writer": an
+/// AMBIGUOUS steer failure (not the typed refusal) while only a renderer LEASE
+/// holds the guard must not open a failure continuation. The lease proves a
+/// renderer is in its window, not that a run exists behind the card — the
+/// restart-armed continuation renders nothing new, so the continuation would be
+/// handed to nobody (ADR-0109, ADR-0113). The chain keeps its card and the
+/// unconfirmed notice is the one visible failure.
+#[tokio::test]
+async fn an_ambiguous_steer_failure_under_a_lease_keeps_the_chain() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // The steer's submit fails, which the bridge must treat as ambiguous
+    // (ADR-0092): it may still have landed.
+    backend.fail_prompts(1, "provider 503");
+    let backend = Arc::new(backend);
+    let (app, platform) = app_over(cfg, backend);
+    seed_session(&app, "ses_test", "/work").await;
+    seed_leased_renderer(&app, CardState::Streaming).await;
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下".into(),
+        None,
+    ))
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_sup"
+        )),
+        "no continuation may be handed to a lease-only renderer: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyText { text, .. } if text.contains("补充消息未确认送达")
+        )),
+        "the failure is visible and stays ambiguous: {calls:?}"
+    );
+    assert_eq!(
+        Turn::card_message_id(&app.cards_handle(), "ses_test")
+            .await
+            .as_deref(),
+        Some("om_live"),
+        "the chain did not move"
     );
     app.waits_handle().release_render_lease("ses_test").await;
 }

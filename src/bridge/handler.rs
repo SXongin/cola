@@ -204,40 +204,25 @@ enum PromptRoute {
     },
 }
 
-/// One routed user message (ADR-0113): everything either route's submission
-/// needs, owned from classification until the route has actually taken it. The
-/// route is decided first and submitted second, and a handshake that changes
-/// the route must submit the SAME message — never a copy or a second id.
+/// One routed user message (ADR-0113): the Turn's context, owned from
+/// classification until the route has actually taken it. The route is decided
+/// first and submitted second, and a handshake that changes the route must
+/// submit the SAME message — never a copy or a second id.
 struct PromptMessage {
-    session_id: String,
-    thread_key: ThreadKey,
-    text: String,
-    message_id: String,
-    subtitle: String,
-    requester_open_id: Option<String>,
-    is_group: bool,
-    files: Vec<PromptFile>,
-    skills: Vec<PromptSkill>,
+    /// The Turn's context, built once with the route-only axes unset: the
+    /// opening line (`advisory_live`) is the route's to choose, and
+    /// `cola_message_id` is a Turn's own mint (a fresh message never reuses an
+    /// id across routes).
+    context: PromptContext,
 }
 
 impl PromptMessage {
-    /// The Turn's context, taken only once the Turn's guard is claimed. The
-    /// `cola_message_id` stays for the Turn to mint (a retry's carries its
-    /// failed attempt's; a fresh message never reuses one across routes).
+    /// The context, taken only once the route has claimed the message: the
+    /// route supplies its one axis.
     fn into_context(self, advisory_live: bool) -> PromptContext {
         PromptContext {
-            session_id: self.session_id,
-            thread_key: self.thread_key,
-            text: self.text,
-            message_id: self.message_id,
-            subtitle: self.subtitle,
-            is_retry: false,
-            requester_open_id: self.requester_open_id,
-            is_group: self.is_group,
-            cola_message_id: None,
-            files: self.files,
-            skills: self.skills,
             advisory_live,
+            ..self.context
         }
     }
 }
@@ -245,10 +230,15 @@ impl PromptMessage {
 /// How long a Supplement's typed "no live run" refusal waits for the guard to
 /// clear before it starts the Turn that renders the message (ADR-0113). The
 /// holders that answer this way are out-of-turn renderers retiring or rehydrated
-/// by a restart — both release their lease in well under a second (the live
-/// #1086 report: 100 ms) — and a Turn whose run has not registered yet, which
-/// registers in seconds. Past the bound the message is reported as not
+/// by a restart, and both release their lease in well under a second (the live
+/// #1086 report: 100 ms). Past the bound the message is reported as not
 /// submitted, never silently dropped.
+///
+/// A Turn's own guard is not one of these holders: it clears only when the Turn
+/// ends, so a Supplement that reaches the typed refusal inside a Turn's
+/// pre-registration window (its prompt not yet visible to the status read) is
+/// reported as not submitted after the bound. That window lost the same message
+/// before this change; it is now said out loud instead of dropped.
 const SUPPLEMENT_HANDSHAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The handshake's re-read cadence while it waits for that guard to clear.
@@ -259,6 +249,16 @@ const SUPPLEMENT_HANDSHAKE_POLL: std::time::Duration = std::time::Duration::from
 /// invite a resend: the adapter refused BEFORE submitting, so unlike the
 /// ambiguous failure (ADR-0092) nothing can still land.
 const SUPPLEMENT_REFUSED_NOTICE: &str = "⚠️ 当前会话没有可合并的运行，这条消息未被提交，请重发。";
+
+/// The notice for a merged Supplement whose chain cannot continue (the card
+/// ended inside the split's admission): the message DID reach the Backend, so
+/// the copy must never claim it was lost (ADR-0092).
+const SUPPLEMENT_UNCONTINUABLE_NOTICE: &str = "⚠️ 补充消息已提交，但当前卡片无法继续，请留意后续回复。";
+
+/// The notice for a failed steer with no proven writer (ADR-0109): the merge is
+/// unconfirmed — an ambiguous response may have landed — so the copy says so and
+/// never invites a resend (ADR-0092).
+const SUPPLEMENT_UNCONFIRMED_NOTICE: &str = "⚠️ 补充消息未确认送达，请先确认当前回复是否继续。";
 
 /// What the prompt pipeline did with a submission, for the one caller that must
 /// report the outcome on a card of its own (the Terminal Card's 「问 AI」,
@@ -2285,8 +2285,10 @@ impl App {
         // drives it (every renderer leases the guard), so the recorded card is
         // exactly the orphan a failed Supplement leaves. Collecting it here
         // keeps the stale card from lingering under the new Turn's card. A
-        // renderer that leases the guard while the collect awaits is caught by
-        // the caller's admission, which re-routes the message as a Supplement.
+        // renderer that leases the guard while the collect awaits does not
+        // change what is collected (the card was the orphan at classification
+        // time); the caller's admission then re-routes the message as a
+        // Supplement, so the message is not lost to the Turn's busy refusal.
         if ownership.card_class() == crate::bridge::turn::CardClass::RenderOwned
             && let Some(card_id) = ownership.card_message_id().map(str::to_string)
             && self.cards_handle().chains.has_record(session_id)
@@ -2546,43 +2548,55 @@ impl App {
         // from here, so a route that changes during admission (ADR-0113)
         // submits the SAME message — never a copy, never twice.
         let message = PromptMessage {
-            session_id,
-            thread_key,
-            text,
-            message_id,
-            subtitle,
-            requester_open_id,
-            is_group,
-            files: attachments,
-            skills,
+            context: PromptContext {
+                session_id,
+                thread_key,
+                text,
+                message_id,
+                subtitle,
+                is_retry: false,
+                requester_open_id,
+                is_group,
+                cola_message_id: None,
+                files: attachments,
+                skills,
+                advisory_live: false,
+            },
         };
-        match self.route_prompt(&message.session_id).await {
-            PromptRoute::NewTurn { advisory_live } => {
-                // ADMISSION is the guard claim itself (#1086, ADR-0113), taken
-                // before the context is consumed: a renderer that leases the
-                // guard after the route's awaits (the advisory status read,
-                // the orphan collect) re-routes this message as the Supplement
-                // it is, instead of letting `Turn::start` refuse it busy after
-                // the router chose a Turn for it.
-                let Some(admission) =
-                    crate::bridge::turn::Turn::try_admit(&self.waits_handle(), &message.session_id).await
-                else {
-                    tracing::info!(
-                        "prompt routing: session={} ownership=guard route=supplement (admission handshake)",
-                        message.session_id
-                    );
-                    return self.submit_supplement(message).await;
-                };
-                let outcome = self
-                    .run_prompt_admitted(message.into_context(advisory_live), admission)
-                    .await?;
-                Ok(Some(match outcome {
-                    crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
-                    crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
-                }))
-            }
+        match self.route_prompt(&message.context.session_id).await {
+            PromptRoute::NewTurn { advisory_live } => self.admit_turn(message, advisory_live).await,
             PromptRoute::Supplement => self.submit_supplement(message).await,
         }
+    }
+
+    /// Route the message as a Turn: claim the guard first — the claim IS the
+    /// admission (#1086, ADR-0113), taken before the context is consumed — and
+    /// run it. A refused claim re-routes the SAME message as the Supplement it
+    /// is, instead of letting `Turn::start` refuse it busy after the router
+    /// chose a Turn for it; a renderer can lease the guard after the route's
+    /// awaits (the advisory status read, the orphan collect), so this is the
+    /// only place the two can agree.
+    async fn admit_turn(
+        self: &Arc<Self>,
+        message: PromptMessage,
+        advisory_live: bool,
+    ) -> crate::error::Result<Option<PromptSubmission>> {
+        let Some(admission) =
+            crate::bridge::turn::Turn::try_admit(&self.waits_handle(), &message.context.session_id).await
+        else {
+            tracing::info!(
+                "prompt routing: session={} ownership=guard route=supplement (admission handshake)",
+                message.context.session_id
+            );
+            return self.submit_supplement(message).await;
+        };
+        let outcome = self
+            .run_prompt_admitted(message.into_context(advisory_live), admission)
+            .await?;
+        Ok(Some(match outcome {
+            crate::bridge::turn::PromptOutcome::Accepted => PromptSubmission::NewTurn,
+            crate::bridge::turn::PromptOutcome::NotAccepted => PromptSubmission::NotAccepted,
+        }))
     }
 
     /// Submit `message` as a Supplement (ADR-0043, owned routing per ADR-0062):
@@ -2608,14 +2622,14 @@ impl App {
         self: &Arc<Self>,
         message: PromptMessage,
     ) -> crate::error::Result<Option<PromptSubmission>> {
-        let PromptMessage {
+        let PromptContext {
             session_id,
             text,
             files,
             skills,
             message_id,
             ..
-        } = &message;
+        } = &message.context;
         // Each supplement is its own logical user message: fresh cola-authored
         // id (ADR-0026), never reused.
         let cola_msg_id = crate::backend::parsing::cola_message_id();
@@ -2738,7 +2752,15 @@ impl App {
                 session_id,
             )
             .await;
-            ownership.holds_guard() && ownership.card_class() == crate::bridge::turn::CardClass::RenderOwned
+            // A renderer's LEASE is not proof of a writer (#1086, ADR-0113): it
+            // says a renderer is in its window, not that a run exists behind it.
+            // The restart-armed continuation rehydrates a card, holds the guard
+            // and renders nothing new, so a continuation handed to it would be
+            // the false receipt the live report showed. Only a Turn's (or its
+            // follow's) own guard proves a live chain to continue.
+            ownership.holds_guard()
+                && ownership.card_class() == crate::bridge::turn::CardClass::RenderOwned
+                && !self.waits_handle().owns_render_lease(session_id).await
         };
         let admitted = if submitted {
             crate::bridge::turn::Turn::split_card_chain(
@@ -2768,9 +2790,9 @@ impl App {
             // the copy must not claim a delivery that did not happen
             // (ADR-0092).
             let copy = if submitted {
-                "⚠️ 补充消息已提交，但当前卡片无法继续，请留意后续回复。"
+                SUPPLEMENT_UNCONTINUABLE_NOTICE
             } else {
-                "⚠️ 补充消息未确认送达，请先确认当前回复是否继续。"
+                SUPPLEMENT_UNCONFIRMED_NOTICE
             };
             tracing::info!(
                 "supplement: no continuation for session {session_id} (submitted={submitted}); reporting it"

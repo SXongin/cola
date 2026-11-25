@@ -282,7 +282,9 @@ a **restart-armed continuation** safe: it holds a lease rehydrated from durable
 state and cannot render a new message, and the signal that it cannot is the
 adapter's typed refusal, not the card's display class. A typed refusal therefore
 never opens a `SupplementFailed` continuation; that receipt remains for
-ambiguous failures and an adapter breaking the merge-only contract. Every path
-submits the message at most once, and the busy notice is spoken only by the
+ambiguous failures and an adapter breaking the merge-only contract. An
+ambiguous failure under a lease-only guard keeps its chain too — the lease is
+not a writer (`WaitsHandle::owns_render_lease`, `src/bridge/handles.rs`). Every
+path submits the message at most once, and the busy notice is spoken only by the
 self-admitting callers (an error-card retry, the V1 resume resubmit), never by a
 message that then merges.

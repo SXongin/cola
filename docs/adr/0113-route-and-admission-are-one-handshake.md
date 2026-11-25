@@ -65,6 +65,15 @@ refusal therefore never opens a `SupplementFailed` continuation — that receipt
 survives only for genuinely ambiguous failures and the broken
 `StartedTurn` contract.
 
+**3a. A renderer's lease is not proof of a writer either.** The
+`SupplementFailed` continuation requires a **Turn's own** guard: a lease can own
+the guard (`RenderLease::owns_guard`) and still have no run behind it, which is
+exactly the restart-armed continuation. When only a lease owns the guard, an
+ambiguous steer failure keeps the chain and reports the unconfirmed notice
+(`finish_supplement`, `src/bridge/handler.rs:2728`), so the continuation is
+never handed to a renderer that cannot continue it. A renderer that joined a
+Turn's guard records `owns_guard = false` and is unaffected.
+
 **4. Every path submits at most once.** A Turn route submits one prompt; a
 Supplement route submits one steer (merged); a typed refusal submitted nothing
 and submits one fallback prompt; a bound that expires submits nothing and says
@@ -99,6 +108,13 @@ inside the bound gets the honest copy 「这条消息未被提交，请重发」
   (`SUPPLEMENT_HANDSHAKE_BOUND`, `SUPPLEMENT_HANDSHAKE_POLL`,
   `src/bridge/handler.rs`). Past it the message is reported as not submitted;
   it is never silently dropped and never claimed as delivered.
+- The handshake serves the **retiring / restart-armed** holder, whose lease
+  clears in under a second. A Turn's own guard is not one: it clears only when
+  the Turn ends, so a Supplement that reaches the typed refusal inside a Turn's
+  pre-registration window (its prompt not yet visible to the status read) times
+  out into 「这条消息未被提交，请重发」. That window lost the message under
+  ADR-0109 too — it is reported now, not silently dropped — and closing it
+  would need the Turn to expose its own admission, not another guard wait.
 - A renderer that leases the guard between routing and admission now results in
   a Supplement regardless of whether the router had chosen a Turn. The
   message's *route* follows the writer, which is the property ADR-0109 wanted.
@@ -107,6 +123,11 @@ inside the bound gets the honest copy 「这条消息未被提交，请重发」
 - A merge-only steer can now be answered three ways (`Merged`,
   `StartedTurn`, `RefusedNoLiveRun`) instead of two, and an adapter that folds a
   start into its merge keeps reporting `Merged` as before.
+- The failed-steer continuation (`SupplementFailed`) narrows to a **Turn's own**
+  guard. An out-of-turn renderer whose steer failed ambiguously keeps its chain
+  and shows the unconfirmed notice instead of receiving a continuation; a run
+  that did merge the message still renders it in that renderer's own card, so no
+  content is lost.
 - The out-of-turn renderer lease is unchanged: acquiring while a Turn holds the
   guard still joins it without owning it, and only the last release gives it
   back.
