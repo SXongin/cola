@@ -129,9 +129,10 @@ wording stays reserved for responses that may have landed.
   admission taken afterwards covers them. The routing decision is one read; the
   admission is one claim.
 - The handshake polls the guard every 25 ms and retries a merge against a
-  writer every 500 ms (`SUPPLEMENT_HANDSHAKE_POLL`, `SUPPLEMENT_HANDSHAKE_POLL_COARSE`, `SUPPLEMENT_MERGE_RETRY`,
+  writer every 500 ms (`SUPPLEMENT_HANDSHAKE_POLL`, `SUPPLEMENT_MERGE_RETRY`,
   `src/bridge/handler.rs`). `SUPPLEMENT_WAIT_WARN_AFTER` (3 s) is a **WARN**
-  threshold, not a deadline.
+  threshold, not a deadline; once it fires the poll slows to
+  `SUPPLEMENT_HANDSHAKE_POLL_COARSE` (250 ms) so a long wait does not spin.
 - The handshake serves the **retiring / restart-armed** holder, whose lease
   clears in under a second, and a Turn that owns the guard, which ends. A
   guard that never clears would park the message's task indefinitely; every
