@@ -3909,3 +3909,98 @@ async fn wait_for_card_work_context(
     })
     .await;
 }
+
+/// #1086 / ADR-0113: a user message the adapter cannot steer (no live run)
+/// asks the out-of-turn renderer that owns the guard to YIELD. The loop stops
+/// before its next write, releases its lease, and the waiting message starts
+/// the Turn that submits it — exactly once, with no "not submitted" notice and
+/// no second writer.
+#[tokio::test]
+async fn a_waiting_message_retires_the_adopted_follow_and_is_submitted() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    // A live run with a background shell: the adopted follow stays in its
+    // window (⏳) and holds the guard.
+    let live = SessionTranscript::new(vec![
+        user("msg_user_1000", 1_000, "跑一下 CI"),
+        finished("msg_ext_assist", 2_000, FinishReason::Stop),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![background_shell(2_100)]);
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_transcript("ses_ext", vec![live]);
+    // The message's merge-only steer is refused: the adapter sees no run it
+    // can steer into, which is what justifies asking the renderer to yield.
+    mock.refuse_steer_no_live_run_once();
+    let backend = Arc::new(mock);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_ext", "/tmp/ext").await;
+    app.external
+        .render_poll_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    Turn::arm_external_render(
+        &app.cards_handle(),
+        "ses_ext",
+        "om_adopted",
+        &anchor(1_000),
+        "sub",
+        "/tmp/ext",
+        None,
+        None,
+        crate::backend::AgentCapabilities::full(),
+    )
+    .await;
+    app.external
+        .start_adopted_follow(
+            &app.flow_handles(),
+            "ses_ext",
+            &AdoptedFollow {
+                card_message_id: "om_adopted".into(),
+                anchor: anchor(1_000),
+            },
+        )
+        .await;
+    // The renderer owns the guard.
+    wait_for("the adopted follow's guard", || async {
+        app.inflight.lock().await.contains("ses_ext").then_some(())
+    })
+    .await;
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["补充一下".to_string()],
+        "the message is submitted exactly once, by the Turn the yield unblocked"
+    );
+    assert!(
+        !platform
+            .texts()
+            .await
+            .iter()
+            .any(|t| t.contains("这条消息未被提交")),
+        "the yielding message is never reported unsubmitted: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        platform.calls.lock().await.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_sup"
+        )),
+        "the Turn's own card answers the message: {:?}",
+        platform.calls.lock().await
+    );
+}

@@ -2405,12 +2405,12 @@ async fn a_retiring_renderer_with_a_terminal_card_still_starts_the_turn() {
     assert_no_busy_notice(&platform).await;
 }
 
-/// #1086 acceptance 3 through a lease that outlives the handshake's diagnostic
-/// horizon: the message waits instead of being reported unsubmitted, and the
-/// moment the renderer's lease retires it starts the Turn that submits it —
-/// exactly once, with no "not submitted" notice anywhere.
+/// #1086 with a lease that owns the guard: the typed refusal ASKS the
+/// renderer to yield (ADR-0113) instead of waiting out a deadline. The message
+/// starts the Turn the moment the renderer releases — exactly once, with no
+/// "not submitted" notice.
 #[tokio::test]
-async fn a_refusal_waits_out_a_long_lease_and_then_submits() {
+async fn a_refusal_asks_a_lease_to_yield_and_then_submits() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2435,23 +2435,33 @@ async fn a_refusal_waits_out_a_long_lease_and_then_submits() {
             .await;
         })
     };
-    // The lease outlives the 3 s diagnostic horizon: the message must keep
-    // waiting, not report itself unsubmitted.
-    tokio::time::sleep(std::time::Duration::from_millis(3_200)).await;
+    // The refusal asks the lease to yield; a real render loop releases on its
+    // next tick. Nothing has been submitted yet.
+    wait_for("the renderer's yield request", || async {
+        app.waits_handle()
+            .render_lease_retire_requested("ses_test")
+            .await
+            .then_some(())
+    })
+    .await;
+    assert!(
+        backend.prompt_calls.lock().await.is_empty(),
+        "the message waits for the yield; it is not submitted twice"
+    );
     app.waits_handle().release_render_lease("ses_test").await;
-    wait_for_handler(handler, "the waiting message", std::time::Duration::from_secs(5)).await;
+    wait_for_handler(handler, "the yielding message", std::time::Duration::from_secs(5)).await;
 
     assert_eq!(
         backend.prompt_calls.lock().await.clone(),
         vec!["补充一下".to_string()],
-        "the message is submitted exactly once when the lease retires"
+        "the message is submitted exactly once when the lease yields"
     );
     assert!(
         !sent_texts(&platform)
             .await
             .iter()
             .any(|t| t.contains("这条消息未被提交")),
-        "a waiting message is never reported unsubmitted: {:?}",
+        "a yielding message is never reported unsubmitted: {:?}",
         platform.calls.lock().await
     );
     assert_eq!(
@@ -2460,6 +2470,49 @@ async fn a_refusal_waits_out_a_long_lease_and_then_submits() {
         "the Turn rendered and settled the message"
     );
     assert_no_busy_notice(&platform).await;
+}
+
+/// ADR-0113: a yield request targets the CURRENT render window only. A
+/// replacement window (the first acquire after the last release) starts fresh,
+/// so a late request never kills a successor renderer.
+#[tokio::test]
+async fn a_yield_request_targets_the_current_render_window_only() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let waits = app.waits_handle();
+
+    waits.acquire_render_lease("ses_test").await;
+    assert!(
+        !waits.render_lease_retire_requested("ses_test").await,
+        "a fresh window yields nothing"
+    );
+    waits.retire_render_lease("ses_test").await;
+    assert!(
+        waits.render_lease_retire_requested("ses_test").await,
+        "the request targets the window in place"
+    );
+    // A renderer joining the SAME window shares the request, so the whole
+    // window goes rather than leaving a joiner holding the guard.
+    waits.acquire_render_lease("ses_test").await;
+    waits.release_render_lease("ses_test").await;
+    assert!(
+        waits.render_lease_retire_requested("ses_test").await,
+        "the surviving renderer still sees the request"
+    );
+    waits.release_render_lease("ses_test").await;
+    assert!(
+        !waits.render_lease_retire_requested("ses_test").await,
+        "the closed window carries no request"
+    );
+    // A replacement window is never retired for the previous window's request.
+    waits.acquire_render_lease("ses_test").await;
+    assert!(
+        !waits.render_lease_retire_requested("ses_test").await,
+        "a replacement renderer is not killed by a stale request"
+    );
+    waits.release_render_lease("ses_test").await;
 }
 
 /// #1086's "stop counting a restart-armed continuation as a writer": an

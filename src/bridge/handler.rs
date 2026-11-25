@@ -2777,6 +2777,14 @@ impl App {
             // lease (a lease alone is not proof of a run, ADR-0113 §3a): the
             // message can merge the moment that writer's run is visible.
             let writer = !waits.owns_render_lease(&session_id).await;
+            if !writer {
+                // The guard is an out-of-turn renderer's lease and the adapter
+                // proved it can steer nothing: ask that renderer to yield
+                // (ADR-0113). It stops before its next write and releases its
+                // lease, so the next poll admits the Turn here. A request with
+                // no lease (a replacement already left) is a no-op.
+                waits.retire_render_lease(&session_id).await;
+            }
             let due = last_merge.is_none_or(|at| at.elapsed() >= SUPPLEMENT_MERGE_RETRY);
             if writer && due {
                 last_merge = Some(std::time::Instant::now());

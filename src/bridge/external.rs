@@ -1725,10 +1725,19 @@ async fn external_render_loop(
     idle_timeout_ms: u64,
 ) {
     handles.waits.acquire_render_lease(&session_id).await;
+    // The chain this renderer owns, captured with the lease held (ADR-0113): a
+    // takeover can only land after this lease yields, so every render pass is
+    // scoped to the chain that was here when the window opened. A card that has
+    // no chain left to render ends the loop instead.
+    let Some(chain) = Turn::card_chain_id(&handles.cards, &session_id).await else {
+        handles.waits.release_render_lease(&session_id).await;
+        return;
+    };
     external_render_loop_inner(
         handles,
         session_id.clone(),
         anchor,
+        chain,
         poll_ms,
         read_timeout_ms,
         idle_timeout_ms,
@@ -1737,11 +1746,29 @@ async fn external_render_loop(
     handles.waits.release_render_lease(&session_id).await;
 }
 
+/// Renew the renderer's idle clock when the last pass advanced the card's
+/// progress mark (#457). A cancelled pass can never return its stats, so the
+/// mark — advanced the moment a stage renders — is what proves progress.
+async fn renew_idle_clock(
+    handles: &FlowHandles,
+    session_id: &str,
+    last_mark: &mut u64,
+    last_progress: &mut tokio::time::Instant,
+) {
+    if let Some(mark) = Turn::progress_mark(&handles.cards, session_id).await
+        && mark != *last_mark
+    {
+        *last_mark = mark;
+        *last_progress = tokio::time::Instant::now();
+    }
+}
+
 /// The renderer itself; [`external_render_loop`] owns its guard lease.
 async fn external_render_loop_inner(
     handles: &FlowHandles,
     session_id: String,
     anchor: TurnAnchor,
+    chain: u64,
     poll_ms: u64,
     read_timeout_ms: u64,
     idle_timeout_ms: u64,
@@ -1766,6 +1793,13 @@ async fn external_render_loop_inner(
     let mut undecided = false;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
+        // A waiting user message asked this renderer to yield its chain
+        // (ADR-0113): stop BEFORE writing, so its Turn takes the chain over
+        // without a second writer. The lease release is the caller's.
+        if handles.waits.render_lease_retire_requested(&session_id).await {
+            tracing::info!("external render: session {session_id} yielding its chain to a waiting message");
+            break;
+        }
         // Completion, the newer-turn boundary and the streaming render all
         // come from the one Session Transcript read (ADR-0053). The read is
         // BOUNDED: a half-open connection must not park the loop past its
@@ -1841,36 +1875,23 @@ async fn external_render_loop_inner(
         // an abandoned pass is just another no-progress poll.
         let rendered = tokio::time::timeout(
             std::time::Duration::from_millis(read_timeout_ms),
-            Turn::render_and_flush(
-                &handles.cards,
-                &handles.sessions,
-                &handles.backend,
-                &handles.requests,
-                &session_id,
-                &transcript,
-            ),
+            render_or_yield(handles, &session_id, &transcript, chain),
         )
         .await;
-        let stats = match rendered {
-            Ok(Some(pass)) => Some(pass.stats),
-            // The accumulator vanished: nothing left to render.
-            Ok(None) => break,
+        let gained_parts = match rendered {
+            Ok(PassYield::Rendered { gained_parts }) => Some(gained_parts),
+            // A waiting message asked this renderer to yield, or the
+            // accumulator vanished: nothing more to render here.
+            Ok(PassYield::Yielded | PassYield::Gone) => break,
             Err(_) => {
                 tracing::warn!("external render: pass timed out after {} ms", read_timeout_ms);
                 None
             }
         };
-        // Renew on the accumulator's progress mark (#457): it advances the
-        // moment a stage renders, so content a pass had already rendered
-        // before its timeout abandoned it still counts — a cancelled pass can
-        // never return its stats.
-        if let Some(mark) = Turn::progress_mark(&handles.cards, &session_id).await
-            && mark != last_mark
-        {
-            last_mark = mark;
-            last_progress = tokio::time::Instant::now();
-        }
-        let Some(stats) = stats else {
+        // Renew on the accumulator's progress mark (#457): content a pass had
+        // already rendered before its timeout abandoned it still counts.
+        renew_idle_clock(handles, &session_id, &mut last_mark, &mut last_progress).await;
+        let Some(gained_parts) = gained_parts else {
             if !stalled_poll(
                 handles,
                 &session_id,
@@ -1885,7 +1906,7 @@ async fn external_render_loop_inner(
             }
             continue;
         };
-        if stats.new_parts > 0 {
+        if gained_parts {
             tracing::info!("external render: session {} gained parts", session_id);
         }
         if stopped {
@@ -1911,48 +1932,10 @@ async fn external_render_loop_inner(
         // apply re-checks the anchor under the stamp's own lock, so a successor
         // that replaced the accumulator during the render keeps its own card
         // (#457).
-        if let Some(settle) = settle {
-            match settle {
-                // The undecided read keeps observing (`undecided` carries it
-                // to the bound checks); whatever the resumed run produces next
-                // is rendered by the ordinary pass above.
-                TurnSettle::Running => {}
-                TurnSettle::Complete => {
-                    if Turn::finalize_done_if_anchor(
-                        handles.backend.as_ref(),
-                        &handles.cards,
-                        &session_id,
-                        &anchor,
-                    )
-                    .await
-                    {
-                        tracing::info!("external reply rendered: session {} done", session_id);
-                    }
-                    break;
-                }
-                settle => {
-                    // The waiting yield and the settled failure, through the one
-                    // disposition table — the card state and failure line cannot
-                    // disagree with the other ending paths (ADR-0059).
-                    let disposition = Disposition::from(settle);
-                    if Turn::apply_disposition_if_anchor(
-                        handles.backend.as_ref(),
-                        &handles.cards,
-                        &session_id,
-                        &anchor,
-                        &disposition,
-                    )
-                    .await
-                    {
-                        tracing::info!(
-                            "external reply rendered: session {} {}",
-                            session_id,
-                            disposition.log_line()
-                        );
-                    }
-                    break;
-                }
-            }
+        // The ending (if the read decided one) is the shared settle decision
+        // (#568); `true` keeps observing, `false` ends this renderer.
+        if !settle_if_decided(handles, &session_id, &anchor, settle).await {
+            break;
         }
         // A NEWER EXTERNAL user message is a turn boundary — the poller
         // notifies and arms a fresh renderer for it (ADR-0028). A message cola
@@ -2000,6 +1983,98 @@ async fn yielded_chain_held(handles: &FlowHandles, session_id: &str, newest: &Tu
     matches!(ownership.card_class(), CardClass::Yielded { .. }) && ownership.anchor() == Some(newest)
 }
 
+/// What one renderer tick's pass did, as the loop needs it.
+enum PassYield {
+    /// The pass rendered into this renderer's chain.
+    Rendered { gained_parts: bool },
+    /// A waiting message asked the renderer to yield (ADR-0113): exit.
+    Yielded,
+    /// The chain moved to a successor (or the accumulator vanished): exit.
+    Gone,
+}
+
+/// One render pass for this renderer, stopping first when a waiting message
+/// asked it to yield (ADR-0113).
+async fn render_or_yield(
+    handles: &FlowHandles,
+    session_id: &str,
+    transcript: &crate::backend::SessionTranscript,
+    chain: u64,
+) -> PassYield {
+    if handles.waits.render_lease_retire_requested(session_id).await {
+        tracing::info!("external render: session {session_id} yielding its chain to a waiting message");
+        return PassYield::Yielded;
+    }
+    match Turn::render_and_flush_in_chain(
+        &handles.cards,
+        &handles.sessions,
+        &handles.backend,
+        &handles.requests,
+        session_id,
+        transcript,
+        chain,
+    )
+    .await
+    {
+        Some(pass) => PassYield::Rendered {
+            gained_parts: pass.stats.new_parts > 0,
+        },
+        None => PassYield::Gone,
+    }
+}
+
+/// Apply a read's settle decision when it made one (ADR-0059, #568): `true`
+/// keeps observing (the undecided running settlement), `false` ends the
+/// renderer (Done, Failed or the waiting yield, through the one disposition
+/// table). The guarded applies re-check the anchor under the stamp's own lock,
+/// so a successor that replaced the accumulator during the render keeps its own
+/// card (#457).
+async fn settle_if_decided(
+    handles: &FlowHandles,
+    session_id: &str,
+    anchor: &TurnAnchor,
+    settle: Option<TurnSettle>,
+) -> bool {
+    let Some(settle) = settle else {
+        return true;
+    };
+    match settle {
+        // The undecided read keeps observing (`undecided` carries it to the
+        // bound checks); whatever the resumed run produces next is rendered by
+        // the ordinary pass.
+        TurnSettle::Running => true,
+        TurnSettle::Complete => {
+            if Turn::finalize_done_if_anchor(handles.backend.as_ref(), &handles.cards, session_id, anchor)
+                .await
+            {
+                tracing::info!("external reply rendered: session {session_id} done");
+            }
+            false
+        }
+        settle => {
+            // The waiting yield and the settled failure, through the one
+            // disposition table — the card state and failure line cannot
+            // disagree with the other ending paths (ADR-0059).
+            let disposition = Disposition::from(settle);
+            if Turn::apply_disposition_if_anchor(
+                handles.backend.as_ref(),
+                &handles.cards,
+                session_id,
+                anchor,
+                &disposition,
+            )
+            .await
+            {
+                tracing::info!(
+                    "external reply rendered: session {session_id} {}",
+                    disposition.log_line()
+                );
+            }
+            false
+        }
+    }
+}
+
 /// A stalled poll's disposition (#457): `true` keeps the loop polling, `false`
 /// stops it. A successor that replaced this renderer's accumulator ends it
 /// silently — stamping by session id could hit the successor's live card. The
@@ -2018,6 +2093,12 @@ async fn stalled_poll(
     undecided: bool,
 ) -> bool {
     if Turn::armed_turn_anchor(&handles.cards, session_id).await.as_ref() != Some(anchor) {
+        return false;
+    }
+    // A waiting message asked this renderer to yield (ADR-0113): a failed read
+    // is no reason to keep the chain another tick.
+    if handles.waits.render_lease_retire_requested(session_id).await {
+        tracing::info!("external render: session {session_id} yielding its chain to a waiting message");
         return false;
     }
     if !undecided && last_progress.elapsed() >= idle_bound {

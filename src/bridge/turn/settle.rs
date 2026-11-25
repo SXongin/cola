@@ -42,9 +42,62 @@ fn finish(disposition: Disposition, session_id: &str, label: &str) -> Option<Dis
     Some(disposition)
 }
 
+/// One render pass for this loop, scoped by the ticket's chain when it owns one
+/// (ADR-0113): an out-of-turn renderer holding a lease must never render into a
+/// successor's accumulator, so a chain-ticket's pass stops (`None`) when the
+/// chain moved. A Turn-anchored follow renders unscoped — it holds the Turn's
+/// own guard.
+async fn render_pass(
+    flow: &FlowHandles,
+    session_id: &str,
+    transcript: &crate::backend::SessionTranscript,
+    chain: Option<u64>,
+    label: &str,
+) -> Option<super::render::RenderPass> {
+    // A waiting user message asked this renderer to yield its chain
+    // (ADR-0113): stop BEFORE writing, so the successor's Turn takes the chain
+    // over without a second writer. The caller's `?` turns this into the loop's
+    // clean exit; the lease release belongs to the caller that owns it.
+    if flow.waits.render_lease_retire_requested(session_id).await {
+        tracing::info!("{label}: session {session_id} yielding its chain to a waiting message");
+        return None;
+    }
+    match chain {
+        Some(chain) => {
+            Turn::render_and_flush_in_chain(
+                &flow.cards,
+                &flow.sessions,
+                &flow.backend,
+                &flow.requests,
+                session_id,
+                transcript,
+                chain,
+            )
+            .await
+        }
+        None => {
+            Turn::render_and_flush(
+                &flow.cards,
+                &flow.sessions,
+                &flow.backend,
+                &flow.requests,
+                session_id,
+                transcript,
+            )
+            .await
+        }
+    }
+}
+
 /// One last reconcile render before a stop terminal (#394): the abort's
 /// settled tool states must reach a card that is about to stop updating.
-async fn render_once(flow: &FlowHandles, session_id: &str, read_timeout_ms: u64, label: &str) {
+async fn render_once(
+    flow: &FlowHandles,
+    session_id: &str,
+    read_timeout_ms: u64,
+    label: &str,
+    chain: Option<u64>,
+) {
     if let Some(Ok(transcript)) = crate::bridge::bounded_call(
         &format!("{label} transcript"),
         read_timeout_ms,
@@ -52,15 +105,7 @@ async fn render_once(flow: &FlowHandles, session_id: &str, read_timeout_ms: u64,
     )
     .await
     {
-        Turn::render_and_flush(
-            &flow.cards,
-            &flow.sessions,
-            &flow.backend,
-            &flow.requests,
-            session_id,
-            &transcript,
-        )
-        .await;
+        render_pass(flow, session_id, &transcript, chain, label).await;
     }
 }
 
@@ -104,7 +149,7 @@ pub(super) async fn run(
         // settled tool states, then the stop terminal — a deliberate stop is
         // not a failure and its abort's error never reaches the card (#394).
         if flow.waits.is_stopped(session_id).await {
-            render_once(flow, session_id, timing.read_timeout_ms, label).await;
+            render_once(flow, session_id, timing.read_timeout_ms, label, ticket.chain()).await;
             return finish(Disposition::Stopped, session_id, label);
         }
         // Both reads must answer for the tick to count as contact: a wedged
@@ -147,15 +192,7 @@ pub(super) async fn run(
                 // Stream the parts into the SAME card (the accumulator this
                 // chain has been rendering into all along); `None` means the
                 // accumulator vanished and the loop no longer owns anything.
-                let rendered = Turn::render_and_flush(
-                    &flow.cards,
-                    &flow.sessions,
-                    &flow.backend,
-                    &flow.requests,
-                    session_id,
-                    &transcript,
-                )
-                .await?;
+                let rendered = render_pass(flow, session_id, &transcript, ticket.chain(), label).await?;
                 // The record-after-flush invariant (review, PR #595): the
                 // pass commits only once the render that carried its entries
                 // returned an accumulator it wrote to AND the flush that

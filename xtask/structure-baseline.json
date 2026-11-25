@@ -103,15 +103,15 @@
       "path": "src/bridge/external.rs",
       "function": "external_render_loop_inner",
       "metric": "cognitive_complexity",
-      "value": 39,
-      "body": "9593ebe6b720dd56"
+      "value": 35,
+      "body": "40c22c8a3a8d66c9"
     },
     {
       "path": "src/bridge/external.rs",
       "function": "external_render_loop_inner",
       "metric": "too_many_lines",
-      "value": 159,
-      "body": "9593ebe6b720dd56"
+      "value": 117,
+      "body": "40c22c8a3a8d66c9"
     },
     {
       "path": "src/bridge/external.rs",
@@ -383,29 +383,29 @@
       "path": "src/bridge/turn/render.rs",
       "function": "render_and_flush_inner",
       "metric": "cognitive_complexity",
-      "value": 31,
-      "body": "9ee7dcaa4f346672"
+      "value": 30,
+      "body": "0c96c89a1f547ff0"
     },
     {
       "path": "src/bridge/turn/render.rs",
       "function": "render_and_flush_inner",
       "metric": "too_many_lines",
-      "value": 158,
-      "body": "9ee7dcaa4f346672"
+      "value": 156,
+      "body": "0c96c89a1f547ff0"
     },
     {
       "path": "src/bridge/turn/settle.rs",
       "function": "run",
       "metric": "cognitive_complexity",
       "value": 29,
-      "body": "aa2dc93afae33923"
+      "body": "3b6acdcdea7efe65"
     },
     {
       "path": "src/bridge/turn/settle.rs",
       "function": "run",
       "metric": "too_many_lines",
-      "value": 139,
-      "body": "aa2dc93afae33923"
+      "value": 131,
+      "body": "3b6acdcdea7efe65"
     },
     {
       "path": "src/bridge/turn/state.rs",

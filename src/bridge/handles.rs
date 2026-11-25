@@ -2490,12 +2490,19 @@ pub(crate) struct WaitsHandle {
 const INBOUND_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One Session's out-of-turn renderer lease (ADR-0109): how many renderers are
-/// in their window, and whether the FIRST of them claimed the inflight guard
-/// (a guard a Turn already held is not ours to release).
+/// in their window, whether the FIRST of them claimed the inflight guard (a
+/// guard a Turn already held is not ours to release), and whether a waiting
+/// user message asked the window to yield (ADR-0113).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RenderLease {
     pub(crate) count: usize,
     pub(crate) owns_guard: bool,
+    /// A retirement was requested: the holders stop before their next write and
+    /// release, handing the chain to the Turn that is waiting for it
+    /// ([`WaitsHandle::retire_render_lease`]). Cleared by the first acquire of a
+    /// NEW window, so a replacement renderer is never retired for the previous
+    /// window's request.
+    pub(crate) retire: bool,
 }
 
 impl WaitsHandle {
@@ -2509,6 +2516,9 @@ impl WaitsHandle {
         let mut leases = self.render_leases.lock().await;
         let lease = leases.entry(session_id.to_string()).or_default();
         if lease.count == 0 {
+            // A NEW window starts fresh: the previous window's retirement
+            // request must not kill the replacement renderer (ADR-0113).
+            lease.retire = false;
             let mut inflight = self.inflight.lock().await;
             // A Turn or follow already proves the writer; never release its
             // claim on our exit.
@@ -2518,6 +2528,29 @@ impl WaitsHandle {
             }
         }
         lease.count += 1;
+    }
+
+    /// Ask the renderers currently in their window for `session_id` to yield
+    /// (ADR-0113): a waiting user message proved no run can be steered, so the
+    /// in-process renderer holds a guard it cannot use for that message. Both
+    /// out-of-turn loops check [`Self::render_lease_retire_requested`] at the top
+    /// of a tick and stop BEFORE writing, so the chain transfers to the waiting
+    /// Turn without a double writer. A request with no lease is a no-op.
+    pub(crate) async fn retire_render_lease(&self, session_id: &str) {
+        if let Some(lease) = self.render_leases.lock().await.get_mut(session_id) {
+            lease.retire = true;
+        }
+    }
+
+    /// Whether the lease currently held for `session_id` was asked to yield.
+    /// False when there is no lease (nothing to retire) — a caller that owns no
+    /// lease never stops for this.
+    pub(crate) async fn render_lease_retire_requested(&self, session_id: &str) -> bool {
+        self.render_leases
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|lease| lease.retire)
     }
 
     /// Give the Session's inflight guard back, unless an out-of-turn renderer

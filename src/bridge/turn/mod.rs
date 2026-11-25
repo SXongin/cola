@@ -3760,6 +3760,22 @@ impl Turn {
         render::render_and_flush(cards, sessions, backend, requests, session_id, transcript).await
     }
 
+    /// [`Self::render_and_flush`] for an out-of-turn renderer that owns `chain`
+    /// (ADR-0113): the pass stops without writing when the Session's card has
+    /// moved to a successor's chain.
+    pub(crate) async fn render_and_flush_in_chain(
+        cards: &CardsHandle,
+        sessions: &SessionsHandle,
+        backend: &Arc<dyn crate::backend::Backend>,
+        requests: &RequestsHandle,
+        session_id: &str,
+        transcript: &SessionTranscript,
+        chain: u64,
+    ) -> Option<render::RenderPass> {
+        render::render_and_flush_in_chain(cards, sessions, backend, requests, session_id, transcript, chain)
+            .await
+    }
+
     /// [`Self::render_and_flush`] for the request sweep's surfacing drain
     /// (issue #1023): render the read before a request block freezes the card,
     /// writing only when the pass rendered content.
