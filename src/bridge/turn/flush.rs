@@ -242,18 +242,38 @@ struct SentSignatures {
 ///
 /// A card the session no longer tracks (a re-point won a race) is left alone:
 /// the signatures belong to the card that was written.
+///
+/// `carries_live_block` says whether the body that just landed RENDERED a live
+/// question block. Only such a body settles an owed arrival (issue #1103): a
+/// finalized prefix renders no tail — its blocks migrate to the continuation —
+/// so settling on it would zero the retry budget before the block ever reached
+/// a card, and the freeze would re-engage over a box nobody can see.
 async fn advance_sent_signatures(
     cards: &CardsHandle,
     session_id: &str,
     card_id: &str,
     sent: &SentSignatures,
+    carries_live_block: bool,
 ) {
     if let Some(mut card) = cards.card(session_id).await
         && card.card_message_id.as_deref() == Some(card_id)
     {
         card.last_header_sig = sent.header.clone();
         card.last_context_sig = sent.context;
+        if carries_live_block {
+            // The card now shows the block, so the bounded arrival retry is
+            // over (issue #1103).
+            card.acc.settle_block_arrival();
+        }
     }
+}
+
+/// Whether the body just written rendered a live **question** block — the only
+/// kind whose arrival the typed-answer retry exists for (issue #1103).
+fn body_carries_question(rendered: &[RenderedBlock]) -> bool {
+    rendered
+        .iter()
+        .any(|block| block.kind == crate::bridge::request::kind::InteractionKind::Question)
 }
 
 /// The terminal write's fate after an ending PATCH settled (spec #602, ticket
@@ -444,6 +464,13 @@ async fn note_cursor_write_failure(
     stage: crate::bridge::turn::state::StagedCursorId,
     rendered: &[EndingKey],
 ) {
+    // One attempt to land an owed live block was refused (issue #1103): spend
+    // the bounded arrival retry, so a card Feishu refuses for good cannot keep
+    // the typed-answer freeze lifted for the rest of the Turn. A delivered
+    // write settles the retry instead (see [`advance_sent_signatures`]).
+    if let Some(mut session) = cards.card(session_id).await {
+        session.acc.spend_block_arrival();
+    }
     if error.is_recoverable_card_write()
         && let Some(card_message_id) = card_message_id
     {
@@ -713,7 +740,7 @@ pub(super) async fn flush_card_locked(
                     let block = card.acc.interaction(&span.request_id)?;
                     rendered_block(span, block)
                 })
-                .collect();
+                .collect::<Vec<_>>();
             // What this body shows of the two signatures the render gate
             // compares, captured under the SAME lock that built it: the write
             // below advances the gate's cache to exactly what the card carries
@@ -724,6 +751,10 @@ pub(super) async fn flush_card_locked(
             };
             (built, rendered, slice_from, slice_to, sent_sigs)
         };
+        // Whether THIS body rendered a live question block, computed before the
+        // list is recorded (which consumes it): landing such a body settles an
+        // owed arrival, and landing one that did not must not (issue #1103).
+        let carries_question = body_carries_question(&rendered);
 
         if card_is_live {
             let supplement_split_requested = !pending_split.is_empty();
@@ -897,7 +928,7 @@ pub(super) async fn flush_card_locked(
                 // The body the card now carries is what the render gate must
                 // compare against — delivered, or owed a retry that lands it.
                 if !matches!(ending, super::state::EndingWrite::Failed) {
-                    advance_sent_signatures(cards, session_id, &card_id, &sent_sigs).await;
+                    advance_sent_signatures(cards, session_id, &card_id, &sent_sigs, carries_question).await;
                 }
                 set_ending_write(cards, session_id, ending).await;
                 return flush_outcome(wrote, refused);
@@ -1140,7 +1171,10 @@ pub(super) async fn flush_card_locked(
             // The finalized body the card now carries (or is owed) is what the
             // render gate must compare against.
             if should_patch && !refused {
-                advance_sent_signatures(cards, session_id, &card_id, &sent_sigs).await;
+                // The finalized prefix renders NO tail, so its body carries no
+                // block: landing it settles no arrival (issue #1103 — the
+                // blocks are the continuation's).
+                advance_sent_signatures(cards, session_id, &card_id, &sent_sigs, false).await;
             }
             if delivered {
                 // The fenced fallback covered THIS payload only (issue #886).
@@ -1296,7 +1330,7 @@ pub(super) async fn flush_card_locked(
                     .record(&new_id, &built.card, rendered);
                 // The new card carries this body: the render gate's signature
                 // cache follows the card it now describes.
-                advance_sent_signatures(cards, session_id, &new_id, &sent_sigs).await;
+                advance_sent_signatures(cards, session_id, &new_id, &sent_sigs, carries_question).await;
                 // The send delivered the 承接 line (or the size-split slice):
                 // the staged Wake Watermark is user-visible now (ADR-0061).
                 drain_wake_watermark(cards, session_id, watermark).await;
@@ -1499,7 +1533,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{drain_wake_watermark, note_cursor_write_failure, refusal_transition, staged_watermark_id};
+    use super::{
+        advance_sent_signatures, drain_wake_watermark, note_cursor_write_failure, refusal_transition,
+        staged_watermark_id,
+    };
     use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
     use crate::bridge::chain::EndingKey;
     use crate::bridge::test_support::*;
@@ -1535,6 +1572,57 @@ mod tests {
             refusal_transition("continuation ", &permanent),
             "continuation permanent refusal; fallback unchanged"
         );
+    }
+
+    /// A finalized prefix renders **no** tail — its live blocks migrate to the
+    /// continuation — so landing it must not settle an owed block arrival
+    /// (issue #1103, adversarial round). Settling there would zero the retry
+    /// budget before the block ever reached a card: a refused continuation would
+    /// then leave the freeze guarding a box nobody can see, which is the
+    /// original symptom.
+    #[tokio::test]
+    async fn only_a_body_that_carries_the_block_settles_its_arrival() {
+        let (app, _platform) = app_with_live_card("streaming").await;
+        let cards = app.cards_handle();
+        let request = crate::backend::types::QuestionRequest {
+            id: "que_settle".into(),
+            session_id: "ses_test".into(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "备注?".into(),
+                header: "备注".into(),
+                kind: crate::backend::types::FormFieldKind::String,
+                custom: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            Turn::add_question(
+                &cards,
+                "ses_test",
+                &request,
+                "/work",
+                &crate::bridge::question::QuestionPaint::blank(1),
+                None,
+            )
+            .await
+        );
+        let sigs = super::SentSignatures {
+            header: "h".into(),
+            context: (0, None),
+        };
+        let owed = || {
+            let cards = cards.clone();
+            async move { !cards.card("ses_test").await.unwrap().acc.awaits_typed_answer() }
+        };
+        assert!(owed().await, "the insert arms the arrival retry");
+        advance_sent_signatures(&cards, "ses_test", "om_live", &sigs, false).await;
+        assert!(
+            owed().await,
+            "a body with no block finished the arrival's retry budget"
+        );
+        advance_sent_signatures(&cards, "ses_test", "om_live", &sigs, true).await;
+        assert!(!owed().await, "the body that carried the block settled the retry");
     }
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).

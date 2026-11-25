@@ -1706,6 +1706,174 @@ async fn the_drain_flush_stands_down_for_an_unanswered_typed_answer() {
     );
 }
 
+/// Issue #1103: a live question block's arrival write is its only writer.
+/// When Feishu refuses it with its per-message frequency limit, the block must
+/// still reach the card — the retry rides the next render pass, which the
+/// typed-answer freeze would otherwise stand down for good, leaving a card
+/// that says 「等待你的回答」 with only the question text on it.
+#[tokio::test]
+async fn a_rate_limited_question_arrival_is_retried_until_it_lands() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let cards = app.cards_handle();
+    let mut request = question_request("que_rated");
+    request.session_id = "ses_test".into();
+
+    // The arrival write is refused with `230429`: nothing was written, so the
+    // card keeps the body it had (no controls, no box).
+    platform.fail_update(UpdateFailure::RateLimited, 1);
+    assert!(
+        Turn::add_question(
+            &cards,
+            "ses_test",
+            &request,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+            Some(1_000),
+        )
+        .await
+    );
+    let before = platform.updated_cards().await.len();
+    Turn::flush_card(&cards, "ses_test").await;
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        before + 1,
+        "the arrival was attempted and refused"
+    );
+
+    // The next pass must write it: the block is owed, so the freeze stands
+    // aside instead of guarding a box the card does not show.
+    Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
+    let delivered = platform.updated_cards().await;
+    assert_eq!(
+        delivered.len(),
+        before + 2,
+        "the owed arrival is retried on the next pass"
+    );
+    let text = delivered.last().expect("the retried body").to_string();
+    assert!(
+        text.contains("form_que_rated"),
+        "the retried arrival carries the block's form: {text}"
+    );
+    assert!(
+        text.contains("\"answer\":\"/a\""),
+        "the retried arrival carries the option control the card was missing: {text}"
+    );
+
+    // The retry delivered, so the obligation is settled and the typed-answer
+    // freeze is back: another pass writes nothing.
+    Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        before + 2,
+        "a delivered arrival settles the retry; the card is frozen again"
+    );
+}
+
+/// The arrival retry is **bounded** (issue #1103): a card Feishu refuses for
+/// good spends the budget and then returns to the pre-fix behaviour — standing
+/// the passes down — instead of repainting on every tick forever.
+#[tokio::test]
+async fn a_permanently_refused_question_arrival_stops_after_its_budget() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let cards = app.cards_handle();
+    let mut request = question_request("que_refused");
+    request.session_id = "ses_test".into();
+
+    platform.fail_update(UpdateFailure::Permanent, ALWAYS);
+    assert!(
+        Turn::add_question(
+            &cards,
+            "ses_test",
+            &request,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+            Some(1_000),
+        )
+        .await
+    );
+    Turn::flush_card(&cards, "ses_test").await;
+
+    // Run passes until one writes nothing; a second pass must stay quiet too.
+    // Three writes is the budget's exact shape: the arrival flush spent one,
+    // then one per retry. A retry that never fires leaves this at zero, which is
+    // what makes the count discriminate (a bounds-only assertion would pass on a
+    // card that never retries at all).
+    let mut writes = 0;
+    for _ in 0..10 {
+        let before = platform.updated_cards().await.len();
+        Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
+        if platform.updated_cards().await.len() == before {
+            break;
+        }
+        writes += 1;
+    }
+    assert_eq!(
+        writes, 3,
+        "one retry per remaining attempt, then the budget is spent"
+    );
+    let before = platform.updated_cards().await.len();
+    Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        before,
+        "the spent budget hands the card back to the typed-answer freeze"
+    );
+}
+
+/// The arrival carve-out is only for a block that is **not** on the card
+/// (issue #1103): a second question arriving while the card already guards the
+/// Host's typed box must not lift the freeze, or the retry would repaint the
+/// box being typed into (#917).
+#[tokio::test]
+async fn a_second_question_arrival_keeps_the_freeze_for_a_live_typed_box() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+    seed_live_card(&app, "ses_test", "om_live").await;
+    let cards = app.cards_handle();
+
+    for id in ["que_first", "que_second"] {
+        let mut request = question_request(id);
+        request.session_id = "ses_test".into();
+        assert!(
+            Turn::add_question(
+                &cards,
+                "ses_test",
+                &request,
+                "/work",
+                &crate::bridge::question::QuestionPaint::blank(1),
+                Some(1_000),
+            )
+            .await
+        );
+        // Each arrival's own flush lands it (the flow's out-of-band write is
+        // allowed while a box is open); only the *retry* is what must not.
+        Turn::flush_card(&cards, "ses_test").await;
+    }
+    let before = platform.updated_cards().await.len();
+    Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        before,
+        "the second arrival arms no retry: the first question's box is being typed into"
+    );
+}
+
 /// A question raised during an active turn is surfaced INLINE on the
 /// streaming card; answering one of several only toasts and returns the
 /// re-rendered streaming card (markers/已选 in the callback response — the
