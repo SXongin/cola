@@ -180,15 +180,15 @@
       "path": "src/bridge/handler.rs",
       "function": "submit_prompt",
       "metric": "cognitive_complexity",
-      "value": 46,
-      "body": "6232fb6ef7e37e6d"
+      "value": 29,
+      "body": "ab5492795c594ea9"
     },
     {
       "path": "src/bridge/handler.rs",
       "function": "submit_prompt",
       "metric": "too_many_lines",
-      "value": 228,
-      "body": "6232fb6ef7e37e6d"
+      "value": 144,
+      "body": "ab5492795c594ea9"
     },
     {
       "path": "src/bridge/handles.rs",
@@ -370,14 +370,14 @@
       "function": "start",
       "metric": "cognitive_complexity",
       "value": 31,
-      "body": "4eba296e65ecfa68"
+      "body": "88045c73c2b42e96"
     },
     {
       "path": "src/bridge/turn/mod.rs",
       "function": "start",
       "metric": "too_many_lines",
-      "value": 141,
-      "body": "4eba296e65ecfa68"
+      "value": 136,
+      "body": "88045c73c2b42e96"
     },
     {
       "path": "src/bridge/turn/render.rs",
@@ -440,7 +440,7 @@
       "function": "impl Backend for CodexClient",
       "metric": "too_many_lines",
       "value": 114,
-      "body": "7348432e35d92188"
+      "body": "a7e193047fd929a4"
     },
     {
       "path": "src/codex/backend.rs",

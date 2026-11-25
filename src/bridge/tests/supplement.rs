@@ -2139,3 +2139,315 @@ async fn an_adapter_that_starts_a_turn_for_a_merge_only_steer_is_reported() {
     );
     assert!(!has(&card, "📨 已收到补充"), "nothing may claim a merge: {card}");
 }
+
+/// Every text the platform sent as a plain message.
+async fn sent_texts(platform: &RecordingPlatform) -> Vec<String> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// #1086 window 2, the acquiring renderer: a renderer that leases the guard
+/// BETWEEN the router's decision and the Turn's admission captures the message
+/// as a Supplement — it is never answered busy, and it reaches the Backend
+/// exactly once (ADR-0113).
+#[tokio::test]
+async fn a_lease_taken_between_routing_and_admission_merges_as_a_supplement() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    seed_session(&app, "ses_test", "/work").await;
+    // The renderer's live-looking chain card: the Supplement splits at it.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Streaming).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+
+    // Park the routing read: the router has decided a Turn (no guard), and the
+    // handler's admission has not run yet.
+    let gate = backend.hold_next_status_read();
+    let handler = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_sup".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "补充一下".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    wait_for("the routing status read", || async {
+        (backend
+            .status_gate_entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0)
+        .then_some(())
+    })
+    .await;
+    // The renderer leases the guard in exactly that window, then the route
+    // finishes. The router had already chosen a Turn; the handshake must
+    // re-route.
+    app.waits_handle().acquire_render_lease("ses_test").await;
+    gate.add_permits(1);
+    wait_for_handler(
+        handler,
+        "the handshaken message",
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    let (reply_to, card) = continuation(&platform).await;
+    assert_eq!(
+        reply_to, "msg_sup",
+        "the message was captured as a Supplement, not refused busy"
+    );
+    assert!(has(&card, "📨 已收到补充"), "the merge is claimed: {card}");
+    assert!(
+        !sent_texts(&platform)
+            .await
+            .iter()
+            .any(|t| t.contains("上一条消息还在处理中")),
+        "no spurious busy notice: {:?}",
+        platform.calls.lock().await
+    );
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["补充一下".to_string()],
+        "submitted exactly once, through the steer"
+    );
+    app.waits_handle().release_render_lease("ses_test").await;
+}
+
+/// #1086, the restart-armed Wake continuation (the live 2026-11-24 report): the
+/// rehydrated card holds the guard but no run exists behind it, so the steer
+/// answers the typed refusal. The message must become the Turn that renders it
+/// once that window closes — never the failed-supplement receipt over a dropped
+/// message — and it is submitted exactly once (ADR-0113).
+#[tokio::test]
+async fn a_typed_steer_refusal_starts_the_turn_that_renders_the_message() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.refuse_steer_no_live_run_once();
+    let refused = Arc::new(tokio::sync::Notify::new());
+    backend.on_steer({
+        let refused = Arc::clone(&refused);
+        move || refused.notify_one()
+    });
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.completion_notice_delay_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+    seed_live_turn(&app, "ses_test", "第一段进度。").await;
+    // A restart-armed continuation: the card is a display claim, the guard is a
+    // render lease with no Turn behind it.
+    app.inflight.lock().await.remove("ses_test");
+    app.waits_handle().acquire_render_lease("ses_test").await;
+
+    let handler = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_sup".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "编译到本地的 release 目标了吗？".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    // The steer refused (nothing was submitted); the handshake is waiting. The
+    // renderer retires — exactly what the Wake settle loop does 100 ms later.
+    refused.notified().await;
+    app.waits_handle().release_render_lease("ses_test").await;
+    wait_for_handler(
+        handler,
+        "the handshaken message",
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    // Exactly one submission, and it is the message: the steer submitted
+    // nothing and the Turn submitted it once.
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["编译到本地的 release 目标了吗？".to_string()],
+        "the message is submitted exactly once"
+    );
+    // The Turn's card carried the answer, and nothing claimed an unconfirmed
+    // supplement.
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Done),
+        "the Turn rendered and settled the message"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyCard { reply_to, card }
+                if reply_to == "msg_sup" && has(card, "补充消息未确认送达")
+        )),
+        "no failed-supplement receipt over a message that ran: {calls:?}"
+    );
+    assert!(
+        !sent_texts(&platform)
+            .await
+            .iter()
+            .any(|t| t.contains("上一条消息还在处理中")),
+        "no spurious busy notice: {calls:?}"
+    );
+}
+
+/// #1086 window 1, the retiring renderer: its card is already TERMINAL but the
+/// lease is still held. The typed refusal must still end in a new Turn that
+/// renders the next prompt — not only a notice (ADR-0113).
+#[tokio::test]
+async fn a_retiring_renderer_with_a_terminal_card_still_starts_the_turn() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.refuse_steer_no_live_run_once();
+    let refused = Arc::new(tokio::sync::Notify::new());
+    backend.on_steer({
+        let refused = Arc::clone(&refused);
+        move || refused.notify_one()
+    });
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.completion_notice_delay_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_test", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_test", CardState::Done).await;
+    Turn::set_reply_target(&cards, "ses_test", "msg_1").await;
+    app.waits_handle().acquire_render_lease("ses_test").await;
+
+    let handler = {
+        let app = Arc::clone(&app);
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_next".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "新问题".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    refused.notified().await;
+    app.waits_handle().release_render_lease("ses_test").await;
+    wait_for_handler(
+        handler,
+        "the handshaken message",
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    let delivered: String = platform
+        .updated_cards()
+        .await
+        .iter()
+        .map(card_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        delivered.contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the new Turn renders the prompt: {delivered}"
+    );
+    assert_eq!(
+        backend.prompt_calls.lock().await.clone(),
+        vec!["新问题".to_string()],
+        "submitted exactly once"
+    );
+    assert!(
+        !sent_texts(&platform)
+            .await
+            .iter()
+            .any(|t| t.contains("补充消息未确认送达")),
+        "no failed continuation over a message that ran: {:?}",
+        platform.calls.lock().await
+    );
+}
+
+/// A typed refusal whose guard never clears inside the handshake bound is
+/// reported honestly: the message was NOT submitted, so the notice says so and
+/// invites a resend — never the ambiguity-preserving "unconfirmed" copy, and
+/// never a continuation handed to a renderer that does not exist (#1086,
+/// ADR-0113).
+#[tokio::test]
+async fn a_typed_refusal_with_a_guard_that_never_clears_reports_no_submission() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.refuse_steer_no_live_run_once();
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.completion_notice_delay_ms
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_test", "/work").await;
+    seed_live_turn(&app, "ses_test", "第一段进度。").await;
+    app.inflight.lock().await.remove("ses_test");
+    app.waits_handle().acquire_render_lease("ses_test").await;
+
+    app.handle_message(incoming(
+        "msg_sup".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "补充一下".into(),
+        None,
+    ))
+    .await;
+
+    let texts = sent_texts(&platform).await;
+    assert!(
+        texts.iter().any(|t| t.contains("这条消息未被提交")),
+        "the notice states nothing was submitted: {texts:?}"
+    );
+    assert!(
+        backend.prompt_calls.lock().await.is_empty(),
+        "nothing was submitted"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            PlatformCall::ReplyCard { reply_to, .. } if reply_to == "msg_sup"
+        )),
+        "no continuation may be handed to nobody: {calls:?}"
+    );
+    assert!(
+        !app.waits_handle().inbound.lock().await.contains_key("ses_test"),
+        "the message's inbound claim is released"
+    );
+    app.waits_handle().release_render_lease("ses_test").await;
+}
