@@ -67,7 +67,7 @@ async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::erro
         // letting it read as a permanent refusal (issue #1103).
         if let Some(code) = rate_limit_code(&text) {
             return Err(crate::error::BridgeError::FeishuRateLimited {
-                code: i64::from(code),
+                code,
                 detail: format!("{what} HTTP {status}: {}", body_snippet(&text, 200)),
             });
         }
@@ -93,11 +93,17 @@ fn rejection_code(body: &str) -> Option<i64> {
     is_card_content_rejection(code).then_some(code)
 }
 
+/// Whether `code` is the per-message frequency limit (see
+/// [`RATE_LIMIT_CODES`]).
+fn is_rate_limit_code(code: i64) -> bool {
+    RATE_LIMIT_CODES.iter().any(|limit| i64::from(*limit) == code)
+}
+
 /// `Some(code)` when a response body is the frequency limit.
-fn rate_limit_code(body: &str) -> Option<i32> {
+fn rate_limit_code(body: &str) -> Option<i64> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let code = i32::try_from(v.get("code")?.as_i64()?).ok()?;
-    RATE_LIMIT_CODES.contains(&code).then_some(code)
+    let code = v.get("code")?.as_i64()?;
+    is_rate_limit_code(code).then_some(code)
 }
 
 /// Build the error for a non-zero Feishu API `code`, typing card-content
@@ -109,7 +115,7 @@ fn api_error(prefix: &str, code: i64, msg: &str) -> crate::error::BridgeError {
             code,
             detail: format!("{prefix}: {msg}"),
         }
-    } else if i32::try_from(code).is_ok_and(|code| RATE_LIMIT_CODES.contains(&code)) {
+    } else if is_rate_limit_code(code) {
         crate::error::BridgeError::FeishuRateLimited {
             code,
             detail: format!("{prefix}: {msg}"),

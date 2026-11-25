@@ -27,8 +27,15 @@ fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
 /// The transition a refused card write logs (issue #886): one vocabulary for
 /// the three write sites, and the per-message frequency limit is never called a
 /// permanent refusal (issue #1103) — nothing was written, so the identical body
-/// can land once the window passes.
+/// can land once the window passes. `site` names the write site (`""` for the
+/// live slice, `"finalized"`/`"continuation"` for the others) and is prefixed
+/// with one space, so no call site carries its own trailing separator.
 fn refusal_transition(site: &str, e: &crate::error::BridgeError) -> String {
+    let site = if site.is_empty() {
+        String::new()
+    } else {
+        format!("{site} ")
+    };
     if is_card_content_rejected(e) {
         format!("{site}content refused; fallback None/Fenced -> Fenced/Suspended")
     } else if e.is_rate_limited() {
@@ -243,7 +250,7 @@ struct SentSignatures {
 /// A card the session no longer tracks (a re-point won a race) is left alone:
 /// the signatures belong to the card that was written.
 ///
-/// `carries_live_block` says whether the body that just landed RENDERED a live
+/// `carries_question_block` says whether the body that just landed RENDERED a live
 /// question block. Only such a body settles an owed arrival (issue #1103): a
 /// finalized prefix renders no tail — its blocks migrate to the continuation —
 /// so settling on it would zero the retry budget before the block ever reached
@@ -253,14 +260,14 @@ async fn advance_sent_signatures(
     session_id: &str,
     card_id: &str,
     sent: &SentSignatures,
-    carries_live_block: bool,
+    carries_question_block: bool,
 ) {
     if let Some(mut card) = cards.card(session_id).await
         && card.card_message_id.as_deref() == Some(card_id)
     {
         card.last_header_sig = sent.header.clone();
         card.last_context_sig = sent.context;
-        if carries_live_block {
+        if carries_question_block {
             // The card now shows the block, so the bounded arrival retry is
             // over (issue #1103).
             card.acc.settle_block_arrival();
@@ -1049,7 +1056,7 @@ pub(super) async fn flush_card_locked(
                             cards,
                             session_id,
                             &e,
-                            &refusal_transition("finalized ", &e),
+                            &refusal_transition("finalized", &e),
                             &finalized.card,
                             slice_from,
                             finalized.end,
@@ -1346,7 +1353,7 @@ pub(super) async fn flush_card_locked(
                     cards,
                     session_id,
                     &e,
-                    &refusal_transition("continuation ", &e),
+                    &refusal_transition("continuation", &e),
                     &built.card,
                     slice_from,
                     built.end,
@@ -1556,7 +1563,7 @@ mod tests {
         };
         assert_eq!(refusal_transition("", &rate), "rate limited; nothing written");
         assert_eq!(
-            refusal_transition("finalized ", &rate),
+            refusal_transition("finalized", &rate),
             "finalized rate limited; nothing written"
         );
         let content = crate::error::BridgeError::CardContentRejected {
@@ -1569,7 +1576,7 @@ mod tests {
         );
         let permanent = crate::error::BridgeError::Feishu("update error 230002: message not found".into());
         assert_eq!(
-            refusal_transition("continuation ", &permanent),
+            refusal_transition("continuation", &permanent),
             "continuation permanent refusal; fallback unchanged"
         );
     }
@@ -1617,10 +1624,7 @@ mod tests {
         };
         assert!(owed().await, "the insert arms the arrival retry");
         advance_sent_signatures(&cards, "ses_test", "om_live", &sigs, false).await;
-        assert!(
-            owed().await,
-            "a body with no block finished the arrival's retry budget"
-        );
+        assert!(owed().await, "a body with no block must not settle the arrival");
         advance_sent_signatures(&cards, "ses_test", "om_live", &sigs, true).await;
         assert!(!owed().await, "the body that carried the block settled the retry");
     }
