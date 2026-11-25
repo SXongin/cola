@@ -387,6 +387,17 @@ impl Ticket {
         }
     }
 
+    /// The chain identity this loop owns, when its ticket is chain-based (a
+    /// Wake continuation, the unreceived watch). A Turn-anchored follow returns
+    /// `None`: it renders into the Turn's own card, under the guard it holds
+    /// (an out-of-turn renderer that owns a lease always has a chain ticket).
+    pub(super) fn chain(&self) -> Option<u64> {
+        match self {
+            Self::TurnAnchor(_) => None,
+            Self::Chain { chain, .. } | Self::Unlanded { chain, .. } => Some(*chain),
+        }
+    }
+
     /// Apply the ending `disposition` to `session_id`'s card only while the
     /// ticket still covers it — the check and the stamp under ONE `cards` lock
     /// (#539). The callers run after the Session's guard was released, so a

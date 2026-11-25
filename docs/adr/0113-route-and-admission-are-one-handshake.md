@@ -55,29 +55,52 @@ re-routed. Both the generation-neutral default (`src/backend/mod.rs:409`) and
 Codex's `turn/steer` adapter (`src/codex/backend.rs:3231`) answer this way.
 
 **3. A typed refusal re-routes the same message.** Nothing was submitted, so
-the message becomes the Turn it could not merge into. `settle_refused_supplement`
-waits for the guard and claims it the instant it clears, starting that Turn
-(`src/bridge/handler.rs:2757`). Every guard holder is finite — a Turn ends, and
-an out-of-turn renderer's lease is scoped to its own loop (`idle_timeout_ms` in
-`external_render_loop_inner`, and the Wake settle loop's finalize) — so the wait
-ends with the message **admitted and submitted exactly once**. This is the path
-for a retiring renderer (terminal card, lease still held), the restart-armed
-continuation, and the loser of two simultaneous refusals.
+the message becomes the Turn it could not merge into,
+`settle_refused_supplement` (`src/bridge/handler.rs:2749`):
 
-While a **writer** holds the guard — another message's Turn whose run has not
-registered yet, or a renderer that begins its run — the merge is retried on a
-coarse cadence, so the message joins that run as soon as the adapter can see it
-(`src/bridge/handler.rs:2795`). Every attempt is merge-only and every earlier
-one refused before submitting, so the retry is the message's first submission,
-and it reuses the message's `cola_msg_id` so it stays one logical message.
+- **The guard is free**: claim it (`Turn::try_admit`) and run the Turn.
+- **A writer holds it** — another message's Turn, or a renderer that began its
+  run: retry the merge on a coarse cadence so the message joins that run as soon
+  as the adapter can see it (`src/bridge/handler.rs:2795`). Every attempt is
+  merge-only and every earlier one refused before submitting, so the retry is
+  the message's first submission; it reuses the message's `cola_msg_id`, so it
+  stays one logical message.
+- **An out-of-turn renderer's lease owns it**: the renderer is asked to
+  **yield** (§3b). It stops before its next write and releases its lease, so the
+  message's next poll admits the Turn — no user-facing deadline and no second
+  writer.
 
 The wait has **no user-facing deadline**: the message's own task is the same one
 a Turn lives in for minutes, and reporting it unsubmitted while a writer exists
 is the loss this record fixes. `SUPPLEMENT_WAIT_WARN_AFTER` is a diagnostic:
-past it a WARN records the long wait so a holder that never clears is visible;
-the message keeps waiting. A typed refusal therefore never opens a
-`SupplementFailed` continuation either — that receipt survives only for
+past it a WARN records an unexpectedly long wait (a Turn whose run never
+becomes steerable); the message keeps waiting. A typed refusal therefore never
+opens a `SupplementFailed` continuation either — that receipt survives only for
 genuinely ambiguous failures and the broken `StartedTurn` contract.
+
+**3b. A guard a waiting message cannot use is yielded, not waited out.** The
+guard's holder writes the chain, so a message may not take the chain by force
+(its own render pass would race a stale one). It asks instead:
+`WaitsHandle::retire_render_lease` marks the lease currently held, both
+out-of-turn loops check the mark at the top of a tick and stop **before**
+writing (`external_render_loop_inner`, the shared settle loop), and only the
+holder releases — so the reference-counted guard is never broken from outside.
+The request targets the **current window**: the first acquire of a replacement
+window clears it, so a late request never kills a successor renderer.
+
+The chain transfer is protected by an identity check, not by the timing of the
+yield: every out-of-turn render pass is scoped to the chain it was armed for
+(`render_and_flush_in_chain`), and a pass whose chain has moved writes nothing
+and stops. The check runs under the same cards lock the successor's install runs
+under, so a renderer that loses the race between its yield check and its write
+cannot inject its own transcript's parts into the successor's card.
+
+This is what makes the unbounded Wake settle wait safe. That loop may wait for
+an Execution boundary with no time bound (ADR-0059/#568); its lease no longer
+wedges the Session, because a user message proves through the typed refusal that
+no run can be steered and asks the loop to yield. The successor Turn takes the
+chain (the takeover seeds the orphan's undelivered delta and collects the old
+card), so the user's message is submitted and the stuck card is resolved.
 
 **3a. A renderer's lease is not proof of a writer either.** The
 `SupplementFailed` continuation requires a **Turn's own** guard: a lease can own
@@ -133,12 +156,14 @@ wording stays reserved for responses that may have landed.
   `src/bridge/handler.rs`). `SUPPLEMENT_WAIT_WARN_AFTER` (3 s) is a **WARN**
   threshold, not a deadline; once it fires the poll slows to
   `SUPPLEMENT_HANDSHAKE_POLL_COARSE` (250 ms) so a long wait does not spin.
-- The handshake serves the **retiring / restart-armed** holder, whose lease
-  clears in under a second, and a Turn that owns the guard, which ends. A
-  guard that never clears would park the message's task indefinitely; every
-  holder in the code has a bound (a Turn's own lifecycle, a render loop's idle
-  bound), and the WARN makes a violation visible. The parked task costs the same
-  as the Turn it waits to start, and the message is never lost.
+- The handshake serves the **retiring / restart-armed** holder and every
+  out-of-turn renderer: a typed refusal asks it to yield (§3b), and the holder
+  releases at its next tick. A Turn-owned guard ends on its own, and the merge
+  retry joins its run as soon as the run is visible. The WARN makes an
+  unexpectedly long wait visible; it is not a deadline.
+- Every out-of-turn render pass is chain-scoped (`render_and_flush_in_chain`,
+  `src/bridge/turn/render.rs`): a superseded renderer writes nothing, so the
+  chain transfer cannot produce two writers even in the tick the yield races.
 - A message waiting on a lease holds its inbound claim for that window
   (`INBOUND_CLAIM_TTL` degrades it to absent after 120 s, so Session Sync is
   never wedged by a long wait).

@@ -2933,6 +2933,36 @@ impl RenderMode {
 /// the same read owns the card write, so the settle tick adds no second durable
 /// write and no out-of-order flush (a pending split still serves on
 /// finalization, exactly as before).
+/// How one render pass is scoped (ADR-0113): the session-facing behaviour and,
+/// for an out-of-turn renderer, the card chain the pass must still own.
+#[derive(Clone, Copy)]
+struct PassScope {
+    mode: RenderMode,
+    /// `Some(chain)` for a renderer that owns a lease: the pass writes nothing
+    /// and stops when the Session's card has moved to a successor's chain.
+    chain: Option<u64>,
+}
+
+/// Follow the server's live title when this pass has side effects (OpenCode
+/// auto-renames a session after a turn).
+async fn refresh_title_if(
+    mode: RenderMode,
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+) {
+    if mode.side_effects() {
+        refresh_session_title(cards, sessions, backend, session_id).await;
+    }
+}
+
+/// Whether a scoped pass's card is stale: a successor owns the accumulator now,
+/// so this pass must never render into it (ADR-0113).
+fn stale(card: &super::state::CardSession, chain: Option<u64>) -> bool {
+    chain.is_some_and(|chain| card.chain_id() != chain)
+}
+
 pub(super) async fn render_and_flush_settling(
     cards: &CardsHandle,
     sessions: &SessionsHandle,
@@ -2948,7 +2978,10 @@ pub(super) async fn render_and_flush_settling(
         requests,
         session_id,
         transcript,
-        RenderMode::Settling,
+        PassScope {
+            mode: RenderMode::Settling,
+            chain: None,
+        },
     )
     .await
 }
@@ -2981,7 +3014,40 @@ pub(super) async fn render_and_flush(
         requests,
         session_id,
         transcript,
-        RenderMode::Streaming,
+        PassScope {
+            mode: RenderMode::Streaming,
+            chain: None,
+        },
+    )
+    .await
+}
+
+/// [`render_and_flush`] for an out-of-turn renderer that owns a card chain
+/// (ADR-0113): the pass writes nothing and stops (`None`) when the Session's
+/// card is no longer `chain` — a successor took the chain over, so this
+/// renderer must never render its own transcript into the successor's
+/// accumulator. Scoped under the same `cards` lock the takeover installs
+/// under, so the check and the write cannot interleave with a takeover.
+pub(super) async fn render_and_flush_in_chain(
+    cards: &CardsHandle,
+    sessions: &SessionsHandle,
+    backend: &Arc<dyn crate::backend::Backend>,
+    requests: &RequestsHandle,
+    session_id: &str,
+    transcript: &SessionTranscript,
+    chain: u64,
+) -> Option<RenderPass> {
+    render_and_flush_inner(
+        cards,
+        sessions,
+        backend,
+        requests,
+        session_id,
+        transcript,
+        PassScope {
+            mode: RenderMode::Streaming,
+            chain: Some(chain),
+        },
     )
     .await
 }
@@ -3006,7 +3072,10 @@ pub(super) async fn render_and_flush_draining(
         requests,
         session_id,
         transcript,
-        RenderMode::Draining,
+        PassScope {
+            mode: RenderMode::Draining,
+            chain: None,
+        },
     )
     .await
 }
@@ -3018,15 +3087,16 @@ async fn render_and_flush_inner(
     requests: &RequestsHandle,
     session_id: &str,
     transcript: &SessionTranscript,
-    mode: RenderMode,
+    scope: PassScope,
 ) -> Option<RenderPass> {
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
-    if mode.side_effects() {
-        refresh_session_title(cards, sessions, backend, session_id).await;
-    }
+    refresh_title_if(scope.mode, cards, sessions, backend, session_id).await;
     let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans, typing) = {
-        let mut card = cards.card(session_id).await?;
+        // A scoped pass (an out-of-turn renderer's) stops the moment the chain
+        // it was armed for is gone; the check runs under the same cards lock
+        // the successor's install runs under (ADR-0113).
+        let mut card = cards.card(session_id).await.filter(|c| !stale(c, scope.chain))?;
         // The attachment's surface declaration, re-read each pass so a
         // reattach's new value governs the next render (ADR-0106). A change is
         // content the body owes (a stored plan/diff/usage/compaction surface
@@ -3105,7 +3175,7 @@ async fn render_and_flush_inner(
     // Message reply omits `reply_in_thread`, so Feishu keeps it in the live
     // card's own container (ADR-0076's amendment) — no Session mapping lookup,
     // so an adopt-mid-turn transition cannot fork the conversation.
-    let file_changed = mode.side_effects() && resolve_file_deliveries(cards, session_id).await;
+    let file_changed = scope.mode.side_effects() && resolve_file_deliveries(cards, session_id).await;
     // One output read per planned entry, OUTSIDE the cards lock (the reads are
     // network). The entries themselves are COMMITTED below, together with the
     // ledger and the write (spec #593, issue #917): committing them here would
@@ -3117,7 +3187,7 @@ async fn render_and_flush_inner(
     // A caller that will finalize on this same read defers it (#604): the
     // finalization's own render names the anchor, and the extra write here
     // would be a second persist for one turn.
-    if mode.persists_anchor()
+    if scope.mode.persists_anchor()
         && let Some((card_message_id, anchor)) = &anchor
     {
         cards.chains.set_anchor(session_id, card_message_id, anchor);
@@ -3153,7 +3223,7 @@ async fn render_and_flush_inner(
     // A draining pass (issue #1023) takes the lock for the same check+apply but
     // writes nothing; its caller's flush re-checks the freeze under the lock,
     // so a form that lands in between still refuses the write.
-    let write_lock = if mode.guards_forms() {
+    let write_lock = if scope.mode.guards_forms() {
         Some(cards.write_lock(session_id).await)
     } else {
         None
@@ -3162,7 +3232,7 @@ async fn render_and_flush_inner(
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
-    if mode.guards_forms()
+    if scope.mode.guards_forms()
         && cards
             .card(session_id)
             .await
@@ -3260,7 +3330,7 @@ async fn render_and_flush_inner(
         || ledger.owes()
         || liveness_changed
         || entries_changed;
-    let flush = if !mode.flushes() {
+    let flush = if !scope.mode.flushes() {
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
         FlushOutcome::Unwritten
@@ -14255,5 +14325,49 @@ Index: /x/src/main.rs
         let anchored = acc.build_card();
         assert!(card_text(&anchored).contains("📝 本轮期间工作区变化 · 1 files · +1 −1"));
         assert!(turn_diff_button(&anchored).is_some());
+    }
+
+    /// ADR-0113: a render pass scoped to a chain writes nothing once a successor
+    /// (a new Turn's install) owns the session's accumulator. The check runs
+    /// under the same `cards` lock the takeover installs under, so a superseded
+    /// renderer can never inject its own transcript's parts into the successor's
+    /// card.
+    #[tokio::test]
+    async fn a_chain_scoped_pass_stops_when_the_chain_moved() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_chain_scope";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_scope")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        let armed = Turn::card_chain_id(&cards, sid).await.expect("the armed chain");
+        // A successor owns the session's card now.
+        Turn::seed_card(&cards, sid, Some("om_successor")).await;
+        assert_ne!(
+            Turn::card_chain_id(&cards, sid).await,
+            Some(armed),
+            "the successor installed a new chain"
+        );
+
+        let transcript = SessionTranscript::default();
+        let pass = Turn::render_and_flush_in_chain(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+            armed,
+        )
+        .await;
+        assert!(pass.is_none(), "the superseded pass stops without writing");
+        assert!(
+            platform.updated_cards().await.is_empty(),
+            "no card write came from the superseded chain"
+        );
     }
 }
