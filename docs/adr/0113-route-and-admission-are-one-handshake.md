@@ -74,6 +74,13 @@ ambiguous steer failure keeps the chain and reports the unconfirmed notice
 never handed to a renderer that cannot continue it. A renderer that joined a
 Turn's guard records `owns_guard = false` and is unaffected.
 
+The ownership read and the lease read are two acquisitions, so a lease that
+releases between them reads as a writer for one instant. That window is
+strictly narrower than the pre-handshake one (where the release could happen
+across the split's awaited lock), and the split's own admission still re-checks
+the card under the cards lock; the chain is never left pointing at a card that
+was replaced.
+
 **4. Every path submits at most once.** A Turn route submits one prompt; a
 Supplement route submits one steer (merged); a typed refusal submitted nothing
 and submits one fallback prompt; a bound that expires submits nothing and says
