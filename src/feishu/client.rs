@@ -18,6 +18,15 @@ pub(crate) const MESSAGE_PIN_SCOPE: &str = "im:message.pins:write_only";
 // frequency limit and must not trigger a fresh-copy fallback.
 const MESSAGE_EDIT_LIMIT_REACHED_CODE: i32 = 230072;
 
+/// The per-message **frequency limit** business codes (issue #1103). Feishu
+/// reports them inside the response body, on a 200 or a 400 alike: `230020`
+/// "This operation triggers the frequency limit" (the update window, in the
+/// Edit message error table above) and `230429` ("This operation triggers the
+/// frequency limit", the same refusal under its documented umbrella code).
+/// Nothing is written, so the identical body succeeds once the window passes —
+/// typed so a caller retries instead of calling it permanent.
+const RATE_LIMIT_CODES: [i32; 2] = [230020, 230429];
+
 /// A minimal Feishu REST client.
 pub struct Client {
     http: reqwest::Client,
@@ -53,6 +62,15 @@ async fn read_body_with_diag(resp: reqwest::Response, what: &str) -> crate::erro
                 detail: format!("{what} HTTP {status}: {}", body_snippet(&text, 200)),
             });
         }
+        // The frequency limit arrives the same way (HTTP 400, business code in
+        // the body): nothing was written, so type it as retryable rather than
+        // letting it read as a permanent refusal (issue #1103).
+        if let Some(code) = rate_limit_code(&text) {
+            return Err(crate::error::BridgeError::FeishuRateLimited {
+                code: i64::from(code),
+                detail: format!("{what} HTTP {status}: {}", body_snippet(&text, 200)),
+            });
+        }
         return Err(crate::error::BridgeError::FeishuHttp {
             status: status.as_u16(),
             detail: format!("{what} HTTP {status}: {}", body_snippet(&text, 200)),
@@ -75,11 +93,24 @@ fn rejection_code(body: &str) -> Option<i64> {
     is_card_content_rejection(code).then_some(code)
 }
 
+/// `Some(code)` when a response body is the frequency limit.
+fn rate_limit_code(body: &str) -> Option<i32> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = i32::try_from(v.get("code")?.as_i64()?).ok()?;
+    RATE_LIMIT_CODES.contains(&code).then_some(code)
+}
+
 /// Build the error for a non-zero Feishu API `code`, typing card-content
-/// rejections so render callers can recognize them.
+/// rejections so render callers can recognize them, and the frequency limit so
+/// a caller can retry it instead of treating it as permanent (issue #1103).
 fn api_error(prefix: &str, code: i64, msg: &str) -> crate::error::BridgeError {
     if is_card_content_rejection(code) {
         crate::error::BridgeError::CardContentRejected {
+            code,
+            detail: format!("{prefix}: {msg}"),
+        }
+    } else if i32::try_from(code).is_ok_and(|code| RATE_LIMIT_CODES.contains(&code)) {
+        crate::error::BridgeError::FeishuRateLimited {
             code,
             detail: format!("{prefix}: {msg}"),
         }
@@ -1770,6 +1801,40 @@ mod tests {
             ),
             "a 230099 rejection must be typed: {err}"
         );
+    }
+
+    /// The frequency limit is the other half of the same table: nothing was
+    /// written, so the identical body can land later. Typed as its own refusal
+    /// so the flush neither logs it as permanent nor withholds a retry (issue
+    /// #1103). Feishu reports it both inside a 400 body (the update window,
+    /// `230020`) and inside a 200 body (`230429`) — both must be typed.
+    #[tokio::test]
+    async fn update_message_types_the_frequency_limit_refusals() {
+        let card = serde_json::json!({"elements": []});
+        for (status, body) in [
+            (
+                400,
+                r#"{"code":230020,"msg":"This operation triggers the frequency limit, ext=Update the single messages too frequently"}"#,
+            ),
+            (
+                200,
+                r#"{"code":230429,"msg":"This operation triggers the frequency limit."}"#,
+            ),
+        ] {
+            let (server, client) = wire_client().await;
+            server.route("PATCH", "/open-apis/im/v1/messages/om_42", status, body);
+
+            let err = client.update_message("om_42", &card).await.unwrap_err();
+
+            assert!(
+                err.is_rate_limited(),
+                "a frequency-limit refusal must be typed as retryable (status {status}): {err}"
+            );
+            assert!(
+                !matches!(err, crate::error::BridgeError::CardContentRejected { .. }),
+                "a frequency limit is not a content rejection: {err}"
+            );
+        }
     }
 
     /// A transient Feishu failure keeps its HTTP status typed, so the delivery
