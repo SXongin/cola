@@ -3793,11 +3793,21 @@ impl StreamAccumulator {
     /// answer no one can give. [`Self::block_arrival_owed`] keeps that carve-out
     /// bounded to the window armed by [`Self::owe_block_arrival`].
     pub(super) fn awaits_typed_answer(&self) -> bool {
-        !self.block_arrival_owed()
-            && self.interactions.iter().any(|block| match block {
-                InteractionBlock::Question(q) => q.awaits_typed_answer(),
-                InteractionBlock::Permission(_) | InteractionBlock::Receipt(_) => false,
-            })
+        !self.block_arrival_owed() && self.has_open_typed_answer()
+    }
+
+    /// Whether any resident question block still renders a typed answer field —
+    /// the raw premise of [`Self::awaits_typed_answer`], WITHOUT the owed
+    /// arrival window's carve-out. The finalized-prefix claim reads this
+    /// (issue #1208): its keyless retry is freeze-blind, and a card may still be
+    /// displaying an older form while a newer block's arrival is owed, so the
+    /// conservative answer is "a box may be on screen". A resolved question and
+    /// a permission block have no input, so neither counts.
+    pub(super) fn has_open_typed_answer(&self) -> bool {
+        self.interactions.iter().any(|block| match block {
+            InteractionBlock::Question(q) => q.awaits_typed_answer(),
+            InteractionBlock::Permission(_) | InteractionBlock::Receipt(_) => false,
+        })
     }
 
     /// A live block was just inserted and must reach the card: its arrival
@@ -8938,6 +8948,47 @@ mod tests {
             acc.awaits_typed_answer(),
             "an expired window hands the card back to the freeze, never to a repaint loop"
         );
+    }
+
+    /// Issue #1208's claim guard reads the raw premise, not the freeze: an owed
+    /// arrival window lifts `awaits_typed_answer` (the new block is not on the
+    /// card), but a finalized-prefix claim must still assume an OLDER delivered
+    /// body may be showing a box, so `has_open_typed_answer` stays true.
+    #[test]
+    fn an_owed_arrival_does_not_hide_a_typed_box_from_the_prefix_claim() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(InteractionBlock::Question(PendingQuestion {
+            request_id: "q".into(),
+            session_id: "s".into(),
+            title: String::new(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "备注?".into(),
+                header: "备注".into(),
+                kind: crate::backend::types::FormFieldKind::String,
+                custom: Some(true),
+                ..Default::default()
+            }],
+            uncollectable: None,
+            directory: "/w".into(),
+            answers: vec![None],
+            done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
+            asked_at: None,
+        }));
+        assert!(acc.has_open_typed_answer());
+        assert!(acc.awaits_typed_answer());
+        acc.owe_block_arrival("q");
+        assert!(
+            !acc.awaits_typed_answer(),
+            "the freeze lifts while the arrival is owed"
+        );
+        assert!(
+            acc.has_open_typed_answer(),
+            "but the prefix claim must still assume the old card shows the box"
+        );
+        assert!(acc.dismiss_interaction("q"));
+        assert!(!acc.has_open_typed_answer(), "a resolved question has no input");
     }
 
     /// When the window expires, the predicate that closes the freeze reports it

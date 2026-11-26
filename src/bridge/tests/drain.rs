@@ -4509,6 +4509,86 @@ async fn a_rate_limited_live_split_prefix_stays_owed_and_converges() {
     );
 }
 
+/// Issue #1208, the safety half: the claim's retry is freeze-blind, so it must
+/// never run over a card that still renders an unanswered typed answer. A
+/// Supplement or pull can split a card whose form is on screen; if the prefix
+/// PATCH is refused, the form stays visible, and only this guard keeps the
+/// later drain retry from repainting the card and erasing what the Host typed
+/// (ADR-0038/0100, #917).
+#[tokio::test]
+async fn a_rate_limited_live_split_prefix_is_not_claimed_over_a_typed_form() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_live", Some("om_live")).await;
+    Turn::set_card_state(&cards, "ses_live", CardState::Streaming).await;
+    Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
+    // The live card shows an unanswered typed answer: its form is the box the
+    // freeze protects.
+    add_typed_question(&app, "ses_live", "/work").await;
+    assert!(
+        Turn::awaits_typed_answer(&cards, "ses_live").await,
+        "the seeded card renders the typed form"
+    );
+    for i in 0..8 {
+        Turn::push_text_at(&cards, "ses_live", 5_000 + i * 1_000, &"很长的回答。".repeat(130)).await;
+    }
+
+    platform.fail_update(UpdateFailure::RateLimited, ALWAYS);
+    Turn::flush_card(&cards, "ses_live").await;
+
+    assert!(
+        !app.core.feishu.delivery().has_pending_card_update("om_live"),
+        "a typed answer withholds the claim over the old card: {:?}",
+        platform.calls.lock().await
+    );
+    // The form's own body stays the card's last delivered one — no later PATCH
+    // replaced it with the tail-less prefix.
+    let with_input = patches_to(&platform, "om_live")
+        .await
+        .into_iter()
+        .rfind(|card| !card_inputs(card).is_empty())
+        .expect("the form landed on the card");
+    assert!(
+        card_text(&with_input).contains("备注一下"),
+        "the form the Host is typing into is untouched: {with_input}"
+    );
+}
+
+/// Seed the poller's inline question with a free-text answer — the box a typed
+/// answer's text lives in, which the render freeze protects (#917).
+async fn add_typed_question(app: &Arc<App>, session_id: &str, directory: &str) {
+    use crate::backend::types::{FormFieldKind, QuestionInfo, QuestionRequest};
+    let request = QuestionRequest {
+        id: "que_typed".into(),
+        session_id: session_id.into(),
+        questions: vec![QuestionInfo {
+            question: "备注一下".into(),
+            header: "备注".into(),
+            kind: FormFieldKind::String,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    Turn::add_question(
+        &app.cards_handle(),
+        session_id,
+        &request,
+        directory,
+        &crate::bridge::question::QuestionPaint::blank(1),
+        None,
+    )
+    .await;
+    // Land the form. The arrival window closes on the delivered body, handing
+    // the repaint freeze back to the box now on screen.
+    Turn::flush_card(&app.cards_handle(), session_id).await;
+}
+
 /// Finding D (spec #602 review): a size-split whose continuation create FAILS
 /// leaves the tracked card id on the OLD card, whose finalize PATCH delivered —
 /// so the delivery layer would answer "Delivered" for the wrong card and the

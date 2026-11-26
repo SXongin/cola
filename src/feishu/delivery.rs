@@ -379,8 +379,8 @@ impl PendingEntry {
     /// An accepted keyed state write supersedes the card's owed keyless payload
     /// (spec #571 review): the drain must never resurrect a collected or ended
     /// card's older body over the keyed state, so the payload goes. The
-    /// rate-limited claim record goes with it — a terminal flush may not claim a
-    /// body the newer keyed write replaced (ADR-0115, issue #1201) — while the
+    /// rate-limited claim record goes with it — a tail-less flush may not claim a
+    /// body the newer keyed write replaced (ADR-0115/0116, issues #1201/#1208) — while the
     /// delivered sequences and failure memory, which the cursor reconcile still
     /// reads, stay. Bumps [`Self::keyed_state`] so a still-in-flight keyless
     /// PATCH cannot recreate the claim when its outcome is observed.
@@ -494,7 +494,7 @@ struct State {
     entries: HashMap<String, PendingEntry>,
     /// The most recent failure per card that may still deliver — a recoverable
     /// failure, or a frequency limit that proves nothing was written and a
-    /// terminal flush may claim as owed (ADR-0115) — `(seq, payload)`: the exact
+    /// tail-less flush may claim as owed (ADR-0115/0116) — `(seq, payload)`: the exact
     /// write a failure note asks about (spec #561, review #569). A newer write
     /// may replace `entries` before the note runs, and the note must still learn
     /// whether that payload's own sequence delivered.
@@ -653,8 +653,8 @@ impl CardDelivery {
         }
         let recoverable = matches!(result, Err(e) if e.is_recoverable_card_write());
         // A typed frequency limit is not queued by `observe`, but it is a
-        // DEFINITE non-delivery a terminal flush may claim as owed (ADR-0115,
-        // issue #1201). Remember it the same way as a recoverable failure: a
+        // DEFINITE non-delivery a tail-less flush may claim as owed (ADR-0115/0116,
+        // issues #1201/#1208). Remember it the same way as a recoverable failure: a
         // forced drain can deliver the claimed payload before the flush reads
         // its ending, and then only this payload's own sequence can tell the
         // failure note (and the notice gate) that the body DID land.
@@ -685,7 +685,7 @@ impl CardDelivery {
         entry.attempts = 0;
         entry.age = age;
         // A typed frequency limit is a DEFINITE non-delivery (issue #1201):
-        // remember this exact attempt so a terminal flush can claim it through
+        // remember this exact attempt so a tail-less flush can claim it through
         // `owe_rate_limited_write`, while any later outcome clears it. It is
         // not queued automatically: a live slice's next render pass converges
         // on its own, and queueing a live-block arrival would let the
