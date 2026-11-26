@@ -59,14 +59,37 @@ fn commit_delivered_slice(cards: &CardsHandle, session_id: &str, card_id: &str, 
     );
 }
 
-/// Whether a failed card write proves the card did **not** receive the body
-/// (issue #1103): a typed content rejection, a typed frequency limit or any
-/// other definite business refusal wrote nothing, so a live block is still off
-/// the card and may retry. An ambiguous failure — transport, timeout, 5xx, 408 —
-/// may have landed it, and then the freeze must close over whatever the card
-/// shows.
+/// Whether a failed card write **proves** the card did not receive the body
+/// (issue #1103). Deliberately an allow-list: only an answer Feishu itself
+/// returned can prove non-delivery, so everything else — a transport error, a
+/// timeout, a 5xx, or a 2xx whose body failed to parse after the PATCH was
+/// applied — is read as "may have landed" and keeps the freeze closed.
+///
+/// The allow-list is the flush's own error surface:
+/// - [`BridgeError::CardContentRejected`]: HTTP 400 with `230099`, the JSON was
+///   refused;
+/// - [`BridgeError::FeishuRateLimited`]: the per-message frequency limit;
+/// - [`BridgeError::Feishu`]: `api_error`'s business refusal, decoded from a
+///   response with a non-zero `code` — the write was refused;
+/// - [`BridgeError::FeishuHttp`] with a 4xx other than 408: refused before it ran.
 fn refusal_proves_nothing_written(e: &crate::error::BridgeError) -> bool {
-    !e.is_recoverable_card_write()
+    match e {
+        crate::error::BridgeError::CardContentRejected { .. }
+        | crate::error::BridgeError::FeishuRateLimited { .. }
+        | crate::error::BridgeError::Feishu(_) => true,
+        crate::error::BridgeError::FeishuHttp { status, .. } => (400..500).contains(status) && *status != 408,
+        _ => false,
+    }
+}
+
+/// Whether the body just written rendered a live **question** block — the only
+/// kind whose arrival the retry window exists for (issue #1103). A finalized
+/// prefix and an intermediate continuation slice render no tail, so their writes
+/// neither close nor re-open the window.
+fn body_carries_question(rendered: &[RenderedBlock]) -> bool {
+    rendered
+        .iter()
+        .any(|block| block.kind == crate::bridge::request::kind::InteractionKind::Question)
 }
 
 /// Book a failed card write on the arrival window, **synchronously at the
@@ -810,7 +833,7 @@ pub(super) async fn flush_card_locked(
             return FlushOutcome::Unwritten;
         };
 
-        let (built, rendered, slice_from, slice_to, sent_sigs, arrival) = {
+        let (built, rendered, slice_from, slice_to, sent_sigs, arrival, carries_question) = {
             let Some(mut card) = cards.card(session_id).await else {
                 return FlushOutcome::Unwritten;
             };
@@ -852,7 +875,16 @@ pub(super) async fn flush_card_locked(
                 deadline: arrival_deadline,
                 request: card.acc.block_arrival_request_id().map(str::to_string),
             };
-            (built, rendered, slice_from, slice_to, sent_sigs, arrival)
+            let carries_question = body_carries_question(&rendered);
+            (
+                built,
+                rendered,
+                slice_from,
+                slice_to,
+                sent_sigs,
+                arrival,
+                carries_question,
+            )
         };
         if card_is_live {
             let supplement_split_requested = !pending_split.is_empty();
@@ -863,9 +895,10 @@ pub(super) async fn flush_card_locked(
                 // before the write, so a body staged meanwhile is never
                 // confirmed by this one (review #569).
                 let (stage, watermark) = stage_live_slice(cards, session_id, &card_id, &built).await;
-                // Close the arrival window BEFORE writing (issue #1103): the
-                // body carries the tail, so it carries the block.
-                let arrival_was_open = arrival.close();
+                // Close the arrival window BEFORE writing, and only for a body
+                // that carries the block (issue #1103): the write may land, or
+                // its outcome may be swallowed by a cancellation.
+                let arrival_was_open = carries_question && arrival.close();
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
                     Ok(()) => {
                         commit_delivered_slice(cards, session_id, &card_id, &built);
@@ -1337,9 +1370,10 @@ pub(super) async fn flush_card_locked(
         )
         .await;
         let watermark = staged_watermark_id(cards, session_id).await;
-        // The continuation carries the tail — and so the block: close the window
-        // before the create for the same reason as the live PATCH (issue #1103).
-        let arrival_was_open = arrival.close();
+        // Close the window around a create that carries the tail (issue #1103).
+        // An intermediate `built.full` slice renders no tail — its success must
+        // not close a window the tail-carrying create still needs.
+        let arrival_was_open = carries_question && arrival.close();
         let sent = match (reply_to.as_deref(), fallback_chat.as_deref()) {
             (Some(reply_to), _) => cards.feishu.reply_card(reply_to, &built.card).await,
             (None, Some(chat)) => cards.feishu.send_card("chat_id", chat, &built.card).await,
@@ -1721,6 +1755,11 @@ mod tests {
                 status: 400,
                 detail: "bad request".into(),
             },
+            // A 429 at the transport layer is the same refusal: not applied.
+            BridgeError::FeishuHttp {
+                status: 429,
+                detail: "proxy rate limit".into(),
+            },
         ];
         for error in definite {
             assert!(
@@ -1738,10 +1777,9 @@ mod tests {
                 status: 408,
                 detail: "timeout".into(),
             },
-            BridgeError::FeishuHttp {
-                status: 429,
-                detail: "proxy rate limit".into(),
-            },
+            // The PATCH can be APPLIED while its 200 body fails to parse: a
+            // parse error proves nothing, so it must not re-open the window.
+            BridgeError::Json(serde_json::from_str::<u8>("applied").unwrap_err()),
         ];
         for error in ambiguous {
             assert!(
