@@ -6,7 +6,7 @@
 //! outside the Turn module. The card-delivery helpers other flows genuinely use
 //! (target resolution, stale marking) stay in their owning modules.
 
-use super::state::{CardFallback, SliceFingerprint};
+use super::state::{BuiltCard, CardFallback, SliceFingerprint};
 use super::wake::record_landed_rendered;
 use super::{MAX_CARD_CHAIN, SplitKind, Turn};
 
@@ -24,6 +24,52 @@ fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
     matches!(e, crate::error::BridgeError::CardContentRejected { .. })
 }
 
+/// Stage a live slice's Rendered Cursor and the Wake Watermark it can carry
+/// (review #569): both must be captured before the write, and only a confirmed
+/// write drains them.
+async fn stage_live_slice(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_id: &str,
+    built: &BuiltCard,
+) -> (crate::bridge::turn::state::StagedCursorId, Option<u64>) {
+    let stage = stage_rendered_cursor(
+        cards,
+        session_id,
+        Some(card_id),
+        &built.cursor,
+        built.gap.as_ref(),
+        built.rendered_endings.clone(),
+    )
+    .await;
+    let watermark = staged_watermark_id(cards, session_id).await;
+    (stage, watermark)
+}
+
+/// Commit a delivered live-slice PATCH, in this synchronous step before any
+/// await (ADR-0080): the Rendered Cursor, its gap coverage and its endings'
+/// shown bits in ONE chains write, so a later cancellation cannot lose the bit;
+/// plus the arrival settle when the body carried the block (issue #1103).
+fn commit_delivered_slice(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_id: &str,
+    built: &BuiltCard,
+    carries_question: bool,
+    arrival: &std::sync::atomic::AtomicU8,
+) {
+    cards.chains.advance_cursor_and_gap(
+        session_id,
+        card_id,
+        &built.cursor,
+        built.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
+        &built.rendered_endings,
+    );
+    if carries_question {
+        arrival.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Whether a failed card write proves the card did **not** receive the body
 /// (issue #1103): a typed content rejection, a typed frequency limit or any
 /// other definite business refusal wrote nothing, so a live block is still off
@@ -32,6 +78,48 @@ fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
 /// shows.
 fn refusal_proves_nothing_written(e: &crate::error::BridgeError) -> bool {
     !e.is_recoverable_card_write()
+}
+
+/// Book a failed card write on the arrival retry, **synchronously at the
+/// failure** (issue #1103): the state must move before any await, so a
+/// cancellation during logging or a lock wait cannot leave the freeze lifted
+/// over a box the card may already show.
+///
+/// A definite refusal wrote nothing, so the retry is spent; an ambiguous failure
+/// may have landed the body, so the freeze closes over whatever the card shows.
+fn note_arrival_failure(
+    arrival: &std::sync::atomic::AtomicU8,
+    request: Option<&str>,
+    error: &crate::error::BridgeError,
+) {
+    if !refusal_proves_nothing_written(error) {
+        arrival.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let before = arrival
+        .try_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |left| (left > 0).then(|| left - 1),
+        )
+        .unwrap_or(0);
+    if before == 1 {
+        // Name the block: with several Sessions refusing arrivals in one window
+        // this line is the only pointer to the undelivered one (ADR-0114).
+        tracing::warn!(
+            "{}",
+            crate::bridge::turn::state::block_arrival_exhausted_line(request.unwrap_or("-"))
+        );
+    }
+}
+
+/// Settle an owed arrival when the body carrying it landed: the state moves
+/// before the awaits that follow the write, so a cancellation cannot leave the
+/// freeze lifted over a box the card shows (issue #1103).
+fn settle_arrival_if_carried(carries_question: bool, arrival: &std::sync::atomic::AtomicU8) {
+    if carries_question {
+        arrival.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The transition a refused card write logs (issue #886): one vocabulary for
@@ -469,27 +557,6 @@ async fn note_cursor_write_failure(
     stage: crate::bridge::turn::state::StagedCursorId,
     rendered: &[EndingKey],
 ) {
-    // The arrival retry's bookkeeping (issue #1103). A refused write either
-    // proves nothing was written or leaves it unknown:
-    //
-    // - a DEFINITE refusal (a typed rate limit, a content rejection, a business
-    //   error) wrote nothing, so the block is still off the card: spend one
-    //   retry, and a card Feishu refuses for good cannot keep the freeze lifted
-    //   for the rest of the Turn;
-    // - an AMBIGUOUS failure (transport, timeout, 5xx) may have landed the body.
-    //   The card might be showing the box right now, so the freeze must close
-    //   over it: safety over liveness — a stranded block is visible, an erased
-    //   draft is not.
-    if let Some(mut session) = cards.card(session_id).await {
-        if refusal_proves_nothing_written(error) {
-            session.acc.spend_block_arrival();
-        } else {
-            session
-                .acc
-                .block_arrival_handle()
-                .store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
     if error.is_recoverable_card_write()
         && let Some(card_message_id) = card_message_id
     {
@@ -736,7 +803,7 @@ pub(super) async fn flush_card_locked(
             return FlushOutcome::Unwritten;
         };
 
-        let (built, rendered, slice_from, slice_to, sent_sigs, arrival) = {
+        let (built, rendered, slice_from, slice_to, sent_sigs, arrival, arrival_request) = {
             let Some(mut card) = cards.card(session_id).await else {
                 return FlushOutcome::Unwritten;
             };
@@ -773,7 +840,16 @@ pub(super) async fn flush_card_locked(
             // arm, before any await, so a cancellation cannot leave the freeze
             // lifted over a box the card already shows.
             let arrival = card.acc.block_arrival_handle();
-            (built, rendered, slice_from, slice_to, sent_sigs, arrival)
+            let arrival_request = card.acc.block_arrival_request_id().map(str::to_string);
+            (
+                built,
+                rendered,
+                slice_from,
+                slice_to,
+                sent_sigs,
+                arrival,
+                arrival_request,
+            )
         };
         // Whether THIS body rendered a live question block, computed before the
         // list is recorded (which consumes it): landing such a body settles an
@@ -788,43 +864,22 @@ pub(super) async fn flush_card_locked(
                 // stage identity (and the watermark it can carry) is captured
                 // before the write, so a body staged meanwhile is never
                 // confirmed by this one (review #569).
-                let stage = stage_rendered_cursor(
-                    cards,
-                    session_id,
-                    Some(&card_id),
-                    &built.cursor,
-                    built.gap.as_ref(),
-                    built.rendered_endings.clone(),
-                )
-                .await;
-                let watermark = staged_watermark_id(cards, session_id).await;
+                let (stage, watermark) = stage_live_slice(cards, session_id, &card_id, &built).await;
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
                     Ok(()) => {
-                        // The PATCH is accepted NOW: advance this body's Rendered
-                        // Cursor, its gap coverage and its endings' shown bits in
-                        // ONE chains write, in this synchronous step before any
-                        // await (ADR-0080). A later cancellation cannot lose the
-                        // bit, and a crash cannot leave it apart from the cursor it
-                        // was confirmed with. The write stamps itself newest, so a
-                        // stage whose confirmation the cancellation ate can never
-                        // move the record back; the confirmation below is therefore
-                        // refused as stale, having nothing left to add.
-                        cards.chains.advance_cursor_and_gap(
+                        commit_delivered_slice(
+                            cards,
                             session_id,
                             &card_id,
-                            &built.cursor,
-                            built.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
-                            &built.rendered_endings,
+                            &built,
+                            carries_question,
+                            &arrival,
                         );
-                        // This body carried the block, so the arrival landed:
-                        // settle it HERE, synchronously, for the reason above.
-                        if carries_question {
-                            arrival.store(0, std::sync::atomic::Ordering::Relaxed);
-                        }
                         wrote = true;
                         true
                     }
                     Err(e) => {
+                        note_arrival_failure(&arrival, arrival_request.as_deref(), &e);
                         let content_rejected = is_card_content_rejected(&e);
                         log_card_rejection(
                             cards,
@@ -1073,6 +1128,7 @@ pub(super) async fn flush_card_locked(
                         true
                     }
                     Err(e) => {
+                        note_arrival_failure(&arrival, arrival_request.as_deref(), &e);
                         let content_rejected = is_card_content_rejected(&e);
                         log_card_rejection(
                             cards,
@@ -1302,13 +1358,8 @@ pub(super) async fn flush_card_locked(
                 // with (issue #671, ticket #672).
                 //
                 // This create carries the tail, so a question block it rendered
-                // has landed: settle the arrival HERE, synchronously, before the
-                // awaits below (issue #1103 — a cancellation between the create
-                // and its bookkeeping must not leave the freeze lifted over a
-                // box the card shows).
-                if carries_question {
-                    arrival.store(0, std::sync::atomic::Ordering::Relaxed);
-                }
+                // has landed: settle it before the awaits below (issue #1103).
+                settle_arrival_if_carried(carries_question, &arrival);
                 wrote = true;
                 {
                     if let Some(mut card) = cards.card(session_id).await {
@@ -1379,6 +1430,7 @@ pub(super) async fn flush_card_locked(
                 // next slice's card.
             }
             Err(e) => {
+                note_arrival_failure(&arrival, arrival_request.as_deref(), &e);
                 let content_rejected = is_card_content_rejected(&e);
                 log_card_rejection(
                     cards,
@@ -1571,7 +1623,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{drain_wake_watermark, note_cursor_write_failure, refusal_transition, staged_watermark_id};
+    use super::{
+        drain_wake_watermark, note_arrival_failure, note_cursor_write_failure, refusal_transition,
+        staged_watermark_id,
+    };
     use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
     use crate::bridge::chain::EndingKey;
     use crate::bridge::test_support::*;
@@ -1701,6 +1756,42 @@ mod tests {
                 "an ambiguous failure closes the freeze instead: {error}"
             );
         }
+    }
+
+    /// A definite refusal spends the arrival budget and, when it runs out, names
+    /// the armed block; an ambiguous failure closes the freeze at once (issue
+    /// #1103, gate rounds 4-5).
+    #[tokio::test]
+    async fn arrival_failure_booking_spends_on_refusal_and_closes_on_ambiguity() {
+        use crate::bridge::turn::state::BLOCK_ARRIVAL_RETRIES;
+        use crate::error::BridgeError;
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let rate = BridgeError::FeishuRateLimited {
+            code: 230429,
+            detail: "update error 230429".into(),
+        };
+        let arrival = AtomicU8::new(BLOCK_ARRIVAL_RETRIES);
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {
+            for _ in 0..BLOCK_ARRIVAL_RETRIES {
+                note_arrival_failure(&arrival, Some("que_named"), &rate);
+            }
+        })
+        .await;
+        assert_eq!(arrival.load(Ordering::Relaxed), 0, "the budget is spent");
+        assert!(
+            logs.contains("que_named"),
+            "the exhausted warning names the armed block: {logs}"
+        );
+
+        let ambiguous = BridgeError::Io(std::io::Error::other("connection reset"));
+        let arrival = AtomicU8::new(BLOCK_ARRIVAL_RETRIES);
+        note_arrival_failure(&arrival, Some("que_named"), &ambiguous);
+        assert_eq!(
+            arrival.load(Ordering::Relaxed),
+            0,
+            "an ambiguous failure may have landed the body: the freeze closes"
+        );
     }
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).

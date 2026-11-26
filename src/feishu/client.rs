@@ -99,7 +99,8 @@ fn is_rate_limit_code(code: i64) -> bool {
     RATE_LIMIT_CODES.iter().any(|limit| i64::from(*limit) == code)
 }
 
-/// `Some(code)` when a response body is the frequency limit.
+/// The body's business code, when that code is the frequency limit: the limit
+/// arrives inside the response, so a status check alone cannot see it.
 fn rate_limit_code(body: &str) -> Option<i64> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let code = v.get("code")?.as_i64()?;
