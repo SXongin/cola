@@ -180,10 +180,9 @@ and the map from the old numbers.
   block is written by exactly one write — the flow's arrival flush — so a card
   that renders its box and then never receives it has no control at all (a card
   titled 「等待你的回答」 showing only the prose). A question block's insert
-  arms a bounded retry (`BLOCK_ARRIVAL_RETRIES` attempts,
-  `owe_block_arrival` / `spend_block_arrival` / `settle_block_arrival`,
-  `src/bridge/turn/state.rs`) and `awaits_typed_answer` is false while one is
-  owed — the freeze guards a box the card **shows**, and this one is not there.
+  arms a bounded retry (`BLOCK_ARRIVAL_RETRIES` attempts, `owe_block_arrival` /
+  `block_arrival_handle` / `note_arrival_failure`, `src/bridge/turn/`) and
+  `awaits_typed_answer` is false while one is owed — the freeze guards a box the card **shows**, and this one is not there.
   A delivered body that renders the block settles it — in the write's own `Ok`
   arm, before any await (`block_arrival_handle`), so a cancellation cannot leave
   the freeze lifted over a box the card shows — and only a refusal that

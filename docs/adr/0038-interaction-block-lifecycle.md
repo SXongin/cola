@@ -469,8 +469,9 @@ refused arrival used to strand the block forever (live 2026-11-20: the header
 said 「等待你的回答」 and the card carried the question's prose with no
 controls). A question block's insert therefore arms
 `BLOCK_ARRIVAL_RETRIES` attempts (`owe_block_arrival`), `awaits_typed_answer()`
-is false while one is owed, each refused attempt spends one, and a delivered
-write settles the obligation (`settle_block_arrival`). A card already guarding
+is false while one is owed, only a refusal that proves nothing was written spends
+one, and the delivered write that carries the block settles the obligation in its
+own `Ok` arm (`block_arrival_handle`, before any await). A card already guarding
 a sibling question's box arms nothing. The freeze's rule is otherwise unchanged:
 a card that shows a box is never written by the render pass.
 

@@ -1847,24 +1847,39 @@ async fn a_second_question_arrival_keeps_the_freeze_for_a_live_typed_box() {
     seed_live_card(&app, "ses_test", "om_live").await;
     let cards = app.cards_handle();
 
-    for id in ["que_first", "que_second"] {
-        let mut request = question_request(id);
-        request.session_id = "ses_test".into();
-        assert!(
-            Turn::add_question(
-                &cards,
-                "ses_test",
-                &request,
-                "/work",
-                &crate::bridge::question::QuestionPaint::blank(1),
-                Some(1_000),
-            )
-            .await
-        );
-        // Each arrival's own flush lands it (the flow's out-of-band write is
-        // allowed while a box is open); only the *retry* is what must not.
-        Turn::flush_card(&cards, "ses_test").await;
-    }
+    let mut first = question_request("que_first");
+    first.session_id = "ses_test".into();
+    assert!(
+        Turn::add_question(
+            &cards,
+            "ses_test",
+            &first,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+            Some(1_000),
+        )
+        .await
+    );
+    // The first arrival lands, so its box is now the one the Host may be typing
+    // into.
+    Turn::flush_card(&cards, "ses_test").await;
+
+    // The second question arrives while that box is shown, and it gets no
+    // out-of-band flush of its own: only an armed retry would write it, which is
+    // exactly what must not happen here.
+    let mut second = question_request("que_second");
+    second.session_id = "ses_test".into();
+    assert!(
+        Turn::add_question(
+            &cards,
+            "ses_test",
+            &second,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+            Some(1_000),
+        )
+        .await
+    );
     let before = platform.updated_cards().await.len();
     Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
     assert_eq!(
