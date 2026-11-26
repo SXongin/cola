@@ -269,6 +269,12 @@ struct PendingEntry {
     /// and only while no newer write has replaced this state. Cleared by any
     /// later outcome.
     rate_limited: Option<(u64, Value)>,
+    /// How many accepted **keyed** state writes have superseded this card's
+    /// keyless payload (issue #1201). A keyless PATCH snapshots it before its
+    /// request and compares it when the outcome is observed: a keyed admission
+    /// during that write is newer, so the attempt's rate limit must not be
+    /// claimable afterwards.
+    keyed_state: u64,
     /// Failed retry attempts so far — the backoff exponent.
     attempts: u32,
     /// The earliest instant the next retry may go out (unless forced).
@@ -354,6 +360,7 @@ impl PendingEntry {
             attempts: 0,
             next_attempt: tokio::time::Instant::now(),
             rate_limited: None,
+            keyed_state: 0,
             lock,
             generation: 0,
             floor: 0,
@@ -375,10 +382,12 @@ impl PendingEntry {
     /// rate-limited claim record goes with it — a terminal flush may not claim a
     /// body the newer keyed write replaced (ADR-0115, issue #1201) — while the
     /// delivered sequences and failure memory, which the cursor reconcile still
-    /// reads, stay.
+    /// reads, stay. Bumps [`Self::keyed_state`] so a still-in-flight keyless
+    /// PATCH cannot recreate the claim when its outcome is observed.
     fn supersede_keyless_payload(&mut self) {
         self.card = None;
         self.rate_limited = None;
+        self.keyed_state += 1;
     }
 
     /// Whether this card's queue already owns `(generation, intent)` (spec
@@ -632,8 +641,11 @@ impl CardDelivery {
     /// than the stored one cannot re-register a superseded payload.
     ///
     /// The keyed queue lives in the same entry and is left untouched: the
-    /// sequence governs the keyless payload alone.
-    fn observe(&self, message_id: &str, seq: u64, card: &Value, result: &Result<()>) {
+    /// sequence governs the keyless payload alone. `keyed_state` is the entry's
+    /// [`PendingEntry::keyed_state`] snapshot taken when this PATCH started: a
+    /// keyed admission since then is newer than this write, so its rate limit
+    /// is not recorded as claimable (issue #1201).
+    fn observe(&self, message_id: &str, seq: u64, card: &Value, result: &Result<()>, keyed_state: u64) {
         let mut state = self.state.lock().unwrap();
         let newest = state.entries.get(message_id).is_none_or(|entry| entry.seq < seq);
         if !newest {
@@ -678,8 +690,12 @@ impl CardDelivery {
         // not queued automatically: a live slice's next render pass converges
         // on its own, and queueing a live-block arrival would let the
         // freeze-blind drain repaint a form someone is typing into (#917).
+        // A keyed admission since this PATCH started is NEWER than it (it
+        // superseded the keyless payload and bumped `keyed_state`), so the
+        // attempt must not become claimable behind the keyed state.
+        let keyed_interleaved = entry.keyed_state != keyed_state;
         entry.rate_limited = match result {
-            Err(e) if e.is_rate_limited() => Some((seq, card.clone())),
+            Err(e) if e.is_rate_limited() && !keyed_interleaved => Some((seq, card.clone())),
             _ => None,
         };
         if result.is_ok() {
@@ -1635,8 +1651,19 @@ impl Platform for CardDelivery {
         // newest-wins).
         let lock = self.card_lock(message_id);
         let _delivery = lock.lock().await;
+        // The keyed state this write starts under (issue #1201): a keyed
+        // admission while the PATCH is in flight is NEWER than it, so this
+        // attempt's frequency limit must not become claimable afterwards — the
+        // drain would replay this older body over the keyed state.
+        let keyed_state = self
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get(message_id)
+            .map_or(0, |entry| entry.keyed_state);
         let result = self.inner.update_message(message_id, card).await;
-        self.observe(message_id, seq, card, &result);
+        self.observe(message_id, seq, card, &result, keyed_state);
         result
     }
 
@@ -2838,6 +2865,41 @@ mod tests {
             "the keyed state write superseded the refused keyless attempt"
         );
         assert!(!delivery.pending("om_1"));
+    }
+
+    /// Issue #1201's second keyed timing: the keyed write is admitted while the
+    /// terminal PATCH is **in flight**, so admission clears the claim record
+    /// first and the PATCH's later outcome would recreate it. The observation
+    /// must not recreate a claim for a body the newer keyed state replaced.
+    #[tokio::test]
+    async fn a_keyed_write_admitted_during_the_patch_is_never_claimed_back() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let refused = serde_json::json!({ "body": "terminal" });
+        let keyed = serde_json::json!({ "body": "collected" });
+
+        inner.fail_next(Fail::RateLimited);
+        let (entered, release) = inner.park_next();
+        let patching = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let refused = refused.clone();
+            async move { delivery.update_message("om_1", &refused).await }
+        });
+        entered.notified().await;
+
+        // The keyed state write is admitted while the PATCH holds the card
+        // lock; its driver waits for that lock, then lands after the refusal.
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Settle, &keyed).await;
+
+        release.notify_one();
+        assert!(patching.await.unwrap().is_err());
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+
+        assert_eq!(
+            delivery.owe_rate_limited_write("om_1", &refused),
+            None,
+            "a keyed admission during the PATCH makes the older body unclaimable"
+        );
     }
 
     /// A non-recoverable HTTP status (a 4xx other than 408/429) is permanent:
