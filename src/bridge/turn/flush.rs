@@ -1687,8 +1687,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        drain_wake_watermark, note_arrival_failure, note_cursor_write_failure, refusal_transition,
-        staged_watermark_id,
+        drain_wake_watermark, ending_write_for_patch, note_arrival_failure, note_cursor_write_failure,
+        refusal_transition, staged_watermark_id,
     };
     use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
     use crate::bridge::chain::EndingKey;
@@ -1960,6 +1960,36 @@ mod tests {
         let (app, platform) = app_with_session().await;
         seed_live_card(&app, text).await;
         (app, platform)
+    }
+
+    /// Issue #1201's interleaving: a forced drain (a WS reconnect) can deliver
+    /// the claimed terminal body between the claim and the flush's ending read.
+    /// The payload's own failure memory must still answer for its sequence —
+    /// otherwise the ending reads `Failed` even though the body landed,
+    /// suppressing the notice and discarding the staged cursor.
+    #[tokio::test]
+    async fn a_claimed_terminal_write_delivered_before_the_ending_read_still_reads_owed() {
+        let (app, platform) = app_with_session().await;
+        let cards = app.cards_handle();
+        let delivery = cards.feishu.delivery();
+        let card = serde_json::json!({ "body": "terminal" });
+
+        platform.fail_update(UpdateFailure::RateLimited, 1);
+        assert!(cards.feishu.update_message("om_live", &card).await.is_err());
+        let seq = delivery
+            .owe_rate_limited_write("om_live", &card)
+            .expect("the terminal body is claimed as owed");
+
+        // The reconnect drain delivers it while the flush is still between the
+        // claim and its ending read.
+        delivery.drain_pending_card_updates(true).await;
+        assert!(delivery.card_write_delivered("om_live", seq));
+
+        assert_eq!(
+            ending_write_for_patch(&cards, "om_live", &card, false, false),
+            EndingWrite::Owed(seq),
+            "the delivered claim still answers for its own sequence (the notice gate resolves it to Delivered)"
+        );
     }
 
     /// A `230099` rejection flips the turn to the fenced fallback and the SAME
