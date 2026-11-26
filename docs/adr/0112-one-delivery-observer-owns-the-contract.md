@@ -1,5 +1,11 @@
 # One delivery observer owns the contract
 
+> **Amended by ADR-0116**: `DeliveryObserver` gains a parked form of the
+> frequency-limit claim (`owe_rate_limited_write_parked`) plus `release_card_write`,
+> so a proved-unsent body that may replace a card showing a typed answer is owed
+> but not delivered until the form resolves. The one-owner rule and the no-op's
+> answers below are unchanged.
+
 > **Amended by ADR-0115**: `DeliveryObserver` declares a twelfth required
 > method, `owe_rate_limited_write`, which claims a terminal body Feishu's
 > frequency limit proved unsent as the card's keyless Pending Card Update. The

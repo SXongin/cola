@@ -4509,14 +4509,13 @@ async fn a_rate_limited_live_split_prefix_stays_owed_and_converges() {
     );
 }
 
-/// Issue #1208, the safety half: the claim's retry is freeze-blind, so it must
-/// never run over a card that still renders an unanswered typed answer. A
-/// Supplement or pull can split a card whose form is on screen; if the prefix
-/// PATCH is refused, the form stays visible, and only this guard keeps the
-/// later drain retry from repainting the card and erasing what the Host typed
-/// (ADR-0038/0100, #917).
+/// Issue #1208, the safety half: the claim's drain retry is freeze-blind, so a
+/// finalized prefix that replaces a card still showing a typed answer is claimed
+/// but **parked**. The prefix is owed (the claim holds its sequence, so the old
+/// card converges once released), and no drain may repaint the box until the
+/// answer resolves it (ADR-0038/0100, #917; ADR-0116).
 #[tokio::test]
-async fn a_rate_limited_live_split_prefix_is_not_claimed_over_a_typed_form() {
+async fn a_typed_form_parks_the_prefix_retry_until_it_resolves() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -4542,21 +4541,46 @@ async fn a_rate_limited_live_split_prefix_is_not_claimed_over_a_typed_form() {
     platform.fail_update(UpdateFailure::RateLimited, ALWAYS);
     Turn::flush_card(&cards, "ses_live").await;
 
+    // The split continued on a new card, and the refused prefix is claimed on
+    // the OLD card — parked until the form resolves.
     assert!(
-        !app.core.feishu.delivery().has_pending_card_update("om_live"),
-        "a typed answer withholds the claim over the old card: {:?}",
+        !platform.replied_cards().await.is_empty(),
+        "the split sent its continuation: {:?}",
         platform.calls.lock().await
     );
-    // The form's own body stays the card's last delivered one — no later PATCH
-    // replaced it with the tail-less prefix.
-    let with_input = patches_to(&platform, "om_live")
-        .await
-        .into_iter()
-        .rfind(|card| !card_inputs(card).is_empty())
-        .expect("the form landed on the card");
     assert!(
-        card_text(&with_input).contains("备注一下"),
-        "the form the Host is typing into is untouched: {with_input}"
+        app.core.feishu.delivery().has_pending_card_update("om_live"),
+        "the refused prefix is claimed, not dropped: {:?}",
+        platform.calls.lock().await
+    );
+    // A forced drain must not repaint the box the Host is typing into.
+    let patches_before = patches_to(&platform, "om_live").await.len();
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
+    assert_eq!(
+        patches_to(&platform, "om_live").await.len(),
+        patches_before,
+        "the parked retry did not repaint the typed form: {:?}",
+        platform.calls.lock().await
+    );
+
+    // The answer resolves the form. The answer's flush releases the park and the
+    // drain delivers the prefix to the original card.
+    assert!(Turn::dismiss_interaction(&cards, "ses_live", "que_typed").await);
+    platform.clear_fail_update();
+    Turn::flush_card(&cards, "ses_live").await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
+    assert!(
+        !app.core.feishu.delivery().has_pending_card_update("om_live"),
+        "the released retry delivered the owed prefix"
+    );
+    let delivered = patches_to(&platform, "om_live")
+        .await
+        .last()
+        .cloned()
+        .expect("the old card received its owed prefix");
+    assert!(
+        card_text(&delivered).contains("很长的回答。") && card_inputs(&delivered).is_empty(),
+        "the converged prefix is the tail-less slice the user generated: {delivered}"
     );
 }
 

@@ -727,6 +727,10 @@ async fn discard_staged_cursor(
 /// queueing a live-block arrival would let the freeze-blind drain repaint a
 /// form the Host is typing into (#917).
 ///
+/// `hold` parks the retry (ADR-0116): the writer claims a body that replaces a
+/// card still showing an unanswered typed answer, so the drain must wait for
+/// the answer before repainting that box ([`release_held_prefix`]).
+///
 /// The claim requires the delivery layer to recognise this exact attempt as the
 /// card's newest (see
 /// [`crate::feishu::delivery::DeliveryObserver::owe_rate_limited_write`]); when
@@ -736,15 +740,19 @@ fn claim_rate_limited_unsent(
     card_id: &str,
     card: &serde_json::Value,
     claimable: bool,
+    hold: bool,
     error: &crate::error::BridgeError,
 ) -> bool {
-    claimable
-        && error.is_rate_limited()
-        && cards
-            .feishu
-            .delivery()
-            .owe_rate_limited_write(card_id, card)
-            .is_some()
+    if !claimable || !error.is_rate_limited() {
+        return false;
+    }
+    let delivery = cards.feishu.delivery();
+    if hold {
+        delivery.owe_rate_limited_write_parked(card_id, card)
+    } else {
+        delivery.owe_rate_limited_write(card_id, card)
+    }
+    .is_some()
 }
 
 /// Whether the card a finalized prefix replaces may still render a typed
@@ -758,6 +766,34 @@ async fn replaced_card_shows_typed_answer(cards: &CardsHandle, session_id: &str)
         .card(session_id)
         .await
         .is_some_and(|card| card.acc.has_open_typed_answer())
+}
+
+/// Remember the old card whose claimed prefix retry is parked (ADR-0116): the
+/// next flush that finds no open typed answer releases it. A chain may split
+/// more than once before the form resolves, so every parked card is kept.
+async fn park_held_prefix(cards: &CardsHandle, session_id: &str, card_id: &str, park: bool) {
+    if park
+        && let Some(mut card) = cards.card(session_id).await
+        && !card.held_prefixes.iter().any(|held| held == card_id)
+    {
+        card.held_prefixes.push(card_id.to_string());
+    }
+}
+
+/// Release every parked prefix retry once the card no longer renders a typed
+/// answer (ADR-0116): the drain may deliver the old cards' owed bodies now. Runs
+/// on every flush, so the answer's own settlement flush is the release trigger.
+async fn release_held_prefix(cards: &CardsHandle, session_id: &str) {
+    let Some(mut card) = cards.card(session_id).await else {
+        return;
+    };
+    if card.held_prefixes.is_empty() || card.acc.has_open_typed_answer() {
+        return;
+    }
+    for card_id in &card.held_prefixes {
+        cards.feishu.delivery().release_card_write(card_id);
+    }
+    card.held_prefixes.clear();
 }
 
 /// The flush machine proper, entered with the session's card-write lock
@@ -828,6 +864,9 @@ pub(super) async fn flush_card_locked(
             card.acc.reset_card_fallback();
         }
     }
+    // A parked prefix retry may be safe to release now (ADR-0116): the card's
+    // typed answer resolved since it was claimed.
+    release_held_prefix(cards, session_id).await;
     // The writes this flush issues, tracked for its answer (review, PR #595):
     // `wrote` is any delivered or owed write, `refused` any permanent refusal.
     // A refusal dominates; no write at all answers `Unwritten`.
@@ -1027,7 +1066,8 @@ pub(super) async fn flush_card_locked(
                         // retries it after the window instead of dropping the
                         // turn's last body and its notice (#1201). A live slice
                         // renders the tail and keeps its render-pass retry.
-                        let owed = claim_rate_limited_unsent(cards, &card_id, &built.card, terminal, &e);
+                        let owed =
+                            claim_rate_limited_unsent(cards, &card_id, &built.card, terminal, false, &e);
                         note_cursor_write_failure(
                             cards,
                             session_id,
@@ -1292,11 +1332,16 @@ pub(super) async fn flush_card_locked(
                             return FlushOutcome::Refused;
                         }
                         // A finalized prefix refused by the frequency limit is
-                        // proven unsent: claim it (#1201, #1208) unless the card it
-                        // replaces still shows a typed answer — the drain retry is
-                        // freeze-blind (#917).
-                        let claimable = !replaced_card_shows_typed_answer(cards, session_id).await;
-                        let owed = claim_rate_limited_unsent(cards, &card_id, &finalized.card, claimable, &e);
+                        // proven unsent, so claim it (#1201, #1208). Claiming
+                        // over a typed form parks the retry until the answer
+                        // (ADR-0116, #917). Register the card BEFORE the claim:
+                        // the registration awaits, the claim does not, so a
+                        // cancellation can never leave a parked entry with no
+                        // id to release.
+                        let hold = replaced_card_shows_typed_answer(cards, session_id).await;
+                        park_held_prefix(cards, session_id, &card_id, hold).await;
+                        let owed =
+                            claim_rate_limited_unsent(cards, &card_id, &finalized.card, true, hold, &e);
                         note_cursor_write_failure(
                             cards,
                             session_id,
@@ -1703,7 +1748,7 @@ mod tests {
 
     use super::{
         drain_wake_watermark, ending_write_for_patch, note_arrival_failure, note_cursor_write_failure,
-        refusal_transition, staged_watermark_id,
+        park_held_prefix, refusal_transition, release_held_prefix, staged_watermark_id,
     };
     use crate::backend::runs::{RunKey, TaskEnding, TaskEndingClass, TaskEndingState, TaskRunIdentity};
     use crate::bridge::chain::EndingKey;
@@ -1975,6 +2020,38 @@ mod tests {
         let (app, platform) = app_with_session().await;
         seed_live_card(&app, text).await;
         (app, platform)
+    }
+
+    /// Gate round 3: the parked id is registered BEFORE the claim. The
+    /// registration awaits and the claim does not, so a flush cancelled at that
+    /// await leaves an id a later flush can release — never a held queue entry
+    /// nobody can name.
+    #[tokio::test]
+    async fn a_parked_id_is_registered_before_the_claim_and_released_later() {
+        let (app, _platform) = app_with_live_card("").await;
+        let cards = app.cards_handle();
+        // Simulate the cancellation: the registration lands, the claim does not.
+        park_held_prefix(&cards, "ses_test", "om_live", true).await;
+        assert!(
+            cards
+                .card("ses_test")
+                .await
+                .expect("the session's card")
+                .held_prefixes
+                .iter()
+                .any(|id| id == "om_live"),
+            "the cancelled flush left the card nameable"
+        );
+        release_held_prefix(&cards, "ses_test").await;
+        assert!(
+            cards
+                .card("ses_test")
+                .await
+                .expect("the session's card")
+                .held_prefixes
+                .is_empty(),
+            "a later clean flush clears the registration"
+        );
     }
 
     /// Issue #1201's interleaving: a forced drain (a WS reconnect) can deliver

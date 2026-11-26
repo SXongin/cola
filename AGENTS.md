@@ -201,9 +201,11 @@ and the map from the old numbers.
   log it as a permanent refusal. That type is **not** made recoverable: the
   keyless drain retry does not read this freeze. The queue never takes a
   live-block arrival; it takes only a body that renders no tail — the
-  **ending's** own body, or a split's **finalized prefix**, and the latter only
-  while the old card renders no typed answer — which the flush claims
-  explicitly (`owe_rate_limited_write`, ADR-0115/0116, issues #1201/#1208).
+  **ending's** own body, or a split's **finalized prefix** — which the flush
+  claims explicitly (`owe_rate_limited_write`, ADR-0115/0116, issues
+  #1201/#1208). A claim over a card that may still show a typed answer is
+  **parked**: owed, but withheld from the drain until the answer resolves
+  (`release_card_write`), so no retry repaints the box.
 
   One user-initiated repaint is allowed while a box holds text: switching to
   another question (ADR-0100). It is a form **submit**, so the text arrives with
