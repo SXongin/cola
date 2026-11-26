@@ -471,10 +471,12 @@ impl PendingEntry {
 #[derive(Default)]
 struct State {
     entries: HashMap<String, PendingEntry>,
-    /// The most recent RECOVERABLE failure per card — `(seq, payload)` — the
-    /// exact write a failure note asks about (spec #561, review #569): a newer
-    /// write may replace `entries` before the note runs, and the note must
-    /// still learn whether that payload's own sequence delivered.
+    /// The most recent failure per card that may still deliver — a recoverable
+    /// failure, or a frequency limit that proves nothing was written and a
+    /// terminal flush may claim as owed (ADR-0115) — `(seq, payload)`: the exact
+    /// write a failure note asks about (spec #561, review #569). A newer write
+    /// may replace `entries` before the note runs, and the note must still learn
+    /// whether that payload's own sequence delivered.
     failed: HashMap<String, (u64, Value)>,
     /// One delivery lock per card while its entry lives — plus while any call
     /// still holds it. Every write to a message is serialized on it, so the
@@ -626,11 +628,21 @@ impl CardDelivery {
             return;
         }
         let recoverable = matches!(result, Err(e) if e.is_recoverable_card_write());
+        // A typed frequency limit is not queued by `observe`, but it is a
+        // DEFINITE non-delivery a terminal flush may claim as owed (ADR-0115,
+        // issue #1201). Remember it the same way as a recoverable failure: a
+        // forced drain can deliver the claimed payload before the flush reads
+        // its ending, and then only this payload's own sequence can tell the
+        // failure note (and the notice gate) that the body DID land.
+        let may_deliver = matches!(
+            result,
+            Err(e) if e.is_recoverable_card_write() || e.is_rate_limited()
+        );
         let age = {
             state.age += 1;
             state.age
         };
-        if recoverable {
+        if may_deliver {
             // Remember the exact write a failure note will ask about (spec
             // #561, review #569): a newer write may replace the entry before
             // the note runs, and the note must still be able to tell whether
@@ -2738,6 +2750,14 @@ mod tests {
             "a direct PATCH's rate limit is not queued on its own"
         );
 
+        // The claim is bound to the EXACT payload: a different body cannot
+        // claim this attempt, and the right one still can afterwards.
+        assert_eq!(
+            delivery.owe_rate_limited_write("om_1", &serde_json::json!({ "body": "other" })),
+            None,
+            "a different payload cannot claim the refused attempt"
+        );
+
         let seq = delivery
             .owe_rate_limited_write("om_1", &card)
             .expect("the refused attempt is claimable as owed");
@@ -2754,6 +2774,11 @@ mod tests {
         delivery.drain_pending_card_updates(true).await;
         assert!(!delivery.pending("om_1"));
         assert!(delivery.card_write_delivered("om_1", seq));
+        assert_eq!(
+            delivery.failed_card_write("om_1", &card),
+            Some(seq),
+            "a claim delivered before the ending read still answers for its own payload"
+        );
     }
 
     /// A rate-limited attempt is superseded by a newer write (ADR-0067's

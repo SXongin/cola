@@ -240,11 +240,13 @@ pub trait DeliveryObserver: Send + Sync {
     /// refused, or was superseded or evicted.
     fn card_write_delivered(&self, message_id: &str, seq: u64) -> bool;
 
-    /// The sequence of `message_id`'s most recent RECOVERABLE failure when the
-    /// payload it carried is exactly `card` (spec #561, review #569): the write
-    /// a failure note asks about even after a newer write — a cached repaint
-    /// that may omit this payload's delta — replaced the card's entry. `None`
-    /// when the newest failure carried another payload.
+    /// The sequence of `message_id`'s most recent failure that may still
+    /// deliver — a recoverable one, or a frequency limit a terminal flush may
+    /// claim as owed (ADR-0115) — when the payload it carried is exactly `card`
+    /// (spec #561, review #569): the write a failure note asks about even after
+    /// a newer write — a cached repaint that may omit this payload's delta —
+    /// replaced the card's entry. `None` when the newest such failure carried
+    /// another payload.
     fn failed_card_write(&self, message_id: &str, card: &Value) -> Option<u64>;
 
     /// The settled delivery verdict of `message_id`'s newest card write once
@@ -413,17 +415,15 @@ impl DeliveryObserver for CardDelivery {
     fn owe_rate_limited_write(&self, message_id: &str, card: &Value) -> Option<u64> {
         let mut state = self.state.lock().unwrap();
         let entry = state.entries.get_mut(message_id)?;
+        let (seq, payload) = entry.rate_limited.take()?;
         // Only the card's newest attempt, and only this exact payload: a later
-        // write has superseded it (ADR-0067's newest-wins), so claiming the
-        // older body would make the card converge backwards.
-        let claimable = entry
-            .rate_limited
-            .as_ref()
-            .is_some_and(|(seq, payload)| *seq == entry.seq && entry.card.is_none() && payload == card);
-        if !claimable {
+        // write has superseded it (ADR-0067's newest-wins), and claiming an
+        // older body would make the card converge backwards. A mismatch keeps
+        // the record for the caller that does hold the payload.
+        if entry.seq != seq || entry.card.is_some() || payload != *card {
+            entry.rate_limited = Some((seq, payload));
             return None;
         }
-        let (seq, payload) = entry.rate_limited.take()?;
         entry.card = Some(payload);
         entry.attempts = 0;
         entry.next_attempt = tokio::time::Instant::now() + self.limits.backoff_base;

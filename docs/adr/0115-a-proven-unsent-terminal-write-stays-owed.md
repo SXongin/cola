@@ -56,6 +56,13 @@ render.
    owed. A rate limit on the **drain's own retry** keeps the payload owed — the
    queue owns it now — instead of settling it as a permanent refusal and
    dropping the armed notice.
+5. **The refused attempt stays in the card's failure memory.** A forced drain (a
+   WS reconnect) can deliver the claimed body before the flush reads its ending;
+   the ending must then still answer for **that payload's own sequence**. The
+   limit's attempt is recorded exactly like a recoverable failure, so
+   `failed_card_write` + `card_write_delivered` confirm the staged cursor and
+   the notice gate resolves to `Delivered` instead of reading `Failed` over a
+   body that did land.
 
 **Invariant.** A terminal payload is either delivered or queued; a refusal that
 proves nothing was written never becomes a permanent failure. The Completion
