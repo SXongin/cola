@@ -167,6 +167,21 @@ pub trait DeliveryObserver: Send + Sync {
     /// returns the submission's completion ticket.
     async fn submit_ordered(&self, submission: KeyedSubmission<'_>) -> CardWriteTicket;
 
+    /// Claim a card write Feishu refused with its typed **frequency limit**
+    /// as the card's keyless Pending Card Update (issue #1201): the limit
+    /// proves nothing was written, so the exact payload may be retried once
+    /// the window clears. Returns the sequence its delivery will settle at —
+    /// the same attempt's sequence, so the Rendered Cursor and the Completion
+    /// Notice gates that already key on it need no new vocabulary.
+    ///
+    /// Only the card's most recent attempt may be claimed, and only while its
+    /// payload is exactly `card`: a later write has superseded it, and
+    /// re-queuing would resurrect an older body over what the card now holds
+    /// (ADR-0067's newest-wins). `None` when nothing was claimed — no queue
+    /// exists, the attempt is no longer the newest, or this card's last
+    /// refusal was not this payload's frequency limit.
+    fn owe_rate_limited_write(&self, message_id: &str, card: &Value) -> Option<u64>;
+
     /// Whether the keyed queue already **covers** `(generation, intent)` for
     /// `message_id` (spec #571): the generation is closed (a settle ended it),
     /// a `Stamp` at or below an accepted ending's generation is shadowed (the
@@ -286,6 +301,12 @@ impl DeliveryObserver for Unobserved {
         false
     }
 
+    fn owe_rate_limited_write(&self, _message_id: &str, _card: &Value) -> Option<u64> {
+        // No queue can hold the retry: leave the caller's refusal final, so it
+        // never claims an acceptance nothing will carry.
+        None
+    }
+
     fn keyed_ticket_await(&self) -> Duration {
         KEYED_TICKET_AWAIT
     }
@@ -387,6 +408,26 @@ impl DeliveryObserver for CardDelivery {
             .entries
             .get(message_id)
             .is_some_and(|entry| entry.covers(generation, intent))
+    }
+
+    fn owe_rate_limited_write(&self, message_id: &str, card: &Value) -> Option<u64> {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entries.get_mut(message_id)?;
+        // Only the card's newest attempt, and only this exact payload: a later
+        // write has superseded it (ADR-0067's newest-wins), so claiming the
+        // older body would make the card converge backwards.
+        let claimable = entry
+            .rate_limited
+            .as_ref()
+            .is_some_and(|(seq, payload)| *seq == entry.seq && entry.card.is_none() && payload == card);
+        if !claimable {
+            return None;
+        }
+        let (seq, payload) = entry.rate_limited.take()?;
+        entry.card = Some(payload);
+        entry.attempts = 0;
+        entry.next_attempt = tokio::time::Instant::now() + self.limits.backoff_base;
+        Some(seq)
     }
 
     fn keyed_ticket_await(&self) -> Duration {

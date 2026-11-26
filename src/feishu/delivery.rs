@@ -260,6 +260,15 @@ struct PendingEntry {
     /// payload — can never answer for an older one. Bounded oldest-first: a
     /// sequence no stage can still name ages out.
     delivered: VecDeque<u64>,
+    /// The card's most recent write, when Feishu refused it with its typed
+    /// **frequency limit** (`BridgeError::FeishuRateLimited`, issue #1201):
+    /// the sequence and the exact payload that was proven unsent. The limit is
+    /// not a recoverable failure, so it is not queued automatically — but a
+    /// terminal write the caller re-submits through
+    /// [`super::DeliveryObserver::owe_rate_limited_write`] may still claim it,
+    /// and only while no newer write has replaced this state. Cleared by any
+    /// later outcome.
+    rate_limited: Option<(u64, Value)>,
     /// Failed retry attempts so far — the backoff exponent.
     attempts: u32,
     /// The earliest instant the next retry may go out (unless forced).
@@ -344,6 +353,7 @@ impl PendingEntry {
             delivered: VecDeque::new(),
             attempts: 0,
             next_attempt: tokio::time::Instant::now(),
+            rate_limited: None,
             lock,
             generation: 0,
             floor: 0,
@@ -638,6 +648,16 @@ impl CardDelivery {
         entry.seq = seq;
         entry.attempts = 0;
         entry.age = age;
+        // A typed frequency limit is a DEFINITE non-delivery (issue #1201):
+        // remember this exact attempt so a terminal flush can claim it through
+        // `owe_rate_limited_write`, while any later outcome clears it. It is
+        // not queued automatically: a live slice's next render pass converges
+        // on its own, and queueing a live-block arrival would let the
+        // freeze-blind drain repaint a form someone is typing into (#917).
+        entry.rate_limited = match result {
+            Err(e) if e.is_rate_limited() => Some((seq, card.clone())),
+            _ => None,
+        };
         if result.is_ok() {
             Self::remember_delivered(&mut entry.delivered, seq);
         }
@@ -1375,7 +1395,11 @@ impl CardDelivery {
                     tracing::info!("pending card update for {message_id} delivered after {attempts} retries");
                 }
             }
-            Err(e) if e.is_recoverable_card_write() => {
+            // A queued payload the queue itself owes: a transport-class failure
+            // retries as before, and so does Feishu's frequency limit — the
+            // limit proved this attempt wrote nothing, and the queue (not the
+            // caller) now holds the retry (issue #1201).
+            Err(e) if e.is_recoverable_card_write() || e.is_rate_limited() => {
                 if let Some(current) = state.entries.get_mut(&message_id) {
                     current.attempts += 1;
                     current.next_attempt = tokio::time::Instant::now() + self.backoff(current.attempts);
@@ -1715,6 +1739,7 @@ mod tests {
     enum Fail {
         Transport,
         ContentRejected,
+        RateLimited,
         Http(u16),
     }
 
@@ -1795,6 +1820,10 @@ mod tests {
                 Some(Fail::ContentRejected) => Err(BridgeError::CardContentRejected {
                     code: 230099,
                     detail: "rejected".into(),
+                }),
+                Some(Fail::RateLimited) => Err(BridgeError::FeishuRateLimited {
+                    code: 230429,
+                    detail: "This operation triggers the frequency limit.".into(),
                 }),
                 Some(Fail::Http(status)) => Err(BridgeError::FeishuHttp {
                     status,
@@ -2690,6 +2719,68 @@ mod tests {
 
         delivery.drain_pending_card_updates(true).await;
         assert_eq!(inner.attempts().len(), 1, "nothing was retried");
+    }
+
+    /// A frequency limit is a DEFINITE non-delivery but not a queued retry: a
+    /// direct PATCH is never queued automatically (issue #1201). The caller
+    /// that owns the ending claims this exact attempt, the drain retries it,
+    /// and a second limit keeps it owed rather than settling it as final.
+    #[tokio::test]
+    async fn a_rate_limited_write_is_owed_only_when_the_caller_claims_it() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "terminal" });
+
+        inner.fail_next(Fail::RateLimited);
+        assert!(delivery.update_message("om_1", &card).await.is_err());
+        assert!(
+            !delivery.pending("om_1"),
+            "a direct PATCH's rate limit is not queued on its own"
+        );
+
+        let seq = delivery
+            .owe_rate_limited_write("om_1", &card)
+            .expect("the refused attempt is claimable as owed");
+        assert!(delivery.pending("om_1"));
+        assert_eq!(delivery.pending_card_write("om_1", &card), Some(seq));
+
+        // The drain's first retry hits the same limit: the queue still owes it
+        // (nothing was written), so it must not settle as a permanent refusal.
+        inner.fail_next(Fail::RateLimited);
+        delivery.drain_pending_card_updates(true).await;
+        assert!(delivery.pending("om_1"), "a limited retry stays owed");
+
+        // The window clears: the retry lands at the claimed sequence.
+        delivery.drain_pending_card_updates(true).await;
+        assert!(!delivery.pending("om_1"));
+        assert!(delivery.card_write_delivered("om_1", seq));
+    }
+
+    /// A rate-limited attempt is superseded by a newer write (ADR-0067's
+    /// newest-wins): the older payload must not be resurrected behind it, and
+    /// a newer successful write leaves nothing claimable.
+    #[tokio::test]
+    async fn a_newer_write_clears_a_rate_limited_attempt() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let old = serde_json::json!({ "body": "old" });
+        let new = serde_json::json!({ "body": "new" });
+
+        inner.fail_next(Fail::RateLimited);
+        assert!(delivery.update_message("om_1", &old).await.is_err());
+        delivery.update_message("om_1", &new).await.unwrap();
+
+        assert_eq!(
+            delivery.owe_rate_limited_write("om_1", &old),
+            None,
+            "the superseded payload is not claimable"
+        );
+        assert_eq!(
+            delivery.owe_rate_limited_write("om_1", &new),
+            None,
+            "a delivered write has nothing to claim"
+        );
+        assert!(!delivery.pending("om_1"));
     }
 
     /// A non-recoverable HTTP status (a 4xx other than 408/429) is permanent:
