@@ -104,7 +104,6 @@ fn body_carries_question(rendered: &[RenderedBlock]) -> bool {
 fn note_arrival_failure(
     open: &std::sync::atomic::AtomicBool,
     deadline: &std::sync::atomic::AtomicU64,
-    request: Option<&str>,
     error: &crate::error::BridgeError,
     was_open: bool,
 ) {
@@ -113,12 +112,9 @@ fn note_arrival_failure(
         return;
     }
     if crate::bridge::turn::state::arrival_window_expired(deadline) {
-        // Name the block: with several Sessions refused in one window this line
-        // is the only pointer to the undelivered one (ADR-0114).
-        tracing::warn!(
-            "{}",
-            crate::bridge::turn::state::block_arrival_expired_line(request.unwrap_or("-"))
-        );
+        // The expiry itself is reported once by the predicate that closes the
+        // freeze ([`StreamAccumulator::block_arrival_owed`]), which also runs on
+        // the ticks where no write is attempted.
         return;
     }
     open.store(true, Ordering::Relaxed);
@@ -129,7 +125,6 @@ fn note_arrival_failure(
 struct ArrivalWindow {
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
     deadline: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    request: Option<String>,
 }
 
 impl ArrivalWindow {
@@ -141,13 +136,7 @@ impl ArrivalWindow {
 
     /// Book the failed write (see [`note_arrival_failure`]).
     fn refused(&self, error: &crate::error::BridgeError, was_open: bool) {
-        note_arrival_failure(
-            &self.open,
-            &self.deadline,
-            self.request.as_deref(),
-            error,
-            was_open,
-        );
+        note_arrival_failure(&self.open, &self.deadline, error, was_open);
     }
 }
 
@@ -873,7 +862,6 @@ pub(super) async fn flush_card_locked(
             let arrival = ArrivalWindow {
                 open: arrival_open,
                 deadline: arrival_deadline,
-                request: card.acc.block_arrival_request_id().map(str::to_string),
             };
             let carries_question = body_carries_question(&rendered);
             (
@@ -1734,12 +1722,11 @@ mod tests {
         );
     }
 
-    /// The arrival retry is spent only by a refusal that PROVES nothing was
-    /// written (issue #1103, gate round 4): an ambiguous failure may have
-    /// landed the body, so the freeze closes over the card instead of leaving a
-    /// window where the box is visible and the next pass could repaint it.
+    /// Only a refusal that PROVES nothing was written may re-open the window
+    /// (issue #1103): the allow-list is the flush's own refusal surface, and
+    /// everything else may have landed the body.
     #[test]
-    fn only_a_definite_refusal_spends_the_arrival_retry() {
+    fn only_a_definite_refusal_proves_nothing_was_written() {
         use crate::error::BridgeError;
         let definite = [
             BridgeError::CardContentRejected {
@@ -1768,6 +1755,7 @@ mod tests {
             );
         }
         let ambiguous = [
+            BridgeError::FeishuParse("parse update message response: EOF".into()),
             BridgeError::Io(std::io::Error::other("connection reset")),
             BridgeError::FeishuHttp {
                 status: 503,
@@ -1789,13 +1777,11 @@ mod tests {
         }
     }
 
-    /// The arrival window's failure booking (issue #1103, gate rounds 4-6):
-    /// the write closes it, only a definite refusal re-opens it, an ambiguous
-    /// failure leaves it closed, and an expired window stops re-opening it and
-    /// names the block.
-    #[tokio::test]
-    async fn arrival_failure_booking_reopens_only_for_a_definite_refusal() {
-        use crate::bridge::turn::state::{block_arrival_expired_line, now_ms};
+    /// A write closes the window before it starts, and a refusal that proves
+    /// nothing was written re-opens it (issue #1103).
+    #[test]
+    fn a_definite_refusal_reopens_the_arrival_window() {
+        use crate::bridge::turn::state::now_ms;
         use crate::error::BridgeError;
         use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1804,40 +1790,46 @@ mod tests {
             detail: "update error 230429".into(),
         };
         let deadline = AtomicU64::new(now_ms() + 60_000);
-
         let open = AtomicBool::new(true);
-        let was_open = super::close_arrival_window(&open);
-        assert!(
-            was_open && !open.load(Ordering::Relaxed),
-            "the write closes the window"
-        );
-        note_arrival_failure(&open, &deadline, Some("que_named"), &rate, was_open);
-        assert!(
-            open.load(Ordering::Relaxed),
-            "a definite refusal re-opens the window"
-        );
 
-        let open = AtomicBool::new(true);
-        let ambiguous = BridgeError::Io(std::io::Error::other("connection reset"));
         let was_open = super::close_arrival_window(&open);
-        note_arrival_failure(&open, &deadline, Some("que_named"), &ambiguous, was_open);
-        assert!(
-            !open.load(Ordering::Relaxed),
-            "an ambiguous failure may have landed the body: the freeze stays engaged"
-        );
+        assert!(was_open, "the write finds the window open");
+        assert!(!open.load(Ordering::Relaxed), "and closes it before writing");
 
-        // An expired window cannot re-open, and its refusal names the block.
-        let expired = AtomicU64::new(0);
-        let open = AtomicBool::new(true);
-        let was_open = super::close_arrival_window(&open);
-        let (_, logs) = crate::bridge::test_support::capture_logs(async {}).await;
-        let _ = logs;
-        note_arrival_failure(&open, &expired, Some("que_named"), &rate, was_open);
-        assert!(!open.load(Ordering::Relaxed), "the window is spent");
-        assert!(
-            block_arrival_expired_line("que_named").contains("que_named"),
-            "the expiry line names the armed block"
-        );
+        note_arrival_failure(&open, &deadline, &rate, was_open);
+        assert!(open.load(Ordering::Relaxed), "a definite refusal re-opens it");
+    }
+
+    /// An ambiguous failure leaves the window closed, because the body may have
+    /// landed: the freeze must stay engaged over a box the card could show
+    /// (issue #1103). A body this build could not parse is one of those.
+    #[test]
+    fn an_ambiguous_failure_leaves_the_arrival_window_closed() {
+        use crate::bridge::turn::state::now_ms;
+        use crate::error::BridgeError;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let deadline = AtomicU64::new(now_ms() + 60_000);
+        for error in [
+            BridgeError::Io(std::io::Error::other("connection reset")),
+            BridgeError::FeishuHttp {
+                status: 408,
+                detail: "timeout".into(),
+            },
+            BridgeError::FeishuHttp {
+                status: 503,
+                detail: "unavailable".into(),
+            },
+            BridgeError::FeishuParse("parse update message response: EOF".into()),
+        ] {
+            let open = AtomicBool::new(true);
+            let was_open = super::close_arrival_window(&open);
+            note_arrival_failure(&open, &deadline, &error, was_open);
+            assert!(
+                !open.load(Ordering::Relaxed),
+                "an ambiguous failure keeps the freeze engaged: {error}"
+            );
+        }
     }
 
     /// The run one test's synthetic retirement belongs to (ADR-0080).

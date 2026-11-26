@@ -86,11 +86,15 @@ fn is_card_content_rejection(code: i64) -> bool {
     code == 230099
 }
 
+/// The response body's business code, when it carries one.
+fn body_code(body: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("code")?.as_i64()
+}
+
 /// `Some(code)` when a response body is a card-content rejection.
 fn rejection_code(body: &str) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let code = v.get("code")?.as_i64()?;
-    is_card_content_rejection(code).then_some(code)
+    body_code(body).filter(|code| is_card_content_rejection(*code))
 }
 
 /// Whether `code` is the per-message frequency limit (see
@@ -102,9 +106,7 @@ fn is_rate_limit_code(code: i64) -> bool {
 /// The body's business code, when that code is the frequency limit: the limit
 /// arrives inside the response, so a status check alone cannot see it.
 fn rate_limit_code(body: &str) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let code = v.get("code")?.as_i64()?;
-    is_rate_limit_code(code).then_some(code)
+    body_code(body).filter(|code| is_rate_limit_code(*code))
 }
 
 /// Build the error for a non-zero Feishu API `code`, typing card-content
@@ -132,7 +134,12 @@ fn api_error(prefix: &str, code: i64, msg: &str) -> crate::error::BridgeError {
 /// success-shaped body can never read as success.
 fn parse_json<T: serde::de::DeserializeOwned>(text: &str, what: &str) -> crate::error::Result<T> {
     serde_json::from_str(text).map_err(|e| {
-        crate::error::BridgeError::Feishu(format!("parse {what}: {e} — body: {}", body_snippet(text, 200)))
+        // Its own variant: a body we could not read may belong to a request that
+        // WAS applied, so it must never be read as a refusal (issue #1103).
+        crate::error::BridgeError::FeishuParse(format!(
+            "parse {what}: {e} — body: {}",
+            body_snippet(text, 200)
+        ))
     })
 }
 
@@ -1495,8 +1502,10 @@ mod tests {
         match err {
             crate::error::BridgeError::Feishu(message) => message,
             // The HTTP-status variant carries the same `"<what> HTTP <status>: <body>"`
-            // detail; both spellings are "a Feishu error" to these tests.
+            // detail, and a body this build cannot decode has its own variant
+            // (issue #1103); all three spellings are "a Feishu error" here.
             crate::error::BridgeError::FeishuHttp { detail, .. } => detail,
+            crate::error::BridgeError::FeishuParse(detail) => detail,
             other => panic!("expected a Feishu error, got: {other:?}"),
         }
     }
@@ -1807,6 +1816,35 @@ mod tests {
                 crate::error::BridgeError::CardContentRejected { code: 230099, .. }
             ),
             "a 230099 rejection must be typed: {err}"
+        );
+    }
+
+    /// A 2xx whose body this build cannot decode is its own error, never a
+    /// refusal: Feishu may have applied the PATCH before the body broke, so the
+    /// flush must not read it as proof that nothing was written (issue #1103).
+    #[tokio::test]
+    async fn update_message_types_a_malformed_success_body_as_a_parse_error() {
+        let (server, client) = wire_client().await;
+        server.route_raw(
+            "PATCH",
+            "/open-apis/im/v1/messages/om_42",
+            200,
+            "text/html",
+            "<html>gateway</html>",
+        );
+
+        let err = client
+            .update_message("om_42", &serde_json::json!({"elements": []}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::error::BridgeError::FeishuParse(_)),
+            "a malformed 200 body must not read as a refusal: {err:?}"
+        );
+        assert!(
+            !err.is_rate_limited(),
+            "and is not a rate limit, so nothing may retry on it"
         );
     }
 

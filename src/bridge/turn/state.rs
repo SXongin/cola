@@ -1327,6 +1327,9 @@ pub(super) struct StreamAccumulator {
     /// clones: they name facts about the CARD, not about the accumulator.
     block_arrival_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
     block_arrival_deadline_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set once the expiry has been reported, so the predicate warns exactly
+    /// once per window instead of on every tick that reads it.
+    block_arrival_expiry_reported: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
@@ -3787,8 +3790,8 @@ impl StreamAccumulator {
     /// card at all (issue #1103), so its box holds nothing and the freeze must
     /// not guard it: the block's arrival write is its only writer, and standing
     /// the later passes down would leave a card that says it waits for an
-    /// answer no one can give. [`Self::block_arrival_retries`] keeps that
-    /// carve-out bounded.
+    /// answer no one can give. [`Self::block_arrival_owed`] keeps that carve-out
+    /// bounded to the window armed by [`Self::owe_block_arrival`].
     pub(super) fn awaits_typed_answer(&self) -> bool {
         !self.block_arrival_owed()
             && self.interactions.iter().any(|block| match block {
@@ -3808,6 +3811,8 @@ impl StreamAccumulator {
         );
         self.block_arrival_open
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.block_arrival_expiry_reported
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.block_arrival_request = Some(request_id.to_string());
     }
 
@@ -3826,22 +3831,26 @@ impl StreamAccumulator {
         )
     }
 
-    /// The request the arrival window was armed for, so the flush's
-    /// synchronous failure bookkeeping can name it without taking this
-    /// accumulator's lock (issue #1103).
-    pub(super) fn block_arrival_request_id(&self) -> Option<&str> {
-        self.block_arrival_request.as_deref()
-    }
-
     /// Whether a block's arrival is still owed a retry. A second block inserted
-    /// during that window joins the SAME budget instead of re-arming it, so a
-    /// stream of questions cannot keep the freeze lifted indefinitely.
+    /// during the window joins it instead of re-arming it, so a stream of
+    /// questions cannot keep the freeze lifted indefinitely. Expiry is reported
+    /// here, once: the freeze it engages stands the render pass down, so no write
+    /// runs afterwards to report it.
     pub(super) fn block_arrival_owed(&self) -> bool {
-        self.block_arrival_open.load(std::sync::atomic::Ordering::Relaxed)
-            && now_ms()
-                < self
-                    .block_arrival_deadline_ms
-                    .load(std::sync::atomic::Ordering::Relaxed)
+        use std::sync::atomic::Ordering;
+        if !self.block_arrival_open.load(Ordering::Relaxed) {
+            return false;
+        }
+        if now_ms() < self.block_arrival_deadline_ms.load(Ordering::Relaxed) {
+            return true;
+        }
+        if !self.block_arrival_expiry_reported.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "{}",
+                block_arrival_expired_line(self.block_arrival_request.as_deref().unwrap_or("-"))
+            );
+        }
+        false
     }
 
     /// Progress inputs for the header (ADR-0014): which request kinds await the
@@ -8928,6 +8937,64 @@ mod tests {
         assert!(
             acc.awaits_typed_answer(),
             "an expired window hands the card back to the freeze, never to a repaint loop"
+        );
+    }
+
+    /// When the window expires, the predicate that closes the freeze reports it
+    /// once, naming the block (issue #1103): no write runs after that point, so
+    /// this is the only place the expiry can be observed.
+    #[tokio::test]
+    async fn an_expired_arrival_window_warns_once_and_names_the_block() {
+        use std::sync::atomic::Ordering;
+        let block = |id: &str| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: id.into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "备注?".into(),
+                    header: "备注".into(),
+                    kind: crate::backend::types::FormFieldKind::String,
+                    custom: Some(true),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![false],
+                open: 0,
+                drafts: vec![String::new()],
+                asked_at: None,
+            })
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(block("que_first"));
+        acc.add_interaction(block("que_named"));
+        acc.owe_block_arrival("que_named");
+        let (_, deadline) = acc.block_arrival_handle();
+        deadline.store(0, Ordering::Relaxed);
+
+        // Two reads: the freeze is engaged both times, the warning fires once.
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {
+            assert!(
+                acc.awaits_typed_answer(),
+                "the expired window hands the card to the freeze"
+            );
+            assert!(acc.awaits_typed_answer(), "and keeps it there");
+        })
+        .await;
+        assert_eq!(
+            logs.matches("still undelivered").count(),
+            1,
+            "the expiry is reported once: {logs}"
+        );
+        assert!(
+            logs.contains("que_named"),
+            "and names the block the window was armed for: {logs}"
+        );
+        assert!(
+            !logs.contains("que_first"),
+            "not merely the first question on the card: {logs}"
         );
     }
 

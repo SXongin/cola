@@ -25,6 +25,13 @@ pub enum BridgeError {
     #[error("feishu error: {detail}")]
     FeishuHttp { status: u16, detail: String },
 
+    /// A Feishu response body this build could not decode. The request may
+    /// still have been **applied** — a 2xx whose body is malformed says nothing
+    /// about the write — so a caller must read it as ambiguous, never as proof
+    /// that nothing was written (issue #1103).
+    #[error("feishu response parse error: {0}")]
+    FeishuParse(String),
+
     /// Feishu refused a message write with its **frequency limit** — the
     /// per-message update window, reported as a business code inside the
     /// response body (`230020` "Update the single messages too frequently",

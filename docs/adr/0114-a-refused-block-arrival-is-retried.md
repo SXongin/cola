@@ -66,9 +66,11 @@ Re-opening is an **allow-list**, because only an answer Feishu itself returned
 proves the body was not written: a typed content rejection, a typed frequency
 limit, a business refusal, or a 4xx other than 408. Everything else — transport,
 timeout, 5xx, a 408, and a 2xx whose body failed to parse *after* the PATCH was
-applied — is read as "may have landed" and leaves the freeze closed. When the
-window expires with the block still owed, the card keeps its previous body and a
-WARN names the request the window was armed for.
+applied (typed `FeishuParse`, never a business refusal) — is read as "may have
+landed" and leaves the freeze closed. When the window expires with the block
+still owed, the card keeps its previous body and the predicate that closes the
+freeze reports the expiry once, naming the request the window was armed for (no
+write runs after that point).
 
 **3. Typed text wins over a sibling block.** An insertion that lands on a card
 already guarding another question's box arms nothing: the flow's own out-of-band
