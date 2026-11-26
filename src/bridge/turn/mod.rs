@@ -5288,6 +5288,15 @@ impl Turn {
             .await
     }
 
+    /// Resolve a block without the flow — the answer's own settlement flush is
+    /// the test's next step (ADR-0100).
+    pub(crate) async fn dismiss_interaction(cards: &CardsHandle, session_id: &str, request_id: &str) -> bool {
+        match cards.card(session_id).await {
+            Some(mut card) => card.acc.dismiss_interaction(request_id),
+            None => false,
+        }
+    }
+
     /// Whether any card carries an Interaction Receipt starting with `prefix`.
     pub(crate) async fn has_receipt_prefix(cards: &CardsHandle, prefix: &str) -> bool {
         cards

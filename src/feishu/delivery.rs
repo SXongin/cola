@@ -253,6 +253,13 @@ struct PendingEntry {
     seq: u64,
     /// The undelivered newest card JSON; `None` for a settled tombstone.
     card: Option<Value>,
+    /// This owed payload's retry is **parked** (ADR-0116, issues #1208/#917):
+    /// the claim is recorded (its sequence still answers the cursor and notice
+    /// gates), but the drain must not deliver it while the card it replaces may
+    /// show an unanswered typed answer. Only
+    /// [`super::DeliveryObserver::release_card_write`] — or a newer write, which
+    /// replaces the payload and clears the park — lets it out.
+    held: bool,
     /// The exact sequences PROVEN delivered for this card (spec #561, review
     /// #569): a successful write adds its own sequence, and a drain retry adds
     /// the payload's. A confirmation asks whether ITS sequence is in here, so
@@ -356,6 +363,7 @@ impl PendingEntry {
         Self {
             seq: 0,
             card: None,
+            held: false,
             delivered: VecDeque::new(),
             attempts: 0,
             next_attempt: tokio::time::Instant::now(),
@@ -386,6 +394,8 @@ impl PendingEntry {
     /// PATCH cannot recreate the claim when its outcome is observed.
     fn supersede_keyless_payload(&mut self) {
         self.card = None;
+        // A parked retry goes with the payload it carried (ADR-0116).
+        self.held = false;
         self.rate_limited = None;
         self.keyed_state += 1;
     }
@@ -684,6 +694,9 @@ impl CardDelivery {
         entry.seq = seq;
         entry.attempts = 0;
         entry.age = age;
+        // Any new write supersedes a parked claim: its payload is no longer the
+        // card's owed body (ADR-0067's newest-wins, ADR-0116).
+        entry.held = false;
         // A typed frequency limit is a DEFINITE non-delivery (issue #1201):
         // remember this exact attempt so a tail-less flush can claim it through
         // `owe_rate_limited_write`, while any later outcome clears it. It is
@@ -2763,6 +2776,71 @@ mod tests {
 
         delivery.drain_pending_card_updates(true).await;
         assert_eq!(inner.attempts().len(), 1, "nothing was retried");
+    }
+
+    /// Issue #1208: a claim whose card may still show a typed answer is
+    /// **parked**. Its sequence is owed (the cursor and notice gates see it),
+    /// but the drain skips it — even forced — until `release_card_write`, so a
+    /// freeze-blind retry can never repaint the box (#917).
+    #[tokio::test]
+    async fn a_parked_claim_is_skipped_by_the_drain_until_released() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "prefix" });
+
+        inner.fail_next(Fail::RateLimited);
+        assert!(delivery.update_message("om_1", &card).await.is_err());
+        let seq = delivery
+            .owe_rate_limited_write_parked("om_1", &card)
+            .expect("the refused attempt is claimed and parked");
+        assert!(delivery.pending("om_1"));
+
+        delivery.drain_pending_card_updates(true).await;
+        assert!(delivery.pending("om_1"), "a forced drain skips a parked claim");
+        assert!(!delivery.card_write_delivered("om_1", seq));
+
+        assert!(delivery.release_card_write("om_1"), "the park is released");
+        assert!(
+            !delivery.release_card_write("om_1"),
+            "releasing an unparked entry is a no-op"
+        );
+        delivery.drain_pending_card_updates(true).await;
+        assert!(!delivery.pending("om_1"), "the released claim delivers");
+        assert!(delivery.card_write_delivered("om_1", seq));
+    }
+
+    /// A newer write supersedes a parked claim (ADR-0067's newest-wins): the
+    /// parked payload can never be resurrected over what the card now holds,
+    /// and the drain has nothing left to send for it.
+    #[tokio::test]
+    async fn a_newer_write_clears_a_parked_claim() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let card = serde_json::json!({ "body": "prefix" });
+
+        inner.fail_next(Fail::RateLimited);
+        assert!(delivery.update_message("om_1", &card).await.is_err());
+        let seq = delivery
+            .owe_rate_limited_write_parked("om_1", &card)
+            .expect("the attempt is parked");
+        assert!(delivery.pending("om_1"));
+
+        // A direct write lands a newer body: the parked payload settles with it.
+        delivery
+            .update_message("om_1", &serde_json::json!({ "body": "newer" }))
+            .await
+            .expect("the newer write lands");
+        assert!(!delivery.pending("om_1"));
+        assert!(
+            !delivery.release_card_write("om_1"),
+            "there is no park left to release"
+        );
+        assert!(!delivery.card_write_delivered("om_1", seq));
+
+        // Nothing is retried over the newer body.
+        let attempts = inner.attempts().len();
+        delivery.drain_pending_card_updates(true).await;
+        assert_eq!(inner.attempts().len(), attempts);
     }
 
     /// A frequency limit is a DEFINITE non-delivery but not a queued retry: a

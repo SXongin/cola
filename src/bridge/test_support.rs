@@ -947,6 +947,14 @@ impl feishu::delivery::DeliveryObserver for RecordingPlatform {
         feishu::delivery::UNOBSERVED.owe_rate_limited_write(message_id, card)
     }
 
+    fn owe_rate_limited_write_parked(&self, message_id: &str, card: &serde_json::Value) -> Option<u64> {
+        feishu::delivery::UNOBSERVED.owe_rate_limited_write_parked(message_id, card)
+    }
+
+    fn release_card_write(&self, message_id: &str) -> bool {
+        feishu::delivery::UNOBSERVED.release_card_write(message_id)
+    }
+
     fn keyed_ticket_await(&self) -> std::time::Duration {
         *self.keyed_ticket_await.lock().unwrap()
     }

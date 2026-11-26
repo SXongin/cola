@@ -182,6 +182,20 @@ pub trait DeliveryObserver: Send + Sync {
     /// refusal was not this payload's frequency limit.
     fn owe_rate_limited_write(&self, message_id: &str, card: &Value) -> Option<u64>;
 
+    /// [`Self::owe_rate_limited_write`] with the retry **parked** (issues
+    /// #1208, #917): the payload is claimed — the Rendered Cursor and notice
+    /// gates still key on the same sequence — but the drain must not deliver it
+    /// until [`Self::release_card_write`]. The writer parks a body that replaces
+    /// a card still showing an unanswered typed answer: the refusal left that
+    /// form on screen, and a freeze-blind repaint would erase the Host's
+    /// client-only text. A newer write to the card clears the park with the
+    /// payload (ADR-0067's newest-wins).
+    fn owe_rate_limited_write_parked(&self, message_id: &str, card: &Value) -> Option<u64>;
+
+    /// Release a parked claim (see [`Self::owe_rate_limited_write_parked`]): the
+    /// next drain may deliver it. Answers whether a parked claim was released.
+    fn release_card_write(&self, message_id: &str) -> bool;
+
     /// Whether the keyed queue already **covers** `(generation, intent)` for
     /// `message_id` (spec #571): the generation is closed (a settle ended it),
     /// a `Stamp` at or below an accepted ending's generation is shadowed (the
@@ -309,6 +323,15 @@ impl DeliveryObserver for Unobserved {
         None
     }
 
+    fn owe_rate_limited_write_parked(&self, _message_id: &str, _card: &Value) -> Option<u64> {
+        // No queue exists, so a park would never be released or delivered.
+        None
+    }
+
+    fn release_card_write(&self, _message_id: &str) -> bool {
+        false
+    }
+
     fn keyed_ticket_await(&self) -> Duration {
         KEYED_TICKET_AWAIT
     }
@@ -363,6 +386,31 @@ impl DeliveryObserver for Unobserved {
     }
 }
 
+impl CardDelivery {
+    /// The shared claim body (ADR-0115, #1201): take this card's newest typed
+    /// frequency-limit attempt when it is exactly `card`, and queue it as the
+    /// keyless Pending Card Update — parked (`held`) when the writer says the
+    /// card may still show a typed answer (ADR-0116, #1208).
+    fn claim_rate_limited(&self, message_id: &str, card: &Value, held: bool) -> Option<u64> {
+        let mut state = self.state.lock().unwrap();
+        let entry = state.entries.get_mut(message_id)?;
+        let (seq, payload) = entry.rate_limited.take()?;
+        // Only the card's newest attempt, and only this exact payload: a later
+        // write has superseded it (ADR-0067's newest-wins), and claiming an
+        // older body would make the card converge backwards. A mismatch keeps
+        // the record for the caller that does hold the payload.
+        if entry.seq != seq || entry.card.is_some() || payload != *card {
+            entry.rate_limited = Some((seq, payload));
+            return None;
+        }
+        entry.card = Some(payload);
+        entry.held = held;
+        entry.attempts = 0;
+        entry.next_attempt = tokio::time::Instant::now() + self.limits.backoff_base;
+        Some(seq)
+    }
+}
+
 #[async_trait]
 impl DeliveryObserver for CardDelivery {
     async fn submit_ordered(&self, submission: KeyedSubmission<'_>) -> CardWriteTicket {
@@ -413,21 +461,24 @@ impl DeliveryObserver for CardDelivery {
     }
 
     fn owe_rate_limited_write(&self, message_id: &str, card: &Value) -> Option<u64> {
+        self.claim_rate_limited(message_id, card, false)
+    }
+
+    fn owe_rate_limited_write_parked(&self, message_id: &str, card: &Value) -> Option<u64> {
+        self.claim_rate_limited(message_id, card, true)
+    }
+
+    fn release_card_write(&self, message_id: &str) -> bool {
         let mut state = self.state.lock().unwrap();
-        let entry = state.entries.get_mut(message_id)?;
-        let (seq, payload) = entry.rate_limited.take()?;
-        // Only the card's newest attempt, and only this exact payload: a later
-        // write has superseded it (ADR-0067's newest-wins), and claiming an
-        // older body would make the card converge backwards. A mismatch keeps
-        // the record for the caller that does hold the payload.
-        if entry.seq != seq || entry.card.is_some() || payload != *card {
-            entry.rate_limited = Some((seq, payload));
-            return None;
+        let Some(entry) = state.entries.get_mut(message_id) else {
+            return false;
+        };
+        if !entry.held {
+            return false;
         }
-        entry.card = Some(payload);
-        entry.attempts = 0;
-        entry.next_attempt = tokio::time::Instant::now() + self.limits.backoff_base;
-        Some(seq)
+        entry.held = false;
+        entry.next_attempt = tokio::time::Instant::now();
+        true
     }
 
     fn keyed_ticket_await(&self) -> Duration {
@@ -471,7 +522,9 @@ impl DeliveryObserver for CardDelivery {
             state
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.card.is_some() && (force || entry.next_attempt <= now))
+                .filter(|(_, entry)| {
+                    !entry.held && entry.card.is_some() && (force || entry.next_attempt <= now)
+                })
                 .map(|(message_id, entry)| KeylessRetry {
                     message_id: message_id.clone(),
                     card: entry.card.clone().expect("filtered to a pending payload"),

@@ -851,6 +851,11 @@ pub struct CardSession {
     /// that exhausted the chain bound — or died between a finalize and its
     /// continuation — resumes the chain instead of losing the slice it sent.
     pub(super) card_is_live: bool,
+    /// The card messages whose proved-unsent prefix retries are **parked**
+    /// until this card no longer renders a typed answer (ADR-0116, #1208): the
+    /// flush claims each (so it converges) but the drain must not repaint the
+    /// box. The next flush that finds no open typed answer releases them.
+    pub(super) held_prefixes: Vec<String>,
     /// The chain's identity, handed out fresh by [`CardSession::new`]. A
     /// replacing session (a new Turn, an external arm, a Wake continuation
     /// armed from scratch) gets a new one, so a render loop can tell "my
@@ -899,6 +904,7 @@ impl CardSession {
             last_context_sig,
             pending_split: Vec::new(),
             card_is_live: true,
+            held_prefixes: Vec::new(),
             chain_id: next_chain_id(),
             fallback_chat: None,
         }
