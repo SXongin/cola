@@ -190,7 +190,9 @@ and the map from the old numbers.
   outcome a cancellation swallows — leaves the freeze engaged over the box the
   card may show; only a refusal that **proves** nothing was written re-opens it —
   an allow-list (content rejection, frequency limit, business refusal, 4xx but
-  408), because a lost or unparseable response may still have applied the PATCH.
+  408), because a lost or unparseable response (`FeishuParse`) may still have
+  applied the PATCH. Expiry is reported once by the predicate that closes the
+  freeze, since no write runs afterwards.
   A body that renders no tail (a finalized prefix, an intermediate slice) touches
   neither. A card already guarding a sibling question's box opens no window (typed text outranks a second block),
   and a second insert while the window is open joins it rather than re-opening
