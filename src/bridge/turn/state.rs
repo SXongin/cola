@@ -1098,20 +1098,35 @@ impl CardFallback {
 /// write clears the budget.
 const MAX_CARD_ABANDONMENTS: u8 = 2;
 
-/// How many refused attempts may retry a live block's **arrival** (issue
-/// #1103). One per render tick, so this counts ticks, not time: a block whose
-/// carrying write Feishu refused has no other writer, and the typed-answer
-/// freeze would otherwise stand every later pass down for good. Spending the
-/// budget leaves the card exactly as it was before the retry existed.
-pub(super) const BLOCK_ARRIVAL_RETRIES: u8 = 4;
+/// How long a live block's **arrival** may be retried (issue #1103). A wall-clock
+/// window rather than a tick count: the refusals it must outlast are Feishu's
+/// per-message update window, which the incident showed running for ~30 s, and a
+/// tick count makes the guarantee depend on the render cadence. Retries inside
+/// the window ride the existing ticks (no timer of their own); once it expires
+/// the card keeps its previous body and the WARN names the block.
+pub(super) const BLOCK_ARRIVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Whether the arrival window's deadline has passed (issue #1103).
+pub(super) fn arrival_window_expired(deadline: &std::sync::atomic::AtomicU64) -> bool {
+    now_ms() >= deadline.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Epoch milliseconds now, for the arrival window's deadline.
+pub(super) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The line logged when that budget runs out: it names the block still missing
 /// from the card, because with several Sessions refused in one window this is
 /// the only pointer to it (ADR-0114).
-pub(super) fn block_arrival_exhausted_line(request: &str) -> String {
+pub(super) fn block_arrival_expired_line(request: &str) -> String {
     format!(
-        "a live block's arrival is still undelivered after {BLOCK_ARRIVAL_RETRIES} refusals \
-         (request {request}); the card keeps its previous body"
+        "a live block's arrival is still undelivered after {}s of refusals (request {request}); \
+         the card keeps its previous body",
+        BLOCK_ARRIVAL_WINDOW.as_secs()
     )
 }
 
@@ -1303,17 +1318,15 @@ pub(super) struct StreamAccumulator {
     /// the request that never reached the card, so the exhausted-budget WARN
     /// names that block rather than whichever question happens to sort first.
     block_arrival_request: Option<String>,
-    /// Refused attempts left to land a live block's arrival (issue #1103).
-    /// Private to this module: armed by [`Self::owe_block_arrival`] when a
-    /// block is inserted, spent one definite refusal at a time (the flush's own
-    /// synchronous bookkeeping) and cleared by the delivered write that
-    /// carries the block, **inside the write's `Ok` arm** before any await
-    /// ([`Self::block_arrival_handle`]) — a cancellation between the PATCH and
-    /// its bookkeeping must not leave the freeze lifted over a box the card
-    /// already shows. Non-zero lifts the typed-answer freeze, because a block
-    /// that never reached the card holds no text. Shared across clones: it
-    /// names a fact about the CARD, not about the accumulator that mirrors it.
-    block_arrival_retries: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Whether the arrival retry window is open (issue #1103), and when it
+    /// closes. Armed by [`Self::owe_block_arrival`] when a block is inserted;
+    /// the flush **closes it before every write that can carry the block** and
+    /// re-opens it only for a refusal that proves nothing was written — so a
+    /// write that lands, or whose outcome a cancellation swallows, leaves the
+    /// freeze engaged over a box the card may show. Both are shared across
+    /// clones: they name facts about the CARD, not about the accumulator.
+    block_arrival_open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    block_arrival_deadline_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
@@ -3789,19 +3802,31 @@ impl StreamAccumulator {
     /// writes a block once it exists (issue #1103). Arms the bounded retry the
     /// later render passes spend; a delivered write settles it.
     pub(super) fn owe_block_arrival(&mut self, request_id: &str) {
-        self.block_arrival_retries
-            .store(BLOCK_ARRIVAL_RETRIES, std::sync::atomic::Ordering::Relaxed);
+        self.block_arrival_deadline_ms.store(
+            now_ms().saturating_add(BLOCK_ARRIVAL_WINDOW.as_millis() as u64),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.block_arrival_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.block_arrival_request = Some(request_id.to_string());
     }
 
     /// The arrival budget's synchronous handle, for the flush's `Ok` arm: a
     /// delivered body that carries the block settles it before any await, so a
     /// cancellation cannot leave the freeze lifted over a box the card shows.
-    pub(super) fn block_arrival_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
-        self.block_arrival_retries.clone()
+    pub(super) fn block_arrival_handle(
+        &self,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        (
+            self.block_arrival_open.clone(),
+            self.block_arrival_deadline_ms.clone(),
+        )
     }
 
-    /// The request the buffered arrival budget was armed for, so the flush's
+    /// The request the arrival window was armed for, so the flush's
     /// synchronous failure bookkeeping can name it without taking this
     /// accumulator's lock (issue #1103).
     pub(super) fn block_arrival_request_id(&self) -> Option<&str> {
@@ -3812,9 +3837,11 @@ impl StreamAccumulator {
     /// during that window joins the SAME budget instead of re-arming it, so a
     /// stream of questions cannot keep the freeze lifted indefinitely.
     pub(super) fn block_arrival_owed(&self) -> bool {
-        self.block_arrival_retries
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
+        self.block_arrival_open.load(std::sync::atomic::Ordering::Relaxed)
+            && now_ms()
+                < self
+                    .block_arrival_deadline_ms
+                    .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Progress inputs for the header (ADR-0014): which request kinds await the
@@ -8884,18 +8911,23 @@ mod tests {
             "a refused arrival is not on the card, so nothing is being typed into it"
         );
         acc.block_arrival_handle()
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+            .0
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(acc.awaits_typed_answer(), "a delivered write ends the retry");
 
         acc.owe_block_arrival("q");
-        for _ in 0..BLOCK_ARRIVAL_RETRIES {
-            assert!(!acc.awaits_typed_answer(), "the retry is still owed");
-        }
-        acc.block_arrival_handle()
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(!acc.awaits_typed_answer(), "the retry is still owed");
+        let (open, deadline) = acc.block_arrival_handle();
+        open.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(
             acc.awaits_typed_answer(),
-            "the spent budget hands the card back to the freeze, never to a repaint loop"
+            "a closed window hands the card back to the freeze"
+        );
+        open.store(true, std::sync::atomic::Ordering::Relaxed);
+        deadline.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            acc.awaits_typed_answer(),
+            "an expired window hands the card back to the freeze, never to a repaint loop"
         );
     }
 

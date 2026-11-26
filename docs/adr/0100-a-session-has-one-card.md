@@ -356,6 +356,7 @@ Source: #945, #999.
 so does the freeze's rule: a card that **shows** an unanswered typed answer is
 not written by the render pass. What changes is its premise — a live block whose
 carrying write Feishu refused is not on the card at all, so the next pass may
-write it (bounded, `BLOCK_ARRIVAL_RETRIES` attempts, settled by a delivered
-write). Without it a refused arrival left the card titled 「等待你的回答」 with
+write it (bounded by a `BLOCK_ARRIVAL_WINDOW` of 45 s, closed around every write
+that can carry the block and re-opened only by a refusal that proves nothing was
+written). Without it a refused arrival left the card titled 「等待你的回答」 with
 the question's prose and no control to answer with.

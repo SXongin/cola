@@ -48,16 +48,8 @@ async fn stage_live_slice(
 
 /// Commit a delivered live-slice PATCH, in this synchronous step before any
 /// await (ADR-0080): the Rendered Cursor, its gap coverage and its endings'
-/// shown bits in ONE chains write, so a later cancellation cannot lose the bit;
-/// plus the arrival settle when the body carried the block (issue #1103).
-fn commit_delivered_slice(
-    cards: &CardsHandle,
-    session_id: &str,
-    card_id: &str,
-    built: &BuiltCard,
-    carries_question: bool,
-    arrival: &std::sync::atomic::AtomicU8,
-) {
+/// shown bits in ONE chains write, so a later cancellation cannot lose the bit.
+fn commit_delivered_slice(cards: &CardsHandle, session_id: &str, card_id: &str, built: &BuiltCard) {
     cards.chains.advance_cursor_and_gap(
         session_id,
         card_id,
@@ -65,9 +57,6 @@ fn commit_delivered_slice(
         built.gap.as_ref().map(|gap| (&gap.frontier, gap.complete)),
         &built.rendered_endings,
     );
-    if carries_question {
-        arrival.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 /// Whether a failed card write proves the card did **not** receive the body
@@ -80,46 +69,72 @@ fn refusal_proves_nothing_written(e: &crate::error::BridgeError) -> bool {
     !e.is_recoverable_card_write()
 }
 
-/// Book a failed card write on the arrival retry, **synchronously at the
+/// Book a failed card write on the arrival window, **synchronously at the
 /// failure** (issue #1103): the state must move before any await, so a
 /// cancellation during logging or a lock wait cannot leave the freeze lifted
 /// over a box the card may already show.
 ///
-/// A definite refusal wrote nothing, so the retry is spent; an ambiguous failure
-/// may have landed the body, so the freeze closes over whatever the card shows.
+/// The write closed the window before it started (see [`close_arrival_window`]).
+/// Only a refusal that PROVES nothing was written re-opens it, and only while the
+/// window still has time on it: an ambiguous failure may have landed the body, and
+/// an expired window has run out of storm cover either way.
 fn note_arrival_failure(
-    arrival: &std::sync::atomic::AtomicU8,
+    open: &std::sync::atomic::AtomicBool,
+    deadline: &std::sync::atomic::AtomicU64,
     request: Option<&str>,
     error: &crate::error::BridgeError,
+    was_open: bool,
 ) {
-    if !refusal_proves_nothing_written(error) {
-        arrival.store(0, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering;
+    if !was_open || !refusal_proves_nothing_written(error) {
         return;
     }
-    let before = arrival
-        .try_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |left| (left > 0).then(|| left - 1),
-        )
-        .unwrap_or(0);
-    if before == 1 {
-        // Name the block: with several Sessions refusing arrivals in one window
-        // this line is the only pointer to the undelivered one (ADR-0114).
+    if crate::bridge::turn::state::arrival_window_expired(deadline) {
+        // Name the block: with several Sessions refused in one window this line
+        // is the only pointer to the undelivered one (ADR-0114).
         tracing::warn!(
             "{}",
-            crate::bridge::turn::state::block_arrival_exhausted_line(request.unwrap_or("-"))
+            crate::bridge::turn::state::block_arrival_expired_line(request.unwrap_or("-"))
+        );
+        return;
+    }
+    open.store(true, Ordering::Relaxed);
+}
+
+/// The arrival window captured with the body's write facts, so a write site can
+/// close it and book a failure in one line each (issue #1103).
+struct ArrivalWindow {
+    open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    request: Option<String>,
+}
+
+impl ArrivalWindow {
+    /// Close the window around a write that may carry the block; the answer is
+    /// what [`Self::refused`] needs to re-open it.
+    fn close(&self) -> bool {
+        close_arrival_window(&self.open)
+    }
+
+    /// Book the failed write (see [`note_arrival_failure`]).
+    fn refused(&self, error: &crate::error::BridgeError, was_open: bool) {
+        note_arrival_failure(
+            &self.open,
+            &self.deadline,
+            self.request.as_deref(),
+            error,
+            was_open,
         );
     }
 }
 
-/// Settle an owed arrival when the body carrying it landed: the state moves
-/// before the awaits that follow the write, so a cancellation cannot leave the
-/// freeze lifted over a box the card shows (issue #1103).
-fn settle_arrival_if_carried(carries_question: bool, arrival: &std::sync::atomic::AtomicU8) {
-    if carries_question {
-        arrival.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
+/// Close the arrival window around a write that may carry the block: if the write
+/// lands — or a cancellation swallows its outcome — the freeze must already be
+/// engaged, so a later pass cannot repaint the box the Host may be typing into
+/// (issue #1103). Returns whether the window was open, which is what a *definite*
+/// refusal uses to re-open it.
+fn close_arrival_window(open: &std::sync::atomic::AtomicBool) -> bool {
+    open.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The transition a refused card write logs (issue #886): one vocabulary for
@@ -359,14 +374,6 @@ async fn advance_sent_signatures(
         card.last_header_sig = sent.header.clone();
         card.last_context_sig = sent.context;
     }
-}
-
-/// Whether the body just written rendered a live **question** block — the only
-/// kind whose arrival the typed-answer retry exists for (issue #1103).
-fn body_carries_question(rendered: &[RenderedBlock]) -> bool {
-    rendered
-        .iter()
-        .any(|block| block.kind == crate::bridge::request::kind::InteractionKind::Question)
 }
 
 /// The terminal write's fate after an ending PATCH settled (spec #602, ticket
@@ -803,7 +810,7 @@ pub(super) async fn flush_card_locked(
             return FlushOutcome::Unwritten;
         };
 
-        let (built, rendered, slice_from, slice_to, sent_sigs, arrival, arrival_request) = {
+        let (built, rendered, slice_from, slice_to, sent_sigs, arrival) = {
             let Some(mut card) = cards.card(session_id).await else {
                 return FlushOutcome::Unwritten;
             };
@@ -835,27 +842,18 @@ pub(super) async fn flush_card_locked(
                 header: card.acc.header_sig(),
                 context: card.acc.context_sig(),
             };
-            // The arrival retry's synchronous handle (issue #1103): a delivered
-            // body that carries the block settles it in the write's own `Ok`
-            // arm, before any await, so a cancellation cannot leave the freeze
-            // lifted over a box the card already shows.
-            let arrival = card.acc.block_arrival_handle();
-            let arrival_request = card.acc.block_arrival_request_id().map(str::to_string);
-            (
-                built,
-                rendered,
-                slice_from,
-                slice_to,
-                sent_sigs,
-                arrival,
-                arrival_request,
-            )
+            // The arrival window's synchronous handles (issue #1103): the write
+            // below closes the window before it starts, so a body that lands —
+            // or whose outcome a cancellation swallows — cannot leave the freeze
+            // lifted over a box the card now shows.
+            let (arrival_open, arrival_deadline) = card.acc.block_arrival_handle();
+            let arrival = ArrivalWindow {
+                open: arrival_open,
+                deadline: arrival_deadline,
+                request: card.acc.block_arrival_request_id().map(str::to_string),
+            };
+            (built, rendered, slice_from, slice_to, sent_sigs, arrival)
         };
-        // Whether THIS body rendered a live question block, computed before the
-        // list is recorded (which consumes it): landing such a body settles an
-        // owed arrival, and landing one that did not must not (issue #1103).
-        let carries_question = body_carries_question(&rendered);
-
         if card_is_live {
             let supplement_split_requested = !pending_split.is_empty();
             if !supplement_split_requested && !built.full {
@@ -865,21 +863,17 @@ pub(super) async fn flush_card_locked(
                 // before the write, so a body staged meanwhile is never
                 // confirmed by this one (review #569).
                 let (stage, watermark) = stage_live_slice(cards, session_id, &card_id, &built).await;
+                // Close the arrival window BEFORE writing (issue #1103): the
+                // body carries the tail, so it carries the block.
+                let arrival_was_open = arrival.close();
                 let delivered = match cards.feishu.update_message(&card_id, &built.card).await {
                     Ok(()) => {
-                        commit_delivered_slice(
-                            cards,
-                            session_id,
-                            &card_id,
-                            &built,
-                            carries_question,
-                            &arrival,
-                        );
+                        commit_delivered_slice(cards, session_id, &card_id, &built);
                         wrote = true;
                         true
                     }
                     Err(e) => {
-                        note_arrival_failure(&arrival, arrival_request.as_deref(), &e);
+                        arrival.refused(&e, arrival_was_open);
                         let content_rejected = is_card_content_rejected(&e);
                         log_card_rejection(
                             cards,
@@ -1128,7 +1122,6 @@ pub(super) async fn flush_card_locked(
                         true
                     }
                     Err(e) => {
-                        note_arrival_failure(&arrival, arrival_request.as_deref(), &e);
                         let content_rejected = is_card_content_rejected(&e);
                         log_card_rejection(
                             cards,
@@ -1344,6 +1337,9 @@ pub(super) async fn flush_card_locked(
         )
         .await;
         let watermark = staged_watermark_id(cards, session_id).await;
+        // The continuation carries the tail — and so the block: close the window
+        // before the create for the same reason as the live PATCH (issue #1103).
+        let arrival_was_open = arrival.close();
         let sent = match (reply_to.as_deref(), fallback_chat.as_deref()) {
             (Some(reply_to), _) => cards.feishu.reply_card(reply_to, &built.card).await,
             (None, Some(chat)) => cards.feishu.send_card("chat_id", chat, &built.card).await,
@@ -1357,9 +1353,6 @@ pub(super) async fn flush_card_locked(
                 // never leave the mark apart from the cursor it was confirmed
                 // with (issue #671, ticket #672).
                 //
-                // This create carries the tail, so a question block it rendered
-                // has landed: settle it before the awaits below (issue #1103).
-                settle_arrival_if_carried(carries_question, &arrival);
                 wrote = true;
                 {
                     if let Some(mut card) = cards.card(session_id).await {
@@ -1430,7 +1423,7 @@ pub(super) async fn flush_card_locked(
                 // next slice's card.
             }
             Err(e) => {
-                note_arrival_failure(&arrival, arrival_request.as_deref(), &e);
+                arrival.refused(&e, arrival_was_open);
                 let content_rejected = is_card_content_rejected(&e);
                 log_card_rejection(
                     cards,
@@ -1758,39 +1751,54 @@ mod tests {
         }
     }
 
-    /// A definite refusal spends the arrival budget and, when it runs out, names
-    /// the armed block; an ambiguous failure closes the freeze at once (issue
-    /// #1103, gate rounds 4-5).
+    /// The arrival window's failure booking (issue #1103, gate rounds 4-6):
+    /// the write closes it, only a definite refusal re-opens it, an ambiguous
+    /// failure leaves it closed, and an expired window stops re-opening it and
+    /// names the block.
     #[tokio::test]
-    async fn arrival_failure_booking_spends_on_refusal_and_closes_on_ambiguity() {
-        use crate::bridge::turn::state::BLOCK_ARRIVAL_RETRIES;
+    async fn arrival_failure_booking_reopens_only_for_a_definite_refusal() {
+        use crate::bridge::turn::state::{block_arrival_expired_line, now_ms};
         use crate::error::BridgeError;
-        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         let rate = BridgeError::FeishuRateLimited {
             code: 230429,
             detail: "update error 230429".into(),
         };
-        let arrival = AtomicU8::new(BLOCK_ARRIVAL_RETRIES);
-        let (_, logs) = crate::bridge::test_support::capture_logs(async {
-            for _ in 0..BLOCK_ARRIVAL_RETRIES {
-                note_arrival_failure(&arrival, Some("que_named"), &rate);
-            }
-        })
-        .await;
-        assert_eq!(arrival.load(Ordering::Relaxed), 0, "the budget is spent");
+        let deadline = AtomicU64::new(now_ms() + 60_000);
+
+        let open = AtomicBool::new(true);
+        let was_open = super::close_arrival_window(&open);
         assert!(
-            logs.contains("que_named"),
-            "the exhausted warning names the armed block: {logs}"
+            was_open && !open.load(Ordering::Relaxed),
+            "the write closes the window"
+        );
+        note_arrival_failure(&open, &deadline, Some("que_named"), &rate, was_open);
+        assert!(
+            open.load(Ordering::Relaxed),
+            "a definite refusal re-opens the window"
         );
 
+        let open = AtomicBool::new(true);
         let ambiguous = BridgeError::Io(std::io::Error::other("connection reset"));
-        let arrival = AtomicU8::new(BLOCK_ARRIVAL_RETRIES);
-        note_arrival_failure(&arrival, Some("que_named"), &ambiguous);
-        assert_eq!(
-            arrival.load(Ordering::Relaxed),
-            0,
-            "an ambiguous failure may have landed the body: the freeze closes"
+        let was_open = super::close_arrival_window(&open);
+        note_arrival_failure(&open, &deadline, Some("que_named"), &ambiguous, was_open);
+        assert!(
+            !open.load(Ordering::Relaxed),
+            "an ambiguous failure may have landed the body: the freeze stays engaged"
+        );
+
+        // An expired window cannot re-open, and its refusal names the block.
+        let expired = AtomicU64::new(0);
+        let open = AtomicBool::new(true);
+        let was_open = super::close_arrival_window(&open);
+        let (_, logs) = crate::bridge::test_support::capture_logs(async {}).await;
+        let _ = logs;
+        note_arrival_failure(&open, &expired, Some("que_named"), &rate, was_open);
+        assert!(!open.load(Ordering::Relaxed), "the window is spent");
+        assert!(
+            block_arrival_expired_line("que_named").contains("que_named"),
+            "the expiry line names the armed block"
         );
     }
 

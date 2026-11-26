@@ -1775,11 +1775,12 @@ async fn a_rate_limited_question_arrival_is_retried_until_it_lands() {
     );
 }
 
-/// The arrival retry is **bounded** (issue #1103): a card Feishu refuses for
-/// good spends the budget and then returns to the pre-fix behaviour — standing
-/// the passes down — instead of repainting on every tick forever.
+/// The arrival retry is **bounded** by its wall-clock window (issue #1103): a
+/// card Feishu refuses for good keeps retrying while the window is open — the
+/// storm cover the incident needed — and stops once it expires, instead of
+/// repainting on every tick forever.
 #[tokio::test]
-async fn a_permanently_refused_question_arrival_stops_after_its_budget() {
+async fn a_permanently_refused_question_arrival_stops_when_its_window_expires() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1805,31 +1806,19 @@ async fn a_permanently_refused_question_arrival_stops_after_its_budget() {
     );
     Turn::flush_card(&cards, "ses_test").await;
 
-    // Run passes until one writes nothing; a second pass must stay quiet too.
-    // Three writes is the budget's exact shape: the arrival flush spent one,
-    // then one per retry. A retry that never fires leaves this at zero, which is
-    // what makes the count discriminate (a bounds-only assertion would pass on a
-    // card that never retries at all).
-    let mut writes = 0;
-    for _ in 0..10 {
-        let before = platform.updated_cards().await.len();
-        Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
-        if platform.updated_cards().await.len() == before {
-            break;
-        }
-        writes += 1;
-    }
-    assert_eq!(
-        writes, 3,
-        "one retry per remaining attempt, then the budget is spent"
-    );
+    // While the window is open every pass retries: the arrival write is the
+    // block's only writer, and a storm can outlast a tick or two.
     let before = platform.updated_cards().await.len();
     Turn::flush_card_unless_typed_answer(&cards, "ses_test").await;
-    assert_eq!(
-        platform.updated_cards().await.len(),
-        before,
-        "the spent budget hands the card back to the typed-answer freeze"
+    assert!(
+        platform.updated_cards().await.len() > before,
+        "the open window retries the arrival"
     );
+
+    // The window's expiry is the flush-level unit test
+    // (`arrival_failure_booking_reopens_only_for_a_definite_refusal`); here the
+    // point is that a refused arrival is retried at all, which the pre-fix card
+    // never did.
 }
 
 /// The arrival carve-out is only for a block that is **not** on the card

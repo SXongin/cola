@@ -44,28 +44,27 @@ card PATCH is never queued there. Reading the limit as owed would claim a retry
 nobody holds. The flush's rejection log distinguishes all three refusals
 (content refused / rate limited / permanent) from one helper.
 
-**2. A block's arrival carries a bounded retry, and the freeze reads it.** A
-question block's insert arms `BLOCK_ARRIVAL_RETRIES` (4) attempts
-(`owe_block_arrival`, `src/bridge/turn/state.rs`) — unless an arrival is already
-owed, which joins the remaining budget instead of re-arming it, so a run of
-questions cannot hold the freeze open. `awaits_typed_answer()` is
-false while an arrival is owed — the freeze's own premise is what the carve-out
-reads, so a block the card does not carry does not guard text it does not show,
-and the next pass writes it. Only a refusal that **proves nothing was written**
-spends a retry (`spend_block_arrival`, from `note_cursor_write_failure` — the one
-seam all three write sites share): a typed rate limit, a content rejection, a
-business refusal. An **ambiguous** failure — transport, timeout, 5xx, 408 — may
-have landed the body, so it closes the freeze instead of leaving the window
-open: the card might be showing the box right now. A delivered body that
-**renders** the block settles the obligation in the write's own `Ok` arm,
-synchronously, through the budget's shared handle (`block_arrival_handle`) —
-before the awaits that follow, because a cancellation between the PATCH and its
-bookkeeping must never leave the freeze lifted over a box the card already
-shows. A finalized prefix renders no tail, so
-its PATCH settles nothing: the blocks stay owed until the continuation carries
-them. Spending the budget returns the card to the pre-fix behaviour: the freeze
-holds, and a WARN names the request the budget was armed for — the block that
-never reached the card, not whichever question happens to sort first.
+**2. A block's arrival has a wall-clock retry window, and the freeze reads it.** A
+question block's insert opens a window of `BLOCK_ARRIVAL_WINDOW` (45 s,
+`owe_block_arrival`, `src/bridge/turn/state.rs`) — a duration, not a tick count,
+because the refusals it must outlast are Feishu's per-message update window (the
+incident ran ~30 s) and a tick count would make the guarantee depend on the
+render cadence. `awaits_typed_answer()` is false while the window is open and
+unexpired: the freeze's own premise is what the carve-out reads, so a block the
+card does not carry does not guard text it does not show, and the next pass
+writes it.
+
+**The window closes around every write that can carry the block**
+(`close_arrival_window`, before the live PATCH and the continuation create). If
+the write lands — or a cancellation swallows its outcome — the freeze is already
+engaged over the box the card may now show, so no later pass can repaint it.
+Only a refusal that **proves nothing was written** (a typed rate limit, a content
+rejection, a business refusal) re-opens the window, and only while it has time
+left; an **ambiguous** failure (transport, timeout, 5xx, 408) leaves it closed.
+When the window expires with the block still owed, the card keeps its previous
+body and a WARN names the request the window was armed for. A finalized prefix
+renders no tail, so its write neither closes nor re-opens the window — the blocks
+are the continuation's.
 
 **3. Typed text wins over a sibling block.** An insertion that lands on a card
 already guarding another question's box arms nothing: the flow's own out-of-band
@@ -78,18 +77,16 @@ card holds no unsubmitted text.
 
 ## Consequences
 
-- A rate-limited block arrival now lands after at most four further ticks (one
-  PATCH per tick, no timer, no task, no lock held while waiting) instead of
-  never. The 14:18 storm's shape — repeated refusals on one card — still costs
-  one attempt per tick, but it no longer leaves a wait card without controls.
-- A card Feishu refuses for good (a content rejection) spends the same budget
-  and then behaves exactly as before; the bound is what keeps this from becoming
-  a repaint loop.
-- The budget bounds the card's **refusals**, not the block's own attempts: any
-  refused write spends one, because none of them carried the block to the card.
-  A turn whose writes are all refused (the incident's shape) therefore spends in
-  step with the retry, and a mixed turn can spend a retry or two early — the
-  bound is the guarantee, not a per-arrival count.
+- A rate-limited block arrival now keeps retrying, on the existing ticks (no
+  timer, no task, no lock held while waiting), for as long as Feishu's own update
+  window can plausibly last, instead of never. The 14:18 storm's shape — repeated
+  refusals on one card for ~30 s — stays covered by the 45 s window.
+- A card Feishu refuses for good (a content rejection) retries until the window
+  expires and then behaves exactly as before; the window is what keeps this from
+  becoming a repaint loop.
+- The window is time, not attempts: its length was chosen from the observed
+  storm, and every refused write inside it costs one PATCH on the tick that was
+  going to run anyway.
 - The freeze keeps its one hard rule: a card that shows a box is never written by
   the render pass, so a draft cannot be eaten. The carve-out is only ever open
   when the card provably does not show the box: a definite refusal spends, an
