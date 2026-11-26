@@ -1,5 +1,11 @@
 # A refused block arrival is the render pass's one exception
 
+> **Amended by ADR-0115**: decision 1's account of the **terminal** write is
+> superseded — the limit is still not `is_recoverable_card_write()`, but the
+> writer of a terminal body may claim the proved-unsent payload as a keyless
+> Pending Card Update, so the ending converges instead of being lost. The
+> arrival window and its allow-list below are unchanged.
+
 > **Amends ADR-0038** (its 2026-10-31 freeze, "a live form freezes the render
 > pass") and **ADR-0100** (the same rule restated there): the freeze stands, but
 > it no longer guards a box the card does not show. Everything else those ADRs

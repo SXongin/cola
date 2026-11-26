@@ -5,6 +5,13 @@
 > class alone, and the record-release gate also counts a keyed ending the queue
 > still owes. See the amendment at the end.
 
+> **Amended by ADR-0115**: the Pending Card Update set also admits a typed
+> frequency limit (`230429` on a 200, `230020` on a 400) that the ending's
+> writer claims through `DeliveryObserver::owe_rate_limited_write`; a limit on
+> the drain's own retry of an already-owed payload keeps it owed. The automatic
+> admission rule below — only a recoverable failure enters the set on its own —
+> is unchanged.
+
 ## Context
 
 Card writes are fire-and-forget: a failed `update_message` is logged and
