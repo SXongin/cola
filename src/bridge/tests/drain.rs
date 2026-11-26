@@ -4434,6 +4434,81 @@ async fn a_rate_limited_finalized_prefix_is_queued_while_the_continuation_lands(
     );
 }
 
+/// Issue #1208: the LIVE size split (a Turn still running) has the same defect
+/// the terminal split fixed in #1201. The live flush outgrows `om_live`, builds
+/// a finalized prefix (no tail), PATCHes it, and continues on a new card. A
+/// frequency-limit refusal proves the prefix wrote nothing; the build already
+/// advanced `render_from` past it, so without a claim the slice is skipped and
+/// the old card freezes on older content forever. It must instead stay owed on
+/// the ORIGINAL card and converge once the window clears — while the live-block
+/// arrival path (a body that renders a tail) keeps its render-pass retry.
+#[tokio::test]
+async fn a_rate_limited_live_split_prefix_stays_owed_and_converges() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_live", Some("om_live")).await;
+    // The Turn is still running: the card state is NOT terminal, so this is the
+    // live split branch rather than an ending's split.
+    Turn::set_card_state(&cards, "ses_live", CardState::Streaming).await;
+    Turn::set_reply_target(&cards, "ses_live", "msg_1").await;
+    // Content far past one card's budget, in entries a card can hold: the
+    // finalized prefix keeps some of it, and the continuation carries the rest.
+    for i in 0..8 {
+        Turn::push_text_at(&cards, "ses_live", 5_000 + i * 1_000, &"很长的回答。".repeat(130)).await;
+    }
+
+    // Every PATCH is refused with the frequency limit; the continuation is a
+    // CREATE, so it still lands.
+    platform.fail_update(UpdateFailure::RateLimited, ALWAYS);
+    Turn::flush_card(&cards, "ses_live").await;
+
+    // The live split landed its continuation (it carries the tail the finalized
+    // prefix must not).
+    assert!(
+        !platform.replied_cards().await.is_empty(),
+        "the live split sent a continuation: {:?}",
+        platform.calls.lock().await
+    );
+    assert!(
+        app.core.feishu.delivery().has_pending_card_update("om_live"),
+        "a rate-limited live split prefix is proven unsent and must stay owed, \
+         not silently skipped: {:?}",
+        platform.calls.lock().await
+    );
+
+    // Feishu recovers: the drain delivers the prefix body to the original card.
+    let patches_before = patches_to(&platform, "om_live").await.len();
+    platform.clear_fail_update();
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
+    assert!(
+        !app.core.feishu.delivery().has_pending_card_update("om_live"),
+        "the drain delivers the owed live prefix"
+    );
+    assert!(
+        patches_to(&platform, "om_live").await.len() > patches_before,
+        "the old card receives the owed prefix after the window clears"
+    );
+    let delivered = patches_to(&platform, "om_live")
+        .await
+        .last()
+        .cloned()
+        .expect("the old card received its owed prefix");
+    assert!(
+        card_text(&delivered).contains("很长的回答。"),
+        "the converged prefix is the slice the user already generated: {delivered}"
+    );
+    assert!(
+        card_header(&delivered).contains("部分完成"),
+        "the converged prefix keeps its split header: {delivered}"
+    );
+}
+
 /// Finding D (spec #602 review): a size-split whose continuation create FAILS
 /// leaves the tracked card id on the OLD card, whose finalize PATCH delivered —
 /// so the delivery layer would answer "Delivered" for the wrong card and the

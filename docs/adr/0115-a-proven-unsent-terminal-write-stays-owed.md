@@ -7,6 +7,10 @@
 > writer of a terminal body may queue that body when the limit proves nothing
 > was written).
 
+> **Amended by ADR-0116**: decision 3's "only the ENDING slice" is widened — a
+> split's finalized prefix renders no tail, so a typed frequency limit claims
+> it too; the claim's predicate is "renders no live block", not "terminal".
+
 ## Context
 
 Feishu reports its per-message update window as a business code inside the
@@ -49,7 +53,8 @@ render.
    unclaimable even though the PATCH attempts after it. Any other outcome — no
    queue, a superseded attempt, a different payload — answers `None`, and the
    caller keeps the permanent refusal it had.
-3. **The flush claims only the ENDING slice.** The final render applies the
+3. **The flush claims only the ENDING slice.** **(widened by ADR-0116: a
+   split's finalized prefix renders no tail, so it is claimed as well.)** The final render applies the
    terminal card state before flushing; a rate-limited PATCH of a body built
    under that state is claimed. A live slice's rate limit changes nothing: its
    next render pass rebuilds and retries it, as before.
