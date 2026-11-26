@@ -1,5 +1,10 @@
 # One delivery observer owns the contract
 
+> **Amended by ADR-0115**: `DeliveryObserver` declares a twelfth required
+> method, `owe_rate_limited_write`, which claims a terminal body Feishu's
+> frequency limit proved unsent as the card's keyless Pending Card Update. The
+> one-owner rule and the no-op's answers below are unchanged.
+
 > **Amends ADR-0072**: one clause — `Platform::submit_ordered`'s default
 > `update_message` fallback for an unwrapped platform — is superseded. The
 > decorator's ownership of per-card write order stays as ADR-0072 recorded it.
