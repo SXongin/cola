@@ -369,6 +369,18 @@ impl PendingEntry {
         }
     }
 
+    /// An accepted keyed state write supersedes the card's owed keyless payload
+    /// (spec #571 review): the drain must never resurrect a collected or ended
+    /// card's older body over the keyed state, so the payload goes. The
+    /// rate-limited claim record goes with it — a terminal flush may not claim a
+    /// body the newer keyed write replaced (ADR-0115, issue #1201) — while the
+    /// delivered sequences and failure memory, which the cursor reconcile still
+    /// reads, stay.
+    fn supersede_keyless_payload(&mut self) {
+        self.card = None;
+        self.rate_limited = None;
+    }
+
     /// Whether this card's queue already owns `(generation, intent)` (spec
     /// #571, tickets #575): the generation is closed (a settle ended it, so
     /// no submission of it will ever write), a `Stamp` at or below an accepted
@@ -1007,14 +1019,10 @@ impl CardDelivery {
             entry.order_state_since = Some(now);
         }
         // An accepted keyed state write supersedes an owed keyless payload
-        // (spec #571 review): the payload predates the keyed state (a collect,
-        // an ending), so the drain must never resurrect it over it — a
-        // collected card must not start looking live again. The tombstone keeps
-        // the existing bookkeeping (the delivered sequences the cursor
-        // reconcile reads, the failure memory); only the payload goes. A
-        // keyless failure AFTER the keyed state is the newer writer and stays
-        // owed as today.
-        entry.card = None;
+        // (spec #571 review): the payload and its rate-limited claim record go,
+        // so the drain can never resurrect a body the keyed state replaced; the
+        // delivered sequences and failure memory stay.
+        entry.supersede_keyless_payload();
         let mut write = QueuedWrite::new(token, submission, now);
         // The ticket lives with the queue until the submission settles: a
         // displaced or dropped slot still answers its caller.
@@ -2804,6 +2812,30 @@ mod tests {
             delivery.owe_rate_limited_write("om_1", &new),
             None,
             "a delivered write has nothing to claim"
+        );
+        assert!(!delivery.pending("om_1"));
+    }
+
+    /// A newer KEYED write supersedes the refused keyless attempt: keyed
+    /// admission tombstones the keyless payload, so the claim record must go
+    /// with it — a terminal flush must never resurrect the older body over the
+    /// keyed state (ADR-0115, issue #1201).
+    #[tokio::test]
+    async fn a_keyed_write_clears_a_rate_limited_attempt() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = CardDelivery::new(inner.clone());
+        let refused = serde_json::json!({ "body": "terminal" });
+        let keyed = serde_json::json!({ "body": "collected" });
+
+        inner.fail_next(Fail::RateLimited);
+        assert!(delivery.update_message("om_1", &refused).await.is_err());
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Settle, &keyed).await;
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+
+        assert_eq!(
+            delivery.owe_rate_limited_write("om_1", &refused),
+            None,
+            "the keyed state write superseded the refused keyless attempt"
         );
         assert!(!delivery.pending("om_1"));
     }

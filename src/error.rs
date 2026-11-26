@@ -35,7 +35,7 @@ pub enum BridgeError {
     /// Feishu refused a message write with its **frequency limit** — the
     /// per-message update window, reported as a business code inside the
     /// response body (`230020` "Update the single messages too frequently",
-    /// `230429`), on a 200 or a 400 alike.
+    /// `230429`, and the app-level `99991400`), on a 200 or a 400 alike.
     ///
     /// Typed apart from [`Self::Feishu`] because nothing was written and the
     /// same body succeeds once the window passes: a caller can retry it, and a

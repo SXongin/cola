@@ -21,11 +21,13 @@ const MESSAGE_EDIT_LIMIT_REACHED_CODE: i32 = 230072;
 /// The per-message **frequency limit** business codes (issue #1103). Feishu
 /// reports them inside the response body, on a 200 or a 400 alike: `230020`
 /// "This operation triggers the frequency limit" (the update window, in the
-/// Edit message error table above) and `230429` ("This operation triggers the
-/// frequency limit", the same refusal under its documented umbrella code).
-/// Nothing is written, so the identical body succeeds once the window passes —
-/// typed so a caller retries instead of calling it permanent.
-const RATE_LIMIT_CODES: [i32; 2] = [230020, 230429];
+/// Edit message error table above), `230429` ("This operation triggers the
+/// frequency limit", the same refusal under its documented umbrella code), and
+/// `99991400` (the app-level "request trigger frequency limit" — the same
+/// refusal one layer up, issue #1201). Nothing is written, so the identical
+/// body succeeds once the window passes — typed so a caller retries instead of
+/// calling it permanent.
+const RATE_LIMIT_CODES: [i32; 3] = [230020, 230429, 99991400];
 
 /// A minimal Feishu REST client.
 pub struct Client {
@@ -1851,8 +1853,10 @@ mod tests {
     /// The frequency limit is the other half of the same table: nothing was
     /// written, so the identical body can land later. Typed as its own refusal
     /// so the flush neither logs it as permanent nor withholds a retry (issue
-    /// #1103). Feishu reports it both inside a 400 body (the update window,
-    /// `230020`) and inside a 200 body (`230429`) — both must be typed.
+    /// #1103). Feishu reports it inside a 400 body (the update window,
+    /// `230020`), inside a 200 body (`230429`), and as the app-level
+    /// `99991400` (`request trigger frequency limit`, issue #1201) — all must
+    /// be typed.
     #[tokio::test]
     async fn update_message_types_the_frequency_limit_refusals() {
         let card = serde_json::json!({"elements": []});
@@ -1864,6 +1868,10 @@ mod tests {
             (
                 200,
                 r#"{"code":230429,"msg":"This operation triggers the frequency limit."}"#,
+            ),
+            (
+                400,
+                r#"{"code":99991400,"msg":"request trigger frequency limit"}"#,
             ),
         ] {
             let (server, client) = wire_client().await;
