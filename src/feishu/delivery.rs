@@ -1641,27 +1641,24 @@ impl Platform for CardDelivery {
     }
 
     async fn update_message(&self, message_id: &str, card: &Value) -> Result<()> {
-        let seq = {
+        // The sequence this write is, and the keyed state it ENTERS under
+        // (issue #1201), taken together under one lock: a keyed admission from
+        // now on — including one while this PATCH waits for the card lock — is
+        // newer, so this attempt's frequency limit must not become claimable
+        // afterwards. Taking the snapshot only after acquiring the card lock
+        // would let a keyed write admitted during that wait look older than
+        // this PATCH, and the drain could then replay this body over it.
+        let (seq, keyed_state) = {
             let mut state = self.state.lock().unwrap();
             state.seq += 1;
-            state.seq
+            let keyed_state = state.entries.get(message_id).map_or(0, |entry| entry.keyed_state);
+            (state.seq, keyed_state)
         };
         // Serialize with any in-flight drain retry for this card: the newest
         // write must land at Feishu last (ADR-0038's ordering; ADR-0067's
         // newest-wins).
         let lock = self.card_lock(message_id);
         let _delivery = lock.lock().await;
-        // The keyed state this write starts under (issue #1201): a keyed
-        // admission while the PATCH is in flight is NEWER than it, so this
-        // attempt's frequency limit must not become claimable afterwards — the
-        // drain would replay this older body over the keyed state.
-        let keyed_state = self
-            .state
-            .lock()
-            .unwrap()
-            .entries
-            .get(message_id)
-            .map_or(0, |entry| entry.keyed_state);
         let result = self.inner.update_message(message_id, card).await;
         self.observe(message_id, seq, card, &result, keyed_state);
         result
@@ -2899,6 +2896,52 @@ mod tests {
             delivery.owe_rate_limited_write("om_1", &refused),
             None,
             "a keyed admission during the PATCH makes the older body unclaimable"
+        );
+    }
+
+    /// Issue #1201's lock-wait timing: the terminal PATCH is enqueued while
+    /// another writer holds the card lock, and a keyed state write is admitted
+    /// during that wait. The snapshot must be taken when the PATCH ENTERS — not
+    /// after it acquires the lock — so the later admission makes the older body
+    /// unclaimable even though the PATCH attempts after it.
+    #[tokio::test]
+    async fn a_keyed_write_admitted_while_the_patch_waits_is_never_claimed_back() {
+        let inner = Arc::new(FakePlatform::new());
+        let delivery = Arc::new(CardDelivery::new(inner.clone()));
+        let refused = serde_json::json!({ "body": "terminal" });
+        let keyed = serde_json::json!({ "body": "collected" });
+
+        // Hold the card lock so the PATCH queues behind it.
+        let lock = delivery.card_lock("om_1");
+        let guard = lock.lock().await;
+        let seq_before = delivery.state.lock().unwrap().seq;
+        inner.fail_next(Fail::RateLimited);
+        let patching = tokio::spawn({
+            let delivery = Arc::clone(&delivery);
+            let refused = refused.clone();
+            async move { delivery.update_message("om_1", &refused).await }
+        });
+        // Wait until the PATCH has entered — its sequence allocated and its
+        // keyed-state snapshot taken — and is parked on the card lock.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while delivery.state.lock().unwrap().seq == seq_before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the PATCH enters the queue");
+
+        // The keyed state write is admitted during the wait; its driver lands
+        // once the lock frees, after the PATCH's refusal.
+        let ticket = submit(&delivery, "om_1", 1, CardWriteIntent::Settle, &keyed).await;
+        drop(guard);
+
+        assert!(patching.await.unwrap().is_err());
+        assert!(matches!(ticket.settled().await, WriteOutcome::Delivered));
+        assert_eq!(
+            delivery.owe_rate_limited_write("om_1", &refused),
+            None,
+            "a keyed admission during the lock wait makes the older body unclaimable"
         );
     }
 
