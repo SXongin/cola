@@ -42,9 +42,12 @@ render.
    payload's typed frequency limit and nothing is owed; a later keyless write —
    or an accepted keyed state write, which already tombstones the keyless
    payload — clears the claim (ADR-0067's newest-wins), so an older body can
-   never be resurrected over what the card now holds. Any other outcome — no
-   queue, a superseded attempt, a different payload — answers `None`, and the
-   caller keeps the permanent refusal it had.
+   never be resurrected over what the card now holds. That includes a keyed
+   admission **while the PATCH is in flight**: the observation snapshots the
+   keyed-state counter before the request and does not recreate a claim the
+   admission just cleared. Any other outcome — no queue, a superseded attempt,
+   a different payload — answers `None`, and the caller keeps the permanent
+   refusal it had.
 3. **The flush claims only the ENDING slice.** The final render applies the
    terminal card state before flushing; a rate-limited PATCH of a body built
    under that state is claimed. A live slice's rate limit changes nothing: its
