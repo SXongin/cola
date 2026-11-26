@@ -1775,12 +1775,14 @@ async fn a_rate_limited_question_arrival_is_retried_until_it_lands() {
     );
 }
 
-/// The arrival retry is **bounded** by its wall-clock window (issue #1103): a
-/// card Feishu refuses for good keeps retrying while the window is open — the
-/// storm cover the incident needed — and stops once it expires, instead of
-/// repainting on every tick forever.
+/// A refused arrival is still retried (issue #1103): while the window is open the
+/// next pass writes the block the pre-fix card never re-sent. The window's
+/// expiry and the refusal/ambiguity split are the flush's own unit tests
+/// (`a_definite_refusal_reopens_the_arrival_window`,
+/// `an_ambiguous_failure_leaves_the_arrival_window_closed`,
+/// `an_expired_arrival_window_warns_once_and_names_the_block`).
 #[tokio::test]
-async fn a_permanently_refused_question_arrival_stops_when_its_window_expires() {
+async fn a_refused_question_arrival_is_retried_by_the_next_pass() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1814,11 +1816,6 @@ async fn a_permanently_refused_question_arrival_stops_when_its_window_expires() 
         platform.updated_cards().await.len() > before,
         "the open window retries the arrival"
     );
-
-    // The window's expiry is the flush-level unit test
-    // (`arrival_failure_booking_reopens_only_for_a_definite_refusal`); here the
-    // point is that a refused arrival is retried at all, which the pre-fix card
-    // never did.
 }
 
 /// The arrival carve-out is only for a block that is **not** on the card
