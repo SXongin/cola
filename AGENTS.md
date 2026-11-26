@@ -180,20 +180,21 @@ and the map from the old numbers.
   block is written by exactly one write — the flow's arrival flush — so a card
   that renders its box and then never receives it has no control at all (a card
   titled 「等待你的回答」 showing only the prose). A question block's insert
-  arms a bounded retry (`BLOCK_ARRIVAL_RETRIES` attempts, `owe_block_arrival` /
-  `block_arrival_handle` / `note_arrival_failure`, `src/bridge/turn/`) and
-  `awaits_typed_answer` is false while one is owed — the freeze guards a box the card **shows**, and this one is not there.
-  A delivered body that renders the block settles it — in the write's own `Ok`
-  arm, before any await (`block_arrival_handle`), so a cancellation cannot leave
-  the freeze lifted over a box the card shows — and only a refusal that
-  **proves** nothing was written spends a retry (an ambiguous transport/5xx
-  failure closes the freeze instead: the card may already show the box). A card already guarding a sibling
-  question's box arms nothing (typed text outranks a second block), and a second
-  insert while an arrival is already owed joins the remaining budget rather than
-  re-arming it. Feishu's frequency limit
-  (`230020`/`230429`, a business code inside the body) is typed
-  `BridgeError::FeishuRateLimited` for exactly this reason — never log it as a
-  permanent refusal.
+  opens a 45 s retry window (`BLOCK_ARRIVAL_WINDOW`, `owe_block_arrival` /
+  `close_arrival_window` / `note_arrival_failure`, `src/bridge/turn/`), and
+  `awaits_typed_answer` is false while it is open — the freeze guards a box the
+  card **shows**, and this one is not there.
+
+  **The window is closed around every write that can carry the block** (before
+  the live PATCH and the continuation create), so a write that lands — or whose
+  outcome a cancellation swallows — leaves the freeze engaged over the box the
+  card may show; only a refusal that **proves** nothing was written re-opens it
+  (an ambiguous transport/5xx failure leaves it closed). A card already guarding
+  a sibling question's box opens no window (typed text outranks a second block),
+  and a second insert while the window is open joins it rather than re-opening
+  it. Feishu's frequency limit (`230020`/`230429`, a business code inside the
+  body) is typed `BridgeError::FeishuRateLimited` for exactly this reason — never
+  log it as a permanent refusal.
 
   One user-initiated repaint is allowed while a box holds text: switching to
   another question (ADR-0100). It is a form **submit**, so the text arrives with

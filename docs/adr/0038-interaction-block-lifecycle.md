@@ -468,11 +468,11 @@ every later pass stands down while the block renders a typed answer, so a
 refused arrival used to strand the block forever (live 2026-11-20: the header
 said 「等待你的回答」 and the card carried the question's prose with no
 controls). A question block's insert therefore arms
-`BLOCK_ARRIVAL_RETRIES` attempts (`owe_block_arrival`), `awaits_typed_answer()`
-is false while one is owed, only a refusal that proves nothing was written spends
-one, and the delivered write that carries the block settles the obligation in its
-own `Ok` arm (`block_arrival_handle`, before any await). A card already guarding
-a sibling question's box arms nothing. The freeze's rule is otherwise unchanged:
+a 45 s window (`owe_block_arrival`, `BLOCK_ARRIVAL_WINDOW`), `awaits_typed_answer()`
+is false while it is open, every write that can carry the block closes it first,
+and only a refusal that proves nothing was written re-opens it — so the freeze is
+engaged the moment the card can show the box. A card already guarding a sibling
+question's box opens no window. The freeze's rule is otherwise unchanged:
 a card that shows a box is never written by the render pass.
 
 ## Domain note
