@@ -10,7 +10,8 @@
 ## Context
 
 Feishu reports its per-message update window as a business code inside the
-response body (`230020` on a 400, `230429` on a 200). ADR-0114 typed it
+response body (`230020` on a 400, `230429` on a 200, and the app-level
+`99991400`). ADR-0114 typed it
 (`BridgeError::FeishuRateLimited`) and gave a **live interaction block's
 arrival** a wall-clock retry window, but deliberately left
 `is_recoverable_card_write()` false: that predicate means "the delivery layer
@@ -38,11 +39,12 @@ render.
 2. **`DeliveryObserver::owe_rate_limited_write(message_id, card)` claims one
    proved-unsent attempt as the card's keyless Pending Card Update.** It answers
    `Some(seq)` only when the card's **newest** recorded attempt was that
-   payload's typed frequency limit and nothing is owed; a later write clears the
-   claim (ADR-0067's newest-wins), so an older body can never be resurrected
-   over what the card now holds. Any other outcome — no queue, a superseded
-   attempt, a different payload — answers `None`, and the caller keeps the
-   permanent refusal it had.
+   payload's typed frequency limit and nothing is owed; a later keyless write —
+   or an accepted keyed state write, which already tombstones the keyless
+   payload — clears the claim (ADR-0067's newest-wins), so an older body can
+   never be resurrected over what the card now holds. Any other outcome — no
+   queue, a superseded attempt, a different payload — answers `None`, and the
+   caller keeps the permanent refusal it had.
 3. **The flush claims only the ENDING slice.** The final render applies the
    terminal card state before flushing; a rate-limited PATCH of a body built
    under that state is claimed. A live slice's rate limit changes nothing: its
