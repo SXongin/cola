@@ -718,25 +718,27 @@ async fn discard_staged_cursor(
     }
 }
 
-/// Claim a rate-limited **ending** body as the card's Pending Card Update (issue
-/// #1201): a typed frequency limit proves the PATCH wrote nothing, so the drain
-/// can retry the exact payload once the window clears. Only the terminal slice
-/// is claimed — a live slice converges on its next render pass, and queueing a
-/// live-block arrival would let the freeze-blind drain repaint a form the Host
-/// is typing into (#917).
+/// Claim a rate-limited body that is **proved unsent** as the card's Pending
+/// Card Update (issues #1201, #1208): a typed frequency limit proves the PATCH
+/// wrote nothing, so the drain can retry the exact payload once the window
+/// clears. Only a body that renders **no live block** is claimable — the
+/// ending slice, or the finalized prefix of a split (which carries no tail
+/// either, ADR-0114). A plain live slice converges on its next render pass, and
+/// queueing a live-block arrival would let the freeze-blind drain repaint a
+/// form the Host is typing into (#917).
 ///
 /// The claim requires the delivery layer to recognise this exact attempt as the
 /// card's newest (see
 /// [`crate::feishu::delivery::DeliveryObserver::owe_rate_limited_write`]); when
 /// it cannot, the caller keeps its permanent refusal.
-fn claim_rate_limited_ending(
+fn claim_rate_limited_unsent(
     cards: &CardsHandle,
     card_id: &str,
     card: &serde_json::Value,
-    terminal: bool,
+    claimable: bool,
     error: &crate::error::BridgeError,
 ) -> bool {
-    terminal
+    claimable
         && error.is_rate_limited()
         && cards
             .feishu
@@ -893,9 +895,9 @@ pub(super) async fn flush_card_locked(
                 deadline: arrival_deadline,
             };
             let carries_question = body_carries_question(&rendered);
-            // Whether this flush IS the turn's ending (the final render applied
-            // a terminal card state before flushing): only that slice is worth
-            // claiming from a definite rate limit as owed (issue #1201).
+            // Whether the final render applied a terminal card state before this
+            // flush's ending: the plain slice claims only then (a live slice's
+            // render pass retries); the finalized prefix claims regardless.
             let terminal = card.acc.card_state().is_terminal();
             (
                 built,
@@ -1007,12 +1009,12 @@ pub(super) async fn flush_card_locked(
                                 }
                             }
                         }
-                        // A terminal body Feishu refused with its per-message
-                        // frequency limit is PROVEN unsent (issue #1103): claim
-                        // it so the drain retries it after the window, instead
-                        // of dropping the turn's last body and suppressing its
-                        // notice (issue #1201).
-                        let owed = claim_rate_limited_ending(cards, &card_id, &built.card, terminal, &e);
+                        // A TERMINAL body refused by the frequency limit is
+                        // PROVEN unsent (issue #1103): claim it so the drain
+                        // retries it after the window instead of dropping the
+                        // turn's last body and its notice (#1201). A live slice
+                        // renders the tail and keeps its render-pass retry.
+                        let owed = claim_rate_limited_unsent(cards, &card_id, &built.card, terminal, &e);
                         note_cursor_write_failure(
                             cards,
                             session_id,
@@ -1276,12 +1278,12 @@ pub(super) async fn flush_card_locked(
                             set_ending_write(cards, session_id, super::state::EndingWrite::Failed).await;
                             return FlushOutcome::Refused;
                         }
-                        // A terminal slice of the ending's chain refused by the
-                        // frequency limit is proven unsent: claim it too, so the
-                        // prefix card converges instead of freezing on older
-                        // content while the continuation carries the tail (issue
-                        // #1201).
-                        let owed = claim_rate_limited_ending(cards, &card_id, &finalized.card, terminal, &e);
+                        // A finalized prefix refused by the frequency limit is
+                        // proven unsent: claim it too — terminal or live (#1201,
+                        // #1208). Its build passes include_tail=false (ADR-0114),
+                        // so the freeze-blind drain retry is safe; a live-block
+                        // arrival keeps the render pass's own retry.
+                        let owed = claim_rate_limited_unsent(cards, &card_id, &finalized.card, true, &e);
                         note_cursor_write_failure(
                             cards,
                             session_id,
