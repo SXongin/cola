@@ -747,6 +747,19 @@ fn claim_rate_limited_unsent(
             .is_some()
 }
 
+/// Whether the card a finalized prefix replaces may still render a typed
+/// answer. A refused prefix is claimable only when it does not: the drain's
+/// keyless retry is freeze-blind, so repainting that old body would erase what
+/// the Host is typing into it (ADR-0038/0100, #917). The predicate ignores the
+/// arrival window's carve-out — an owed block's arrival must not mask an older
+/// form the card is still showing.
+async fn replaced_card_shows_typed_answer(cards: &CardsHandle, session_id: &str) -> bool {
+    cards
+        .card(session_id)
+        .await
+        .is_some_and(|card| card.acc.has_open_typed_answer())
+}
+
 /// The flush machine proper, entered with the session's card-write lock
 /// already held by [`Turn::flush_card`](super::Turn::flush_card),
 /// [`Turn::split_card_chain`](super::Turn::split_card_chain),
@@ -1279,11 +1292,11 @@ pub(super) async fn flush_card_locked(
                             return FlushOutcome::Refused;
                         }
                         // A finalized prefix refused by the frequency limit is
-                        // proven unsent: claim it too — terminal or live (#1201,
-                        // #1208). Its build passes include_tail=false (ADR-0114),
-                        // so the freeze-blind drain retry is safe; a live-block
-                        // arrival keeps the render pass's own retry.
-                        let owed = claim_rate_limited_unsent(cards, &card_id, &finalized.card, true, &e);
+                        // proven unsent: claim it (#1201, #1208) unless the card it
+                        // replaces still shows a typed answer — the drain retry is
+                        // freeze-blind (#917).
+                        let claimable = !replaced_card_shows_typed_answer(cards, session_id).await;
+                        let owed = claim_rate_limited_unsent(cards, &card_id, &finalized.card, claimable, &e);
                         note_cursor_write_failure(
                             cards,
                             session_id,

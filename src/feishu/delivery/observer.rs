@@ -241,8 +241,8 @@ pub trait DeliveryObserver: Send + Sync {
     fn card_write_delivered(&self, message_id: &str, seq: u64) -> bool;
 
     /// The sequence of `message_id`'s most recent failure that may still
-    /// deliver — a recoverable one, or a frequency limit a terminal flush may
-    /// claim as owed (ADR-0115) — when the payload it carried is exactly `card`
+    /// deliver — a recoverable one, or a frequency limit a tail-less flush may
+    /// claim as owed (ADR-0115/0116) — when the payload it carried is exactly `card`
     /// (spec #561, review #569): the write a failure note asks about even after
     /// a newer write — a cached repaint that may omit this payload's delta —
     /// replaced the card's entry. `None` when the newest such failure carried

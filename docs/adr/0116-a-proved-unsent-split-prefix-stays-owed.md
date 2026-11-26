@@ -42,9 +42,18 @@ terminal".**
    a keyed admission.
 2. **Both claim sites name the property explicitly.** The plain live slice
    passes `terminal` — a non-full live build renders the tail, so only a
-   settled ending is claimable there. The finalized prefix passes `true`
-   unconditionally: its build renders no tail whether the split is a size split
-   or a Supplement, and whether the card was live or already ended.
+   settled ending is claimable there. The finalized prefix is claimable
+   whenever its build renders no tail, whether the split is a size split or a
+   Supplement and whether the card was live or already ended — **except** while
+   a resident question block still renders a typed answer field. The prefix
+   body is tail-less, but a refused PATCH leaves the OLD body (and its form) on
+   screen, so a delayed retry would repaint a box the Host may now be typing
+   into (ADR-0038/0100, #917). The guard reads the raw predicate
+   (`has_open_typed_answer`, without `awaits_typed_answer`'s owed-arrival
+   carve-out): an owed block's arrival must not mask an older form the card is
+   still showing. That one case keeps the old card's delivered body and is not
+   retried — safety over liveness, as ADR-0114 records — so the slice is not
+   re-rendered there either.
 3. **The live-block arrival path is unchanged.** A rate-limited body that
    renders a question or permission block is still the render pass's own retry
    (ADR-0114's arrival window), never the queue's. A plain live slice is still
@@ -56,8 +65,9 @@ terminal".**
    card while the chain continues.
 
 **Invariant.** A proved-unsent body that renders no live block is either
-delivered or queued; a body that renders a live block is only ever retried by
-the render pass, never by the freeze-blind drain.
+delivered or queued, unless a resident question block still renders a typed
+answer field (the old card may be showing that box); a body that renders a live
+block is only ever retried by the render pass, never by the freeze-blind drain.
 
 ## Consequences
 
@@ -73,6 +83,8 @@ the render pass, never by the freeze-blind drain.
   refusal stays final — the pre-existing behaviour for every claimable body.
 - Tests pin: a live size split whose prefix PATCH is rate-limited stays owed on
   the original card, and the drain delivers the prefix after the window clears;
+  a split whose old card may show a typed answer is **not** claimed — including
+  while a newer block's arrival is owed — so no retry can wipe the Host's text;
   the existing terminal split and live-block arrival tests are unchanged.
 
 ## Alternatives considered

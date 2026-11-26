@@ -5229,6 +5229,15 @@ impl Turn {
         cards.card(session_id).await.map(|c| c.acc.build_card())
     }
 
+    /// Whether the card currently renders an unanswered typed answer — the box
+    /// the repaint freeze guards (#917).
+    pub(crate) async fn awaits_typed_answer(cards: &CardsHandle, session_id: &str) -> bool {
+        cards
+            .card(session_id)
+            .await
+            .is_some_and(|card| card.acc.awaits_typed_answer())
+    }
+
     /// The timeline index the card currently renders from.
     pub(crate) async fn render_from(cards: &CardsHandle, session_id: &str) -> Option<usize> {
         cards.card(session_id).await.map(|c| c.acc.render_from())
