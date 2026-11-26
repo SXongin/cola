@@ -4216,6 +4216,105 @@ async fn a_queued_ending_patch_notifies_only_after_it_drains() {
     );
 }
 
+/// Issue #1201: Feishu's per-message frequency limit arrives as a business code
+/// inside an HTTP 200 body (`230429`). It proves the terminal PATCH wrote
+/// nothing, so the terminal body must be queued and retried — not dropped as a
+/// permanent refusal — and the Completion Notice must follow the retry's
+/// delivery. Before the fix the ending read `Failed`, the notice was
+/// suppressed, and the card froze on an older slice forever.
+#[tokio::test]
+async fn a_rate_limited_terminal_patch_is_queued_and_notifies_after_it_drains() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "最终答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // Every card write is refused with Feishu's in-body frequency limit: the
+    // terminal PATCH included, but it is the only one that must be queued.
+    platform.fail_update(UpdateFailure::RateLimited, ALWAYS);
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    // The terminal body never reached the card — every write was refused — yet
+    // the delivery layer now owes it, and the notice waits for that retry.
+    assert!(
+        !noticed(&platform).await,
+        "an owed terminal write must not announce before it drains: {:?}",
+        platform.calls.lock().await
+    );
+    let card_id = app
+        .cards_handle()
+        .card("ses_test")
+        .await
+        .expect("the turn's card")
+        .card_message_id()
+        .expect("the card has an id")
+        .to_string();
+    assert!(
+        app.core.feishu.delivery().has_pending_card_update(&card_id),
+        "a rate-limited terminal PATCH is proven unsent and must stay owed"
+    );
+
+    // Feishu's window clears: the drain delivers the terminal body and only
+    // then does the notice fire.
+    platform.clear_fail_update();
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
+    wait_for_notice(&platform).await;
+
+    let delivered = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&delivered).contains("最终答复。"),
+        "the retry carries the terminal body the notice announces: {delivered}"
+    );
+}
+
+/// Issue #1201: a frequency limit that never clears must keep the notice
+/// suppressed — no loop, no announcement over a terminal body that never
+/// reached Feishu.
+#[tokio::test]
+async fn a_rate_limit_that_never_clears_never_announces_the_end() {
+    let _wd = test_work_dir();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, "最终答复。"),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    platform.fail_update(UpdateFailure::RateLimited, ALWAYS);
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+    // Two forced drains retry the owed terminal body; it is still refused, so
+    // the queue must keep it owed rather than settling it as a permanent
+    // failure (the retry's own rate limit proves nothing was written either).
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        !noticed(&platform).await,
+        "a terminal write that never lands must never announce: {:?}",
+        platform.calls.lock().await
+    );
+    let card_id = app
+        .cards_handle()
+        .card("ses_test")
+        .await
+        .expect("the turn's card")
+        .card_message_id()
+        .expect("the card has an id")
+        .to_string();
+    assert!(
+        app.core.feishu.delivery().has_pending_card_update(&card_id),
+        "a retry refused by the same frequency limit stays owed, never dropped"
+    );
+}
+
 /// Acceptance (ticket #607), at the mandated lifecycle seam: a scripted run
 /// whose terminal answer outgrows one Card size-splits on its own flush, and
 /// the Completion Notice must follow the new Card's send — never precede it.
@@ -4288,6 +4387,50 @@ async fn a_size_split_terminal_flush_notifies_after_the_new_card() {
     assert!(
         continuation_at < notice_at,
         "the notice must follow the new card's send: {calls:?}"
+    );
+}
+
+/// Issue #1201, size-split carrier: the finalized prefix's PATCH is refused by
+/// the frequency limit while the continuation create carries the terminal tail.
+/// The prefix was proven unsent, so it must stay owed on the ORIGINAL card and
+/// converge once the window clears — while the already-delivered tail still
+/// announces the ending.
+#[tokio::test]
+async fn a_rate_limited_finalized_prefix_is_queued_while_the_continuation_lands() {
+    let _wd = test_work_dir();
+    let long = format!("{}【尾部标记】", "很长的回答。".repeat(1200));
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "你好"),
+        assistant(2_000, &long),
+    ]);
+    let (_dir, app, _backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Idle)).await;
+    // Every PATCH is limited; the continuation is a CREATE, so the tail still
+    // lands and the ending still delivers.
+    platform.fail_update(UpdateFailure::RateLimited, ALWAYS);
+    // Hold the submit-window poll off the long answer so the split happens on
+    // the finalization flush (the same shape as the size-split notice test).
+    app.turn_render_poll_ms.store(200, Ordering::Relaxed);
+    app.completion_notice_delay_ms.store(0, Ordering::Relaxed);
+    platform.given_reply_id("om_loading");
+    platform.given_reply_id("om_continuation");
+    let mut context = ctx("ses_test", "你好");
+    context.is_group = true;
+    context.requester_open_id = Some(TEST_HOST.to_string());
+
+    Turn::run(&app.turn_handles(), context).await.unwrap();
+
+    wait_for_notice(&platform).await;
+    assert!(
+        app.core.feishu.delivery().has_pending_card_update("om_loading"),
+        "the rate-limited finalized prefix is proven unsent and must stay owed"
+    );
+
+    // Feishu recovers: the drain delivers the prefix body to the original card.
+    platform.clear_fail_update();
+    app.core.feishu.delivery().drain_pending_card_updates(true).await;
+    assert!(
+        !app.core.feishu.delivery().has_pending_card_update("om_loading"),
+        "the drain delivers the owed prefix"
     );
 }
 

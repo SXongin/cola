@@ -204,6 +204,11 @@ async fn a_platform_without_an_observer_reports_no_delivery_state() {
         None,
         "the no-op remembers no failure"
     );
+    assert_eq!(
+        delivery.owe_rate_limited_write("om_unobserved", &card),
+        None,
+        "the no-op can never claim a retry it does not hold"
+    );
     assert!(
         !delivery.card_write_delivered("om_unobserved", 1),
         "no sequence is ever delivered"

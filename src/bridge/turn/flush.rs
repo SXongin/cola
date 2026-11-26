@@ -557,10 +557,12 @@ async fn confirm_staged_cursor(
 }
 
 /// Fold a failed card write into the staged Rendered Cursor (spec #561): a
-/// recoverable failure ties the stage to the Pending Card Update payload it
-/// left owed — the drain reconcile confirms the cursor once that payload
-/// delivers — while anything else (a permanent refusal, a create that will
-/// never be retried) drops the stage, because no later write can carry it.
+/// recoverable failure — or a frequency limit the flush has just claimed as
+/// owed (issue #1201) — ties the stage to the Pending Card Update payload it
+/// left owed, and the drain reconcile confirms the cursor once that payload
+/// delivers; while anything else (a permanent refusal, a create that will
+/// never be retried, a rate limit nothing queued) drops the stage, because no
+/// later write can carry it.
 ///
 /// A recoverable failure whose payload the drain ALREADY delivered before this
 /// note ran (the sequence lookup finds the payload settled, not owed) is a
@@ -576,7 +578,7 @@ async fn note_cursor_write_failure(
     stage: crate::bridge::turn::state::StagedCursorId,
     rendered: &[EndingKey],
 ) {
-    if error.is_recoverable_card_write()
+    if (error.is_recoverable_card_write() || error.is_rate_limited())
         && let Some(card_message_id) = card_message_id
     {
         if let Some(seq) = cards.feishu.delivery().pending_card_write(card_message_id, card) {
@@ -716,6 +718,33 @@ async fn discard_staged_cursor(
     }
 }
 
+/// Claim a rate-limited **ending** body as the card's Pending Card Update (issue
+/// #1201): a typed frequency limit proves the PATCH wrote nothing, so the drain
+/// can retry the exact payload once the window clears. Only the terminal slice
+/// is claimed — a live slice converges on its next render pass, and queueing a
+/// live-block arrival would let the freeze-blind drain repaint a form the Host
+/// is typing into (#917).
+///
+/// The claim requires the delivery layer to recognise this exact attempt as the
+/// card's newest (see
+/// [`crate::feishu::delivery::DeliveryObserver::owe_rate_limited_write`]); when
+/// it cannot, the caller keeps its permanent refusal.
+fn claim_rate_limited_ending(
+    cards: &CardsHandle,
+    card_id: &str,
+    card: &serde_json::Value,
+    terminal: bool,
+    error: &crate::error::BridgeError,
+) -> bool {
+    terminal
+        && error.is_rate_limited()
+        && cards
+            .feishu
+            .delivery()
+            .owe_rate_limited_write(card_id, card)
+            .is_some()
+}
+
 /// The flush machine proper, entered with the session's card-write lock
 /// already held by [`Turn::flush_card`](super::Turn::flush_card),
 /// [`Turn::split_card_chain`](super::Turn::split_card_chain),
@@ -822,7 +851,7 @@ pub(super) async fn flush_card_locked(
             return FlushOutcome::Unwritten;
         };
 
-        let (built, rendered, slice_from, slice_to, sent_sigs, arrival, carries_question) = {
+        let (built, rendered, slice_from, slice_to, sent_sigs, arrival, carries_question, terminal) = {
             let Some(mut card) = cards.card(session_id).await else {
                 return FlushOutcome::Unwritten;
             };
@@ -864,6 +893,10 @@ pub(super) async fn flush_card_locked(
                 deadline: arrival_deadline,
             };
             let carries_question = body_carries_question(&rendered);
+            // Whether this flush IS the turn's ending (the final render applied
+            // a terminal card state before flushing): only that slice is worth
+            // claiming from a definite rate limit as owed (issue #1201).
+            let terminal = card.acc.card_state().is_terminal();
             (
                 built,
                 rendered,
@@ -872,6 +905,7 @@ pub(super) async fn flush_card_locked(
                 sent_sigs,
                 arrival,
                 carries_question,
+                terminal,
             )
         };
         if card_is_live {
@@ -973,6 +1007,12 @@ pub(super) async fn flush_card_locked(
                                 }
                             }
                         }
+                        // A terminal body Feishu refused with its per-message
+                        // frequency limit is PROVEN unsent (issue #1103): claim
+                        // it so the drain retries it after the window, instead
+                        // of dropping the turn's last body and suppressing its
+                        // notice (issue #1201).
+                        let owed = claim_rate_limited_ending(cards, &card_id, &built.card, terminal, &e);
                         note_cursor_write_failure(
                             cards,
                             session_id,
@@ -984,9 +1024,10 @@ pub(super) async fn flush_card_locked(
                         )
                         .await;
                         // The delivery layer's own split (ADR-0067): a
-                        // recoverable failure stays owed a retry — accepted;
-                        // anything else is settled as permanently refused.
-                        if e.is_recoverable_card_write() {
+                        // recoverable failure — or a rate limit this flush has
+                        // just queued — stays owed a retry and counts as
+                        // accepted; anything else is a permanent refusal.
+                        if owed || e.is_recoverable_card_write() {
                             wrote = true;
                         } else {
                             refused = true;
@@ -1235,6 +1276,12 @@ pub(super) async fn flush_card_locked(
                             set_ending_write(cards, session_id, super::state::EndingWrite::Failed).await;
                             return FlushOutcome::Refused;
                         }
+                        // A terminal slice of the ending's chain refused by the
+                        // frequency limit is proven unsent: claim it too, so the
+                        // prefix card converges instead of freezing on older
+                        // content while the continuation carries the tail (issue
+                        // #1201).
+                        let owed = claim_rate_limited_ending(cards, &card_id, &finalized.card, terminal, &e);
                         note_cursor_write_failure(
                             cards,
                             session_id,
@@ -1246,9 +1293,10 @@ pub(super) async fn flush_card_locked(
                         )
                         .await;
                         // The delivery layer's own split (ADR-0067): a
-                        // recoverable failure stays owed a retry — accepted;
-                        // anything else is settled as permanently refused.
-                        if e.is_recoverable_card_write() {
+                        // recoverable failure — or a rate limit this flush has
+                        // just queued — stays owed a retry and counts as
+                        // accepted; anything else is a permanent refusal.
+                        if owed || e.is_recoverable_card_write() {
                             wrote = true;
                         } else {
                             refused = true;

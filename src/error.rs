@@ -42,8 +42,9 @@ pub enum BridgeError {
     /// log line must not call it a permanent refusal (issue #1103). It is
     /// deliberately **not** [`Self::is_recoverable_card_write`]: that predicate
     /// answers "the delivery layer still owes this write a retry", and a direct
-    /// card PATCH is never queued there — the bridge retries a live block's
-    /// arrival itself.
+    /// card PATCH is not queued on its own — the bridge retries a live block's
+    /// arrival itself, and only a terminal body's writer may claim the payload
+    /// as owed (ADR-0115, issue #1201).
     #[error("feishu rate limited ({code}): {detail}")]
     FeishuRateLimited { code: i64, detail: String },
 
@@ -151,9 +152,12 @@ impl BridgeError {
     /// A rate limit is retryable in principle but answers **false** here: this
     /// predicate means "the delivery layer still owes the write", and the call
     /// sites that ask are queued writes plus the flush's own accounting. A
-    /// direct card PATCH is never queued, so reading the limit as owed would
-    /// claim a retry nobody holds; the bridge retries a live block's arrival on
-    /// its own ([`Self::is_rate_limited`], issue #1103).
+    /// direct card PATCH is not queued on its own, so reading the limit as owed
+    /// would claim a retry nobody holds; the bridge retries a live block's
+    /// arrival itself ([`Self::is_rate_limited`], issue #1103), and the ending's
+    /// flush claims a terminal body explicitly
+    /// ([`crate::feishu::delivery::DeliveryObserver::owe_rate_limited_write`],
+    /// ADR-0115).
     pub(crate) fn is_recoverable_card_write(&self) -> bool {
         match self {
             BridgeError::Http(_) | BridgeError::Io(_) => true,
