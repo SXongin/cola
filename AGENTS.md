@@ -188,9 +188,11 @@ and the map from the old numbers.
   **The window is closed around every write that can carry the block** (before
   the live PATCH and the continuation create), so a write that lands — or whose
   outcome a cancellation swallows — leaves the freeze engaged over the box the
-  card may show; only a refusal that **proves** nothing was written re-opens it
-  (an ambiguous transport/5xx failure leaves it closed). A card already guarding
-  a sibling question's box opens no window (typed text outranks a second block),
+  card may show; only a refusal that **proves** nothing was written re-opens it —
+  an allow-list (content rejection, frequency limit, business refusal, 4xx but
+  408), because a lost or unparseable response may still have applied the PATCH.
+  A body that renders no tail (a finalized prefix, an intermediate slice) touches
+  neither. A card already guarding a sibling question's box opens no window (typed text outranks a second block),
   and a second insert while the window is open joins it rather than re-opening
   it. Feishu's frequency limit (`230020`/`230429`, a business code inside the
   body) is typed `BridgeError::FeishuRateLimited` for exactly this reason — never

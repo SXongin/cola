@@ -55,16 +55,20 @@ card does not carry does not guard text it does not show, and the next pass
 writes it.
 
 **The window closes around every write that can carry the block**
-(`close_arrival_window`, before the live PATCH and the continuation create). If
-the write lands — or a cancellation swallows its outcome — the freeze is already
-engaged over the box the card may now show, so no later pass can repaint it.
-Only a refusal that **proves nothing was written** (a typed rate limit, a content
-rejection, a business refusal) re-opens the window, and only while it has time
-left; an **ambiguous** failure (transport, timeout, 5xx, 408) leaves it closed.
-When the window expires with the block still owed, the card keeps its previous
-body and a WARN names the request the window was armed for. A finalized prefix
-renders no tail, so its write neither closes nor re-opens the window — the blocks
-are the continuation's.
+(`close_arrival_window`, before the live PATCH and the continuation create, and
+only when that body rendered a live question block). If the write lands — or a
+cancellation swallows its outcome — the freeze is already engaged over the box
+the card may now show, so no later pass can repaint it. A body that renders no
+tail (a finalized prefix, an intermediate continuation slice) neither closes nor
+re-opens the window: its blocks live on the next card.
+
+Re-opening is an **allow-list**, because only an answer Feishu itself returned
+proves the body was not written: a typed content rejection, a typed frequency
+limit, a business refusal, or a 4xx other than 408. Everything else — transport,
+timeout, 5xx, a 408, and a 2xx whose body failed to parse *after* the PATCH was
+applied — is read as "may have landed" and leaves the freeze closed. When the
+window expires with the block still owed, the card keeps its previous body and a
+WARN names the request the window was armed for.
 
 **3. Typed text wins over a sibling block.** An insertion that lands on a card
 already guarding another question's box arms nothing: the flow's own out-of-band

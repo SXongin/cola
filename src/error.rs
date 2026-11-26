@@ -193,14 +193,21 @@ mod tests {
             !rate.is_recoverable_card_write(),
             "no queued write holds the retry"
         );
-        assert!(!rate.is_message_gone());
-        assert!(!BridgeError::Feishu("update error 230002: message not found".into()).is_rate_limited());
+        assert!(
+            !rate.is_message_gone(),
+            "a rate limit says nothing about the message being deleted, so it is not a gone message"
+        );
+        assert!(
+            !BridgeError::Feishu("update error 230002: message not found".into()).is_rate_limited(),
+            "a gone message is the sibling refusal, so it is not a rate limit"
+        );
         assert!(
             !BridgeError::CardContentRejected {
                 code: 230099,
                 detail: "refused".into(),
             }
-            .is_rate_limited()
+            .is_rate_limited(),
+            "a content rejection is deterministic, so it is not a rate limit"
         );
     }
 
