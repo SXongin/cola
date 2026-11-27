@@ -1184,21 +1184,36 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// session whose card reads these rows: a job owned by any other session is a
 /// **Child Job** and carries its owning subagent row's label when one is
 /// present, and stays marked as one (`child_job`) even when no row names it.
-pub(super) fn merge_job_tasks(transcript: &mut SessionTranscript, session_id: &str, jobs: &[BackgroundJob]) {
+///
+/// Returns the task built for every running job, post-Wake and PRE-dedupe, in
+/// the same start-then-id order the appended rows use: the failed-read cache
+/// must keep a job even when a tool-part task outranks it in this read. The
+/// tool-part marker never flips, so the launch part can leave a later read
+/// (compaction, the ascending page cap); the job list is then the run's only
+/// representation, and a failed read must re-attach it rather than settle a
+/// live job.
+pub(super) fn merge_job_tasks(
+    transcript: &mut SessionTranscript,
+    session_id: &str,
+    jobs: &[BackgroundJob],
+) -> Vec<BackgroundTask> {
     let mut tasks = std::mem::take(&mut transcript.background_tasks);
     let existing = tasks.len();
+    let mut built: Vec<BackgroundTask> = Vec::new();
     for job in jobs.iter().filter(|job| job.status == "running") {
         let task = job.task(transcript, &tasks, session_id);
         if transcript.wakes.iter().any(|wake| wake.retires(&task)) {
             continue;
         }
-        if tasks.iter().any(|current| same_run(current, &task)) {
-            continue;
+        if !tasks.iter().any(|current| same_run(current, &task)) {
+            tasks.push(task.clone());
         }
-        tasks.push(task);
+        built.push(task);
     }
     sort_job_rows(&mut tasks[existing..]);
+    sort_job_rows(&mut built);
     transcript.background_tasks = tasks;
+    built
 }
 
 /// Re-attach the last successfully read job rows after a failed job read
@@ -3856,10 +3871,23 @@ mod tests {
                 },
             ]
         });
-        merge_job_tasks(
+        let cached = merge_job_tasks(
             &mut transcript,
             "ses_1",
             &decode_job_list(&jobs).expect("the envelope"),
+        );
+        assert_eq!(
+            cached
+                .iter()
+                .map(|task| task.job_id.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("call_shell"),
+                Some("job_new"),
+                Some("job_shell"),
+                Some("job_sub"),
+            ],
+            "every running job is cached (the deduped ones included), in row order"
         );
 
         let ids: Vec<&str> = transcript
@@ -3884,10 +3912,18 @@ mod tests {
             5_000,
             serde_json::json!({"source": "codemode", "jobID": "job_cc"}),
         )]);
-        merge_job_tasks(
+        let cached = merge_job_tasks(
             &mut transcript,
             "ses_1",
             &decode_job_list(&hand_authored_job_list()).expect("the recorded envelope"),
+        );
+        assert_eq!(
+            cached
+                .iter()
+                .map(|task| task.job_id.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("job_img"), Some("job_vid")],
+            "a Wake-retired job is never cached"
         );
 
         let ids: Vec<&str> = transcript
