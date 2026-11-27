@@ -3185,6 +3185,93 @@ async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
     );
 }
 
+/// Overlapping transcript reads finish out of order in production (the render
+/// loops and Session Sync share the strategy). A cache verdict applies by READ
+/// START, not completion: an older read that saw a running job must never
+/// overwrite a newer read's empty list (spec #1220 AC3 — the row disappears on
+/// the first successful read whose list no longer reports it). The older
+/// read's own transcript still carries its own row; the cache does not, so a
+/// later failed read re-attaches nothing.
+#[tokio::test]
+async fn a_stale_successful_read_never_overwrites_a_newer_job_verdict() {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+    let served = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    {
+        let served = Arc::clone(&served);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        server.route_async_dynamic("GET", "/api/experimental/job", move |_| {
+            let index = served.fetch_add(1, Ordering::SeqCst);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                match index {
+                    // The older read: report a running job, held open until
+                    // the newer read has recorded its verdict.
+                    0 => {
+                        entered.notify_one();
+                        release.notified().await;
+                        DynamicResponse::new(200, "application/json", running_jobs_body())
+                    }
+                    // The newer read: the list no longer reports the job.
+                    1 => DynamicResponse::new(200, "application/json", r#"{"data":[]}"#),
+                    // The follow-up read after both: a failing list, so only
+                    // the cache decides whether the job comes back.
+                    _ => DynamicResponse::new(500, "application/json", r#"{"message":"boom"}"#),
+                }
+            }
+        });
+    }
+    let client = v2_wire_client(&server);
+
+    let older = tokio::spawn({
+        let client = client.clone();
+        async move { client.transcript("ses_1").await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the older read reaches the job list");
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+
+    // The newer read starts after the older one and finishes first.
+    let newer = client.transcript("ses_1").await.expect("the newer read succeeds");
+    assert!(
+        newer.background_tasks.is_empty(),
+        "the newer list reports no running job: {:#?}",
+        newer.background_tasks
+    );
+
+    release.notify_one();
+    let older = tokio::time::timeout(Duration::from_secs(5), older)
+        .await
+        .expect("the released older read completes")
+        .expect("the spawned read task")
+        .expect("the older read succeeds");
+    assert_eq!(
+        job_task_ids(&older),
+        ["job_img", "job_vid", "job_cc"],
+        "a stale read still carries its own row; only the cache is ordered"
+    );
+
+    // The failed read is newer than both: it must re-attach nothing, because
+    // the newer empty verdict owns the cache.
+    let after = client
+        .transcript("ses_1")
+        .await
+        .expect("the failed job read never fails the transcript");
+    assert!(
+        after.background_tasks.is_empty(),
+        "the older success must not resurrect the retired job: {:#?}",
+        after.background_tasks
+    );
+}
+
 /// A 404 or 405 is the server's "no job surface": the read carries no job rows
 /// and blocks nothing, even after rows were seen — and it clears the cache, so
 /// a later failure invents nothing.

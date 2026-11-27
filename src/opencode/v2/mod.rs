@@ -63,6 +63,7 @@ mod tests;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::backend::{
     BackgroundTask, ChildEvidence, ChildRuntime, PromptSkill, SessionTranscript, ShellRuntime, SkillInfo,
@@ -162,6 +163,18 @@ const MAX_MESSAGE_PAGES: usize = 100;
 /// page is the difference between one request and many on a long session.
 const MESSAGE_PAGE_LIMIT: &str = "200";
 
+/// One session's failed-read job cache: the rows a successful job read
+/// produced, and the READ-START sequence that produced them (ADR-0118).
+/// Transcript reads overlap (the render loops and Session Sync share the
+/// strategy) and finish out of order, so the sequence — not completion
+/// order — decides which verdict applies. `rows` empty is a positive
+/// "nothing running" verdict too, and keeps its sequence so a stale read
+/// cannot resurrect what a newer read retired.
+struct CachedJobRows {
+    seq: u64,
+    rows: Vec<BackgroundTask>,
+}
+
 /// The strategy that speaks the V2 generation.
 pub(crate) struct V2Strategy {
     /// V2's live tool progress, fed by the server's event stream and overlaid
@@ -169,12 +182,16 @@ pub(crate) struct V2Strategy {
     /// record carries no progress while a call runs, so this is where a live
     /// `subagent`'s child session id comes from.
     progress: progress::Progress,
+    /// The read-start sequence handed to every transcript read: the failed-read
+    /// job cache applies a read's verdict only when that read started after the
+    /// one that produced the stored rows (ADR-0118).
+    reads: AtomicU64,
     /// The last successfully read job rows, per session (ADR-0118): a failed
     /// job list read re-attaches them unchanged, so the card neither flickers
     /// nor settles a live job. Process-local and per attachment — a reconnect
     /// builds a fresh strategy, and a session's own rows never leak to
     /// another.
-    jobs: Mutex<HashMap<String, Vec<BackgroundTask>>>,
+    jobs: Mutex<HashMap<String, CachedJobRows>>,
 }
 
 /// The location-scoped list URL: V2 selects an instance/workspace with the
@@ -648,6 +665,11 @@ impl GenerationStrategy for V2Strategy {
     /// so the loop stops on the first empty page; a failed read names itself
     /// and carries a body preview, like the module's other reads.
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript> {
+        // The failed-read job cache applies by READ START, not completion:
+        // transcript reads overlap (the render loops and Session Sync share the
+        // strategy) and finish out of order, so an older read's verdict must
+        // never overwrite a newer one (ADR-0118).
+        let seq = self.reads.fetch_add(1, Ordering::Relaxed);
         // The request read is the source of truth; the event stream only fills
         // RUNNING tool parts' ephemeral progress (issue #470). Start the reader
         // lazily: the first transcript read is where the live transport exists.
@@ -667,16 +689,19 @@ impl GenerationStrategy for V2Strategy {
                 // marker never flips, so a later read can lose the launch part
                 // and must still find the run in the job cache.
                 let rows = wire::merge_job_tasks(&mut transcript, session_id, &jobs);
-                self.remember_job_rows(session_id, rows);
+                self.remember_job_rows(session_id, seq, rows);
             }
             // 404/405: the server has no job surface. No rows, no wait — and
             // no stale rows from a previous attachment state.
-            Ok(None) => self.forget_job_rows(session_id),
+            Ok(None) => self.forget_job_rows(session_id, seq),
             Err(error) => {
                 tracing::debug!("session {session_id} job list: {error}; keeping the last job rows");
+                // A stale failure still shows the CURRENT cache on its own
+                // transcript; the seq-guarded re-memory below leaves a newer
+                // read's cache untouched.
                 let cached = self.cached_job_rows(session_id);
                 let survivors = wire::attach_job_tasks(&mut transcript, &cached);
-                self.remember_job_rows(session_id, survivors);
+                self.remember_job_rows(session_id, seq, survivors);
             }
         }
         Ok(transcript)
@@ -1237,6 +1262,7 @@ impl V2Strategy {
     pub(crate) fn new() -> Self {
         Self {
             progress: progress::Progress::new(),
+            reads: AtomicU64::new(0),
             jobs: Mutex::new(HashMap::new()),
         }
     }
@@ -1299,14 +1325,18 @@ impl V2Strategy {
     /// Keep the rows a successful job read left, so a later failure can
     /// re-attach them (ADR-0118): every running job's task, including one
     /// deduped against a tool-part row, minus the jobs this read's Wakes
-    /// retired. An empty set clears the session's entry.
-    fn remember_job_rows(&self, session_id: &str, rows: Vec<BackgroundTask>) {
+    /// retired. An empty set is a positive "nothing running" verdict too.
+    ///
+    /// `seq` is the read's START sequence: a read that started before the one
+    /// that produced the stored rows is stale, and its verdict is dropped — so
+    /// an older read finishing late can never resurrect retired rows or
+    /// overwrite a newer verdict.
+    fn remember_job_rows(&self, session_id: &str, seq: u64, rows: Vec<BackgroundTask>) {
         let mut cache = self.jobs.lock().expect("job row cache lock");
-        if rows.is_empty() {
-            cache.remove(session_id);
-        } else {
-            cache.insert(session_id.to_string(), rows);
+        if cache.get(session_id).is_some_and(|cached| cached.seq > seq) {
+            return;
         }
+        cache.insert(session_id.to_string(), CachedJobRows { seq, rows });
     }
 
     /// The last successfully read job rows for `session_id`, empty when the
@@ -1316,14 +1346,15 @@ impl V2Strategy {
             .lock()
             .expect("job row cache lock")
             .get(session_id)
-            .cloned()
+            .map(|cached| cached.rows.clone())
             .unwrap_or_default()
     }
 
-    /// Drop a session's cached rows: the server answered no job surface, so a
-    /// later failure must invent nothing.
-    fn forget_job_rows(&self, session_id: &str) {
-        self.jobs.lock().expect("job row cache lock").remove(session_id);
+    /// Record a 404/405 "no job surface" verdict: no rows, and the sequence
+    /// that saw it. A STALE 404/405 must not forget a newer cache, so this
+    /// shares the success arm's seq guard.
+    fn forget_job_rows(&self, session_id: &str, seq: u64) {
+        self.remember_job_rows(session_id, seq, Vec::new());
     }
 
     /// Durably admit one prompt (`POST /api/session/{id}/prompt`) with
