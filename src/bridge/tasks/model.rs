@@ -38,11 +38,13 @@ impl TaskKind {
         }
     }
 
-    /// Whether this kind's row renders a running total (ADR-0060, ADR-0118):
-    /// a shell's elapsed is its only liveness, and a job's row shows its total
-    /// runtime the same way. A subagent row never does — its liveness is its
-    /// child's activity fragment, and a total would only restate the
-    /// fragment's age.
+    /// The by-KIND default for rendering a running total (ADR-0060, ADR-0118):
+    /// a shell's elapsed is its only liveness, and the job kinds show their
+    /// total runtime the same way. A `subagent` row does not by kind — its
+    /// liveness is its child's activity fragment — but the LIVE ROW decides
+    /// ([`TaskLedgerRow::render_elapsed`]): a job-sourced `subagent` row is the
+    /// job's own work and DOES render its total (ADR-0118), so the kind alone
+    /// cannot decide.
     pub(crate) fn renders_elapsed(self) -> bool {
         matches!(self, Self::Shell | Self::CodeMode | Self::Image | Self::Video)
     }
@@ -104,6 +106,12 @@ pub struct TaskLedgerRow {
     pub kind: TaskKind,
     pub label: Option<String>,
     pub started_at: Option<i64>,
+    /// Whether this row renders a running total. Decided per ROW, not from the
+    /// kind alone (ADR-0118): a shell row always does, and a **job-sourced**
+    /// row does whatever its kind — a `subagent` job's total runtime included —
+    /// while a tool-part `subagent` row never does (its liveness is its child's
+    /// activity fragment).
+    pub render_elapsed: bool,
     /// True when a reconciliation read reported the task not running while no
     /// Wake retired it. The row stays live (the runtime read is evidence, not
     /// an ending) but reads as unconfirmed.

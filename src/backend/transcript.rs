@@ -1266,8 +1266,11 @@ pub struct BackgroundTask {
     pub started_at: Option<i64>,
     /// The running job that represents this run, when known (ADR-0118): the
     /// job a transcript-derived task was deduped against, or the job this task
-    /// itself was discovered from. This is the association key only — whether
-    /// the row IS the job is [`Self::job_sourced`].
+    /// itself was discovered from. A tool-part task carries upstream 2.4's own
+    /// alias from decode time — a shell job's id is its `shellID`, a subagent
+    /// job's its `childSessionID` — so a Wake naming only the job retires it.
+    /// This is the association key only — whether the row IS the job is
+    /// [`Self::job_sourced`].
     pub job_id: Option<String>,
     /// Whether this task exists only because of the job list (ADR-0118). A
     /// job-sourced row keeps the job's identity and has no launch part; a

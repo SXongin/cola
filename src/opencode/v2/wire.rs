@@ -1434,6 +1434,17 @@ impl ToolCall {
             BackgroundLaunch::Shell { shell_id } => (shell_id, None),
             BackgroundLaunch::Subagent { child_id } => (None, child_id),
         };
+        // Upstream 2.4 keys a backgrounded shell's job by its `shellID` and a
+        // subagent's by its `childSessionID` (`jobs.start({ id })`), so the
+        // tool task carries that alias from decode time: a Wake naming only
+        // the JOB id then retires this task on the very next read, before any
+        // job list could associate it. The row stays a tool task —
+        // `job_sourced` is false and its call identity is unchanged.
+        let job_id = match self.identity.name.as_str() {
+            "shell" => shell_id.clone(),
+            "subagent" => child_id.clone(),
+            _ => None,
+        };
         // The launch's own neutral label: a shell's command, a subagent's
         // description. It is also the label a Child Job renders as its owner.
         let label = match self.identity.name.as_str() {
@@ -1446,7 +1457,7 @@ impl ToolCall {
             shell_id,
             child_id,
             started_at: self.started_at,
-            job_id: None,
+            job_id,
             job_sourced: false,
             label,
             owner_label: None,
@@ -3924,12 +3935,14 @@ mod tests {
         let jobs = serde_json::json!({
             "data": [
                 {
-                    "id": "job_shell", "kind": "shell", "sessionID": "ses_1",
+                    // Upstream keys a shell job by its shellID.
+                    "id": "sh_1", "kind": "shell", "sessionID": "ses_1",
                     "status": "running", "time": {"started": 1000},
                     "shellID": "sh_1", "command": "sleep 2",
                 },
                 {
-                    "id": "job_sub", "kind": "subagent", "sessionID": "ses_1",
+                    // ... and a subagent job by its childSessionID.
+                    "id": "ses_child", "kind": "subagent", "sessionID": "ses_1",
                     "status": "running", "time": {"started": 1000},
                     "childSessionID": "ses_child", "agent": "general",
                     "description": "review",
@@ -3958,8 +3971,8 @@ mod tests {
             [
                 Some("call_shell"),
                 Some("job_new"),
-                Some("job_shell"),
-                Some("job_sub"),
+                Some("ses_child"),
+                Some("sh_1"),
             ],
             "every running job is cached (the deduped ones included), in row order"
         );
@@ -3974,9 +3987,9 @@ mod tests {
             ["call_shell", "call_sub", "job_new"],
             "only the identity no task already names adds a row"
         );
-        // The deduped tool tasks carry the job id (so a Wake naming only the
-        // job retires them) but keep their launch identity, so the lifecycle
-        // still treats them as tool tasks.
+        // The deduped tool tasks carry upstream's job alias from decode time
+        // (so a Wake naming only the job retires them) but keep their launch
+        // identity, so the lifecycle still treats them as tool tasks.
         let by_call = |call_id: &str| {
             transcript
                 .background_tasks
@@ -3984,56 +3997,73 @@ mod tests {
                 .find(|task| task.tool.call_id == call_id)
                 .expect("the deduped tool task")
         };
-        assert_eq!(by_call("call_shell").job_id.as_deref(), Some("job_shell"));
-        assert_eq!(by_call("call_sub").job_id.as_deref(), Some("job_sub"));
+        assert_eq!(by_call("call_shell").job_id.as_deref(), Some("sh_1"));
+        assert_eq!(by_call("call_sub").job_id.as_deref(), Some("ses_child"));
         assert!(!by_call("call_shell").is_job_sourced());
         assert!(!by_call("call_sub").is_job_sourced());
         assert!(by_call("job_new").is_job_sourced());
     }
 
-    /// AC3 for a deduped tool task: a shell job `job1` / `sh1` dedupes against
-    /// the tool task whose `shell_id` is `sh1`. A Wake that names only
-    /// `jobID = job1` must retire the tool task too — its launch metadata never
-    /// flips, so no other fact would end it — and the job is not cached.
+    /// AC3 across reads for a deduped tool task: upstream keys a subagent job
+    /// by its `childSessionID`, so the tool task carries that alias from decode
+    /// time. A Wake naming only the job id then retires it on the very NEXT
+    /// read too — the job list no longer reports it, but the launch part's
+    /// metadata still says `running`, so without the alias the row would come
+    /// back forever.
     #[test]
     fn a_wake_naming_only_the_job_retires_its_deduped_tool_task() {
-        let mut transcript = decode_messages(&[
+        let launch = || {
             serde_json::json!({
                 "id": "msg_a",
                 "type": "assistant",
                 "time": {"created": 900},
-                "content": [background_shell_part("call_shell", "sh1")],
-            }),
-            synthetic_wake(
-                "msg_w",
-                5_000,
-                serde_json::json!({"source": "shell", "jobID": "job1"}),
-            ),
-        ]);
-        assert_eq!(
-            transcript.background_tasks.len(),
-            1,
-            "the decode alone cannot retire the tool task: the Wake names only the job"
-        );
+                "content": [background_subagent_part("call_sub", "ses_child")],
+            })
+        };
 
+        // Read 1: the job list still reports the child job, so the tool-part
+        // derivation wins the row and the job is deduped (and cached).
+        let mut first = decode_messages(&[launch()]);
         let jobs = serde_json::json!({
             "data": [{
-                "id": "job1", "kind": "shell", "sessionID": "ses_1",
+                // Upstream keys the subagent job by its child session id.
+                "id": "ses_child", "kind": "subagent", "sessionID": "ses_1",
                 "status": "running", "time": {"started": 1000},
-                "shellID": "sh1", "command": "sleep 2",
+                "childSessionID": "ses_child", "agent": "general",
+                "description": "review",
             }]
         });
         let cached = merge_job_tasks(
-            &mut transcript,
+            &mut first,
             "ses_1",
             &decode_job_list(&jobs).expect("the envelope"),
         );
-        assert!(
-            transcript.background_tasks.is_empty(),
-            "the job's Wake retires the deduped tool task: {:#?}",
-            transcript.background_tasks
+        assert_eq!(first.background_tasks.len(), 1, "the tool task wins");
+        assert_eq!(first.background_tasks[0].tool.call_id, "call_sub");
+        assert_eq!(
+            first.background_tasks[0].job_id.as_deref(),
+            Some("ses_child"),
+            "the decode carries upstream's job alias"
         );
-        assert!(cached.is_empty(), "a Wake-retired job is not cached: {cached:#?}");
+        assert!(!cached.is_empty(), "the deduped job is cached");
+
+        // Read 2: the same launch (metadata still says running), the Wake
+        // naming only the job id, and no running job in the list. The row must
+        // NOT return.
+        let mut second = decode_messages(&[
+            launch(),
+            synthetic_wake(
+                "msg_w",
+                5_000,
+                serde_json::json!({"source": "subagent", "jobID": "ses_child"}),
+            ),
+        ]);
+        merge_job_tasks(&mut second, "ses_1", &[]);
+        assert!(
+            second.background_tasks.is_empty(),
+            "the next read must not resurrect the retired tool task: {:#?}",
+            second.background_tasks
+        );
     }
 
     /// A job whose id happens to equal a tool task's call id only corroborates
@@ -4046,13 +4076,13 @@ mod tests {
             "id": "msg_a",
             "type": "assistant",
             "time": {"created": 900},
-            "content": [background_shell_part("job1", "sh1")],
+            "content": [background_shell_part("job1", "job1")],
         })]);
         let jobs = serde_json::json!({
             "data": [{
                 "id": "job1", "kind": "shell", "sessionID": "ses_1",
                 "status": "running", "time": {"started": 1000},
-                "shellID": "sh1", "command": "sleep 2",
+                "shellID": "job1", "command": "sleep 2",
             }]
         });
         let cached = merge_job_tasks(

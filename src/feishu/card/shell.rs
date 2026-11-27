@@ -816,6 +816,7 @@ mod tests {
         let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::Shell,
+            render_elapsed: true,
             child_job: None,
             label: Some("a <number_tag> | b".into()),
             started_at: Some(start),
@@ -897,6 +898,7 @@ mod tests {
         let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::CodeMode,
+            render_elapsed: true,
             child_job: Some(ChildJobOwner::Named("review the diff".into())),
             label: Some("const answer = 42".into()),
             started_at: Some(start),
