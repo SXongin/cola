@@ -3186,12 +3186,12 @@ async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
 }
 
 /// Overlapping transcript reads finish out of order in production (the render
-/// loops and Session Sync share the strategy). A cache verdict applies by READ
-/// START, not completion: an older read that saw a running job must never
-/// overwrite a newer read's empty list (spec #1220 AC3 — the row disappears on
-/// the first successful read whose list no longer reports it). The older
-/// read's own transcript still carries its own row; the cache does not, so a
-/// later failed read re-attaches nothing.
+/// loops and Session Sync share the strategy). A cache verdict applies by
+/// JOB-REQUEST order, not completion: an older job request that saw a running
+/// job must never overwrite a newer request's empty list (spec #1220 AC3 — the
+/// row disappears on the first successful read whose list no longer reports it
+/// running). The older read's own transcript still carries its own row; the
+/// cache does not, so a later failed read re-attaches nothing.
 #[tokio::test]
 async fn a_stale_successful_read_never_overwrites_a_newer_job_verdict() {
     use std::time::Duration;
@@ -3268,6 +3268,96 @@ async fn a_stale_successful_read_never_overwrites_a_newer_job_verdict() {
     assert!(
         after.background_tasks.is_empty(),
         "the older success must not resurrect the retired job: {:#?}",
+        after.background_tasks
+    );
+}
+
+/// A verdict's truth-time is its JOB-LIST request, not its transcript entry:
+/// with message-page duration inversion a later-started read can issue its job
+/// request first. Here A enters first but is held on its message page; B starts
+/// later, issues its job request first and sees the job running; A's job
+/// request then sees it gone. A's empty verdict is the newer observation and
+/// must own the cache, so a following failed read re-attaches nothing.
+#[tokio::test]
+async fn job_verdicts_are_ordered_by_job_request_not_read_entry() {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    let server = TestHttpServer::start().await;
+    let message_served = Arc::new(AtomicUsize::new(0));
+    let message_entered = Arc::new(Notify::new());
+    let release_message = Arc::new(Notify::new());
+    {
+        let served = Arc::clone(&message_served);
+        let entered = Arc::clone(&message_entered);
+        let release = Arc::clone(&release_message);
+        server.route_async_dynamic("GET", "/api/session/ses_1/message", move |_| {
+            let index = served.fetch_add(1, Ordering::SeqCst);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                if index == 0 {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                DynamicResponse::new(200, "application/json", r#"{"data":[]}"#)
+            }
+        });
+    }
+    let job_served = Arc::new(AtomicUsize::new(0));
+    {
+        let served = Arc::clone(&job_served);
+        server.route_dynamic("GET", "/api/experimental/job", move |_| {
+            match served.fetch_add(1, Ordering::SeqCst) {
+                // B's job request: the job is still running.
+                0 => DynamicResponse::new(200, "application/json", running_jobs_body()),
+                // A's later job request: the job is gone.
+                1 => DynamicResponse::new(200, "application/json", r#"{"data":[]}"#),
+                // The follow-up read: a failed list, so only the cache decides.
+                _ => DynamicResponse::new(500, "application/json", r#"{"message":"boom"}"#),
+            }
+        });
+    }
+    let client = v2_wire_client(&server);
+
+    let slow = tokio::spawn({
+        let client = client.clone();
+        async move { client.transcript("ses_1").await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), message_entered.notified())
+        .await
+        .expect("the slow read reaches its message page");
+
+    // The later-started read reaches its job request first.
+    let earlier_job = client
+        .transcript("ses_1")
+        .await
+        .expect("the later-started read succeeds");
+    assert_eq!(
+        job_task_ids(&earlier_job),
+        ["job_img", "job_vid", "job_cc"],
+        "the first job request sees the job running"
+    );
+
+    release_message.notify_one();
+    let slow = tokio::time::timeout(Duration::from_secs(5), slow)
+        .await
+        .expect("the released slow read completes")
+        .expect("the spawned read task")
+        .expect("the slow read succeeds");
+    assert!(
+        slow.background_tasks.is_empty(),
+        "the later job request sees the job gone: {:#?}",
+        slow.background_tasks
+    );
+
+    let after = client
+        .transcript("ses_1")
+        .await
+        .expect("the failed job read never fails the transcript");
+    assert!(
+        after.background_tasks.is_empty(),
+        "the newer JOB REQUEST's verdict owns the cache: {:#?}",
         after.background_tasks
     );
 }

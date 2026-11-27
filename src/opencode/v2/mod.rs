@@ -164,12 +164,13 @@ const MAX_MESSAGE_PAGES: usize = 100;
 const MESSAGE_PAGE_LIMIT: &str = "200";
 
 /// One session's failed-read job cache: the rows a successful job read
-/// produced, and the READ-START sequence that produced them (ADR-0118).
+/// produced, and the JOB-REQUEST sequence that produced them (ADR-0118).
 /// Transcript reads overlap (the render loops and Session Sync share the
-/// strategy) and finish out of order, so the sequence — not completion
-/// order — decides which verdict applies. `rows` empty is a positive
-/// "nothing running" verdict too, and keeps its sequence so a stale read
-/// cannot resurrect what a newer read retired.
+/// strategy) and finish out of order; a verdict's truth-time is its job-list
+/// request, so that sequence — not the read's entry or completion order —
+/// decides which verdict applies. `rows` empty is a positive "nothing
+/// running" verdict too, and keeps its sequence so an older observation
+/// cannot resurrect what a newer one retired.
 struct CachedJobRows {
     seq: u64,
     rows: Vec<BackgroundTask>,
@@ -182,9 +183,10 @@ pub(crate) struct V2Strategy {
     /// record carries no progress while a call runs, so this is where a live
     /// `subagent`'s child session id comes from.
     progress: progress::Progress,
-    /// The read-start sequence handed to every transcript read: the failed-read
-    /// job cache applies a read's verdict only when that read started after the
-    /// one that produced the stored rows (ADR-0118).
+    /// The job-request sequence handed to every transcript read's job-list
+    /// call: the failed-read job cache applies a verdict only when that job
+    /// request was issued after the one that produced the stored rows
+    /// (ADR-0118).
     reads: AtomicU64,
     /// The last successfully read job rows, per session (ADR-0118): a failed
     /// job list read re-attaches them unchanged, so the card neither flickers
@@ -665,11 +667,6 @@ impl GenerationStrategy for V2Strategy {
     /// so the loop stops on the first empty page; a failed read names itself
     /// and carries a body preview, like the module's other reads.
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript> {
-        // The failed-read job cache applies by READ START, not completion:
-        // transcript reads overlap (the render loops and Session Sync share the
-        // strategy) and finish out of order, so an older read's verdict must
-        // never overwrite a newer one (ADR-0118).
-        let seq = self.reads.fetch_add(1, Ordering::Relaxed);
         // The request read is the source of truth; the event stream only fills
         // RUNNING tool parts' ephemeral progress (issue #470). Start the reader
         // lazily: the first transcript read is where the live transport exists.
@@ -682,6 +679,12 @@ impl GenerationStrategy for V2Strategy {
         // job list after the progress overlay, merge the jobs no tool part
         // already names, and keep the rows through a failed read. Best-effort
         // throughout — the transcript read never fails on this request.
+        //
+        // The verdict sequence is taken right before the job request, not at
+        // this read's entry: a verdict's truth-time is its job-list request,
+        // and message-page durations can invert two reads' entry order. The
+        // cache applies by this sequence, so the last job request wins.
+        let seq = self.reads.fetch_add(1, Ordering::Relaxed);
         match self.running_jobs(http, session_id).await {
             Ok(Some(jobs)) => {
                 // Cache the task built for EVERY running job — a job deduped
@@ -1327,10 +1330,10 @@ impl V2Strategy {
     /// deduped against a tool-part row, minus the jobs this read's Wakes
     /// retired. An empty set is a positive "nothing running" verdict too.
     ///
-    /// `seq` is the read's START sequence: a read that started before the one
-    /// that produced the stored rows is stale, and its verdict is dropped — so
-    /// an older read finishing late can never resurrect retired rows or
-    /// overwrite a newer verdict.
+    /// `seq` is the JOB-REQUEST sequence: a verdict whose job request was
+    /// issued before the one that produced the stored rows is stale, and its
+    /// rows are dropped — so an older observation can never resurrect retired
+    /// rows or overwrite a newer verdict.
     fn remember_job_rows(&self, session_id: &str, seq: u64, rows: Vec<BackgroundTask>) {
         let mut cache = self.jobs.lock().expect("job row cache lock");
         if cache.get(session_id).is_some_and(|cached| cached.seq > seq) {
