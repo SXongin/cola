@@ -4791,7 +4791,14 @@ impl StreamAccumulator {
                     .iter()
                     .find(|run| transcript.run_is_task(run, task))
             {
-                rows.push(self.run_row(transcript, activities, finished, run, &mut activity_keys));
+                rows.push(self.run_row(
+                    transcript,
+                    activities,
+                    finished,
+                    run,
+                    &mut activity_keys,
+                    task.is_job_sourced(),
+                ));
                 continue;
             }
             let activity = (kind == TaskKind::Subagent && !finished.contains(call_id))
@@ -4810,6 +4817,11 @@ impl StreamAccumulator {
                 kind,
                 label: task_row_label(transcript, task, kind),
                 started_at: task.started_at,
+                // A shell row's elapsed is its only liveness, and a
+                // job-sourced row shows its total whatever its kind (ADR-0118)
+                // — a `subagent` job included. A tool-part subagent row's
+                // liveness is its child's fragment, so it renders none.
+                render_elapsed: task.is_job_sourced() || kind.renders_elapsed(),
                 // A task the runtime could not confirm (issue #454): the row
                 // renders its own facts plus the unconfirmed marker, and stays
                 // live until its Wake or a positive terminal verdict retires it.
@@ -4854,7 +4866,7 @@ impl StreamAccumulator {
             {
                 continue;
             }
-            rows.push(self.run_row(transcript, activities, finished, run, &mut activity_keys));
+            rows.push(self.run_row(transcript, activities, finished, run, &mut activity_keys, false));
         }
         // Keep the cache to the live runs (a retired run's fragment leaves with
         // its row) and fold in this read's fresh successes — a failed child
@@ -4915,6 +4927,7 @@ impl StreamAccumulator {
         finished: &std::collections::HashSet<String>,
         run: &crate::backend::AgentRun,
         activity_keys: &mut std::collections::HashSet<String>,
+        render_elapsed: bool,
     ) -> TaskLedgerRow {
         let launch = run.launched_by.first().map(|call| call.call_id.as_str());
         let key = run.run_id.as_str();
@@ -4952,6 +4965,9 @@ impl StreamAccumulator {
             kind: TaskKind::Subagent,
             label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
             started_at: run.started_at,
+            // A run the job list owns renders its total like any job row; a
+            // tool-part subagent row's liveness stays its child's fragment.
+            render_elapsed,
             unconfirmed: run.ids().any(|id| transcript.unconfirmed_tasks.contains(id)),
             // A run-sourced row is the session's own child, never a job a
             // descendant owns: no `↳` marker (ADR-0118).
@@ -7970,6 +7986,7 @@ mod tests {
         acc.set_ledger(
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                render_elapsed: true,
                 child_job: None,
                 label: Some("npm run build".into()),
                 started_at: None,
@@ -8020,6 +8037,7 @@ mod tests {
     fn the_cleanup_button_rides_a_waiting_card_with_unconfirmed_rows_only() {
         let row = |unconfirmed: bool| TaskLedgerRow {
             kind: TaskKind::Shell,
+            render_elapsed: true,
             child_job: None,
             label: Some("npm run build".into()),
             started_at: None,
@@ -8086,6 +8104,7 @@ mod tests {
         let rows = || {
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                render_elapsed: true,
                 child_job: None,
                 label: Some("npm run build".into()),
                 started_at: Some(start),
@@ -8132,6 +8151,7 @@ mod tests {
         let start = 1_800_000_000_000;
         let row = |captured_ms: i64, text: &str| TaskLedgerRow {
             kind: TaskKind::Shell,
+            render_elapsed: true,
             child_job: None,
             label: Some("npm run build".into()),
             started_at: None,
@@ -8190,6 +8210,7 @@ mod tests {
         let rows = || {
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                render_elapsed: true,
                 child_job: None,
                 label: Some("npm run build".into()),
                 started_at: Some(start),
@@ -8226,6 +8247,7 @@ mod tests {
         let row = |activity: TaskLiveness| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                render_elapsed: false,
                 child_job: None,
                 label: Some("review the diff".into()),
                 // No elapsed: the activity age is the card's only rendered
@@ -8282,6 +8304,7 @@ mod tests {
         let row = |activity: Option<TaskLiveness>| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                render_elapsed: false,
                 child_job: None,
                 label: Some("review the diff".into()),
                 // No elapsed: the activity age is the card's only rendered
@@ -8535,6 +8558,7 @@ mod tests {
         let shell = |label: Option<&str>, started_at: Option<i64>| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                render_elapsed: true,
                 child_job: None,
                 label: label.map(str::to_string),
                 started_at,
@@ -8607,6 +8631,7 @@ mod tests {
         let row = |started_at: i64, activity_at: i64| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                render_elapsed: false,
                 child_job: None,
                 label: Some("review the diff".into()),
                 started_at: Some(started_at),
@@ -8647,6 +8672,7 @@ mod tests {
         let rows = || {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                render_elapsed: false,
                 child_job: None,
                 label: Some("review the diff".into()),
                 started_at: None,

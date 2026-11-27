@@ -3140,7 +3140,7 @@ async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
                 vec![],
                 serde_json::json!({
                     "data": [{
-                        "id": "job_shell", "kind": "shell", "sessionID": "ses_1",
+                        "id": "sh_job", "kind": "shell", "sessionID": "ses_1",
                         "status": "running", "time": {"started": 1000},
                         "shellID": "sh_job", "command": "npm run build",
                     }]
@@ -3162,7 +3162,7 @@ async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
     assert_eq!(launched.background_tasks[0].tool.call_id, "call_shell");
     assert_eq!(
         launched.background_tasks[0].job_id.as_deref(),
-        Some("job_shell"),
+        Some("sh_job"),
         "the deduped job adds no row, but associates its id with the tool task"
     );
     assert!(
@@ -3185,7 +3185,7 @@ async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
     let row = &orphaned.background_tasks[0];
     assert_eq!(
         row.job_id.as_deref(),
-        Some("job_shell"),
+        Some("sh_job"),
         "the job task is the row now, not the departed launch"
     );
     assert_eq!(row.tool.name, "shell");
