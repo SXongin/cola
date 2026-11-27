@@ -137,8 +137,8 @@ impl OpenCodeBackend {
     /// alive, so an appearing Service (or a preferred sibling) never truncates
     /// a streaming generation; a dead attached server reattaches immediately
     /// (the heal path). When more than one eligible server exists, the pass
-    /// also WARNs once naming the canonical and every ignored server, so the
-    /// choice is visible without attempting to sync two servers.
+    /// also WARNs once per distinct set naming the canonical and every ignored
+    /// server, so the choice is visible without attempting to sync two servers.
     async fn reconcile(&self, request: &EnsureAttached<'_>) -> crate::error::Result<AttachOutcome> {
         let candidates = match discovery::scan_processes() {
             Ok(candidates) => candidates,
@@ -246,30 +246,12 @@ impl OpenCodeBackend {
         };
         let url = server.url();
         let ignored = discovery::other_servers(&candidates, server);
-        if !ignored.is_empty() {
-            // One server is the premise of real-time sync (ADR-0085). cola
-            // cannot aggregate two servers, so make the choice and the ignored
-            // servers visible every pass instead of silently flapping.
-            tracing::warn!(
-                "multiple default-store OpenCode servers; canonical {} (pid {}); ignoring {}",
-                url,
-                server.pid,
-                ignored
-                    .iter()
-                    .map(|c| format!(
-                        "{} (pid {}, {})",
-                        c.url(),
-                        c.pid,
-                        if c.is_service() {
-                            "service"
-                        } else {
-                            "not a service"
-                        }
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+        // One server is the premise of real-time sync (ADR-0085). cola cannot
+        // aggregate two servers, so make the choice and the ignored servers
+        // visible — on a change of the set, not on every pass: an adopted
+        // second server is a standing condition, and an identical repeat
+        // carries no information (issue #1209, ADR-0117).
+        self.note_multi_server(multi_server_condition(server, &ignored));
         let current = self.base_url();
         let attached_pid = self.attached_server_pid();
         let pick_is_owned = self_pid == Some(server.pid);
@@ -320,6 +302,78 @@ impl OpenCodeBackend {
         }
         Ok(AttachOutcome::Attached)
     }
+
+    /// Report the multi-server condition once per distinct set (issue #1209).
+    ///
+    /// A reconcile pass re-observes a standing second default-store server
+    /// every 5 s, so the same fact at WARN buries the log — the reconnect
+    /// loop's stated policy is WARN once per distinct condition, DEBUG on an
+    /// identical repeat, INFO on a recovery (ADR-0048's level policy, decided
+    /// for this line by ADR-0117; [`crate::bridge::poll::PollLoop`]). `None`
+    /// means the canonical server is alone again. The latch lives on the
+    /// backend, not in the pass, so it survives across passes and every clone
+    /// shares it.
+    ///
+    /// A pass that finds no server at all leaves the latch untouched: its own
+    /// serverless path reports that transition, and a set that comes back with
+    /// the same pids, ports and classes would be the same condition anyway —
+    /// a genuinely new server carries a new pid and WARNs.
+    fn note_multi_server(&self, condition: Option<String>) {
+        let mut latch = self
+            .multi_server_latch()
+            .lock()
+            .expect("the multi-server latch is never poisoned");
+        // Taking the previous condition leaves the guard free to be rewritten
+        // in either branch; a cleared condition is simply not put back.
+        let reported = latch.take();
+        match condition {
+            Some(current) => {
+                if reported.as_deref() == Some(current.as_str()) {
+                    tracing::debug!("{current} (unchanged since the last pass)");
+                } else {
+                    tracing::warn!("{current}");
+                }
+                *latch = Some(current);
+            }
+            None => {
+                if reported.is_some() {
+                    tracing::info!(
+                        "back to one default-store OpenCode server; the multi-server choice is settled"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The standing multi-server condition as one line, or `None` when the
+/// canonical server is the only one (issue #1209).
+///
+/// The wording keeps its historical `multiple default-store OpenCode servers`
+/// prefix so existing log filters and triage greps still match it.
+fn multi_server_condition(canonical: &ServerCandidate, ignored: &[&ServerCandidate]) -> Option<String> {
+    if ignored.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "multiple default-store OpenCode servers; canonical {} (pid {}); ignoring {}",
+        canonical.url(),
+        canonical.pid,
+        ignored
+            .iter()
+            .map(|c| format!(
+                "{} (pid {}, {})",
+                c.url(),
+                c.pid,
+                if c.is_service() {
+                    "service"
+                } else {
+                    "not a service"
+                }
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// The Background Task capability a **resolved** generation proves (ADR-0079,
@@ -481,6 +535,7 @@ impl ServerLifecycle for OpenCodeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::test_support::{capture_logs, level_count};
     use crate::opencode::discovery::ServerClass;
 
     fn cand(pid: i32, port: u16) -> ServerCandidate {
@@ -601,6 +656,119 @@ mod tests {
             capability(&absent, "background_tasks").is_none(),
             "no attachment advertises no capability"
         );
+    }
+
+    /// Issue #1209: the ignored set is a condition, not a per-pass event.
+    /// The line keeps its historical prefix (log filters and triage greps
+    /// match on it), names the canonical pid, and marks each ignored server's
+    /// class.
+    #[test]
+    fn the_multi_server_condition_names_the_canonical_and_each_ignored_server() {
+        let canonical = cand(11, 4096);
+        let coexistent = cand(12, 4097);
+        let service = ServerCandidate {
+            class: ServerClass::Service,
+            ..cand(13, 4098)
+        };
+
+        let condition = multi_server_condition(&canonical, &[&coexistent, &service])
+            .expect("two servers are a condition");
+
+        assert!(
+            condition.starts_with("multiple default-store OpenCode servers"),
+            "the historical prefix is what existing filters match: {condition}"
+        );
+        assert!(
+            condition.contains("canonical http://localhost:4096 (pid 11)"),
+            "{condition}"
+        );
+        assert!(
+            condition.contains("http://localhost:4097 (pid 12, not a service)"),
+            "{condition}"
+        );
+        assert!(
+            condition.contains("http://localhost:4098 (pid 13, service)"),
+            "{condition}"
+        );
+    }
+
+    #[test]
+    fn a_single_server_has_no_multi_server_condition() {
+        assert_eq!(multi_server_condition(&cand(11, 4096), &[]), None);
+    }
+
+    /// The first observation WARNs, an identical repeat is DEBUG, a changed set
+    /// WARNs again (issue #1209): the 5 s pass must not repeat a standing fact.
+    #[tokio::test]
+    async fn an_identical_multi_server_condition_warns_once_then_debugs() {
+        let backend = serverless_backend(crate::config::OpenCodeConfig::default());
+        let (_, logs) = capture_logs(async {
+            backend.note_multi_server(Some(multi_condition_line("a")));
+            backend.note_multi_server(Some(multi_condition_line("a")));
+            backend.note_multi_server(Some(multi_condition_line("b")));
+        })
+        .await;
+
+        assert_eq!(
+            level_count(&logs, "multiple default-store", "WARN"),
+            2,
+            "the first observation and the changed set warn:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "unchanged since the last pass", "DEBUG"),
+            1,
+            "the identical repeat is DEBUG:\n{logs}"
+        );
+    }
+
+    /// A clear is INFO once — not on every following single-server pass — and a
+    /// condition that comes back is a fresh WARN.
+    #[tokio::test]
+    async fn a_cleared_multi_server_condition_reports_once_and_rearms() {
+        let backend = serverless_backend(crate::config::OpenCodeConfig::default());
+        let (_, logs) = capture_logs(async {
+            backend.note_multi_server(Some(multi_condition_line("a")));
+            backend.note_multi_server(None);
+            backend.note_multi_server(None);
+            backend.note_multi_server(Some(multi_condition_line("a")));
+        })
+        .await;
+
+        assert_eq!(
+            level_count(&logs, "back to one default-store", "INFO"),
+            1,
+            "a clear reports once; the next single-server pass is silent:\n{logs}"
+        );
+        assert_eq!(
+            level_count(&logs, "multiple default-store", "WARN"),
+            2,
+            "a condition that reappears after a clear is a fresh WARN:\n{logs}"
+        );
+    }
+
+    /// The latch is backend state shared by every clone; a per-clone latch
+    /// would warn once per clone for the same condition.
+    #[tokio::test]
+    async fn the_multi_server_latch_is_shared_across_clones() {
+        let backend = serverless_backend(crate::config::OpenCodeConfig::default());
+        let clone = backend.clone();
+        let (_, logs) = capture_logs(async {
+            backend.note_multi_server(Some(multi_condition_line("a")));
+            clone.note_multi_server(Some(multi_condition_line("a")));
+        })
+        .await;
+
+        assert_eq!(
+            level_count(&logs, "multiple default-store", "WARN"),
+            1,
+            "a clone reports the same standing condition as DEBUG:\n{logs}"
+        );
+    }
+
+    /// A hand-built condition with the production prefix, so the level asserts
+    /// can match on it.
+    fn multi_condition_line(ignored: &str) -> String {
+        format!("multiple default-store OpenCode servers; ignoring {ignored}")
     }
 
     /// The demand path's real decision, not an extracted helper: with
