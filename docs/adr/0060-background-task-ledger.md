@@ -16,6 +16,21 @@
 >
 > **Amended 2026-10-31 (#917)**: a card rendering an unanswered typed answer
 > field stops refreshing its ledger, so the repaint cannot wipe the text.
+>
+> **Amended by ADR-0118**: the ledger also lists a running job-sourced
+> **Background Task** — a V2 `codemode` / `image` / `video` job, or a shell /
+> subagent the tool part did not mark. Its type word is the job's kind, its
+> label the job's own (a script's first non-empty line, a file path), and a
+> child job appends `↳ <subagent label>` (or `↳ 子会话`). Job rows follow the
+> transcript-derived rows in start order. Its list-ended retirement is a read
+> verdict with no durable ending (ADR-0118), and its Wake entry joins the
+> launching tool part by `metadata.jobID`.
+>
+> The freeze's in-place carve-out widens once more: a late content tail that is
+> **not** a genuine resumption — a job completion notice, or a Wake-less tail —
+> also renders on an open yielded card, in place and with no 承接 line, which is
+> what `bridge/turn/wake.rs` step 3 already does. The ledger and the quiet true
+> end stay the only *state* updates; this is content the card owed.
 
 ## Context
 

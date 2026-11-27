@@ -32,6 +32,11 @@
 > "recorded at derivation / an entry-less chain included" promise is scoped to
 > the evidence and **Cleanup** endings. See the amendment below.
 
+> **Amended by ADR-0118**: a job-sourced Background Task's list-ended
+> retirement is the V2 job-list read's verdict, not a durable Task Ending. It
+> records no ending and owes no entry; the synthetic notice is its record. A
+> **Wake** that does arrive still records its ending here, unchanged.
+
 A **Background Task**'s end is re-derived from the transcript on every read,
 corrected by a process-local overlay, marked single by a per-chain announce set,
 and kept single across a restart by a parallel `rendered` key set — while one

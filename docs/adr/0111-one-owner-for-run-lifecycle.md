@@ -12,6 +12,12 @@
 > boundary (the owner is neutral, `ChainRecords` the one implementation), not an
 > abstraction over hypothetical adapters.
 
+> **Amended by ADR-0118**: the live set for a job-sourced **Background Task**
+> is the V2 job-list read, not the complement of recorded endings. A successful
+> read that no longer reports the job retires its row without recording a Task
+> Ending; only a Wake records one. The owner's invariants are otherwise
+> unchanged.
+
 ## Context
 
 The ticket counted four homes — `backend/runs.rs` (2,079),
