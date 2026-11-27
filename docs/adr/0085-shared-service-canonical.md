@@ -1,5 +1,9 @@
 # The V2 Shared Service is the canonical server
 
+> **Amended by ADR-0117**: the several-servers clause no longer WARNs on every
+> reconcile pass — the line WARNs once per distinct canonical + ignored set,
+> repeats at DEBUG and clears at INFO (issue #1209).
+
 ADR-0013 fixed the two-server flap: cola yields its Owned Server to a
 Coexistent one. That model predates the V2 **Shared Service**. OpenCode V2's
 default way for a machine to have a server is `opencode serve --service`: the
@@ -61,7 +65,9 @@ boundary around it.
   `Restarted`; Coexistent → `NotOwned`; nothing → `NoServer`.
 - **Several servers stay visible, never aggregated.** cola still attaches to
   exactly one. Each reconcile pass WARNs the canonical server (URL + pid) and
-  every ignored one (URL + pid, service or not); `cola status` shows the
+  every ignored one (URL + pid, service or not) **(superseded by ADR-0117: one
+  WARN per distinct set, DEBUG on an identical repeat, INFO when it clears —
+  issue #1209)**; `cola status` shows the
   canonical server and lists `other_servers` in the human report and `--json`;
   `cola doctor` WARNs when more than one default-store server runs.
 

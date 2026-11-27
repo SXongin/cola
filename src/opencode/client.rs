@@ -8,7 +8,7 @@
 //! response decoders; V1's lives under [`crate::opencode::v1`], and deleting
 //! that module is V1 retirement.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime};
 use crate::bridge::tasks::TasksHandle;
@@ -53,6 +53,14 @@ pub struct OpenCodeBackend {
     /// replacement on the same port (a new generation or password). Shared
     /// across clones like the strategy.
     attached_pid: Arc<RwLock<Option<i32>>>,
+    /// The multi-server condition the reconcile loop already reported (issue
+    /// #1209): a second default-store server cola does not attach to is a
+    /// **standing** fact, so the loop WARNs on a change of the canonical +
+    /// ignored set, logs an identical repeat at DEBUG and a clear at INFO —
+    /// ADR-0048's level policy, which the in-pass line used to sidestep;
+    /// ADR-0117 records the decision. Shared across clones: a per-clone latch
+    /// would WARN once per clone for the same condition.
+    multi_server: Arc<Mutex<Option<String>>>,
     /// The Background Task State handle the adapter was constructed with
     /// (ADR-0079, ticket #682): the module's one handle, which owns the
     /// volatile liveness tier — the Background Task facts a Runtime
@@ -86,6 +94,7 @@ impl Clone for OpenCodeBackend {
             model: self.model.clone(),
             strategy: Arc::clone(&self.strategy),
             attached_pid: Arc::clone(&self.attached_pid),
+            multi_server: Arc::clone(&self.multi_server),
             tasks: self.tasks.clone(),
             settings: self.settings.clone(),
             layout: self.layout.clone(),
@@ -219,6 +228,7 @@ impl OpenCodeBackend {
             model: model.and_then(parse_model),
             strategy: Arc::new(RwLock::new(generation.strategy())),
             attached_pid: Arc::new(RwLock::new(attached_pid)),
+            multi_server: Arc::new(Mutex::new(None)),
             tasks,
             settings,
             layout,
@@ -243,6 +253,14 @@ impl OpenCodeBackend {
             .attached_pid
             .read()
             .expect("the attached-pid lock is never poisoned")
+    }
+
+    /// The slot for the standing multi-server condition (issue #1209). The
+    /// backend owns the state so it outlives a reconcile pass and is shared by
+    /// every clone; the lifecycle owns the level policy, so this is only the
+    /// slot.
+    pub(crate) fn multi_server_latch(&self) -> &Mutex<Option<String>> {
+        &self.multi_server
     }
 
     /// Point this backend at a (re)discovered attachment, selecting its
