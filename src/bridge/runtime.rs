@@ -532,15 +532,24 @@ fn cleanup_mark_pass(backend: &Arc<dyn Backend>, transcript: &mut SessionTranscr
 /// in the read's own order — the reconcile's ask list. Empty when the read
 /// lists no live task, which is what makes the reconcile spend nothing (and,
 /// under [`RuntimeReconcile::observe`], not even consume a throttle attempt).
+///
+/// A **job-sourced** row carries its shell/child ids too, but its liveness is
+/// the job list, never a runtime verdict (ADR-0118): asking for it would admit
+/// a pass every throttle cycle only for [`RunLifecycle::apply_task_runtime`] to
+/// refuse the answer. Job rows are therefore excluded here — but NOT from
+/// [`capture_shell_outputs`], which is a different read: a shell job's output
+/// window still renders whenever a pass runs for other work.
 fn live_task_ids(transcript: &SessionTranscript) -> (Vec<String>, Vec<String>) {
     let shells = transcript
         .background_tasks
         .iter()
+        .filter(|task| task.job_id.is_none())
         .filter_map(|task| task.shell_id.clone())
         .collect();
     let mut children: Vec<String> = transcript
         .background_tasks
         .iter()
+        .filter(|task| task.job_id.is_none())
         .filter_map(|task| task.child_id.clone())
         .collect();
     // A child-only run has no Background Task to name it (Codex), so its child
@@ -629,6 +638,22 @@ mod tests {
             shell_id: shell_id.map(str::to_string),
             child_id: child_id.map(str::to_string),
             started_at: Some(1_000),
+            ..Default::default()
+        }
+    }
+
+    /// A job-sourced Background Task (ADR-0118): the job id is its call
+    /// identity and `job_id` is set, so the runtime ask list must leave it out.
+    fn job_row(job_id: &str, kind: &str, shell_id: Option<&str>, child_id: Option<&str>) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: kind.into(),
+                call_id: job_id.into(),
+            },
+            shell_id: shell_id.map(str::to_string),
+            child_id: child_id.map(str::to_string),
+            started_at: Some(1_000),
+            job_id: Some(job_id.into()),
             ..Default::default()
         }
     }
@@ -1290,29 +1315,92 @@ mod tests {
 
     /// A job-sourced row is not a childless task either (spec #1220, ticket
     /// #1223): its liveness is the V2 job list, so the runtime reconcile spends
-    /// nothing on job-only work — the "no live task, no request" gate holds —
-    /// and marks nothing, on the success or the failure path.
+    /// nothing on job-only work — the "no live task, no request" gate holds for
+    /// all five job shapes, a shell or subagent job's ids included — and marks
+    /// nothing, on the success or the failure path.
     #[tokio::test]
     async fn job_only_work_spends_no_runtime_read_and_marks_nothing() {
+        for row in [
+            job_row("job_cc", "codemode", None, None),
+            job_row("job_img", "image", None, None),
+            job_row("job_vid", "video", None, None),
+            // A shell job names a shell id ...
+            job_row("job_sh", "shell", Some("sh_job"), None),
+            // ... and a subagent job a child id: neither makes it the runtime's.
+            job_row("job_sub", "subagent", None, Some("ses_job_child")),
+        ] {
+            let mock = MockBackend::new(Vec::new());
+            // A failed verdict read is the strongest absence: if the gate ever
+            // admitted the pass, the failure path would mark the Cleanup exit.
+            mock.fail_task_runtime_reads(usize::MAX);
+            let mock = Arc::new(mock);
+            let calls = Arc::clone(&mock.task_runtime_calls);
+            let outputs = Arc::clone(&mock.shell_output_calls);
+            let backend: Arc<dyn Backend> = mock;
+            let mut transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![row.clone()]);
+            assert!(
+                !backend.runs().needs_cleanup_marking(&transcript),
+                "a job row has an identity: no Cleanup exit to mark ({})",
+                row.tool.call_id
+            );
+
+            let reconcile = RuntimeReconcile::new();
+            reconcile
+                .interval_ms
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                reconcile
+                    .observe(&backend, "ses_test", "/work", &mut transcript, 50, None)
+                    .await
+                    .is_none(),
+                "job-only work is the read's, never the reconcile's ({})",
+                row.tool.call_id
+            );
+            assert!(
+                calls.lock().await.is_empty(),
+                "the gate is restored: no runtime verdict was asked for ({})",
+                row.tool.call_id
+            );
+            assert!(
+                transcript.unconfirmed_tasks.is_empty(),
+                "and no ⚠️ marker rides a live job ({}): {:?}",
+                row.tool.call_id,
+                transcript.unconfirmed_tasks
+            );
+            assert_eq!(
+                transcript.background_tasks,
+                vec![row.clone()],
+                "the job row is untouched ({})",
+                row.tool.call_id
+            );
+            // The job-only gate returns before the capture step, so a shell
+            // job's window is owed to the first pass that runs for other work
+            // (pinned by the sibling test below) — never to a job-only cycle.
+            assert!(
+                outputs.lock().await.is_empty(),
+                "a job-only cycle spends no request at all ({})",
+                row.tool.call_id
+            );
+        }
+    }
+
+    /// The shell-window half (ticket #1223 review): excluding job rows from the
+    /// runtime ask list must not exclude them from the output capture. When a
+    /// pass is admitted for another live task, the job's own shell still gets
+    /// its window read — the capture iterates every Background Task.
+    #[tokio::test]
+    async fn a_shell_jobs_output_window_is_still_captured() {
         let mock = MockBackend::new(Vec::new());
-        mock.fail_task_runtime_reads(usize::MAX);
         let mock = Arc::new(mock);
         let calls = Arc::clone(&mock.task_runtime_calls);
+        let outputs = Arc::clone(&mock.shell_output_calls);
         let backend: Arc<dyn Backend> = mock;
-        let mut transcript =
-            SessionTranscript::new(vec![]).with_background_tasks(vec![crate::backend::BackgroundTask {
-                tool: ToolIdentity {
-                    name: "codemode".into(),
-                    call_id: "job_cc".into(),
-                },
-                job_id: Some("job_cc".into()),
-                started_at: Some(1_000),
-                ..Default::default()
-            }]);
-        assert!(
-            !backend.runs().needs_cleanup_marking(&transcript),
-            "a job row has an identity: no Cleanup exit to mark"
-        );
+        let mut transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![
+            // Another live shell is what admits the pass ...
+            task("call_bg", Some("sh_bg"), None),
+            // ... and the job's shell still rides the capture.
+            job_row("job_sh", "shell", Some("sh_job"), None),
+        ]);
 
         let reconcile = RuntimeReconcile::new();
         reconcile
@@ -1322,19 +1410,23 @@ mod tests {
             reconcile
                 .observe(&backend, "ses_test", "/work", &mut transcript, 50, None)
                 .await
-                .is_none(),
-            "job-only work is the read's, never the reconcile's"
+                .is_some(),
+            "the non-job shell admits the pass"
+        );
+        assert_eq!(
+            calls.lock().await.as_slice(),
+            [("ses_test".to_string(), vec!["sh_bg".to_string()], Vec::new())],
+            "only the non-job shell is asked for a verdict"
+        );
+        assert_eq!(
+            outputs.lock().await.as_slice(),
+            ["sh_bg".to_string(), "sh_job".to_string()],
+            "the job's shell window is still captured"
         );
         assert!(
-            calls.lock().await.is_empty(),
-            "the gate is restored: no runtime verdict was asked for"
+            transcript.shell_outputs.contains_key("sh_job"),
+            "and stored on the read the ledger renders"
         );
-        assert!(
-            transcript.unconfirmed_tasks.is_empty(),
-            "and no ⚠️ marker rides a live job: {:?}",
-            transcript.unconfirmed_tasks
-        );
-        assert_eq!(transcript.background_tasks.len(), 1, "the job row is untouched");
     }
 
     /// A launch whose refs are ALL terminal creates a terminal run with no
