@@ -3012,6 +3012,43 @@ async fn a_failed_job_read_keeps_the_last_rows_and_still_returns_ok() {
     );
 }
 
+/// A 200 whose body is valid JSON but not the `{data: Job.Info[]}` envelope is
+/// a FAILED read, not an empty list: a gateway answering `{"error":…}` with
+/// 200 must not clear live rows. The transcript stays `Ok`, the last rows come
+/// back, and the cache survives for the next failure.
+#[tokio::test]
+async fn a_200_non_envelope_job_body_keeps_the_last_rows() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+    serve_job_script(
+        &server,
+        vec![
+            (200, vec![], running_jobs_body()),
+            (200, vec![], r#"{"error":"gateway"}"#.to_string()),
+            (200, vec![], r#"{"data":{}}"#.to_string()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let first = client.transcript("ses_1").await.unwrap();
+    assert_eq!(job_task_ids(&first), ["job_img", "job_vid", "job_cc"]);
+
+    let gateway = client
+        .transcript("ses_1")
+        .await
+        .expect("a non-envelope 200 must never fail the transcript read");
+    assert_eq!(
+        gateway.background_tasks, first.background_tasks,
+        "a gateway error object is a failed read: the rows stand"
+    );
+
+    let malformed = client.transcript("ses_1").await.unwrap();
+    assert_eq!(
+        malformed.background_tasks, first.background_tasks,
+        "a `data` that is not an array is the same failed read, and the cache survived it"
+    );
+}
+
 /// A 404 or 405 is the server's "no job surface": the read carries no job rows
 /// and blocks nothing, even after rows were seen — and it clears the cache, so
 /// a later failure invents nothing.

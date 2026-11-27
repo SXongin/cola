@@ -1151,21 +1151,21 @@ pub(super) struct BackgroundJob {
     pub(super) started_at: Option<i64>,
 }
 
-/// Decode the `{data: Job.Info[]}` body of the experimental job list. A body
-/// that is not the envelope carries no jobs; one entry that fails to decode is
-/// skipped rather than failing its siblings (the list is a live read, never a
-/// reason to lose the other running rows).
-pub(super) fn decode_job_list(body: &Value) -> Vec<BackgroundJob> {
-    body.get("data")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| serde_json::from_value::<RawJob>(entry.clone()).ok())
-                .map(RawJob::into_neutral)
-                .collect()
-        })
-        .unwrap_or_default()
+/// Decode the `{data: Job.Info[]}` body of the experimental job list. `None`
+/// when the body is not that envelope at all — a gateway's 200 error object,
+/// or a `data` that is not an array — which the caller must treat as a FAILED
+/// read, never as an empty list: an empty list is a verdict that retires rows.
+/// One entry that fails to decode is still skipped rather than failing its
+/// siblings (the list is a live read, never a reason to lose the other running
+/// rows).
+pub(super) fn decode_job_list(body: &Value) -> Option<Vec<BackgroundJob>> {
+    body.get("data").and_then(Value::as_array).map(|entries| {
+        entries
+            .iter()
+            .filter_map(|entry| serde_json::from_value::<RawJob>(entry.clone()).ok())
+            .map(RawJob::into_neutral)
+            .collect()
+    })
 }
 
 /// A string field that carries something: an absent field and a blank value
@@ -3670,7 +3670,7 @@ mod tests {
     /// start time then id — the list's own order never shows.
     #[test]
     fn running_jobs_merge_as_background_tasks_with_their_labels() {
-        let jobs = decode_job_list(&hand_authored_job_list());
+        let jobs = decode_job_list(&hand_authored_job_list()).expect("the recorded envelope");
         assert_eq!(jobs.len(), 4, "every entry decodes; the merge filters status");
 
         let mut transcript = decode_messages(&[serde_json::json!({
@@ -3721,6 +3721,30 @@ mod tests {
         }
     }
 
+    /// A 200 body that is valid JSON but not the `{data: Job.Info[]}` envelope
+    /// is NOT an empty list: an empty list retires rows, so a gateway's error
+    /// object must reach the failed-read arm instead (a `data` that is not an
+    /// array included). Only a real (possibly empty) array is a successful
+    /// read.
+    #[test]
+    fn a_non_envelope_job_body_is_not_an_empty_list() {
+        for body in [
+            serde_json::json!({"error": "gateway"}),
+            serde_json::json!({"data": {}}),
+            serde_json::json!([{"id": "job_1", "kind": "shell"}]),
+        ] {
+            assert!(
+                decode_job_list(&body).is_none(),
+                "a non-envelope body must not read as no jobs: {body}"
+            );
+        }
+        assert_eq!(
+            decode_job_list(&serde_json::json!({"data": []})),
+            Some(Vec::new()),
+            "an empty data array is a successful empty read"
+        );
+    }
+
     /// The codemode label falls back to the job's title and then to the id when
     /// no launching `execute` part names the job in this read.
     #[test]
@@ -3732,7 +3756,11 @@ mod tests {
             }]
         });
         let mut transcript = decode_messages(&[]);
-        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&labelled));
+        merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&labelled).expect("the envelope"),
+        );
         assert_eq!(
             transcript.background_tasks[0].label.as_deref(),
             Some("named program"),
@@ -3746,7 +3774,11 @@ mod tests {
             }]
         });
         let mut transcript = decode_messages(&[]);
-        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&untitled));
+        merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&untitled).expect("the envelope"),
+        );
         assert_eq!(
             transcript.background_tasks[0].label.as_deref(),
             Some("job_2"),
@@ -3794,7 +3826,11 @@ mod tests {
                 },
             ]
         });
-        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&jobs));
+        merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&jobs).expect("the envelope"),
+        );
 
         let ids: Vec<&str> = transcript
             .background_tasks
@@ -3821,7 +3857,7 @@ mod tests {
         merge_job_tasks(
             &mut transcript,
             "ses_1",
-            &decode_job_list(&hand_authored_job_list()),
+            &decode_job_list(&hand_authored_job_list()).expect("the recorded envelope"),
         );
 
         let ids: Vec<&str> = transcript
@@ -3856,7 +3892,11 @@ mod tests {
                 },
             ]
         });
-        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&jobs));
+        merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&jobs).expect("the envelope"),
+        );
 
         let task = |id: &str| {
             transcript
