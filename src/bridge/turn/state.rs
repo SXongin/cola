@@ -18,8 +18,8 @@ use super::timeline::{
 use crate::backend::TranscriptMessage;
 use crate::backend::runs::{RunKey, TaskEndingClass};
 use crate::backend::{
-    AgentCapabilities, Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall,
-    TurnAnchor, TurnDiffStats,
+    AgentCapabilities, BackgroundTask, Compaction, FileContent, MessageId, Part, PromptSkill,
+    SessionTranscript, ToolCall, TurnAnchor, TurnDiffStats,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor};
 use crate::bridge::handles::CardsHandle;
@@ -4802,40 +4802,19 @@ impl StreamAccumulator {
                         .cloned()
                 })
                 .flatten();
-            // The shell's output window (spec #592): the read's own outcome
-            // when it spent one, the last established window when the
-            // shared cycle's throttle spent nothing. An empty capture is a
-            // success the row still omits (spec #588, review) — only the
-            // entry's own read tells it apart from 「输出已不可用」.
-            let output = if kind == TaskKind::Shell {
-                task.shell_id.as_deref().and_then(|shell_id| {
-                    match transcript.shell_outputs.get(shell_id) {
-                        // The read spent a tail read and found nothing
-                        // renderable: an empty capture or an unavailable
-                        // record. The window is omitted, and any stored one
-                        // leaves with it — never a stale window posing as
-                        // current, never a placeholder.
-                        Some(read) => read.window().cloned(),
-                        // No tail read this cycle (the shared throttle):
-                        // the last established window stands, exactly like
-                        // a subagent's stored activity fragment.
-                        None => self.ledger_outputs.get(shell_id).cloned(),
-                    }
-                })
-            } else {
-                None
-            };
+            let output = self.task_row_output(transcript, task, kind);
             if kind == TaskKind::Subagent {
                 activity_keys.insert(call_id.to_string());
             }
             rows.push(TaskLedgerRow {
                 kind,
-                label: task_label(kind, transcript.tool_input(call_id)),
+                label: task_row_label(transcript, task, kind),
                 started_at: task.started_at,
                 // A task the runtime could not confirm (issue #454): the row
                 // renders its own facts plus the unconfirmed marker, and stays
                 // live until its Wake or a positive terminal verdict retires it.
                 unconfirmed: transcript.unconfirmed_tasks.contains(call_id),
+                child_job: child_job_owner(task),
                 activity,
                 output,
             });
@@ -4974,9 +4953,42 @@ impl StreamAccumulator {
             label: Some(run.label.clone()).filter(|label| !label.trim().is_empty()),
             started_at: run.started_at,
             unconfirmed: run.ids().any(|id| transcript.unconfirmed_tasks.contains(id)),
+            // A run-sourced row is the session's own child, never a job a
+            // descendant owns: no `↳` marker (ADR-0118).
+            child_job: None,
             activity,
             output: None,
         }
+    }
+
+    /// The shell output window a task's row renders (spec #592): the read's own
+    /// outcome when it spent one, the last established window when the shared
+    /// cycle's throttle spent nothing. An empty capture is a success the row
+    /// still omits (spec #588, review) — only the entry's own read tells it
+    /// apart from 「输出已不可用」. Only a shell task carries one: a job's row has
+    /// no shell record to tail.
+    fn task_row_output(
+        &self,
+        transcript: &SessionTranscript,
+        task: &BackgroundTask,
+        kind: TaskKind,
+    ) -> Option<crate::backend::ShellOutputWindow> {
+        if kind != TaskKind::Shell {
+            return None;
+        }
+        task.shell_id.as_deref().and_then(|shell_id| {
+            match transcript.shell_outputs.get(shell_id) {
+                // The read spent a tail read and found nothing renderable: an
+                // empty capture or an unavailable record. The window is
+                // omitted, and any stored one leaves with it — never a stale
+                // window posing as current, never a placeholder.
+                Some(read) => read.window().cloned(),
+                // No tail read this cycle (the shared throttle): the last
+                // established window stands, exactly like a subagent's stored
+                // activity fragment.
+                None => self.ledger_outputs.get(shell_id).cloned(),
+            }
+        })
     }
 
     /// Build the whole card (tests + simple callers). Assembles the full
@@ -6305,7 +6317,17 @@ pub(super) async fn refresh_context_window(
 /// and the durable ending's identity all derive a task from. Re-exported from
 /// the Background Task State module (ADR-0080), the one home `TaskKind` already
 /// has, so `super::state::task_kind` keeps resolving for the render.
-pub(super) use crate::bridge::tasks::{task_kind, task_label};
+pub(super) use crate::bridge::tasks::{child_job_owner, task_kind, task_label};
+
+/// The label a task's ledger row renders: the originating tool part's input by
+/// the task's call id when the read still carries it, else the task's own
+/// neutral label — the only fact a job-sourced task has, because its launch
+/// joins by `metadata.jobID` rather than by its call id (ADR-0118). `None` when
+/// neither names one, so a bare row invents nothing.
+fn task_row_label(transcript: &SessionTranscript, task: &BackgroundTask, kind: TaskKind) -> Option<String> {
+    task_label(kind, transcript.tool_input(task.tool.call_id.as_str()))
+        .or_else(|| task.label.clone().filter(|label| !label.is_empty()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -7948,6 +7970,7 @@ mod tests {
         acc.set_ledger(
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: Some("npm run build".into()),
                 started_at: None,
                 unconfirmed: false,
@@ -7997,6 +8020,7 @@ mod tests {
     fn the_cleanup_button_rides_a_waiting_card_with_unconfirmed_rows_only() {
         let row = |unconfirmed: bool| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some("npm run build".into()),
             started_at: None,
             unconfirmed,
@@ -8062,6 +8086,7 @@ mod tests {
         let rows = || {
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: Some("npm run build".into()),
                 started_at: Some(start),
                 unconfirmed: false,
@@ -8107,6 +8132,7 @@ mod tests {
         let start = 1_800_000_000_000;
         let row = |captured_ms: i64, text: &str| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some("npm run build".into()),
             started_at: None,
             unconfirmed: false,
@@ -8164,6 +8190,7 @@ mod tests {
         let rows = || {
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: Some("npm run build".into()),
                 started_at: Some(start),
                 unconfirmed: false,
@@ -8199,6 +8226,7 @@ mod tests {
         let row = |activity: TaskLiveness| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: Some("review the diff".into()),
                 // No elapsed: the activity age is the card's only rendered
                 // number, so each assertion isolates it.
@@ -8254,6 +8282,7 @@ mod tests {
         let row = |activity: Option<TaskLiveness>| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: Some("review the diff".into()),
                 // No elapsed: the activity age is the card's only rendered
                 // number, so each assertion isolates it.
@@ -8313,6 +8342,88 @@ mod tests {
         ));
         // …and the gather losing the child renders the bare row again.
         assert!(acc.set_ledger(row(None), start + 60_400, LedgerCadence::Minute));
+    }
+
+    /// ADR-0118: a job-sourced row takes its neutral label from the task (the
+    /// read carries no tool part keyed by the job id), renders the job's own
+    /// kind, and a **Child Job** carries its owner marker — both the resolved
+    /// label and the neutral fallback.
+    #[test]
+    fn a_job_rows_label_and_child_marker_come_from_the_task() {
+        let start = 1_800_000_000_000;
+        let job = |id: &str, kind: &str, label: &str, child: bool, owner: Option<&str>| BackgroundTask {
+            tool: ToolIdentity {
+                name: kind.into(),
+                call_id: id.into(),
+            },
+            started_at: Some(start),
+            job_id: Some(id.into()),
+            label: Some(label.into()),
+            owner_label: owner.map(str::to_string),
+            child_job: child,
+            ..Default::default()
+        };
+        let owner = BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            child_id: Some("ses_child".into()),
+            started_at: Some(start - 1_000),
+            label: Some("review the diff".into()),
+            ..Default::default()
+        };
+        let transcript = SessionTranscript::default().with_background_tasks(vec![
+            owner,
+            job("job_cc", "codemode", "const answer = 42", false, None),
+            job(
+                "job_img",
+                "image",
+                "/work/out/apple",
+                true,
+                Some("review the diff"),
+            ),
+            job("job_orphan", "video", "/tmp/orphan.mp4", true, None),
+        ]);
+
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_ledger_from_read(
+            &transcript,
+            &HashMap::new(),
+            &HashSet::new(),
+            start,
+            LedgerCadence::Minute,
+        );
+        let kinds: Vec<TaskKind> = acc.ledger.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                TaskKind::Subagent,
+                TaskKind::CodeMode,
+                TaskKind::Image,
+                TaskKind::Video
+            ],
+            "the job's own kind is the row's type word"
+        );
+        assert_eq!(
+            acc.ledger[1].label.as_deref(),
+            Some("const answer = 42"),
+            "the task's neutral label stands in for the absent part"
+        );
+        assert_eq!(acc.ledger[1].child_job, None, "the session's own job");
+        assert_eq!(
+            acc.ledger[2].child_job,
+            Some(crate::feishu::card::ledger::ChildJobOwner::Named(
+                "review the diff".into()
+            )),
+            "a child job carries its owning subagent's label"
+        );
+        assert_eq!(
+            acc.ledger[3].child_job,
+            Some(crate::feishu::card::ledger::ChildJobOwner::Unnamed),
+            "a child no row names falls back to the neutral marker"
+        );
+        assert_eq!(acc.ledger[3].label.as_deref(), Some("/tmp/orphan.mp4"));
     }
 
     /// Read recovery on the live path (spec #501, ticket #504): a FAILED gather
@@ -8423,6 +8534,7 @@ mod tests {
         let shell = |label: Option<&str>, started_at: Option<i64>| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: label.map(str::to_string),
                 started_at,
                 unconfirmed: false,
@@ -8494,6 +8606,7 @@ mod tests {
         let row = |started_at: i64, activity_at: i64| {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: Some("review the diff".into()),
                 started_at: Some(started_at),
                 unconfirmed: false,
@@ -8533,6 +8646,7 @@ mod tests {
         let rows = || {
             vec![TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: Some("review the diff".into()),
                 started_at: None,
                 unconfirmed: false,

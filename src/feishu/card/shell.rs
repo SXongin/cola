@@ -816,6 +816,7 @@ mod tests {
         let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some("a <number_tag> | b".into()),
             started_at: Some(start),
             unconfirmed: false,
@@ -886,6 +887,45 @@ mod tests {
         assert_eq!(bare["body"]["elements"].as_array().unwrap().len(), 0);
     }
 
+    /// ADR-0118: a job-sourced row rides the same folded ledger panel as a
+    /// shell row, with the job's own kind, its label, the start clock and the
+    /// elapsed, and a **Child Job** appends its `↳` owner after the elapsed.
+    #[test]
+    fn a_job_row_renders_in_the_ledger_panel() {
+        use crate::feishu::card::ledger::{ChildJobOwner, TaskKind, TaskLedgerRow};
+
+        let start = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let rows = vec![TaskLedgerRow {
+            kind: TaskKind::CodeMode,
+            child_job: Some(ChildJobOwner::Named("review the diff".into())),
+            label: Some("const answer = 42".into()),
+            started_at: Some(start),
+            unconfirmed: false,
+            activity: None,
+            output: None,
+        }];
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_text("正文")
+            .with_task_ledger(&rows)
+            .build();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2, "{card}");
+        let panel = &elements[1];
+        assert_eq!(panel["tag"], "collapsible_panel", "{card}");
+        assert_eq!(panel["header"]["title"]["content"], "⏳ 后台任务（1）");
+        let body = panel["elements"][0]["content"].as_str().unwrap();
+        let row = body.lines().next().expect("the row");
+        assert!(
+            row.starts_with("· codemode：**const answer = 42** · 14:02 · "),
+            "the job's own kind, label and start clock: {row:?}"
+        );
+        assert!(
+            row.ends_with(" · ↳ review the diff"),
+            "the Child Job marker follows the elapsed: {row:?}"
+        );
+    }
+
     /// A completion entry (ADR-0060): a folded panel whose header is the
     /// mechanical completion line and whose body is the identity/timing line,
     /// rendered where the caller puts it (the timeline's own order) with a
@@ -939,6 +979,30 @@ mod tests {
             card["body"]["elements"][0]["element_id"].is_null(),
             "no id → no element_id"
         );
+
+        // ADR-0118: a job's completion entry rides the same folded panel, with
+        // its own kind as the mechanical line and the job id as its identity.
+        let job = TaskCompletionEntry {
+            kind: TaskKind::CodeMode,
+            label: Some("const answer = 42".into()),
+            id: Some("job_cc".into()),
+            started_at: Some(finished - 3 * 60_000),
+            finished_at: Some(finished),
+            ending: TaskEnding::Wake {
+                state: Some("completed".into()),
+            },
+            output: None,
+        };
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_task_entry(&job, None)
+            .build();
+        let panel = &card["body"]["elements"][0];
+        assert_eq!(
+            panel["header"]["title"]["content"],
+            "🔔 codemode 完成：const answer = 42"
+        );
+        assert_eq!(panel["elements"][0]["content"], "codemode job_cc · 14:02 · 3m");
     }
 
     #[test]

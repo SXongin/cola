@@ -1274,6 +1274,13 @@ pub struct BackgroundTask {
     /// subagent row's label, when a task in the same read names that child.
     /// `None` renders the neutral `↳ 子会话` fallback (ADR-0118).
     pub owner_label: Option<String>,
+    /// Whether this task is a **Child Job**: a job whose owner session is not
+    /// the session whose transcript named it (ADR-0118). Set by the job merge
+    /// from the job's `sessionID`; a tool-part task is always the session's
+    /// own work, so it stays `false`. The presentation layer reads this — never
+    /// `owner_label` alone, which is `None` for both an own-session job and a
+    /// child job no row in the read names.
+    pub child_job: bool,
 }
 
 /// How a shell Background Task ended, as the runtime reports it (V2's

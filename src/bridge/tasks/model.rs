@@ -11,12 +11,41 @@ use crate::backend::runs::TaskRunIdentity;
 use crate::backend::{BackgroundTask, ShellOutputWindow, Wake, WakeSource};
 use crate::feishu::card::tool_view::TaskLiveness;
 
-/// The kind of Background Task a ledger row names. Only these two background
-/// through the V2 tool shape (ADR-0059/0060).
+/// The kind of Background Task a ledger row names: the two the V2 tool shape
+/// derives (ADR-0059/0060), plus the job kinds a job-sourced task carries as
+/// its tool name and a job completion Wake names (ADR-0118).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     Shell,
     Subagent,
+    CodeMode,
+    Image,
+    Video,
+}
+
+impl TaskKind {
+    /// The neutral token this kind renders as: the tool's own (`shell` /
+    /// `subagent`, ADR-0107) or the job's kind word (`codemode` / `image` /
+    /// `video`, ADR-0118). One home for the word the live row, the entry body
+    /// and a durable identity record, so they cannot drift apart.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Subagent => "subagent",
+            Self::CodeMode => "codemode",
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+
+    /// Whether this kind's row renders a running total (ADR-0060, ADR-0118):
+    /// a shell's elapsed is its only liveness, and a job's row shows its total
+    /// runtime the same way. A subagent row never does — its liveness is its
+    /// child's activity fragment, and a total would only restate the
+    /// fragment's age.
+    pub(crate) fn renders_elapsed(self) -> bool {
+        matches!(self, Self::Shell | Self::CodeMode | Self::Image | Self::Video)
+    }
 }
 
 /// Why a Background Task left the live list, as its completion entry names it.
@@ -46,16 +75,30 @@ pub enum TaskEnding {
     ClientCancelled,
 }
 
+/// A **Child Job**'s owner, as its ledger row marks it (ADR-0118): the owning
+/// subagent row's label when one in the same read names that child, or the
+/// neutral fallback when none does. A task that is not a child job carries no
+/// owner at all, so its row never renders a `↳` marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildJobOwner {
+    /// The owning subagent row's label.
+    Named(String),
+    /// No row in this read names the child: the ledger renders the pinned
+    /// `↳ 子会话` fallback.
+    Unnamed,
+}
+
 /// One live Background Task as its ledger row renders it: the task's type, the
 /// label joined from the originating tool part's input by `call_id` (`None`
 /// when that input names no label — the row then renders bare), when the run
-/// started (`None` renders no start clock; a shell row also renders its elapsed
-/// from it, a subagent row never does), whether a runtime reconciliation could
-/// not confirm it as running (issue #454 — the row then carries the
-/// 状态待确认 marker, and only its own Wake or a positive terminal verdict can
-/// retire it), and the task's child-session liveness when it has one (spec
+/// started (`None` renders no start clock; a shell or job row also renders its
+/// elapsed from it, a subagent row never does), whether a runtime
+/// reconciliation could not confirm it as running (issue #454 — the row then
+/// carries the 状态待确认 marker, and only its own Wake or a positive terminal
+/// verdict can retire it), the **Child Job** owner it marks itself with
+/// (ADR-0118), and the task's child-session liveness when it has one (spec
 /// #501 — a background `subagent` row carries the same activity fragment the
-/// live `task` panel shows, while a `shell` row has none).
+/// live `task` panel shows, while a `shell` or job row has none).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TaskLedgerRow {
     pub kind: TaskKind,
@@ -65,6 +108,12 @@ pub struct TaskLedgerRow {
     /// Wake retired it. The row stays live (the runtime read is evidence, not
     /// an ending) but reads as unconfirmed.
     pub unconfirmed: bool,
+    /// The **Child Job** owner this row marks itself with (ADR-0118): `None`
+    /// for the session's own work, `Some` for a job a descendant session owns
+    /// — the owner's label when a row in the same read names that child, else
+    /// [`ChildJobOwner::Unnamed`]. The ledger appends ` · ↳ <owner>` after the
+    /// row's elapsed, so a descendant's work never reads as the parent's.
+    pub child_job: Option<ChildJobOwner>,
     /// The child session's last successfully gathered liveness (spec #501),
     /// rendered as the front task panel's own fragment — `bash 5s`,
     /// `waiting 1m30s · 等待你的授权` — after the row's start clock. `None` for a
@@ -214,7 +263,11 @@ pub(crate) fn identity_of_task(
             .map(str::trim)
             .filter(|label| !label.is_empty())
             .map(str::to_string)
-            .or_else(|| task_label(task_kind(task), input)),
+            .or_else(|| task_label(task_kind(task), input))
+            // A job-sourced task's launching part is joined by `metadata.jobID`
+            // upstream, not by its call id, so the task's own neutral label is
+            // where its facts live (ADR-0118).
+            .or_else(|| task.label.clone().filter(|label| !label.trim().is_empty())),
     }
 }
 
@@ -224,9 +277,9 @@ pub(crate) fn identity_of_task(
 /// call id stays `None`: a Wake never carried one, and the record's stored key
 /// (the shell/child id it reports) stands in for it.
 pub(crate) fn identity_of_wake(wake: &Wake) -> TaskRunIdentity {
-    let tool = match wake.source {
+    let tool = match &wake.source {
         WakeSource::Subagent => "subagent",
-        _ => "shell",
+        source => wake_task_kind(source).map(TaskKind::token).unwrap_or("shell"),
     };
     TaskRunIdentity {
         tool: Some(tool.to_string()),
@@ -244,12 +297,56 @@ pub(crate) fn identity_of_wake(wake: &Wake) -> TaskRunIdentity {
 /// identity-less shape is a V2 `subagent` launch whose metadata omitted its
 /// session id: there the adapter's neutral launch noun — never a vendor id, and
 /// exactly the ADR-0107 "name as a last fact" exception — is all that is left.
+/// A job-sourced task carries its job kind as the tool name, and those map to
+/// their own kind rather than falling through to a shell row (ADR-0118).
 pub(crate) fn task_kind(task: &BackgroundTask) -> TaskKind {
     if task.child_id.is_some() || task.tool.name == "subagent" {
-        TaskKind::Subagent
-    } else {
-        TaskKind::Shell
+        return TaskKind::Subagent;
     }
+    job_task_kind(&task.tool.name).unwrap_or(TaskKind::Shell)
+}
+
+/// The ledger kind a job's own `kind` word names (ADR-0118) — the value a
+/// job-sourced task carries as its tool name. `None` for every other name: the
+/// tool-part kinds keep their own derivation, and a kind this build does not
+/// model keeps the tolerant shell default.
+fn job_task_kind(kind: &str) -> Option<TaskKind> {
+    match kind {
+        "codemode" => Some(TaskKind::CodeMode),
+        "image" => Some(TaskKind::Image),
+        "video" => Some(TaskKind::Video),
+        _ => None,
+    }
+}
+
+/// The ledger kind a completion Wake's source names (ADR-0118): the tool
+/// sources (`shell` / `subagent`), plus a job's own marker — `codemode`,
+/// `generate_image`, `generate_video`. `None` for a source that completes no
+/// Background Task: a restart, an interruption, or a marker this build does not
+/// know, which stays a non-resumption (ADR-0066).
+pub(crate) fn wake_task_kind(source: &WakeSource) -> Option<TaskKind> {
+    match source {
+        WakeSource::Shell => Some(TaskKind::Shell),
+        WakeSource::Subagent => Some(TaskKind::Subagent),
+        WakeSource::Other(marker) => match marker.as_str() {
+            "codemode" => Some(TaskKind::CodeMode),
+            "generate_image" => Some(TaskKind::Image),
+            "generate_video" => Some(TaskKind::Video),
+            _ => None,
+        },
+        WakeSource::Restart | WakeSource::Interrupt | WakeSource::Unknown => None,
+    }
+}
+
+/// The `↳` marker a task's row carries (ADR-0118): `None` for the session's
+/// own work; `Some` for a **Child Job**, carrying the owning subagent row's
+/// label when the read resolved one and the neutral fallback otherwise.
+pub(crate) fn child_job_owner(task: &BackgroundTask) -> Option<ChildJobOwner> {
+    task.child_job
+        .then(|| match task.owner_label.as_deref().map(str::trim) {
+            Some(label) if !label.is_empty() => ChildJobOwner::Named(label.to_string()),
+            _ => ChildJobOwner::Unnamed,
+        })
 }
 
 /// The label the originating tool part's input names for a task of `kind`:
@@ -257,6 +354,10 @@ pub(crate) fn task_kind(task: &BackgroundTask) -> TaskKind {
 /// command), the subagent's `description` — the `subagent` arm nothing else
 /// needed. `None` when the input names no label, so the row renders bare
 /// rather than inventing one (the completion entry's own rule).
+///
+/// A job kind has no such part: its launch joins by `metadata.jobID` and the
+/// adapter already captured the label on the task ([`BackgroundTask::label`],
+/// ADR-0118), so the input-keyed join names nothing here.
 pub(crate) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> Option<String> {
     let label = match kind {
         TaskKind::Shell => input
@@ -270,6 +371,7 @@ pub(crate) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> O
         TaskKind::Subagent => input
             .and_then(|input| input.get("description"))
             .and_then(serde_json::Value::as_str),
+        TaskKind::CodeMode | TaskKind::Image | TaskKind::Video => None,
     }?;
     let label = label.trim();
     (!label.is_empty()).then(|| label.to_string())
@@ -279,7 +381,7 @@ pub(crate) fn task_label(kind: TaskKind, input: Option<&serde_json::Value>) -> O
 mod tests {
     use super::*;
     use crate::backend::runs::RunKey;
-    use crate::backend::{MessageId, WakeSource};
+    use crate::backend::{MessageId, ToolIdentity, WakeSource};
     use crate::bridge::test_support::launch_task;
 
     /// A Wake naming whatever ids the payload carried.
@@ -387,6 +489,115 @@ mod tests {
         // A third adapter's identity-less name is not a subagent token: the
         // tolerant default stays shell.
         assert_eq!(task_kind(&task("spawn_agent", None, None)), TaskKind::Shell);
+    }
+
+    /// ADR-0118: a job-sourced task carries its job kind as the tool name, and
+    /// each maps to its own ledger kind — never through the shell default. The
+    /// job kind's token is also the word the row and the entry render, and only
+    /// the kinds that show a total render an elapsed.
+    #[test]
+    fn a_jobs_kind_is_its_own_and_never_falls_through_to_shell() {
+        let job = |name: &str| BackgroundTask {
+            tool: ToolIdentity {
+                name: name.into(),
+                call_id: "job_1".into(),
+            },
+            job_id: Some("job_1".into()),
+            ..Default::default()
+        };
+        for (name, kind) in [
+            ("codemode", TaskKind::CodeMode),
+            ("image", TaskKind::Image),
+            ("video", TaskKind::Video),
+            ("shell", TaskKind::Shell),
+        ] {
+            assert_eq!(task_kind(&job(name)), kind, "the `{name}` job's own kind");
+            assert_eq!(kind.token(), name, "the kind word is the job's own token");
+        }
+        assert!(TaskKind::CodeMode.renders_elapsed());
+        assert!(TaskKind::Image.renders_elapsed());
+        assert!(TaskKind::Video.renders_elapsed());
+        assert!(TaskKind::Shell.renders_elapsed());
+        assert!(
+            !TaskKind::Subagent.renders_elapsed(),
+            "a subagent row's liveness is its activity fragment, never a total"
+        );
+    }
+
+    /// ADR-0118: a job completion Wake's source marker names the job kind, and
+    /// the notice stays a non-resumption (no 承接 line) — it is `Other`, never
+    /// a genuine resumption or a completion.
+    #[test]
+    fn a_jobs_completion_wake_names_its_kind_and_stays_a_non_resumption() {
+        let kind = |marker: &str| wake_task_kind(&WakeSource::Other(marker.into()));
+        assert_eq!(kind("codemode"), Some(TaskKind::CodeMode));
+        assert_eq!(kind("generate_image"), Some(TaskKind::Image));
+        assert_eq!(kind("generate_video"), Some(TaskKind::Video));
+        assert_eq!(kind("mystery"), None, "an unknown marker plans no entry");
+        assert_eq!(wake_task_kind(&WakeSource::Restart), None);
+        assert_eq!(wake_task_kind(&WakeSource::Interrupt), None);
+        for marker in ["codemode", "generate_image", "generate_video"] {
+            let source = WakeSource::Other(marker.into());
+            assert!(!source.is_genuine_resumption(), "no 承接 line for `{marker}`");
+            assert!(!source.is_completion(), "the notice is not a task handover");
+        }
+    }
+
+    /// ADR-0118: the durable identity a job Wake's ending is recorded with
+    /// names the job's kind token — so a later read re-synthesizes a job task,
+    /// not a shell — and carries no invented launch call id.
+    #[test]
+    fn a_job_wakes_identity_names_its_kind() {
+        let wake = Wake {
+            id: MessageId::new("msg_wake_job"),
+            created_ms: Some(2_000),
+            source: WakeSource::Other("generate_image".into()),
+            shell_id: None,
+            job_id: Some("job_img".into()),
+            child_id: None,
+            state: Some("completed".into()),
+            label: None,
+        };
+        let identity = identity_of_wake(&wake);
+        assert_eq!(identity.tool.as_deref(), Some("image"));
+        assert_eq!(identity.call_id, None, "a Wake never carried a call id");
+        let task = identity.task("job_img");
+        assert_eq!(task_kind(&task), TaskKind::Image);
+        assert_eq!(task.tool.call_id, "job_img", "the run's key stands in");
+    }
+
+    /// ADR-0118: a **Child Job** marks its row with its owner — the owning
+    /// subagent's label when the read resolved one, the neutral fallback when
+    /// it did not — while an own-session task carries no marker at all. The
+    /// owner label alone cannot decide it: both cases leave it `None`.
+    #[test]
+    fn only_a_child_job_carries_an_owner_marker() {
+        let mut task = BackgroundTask {
+            tool: ToolIdentity {
+                name: "image".into(),
+                call_id: "job_1".into(),
+            },
+            job_id: Some("job_1".into()),
+            child_job: true,
+            owner_label: Some("review the diff".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            child_job_owner(&task),
+            Some(ChildJobOwner::Named("review the diff".into()))
+        );
+        task.owner_label = None;
+        assert_eq!(
+            child_job_owner(&task),
+            Some(ChildJobOwner::Unnamed),
+            "a child no row names still marks itself"
+        );
+        task.child_job = false;
+        assert_eq!(
+            child_job_owner(&task),
+            None,
+            "the session's own job carries no `↳`"
+        );
     }
 
     /// A record carries EVERY id its run is known by: a later writer holding

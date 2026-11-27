@@ -64,5 +64,7 @@ pub(crate) mod model;
 pub(crate) mod state;
 
 pub(crate) use handle::TasksHandle;
-pub(crate) use model::{identity_of_task, identity_of_wake, task_kind, task_label};
+pub(crate) use model::{
+    child_job_owner, identity_of_task, identity_of_wake, task_kind, task_label, wake_task_kind,
+};
 pub(crate) use state::TaskCell;

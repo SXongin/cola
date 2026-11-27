@@ -1183,7 +1183,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// call id, which [`Wake::retires`] already matches). `session_id` is the
 /// session whose card reads these rows: a job owned by any other session is a
 /// **Child Job** and carries its owning subagent row's label when one is
-/// present.
+/// present, and stays marked as one (`child_job`) even when no row names it.
 pub(super) fn merge_job_tasks(transcript: &mut SessionTranscript, session_id: &str, jobs: &[BackgroundJob]) {
     let mut tasks = std::mem::take(&mut transcript.background_tasks);
     let existing = tasks.len();
@@ -1249,7 +1249,9 @@ fn sort_job_rows(tasks: &mut [BackgroundTask]) {
 impl BackgroundJob {
     /// This job as a neutral Background Task: the job id is its call identity
     /// (so a Wake naming the job retires it), the kind is its type word, and
-    /// its label/owner come from the read's own facts.
+    /// its label/owner come from the read's own facts. A job any other session
+    /// owns is marked as a **Child Job** (ADR-0118), so a row whose owner no
+    /// longer names it still renders the neutral `↳` marker.
     fn task(
         &self,
         transcript: &SessionTranscript,
@@ -1267,6 +1269,7 @@ impl BackgroundJob {
             job_id: Some(self.id.clone()),
             label: self.label(transcript),
             owner_label: self.owner_label(tasks, session_id),
+            child_job: self.session_id.as_deref() != Some(session_id),
         }
     }
 
@@ -1277,7 +1280,7 @@ impl BackgroundJob {
     fn label(&self, transcript: &SessionTranscript) -> Option<String> {
         match self.kind.as_str() {
             "codemode" => self
-                .launching_code_line(transcript)
+                .launch_label(transcript)
                 .or_else(|| self.title.clone())
                 .or_else(|| Some(self.id.clone())),
             "image" | "video" => self.path.clone(),
@@ -1294,29 +1297,18 @@ impl BackgroundJob {
         }
     }
 
-    /// The first non-empty line of the `execute` program that launched this
-    /// job — the part joins it through `metadata.jobID`, the same key the
-    /// completion entry joins on.
-    fn launching_code_line(&self, transcript: &SessionTranscript) -> Option<String> {
+    /// The label the `execute` / `generate_image` / `generate_video` part that
+    /// launched this job records — the part joins it through
+    /// `metadata.jobID`, the same key the job's completion entry joins on, so
+    /// the live row and the entry cannot name one run two ways.
+    fn launch_label(&self, transcript: &SessionTranscript) -> Option<String> {
         transcript
             .messages
             .iter()
             .flat_map(|message| &message.parts)
-            .find_map(|part| {
-                let Part::Tool(call) = part else {
-                    return None;
-                };
-                if string_field(call.metadata.as_ref(), "jobID").as_deref() != Some(self.id.as_str()) {
-                    return None;
-                }
-                call.input
-                    .as_ref()?
-                    .get("code")?
-                    .as_str()?
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty())
-                    .map(str::to_string)
+            .find_map(|part| match part {
+                Part::Tool(call) if call.job_launch_id() == Some(self.id.as_str()) => call.job_launch_label(),
+                _ => None,
             })
     }
 
@@ -1369,7 +1361,35 @@ impl ToolCall {
             job_id: None,
             label,
             owner_label: None,
+            child_job: false,
         })
+    }
+
+    /// The background job this call handed its work to (ADR-0118): the
+    /// `jobID` a settled `execute`, `generate_image` or `generate_video` part
+    /// records when its run moves to a job. The key lives here, where the
+    /// generation's payload knowledge does; the bridge joins a job completion
+    /// Wake back to its launch by it. `None` for a call that started no job.
+    pub(crate) fn job_launch_id(&self) -> Option<&str> {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("jobID"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+    }
+
+    /// The label a job-launching part records for its run (ADR-0118): a Code
+    /// Mode script's first non-empty line (`input.code`), or the path an image
+    /// or video generation saves to (`metadata.path`). `None` when the part
+    /// names none — the entry renders bare rather than inventing one.
+    pub(crate) fn job_launch_label(&self) -> Option<String> {
+        let code_line = self
+            .input
+            .as_ref()
+            .and_then(|input| input.get("code"))
+            .and_then(Value::as_str)
+            .and_then(first_code_line);
+        code_line.or_else(|| non_empty(string_field(self.metadata.as_ref(), "path")))
     }
 
     /// The background run this call left behind, if it moved its run to the
@@ -1842,6 +1862,16 @@ fn string_field(value: Option<&Value>, field: &str) -> Option<String> {
     value
         .and_then(|value| value.get(field))
         .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The first non-empty, trimmed line of a Code Mode program — the label a
+/// `codemode` job and its completion entry show. `None` when every line is
+/// blank.
+fn first_code_line(code: &str) -> Option<String> {
+    code.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
         .map(str::to_string)
 }
 
@@ -3890,6 +3920,11 @@ mod tests {
                     "status": "running", "time": {"started": 2000},
                     "path": "/tmp/orphan.png", "model": "img-model",
                 },
+                {
+                    "id": "job_own", "kind": "video", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 500},
+                    "path": "/tmp/own.mp4",
+                },
             ]
         });
         merge_job_tasks(
@@ -3915,5 +3950,64 @@ mod tests {
             None,
             "no row names the orphan child"
         );
+        // ADR-0118: the neutral child fact is the job's own owner session, not
+        // the label — an own-session job and a child no row names both leave
+        // `owner_label` `None`, so the row's `↳` fallback needs this field.
+        assert!(
+            task("job_in_child").child_job,
+            "a descendant's job is a Child Job"
+        );
+        assert!(
+            task("job_orphan").child_job,
+            "an unattributed descendant is still a child"
+        );
+        assert!(
+            !task("job_own").child_job,
+            "the session's own job is not a Child Job"
+        );
+    }
+
+    /// ADR-0118: the part a job Wake joins back to — the `metadata.jobID` of
+    /// the `execute` / `generate_image` call — also records the entry's label:
+    /// a Code Mode script's first line, or the path a generation saves to.
+    #[test]
+    fn a_job_launch_part_exposes_its_job_and_label() {
+        let code = decode_tool_item(&codemode_part(
+            "call_exec",
+            "job_cc",
+            "\n\n  const answer = 42\nawait ship(answer)",
+        ));
+        assert_eq!(code.job_launch_id(), Some("job_cc"));
+        assert_eq!(code.job_launch_label().as_deref(), Some("const answer = 42"));
+
+        let image = decode_tool_item(&serde_json::json!({
+            "type": "tool",
+            "id": "call_img",
+            "name": "generate_image",
+            "state": {
+                "status": "completed",
+                "input": {"prompt": "a red apple"},
+                "content": [{"type": "text", "text": "started"}],
+                "metadata": {"path": "/work/out/apple", "model": "acme/image", "jobID": "job_img"},
+            },
+            "time": {"created": 900},
+        }));
+        assert_eq!(image.job_launch_id(), Some("job_img"));
+        assert_eq!(
+            image.job_launch_label().as_deref(),
+            Some("/work/out/apple"),
+            "an image/video launch's label is the path it saves to"
+        );
+
+        // A part that started no job names neither.
+        let shell = decode_tool_item(&serde_json::json!({
+            "type": "tool",
+            "id": "call_shell",
+            "name": "read",
+            "state": {"status": "completed", "input": {"filePath": "/tmp/a"}},
+            "time": {"created": 900},
+        }));
+        assert_eq!(shell.job_launch_id(), None);
+        assert_eq!(shell.job_launch_label(), None);
     }
 }
