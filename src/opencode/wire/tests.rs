@@ -11,8 +11,8 @@ use crate::opencode::strategy::Generation;
 use crate::test_http::TestHttpServer;
 
 use super::{
-    RecordedResponse, v1_transcript_turn, v2_background_wake, v2_interrupt_continuation, v2_subagent_wake,
-    v2_transcript_inflight, v2_transcript_turn,
+    RecordedResponse, v1_transcript_turn, v2_background_wake, v2_interrupt_continuation, v2_job_list,
+    v2_subagent_wake, v2_transcript_inflight, v2_transcript_turn,
 };
 
 /// The session id the recorded bodies are served under: the recording's own id
@@ -337,4 +337,99 @@ fn sanitized_excerpts_stamp_their_provenance() {
             "the note names the sanitization and the server: {note:?}"
         );
     }
+}
+
+/// The recorded 2.4.2 running-job list (spec #1220, ticket #1221): the image
+/// and video entries were recorded live while both ran, the `codemode` entry
+/// is synthesized to the same schema, and the stamp says so. Mounted on the
+/// job route, the production V2 read decodes and merges it into the
+/// transcript's Background Tasks — the union's `kind` is the row's type word,
+/// each kind's own label survives, and `started_at == time.started` in start
+/// order.
+#[tokio::test]
+async fn recorded_v2_job_list_merges_as_background_tasks() {
+    let recorded = v2_job_list();
+    assert_eq!(recorded.capture.generation, "v2", "stamp generation");
+    assert!(
+        recorded.capture.source.contains("2.4.2"),
+        "the stamp names the recording server: {:?}",
+        recorded.capture.source
+    );
+    assert!(
+        recorded.capture.command.contains("/api/experimental/job"),
+        "the stamp names the read that produced it: {:?}",
+        recorded.capture.command
+    );
+    assert!(
+        chrono::NaiveDate::parse_from_str(&recorded.capture.captured_at, "%Y-%m-%d").is_ok(),
+        "the capture date is a YYYY-MM-DD date: {:?}",
+        recorded.capture.captured_at
+    );
+    let note = recorded
+        .capture
+        .note
+        .as_deref()
+        .expect("a sanitized excerpt must carry its provenance note");
+    assert!(
+        note.contains("recorded live") && note.contains("synthesized") && note.contains("codemode"),
+        "the note says which entries were live and which was synthesized: {note:?}"
+    );
+
+    // An empty transcript plus the recorded job list: the adapter's own read
+    // is the only source of these rows.
+    let server = TestHttpServer::start().await;
+    let case = crate::opencode::v2::conformance::case();
+    (case.mount_recorded_transcript)(&server, RECORDED_SESSION, r#"{"data":[]}"#);
+    server.route("GET", "/api/experimental/job", 200, recorded.response.to_string());
+
+    let transcript = case
+        .backend(&server)
+        .transcript(RECORDED_SESSION)
+        .await
+        .expect("the recorded job list must decode through the adapter");
+    let tasks: Vec<&crate::backend::BackgroundTask> = transcript.background_tasks.iter().collect();
+    assert_eq!(
+        tasks.len(),
+        3,
+        "one row per running job: {:#?}",
+        transcript.background_tasks
+    );
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["image", "video", "codemode"],
+        "the union's kind is the row's type word, in time.started order"
+    );
+    assert_eq!(
+        tasks.iter().map(|task| task.label.as_deref()).collect::<Vec<_>>(),
+        [
+            Some("/work/out/apple"),
+            Some("/work/out/apple.mp4"),
+            Some("Code Mode script"),
+        ],
+        "image/video labels are their paths; codemode falls back to its title \
+         (this read carries no launching execute part)"
+    );
+    assert_eq!(
+        tasks.iter().map(|task| task.started_at).collect::<Vec<_>>(),
+        [Some(1000), Some(2000), Some(3000)],
+        "started_at == time.started"
+    );
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.job_id.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("image_fixture"), Some("video_fixture"), Some("cm_fixture")],
+        "the job id is the row's identity"
+    );
+    assert!(
+        tasks
+            .iter()
+            .all(|task| task.shell_id.is_none() && task.child_id.is_none() && task.owner_label.is_none()),
+        "the recorded session owns all three: no child-job owner labels: {:#?}",
+        transcript.background_tasks
+    );
 }

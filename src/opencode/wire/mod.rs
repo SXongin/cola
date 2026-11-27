@@ -111,5 +111,14 @@ pub(crate) fn v2_background_result_wake() -> RecordedResponse {
     RecordedResponse::parse(include_str!("fixtures/v2/background_result_wake.json"))
 }
 
+/// A 2.4.2 running-job list (`GET /api/experimental/job`),
+/// `{data: Job.Info[]}` in the schema's `kind`-tagged union (ADR-0118). The
+/// image and video entries were recorded live while both ran; the `codemode`
+/// entry is synthesized to the same schema (the stamp's `note` records that,
+/// and the neutralized ids, times, paths and session id).
+pub(crate) fn v2_job_list() -> RecordedResponse {
+    RecordedResponse::parse(include_str!("fixtures/v2/job_list.json"))
+}
+
 #[cfg(test)]
 mod tests;
