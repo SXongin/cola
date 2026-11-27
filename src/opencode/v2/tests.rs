@@ -140,6 +140,19 @@ fn job_task_ids(transcript: &crate::backend::SessionTranscript) -> Vec<&str> {
         .collect()
 }
 
+/// The job rows a strategy's cache holds for one session. The tests are a
+/// child module of `v2`, so they read the private cache directly — production
+/// carries no test-only accessor.
+fn cached_rows(strategy: &super::V2Strategy, session: &str) -> Vec<crate::backend::BackgroundTask> {
+    strategy
+        .jobs
+        .lock()
+        .expect("job row cache lock")
+        .get(session)
+        .map(|cached| cached.rows.clone())
+        .unwrap_or_default()
+}
+
 /// The V2 list envelope: entries expose the directory in `location.directory`
 /// (not V1's top-level field) and the cursor in the body. The follow-up loop
 /// walks `cursor.next` to the first empty page, because the server emits `next`
@@ -3547,7 +3560,7 @@ fn a_failed_read_renders_the_newest_verdict_and_never_a_stale_row() {
         transcript.background_tasks
     );
     assert!(
-        strategy.cached_job_rows("ses_1").is_empty(),
+        cached_rows(&strategy, "ses_1").is_empty(),
         "and the newer verdict's sequence is untouched"
     );
 
