@@ -31,9 +31,11 @@ byproduct**. Concretely:
      hashed) with `tool: cargo-llvm-cov` (its README calls hashing tool-name
      refs an impostor-commit hazard).
 
-   The gate's action pin is asserted by `cargo test -p xtask codex_gate`, so a
-   Dependabot group bump moves that expectation deliberately instead of
-   silently reverting it.
+   The gate's action pin is asserted by `cargo test -p xtask codex_gate` on its
+   *shape* — a full commit SHA plus its `# vX.Y.Z` comment — and against the
+   SHAs known to break the step, not against one reviewed version, so a
+   Dependabot bump needs no test edit while a revert to a retired pin still
+   fails (#1203).
 2. **Publish build provenance as release assets.** The release already creates
    `actions/attest-build-provenance` attestations, but Scorecard v5.5.0 only
    reads *release assets* named `*.intoto.jsonl`, not the GitHub attestation
