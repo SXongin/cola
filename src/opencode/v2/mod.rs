@@ -147,6 +147,12 @@ const MCP: &str = "/api/mcp";
 /// the transcript read (ADR-0118). Experimental upstream, so a 404/405 means
 /// the server has no job surface and the read degrades silently.
 const JOB: &str = "/api/experimental/job";
+/// Total budget for the job-list request. A stalled endpoint must become the
+/// failed-read arm (cache re-attach, transcript `Ok`) before the bridge's own
+/// per-read bound cancels the whole transcript future — the default is 30 s
+/// (`turn_follow_read_timeout_ms`), which would skip that re-attach. The read
+/// is a small list the render poll expects every 1.5 s, so 5 s is generous.
+const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
 /// misbehaving server must not spin the client forever. The server's default
@@ -693,10 +699,16 @@ impl GenerationStrategy for V2Strategy {
                 // and must still find the run in the job cache.
                 let rows = wire::merge_job_tasks(&mut transcript, session_id, &jobs);
                 self.remember_job_rows(session_id, seq, rows);
+                // A stale success must not render its own retired rows: the
+                // transcript returns the newest verdict the cache holds.
+                self.sync_job_rows(&mut transcript, session_id);
             }
             // 404/405: the server has no job surface. No rows, no wait — and
             // no stale rows from a previous attachment state.
-            Ok(None) => self.forget_job_rows(session_id, seq),
+            Ok(None) => {
+                self.forget_job_rows(session_id, seq);
+                self.sync_job_rows(&mut transcript, session_id);
+            }
             Err(error) => {
                 tracing::debug!("session {session_id} job list: {error}; keeping the last job rows");
                 // A stale failure still shows the CURRENT cache on its own
@@ -1289,7 +1301,7 @@ impl V2Strategy {
             query.append_pair("status", "running");
             query.append_pair("descendants", "true");
         }
-        let resp = http.client().get(url).send().await?;
+        let resp = http.client().get(url).timeout(JOB_TIMEOUT).send().await?;
         let status = resp.status();
         if matches!(
             status,
@@ -1358,6 +1370,17 @@ impl V2Strategy {
     /// shares the success arm's seq guard.
     fn forget_job_rows(&self, session_id: &str, seq: u64) {
         self.remember_job_rows(session_id, seq, Vec::new());
+    }
+
+    /// Make the read render the newest known job verdict (ADR-0118): drop this
+    /// read's own job-sourced rows and re-attach what the cache holds now. A
+    /// read whose verdict lost the sequence guard therefore returns the newer
+    /// verdict (often empty) instead of its stale snapshot, so a render poll
+    /// can never re-show a retired job.
+    fn sync_job_rows(&self, transcript: &mut SessionTranscript, session_id: &str) {
+        transcript.background_tasks.retain(|task| !task.is_job_sourced());
+        let current = self.cached_job_rows(session_id);
+        let _ = wire::attach_job_tasks(transcript, &current);
     }
 
     /// Durably admit one prompt (`POST /api/session/{id}/prompt`) with

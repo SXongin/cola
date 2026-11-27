@@ -1191,7 +1191,11 @@ impl Wake {
         ) {
             return false;
         }
-        let names_shell_or_call = |id: &str| task.shell_id.as_deref() == Some(id) || task.tool.call_id == id;
+        let names_shell_or_call = |id: &str| {
+            task.shell_id.as_deref() == Some(id)
+                || task.tool.call_id == id
+                || task.job_id.as_deref() == Some(id)
+        };
         self.shell_id.as_deref().is_some_and(names_shell_or_call)
             || self.job_id.as_deref().is_some_and(names_shell_or_call)
             || self
@@ -1260,9 +1264,12 @@ pub struct BackgroundTask {
     pub child_id: Option<String>,
     /// When the tool call started the task, when the payload reported a time.
     pub started_at: Option<i64>,
-    /// The V2 background job this task was discovered from (ADR-0118), when
-    /// the tool-part derivation did not already name the run. `None` for a
-    /// tool-part task: its [`Self::tool`] identity is the launch itself.
+    /// The running job that represents this run, when known (ADR-0118): the
+    /// job a transcript-derived task was deduped against, or the job this task
+    /// itself was discovered from. The row is **job-sourced** iff this equals
+    /// [`Self::tool`]'s call id (the job's own row); a tool-part task the job
+    /// list merely corroborates keeps its launch identity and is still a
+    /// tool-part task for the runtime/Cleanup lifecycle.
     pub job_id: Option<String>,
     /// The task's own neutral label, when the fact that named it carried one:
     /// a shell's command, a subagent's description, a job's kind-specific
@@ -1281,6 +1288,18 @@ pub struct BackgroundTask {
     /// `owner_label` alone, which is `None` for both an own-session job and a
     /// child job no row in the read names.
     pub child_job: bool,
+}
+
+impl BackgroundTask {
+    /// Whether this row is **job-sourced**: a job represents the run and this
+    /// row IS that job (its call id is the job id). A tool-part task the job
+    /// list merely corroborates carries the job id too, but keeps its launch
+    /// call id, so it is not job-sourced and still takes the normal runtime
+    /// verdicts and Cleanup treatment (ADR-0118). The one home for the
+    /// predicate, so its call sites cannot drift.
+    pub fn is_job_sourced(&self) -> bool {
+        self.job_id.as_deref() == Some(self.tool.call_id.as_str())
+    }
 }
 
 /// How a shell Background Task ended, as the runtime reports it (V2's

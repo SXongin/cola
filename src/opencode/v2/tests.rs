@@ -3147,9 +3147,14 @@ async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
         launched.background_tasks
     );
     assert_eq!(launched.background_tasks[0].tool.call_id, "call_shell");
+    assert_eq!(
+        launched.background_tasks[0].job_id.as_deref(),
+        Some("job_shell"),
+        "the deduped job adds no row, but associates its id with the tool task"
+    );
     assert!(
-        launched.background_tasks[0].job_id.is_none(),
-        "the deduped job adds no row"
+        !launched.background_tasks[0].is_job_sourced(),
+        "the associated row is still the tool-part task for the lifecycle"
     );
 
     // The launch part left the read (the read is now head-less); the job list
@@ -3190,8 +3195,8 @@ async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
 /// JOB-REQUEST order, not completion: an older job request that saw a running
 /// job must never overwrite a newer request's empty list (spec #1220 AC3 — the
 /// row disappears on the first successful read whose list no longer reports it
-/// running). The older read's own transcript still carries its own row; the
-/// cache does not, so a later failed read re-attaches nothing.
+/// running). The stale read returns the NEWER verdict too — its own retired row
+/// is never re-rendered — and a later failed read re-attaches nothing.
 #[tokio::test]
 async fn a_stale_successful_read_never_overwrites_a_newer_job_verdict() {
     use std::time::Duration;
@@ -3253,10 +3258,10 @@ async fn a_stale_successful_read_never_overwrites_a_newer_job_verdict() {
         .expect("the released older read completes")
         .expect("the spawned read task")
         .expect("the older read succeeds");
-    assert_eq!(
-        job_task_ids(&older),
-        ["job_img", "job_vid", "job_cc"],
-        "a stale read still carries its own row; only the cache is ordered"
+    assert!(
+        older.background_tasks.is_empty(),
+        "the stale read returns the newer verdict, not its own retired row: {:#?}",
+        older.background_tasks
     );
 
     // The failed read is newer than both: it must re-attach nothing, because
@@ -3438,6 +3443,47 @@ async fn a_transport_error_on_the_job_read_keeps_the_last_rows() {
     assert_eq!(
         second.background_tasks, first.background_tasks,
         "the last successful job rows stand"
+    );
+}
+
+/// A job request that never answers must time out into the failure arm — cache
+/// re-attach, transcript `Ok` — rather than hang the transcript read until the
+/// bridge's own per-read bound cancels the whole future and skips the
+/// re-attach. The delayed answer would retire the rows if it were waited out,
+/// so a passing run proves the timeout fired first.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_job_request_times_out_into_the_failure_arm() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+    let served = Arc::new(AtomicUsize::new(0));
+    {
+        let served = Arc::clone(&served);
+        server.route_async_dynamic("GET", "/api/experimental/job", move |_| {
+            let index = served.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if index == 0 {
+                    return DynamicResponse::new(200, "application/json", running_jobs_body());
+                }
+                // Far past the job request's own total budget. If the client
+                // waits it out, this empty list retires the rows and the
+                // assertion below fails.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                DynamicResponse::new(200, "application/json", r#"{"data":[]}"#)
+            }
+        });
+    }
+    let client = v2_wire_client(&server);
+
+    let first = client.transcript("ses_1").await.unwrap();
+    assert_eq!(job_task_ids(&first), ["job_img", "job_vid", "job_cc"]);
+
+    let stalled = client
+        .transcript("ses_1")
+        .await
+        .expect("a stalled job request must never fail the transcript");
+    assert_eq!(
+        stalled.background_tasks, first.background_tasks,
+        "the timeout took the failure arm and re-attached the last rows"
     );
 }
 

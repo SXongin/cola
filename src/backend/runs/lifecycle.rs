@@ -567,7 +567,7 @@ impl RunLifecycle {
             // verdict (ADR-0118): a child the runtime no longer reports active
             // must not mark a live job, and a shell it no longer knows must not
             // retire one — its own list decides.
-            if transcript.background_tasks[index].job_id.is_some() {
+            if transcript.background_tasks[index].is_job_sourced() {
                 continue;
             }
             if let Some(shell_id) = shell_id {
@@ -624,7 +624,7 @@ impl RunLifecycle {
             || transcript
                 .background_tasks
                 .iter()
-                .any(|task| task.job_id.is_none() && task.shell_id.is_none() && task.child_id.is_none())
+                .any(|task| !task.is_job_sourced() && task.shell_id.is_none() && task.child_id.is_none())
     }
 
     /// Mark every childless run and identity-less task for the Cleanup exit:
@@ -641,7 +641,7 @@ impl RunLifecycle {
         let tasks: Vec<String> = transcript
             .background_tasks
             .iter()
-            .filter(|task| task.job_id.is_none() && task.shell_id.is_none() && task.child_id.is_none())
+            .filter(|task| !task.is_job_sourced() && task.shell_id.is_none() && task.child_id.is_none())
             .map(|task| task.tool.call_id.clone())
             .collect();
         for key in keys {
@@ -1052,7 +1052,7 @@ fn retire_cleanup(transcript: &mut SessionTranscript, key: &str, now_ms: i64) ->
         // A job-sourced row has an identity — its job list — so the Cleanup
         // click never targets it (ADR-0118): that list decides when it ended,
         // and a 🧹 entry would claim an ending the read never derived.
-        if transcript.background_tasks[index].job_id.is_some() {
+        if transcript.background_tasks[index].is_job_sourced() {
             return None;
         }
         let task = transcript.background_tasks.remove(index);
@@ -1889,6 +1889,48 @@ mod tests {
             );
             assert_eq!(read.background_tasks, vec![row], "marking changes no row");
         }
+    }
+
+    /// An associated tool task — a running job corroborates a tool-part run —
+    /// carries the job id so the job's Wake can end it, but it is NOT
+    /// job-sourced: the runtime and Cleanup machinery still treat it as a tool
+    /// task (ADR-0118).
+    #[test]
+    fn an_associated_tool_task_keeps_the_tool_task_lifecycle() {
+        let owner = RunLifecycle::new();
+        let mut task = BackgroundTask {
+            tool: ToolIdentity {
+                name: "subagent".into(),
+                call_id: "call_sub".into(),
+            },
+            job_id: Some("job_sub".into()),
+            started_at: Some(1_000),
+            ..Default::default()
+        };
+        assert!(
+            !task.is_job_sourced(),
+            "the call id is the launch's, not the job's"
+        );
+        let mut read = SessionTranscript::new(vec![]).with_background_tasks(vec![task.clone()]);
+        assert!(
+            owner.needs_cleanup_marking(&read),
+            "a childless associated tool task still needs the Cleanup exit"
+        );
+        owner.mark_cleanup_exits(&mut read);
+        assert!(
+            read.unconfirmed_tasks.contains("call_sub"),
+            "marked by its own call id: {:?}",
+            read.unconfirmed_tasks
+        );
+
+        // The identical row IS job-sourced once its call id is the job id.
+        task.job_id = Some(task.tool.call_id.clone());
+        assert!(task.is_job_sourced());
+        let read = SessionTranscript::new(vec![]).with_background_tasks(vec![task]);
+        assert!(
+            !owner.needs_cleanup_marking(&read),
+            "a job row's list is its exit"
+        );
     }
 
     /// AC4/AC5 (ticket #1223): the cleanup click path takes its ids from the

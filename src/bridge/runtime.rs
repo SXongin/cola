@@ -543,13 +543,13 @@ fn live_task_ids(transcript: &SessionTranscript) -> (Vec<String>, Vec<String>) {
     let shells = transcript
         .background_tasks
         .iter()
-        .filter(|task| task.job_id.is_none())
+        .filter(|task| !task.is_job_sourced())
         .filter_map(|task| task.shell_id.clone())
         .collect();
     let mut children: Vec<String> = transcript
         .background_tasks
         .iter()
-        .filter(|task| task.job_id.is_none())
+        .filter(|task| !task.is_job_sourced())
         .filter_map(|task| task.child_id.clone())
         .collect();
     // A child-only run has no Background Task to name it (Codex), so its child
@@ -656,6 +656,28 @@ mod tests {
             job_id: Some(job_id.into()),
             ..Default::default()
         }
+    }
+
+    /// A tool-part task the job list corroborates carries the job id but is
+    /// not job-sourced, so the runtime ask list still includes it (ADR-0118).
+    #[test]
+    fn an_associated_tool_task_still_joins_the_runtime_ask_list() {
+        let associated = BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: "call_shell".into(),
+            },
+            shell_id: Some("sh1".into()),
+            job_id: Some("job1".into()),
+            ..Default::default()
+        };
+        assert!(!associated.is_job_sourced());
+        let transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![associated]);
+        assert_eq!(
+            live_task_ids(&transcript),
+            (vec!["sh1".to_string()], Vec::new()),
+            "the associated task is not job-sourced: the runtime still asks for it"
+        );
     }
 
     /// ADR-0080: "The ending is recorded when it is derived." A parent's

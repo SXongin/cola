@@ -1180,10 +1180,13 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// row — deduped on the job id against the task's call id / job id, `shellID`
 /// against its shell id, and `childSessionID` against its child id. A Wake in
 /// the same read retires a job like any Background Task (its id is the task's
-/// call id, which [`Wake::retires`] already matches). `session_id` is the
-/// session whose card reads these rows: a job owned by any other session is a
-/// **Child Job** and carries its owning subagent row's label when one is
-/// present, and stays marked as one (`child_job`) even when no row names it.
+/// call id, which [`Wake::retires`] already matches). A deduped tool task
+/// carries the job id too ([`BackgroundTask::job_id`]), so a Wake that names
+/// only the job retires that row as well — its launch metadata never flips, so
+/// nothing else would end it. `session_id` is the session whose card reads
+/// these rows: a job owned by any other session is a **Child Job** and carries
+/// its owning subagent row's label when one is present, and stays marked as
+/// one (`child_job`) even when no row names it.
 ///
 /// Returns the task built for every running job, post-Wake and PRE-dedupe, in
 /// the same start-then-id order the appended rows use: the failed-read cache
@@ -1198,19 +1201,42 @@ pub(super) fn merge_job_tasks(
     jobs: &[BackgroundJob],
 ) -> Vec<BackgroundTask> {
     let mut tasks = std::mem::take(&mut transcript.background_tasks);
-    let existing = tasks.len();
+    // The transcript-derived rows keep their order at the front; job rows
+    // append after them. A Wake can remove an original row (the deduped tool
+    // task below), so the boundary is tracked, not assumed.
+    let mut originals = tasks.len();
     let mut built: Vec<BackgroundTask> = Vec::new();
     for job in jobs.iter().filter(|job| job.status == "running") {
         let task = job.task(transcript, &tasks, session_id);
-        if transcript.wakes.iter().any(|wake| wake.retires(&task)) {
+        let retired = transcript.wakes.iter().any(|wake| wake.retires(&task));
+        if let Some(index) = tasks.iter().position(|current| same_run(current, &task)) {
+            if retired {
+                // The job's Wake retires the run wherever its row came from: a
+                // deduped tool task must leave with the job. Its own metadata
+                // still says running, so no other fact would end it (AC3).
+                tasks.remove(index);
+                if index < originals {
+                    originals -= 1;
+                }
+                continue;
+            }
+            // The tool-part derivation keeps the row; associate the job id so
+            // a Wake naming only the job retires that row too. A row that is
+            // already job-sourced is the job's own and keeps its identity, and
+            // the first job to name a run wins over a later alias.
+            if !tasks[index].is_job_sourced() && tasks[index].job_id.is_none() {
+                tasks[index].job_id = task.job_id.clone();
+            }
+            built.push(task);
             continue;
         }
-        if !tasks.iter().any(|current| same_run(current, &task)) {
-            tasks.push(task.clone());
+        if retired {
+            continue;
         }
+        tasks.push(task.clone());
         built.push(task);
     }
-    sort_job_rows(&mut tasks[existing..]);
+    sort_job_rows(&mut tasks[originals..]);
     sort_job_rows(&mut built);
     transcript.background_tasks = tasks;
     built
@@ -3900,6 +3926,66 @@ mod tests {
             ["call_shell", "call_sub", "job_new"],
             "only the identity no task already names adds a row"
         );
+        // The deduped tool tasks carry the job id (so a Wake naming only the
+        // job retires them) but keep their launch identity, so the lifecycle
+        // still treats them as tool tasks.
+        let by_call = |call_id: &str| {
+            transcript
+                .background_tasks
+                .iter()
+                .find(|task| task.tool.call_id == call_id)
+                .expect("the deduped tool task")
+        };
+        assert_eq!(by_call("call_shell").job_id.as_deref(), Some("job_shell"));
+        assert_eq!(by_call("call_sub").job_id.as_deref(), Some("job_sub"));
+        assert!(!by_call("call_shell").is_job_sourced());
+        assert!(!by_call("call_sub").is_job_sourced());
+        assert!(by_call("job_new").is_job_sourced());
+    }
+
+    /// AC3 for a deduped tool task: a shell job `job1` / `sh1` dedupes against
+    /// the tool task whose `shell_id` is `sh1`. A Wake that names only
+    /// `jobID = job1` must retire the tool task too — its launch metadata never
+    /// flips, so no other fact would end it — and the job is not cached.
+    #[test]
+    fn a_wake_naming_only_the_job_retires_its_deduped_tool_task() {
+        let mut transcript = decode_messages(&[
+            serde_json::json!({
+                "id": "msg_a",
+                "type": "assistant",
+                "time": {"created": 900},
+                "content": [background_shell_part("call_shell", "sh1")],
+            }),
+            synthetic_wake(
+                "msg_w",
+                5_000,
+                serde_json::json!({"source": "shell", "jobID": "job1"}),
+            ),
+        ]);
+        assert_eq!(
+            transcript.background_tasks.len(),
+            1,
+            "the decode alone cannot retire the tool task: the Wake names only the job"
+        );
+
+        let jobs = serde_json::json!({
+            "data": [{
+                "id": "job1", "kind": "shell", "sessionID": "ses_1",
+                "status": "running", "time": {"started": 1000},
+                "shellID": "sh1", "command": "sleep 2",
+            }]
+        });
+        let cached = merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&jobs).expect("the envelope"),
+        );
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "the job's Wake retires the deduped tool task: {:#?}",
+            transcript.background_tasks
+        );
+        assert!(cached.is_empty(), "a Wake-retired job is not cached: {cached:#?}");
     }
 
     /// AC3 (the same-read half): a Wake naming the job retires it even though
