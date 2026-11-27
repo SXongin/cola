@@ -8330,6 +8330,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_child".into()),
             started_at: None,
+            ..Default::default()
         }]);
         let bash = TaskLiveness {
             activity: crate::feishu::card::tool_view::ChildActivity::Tool {

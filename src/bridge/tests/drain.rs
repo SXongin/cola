@@ -3997,6 +3997,7 @@ async fn a_throttled_drain_read_keeps_the_unconfirmed_marker() {
         shell_id: None,
         child_id: Some("ses_call_sub".into()),
         started_at: Some(2_100),
+        ..Default::default()
     }]);
     let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Busy)).await;
     // The child's own read finds no activity and no concluding evidence: the

@@ -4705,6 +4705,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_child".into()),
             started_at: Some(1_000),
+            ..Default::default()
         }
     }
 
@@ -11582,6 +11583,7 @@ Index: /x/src/main.rs
             shell_id: None,
             child_id: Some("ses_call_sub".into()),
             started_at: Some(now - 30_000),
+            ..Default::default()
         }]);
         let render = async || {
             let _ = render_and_flush(
@@ -12126,6 +12128,7 @@ Index: /x/src/main.rs
             shell_id: None,
             child_id: Some("ses_shared".into()),
             started_at: Some(now - 30_000),
+            ..Default::default()
         }]);
 
         let _ = render_and_flush(

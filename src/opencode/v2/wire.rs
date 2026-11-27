@@ -882,6 +882,7 @@ pub(super) fn decode_messages(data: &[Value]) -> SessionTranscript {
             shell_id: None,
             child_id: run.child_id.clone(),
             started_at: run.started_at,
+            ..Default::default()
         };
         !wakes_for_runs.iter().any(|wake| wake.retires(&task))
     });
@@ -1076,6 +1077,265 @@ fn decode_background_tasks(messages: &[TranscriptMessage], wakes: &[Wake]) -> Ve
     tasks
 }
 
+/// One `Job.Info` as the list serializes it. Every field but the identity is
+/// optional: the union's base and per-kind fields arrive flat, and a shape
+/// this build does not know still decodes what it names rather than failing
+/// the whole read (ADR-0053's tolerant decoders).
+#[derive(Debug, Deserialize)]
+pub(super) struct RawJob {
+    pub(super) id: String,
+    pub(super) kind: String,
+    #[serde(rename = "sessionID", default)]
+    pub(super) session_id: Option<String>,
+    #[serde(default)]
+    pub(super) status: Option<String>,
+    #[serde(default)]
+    pub(super) title: Option<String>,
+    #[serde(rename = "shellID", default)]
+    pub(super) shell_id: Option<String>,
+    #[serde(rename = "childSessionID", default)]
+    pub(super) child_id: Option<String>,
+    #[serde(default)]
+    pub(super) command: Option<String>,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    #[serde(default)]
+    pub(super) path: Option<String>,
+    #[serde(default)]
+    pub(super) time: Option<RawJobTime>,
+}
+
+/// `Job.Time`: the `started` clock a ledger row reads. `completed` is not
+/// decoded here — the list is read running-only, and a finished job's record
+/// comes from its Wake, not from this read.
+#[derive(Debug, Deserialize)]
+pub(super) struct RawJobTime {
+    #[serde(default)]
+    pub(super) started: Option<i64>,
+}
+
+impl RawJob {
+    fn into_neutral(self) -> BackgroundJob {
+        BackgroundJob {
+            id: self.id,
+            kind: self.kind,
+            session_id: self.session_id,
+            // The read asked for running jobs; an entry that reports no status
+            // carries no evidence against that filter, so it stays running.
+            status: self.status.unwrap_or_else(|| "running".to_string()),
+            title: non_empty(self.title),
+            shell_id: non_empty(self.shell_id),
+            child_id: non_empty(self.child_id),
+            command: non_empty(self.command),
+            description: non_empty(self.description),
+            path: non_empty(self.path),
+            started_at: self.time.and_then(|time| time.started),
+        }
+    }
+}
+
+/// One decoded job from the running list: the neutral facts `merge_job_tasks`
+/// needs. Nothing here escapes the strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BackgroundJob {
+    pub(super) id: String,
+    pub(super) kind: String,
+    pub(super) session_id: Option<String>,
+    pub(super) status: String,
+    pub(super) title: Option<String>,
+    pub(super) shell_id: Option<String>,
+    pub(super) child_id: Option<String>,
+    pub(super) command: Option<String>,
+    pub(super) description: Option<String>,
+    pub(super) path: Option<String>,
+    pub(super) started_at: Option<i64>,
+}
+
+/// Decode the `{data: Job.Info[]}` body of the experimental job list. A body
+/// that is not the envelope carries no jobs; one entry that fails to decode is
+/// skipped rather than failing its siblings (the list is a live read, never a
+/// reason to lose the other running rows).
+pub(super) fn decode_job_list(body: &Value) -> Vec<BackgroundJob> {
+    body.get("data")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| serde_json::from_value::<RawJob>(entry.clone()).ok())
+                .map(RawJob::into_neutral)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A string field that carries something: an absent field and a blank value
+/// both read as "no label".
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+/// Merge a read's running jobs into `transcript.background_tasks` (ADR-0118):
+/// the transcript-derived rows keep their existing order, job rows append
+/// sorted by `time.started` then id, and a job a task already names adds no
+/// row — deduped on the job id against the task's call id / job id, `shellID`
+/// against its shell id, and `childSessionID` against its child id. A Wake in
+/// the same read retires a job like any Background Task (its id is the task's
+/// call id, which [`Wake::retires`] already matches). `session_id` is the
+/// session whose card reads these rows: a job owned by any other session is a
+/// **Child Job** and carries its owning subagent row's label when one is
+/// present.
+pub(super) fn merge_job_tasks(transcript: &mut SessionTranscript, session_id: &str, jobs: &[BackgroundJob]) {
+    let mut tasks = std::mem::take(&mut transcript.background_tasks);
+    let existing = tasks.len();
+    for job in jobs.iter().filter(|job| job.status == "running") {
+        let task = job.task(transcript, &tasks, session_id);
+        if transcript.wakes.iter().any(|wake| wake.retires(&task)) {
+            continue;
+        }
+        if tasks.iter().any(|current| same_run(current, &task)) {
+            continue;
+        }
+        tasks.push(task);
+    }
+    sort_job_rows(&mut tasks[existing..]);
+    transcript.background_tasks = tasks;
+}
+
+/// Re-attach the last successfully read job rows after a failed job read
+/// (ADR-0118): unchanged and unmarked, deduped against this read's
+/// transcript-derived rows, and still retired by a Wake this read carries.
+/// Returns the rows a later failed read may re-attach (a Wake-retired job is
+/// not one of them).
+pub(super) fn attach_job_tasks(
+    transcript: &mut SessionTranscript,
+    cached: &[BackgroundTask],
+) -> Vec<BackgroundTask> {
+    let survivors: Vec<BackgroundTask> = cached
+        .iter()
+        .filter(|task| !transcript.wakes.iter().any(|wake| wake.retires(task)))
+        .cloned()
+        .collect();
+    let mut tasks = std::mem::take(&mut transcript.background_tasks);
+    for task in &survivors {
+        if !tasks.iter().any(|current| same_run(current, task)) {
+            tasks.push(task.clone());
+        }
+    }
+    transcript.background_tasks = tasks;
+    survivors
+}
+
+/// Whether `task` already names the run `job_task` came from — identity, never
+/// order. The tool-part derivation wins because every existing task is
+/// compared before a job row is appended.
+fn same_run(task: &BackgroundTask, job_task: &BackgroundTask) -> bool {
+    let named = |id: &str| task.tool.call_id == id || task.job_id.as_deref() == Some(id);
+    job_task.job_id.as_deref().is_some_and(named)
+        || (job_task.shell_id.is_some() && job_task.shell_id == task.shell_id)
+        || (job_task.child_id.is_some() && job_task.child_id == task.child_id)
+}
+
+/// Job rows sort by start time then id, so they never trade places between
+/// reads. A job with no start cannot be placed and sorts after the dated ones.
+fn sort_job_rows(tasks: &mut [BackgroundTask]) {
+    tasks.sort_by(|a, b| {
+        a.started_at
+            .unwrap_or(i64::MAX)
+            .cmp(&b.started_at.unwrap_or(i64::MAX))
+            .then_with(|| a.tool.call_id.cmp(&b.tool.call_id))
+    });
+}
+
+impl BackgroundJob {
+    /// This job as a neutral Background Task: the job id is its call identity
+    /// (so a Wake naming the job retires it), the kind is its type word, and
+    /// its label/owner come from the read's own facts.
+    fn task(
+        &self,
+        transcript: &SessionTranscript,
+        tasks: &[BackgroundTask],
+        session_id: &str,
+    ) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: self.kind.clone(),
+                call_id: self.id.clone(),
+            },
+            shell_id: self.shell_id.clone(),
+            child_id: self.child_id.clone(),
+            started_at: self.started_at,
+            job_id: Some(self.id.clone()),
+            label: self.label(transcript),
+            owner_label: self.owner_label(tasks, session_id),
+        }
+    }
+
+    /// The kind's own label (ADR-0118): a Code Mode script's first non-empty
+    /// line from the launching `execute` part, else the job's title, else its
+    /// id; an image/video's path; a shell job's command; a subagent job's
+    /// description.
+    fn label(&self, transcript: &SessionTranscript) -> Option<String> {
+        match self.kind.as_str() {
+            "codemode" => self
+                .launching_code_line(transcript)
+                .or_else(|| self.title.clone())
+                .or_else(|| Some(self.id.clone())),
+            "image" | "video" => self.path.clone(),
+            "shell" => self.command.clone(),
+            "subagent" => self.description.clone(),
+            // A kind this build does not model still names its own work, when
+            // the payload carries one of the generic fields.
+            _ => self
+                .title
+                .clone()
+                .or_else(|| self.path.clone())
+                .or_else(|| self.command.clone())
+                .or_else(|| self.description.clone()),
+        }
+    }
+
+    /// The first non-empty line of the `execute` program that launched this
+    /// job — the part joins it through `metadata.jobID`, the same key the
+    /// completion entry joins on.
+    fn launching_code_line(&self, transcript: &SessionTranscript) -> Option<String> {
+        transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .find_map(|part| {
+                let Part::Tool(call) = part else {
+                    return None;
+                };
+                if string_field(call.metadata.as_ref(), "jobID").as_deref() != Some(self.id.as_str()) {
+                    return None;
+                }
+                call.input
+                    .as_ref()?
+                    .get("code")?
+                    .as_str()?
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_string)
+            })
+    }
+
+    /// A Child Job's owning subagent row label: when the job belongs to a
+    /// descendant session and a task in this read names that child, its
+    /// label is the owner's; otherwise `None` (the render falls back to
+    /// `↳ 子会话`).
+    fn owner_label(&self, tasks: &[BackgroundTask], session_id: &str) -> Option<String> {
+        let owner = self.session_id.as_deref()?;
+        if owner == session_id {
+            return None;
+        }
+        tasks
+            .iter()
+            .find(|task| task.child_id.as_deref() == Some(owner))
+            .and_then(|task| task.label.clone())
+    }
+}
+
 impl ToolCall {
     /// One backgrounded run as its typed tool call recorded it. The part's name
     /// decides which identity the task carries: a `shell` reports its shell id,
@@ -1094,11 +1354,21 @@ impl ToolCall {
             BackgroundLaunch::Shell { shell_id } => (shell_id, None),
             BackgroundLaunch::Subagent { child_id } => (None, child_id),
         };
+        // The launch's own neutral label: a shell's command, a subagent's
+        // description. It is also the label a Child Job renders as its owner.
+        let label = match self.identity.name.as_str() {
+            "shell" => non_empty(string_field(self.input.as_ref(), "command")),
+            "subagent" => non_empty(string_field(self.input.as_ref(), "description")),
+            _ => None,
+        };
         Some(BackgroundTask {
             tool: self.identity.clone(),
             shell_id,
             child_id,
             started_at: self.started_at,
+            job_id: None,
+            label,
+            owner_label: None,
         })
     }
 
@@ -3342,5 +3612,268 @@ mod tests {
             ExecutionOutcome::Other("weird".into())
         );
         assert_eq!(outcome_of(Value::Null), ExecutionOutcome::Unknown);
+    }
+
+    /// A hand-authored job-list body in v2.4.2's `{data: Job.Info[]}` shape
+    /// (`packages/schema/src/job.ts` on the `v2.4.2` tag): the union tagged by
+    /// `kind`, the base fields every kind carries (`id`, `sessionID`, `status`,
+    /// optional `title`, `time.started`), and each kind's own fields. The live
+    /// recording replaces this body once the 2.4.2 capture lands (spec #1220).
+    fn hand_authored_job_list() -> Value {
+        serde_json::json!({
+            "data": [
+                {
+                    "id": "job_cc", "kind": "codemode", "sessionID": "ses_1",
+                    "status": "running", "title": "code mode title",
+                    "time": {"started": 3000},
+                },
+                {
+                    "id": "job_img", "kind": "image", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 1000},
+                    "path": "/tmp/cover.png", "model": "img-model",
+                },
+                {
+                    "id": "job_vid", "kind": "video", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 2000},
+                    "path": "/tmp/clip.mp4",
+                },
+                {
+                    "id": "job_done", "kind": "shell", "sessionID": "ses_1",
+                    "status": "completed", "time": {"started": 500},
+                    "shellID": "sh_done", "command": "npm test",
+                },
+            ]
+        })
+    }
+
+    /// An `execute` tool part that launched a Code Mode job: it carries the
+    /// job id in its metadata and its program in `input.code`, but no
+    /// `metadata.status = "running"` marker, so it derives no task of its own.
+    fn codemode_part(call_id: &str, job_id: &str, code: &str) -> Value {
+        serde_json::json!({
+            "type": "tool",
+            "id": call_id,
+            "name": "execute",
+            "state": {
+                "status": "completed",
+                "input": {"code": code},
+                "content": [{"type": "text", "text": "running in the background"}],
+                "metadata": {"jobID": job_id},
+            },
+            "time": {"created": 900},
+        })
+    }
+
+    /// AC1: the hand-authored 2.4.2 list yields one task per running job, with
+    /// the job id, `started_at == time.started`, and the label each kind
+    /// carries. The completed entry adds nothing, and job rows append sorted by
+    /// start time then id — the list's own order never shows.
+    #[test]
+    fn running_jobs_merge_as_background_tasks_with_their_labels() {
+        let jobs = decode_job_list(&hand_authored_job_list());
+        assert_eq!(jobs.len(), 4, "every entry decodes; the merge filters status");
+
+        let mut transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 900},
+            "content": [codemode_part(
+                "call_cc",
+                "job_cc",
+                "\n  const answer = 42\n  return answer\n",
+            )],
+        })]);
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "an execute part naming a job id but no running status is not a tool-part task"
+        );
+
+        merge_job_tasks(&mut transcript, "ses_1", &jobs);
+
+        let ids: Vec<&str> = transcript
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["job_img", "job_vid", "job_cc"],
+            "running jobs only, appended by time.started then id"
+        );
+        let task = |id: &str| {
+            transcript
+                .background_tasks
+                .iter()
+                .find(|task| task.job_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("the `{id}` job must merge"))
+        };
+        for (id, kind, label, started) in [
+            ("job_img", "image", "/tmp/cover.png", 1000),
+            ("job_vid", "video", "/tmp/clip.mp4", 2000),
+            ("job_cc", "codemode", "const answer = 42", 3000),
+        ] {
+            let task = task(id);
+            assert_eq!(task.tool.name, kind, "the job's own kind is the type word");
+            assert_eq!(task.label.as_deref(), Some(label), "{id} label");
+            assert_eq!(task.started_at, Some(started), "{id} started_at == time.started");
+            assert_eq!(task.job_id.as_deref(), Some(id));
+            assert_eq!(task.owner_label, None, "a parent job carries no owner label");
+        }
+    }
+
+    /// The codemode label falls back to the job's title and then to the id when
+    /// no launching `execute` part names the job in this read.
+    #[test]
+    fn a_codemode_label_falls_back_to_the_title_then_the_job_id() {
+        let labelled = serde_json::json!({
+            "data": [{
+                "id": "job_1", "kind": "codemode", "sessionID": "ses_1",
+                "status": "running", "title": "named program", "time": {"started": 1000},
+            }]
+        });
+        let mut transcript = decode_messages(&[]);
+        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&labelled));
+        assert_eq!(
+            transcript.background_tasks[0].label.as_deref(),
+            Some("named program"),
+            "the job's title is the second source"
+        );
+
+        let untitled = serde_json::json!({
+            "data": [{
+                "id": "job_2", "kind": "codemode", "sessionID": "ses_1",
+                "status": "running", "time": {"started": 1000},
+            }]
+        });
+        let mut transcript = decode_messages(&[]);
+        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&untitled));
+        assert_eq!(
+            transcript.background_tasks[0].label.as_deref(),
+            Some("job_2"),
+            "the job id is the last resort"
+        );
+    }
+
+    /// AC2: a job is skipped when its `id` matches a task's call id, its
+    /// `shellID` a task's shell id, or its `childSessionID` a task's child id —
+    /// the tool-part derivation wins, one row per identity.
+    #[test]
+    fn a_job_a_task_already_names_adds_no_row() {
+        let mut transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 900},
+            "content": [
+                background_shell_part("call_shell", "sh_1"),
+                background_subagent_part("call_sub", "ses_child"),
+            ],
+        })]);
+        assert_eq!(transcript.background_tasks.len(), 2);
+
+        let jobs = serde_json::json!({
+            "data": [
+                {
+                    "id": "job_shell", "kind": "shell", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 1000},
+                    "shellID": "sh_1", "command": "sleep 2",
+                },
+                {
+                    "id": "job_sub", "kind": "subagent", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 1000},
+                    "childSessionID": "ses_child", "agent": "general",
+                    "description": "review",
+                },
+                {
+                    "id": "call_shell", "kind": "codemode", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 1000},
+                },
+                {
+                    "id": "job_new", "kind": "image", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 1000},
+                    "path": "/tmp/new.png", "model": "img-model",
+                },
+            ]
+        });
+        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&jobs));
+
+        let ids: Vec<&str> = transcript
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["call_shell", "call_sub", "job_new"],
+            "only the identity no task already names adds a row"
+        );
+    }
+
+    /// AC3 (the same-read half): a Wake naming the job retires it even though
+    /// the list still reports it running, through the job id the task carries
+    /// as its call id.
+    #[test]
+    fn a_wake_naming_the_job_retires_it_in_the_same_read() {
+        let mut transcript = decode_messages(&[synthetic_wake(
+            "msg_w",
+            5_000,
+            serde_json::json!({"source": "codemode", "jobID": "job_cc"}),
+        )]);
+        merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&hand_authored_job_list()),
+        );
+
+        let ids: Vec<&str> = transcript
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.call_id.as_str())
+            .collect();
+        assert_eq!(ids, ["job_img", "job_vid"], "the Wake retires job_cc");
+    }
+
+    /// A Child Job carries the subagent row label its owner session names, and
+    /// `None` when no row names that child (the render falls back to
+    /// `↳ 子会话`).
+    #[test]
+    fn a_child_job_carries_its_owner_rows_label() {
+        let mut transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 900},
+            "content": [background_subagent_part("call_sub", "ses_child")],
+        })]);
+        let jobs = serde_json::json!({
+            "data": [
+                {
+                    "id": "job_in_child", "kind": "codemode", "sessionID": "ses_child",
+                    "status": "running", "time": {"started": 1000},
+                },
+                {
+                    "id": "job_orphan", "kind": "image", "sessionID": "ses_gone",
+                    "status": "running", "time": {"started": 2000},
+                    "path": "/tmp/orphan.png", "model": "img-model",
+                },
+            ]
+        });
+        merge_job_tasks(&mut transcript, "ses_1", &decode_job_list(&jobs));
+
+        let task = |id: &str| {
+            transcript
+                .background_tasks
+                .iter()
+                .find(|task| task.job_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("the `{id}` job must merge"))
+        };
+        assert_eq!(
+            task("job_in_child").owner_label.as_deref(),
+            Some("review"),
+            "the subagent row's own label names the child"
+        );
+        assert_eq!(
+            task("job_orphan").owner_label,
+            None,
+            "no row names the orphan child"
+        );
     }
 }

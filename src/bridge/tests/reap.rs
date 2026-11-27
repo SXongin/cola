@@ -5903,6 +5903,7 @@ async fn a_restart_successor_carries_the_cleanup_button_and_the_click_works() {
         shell_id: None,
         child_id: Some("ses_child".into()),
         started_at: Some(2_100),
+        ..Default::default()
     }]);
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;
@@ -5978,6 +5979,7 @@ async fn the_cleanup_click_carries_two_keys_and_acks_with_the_cleaning_toast() {
         shell_id: None,
         child_id: Some("ses_child".into()),
         started_at: Some(2_100),
+        ..Default::default()
     }]);
     let (app, platform, backend) =
         restarted_app_with_backend(&session_file, waiting, Some(SessionStatus::Idle)).await;

@@ -56,6 +56,7 @@ fn live_shell(started_at: i64, call_id: &str) -> BackgroundTask {
         shell_id: Some(format!("sh_{call_id}")),
         child_id: None,
         started_at: Some(started_at),
+        ..Default::default()
     }
 }
 
@@ -70,6 +71,7 @@ fn live_subagent(started_at: i64, call_id: &str) -> BackgroundTask {
         shell_id: None,
         child_id: Some(format!("ses_{call_id}")),
         started_at: Some(started_at),
+        ..Default::default()
     }
 }
 
@@ -1060,6 +1062,7 @@ fn live_subagent_child(started_at: i64, call_id: &str, child_id: &str) -> Backgr
         shell_id: None,
         child_id: Some(child_id.into()),
         started_at: Some(started_at),
+        ..Default::default()
     }
 }
 
@@ -6018,6 +6021,7 @@ async fn one_pass_reads_each_distinct_child_once() {
         shell_id: None,
         child_id: Some("ses_shared".into()),
         started_at: Some(started_at),
+        ..Default::default()
     };
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "跑两个审阅"),

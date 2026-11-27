@@ -151,6 +151,7 @@ pub(crate) fn background_shell(started_at: i64) -> BackgroundTask {
         shell_id: Some("sh_bg".into()),
         child_id: None,
         started_at: Some(started_at),
+        ..Default::default()
     }
 }
 
@@ -167,6 +168,7 @@ pub(crate) fn launch_task(call_id: &str, shell_id: Option<&str>, child_id: Optio
         shell_id: shell_id.map(str::to_string),
         child_id: child_id.map(str::to_string),
         started_at: Some(1_000),
+        ..Default::default()
     }
 }
 

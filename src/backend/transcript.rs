@@ -1248,16 +1248,32 @@ impl WakeSource {
 /// Work the agent left running in the background: derived from the assistant
 /// tool part that started it, live until its Wake retires it (ADR-0059). While
 /// one is live its Turn is not complete.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackgroundTask {
-    /// The tool call that started the task — the part's own identity.
+    /// The tool call that started the task — the part's own identity, or a
+    /// job's identity (the job id as the call id, the kind as the name) for a
+    /// job-sourced task (ADR-0118).
     pub tool: ToolIdentity,
-    /// The shell the task runs in, when the part reported one.
+    /// The shell the task runs in, when the part or job reported one.
     pub shell_id: Option<String>,
-    /// The child session a subagent runs in, when the part reported one.
+    /// The child session a subagent runs in, when the part or job reported one.
     pub child_id: Option<String>,
     /// When the tool call started the task, when the payload reported a time.
     pub started_at: Option<i64>,
+    /// The V2 background job this task was discovered from (ADR-0118), when
+    /// the tool-part derivation did not already name the run. `None` for a
+    /// tool-part task: its [`Self::tool`] identity is the launch itself.
+    pub job_id: Option<String>,
+    /// The task's own neutral label, when the fact that named it carried one:
+    /// a shell's command, a subagent's description, a job's kind-specific
+    /// label (a Code Mode script's first line, an image/video path, a shell
+    /// job's command, a subagent job's description). Presentation decides how
+    /// to show it; the model never guesses one (ADR-0118).
+    pub label: Option<String>,
+    /// For a **Child Job** — a job owned by a descendant session — the owning
+    /// subagent row's label, when a task in the same read names that child.
+    /// `None` renders the neutral `↳ 子会话` fallback (ADR-0118).
+    pub owner_label: Option<String>,
 }
 
 /// How a shell Background Task ended, as the runtime reports it (V2's
@@ -2345,8 +2361,10 @@ pub enum BackgroundLaunch {
 }
 
 /// A tool call's identity: the tool's name plus the call's opaque correlation
-/// id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// id. `Default` is the empty identity a [`BackgroundTask`] built
+/// field-by-field starts from: a call id is always set by the fact that names
+/// the run, so the model never carries a half identity into a comparison.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolIdentity {
     pub name: String,
     pub call_id: String,
@@ -2880,6 +2898,7 @@ mod tests {
             shell_id: Some("sh_bg".into()),
             child_id: None,
             started_at: Some(started_at),
+            ..Default::default()
         }
     }
 
@@ -3409,6 +3428,7 @@ mod tests {
                 shell_id: None,
                 child_id: None,
                 started_at: Some(1_100),
+                ..Default::default()
             }]);
         assert!(crate::backend::runs::RunLifecycle::new().needs_cleanup_marking(&transcript));
         assert_eq!(transcript.settle_with(Some(&anchor), true), TurnSettle::Waiting);
@@ -3532,6 +3552,7 @@ mod tests {
             shell_id: Some(shell_id.into()),
             child_id: None,
             started_at: Some(1_100),
+            ..Default::default()
         };
         let child_task = BackgroundTask {
             tool: ToolIdentity {
@@ -3541,6 +3562,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_child".into()),
             started_at: Some(1_100),
+            ..Default::default()
         };
 
         // An ended shell retires with the runtime's own completion time; a
@@ -3655,6 +3677,7 @@ mod tests {
             shell_id: Some(shell_id.into()),
             child_id: None,
             started_at: Some(1_100),
+            ..Default::default()
         };
         let mut transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
             .with_executions(vec![boundary(1_200)])
@@ -3723,6 +3746,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_child".into()),
             started_at: Some(1_000),
+            ..Default::default()
         };
         let mut transcript = SessionTranscript::default().with_background_tasks(vec![task]);
         transcript.runs = vec![AgentRun {
@@ -3778,6 +3802,7 @@ mod tests {
             shell_id: None,
             child_id: Some(child_id.into()),
             started_at: Some(1_100),
+            ..Default::default()
         };
 
         // The runtime marked the child inactive; its own terminal message ends
@@ -3900,6 +3925,7 @@ mod tests {
             shell_id: None,
             child_id: Some(child_id.into()),
             started_at: Some(1_100),
+            ..Default::default()
         };
         let task = child("call_sub", "ses_child");
         let mut transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![
@@ -3977,6 +4003,7 @@ mod tests {
             shell_id: Some("sh_other".into()),
             child_id: None,
             started_at: Some(1_100),
+            ..Default::default()
         }]);
         overlay.observe(
             "ses_a",
@@ -4001,6 +4028,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_child".into()),
             started_at: Some(1_100),
+            ..Default::default()
         };
         let overlay = RunLifecycle::default();
         let live = || SessionTranscript::new(vec![]).with_background_tasks(vec![child_task()]);
@@ -4081,6 +4109,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_child".into()),
             started_at: Some(1_100),
+            ..Default::default()
         };
 
         // A Running verdict resolves the carried marker; the task stays live.

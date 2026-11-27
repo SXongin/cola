@@ -1015,6 +1015,7 @@ fn retire_run_child_evidence(
             shell_id: None,
             child_id: run.child_id.clone(),
             started_at: run.started_at,
+            ..Default::default()
         },
         ending,
         finished_at,
@@ -1102,6 +1103,7 @@ fn retire_cleanup(transcript: &mut SessionTranscript, key: &str, now_ms: i64) ->
             shell_id: None,
             child_id: run.child_id.clone(),
             started_at: run.started_at,
+            ..Default::default()
         },
         ending: TaskRetirementEnding::Cleaned,
         finished_at: Some(now_ms),
@@ -1236,6 +1238,7 @@ mod tests {
             shell_id: None,
             child_id: Some(child.into()),
             started_at: Some(started_at),
+            ..Default::default()
         }
     }
 
@@ -1248,6 +1251,7 @@ mod tests {
             shell_id: Some(shell_id.into()),
             child_id: None,
             started_at: Some(started_at),
+            ..Default::default()
         }
     }
 

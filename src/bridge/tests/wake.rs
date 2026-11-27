@@ -87,6 +87,7 @@ fn another_background_shell(started_at: i64) -> BackgroundTask {
         shell_id: Some("sh_bg2".into()),
         child_id: None,
         started_at: Some(started_at),
+        ..Default::default()
     }
 }
 
@@ -102,6 +103,7 @@ fn live_subagent(started_at: i64) -> BackgroundTask {
         shell_id: None,
         child_id: Some("ses_sub".into()),
         started_at: Some(started_at),
+        ..Default::default()
     }
 }
 
@@ -900,6 +902,7 @@ async fn a_wake_absorbed_by_a_live_turn_is_not_re_posted_after_the_card_ends() {
         shell_id: Some("sh_call_bg".into()),
         child_id: None,
         started_at: Some(started),
+        ..Default::default()
     };
     let mut wake = shell_wake(2_900);
     wake.shell_id = Some("sh_call_bg".into());
@@ -3796,6 +3799,7 @@ async fn several_completions_leave_one_entry_each_in_wake_order() {
         shell_id: None,
         child_id: Some("ses_child".into()),
         started_at: Some(base + 5 * 60_000),
+        ..Default::default()
     };
     let live = SessionTranscript::new(timeline(vec![]))
         .with_executions(vec![execution(base + 30_000)])

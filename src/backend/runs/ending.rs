@@ -116,6 +116,7 @@ impl TaskRunIdentity {
             shell_id: self.shell_id.clone(),
             child_id: self.child_id.clone(),
             started_at: self.started_at,
+            ..Default::default()
         }
     }
 }

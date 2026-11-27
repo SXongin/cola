@@ -629,6 +629,7 @@ mod tests {
             shell_id: shell_id.map(str::to_string),
             child_id: child_id.map(str::to_string),
             started_at: Some(1_000),
+            ..Default::default()
         }
     }
 
@@ -821,6 +822,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_task_child".into()),
             started_at: Some(1_000),
+            ..Default::default()
         }]);
         transcript.unconfirmed_tasks.insert("call_task".into());
 
@@ -893,6 +895,7 @@ mod tests {
             shell_id: None,
             child_id: Some("ses_child".into()),
             started_at: Some(1_000),
+            ..Default::default()
         }]);
         transcript.unconfirmed_tasks.insert("call_spawn".into());
 
@@ -1261,6 +1264,7 @@ mod tests {
                 shell_id: None,
                 child_id: None,
                 started_at: Some(1_000),
+                ..Default::default()
             }]);
         assert!(backend.runs().needs_cleanup_marking(&transcript));
 
