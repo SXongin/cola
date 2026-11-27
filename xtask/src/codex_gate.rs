@@ -634,39 +634,7 @@ mod tests {
         }
         // `openai/codex-action@<40 lowercase hex> # vX.Y.Z`
         let pin = uses_line(codex, "openai/codex-action");
-        let (sha, version) = pin
-            .rsplit_once(" # ")
-            .unwrap_or_else(|| panic!("the pin carries its release comment: {pin}"));
-        assert!(
-            sha.len() == 40
-                && sha
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-            "the pin must be a full lowercase commit SHA, not a tag: {sha}"
-        );
-        let (major, minor) = version
-            .trim()
-            .strip_prefix('v')
-            .and_then(|rest| rest.split_once('.'))
-            .unwrap_or_else(|| panic!("the pin carries its release as `# vX.Y.Z`: {version}"));
-        assert!(
-            !major.is_empty()
-                && major.chars().all(|c| c.is_ascii_digit())
-                && !minor.is_empty()
-                && minor.chars().all(|c| c == '.' || c.is_ascii_digit()),
-            "the pin carries its release as `# vX.Y.Z`: {version}"
-        );
-        // The releases the gate must never return to. v1.12 handed the runner's
-        // descriptors to the whole Codex process tree and waited for them to
-        // close — the #150/#169 stdio hang that burned a finished review
-        // (#530). Keyed by SHA, so a comment cannot launder it.
-        const RETIRED: [&str; 1] = [
-            "86365089eb2b84e0a8fb0717b304f8bdcb13b20e", // v1.12
-        ];
-        assert!(
-            !RETIRED.contains(&sha),
-            "the Codex step must not return to a retired pin ({version})"
-        );
+        check_pin(pin).unwrap();
         // The post step publishes only complete reviews, through the parser
         // the workflow itself wrote (never a file from the reviewed tree).
         let post = step(&workflow, "Post the review as a comment");
@@ -736,5 +704,86 @@ mod tests {
         step.lines()
             .find_map(|line| line.trim().strip_prefix(&prefix))
             .unwrap_or_else(|| panic!("the step uses {action}"))
+    }
+
+    /// The releases the gate must never return to. v1.12 handed the runner's
+    /// descriptors to the whole Codex process tree and waited for them to
+    /// close — the #150/#169 stdio hang that burned a finished review (#530).
+    /// Keyed by SHA, so a comment cannot launder it.
+    const RETIRED_PINS: [&str; 1] = [
+        "86365089eb2b84e0a8fb0717b304f8bdcb13b20e", // v1.12
+    ];
+
+    /// Validate a pinned ref against the Codex step's contract: a full
+    /// lowercase commit SHA (a tag can be re-pointed under us), its release
+    /// recorded as `# vX.Y.Z` or the short `# vX.Y` Dependabot writes, and
+    /// never a retired release. A reviewed upgrade passes without a test edit;
+    /// a revert to v1.12 does not.
+    fn check_pin(pin: &str) -> Result<(), String> {
+        let (sha, version) = pin
+            .rsplit_once(" # ")
+            .ok_or_else(|| format!("the pin carries its release comment: {pin}"))?;
+        if sha.len() != 40
+            || !sha
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        {
+            return Err(format!(
+                "the pin must be a full lowercase commit SHA, not a tag: {sha}"
+            ));
+        }
+        if RETIRED_PINS.contains(&sha) {
+            return Err(format!(
+                "the Codex step must not return to a retired pin ({})",
+                version.trim()
+            ));
+        }
+        let release = version
+            .trim()
+            .strip_prefix('v')
+            .ok_or_else(|| format!("the pin carries its release as `# vX.Y.Z`: {version}"))?;
+        let parts: Vec<&str> = release.split('.').collect();
+        let numbered = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit());
+        if !(2..=3).contains(&parts.len()) || !parts.iter().all(|part| numbered(part)) {
+            return Err(format!("the pin carries its release as `# vX.Y.Z`: {version}"));
+        }
+        Ok(())
+    }
+
+    /// The pin guard's decisions, independent of the tree it runs on. Without
+    /// these the rule is only ever seen accepting today's pin, so a revert to
+    /// the old exact-SHA assertion (or a malformed release) would pass unseen.
+    #[test]
+    fn the_pin_guard_accepts_reviewed_releases_and_rejects_the_rest() {
+        let sha = "306c6a196a99dcc6582530c396a19d2672d5e9ec";
+        for pin in [
+            format!("{sha} # v1.14"),
+            format!("{sha} # v1.14.0"),
+            format!("{sha} # v10.2"),
+        ] {
+            assert_eq!(check_pin(&pin), Ok(()), "{pin} must pass");
+        }
+        for (pin, reason) in [
+            (sha.to_string(), "release comment"),
+            (format!("{sha} # 1.14"), "`# vX.Y.Z`"),
+            (format!("{sha} # v1..14"), "`# vX.Y.Z`"),
+            (format!("{sha} # v1."), "`# vX.Y.Z`"),
+            (format!("{sha} # v1.14-beta"), "`# vX.Y.Z`"),
+            ("v1.14 # v1.14".to_string(), "full lowercase commit SHA"),
+            (
+                "306C6A196A99DCC6582530C396A19D2672D5E9EC # v1.14".to_string(),
+                "full lowercase commit SHA",
+            ),
+            (
+                "86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1.12".to_string(),
+                "retired pin (v1.12)",
+            ),
+        ] {
+            let error = check_pin(&pin).expect_err(&pin);
+            assert!(
+                error.contains(reason),
+                "{pin} must fail with {reason}, got: {error}"
+            );
+        }
     }
 }
