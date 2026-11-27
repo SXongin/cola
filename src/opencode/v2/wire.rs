@@ -1209,32 +1209,17 @@ pub(super) fn merge_job_tasks(
     for job in jobs.iter().filter(|job| job.status == "running") {
         let task = job.task(transcript, &tasks, session_id);
         let retired = transcript.wakes.iter().any(|wake| wake.retires(&task));
-        if let Some(index) = tasks.iter().position(|current| same_run(current, &task)) {
-            if retired {
-                // The job's Wake retires the run wherever its row came from: a
-                // deduped tool task must leave with the job. Its own metadata
-                // still says running, so no other fact would end it (AC3).
-                tasks.remove(index);
+        match fold_job_task(&mut tasks, &task, retired) {
+            JobFold::Removed { index } => {
                 if index < originals {
                     originals -= 1;
                 }
-                continue;
             }
-            // The tool-part derivation keeps the row; associate the job id so
-            // a Wake naming only the job retires that row too. A row that is
-            // already job-sourced is the job's own and keeps its identity, and
-            // the first job to name a run wins over a later alias.
-            if !tasks[index].is_job_sourced() && tasks[index].job_id.is_none() {
-                tasks[index].job_id = task.job_id.clone();
-            }
-            built.push(task);
-            continue;
+            // A deduped job is cached too (the tool-part launch can leave a
+            // later read); a retired one is not.
+            JobFold::Matched | JobFold::Appended => built.push(task),
+            JobFold::Retired => {}
         }
-        if retired {
-            continue;
-        }
-        tasks.push(task.clone());
-        built.push(task);
     }
     sort_job_rows(&mut tasks[originals..]);
     sort_job_rows(&mut built);
@@ -1242,28 +1227,66 @@ pub(super) fn merge_job_tasks(
     built
 }
 
-/// Re-attach the last successfully read job rows after a failed job read
-/// (ADR-0118): unchanged and unmarked, deduped against this read's
-/// transcript-derived rows, and still retired by a Wake this read carries.
-/// Returns the rows a later failed read may re-attach (a Wake-retired job is
-/// not one of them).
-pub(super) fn attach_job_tasks(
-    transcript: &mut SessionTranscript,
-    cached: &[BackgroundTask],
-) -> Vec<BackgroundTask> {
-    let survivors: Vec<BackgroundTask> = cached
+/// How one job row folded into a read's task list.
+enum JobFold {
+    /// An existing task already named the run: it keeps its identity/kind and
+    /// only has the job id associated (the tool-part derivation wins).
+    Matched,
+    /// An existing task named the run and this read's Wake retired the job:
+    /// the task left the list at this index.
+    Removed { index: usize },
+    /// No task named the run; the job row itself was appended.
+    Appended,
+    /// No task named the run and this read's Wake retired the job.
+    Retired,
+}
+
+/// Fold one job row into `tasks` (ADR-0118) — the ONE rule the success merge
+/// and the failed-read render share, so the two paths cannot drift.
+///
+/// The tool-part derivation wins: a matching task keeps its call identity, type
+/// word and label, and only gets the job id associated, so a Wake naming only
+/// the job retires that row too. When `retired`, the matching task is removed
+/// instead — its launch metadata never flips, so nothing else would end it. A
+/// job no task names is appended unless this read's Wake retired it.
+fn fold_job_task(tasks: &mut Vec<BackgroundTask>, job_task: &BackgroundTask, retired: bool) -> JobFold {
+    if let Some(index) = tasks.iter().position(|current| same_run(current, job_task)) {
+        if retired {
+            tasks.remove(index);
+            return JobFold::Removed { index };
+        }
+        if !tasks[index].is_job_sourced() && tasks[index].job_id.is_none() {
+            tasks[index].job_id = job_task.job_id.clone();
+        }
+        return JobFold::Matched;
+    }
+    if retired {
+        return JobFold::Retired;
+    }
+    tasks.push(job_task.clone());
+    JobFold::Appended
+}
+
+/// Render the given current job rows onto `transcript` (ADR-0118): drop this
+/// read's own job-sourced rows, then fold every row — association with a
+/// freshly decoded tool task, removal when this read's Wake retires it, append
+/// when no task names it.
+///
+/// The caller supplies rows it read under its OWN cache lock, and this function
+/// must run inside that acquisition: no await and no second lock read, so a
+/// newer verdict can neither slip between the read and the transcript nor be
+/// overwritten by this read's stale clone.
+pub(super) fn render_job_rows(transcript: &mut SessionTranscript, rows: &[BackgroundTask]) {
+    let retired: Vec<bool> = rows
         .iter()
-        .filter(|task| !transcript.wakes.iter().any(|wake| wake.retires(task)))
-        .cloned()
+        .map(|task| transcript.wakes.iter().any(|wake| wake.retires(task)))
         .collect();
     let mut tasks = std::mem::take(&mut transcript.background_tasks);
-    for task in &survivors {
-        if !tasks.iter().any(|current| same_run(current, task)) {
-            tasks.push(task.clone());
-        }
+    tasks.retain(|task| !task.is_job_sourced());
+    for (task, retired) in rows.iter().zip(retired) {
+        let _ = fold_job_task(&mut tasks, task, retired);
     }
     transcript.background_tasks = tasks;
-    survivors
 }
 
 /// Whether `task` already names the run `job_task` came from — identity, never
@@ -1308,6 +1331,7 @@ impl BackgroundJob {
             child_id: self.child_id.clone(),
             started_at: self.started_at,
             job_id: Some(self.id.clone()),
+            job_sourced: true,
             label: self.label(transcript),
             owner_label: self.owner_label(tasks, session_id),
             child_job: self.session_id.as_deref() != Some(session_id),
@@ -1400,6 +1424,7 @@ impl ToolCall {
             child_id,
             started_at: self.started_at,
             job_id: None,
+            job_sourced: false,
             label,
             owner_label: None,
             child_job: false,
@@ -3986,6 +4011,93 @@ mod tests {
             transcript.background_tasks
         );
         assert!(cached.is_empty(), "a Wake-retired job is not cached: {cached:#?}");
+    }
+
+    /// A job whose id happens to equal a tool task's call id only corroborates
+    /// the run: the explicit `job_sourced` fact (never id equality) keeps the
+    /// tool row, its kind and its lifecycle, and the render appends no job row
+    /// over it (AC2 — the tool-part derivation wins).
+    #[test]
+    fn a_tool_task_whose_call_id_is_the_job_id_stays_a_tool_task() {
+        let mut transcript = decode_messages(&[serde_json::json!({
+            "id": "msg_a",
+            "type": "assistant",
+            "time": {"created": 900},
+            "content": [background_shell_part("job1", "sh1")],
+        })]);
+        let jobs = serde_json::json!({
+            "data": [{
+                "id": "job1", "kind": "shell", "sessionID": "ses_1",
+                "status": "running", "time": {"started": 1000},
+                "shellID": "sh1", "command": "sleep 2",
+            }]
+        });
+        let cached = merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&jobs).expect("the envelope"),
+        );
+        assert_eq!(transcript.background_tasks.len(), 1, "the tool task wins");
+        let task = &transcript.background_tasks[0];
+        assert_eq!(task.tool.call_id, "job1");
+        assert_eq!(task.tool.name, "shell", "the tool kind survives");
+        assert_eq!(task.job_id.as_deref(), Some("job1"), "the association is set");
+        assert!(
+            !task.is_job_sourced(),
+            "a corroborated tool task is not the job's own row"
+        );
+
+        // The cache render (the sync both paths share) keeps the tool row and
+        // never swaps in the job row's identity.
+        render_job_rows(&mut transcript, &cached);
+        assert_eq!(transcript.background_tasks.len(), 1);
+        assert_eq!(transcript.background_tasks[0].tool.name, "shell");
+        assert!(!transcript.background_tasks[0].is_job_sourced());
+    }
+
+    /// The failed-read render shares the merge's association/retire step: a
+    /// cached job row whose Wake names only the job removes the freshly decoded
+    /// tool task it dedupes against, so the row cannot stay live beside its
+    /// completion entry.
+    #[test]
+    fn rendering_a_wake_retired_cached_job_removes_its_tool_task() {
+        let mut transcript = decode_messages(&[
+            serde_json::json!({
+                "id": "msg_a",
+                "type": "assistant",
+                "time": {"created": 900},
+                "content": [background_shell_part("call_shell", "sh1")],
+            }),
+            synthetic_wake(
+                "msg_w",
+                5_000,
+                serde_json::json!({"source": "shell", "jobID": "job1"}),
+            ),
+        ]);
+        assert_eq!(
+            transcript.background_tasks.len(),
+            1,
+            "the decode alone cannot retire the tool task"
+        );
+        let cached = vec![BackgroundTask {
+            tool: ToolIdentity {
+                name: "shell".into(),
+                call_id: "job1".into(),
+            },
+            shell_id: Some("sh1".into()),
+            started_at: Some(1_000),
+            job_id: Some("job1".into()),
+            job_sourced: true,
+            ..Default::default()
+        }];
+
+        render_job_rows(&mut transcript, &cached);
+
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "the Wake retires the cached job and its matched tool task: {:#?}",
+            transcript.background_tasks
+        );
     }
 
     /// AC3 (the same-read half): a Wake naming the job retires it even though

@@ -1351,7 +1351,9 @@ impl V2Strategy {
     }
 
     /// The last successfully read job rows for `session_id`, empty when the
-    /// session has none.
+    /// session has none. Test-only accessor: production always reads the cache
+    /// under the lock that also renders, so it never clones the rows loose.
+    #[cfg(test)]
     fn cached_job_rows(&self, session_id: &str) -> Vec<BackgroundTask> {
         self.jobs
             .lock()
@@ -1368,15 +1370,20 @@ impl V2Strategy {
         self.remember_job_rows(session_id, seq, Vec::new());
     }
 
-    /// Make the read render the newest known job verdict (ADR-0118): drop this
-    /// read's own job-sourced rows and re-attach what the cache holds now. A
-    /// read whose verdict lost the sequence guard therefore returns the newer
-    /// verdict (often empty) instead of its stale snapshot, so a render poll
-    /// can never re-show a retired job.
+    /// Make the read render the newest known job verdict (ADR-0118): under ONE
+    /// cache-lock acquisition, read the current rows and fold them onto the
+    /// transcript (drop this read's own job-sourced rows, associate/retire a
+    /// matching tool task, re-attach the cache's). No await and no second
+    /// acquisition inside, so a newer read can neither slip between this read's
+    /// clone and its attach (which would repaint a retired row) nor be
+    /// overwritten by this read's stale one.
     fn sync_job_rows(&self, transcript: &mut SessionTranscript, session_id: &str) {
-        transcript.background_tasks.retain(|task| !task.is_job_sourced());
-        let current = self.cached_job_rows(session_id);
-        let _ = wire::attach_job_tasks(transcript, &current);
+        let cache = self.jobs.lock().expect("job row cache lock");
+        let current = cache
+            .get(session_id)
+            .map(|cached| cached.rows.clone())
+            .unwrap_or_default();
+        wire::render_job_rows(transcript, &current);
     }
 
     /// Apply a failed job read atomically with its cache update, and render the
@@ -1384,12 +1391,13 @@ impl V2Strategy {
     ///
     /// A failed read has no job list of its own, so under ONE cache-lock
     /// acquisition it reads the current rows, applies the seq guard for its
-    /// Wake-filtered survivor re-memory, and sets the transcript's job-sourced
-    /// rows from the RESULTING current cache (dropping its own, re-attaching
-    /// the cache's, deduped against this read's tool tasks). No await and no
-    /// second acquisition inside: a newer read can neither slip between the
-    /// clone and the transcript (which would repaint a retired row) nor be
-    /// overwritten by a stale one.
+    /// Wake-filtered survivor re-memory, and renders the CURRENT rows onto the
+    /// transcript (association with a freshly decoded tool task, removal of a
+    /// matched task whose job this read's Wake retires, no duplicate job row).
+    /// The render sees the unfiltered current rows so a Wake can still remove
+    /// its matched tool task; the cache itself keeps only the survivors. No
+    /// await and no second acquisition inside: a newer read can neither slip
+    /// between the clone and the transcript nor be overwritten by a stale one.
     fn sync_failed_job_rows(&self, transcript: &mut SessionTranscript, session_id: &str, seq: u64) {
         let mut cache = self.jobs.lock().expect("job row cache lock");
         let cached = cache.get(session_id).cloned();
@@ -1400,22 +1408,10 @@ impl V2Strategy {
             .filter(|task| !transcript.wakes.iter().any(|wake| wake.retires(task)))
             .cloned()
             .collect();
-        let rendered = if stale {
-            // A newer verdict owns the cache: render it unchanged and never
-            // lower the stored sequence.
-            current
-        } else {
-            cache.insert(
-                session_id.to_string(),
-                CachedJobRows {
-                    seq,
-                    rows: survivors.clone(),
-                },
-            );
-            survivors
-        };
-        transcript.background_tasks.retain(|task| !task.is_job_sourced());
-        let _ = wire::attach_job_tasks(transcript, &rendered);
+        if !stale {
+            cache.insert(session_id.to_string(), CachedJobRows { seq, rows: survivors });
+        }
+        wire::render_job_rows(transcript, &current);
     }
 
     /// Durably admit one prompt (`POST /api/session/{id}/prompt`) with
