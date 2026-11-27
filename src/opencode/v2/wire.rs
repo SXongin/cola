@@ -1188,6 +1188,10 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// its owning subagent row's label when one is present, and stays marked as
 /// one (`child_job`) even when no row names it.
 ///
+/// Child Job owner labels are resolved AFTER the whole list is folded
+/// ([`resolve_owner_labels`]), so an owner job row that appears later in the
+/// response (or sorts after the child) is still found.
+///
 /// Returns the task built for every running job, post-Wake and PRE-dedupe, in
 /// the same start-then-id order the appended rows use: the failed-read cache
 /// must keep a job even when a tool-part task outranks it in this read. The
@@ -1207,7 +1211,7 @@ pub(super) fn merge_job_tasks(
     let mut originals = tasks.len();
     let mut built: Vec<BackgroundTask> = Vec::new();
     for job in jobs.iter().filter(|job| job.status == "running") {
-        let task = job.task(transcript, &tasks, session_id);
+        let task = job.task(transcript, session_id);
         let retired = transcript.wakes.iter().any(|wake| wake.retires(&task));
         match fold_job_task(&mut tasks, &task, retired) {
             JobFold::Removed { index } => {
@@ -1223,8 +1227,44 @@ pub(super) fn merge_job_tasks(
     }
     sort_job_rows(&mut tasks[originals..]);
     sort_job_rows(&mut built);
+    // The owner of a Child Job may be a job row that the list placed later or
+    // that sorted after it, so resolve the marker only once every row is in.
+    resolve_owner_labels(jobs, &mut tasks, &mut built);
     transcript.background_tasks = tasks;
     built
+}
+
+/// Resolve every Child Job's owner label once the WHOLE read is known
+/// (ADR-0118): the owner may be another job-sourced row that appears later in
+/// the list or sorts after the child, so a mid-loop lookup would miss it.
+/// `jobs` supplies each job id's owner session; the candidates are the final
+/// row set and the cache set (a transcript-derived tool task or a job row both
+/// count). A child no row names keeps `None` — the render's `↳ 子会话`
+/// fallback.
+fn resolve_owner_labels(jobs: &[BackgroundJob], rows: &mut [BackgroundTask], cached: &mut [BackgroundTask]) {
+    let mut owner_sessions: HashMap<&str, &str> = HashMap::new();
+    for job in jobs.iter().filter(|job| job.status == "running") {
+        if let Some(session) = job.session_id.as_deref() {
+            owner_sessions.insert(job.id.as_str(), session);
+        }
+    }
+    let mut labels: HashMap<String, String> = HashMap::new();
+    for row in rows.iter().chain(cached.iter()) {
+        if let (Some(child), Some(label)) = (row.child_id.as_deref(), row.label.as_deref()) {
+            labels
+                .entry(child.to_string())
+                .or_insert_with(|| label.to_string());
+        }
+    }
+    for row in rows.iter_mut().chain(cached.iter_mut()) {
+        if !row.is_job_sourced() || !row.child_job {
+            continue;
+        }
+        row.owner_label = owner_sessions
+            .get(row.tool.call_id.as_str())
+            .and_then(|session| labels.get(*session))
+            .cloned();
+    }
 }
 
 /// How one job row folded into a read's task list.
@@ -1313,15 +1353,11 @@ fn sort_job_rows(tasks: &mut [BackgroundTask]) {
 impl BackgroundJob {
     /// This job as a neutral Background Task: the job id is its call identity
     /// (so a Wake naming the job retires it), the kind is its type word, and
-    /// its label/owner come from the read's own facts. A job any other session
-    /// owns is marked as a **Child Job** (ADR-0118), so a row whose owner no
-    /// longer names it still renders the neutral `↳` marker.
-    fn task(
-        &self,
-        transcript: &SessionTranscript,
-        tasks: &[BackgroundTask],
-        session_id: &str,
-    ) -> BackgroundTask {
+    /// its label comes from the read's own facts. A job any other session owns
+    /// is marked as a **Child Job** (ADR-0118), so a row whose owner no longer
+    /// names it still renders the neutral `↳` marker; its owner label is
+    /// resolved in a second pass once the whole read is merged.
+    fn task(&self, transcript: &SessionTranscript, session_id: &str) -> BackgroundTask {
         BackgroundTask {
             tool: ToolIdentity {
                 name: self.kind.clone(),
@@ -1333,7 +1369,9 @@ impl BackgroundJob {
             job_id: Some(self.id.clone()),
             job_sourced: true,
             label: self.label(transcript),
-            owner_label: self.owner_label(tasks, session_id),
+            // Resolved once the whole read is merged (a later job row or a
+            // sorted-after owner must be found too).
+            owner_label: None,
             child_job: self.session_id.as_deref() != Some(session_id),
         }
     }
@@ -1375,21 +1413,6 @@ impl BackgroundJob {
                 Part::Tool(call) if call.job_launch_id() == Some(self.id.as_str()) => call.job_launch_label(),
                 _ => None,
             })
-    }
-
-    /// A Child Job's owning subagent row label: when the job belongs to a
-    /// descendant session and a task in this read names that child, its
-    /// label is the owner's; otherwise `None` (the render falls back to
-    /// `↳ 子会话`).
-    fn owner_label(&self, tasks: &[BackgroundTask], session_id: &str) -> Option<String> {
-        let owner = self.session_id.as_deref()?;
-        if owner == session_id {
-            return None;
-        }
-        tasks
-            .iter()
-            .find(|task| task.child_id.as_deref() == Some(owner))
-            .and_then(|task| task.label.clone())
     }
 }
 
@@ -4199,6 +4222,61 @@ mod tests {
             !task("job_own").child_job,
             "the session's own job is not a Child Job"
         );
+    }
+
+    /// A Child Job's owner may be a job row that appears LATER in the list (or
+    /// sorts after it): the owner label is resolved after the whole read is
+    /// merged, so the row still renders `↳ review the diff` rather than the
+    /// `↳ 子会话` fallback.
+    #[test]
+    fn a_child_job_finds_an_owner_row_later_in_the_same_response() {
+        let mut transcript = decode_messages(&[]);
+        let jobs = serde_json::json!({
+            "data": [
+                // The child comes FIRST and sorts first, while its owner
+                // (`childSessionID = ses_child`) comes later and starts later.
+                {
+                    "id": "job_child", "kind": "codemode", "sessionID": "ses_child",
+                    "status": "running", "time": {"started": 1000},
+                },
+                {
+                    "id": "job_owner", "kind": "subagent", "sessionID": "ses_1",
+                    "status": "running", "time": {"started": 2000},
+                    "childSessionID": "ses_child", "agent": "general",
+                    "description": "review the diff",
+                },
+            ]
+        });
+        let cached = merge_job_tasks(
+            &mut transcript,
+            "ses_1",
+            &decode_job_list(&jobs).expect("the envelope"),
+        );
+
+        let task = |id: &str| {
+            transcript
+                .background_tasks
+                .iter()
+                .find(|task| task.job_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("the `{id}` job must merge"))
+        };
+        assert_eq!(
+            task("job_child").owner_label.as_deref(),
+            Some("review the diff"),
+            "the later job row names the child"
+        );
+        assert_eq!(
+            task("job_owner").owner_label,
+            None,
+            "the owner is a parent row, not a Child Job"
+        );
+        // The cache carries the same resolved marker, so a later failed read
+        // re-attaches a correctly labelled row.
+        let cached_child = cached
+            .iter()
+            .find(|task| task.job_id.as_deref() == Some("job_child"))
+            .expect("the child job is cached");
+        assert_eq!(cached_child.owner_label.as_deref(), Some("review the diff"));
     }
 
     /// ADR-0118: the part a job Wake joins back to — the `metadata.jobID` of
