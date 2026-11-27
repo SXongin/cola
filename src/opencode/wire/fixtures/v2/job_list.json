@@ -2,7 +2,7 @@
   "capture": {
     "generation": "v2",
     "source": "opencode 2.4.2",
-    "command": "curl -u opencode:$PASSWORD 'http://127.0.0.1:49374/api/experimental/job?sessionID=ses_recording&descendants=true'",
+    "command": "curl -u opencode:$PASSWORD 'http://127.0.0.1:49374/api/experimental/job?sessionID=ses_recording&status=running&descendants=true'",
     "captured_at": "2026-11-27",
     "note": "Sanitized excerpt: the image and video jobs were recorded live from a 2.4.2 server while both were running (free grok-imagine image/video models); the codemode entry is synthesized to the same schema because full_codemode was off on the recording server. Ids, times, paths, model names and the session id are neutralized."
   },

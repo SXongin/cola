@@ -356,8 +356,9 @@ async fn recorded_v2_job_list_merges_as_background_tasks() {
         recorded.capture.source
     );
     assert!(
-        recorded.capture.command.contains("/api/experimental/job"),
-        "the stamp names the read that produced it: {:?}",
+        recorded.capture.command.contains("/api/experimental/job")
+            && recorded.capture.command.contains("status=running"),
+        "the stamp names the running-only read that produced it: {:?}",
         recorded.capture.command
     );
     assert!(

@@ -1281,7 +1281,15 @@ impl V2Strategy {
                 body_preview(&text)
             ))
         })?;
-        Ok(Some(wire::decode_job_list(&body)))
+        // A 200 that is valid JSON but not the list envelope is a FAILED read,
+        // not an empty list (a gateway's `{"error":…}` must not retire rows).
+        let jobs = wire::decode_job_list(&body).ok_or_else(|| {
+            crate::error::BridgeError::OpenCode(format!(
+                "job list parse: no `data` array — body: {}",
+                body_preview(&text)
+            ))
+        })?;
+        Ok(Some(jobs))
     }
 
     /// Keep the rows a successful job read left, so a later failure can
