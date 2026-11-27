@@ -177,6 +177,7 @@ const MESSAGE_PAGE_LIMIT: &str = "200";
 /// decides which verdict applies. `rows` empty is a positive "nothing
 /// running" verdict too, and keeps its sequence so an older observation
 /// cannot resurrect what a newer one retired.
+#[derive(Clone)]
 struct CachedJobRows {
     seq: u64,
     rows: Vec<BackgroundTask>,
@@ -711,12 +712,7 @@ impl GenerationStrategy for V2Strategy {
             }
             Err(error) => {
                 tracing::debug!("session {session_id} job list: {error}; keeping the last job rows");
-                // A stale failure still shows the CURRENT cache on its own
-                // transcript; the seq-guarded re-memory below leaves a newer
-                // read's cache untouched.
-                let cached = self.cached_job_rows(session_id);
-                let survivors = wire::attach_job_tasks(&mut transcript, &cached);
-                self.remember_job_rows(session_id, seq, survivors);
+                self.sync_failed_job_rows(&mut transcript, session_id, seq);
             }
         }
         Ok(transcript)
@@ -1381,6 +1377,45 @@ impl V2Strategy {
         transcript.background_tasks.retain(|task| !task.is_job_sourced());
         let current = self.cached_job_rows(session_id);
         let _ = wire::attach_job_tasks(transcript, &current);
+    }
+
+    /// Apply a failed job read atomically with its cache update, and render the
+    /// NEWEST known verdict (ADR-0118) — never the rows this read cloned.
+    ///
+    /// A failed read has no job list of its own, so under ONE cache-lock
+    /// acquisition it reads the current rows, applies the seq guard for its
+    /// Wake-filtered survivor re-memory, and sets the transcript's job-sourced
+    /// rows from the RESULTING current cache (dropping its own, re-attaching
+    /// the cache's, deduped against this read's tool tasks). No await and no
+    /// second acquisition inside: a newer read can neither slip between the
+    /// clone and the transcript (which would repaint a retired row) nor be
+    /// overwritten by a stale one.
+    fn sync_failed_job_rows(&self, transcript: &mut SessionTranscript, session_id: &str, seq: u64) {
+        let mut cache = self.jobs.lock().expect("job row cache lock");
+        let cached = cache.get(session_id).cloned();
+        let stale = cached.as_ref().is_some_and(|cached| cached.seq > seq);
+        let current = cached.map(|cached| cached.rows).unwrap_or_default();
+        let survivors: Vec<BackgroundTask> = current
+            .iter()
+            .filter(|task| !transcript.wakes.iter().any(|wake| wake.retires(task)))
+            .cloned()
+            .collect();
+        let rendered = if stale {
+            // A newer verdict owns the cache: render it unchanged and never
+            // lower the stored sequence.
+            current
+        } else {
+            cache.insert(
+                session_id.to_string(),
+                CachedJobRows {
+                    seq,
+                    rows: survivors.clone(),
+                },
+            );
+            survivors
+        };
+        transcript.background_tasks.retain(|task| !task.is_job_sourced());
+        let _ = wire::attach_job_tasks(transcript, &rendered);
     }
 
     /// Durably admit one prompt (`POST /api/session/{id}/prompt`) with
