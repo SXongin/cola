@@ -16,7 +16,7 @@ use crate::backend::runs::{
 };
 use crate::backend::{
     BackgroundTask, Compaction, FileContent, MessageId, Part, SessionTranscript, TaskRetirementEnding,
-    ToolStatus, TurnAnchor, Wake, WakeSource,
+    ToolStatus, TurnAnchor, Wake,
 };
 use crate::bridge::chain::{EndingFacts, EndingKey};
 use crate::bridge::core::SESSION_INFO_TIMEOUT;
@@ -651,35 +651,34 @@ fn wake_retired_task(wake: &Wake, transcript: &SessionTranscript) -> Option<Back
         .rfind(|task| wake.retires(task))
 }
 
-/// The completion entry a shell/subagent Wake leaves on the card that hosted
-/// its task (ADR-0060): the retired task's kind and label (the Wake's own tag
-/// attribute), its identity, and the run's own server-time span. `None` for a
-/// Wake that is not a shell/subagent completion — a restart notice or an
-/// interruption continuation keeps today's behavior — and the label is never
-/// invented: a Wake that named none renders the bare completion line.
+/// The completion entry a shell/subagent/job Wake leaves on the card that
+/// hosted its task (ADR-0060, ADR-0118): the retired task's kind and label, its
+/// identity, and the run's own server-time span. `None` for a Wake that is not
+/// a task completion — a restart notice, an interruption continuation, or a
+/// source this build does not know — and the label is never invented: a Wake
+/// that named none renders the bare completion line.
 ///
 /// The retired task is joined back from the read through the backend's own
 /// correlation ([`wake_retired_task`]), so the entry can only name a run the
-/// Wake actually completed; the launch's start time gives the fold's duration. A
-/// read that no longer carries the launch renders the entry from the durable
-/// ending's own captured identity ([`EndingFacts::identity`], ADR-0080) — the
-/// label and the start clock the derivation recorded, so compaction and a
-/// truncated read change nothing — and only then from the Wake's own named keys.
+/// Wake actually completed; the launch's start time gives the fold's duration.
+/// A job-sourced run has no tool-part task to retire, so its launch is joined by
+/// `metadata.jobID` ([`job_launch`]) for the label (a script's first line, a
+/// saved path) and the start clock, and its id is the job id. A read that no
+/// longer carries the launch renders the entry from the durable ending's own
+/// captured identity ([`EndingFacts::identity`], ADR-0080) — the label and the
+/// start clock the derivation recorded, so compaction and a truncated read
+/// change nothing — and only then from the Wake's own named keys.
 /// `finished_at` is the Wake's server time — the caller's own, already checked
 /// for orderability, so the entry's clock is never guessed here.
 fn wake_completion_entry(
     wake: &Wake,
     retired: Option<&BackgroundTask>,
+    launch: Option<&crate::backend::ToolCall>,
     finished_at: i64,
     durable: Option<&TaskRunIdentity>,
 ) -> Option<TaskCompletionEntry> {
-    let kind = match wake.source {
-        WakeSource::Shell => TaskKind::Shell,
-        WakeSource::Subagent => TaskKind::Subagent,
-        WakeSource::Restart | WakeSource::Interrupt | WakeSource::Other(_) | WakeSource::Unknown => {
-            return None;
-        }
-    };
+    let kind = crate::bridge::tasks::wake_task_kind(&wake.source)?;
+    let job = matches!(kind, TaskKind::CodeMode | TaskKind::Image | TaskKind::Video);
     // The retired task's own identity is the read's fact; the durable ending's
     // captured ids are the fallback when the launch is no longer in the read, and
     // the Wake's own named keys the last resort. Never a made-up id — and never a
@@ -688,6 +687,8 @@ fn wake_completion_entry(
         Some(task) => match kind {
             TaskKind::Shell => task.shell_id.clone().or_else(|| Some(task.tool.call_id.clone())),
             TaskKind::Subagent => task.child_id.clone().or_else(|| Some(task.tool.call_id.clone())),
+            // A job's own id is its call identity (ADR-0118).
+            TaskKind::CodeMode | TaskKind::Image | TaskKind::Video => Some(task.tool.call_id.clone()),
         },
         None => match kind {
             TaskKind::Shell => durable
@@ -697,19 +698,33 @@ fn wake_completion_entry(
             TaskKind::Subagent => durable
                 .and_then(|identity| identity.child_id.clone())
                 .or_else(|| wake.child_id.clone()),
+            // The Wake names the job; a durable ending captured it as the
+            // launch's call id.
+            TaskKind::CodeMode | TaskKind::Image | TaskKind::Video => wake
+                .job_id
+                .clone()
+                .or_else(|| durable.and_then(|identity| identity.call_id.clone())),
         },
     };
     Some(TaskCompletionEntry {
         kind,
-        // The Wake's own text names the work; the durable identity's label stands
-        // in when the Wake named none but the run's ending captured one.
-        label: wake
-            .label
-            .clone()
-            .or_else(|| durable.and_then(|identity| identity.label.clone())),
+        // A shell or subagent's own text names its work; a job's label comes
+        // from the part that launched it, because the job notice names none
+        // (ADR-0118). The durable identity's captured label stands in when the
+        // read no longer carries the launch.
+        label: if job {
+            launch
+                .and_then(|launch| launch.job_launch_label())
+                .or_else(|| durable.and_then(|identity| identity.label.clone()))
+        } else {
+            wake.label
+                .clone()
+                .or_else(|| durable.and_then(|identity| identity.label.clone()))
+        },
         id,
         started_at: retired
             .and_then(|task| task.started_at)
+            .or_else(|| launch.and_then(|launch| launch.started_at))
             .or_else(|| durable.and_then(|identity| identity.started_at)),
         finished_at: Some(finished_at),
         ending: TaskEnding::Wake {
@@ -717,6 +732,24 @@ fn wake_completion_entry(
         },
         output: None,
     })
+}
+
+/// The part that launched the job a completion Wake names (ADR-0118): the
+/// `execute` / `generate_image` / `generate_video` call whose recorded
+/// `metadata.jobID` is the Wake's job id. It gives the entry its label — a
+/// script's first line, a saved path — and the run's start clock. `None` when
+/// the read no longer carries the launch (a compacted read, the V2 page cap, or
+/// a Child Job, whose launch lives in the descendant session's read).
+fn job_launch<'a>(wake: &Wake, transcript: &'a SessionTranscript) -> Option<&'a crate::backend::ToolCall> {
+    let job_id = wake.job_id.as_deref()?;
+    transcript
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .find_map(|part| match part {
+            Part::Tool(call) if call.job_launch_id() == Some(job_id) => Some(call),
+            _ => None,
+        })
 }
 
 /// What a [`PlannedEntry`]'s commit announces (spec #588, review PR #595): the
@@ -967,17 +1000,32 @@ fn plan_wake_entries(
         let input = retired
             .as_ref()
             .and_then(|task| transcript.tool_input(task.tool.call_id.as_str()));
+        // The part a job Wake launched from, joined by `metadata.jobID`
+        // (ADR-0118): the entry's label and start clock. `None` for an
+        // own-session job whose launch left the read, and for a Child Job, whose
+        // launch lives in the descendant session.
+        let launch = job_launch(wake, transcript);
         // The identity the run's Wake ending is recorded with (ADR-0080): the
         // launch's own facts when the read still carries it, else what the Wake
-        // itself names.
+        // itself names — plus, for a job Wake, the launching part's label and
+        // start, which the job notice itself does not carry (ADR-0118), so a
+        // compacted later read still names them.
         let identity = match &retired {
             Some(task) => crate::bridge::tasks::identity_of_task(task, input, None),
-            None => crate::bridge::tasks::identity_of_wake(wake),
+            None => {
+                let mut identity = crate::bridge::tasks::identity_of_wake(wake);
+                if let Some(launch) = launch {
+                    identity.started_at = identity.started_at.or(launch.started_at);
+                    identity.label = identity.label.or_else(|| launch.job_launch_label());
+                }
+                identity
+            }
         };
         // The identity the entry falls back to when the read no longer carries
         // the launch: resolved per field from the run's endings (ADR-0080).
         let durable = run.as_ref().and_then(|run| facts.identity(run));
-        let Some(entry) = wake_completion_entry(wake, retired.as_ref(), created_ms, durable.as_ref()) else {
+        let Some(entry) = wake_completion_entry(wake, retired.as_ref(), launch, created_ms, durable.as_ref())
+        else {
             continue;
         };
         plans.push(PlannedEntry {
@@ -1128,6 +1176,11 @@ fn plan_runtime_entries(
         let id = match kind {
             TaskKind::Shell => task.shell_id.clone().or_else(|| Some(task.tool.call_id.clone())),
             TaskKind::Subagent => task.child_id.clone().or_else(|| Some(task.tool.call_id.clone())),
+            // A job-sourced row's liveness is the job list read, never runtime
+            // evidence, so it has no evidence retirement and owes no 结束 entry
+            // (ADR-0118). #1223 keeps it out of every cleanup path; if a
+            // retirement ever named one, the row would still retire silently.
+            TaskKind::CodeMode | TaskKind::Image | TaskKind::Video => continue,
         };
         let entry = TaskCompletionEntry {
             kind,
@@ -3826,7 +3879,7 @@ mod tests {
     use crate::backend::{
         BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, FinishReason, MessageId,
         MessageRole, MessageTime, ReasoningPart, StepFinish, StepStart, TodoList, TodoStatus, TodoStep,
-        ToolCall, ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
+        ToolCall, ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle, WakeSource,
     };
     use crate::backend::{ToolDetail, ToolKind};
     use crate::bridge::App;
@@ -4408,6 +4461,102 @@ mod tests {
         );
     }
 
+    /// AC3 (spec #1220): a job completion Wake plans one entry of the job's own
+    /// kind, with the job id as its identity and the label and start it joins
+    /// from the launching `execute` part — the notice itself names no label.
+    /// The durable Wake ending is recorded under the job id, and the announce's
+    /// identity names the job kind, so a compacted later read still names both.
+    #[test]
+    fn a_job_completion_wake_joins_its_launching_part() {
+        let acc = StreamAccumulator::new("test");
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_launch",
+            2_000,
+            vec![codemode_launch_part(
+                "call_exec",
+                "job_cc",
+                2_000,
+                "\n\n  const answer = 42\nawait ship(answer)",
+            )],
+        )])
+        .with_wakes(vec![job_wake("codemode", "job_cc", 3_000)]);
+
+        let plans = plan_wake_entries(&acc, &transcript, &turn_anchor(0), &EndingFacts::default());
+        assert_eq!(plans.len(), 1, "the job notice plans one entry");
+        let entry = &plans[0].entry;
+        assert_eq!(entry.kind, TaskKind::CodeMode);
+        assert_eq!(entry.id.as_deref(), Some("job_cc"));
+        assert_eq!(
+            entry.label.as_deref(),
+            Some("const answer = 42"),
+            "the script's first non-empty line is the label"
+        );
+        assert_eq!(entry.started_at, Some(2_000), "the launch's own start");
+        assert_eq!(entry.finished_at, Some(3_000));
+        assert_eq!(
+            entry.ending,
+            TaskEnding::Wake {
+                state: Some("completed".into())
+            }
+        );
+        // #1223 asserts this half: the Wake's durable ending is keyed by the job
+        // id (its call identity), so the existing ending store resolves it.
+        let (run, class) = plans[0].ending.as_ref().expect("the Wake records an ending");
+        assert_eq!(run.key, "job_cc");
+        assert_eq!(*class, TaskEndingClass::Wake);
+        match &plans[0].announce {
+            PlannedAnnounce::Wake { identity, .. } => {
+                assert_eq!(identity.tool.as_deref(), Some("codemode"));
+                assert_eq!(identity.label.as_deref(), Some("const answer = 42"));
+                assert_eq!(identity.started_at, Some(2_000));
+            }
+            _ => panic!("a Wake announces its own entry"),
+        }
+    }
+
+    /// AC3 (spec #1220): a `generate_image` Wake's entry takes the launching
+    /// part's path as its label and the launch's start clock. The same-read half
+    /// — the job row leaves the live list on the read its Wake arrives — is the
+    /// job merge's, pinned in `opencode::v2::wire`
+    /// (`a_wake_naming_the_job_retires_it_in_the_same_read`).
+    #[test]
+    fn an_image_completion_wake_takes_the_launching_path() {
+        let acc = StreamAccumulator::new("test");
+        let transcript = SessionTranscript::new(vec![message(
+            "msg_launch",
+            2_000,
+            vec![image_launch_part("call_img", "job_img", 2_000, "/work/out/apple")],
+        )])
+        .with_wakes(vec![job_wake("generate_image", "job_img", 5_000)]);
+
+        let plans = plan_wake_entries(&acc, &transcript, &turn_anchor(0), &EndingFacts::default());
+        assert_eq!(plans.len(), 1);
+        let entry = &plans[0].entry;
+        assert_eq!(entry.kind, TaskKind::Image);
+        assert_eq!(entry.id.as_deref(), Some("job_img"));
+        assert_eq!(entry.label.as_deref(), Some("/work/out/apple"));
+        assert_eq!(entry.started_at, Some(2_000));
+    }
+
+    /// A job notice is `Other`, so it is not a genuine resumption: its entry
+    /// still renders in place, and a read that no longer carries the launch
+    /// invents no label. (The non-resumption predicate is pinned in
+    /// `bridge::tasks::model`.)
+    #[test]
+    fn a_job_notice_without_its_launch_invents_no_label() {
+        let acc = StreamAccumulator::new("test");
+        let transcript =
+            SessionTranscript::new(vec![]).with_wakes(vec![job_wake("generate_video", "job_vid", 5_000)]);
+        let plans = plan_wake_entries(&acc, &transcript, &turn_anchor(0), &EndingFacts::default());
+        assert_eq!(plans.len(), 1, "its entry still renders");
+        assert_eq!(plans[0].entry.kind, TaskKind::Video);
+        assert_eq!(plans[0].entry.id.as_deref(), Some("job_vid"));
+        assert_eq!(
+            plans[0].entry.label, None,
+            "a launch that left the read invents no label"
+        );
+    }
+
     /// ADR-0080: the run a Wake names folds the read's launch (its call id is
     /// the key every writer of that read agrees on) with the Wake's own ids —
     /// its child id and its Wake id — so a later writer naming the run another
@@ -4738,6 +4887,55 @@ mod tests {
             child_id: Some(child_id.into()),
             state: Some("completed".into()),
             label: Some("review the diff".into()),
+        }
+    }
+
+    /// A settled `execute` part that moved its Code Mode script to `job_id`:
+    /// the launch a job completion Wake joins by `metadata.jobID` (ADR-0118).
+    fn codemode_launch_part(call_id: &str, job_id: &str, created: i64, code: &str) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "execute".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(created),
+            input: Some(serde_json::json!({ "code": code })),
+            metadata: Some(serde_json::json!({ "jobID": job_id })),
+            output: ToolOutput::default(),
+            ..ToolCall::default()
+        })
+    }
+
+    /// A settled `generate_image` part: the job id and the path it saves to ride
+    /// its metadata, exactly as the generator's launch records them.
+    fn image_launch_part(call_id: &str, job_id: &str, created: i64, path: &str) -> Part {
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "generate_image".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(created),
+            input: Some(serde_json::json!({ "prompt": "a red apple" })),
+            metadata: Some(serde_json::json!({ "path": path, "jobID": job_id })),
+            output: ToolOutput::default(),
+            ..ToolCall::default()
+        })
+    }
+
+    /// The completion notice one job's run leaves: the kind's own marker naming
+    /// the job id, and no label of its own (ADR-0118).
+    fn job_wake(marker: &str, job_id: &str, created_ms: i64) -> Wake {
+        Wake {
+            id: MessageId::new(format!("msg_wake_job_{created_ms}")),
+            created_ms: Some(created_ms),
+            source: WakeSource::Other(marker.into()),
+            shell_id: None,
+            job_id: Some(job_id.into()),
+            child_id: None,
+            state: Some("completed".into()),
+            label: None,
         }
     }
 

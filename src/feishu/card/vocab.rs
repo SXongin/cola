@@ -116,6 +116,11 @@ pub(crate) const RUN_CLEANED: &str = "已清理";
 /// ("live runs") keeps `后台任务` as its heading for now (spec #1057's P4).
 pub(crate) const LEDGER_TITLE: &str = "后台任务";
 
+/// A **Child Job** row's neutral owner marker (ADR-0118) when no row in the
+/// read names the child: the work is a descendant's, but which subagent's is
+/// unknown. Copy, because a translator would touch it.
+pub(crate) const CHILD_JOB_UNNAMED: &str = "子会话";
+
 /// The tool token for one call: ADR-0107's closed table, derived from
 /// `(kind, detail)` first and the vendor name last.
 ///

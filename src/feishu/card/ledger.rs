@@ -1,9 +1,10 @@
 //! The Background Task Ledger (ADR-0060).
 //!
 //! The card-tail section that lists a Session's live Background Tasks — task
-//! type, bolded label, start clock, a shell row's elapsed, and a background
-//! subagent's child activity (spec #501) — riding the newest card of its Card
-//! Chain like the Todo Panel and the live Tool Panels. One folded collapsible
+//! type, bolded label, start clock, a shell or job row's elapsed, a child job's
+//! `↳` owner, and a background subagent's child activity (spec #501) — riding
+//! the newest card of its Card Chain like the Todo Panel and the live Tool
+//! Panels. One folded collapsible
 //! panel: the pinned count (`⏳ 后台任务（N）`) is its title, so it stays readable
 //! folded, and the rows are its body. The Bridge gathers the facts (which tasks
 //! are live, what label their originating tool part's input names, what the
@@ -30,7 +31,9 @@ use crate::backend::ShellOutputWindow;
 // (ADR-0079): this module keeps the copy, the formats and the budgets over
 // them, and re-exports them so `ledger::TaskKind` & co. keep resolving.
 pub(crate) use crate::bridge::tasks::model::LedgerRowClock;
-pub use crate::bridge::tasks::model::{TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow, TaskOutput};
+pub use crate::bridge::tasks::model::{
+    ChildJobOwner, TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow, TaskOutput,
+};
 
 /// Characters of a task label the ledger row shows before clipping — shared
 /// with the completion entry's collapsed title (`🔔 shell 完成：<label>`), so
@@ -60,14 +63,12 @@ const OUTPUT_UNAVAILABLE: &str = "输出已不可用";
 pub(crate) const CLEANUP_BUTTON_TEXT: &str = "清理待确认任务";
 
 impl TaskKind {
-    /// The row's type noun: the tool's own token, `shell` / `subagent` (#502,
-    /// ADR-0107). Shared by the live row and the completion entry's fold body,
-    /// so one task type reads the same wherever the ledger renders it.
+    /// The row's type noun: the tool's own token (`shell` / `subagent`) or the
+    /// job's own kind (`codemode` / `image` / `video`, ADR-0118). Shared by the
+    /// live row and the completion entry's fold body, so one task type reads the
+    /// same wherever the ledger renders it.
     fn noun(self) -> &'static str {
-        match self {
-            Self::Shell => super::vocab::TOOL_SHELL,
-            Self::Subagent => super::vocab::TOOL_SUBAGENT,
-        }
+        self.token()
     }
 
     /// The completion entry's collapsed-title phrase: the tool's own token plus
@@ -94,6 +95,19 @@ impl TaskEnding {
     }
 }
 
+impl ChildJobOwner {
+    /// The row's `↳` marker, exactly as the markdown body shows it: the owning
+    /// subagent's label folded and entity-escaped like any other transcript
+    /// text, or the pinned neutral fallback. One builder, so the body, the
+    /// render comparison and the size estimate cannot drift.
+    fn marker(&self) -> String {
+        match self {
+            Self::Named(label) => escaped_entities(&folded_label(label)),
+            Self::Unnamed => super::vocab::CHILD_JOB_UNNAMED.to_string(),
+        }
+    }
+}
+
 impl TaskLedgerRow {
     /// The activity fragment this row RENDERS: `None` while the row is
     /// unconfirmed — an unverified liveness must not read as certain (issue
@@ -114,9 +128,17 @@ impl TaskLedgerRow {
             .map(bold_label)
     }
 
+    /// The `↳` marker as the row renders it (ADR-0118), or `None` when the row
+    /// carries no child-job owner. Compared as rendered text, like the label,
+    /// so an owner name moving past the fold/clip cannot owe a PATCH.
+    fn child_job_marker(&self) -> Option<String> {
+        self.child_job.as_ref().map(ChildJobOwner::marker)
+    }
+
     /// The start clock as the row renders it — local `HH:MM`, or `None` when
     /// the start is absent (or out of range). The elapsed is the render clock's
-    /// business ([`task_ledger_clock`]), and only a shell row renders one.
+    /// business ([`task_ledger_clock`]), and only a kind that
+    /// [`TaskKind::renders_elapsed`] renders one.
     fn rendered_clock(&self) -> Option<String> {
         self.started_at.and_then(fmt_local_time)
     }
@@ -135,20 +157,21 @@ impl TaskLedgerRow {
     /// Whether this row RENDERS like `previous` (ADR-0060's flush rule, spec
     /// #501): the visible facts only — the type, the label as the row folds,
     /// clips and bolds it (an empty label as absent), the local `HH:MM` start
-    /// clock, the unconfirmed flag, the output window's text and clipping
-    /// (spec #592, its cutoff minute is the clock's), and, while the row is
-    /// confirmed, the fragment's label and wait — never the raw label/start
-    /// values that render identically, nor the gathered liveness's stored
-    /// timestamps. The rendered numbers (a shell row's elapsed, the fragment's
-    /// age and the window's cutoff) are the render clock's business
-    /// ([`task_ledger_clock`]), compared at the path's own cadence: text past
-    /// the clip, an empty label, a start moving inside the displayed minute
-    /// and elapsed second, or a child part landing inside the shown second must
-    /// not owe a PATCH.
+    /// clock, a child job's `↳` marker as it renders, the unconfirmed flag, the
+    /// output window's text and clipping (spec #592, its cutoff minute is the
+    /// clock's), and, while the row is confirmed, the fragment's label and
+    /// wait — never the raw label/start values that render identically, nor the
+    /// gathered liveness's stored timestamps. The rendered numbers (a shell or
+    /// job row's elapsed, the fragment's age and the window's cutoff) are the
+    /// render clock's business ([`task_ledger_clock`]), compared at the path's
+    /// own cadence: text past the clip, an empty label, a start moving inside
+    /// the displayed minute and elapsed second, or a child part landing inside
+    /// the shown second must not owe a PATCH.
     pub(crate) fn renders_like(&self, previous: &Self) -> bool {
         self.kind == previous.kind
             && self.rendered_label() == previous.rendered_label()
             && self.rendered_clock() == previous.rendered_clock()
+            && self.child_job_marker() == previous.child_job_marker()
             && self.unconfirmed == previous.unconfirmed
             && self.rendered_output() == previous.rendered_output()
             && (self.unconfirmed
@@ -296,6 +319,8 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
 ///
 /// ```text
 /// · shell：**npm run build** · 14:02 · 3m12s
+/// · codemode：**const answer = 42** · 14:02 · 3m12s
+/// · image：**/work/out/apple** · 14:02 · 3m12s · ↳ review the diff
 /// · subagent：**review the diff** · 14:04 · bash 5s
 /// ```
 ///
@@ -303,21 +328,24 @@ pub(crate) fn task_ledger_title(rows: &[TaskLedgerRow]) -> Option<String> {
 /// the two renderings cannot drift). The type word stays plain, the label is
 /// bolded through [`bold_label`], then the task's server `started_at` renders
 /// as its local `HH:MM` start clock (the completion entry body's own clock).
-/// A `shell` row's bare elapsed follows it — the elapsed is a shell row's only
-/// liveness — while a `subagent` row never renders a total: its liveness is its
-/// child's activity fragment ([`TaskLiveness::title_fragment`]), appended after
-/// the clock (`bash 5s`, `waiting 1m30s · 等待你的授权`), so the fragment's age is
-/// the only runtime it shows. A part the read named none of is omitted whole:
+/// A `shell` or job (`codemode` / `image` / `video`) row's bare elapsed follows
+/// it — the elapsed is that row's only liveness — while a `subagent` row never
+/// renders a total: its liveness is its child's activity fragment
+/// ([`TaskLiveness::title_fragment`]), appended after the clock (`bash 5s`,
+/// `waiting 1m30s · 等待你的授权`), so the fragment's age is the only runtime it
+/// shows. A **Child Job** row appends ` · ↳ <owner>` after its elapsed
+/// ([`ChildJobOwner`], ADR-0118), so a descendant's work never reads as the
+/// parent's. A part the read named none of is omitted whole:
 /// `· shell · 14:02 · 0m05s`, `· shell：**npm run build**`, `· shell`,
-/// `· subagent：**review the diff** · 14:04`. A row a runtime reconciliation
-/// could not confirm as running carries the trailing 状态待确认 marker (issue
-/// #454), after every part it did carry — and renders no activity, whatever
-/// fragment is still stored: an unverified liveness must not read as certain.
-/// Identity stays out of the live row — the completion entry's fold body
-/// carries it. Rows render in the order given (the transcript's own), one line
-/// each: a multi-line command cannot break the row layout, and one label clips
-/// identically wherever the ledger renders it. The caller sanitizes the text
-/// like any other model-authored markdown.
+/// `· codemode：**const answer = 42**`, `· image：**/work/out/apple** · ↳ 子会话`.
+/// A row a runtime reconciliation could not confirm as running carries the
+/// trailing 状态待确认 marker (issue #454), after every part it did carry — and
+/// renders no activity, whatever fragment is still stored: an unverified
+/// liveness must not read as certain. Identity stays out of the live row — the
+/// completion entry's fold body carries it. Rows render in the order given (the
+/// transcript's own), one line each: a multi-line command cannot break the row
+/// layout, and one label clips identically wherever the ledger renders it. The
+/// caller sanitizes the text like any other model-authored markdown.
 pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<String> {
     if rows.is_empty() {
         return None;
@@ -337,13 +365,19 @@ pub(crate) fn task_ledger_text(rows: &[TaskLedgerRow], now_ms: i64) -> Option<St
             if let Some(clock) = fmt_local_time(at) {
                 text.push_str(&format!(" · {clock}"));
             }
-            // A shell row's elapsed is its only liveness, so it renders it; a
-            // subagent row's liveness is its child's activity fragment, and its
-            // total runtime would only restate the fragment's age — never
-            // rendered.
-            if row.kind == TaskKind::Shell {
+            // A shell's or job's elapsed is its only liveness, so it renders
+            // it; a subagent row's liveness is its child's activity fragment,
+            // and its total runtime would only restate the fragment's age —
+            // never rendered.
+            if row.kind.renders_elapsed() {
                 text.push_str(&format!(" · {}", fmt_task_elapsed(secs_since(at, now_ms))));
             }
+        }
+        // A Child Job's `↳` marker (ADR-0118) follows its elapsed, so a
+        // descendant's work never reads as the parent's own.
+        if let Some(owner) = row.child_job_marker() {
+            text.push_str(" · ↳ ");
+            text.push_str(&owner);
         }
         if let Some(activity) = row.rendered_activity() {
             // A tool name is transcript text reaching a markdown body: neuter
@@ -467,11 +501,13 @@ fn output_fence(text: &str) -> String {
 pub(crate) fn task_ledger_clock(rows: &[TaskLedgerRow], now_ms: i64) -> Vec<LedgerRowClock> {
     rows.iter()
         .map(|row| LedgerRowClock {
-            // Only what the row renders ticks: the elapsed is the shell row's
-            // alone, so a subagent's start moving can never owe a flush.
-            elapsed: match row.kind {
-                TaskKind::Shell => row.started_at.map(|at| secs_since(at, now_ms)),
-                TaskKind::Subagent => None,
+            // Only what the row renders ticks: the elapsed belongs to the
+            // kinds that show one (a shell's and a job's), so a subagent's
+            // start moving can never owe a flush.
+            elapsed: if row.kind.renders_elapsed() {
+                row.started_at.map(|at| secs_since(at, now_ms))
+            } else {
+                None
             },
             activity: row
                 .rendered_activity()
@@ -516,19 +552,24 @@ fn bold_label(label: &str) -> String {
 
 /// Estimated serialized size (bytes) of the ledger section, for the card
 /// splitter's tail reserve: the folded panel's title and element overhead, plus
-/// one row per task — its ` · HH:MM` start clock, a shell row's ` · XmYYs`
-/// elapsed, its bolded label, counted exactly as [`bold_label`] renders it
-/// (clipped at [`TASK_LABEL_CHARS`], entity-escaped and wrapped), and its
-/// activity fragment when it renders one ([`activity_estimate`]) — so the
-/// estimate and the row cannot drift apart. The per-row constant stays the
-/// shell-sized one: a subagent row's missing elapsed is over-reserve, which is
-/// safe. Rough like the Bridge's `panel_estimate` for the tail's other
-/// sections.
+/// one row per task — its ` · HH:MM` start clock, a shell or job row's
+/// ` · XmYYs` elapsed, its bolded label, counted exactly as [`bold_label`]
+/// renders it (clipped at [`TASK_LABEL_CHARS`], entity-escaped and wrapped),
+/// a child job's ` · ↳ <owner>` marker, and its activity fragment when it
+/// renders one ([`activity_estimate`]) — so the estimate and the row cannot
+/// drift apart. The per-row constant stays the shell-sized one: a subagent
+/// row's missing elapsed is over-reserve, which is safe. Rough like the
+/// Bridge's `panel_estimate` for the tail's other sections.
 pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
     let labels: usize = rows
         .iter()
         .filter_map(|row| row.label.as_deref().filter(|label| !label.is_empty()))
         .map(|label| bold_label(label).len())
+        .sum();
+    let owners: usize = rows
+        .iter()
+        .filter_map(TaskLedgerRow::child_job_marker)
+        .map(|marker| " · ↳ ".len() + marker.len())
         .sum();
     let activities: usize = rows
         .iter()
@@ -544,7 +585,7 @@ pub(crate) fn task_ledger_estimate(rows: &[TaskLedgerRow]) -> usize {
         .sum();
     // The +80 is the folded panel's own element overhead, exactly like the
     // completion entry's estimate charges it (`task_entry_estimate`).
-    300 + labels + activities + outputs + rows.len() * 120 + 80
+    300 + labels + owners + activities + outputs + rows.len() * 120 + 80
 }
 
 /// Estimated bytes of one row's activity fragment, measured from the same
@@ -650,6 +691,7 @@ mod tests {
         let now = start + 192_000; // 14:05:12, elapsed 3m12s
         let row = |window: Option<ShellOutputWindow>| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some("gh run watch".into()),
             started_at: Some(start),
             unconfirmed: false,
@@ -688,6 +730,7 @@ mod tests {
         let cut = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
         let row = |text: String| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: false,
@@ -725,6 +768,7 @@ mod tests {
         let cut = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
         let row = TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some("npm run build".into()),
             started_at: None,
             unconfirmed: false,
@@ -761,6 +805,7 @@ mod tests {
         let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
         let row = |text: &str, clipped: bool, captured_ms: i64| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: false,
@@ -773,6 +818,7 @@ mod tests {
         };
         let bare = TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: false,
@@ -819,6 +865,7 @@ mod tests {
         let cut = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
         let row = |window: Option<ShellOutputWindow>| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some("npm run build".into()),
             started_at: None,
             unconfirmed: false,
@@ -869,6 +916,7 @@ mod tests {
         let rows = vec![
             TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: Some("gh run watch".into()),
                 started_at: Some(start),
                 unconfirmed: false,
@@ -878,6 +926,7 @@ mod tests {
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: Some("review the diff".into()),
                 started_at: Some(second_start),
                 unconfirmed: false,
@@ -911,6 +960,7 @@ mod tests {
         let now = at + 192_000; // 14:05:12, so the elapsed is 3m12s
         let row = |label: Option<&str>, started_at: Option<i64>| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: label.map(str::to_string),
             started_at,
             unconfirmed: false,
@@ -935,6 +985,7 @@ mod tests {
             task_ledger_text(
                 &[TaskLedgerRow {
                     kind: TaskKind::Subagent,
+                    child_job: None,
                     label: Some("review the diff".into()),
                     started_at: Some(at),
                     unconfirmed: false,
@@ -946,6 +997,132 @@ mod tests {
             )
             .unwrap(),
             "· subagent：**review the diff** · 14:02"
+        );
+    }
+
+    /// ADR-0118: a job row reads like a shell row in the job's own kind — the
+    /// label, the start clock and the total elapsed — and a **Child Job**
+    /// appends its `↳` owner after the elapsed, so a descendant's work never
+    /// reads as the parent's. A missing label or start omits its part whole.
+    #[test]
+    fn a_job_row_renders_its_kind_label_and_child_marker() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let now = at + 192_000; // 14:05:12, elapsed 3m12s
+        let row =
+            |kind: TaskKind, label: Option<&str>, started_at: Option<i64>, child: Option<ChildJobOwner>| {
+                TaskLedgerRow {
+                    kind,
+                    child_job: child,
+                    label: label.map(str::to_string),
+                    started_at,
+                    unconfirmed: false,
+                    activity: None,
+                    output: None,
+                }
+            };
+        let render = |row: &TaskLedgerRow| task_ledger_text(std::slice::from_ref(row), now).unwrap();
+
+        assert_eq!(
+            render(&row(
+                TaskKind::CodeMode,
+                Some("const answer = 42"),
+                Some(at),
+                None
+            )),
+            "· codemode：**const answer = 42** · 14:02 · 3m12s"
+        );
+        assert_eq!(
+            render(&row(TaskKind::Image, Some("/work/out/apple"), Some(at), None)),
+            "· image：**/work/out/apple** · 14:02 · 3m12s"
+        );
+        assert_eq!(
+            render(&row(TaskKind::Video, Some("/work/out/apple.mp4"), Some(at), None)),
+            "· video：**/work/out/apple.mp4** · 14:02 · 3m12s"
+        );
+        // A Child Job marks its owner after its elapsed — the resolved label,
+        // else the neutral fallback.
+        assert_eq!(
+            render(&row(
+                TaskKind::CodeMode,
+                Some("const answer = 42"),
+                Some(at),
+                Some(ChildJobOwner::Named("review the diff".into()))
+            )),
+            "· codemode：**const answer = 42** · 14:02 · 3m12s · ↳ review the diff"
+        );
+        assert_eq!(
+            render(&row(
+                TaskKind::Image,
+                Some("/work/out/apple"),
+                Some(at),
+                Some(ChildJobOwner::Unnamed)
+            )),
+            format!(
+                "· image：**/work/out/apple** · 14:02 · 3m12s · ↳ {}",
+                super::super::vocab::CHILD_JOB_UNNAMED
+            )
+        );
+        // The owner is transcript text: neutered like a label, so it cannot
+        // bleed markdown into the row.
+        assert_eq!(
+            render(&row(
+                TaskKind::Video,
+                Some("/x.mp4"),
+                Some(at),
+                Some(ChildJobOwner::Named("a*b_c".into()))
+            )),
+            "· video：**/x.mp4** · 14:02 · 3m12s · ↳ a&#42;b&#95;c"
+        );
+        // No label or no start drops the part whole — a job row's own shape
+        // rule, exactly like a shell row's.
+        assert_eq!(
+            render(&row(TaskKind::Video, None, Some(at), None)),
+            "· video · 14:02 · 3m12s"
+        );
+        assert_eq!(
+            render(&row(TaskKind::CodeMode, Some("const answer = 42"), None, None)),
+            "· codemode：**const answer = 42**"
+        );
+    }
+
+    /// ADR-0118: a job row's elapsed is a rendered clock exactly like a shell
+    /// row's — so a re-read inside the shown minute owes nothing — while a
+    /// subagent row still renders no total at all.
+    #[test]
+    fn a_job_rows_elapsed_is_its_render_clock() {
+        let at = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let row = |kind: TaskKind, child: Option<ChildJobOwner>| TaskLedgerRow {
+            kind,
+            child_job: child,
+            label: None,
+            started_at: Some(at),
+            unconfirmed: false,
+            activity: None,
+            output: None,
+        };
+        let clock = task_ledger_clock(&[row(TaskKind::Image, None)], at + 192_000);
+        assert_eq!(clock[0].elapsed, Some(192), "a job row's total ticks");
+        let clock = task_ledger_clock(&[row(TaskKind::Subagent, None)], at + 192_000);
+        assert_eq!(clock[0].elapsed, None, "a subagent row never renders a total");
+
+        // The `↳` marker is a rendered fact: a different owner owes a row
+        // change, and the same owner owes nothing.
+        let one = row(TaskKind::Image, Some(ChildJobOwner::Named("review".into())));
+        let same = row(TaskKind::Image, Some(ChildJobOwner::Named("review".into())));
+        let other = row(TaskKind::Image, Some(ChildJobOwner::Unnamed));
+        assert!(one.renders_like(&same));
+        assert!(!one.renders_like(&other));
+        assert!(
+            !one.renders_like(&row(TaskKind::Image, None)),
+            "a child job becoming the session's own work is a row change"
+        );
+
+        // The estimate reserves exactly what the marker renders.
+        let marked = row(TaskKind::Image, Some(ChildJobOwner::Named("review".into())));
+        let plain = row(TaskKind::Image, None);
+        assert_eq!(
+            task_ledger_estimate(&[marked]) - task_ledger_estimate(std::slice::from_ref(&plain)),
+            " · ↳ review".len()
         );
     }
 
@@ -961,6 +1138,7 @@ mod tests {
         let now = at + 65_000; // 14:05:05
         let row = |activity: Option<TaskLiveness>, unconfirmed: bool| TaskLedgerRow {
             kind: TaskKind::Subagent,
+            child_job: None,
             label: Some("review the diff".into()),
             started_at: Some(at),
             unconfirmed,
@@ -1039,6 +1217,7 @@ mod tests {
             task_ledger_text(
                 &[TaskLedgerRow {
                     kind: TaskKind::Shell,
+                    child_job: None,
                     label: None,
                     started_at: Some(at),
                     unconfirmed: false,
@@ -1063,6 +1242,7 @@ mod tests {
         let rows = vec![
             TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: Some("npm run build".into()),
                 started_at: Some(start),
                 unconfirmed: true,
@@ -1072,6 +1252,7 @@ mod tests {
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: None,
                 started_at: None,
                 unconfirmed: false,
@@ -1092,6 +1273,7 @@ mod tests {
         // appends, it never replaces a row's own facts.
         let all_unconfirmed = vec![TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: true,
@@ -1225,6 +1407,37 @@ mod tests {
         assert_eq!(task_entry_title(&wake), "🔔 shell 完成：gh run watch");
     }
 
+    /// ADR-0118: a job's completion entry uses the same title and fold body as
+    /// the tool-part kinds — the job's own kind word, its label, the job id as
+    /// the identity — and never claims a shell's output window.
+    #[test]
+    fn a_job_completion_entry_names_its_kind_and_job() {
+        let started = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 2);
+        let finished = crate::feishu::card::test_local_ms(2026, 9, 29, 14, 5);
+        let entry = TaskCompletionEntry {
+            kind: TaskKind::Image,
+            label: Some("/work/out/apple".into()),
+            id: Some("job_img".into()),
+            started_at: Some(started),
+            finished_at: Some(finished),
+            ending: TaskEnding::Wake {
+                state: Some("completed".into()),
+            },
+            output: None,
+        };
+        assert_eq!(
+            task_entry_title(&entry),
+            "🔔 image 完成：/work/out/apple",
+            "the job's own kind and label form the mechanical line"
+        );
+        assert_eq!(
+            task_entry_body(&entry),
+            "image job_img · 14:05 · 3m",
+            "the job id is the entry's identity, with the run's own span"
+        );
+        assert!(!entry.shows_output(), "a job has no shell output window to fold");
+    }
+
     /// The cleanup button (spec #588, #590): the pinned copy, the handler's
     /// action, and the session the click works on — the card layer owns the
     /// shape so the button and the handler cannot drift.
@@ -1249,6 +1462,7 @@ mod tests {
     fn a_labels_markdown_characters_stay_inside_its_bold_span() {
         let row = |label: &str| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some(label.into()),
             started_at: None,
             unconfirmed: false,
@@ -1323,6 +1537,7 @@ mod tests {
         let rows = vec![
             TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: None,
                 started_at: Some(now - 5_000), // 14:01:55
                 unconfirmed: false,
@@ -1332,6 +1547,7 @@ mod tests {
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: Some(String::new()),
                 started_at: None,
                 unconfirmed: false,
@@ -1355,6 +1571,7 @@ mod tests {
         let long = "x".repeat(TASK_LABEL_CHARS + 20);
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some(format!("{long}\nsecond line")),
             started_at: Some(now),
             unconfirmed: false,
@@ -1389,6 +1606,7 @@ mod tests {
     fn a_future_start_clamps_to_zero() {
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: None,
             started_at: Some(2_000),
             unconfirmed: false,
@@ -1412,6 +1630,7 @@ mod tests {
         let start = 1_800_000_000_000;
         let activity_row = |unconfirmed: bool| TaskLedgerRow {
             kind: TaskKind::Subagent,
+            child_job: None,
             label: None,
             started_at: Some(start),
             unconfirmed,
@@ -1429,6 +1648,7 @@ mod tests {
         let rows = vec![
             TaskLedgerRow {
                 kind: TaskKind::Shell,
+                child_job: None,
                 label: None,
                 started_at: Some(start),
                 unconfirmed: false,
@@ -1438,6 +1658,7 @@ mod tests {
             },
             TaskLedgerRow {
                 kind: TaskKind::Subagent,
+                child_job: None,
                 label: None,
                 started_at: None,
                 unconfirmed: false,
@@ -1513,6 +1734,7 @@ mod tests {
         let now = at + 192_000; // 14:05:12, a 3m12s runtime
         let row = |kind: TaskKind, activity: Option<TaskLiveness>| TaskLedgerRow {
             kind,
+            child_job: None,
             label: Some("review the diff".into()),
             started_at: Some(at),
             unconfirmed: false,
@@ -1554,6 +1776,7 @@ mod tests {
     fn an_untimed_tool_has_no_activity_clock() {
         let rows = vec![TaskLedgerRow {
             kind: TaskKind::Subagent,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: false,
@@ -1585,6 +1808,7 @@ mod tests {
     fn the_estimate_clips_labels_like_the_render() {
         let row = |label: String| TaskLedgerRow {
             kind: TaskKind::Shell,
+            child_job: None,
             label: Some(label),
             started_at: None,
             unconfirmed: false,
@@ -1615,6 +1839,7 @@ mod tests {
         // from the fragment's own parts (label, age, wait).
         let plain = TaskLedgerRow {
             kind: TaskKind::Subagent,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: false,
@@ -1624,6 +1849,7 @@ mod tests {
         };
         let with_activity = |wait: Option<crate::feishu::card::AwaitingAction>| TaskLedgerRow {
             kind: TaskKind::Subagent,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: false,
@@ -1637,6 +1863,7 @@ mod tests {
         };
         let untimed = TaskLedgerRow {
             kind: TaskKind::Subagent,
+            child_job: None,
             label: None,
             started_at: None,
             unconfirmed: false,
