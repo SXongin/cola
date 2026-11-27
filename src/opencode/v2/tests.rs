@@ -2975,6 +2975,20 @@ async fn transcript_appends_running_jobs_and_retires_them_on_later_reads() {
         "a successful list that no longer reports them retires the rows: {:#?}",
         second.background_tasks
     );
+    let anchor = crate::backend::TurnAnchor {
+        message_id: crate::backend::MessageId::new("msg_u1"),
+        created_ms: 1_000,
+    };
+    assert_eq!(
+        second.settle_with(Some(&anchor), true),
+        crate::backend::TurnSettle::Complete,
+        "a successful list without the job ends the wait"
+    );
+    assert!(
+        second.unconfirmed_tasks.is_empty(),
+        "the retired job row leaves no ⚠️ marker: {:?}",
+        second.unconfirmed_tasks
+    );
 
     let third = client.transcript("ses_1").await.unwrap();
     assert_eq!(
@@ -2985,7 +2999,9 @@ async fn transcript_appends_running_jobs_and_retires_them_on_later_reads() {
 }
 
 /// A failed job read never fails the transcript: it re-attaches the last
-/// successful rows unchanged, and a later success corroborates them.
+/// successful rows unchanged, and a later success corroborates them. The
+/// re-attached rows still hold the Turn — no `⚠️` marker, no settle — so a
+/// transient list failure can neither end nor wedge a live job (ticket #1223).
 #[tokio::test]
 async fn a_failed_job_read_keeps_the_last_rows_and_still_returns_ok() {
     let server = TestHttpServer::start().await;
@@ -3009,6 +3025,20 @@ async fn a_failed_job_read_keeps_the_last_rows_and_still_returns_ok() {
     assert_eq!(
         second.background_tasks, first.background_tasks,
         "the last successful rows come back unchanged and unmarked"
+    );
+    let anchor = crate::backend::TurnAnchor {
+        message_id: crate::backend::MessageId::new("msg_u1"),
+        created_ms: 1_000,
+    };
+    assert_eq!(
+        second.settle_with(Some(&anchor), true),
+        crate::backend::TurnSettle::Waiting,
+        "the re-attached job rows still hold the Turn"
+    );
+    assert!(
+        second.unconfirmed_tasks.is_empty(),
+        "a failed job read never marks a live job: {:?}",
+        second.unconfirmed_tasks
     );
 }
 
@@ -3076,6 +3106,20 @@ async fn a_404_or_405_means_no_job_surface_and_drops_the_last_rows() {
             gone.background_tasks.is_empty(),
             "HTTP {status} means no job surface: {:#?}",
             gone.background_tasks
+        );
+        let anchor = crate::backend::TurnAnchor {
+            message_id: crate::backend::MessageId::new("msg_u1"),
+            created_ms: 1_000,
+        };
+        assert_eq!(
+            gone.settle_with(Some(&anchor), true),
+            crate::backend::TurnSettle::Complete,
+            "HTTP {status} blocks nothing"
+        );
+        assert!(
+            gone.unconfirmed_tasks.is_empty(),
+            "HTTP {status} marks nothing: {:?}",
+            gone.unconfirmed_tasks
         );
         let later = client.transcript("ses_1").await.unwrap();
         assert!(
