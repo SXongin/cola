@@ -1350,19 +1350,6 @@ impl V2Strategy {
         cache.insert(session_id.to_string(), CachedJobRows { seq, rows });
     }
 
-    /// The last successfully read job rows for `session_id`, empty when the
-    /// session has none. Test-only accessor: production always reads the cache
-    /// under the lock that also renders, so it never clones the rows loose.
-    #[cfg(test)]
-    fn cached_job_rows(&self, session_id: &str) -> Vec<BackgroundTask> {
-        self.jobs
-            .lock()
-            .expect("job row cache lock")
-            .get(session_id)
-            .map(|cached| cached.rows.clone())
-            .unwrap_or_default()
-    }
-
     /// Record a 404/405 "no job surface" verdict: no rows, and the sequence
     /// that saw it. A STALE 404/405 must not forget a newer cache, so this
     /// shares the success arm's seq guard.
