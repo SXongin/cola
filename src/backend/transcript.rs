@@ -3456,6 +3456,39 @@ mod tests {
         );
     }
 
+    /// AC1 (spec #1220, ticket #1223): a job-sourced row holds the Turn exactly
+    /// like a tool-part Background Task — `Waiting` — and once the job list no
+    /// longer reports it, nothing is live and the Turn is `Complete`. The job
+    /// row is the shape the read model produces: the job id as both the call
+    /// identity and [`BackgroundTask::job_id`], no shell and no child.
+    #[test]
+    fn a_live_job_row_holds_the_turn_until_it_is_gone() {
+        let (_, anchor) = anchored("msg_u1", 1_000);
+        let row = BackgroundTask {
+            tool: ToolIdentity {
+                name: "codemode".into(),
+                call_id: "job_cc".into(),
+            },
+            job_id: Some("job_cc".into()),
+            started_at: Some(1_100),
+            ..Default::default()
+        };
+        let mut transcript = SessionTranscript::new(vec![assistant_step("msg_a1", 1_100, None)])
+            .with_executions(vec![boundary(1_200)])
+            .with_background_tasks(vec![row]);
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), true),
+            TurnSettle::Waiting,
+            "a live job is a Background Task: the Turn waits on it"
+        );
+        transcript.background_tasks.clear();
+        assert_eq!(
+            transcript.settle_with(Some(&anchor), true),
+            TurnSettle::Complete,
+            "the job list stopped reporting it: nothing is live"
+        );
+    }
+
     /// Cleaning a run settles its launch panel too: the panel must not keep
     /// reading `Running` beside the 🧹 entry (ADR-0108 §10), and a shared
     /// launch with a live sibling keeps the panel running.

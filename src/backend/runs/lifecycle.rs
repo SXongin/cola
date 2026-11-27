@@ -563,6 +563,13 @@ impl RunLifecycle {
                     task.child_id.clone(),
                 )
             };
+            // A job-sourced row's liveness is the job list, never a runtime
+            // verdict (ADR-0118): a child the runtime no longer reports active
+            // must not mark a live job, and a shell it no longer knows must not
+            // retire one — its own list decides.
+            if transcript.background_tasks[index].job_id.is_some() {
+                continue;
+            }
             if let Some(shell_id) = shell_id {
                 match runtime.shell(&shell_id) {
                     // No verdict: the read could not place this shell — leave
@@ -607,18 +614,24 @@ impl RunLifecycle {
     /// Background Task with neither a shell nor a child id. Neither has a
     /// transcript to read and no Wake can name it, so the runtime reconcile must
     /// run even when nothing is live — the Cleanup it marks is the only exit.
+    ///
+    /// A **job-sourced** row is excluded (ADR-0118): it has an identity — the
+    /// job list read — so its exit is that list, never a Cleanup click. Marking
+    /// it would show a live job as `⚠️ 状态待确认` and offer the button that ends
+    /// work still running (the hazard #1178 tracks).
     pub(crate) fn needs_cleanup_marking(&self, transcript: &SessionTranscript) -> bool {
         self.live(transcript).any(|run| run.child_id.is_none())
             || transcript
                 .background_tasks
                 .iter()
-                .any(|task| task.shell_id.is_none() && task.child_id.is_none())
+                .any(|task| task.job_id.is_none() && task.shell_id.is_none() && task.child_id.is_none())
     }
 
     /// Mark every childless run and identity-less task for the Cleanup exit:
     /// with no child there is no evidence read that can end it, so the ⚠️ row
     /// and its button are the only way the run/task — and the Turn waiting on
-    /// it — can end.
+    /// it — can end. A job-sourced row has an identity (its job list) and is
+    /// never marked (ADR-0118).
     pub(crate) fn mark_cleanup_exits(&self, transcript: &mut SessionTranscript) {
         let keys: Vec<String> = self
             .live(transcript)
@@ -628,7 +641,7 @@ impl RunLifecycle {
         let tasks: Vec<String> = transcript
             .background_tasks
             .iter()
-            .filter(|task| task.shell_id.is_none() && task.child_id.is_none())
+            .filter(|task| task.job_id.is_none() && task.shell_id.is_none() && task.child_id.is_none())
             .map(|task| task.tool.call_id.clone())
             .collect();
         for key in keys {
@@ -1036,6 +1049,12 @@ fn retire_cleanup(transcript: &mut SessionTranscript, key: &str, now_ms: i64) ->
         .iter()
         .position(|task| task.tool.call_id == key)
     {
+        // A job-sourced row has an identity — its job list — so the Cleanup
+        // click never targets it (ADR-0118): that list decides when it ended,
+        // and a 🧹 entry would claim an ending the read never derived.
+        if transcript.background_tasks[index].job_id.is_some() {
+            return None;
+        }
         let task = transcript.background_tasks.remove(index);
         let mut cleaned_ids: HashSet<String> = HashSet::new();
         cleaned_ids.insert(task.tool.call_id.clone());
@@ -1166,7 +1185,7 @@ mod tests {
     use crate::backend::runs::TaskRunIdentity;
     use crate::backend::{
         AgentCapabilities, AgentRunRef, DelegationEffect, MessageId, MessageRole, MessageTime, Phase,
-        ShellEnd, ShellRuntime, ToolCall, ToolDetail, ToolStatus, TranscriptMessage,
+        ShellEnd, ShellRuntime, ToolCall, ToolDetail, ToolStatus, TranscriptMessage, Wake, WakeSource,
     };
     use crate::bridge::chain::ChainRecords;
     use crate::feishu::card::tool_view::{ChildActivity, TaskLiveness};
@@ -1251,6 +1270,29 @@ mod tests {
             shell_id: Some(shell_id.into()),
             child_id: None,
             started_at: Some(started_at),
+            ..Default::default()
+        }
+    }
+
+    /// A job-sourced Background Task (ADR-0118): the job id is its call
+    /// identity and [`BackgroundTask::job_id`] is set, which is what tells it
+    /// apart from a tool-part launch.
+    fn job_task(
+        job_id: &str,
+        kind: &str,
+        shell_id: Option<&str>,
+        child_id: Option<&str>,
+        started_at: i64,
+    ) -> BackgroundTask {
+        BackgroundTask {
+            tool: ToolIdentity {
+                name: kind.into(),
+                call_id: job_id.into(),
+            },
+            shell_id: shell_id.map(str::to_string),
+            child_id: child_id.map(str::to_string),
+            started_at: Some(started_at),
+            job_id: Some(job_id.into()),
             ..Default::default()
         }
     }
@@ -1812,6 +1854,182 @@ mod tests {
             .find(|ending| ending.class == TaskEndingClass::Cleanup)
             .expect("the click is a Cleanup ending");
         assert_eq!(ending.finished_at, Some(3_000), "the click's own clock");
+    }
+
+    /// AC2 (spec #1220, ticket #1223): a job-sourced row has a job identity, so
+    /// it is not a childless task the Cleanup machinery may end. Its liveness
+    /// is the V2 job list (ADR-0118), and marking it would render a live job as
+    /// `⚠️ 状态待确认` and offer a `清理待确认任务` button that ends work still
+    /// running.
+    #[test]
+    fn a_job_row_is_never_marked_for_the_cleanup_exit() {
+        let owner = RunLifecycle::new();
+        for row in [
+            // The kinds with neither a shell nor a child id are the ones the
+            // childless-task rule would otherwise claim.
+            job_task("job_cc", "codemode", None, None, 1_000),
+            job_task("job_img", "image", None, None, 1_100),
+            job_task("job_vid", "video", None, None, 1_200),
+            // A shell or subagent job also carries an identity the Cleanup must
+            // leave to the job list.
+            job_task("job_sh", "shell", Some("sh_job"), None, 1_300),
+            job_task("job_sub", "subagent", None, Some("ses_job_child"), 1_400),
+        ] {
+            let mut read = SessionTranscript::new(vec![]).with_background_tasks(vec![row.clone()]);
+            assert!(
+                !owner.needs_cleanup_marking(&read),
+                "a job row has an identity: the job list is its exit ({})",
+                row.tool.call_id
+            );
+            owner.mark_cleanup_exits(&mut read);
+            assert!(
+                read.unconfirmed_tasks.is_empty(),
+                "no ⚠️ row and no button for a live job ({})",
+                row.tool.call_id
+            );
+            assert_eq!(read.background_tasks, vec![row], "marking changes no row");
+        }
+    }
+
+    /// AC4/AC5 (ticket #1223): the cleanup click path takes its ids from the
+    /// unconfirmed markers, which never carry a job. A stale card callback
+    /// naming one anyway must not clear the row or mint a Cleanup ending: the
+    /// job's own list decides when it ended.
+    #[test]
+    fn a_cleanup_click_never_targets_a_job_row() {
+        let (owner, chains, _dir) = owner_with_store();
+        let row = job_task("job_cc", "codemode", None, None, 1_000);
+        let mut read = SessionTranscript::new(vec![]).with_background_tasks(vec![row.clone()]);
+
+        owner.cleanup(SESSION, &mut read, &["job_cc".to_string()], 3_000);
+
+        assert_eq!(
+            read.background_tasks,
+            vec![row],
+            "the job stays live: its list is the only verdict"
+        );
+        assert!(
+            read.task_retirements.is_empty(),
+            "the click records no 🧹 entry for a job row"
+        );
+        assert!(
+            chains.endings(SESSION).is_empty(),
+            "and nothing durable: {:#?}",
+            chains.endings(SESSION)
+        );
+    }
+
+    /// AC5 (ticket #1223): the runtime reconcile never marks a job row. A
+    /// subagent job's child going inactive and a shell job the runtime no longer
+    /// knows are both the JOB LIST's verdict to give, not the runtime's — a
+    /// marker would put `⚠️ 状态待确认` and the Cleanup button on a live job.
+    #[test]
+    fn a_runtime_verdict_never_marks_a_job_row() {
+        let owner = RunLifecycle::new();
+        let mut read = SessionTranscript::new(vec![]).with_background_tasks(vec![
+            job_task("job_sub", "subagent", None, Some("ses_job_child"), 1_000),
+            job_task("job_sh", "shell", Some("sh_job"), None, 1_100),
+        ]);
+
+        owner.apply_task_runtime(
+            SESSION,
+            &mut read,
+            &TaskRuntime {
+                shells: vec![("sh_job".to_string(), ShellRuntime::Missing)],
+                children: vec![("ses_job_child".to_string(), ChildRuntime::Inactive)],
+            },
+        );
+
+        assert!(
+            read.unconfirmed_tasks.is_empty(),
+            "no runtime verdict marks a job row: {:?}",
+            read.unconfirmed_tasks
+        );
+        assert_eq!(
+            read.background_tasks.len(),
+            2,
+            "and none retires it: the job list is its liveness"
+        );
+        assert!(read.task_retirements.is_empty());
+    }
+
+    /// AC3 (ticket #1223): a Wake naming a job id records the `Wake` Task
+    /// Ending under that id through the existing `RunKey` path — the job id is
+    /// the row's call identity, so no new cause is needed — and the next read
+    /// carries no live row, whatever the job list still reports.
+    #[test]
+    fn a_wake_commit_ends_a_job_row_and_the_next_read_carries_no_live_row() {
+        let (owner, chains, _dir) = owner_with_store();
+        let row = job_task("job_cc", "codemode", None, None, 1_000);
+        let mut read = SessionTranscript::new(vec![]).with_background_tasks(vec![row.clone()]);
+        let wake = Wake {
+            id: MessageId::new("msg_wake_job"),
+            created_ms: Some(2_000),
+            source: WakeSource::Other("codemode".into()),
+            shell_id: None,
+            job_id: Some("job_cc".into()),
+            child_id: None,
+            state: Some("completed".into()),
+            label: None,
+        };
+        // The run the completion commit names: the read's row folded with the
+        // Wake's own ids, exactly as the render's `wake_run` builds it.
+        let mut run = RunKey::of_launch(&row);
+        run.absorb(&RunKey::of_wake(&wake).expect("the Wake names the job"));
+        assert_eq!(run.key, "job_cc", "the job id is the stored key");
+
+        owner.retire(
+            SESSION,
+            RetireRead::Commit,
+            "",
+            RetireCause::Wake {
+                run: Box::new(run),
+                ending: Box::new(TaskEnding {
+                    class: TaskEndingClass::Wake,
+                    state: TaskEndingState::Owed,
+                    finished_at: Some(2_000),
+                    evidence: Some(TaskEndingEvidence::Wake(Some("completed".into()))),
+                    identity: TaskRunIdentity {
+                        tool: Some("codemode".into()),
+                        call_id: Some("job_cc".into()),
+                        started_at: Some(1_000),
+                        label: Some("const answer = 42".into()),
+                        ..TaskRunIdentity::default()
+                    },
+                }),
+            },
+        );
+        let record = chains
+            .endings(SESSION)
+            .into_iter()
+            .find(|record| record.run.names("job_cc"))
+            .expect("the Wake's ending is keyed by the job id");
+        let ending = record
+            .endings
+            .iter()
+            .find(|ending| ending.class == TaskEndingClass::Wake)
+            .expect("the Wake class");
+        assert_eq!(ending.finished_at, Some(2_000), "the Wake's own clock");
+        assert_eq!(
+            ending.evidence,
+            Some(TaskEndingEvidence::Wake(Some("completed".into())))
+        );
+
+        // The read the Wake arrived on may still list the row (the job list
+        // reported it): the durable ending resolves it.
+        owner.observe(SESSION, &mut read, LiveRunSurface::full());
+        assert!(read.background_tasks.is_empty(), "the ending prunes the row");
+        assert!(read.unconfirmed_tasks.is_empty(), "and no marker rides it");
+
+        // A later read whose job list still reports it synthesizes no live row:
+        // the ending, not the list, is what ended it.
+        let mut later = SessionTranscript::new(vec![]).with_background_tasks(vec![row]);
+        owner.observe(SESSION, &mut later, LiveRunSurface::full());
+        assert!(
+            later.background_tasks.is_empty(),
+            "a re-attached job row never comes back live: {:#?}",
+            later.background_tasks
+        );
     }
 
     /// Absence (the deleted `Wake` write): the completion commit's ending goes

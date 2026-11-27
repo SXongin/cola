@@ -1288,6 +1288,55 @@ mod tests {
         );
     }
 
+    /// A job-sourced row is not a childless task either (spec #1220, ticket
+    /// #1223): its liveness is the V2 job list, so the runtime reconcile spends
+    /// nothing on job-only work — the "no live task, no request" gate holds —
+    /// and marks nothing, on the success or the failure path.
+    #[tokio::test]
+    async fn job_only_work_spends_no_runtime_read_and_marks_nothing() {
+        let mock = MockBackend::new(Vec::new());
+        mock.fail_task_runtime_reads(usize::MAX);
+        let mock = Arc::new(mock);
+        let calls = Arc::clone(&mock.task_runtime_calls);
+        let backend: Arc<dyn Backend> = mock;
+        let mut transcript =
+            SessionTranscript::new(vec![]).with_background_tasks(vec![crate::backend::BackgroundTask {
+                tool: ToolIdentity {
+                    name: "codemode".into(),
+                    call_id: "job_cc".into(),
+                },
+                job_id: Some("job_cc".into()),
+                started_at: Some(1_000),
+                ..Default::default()
+            }]);
+        assert!(
+            !backend.runs().needs_cleanup_marking(&transcript),
+            "a job row has an identity: no Cleanup exit to mark"
+        );
+
+        let reconcile = RuntimeReconcile::new();
+        reconcile
+            .interval_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            reconcile
+                .observe(&backend, "ses_test", "/work", &mut transcript, 50, None)
+                .await
+                .is_none(),
+            "job-only work is the read's, never the reconcile's"
+        );
+        assert!(
+            calls.lock().await.is_empty(),
+            "the gate is restored: no runtime verdict was asked for"
+        );
+        assert!(
+            transcript.unconfirmed_tasks.is_empty(),
+            "and no ⚠️ marker rides a live job: {:?}",
+            transcript.unconfirmed_tasks
+        );
+        assert_eq!(transcript.background_tasks.len(), 1, "the job row is untouched");
+    }
+
     /// A launch whose refs are ALL terminal creates a terminal run with no
     /// `reported_by`. It still owes the child read: otherwise the row leaves
     /// `runs` with no durable ending and no entry. The reconcile reads it and
