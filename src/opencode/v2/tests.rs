@@ -3511,3 +3511,61 @@ async fn the_job_cache_is_per_session() {
         other.background_tasks
     );
 }
+
+/// The failure arm renders the NEWEST verdict, never the rows it could have
+/// cloned: a stale transcript row is replaced by the current cache. This is
+/// the state the old three-acquisition arm handed back when a newer read
+/// recorded an empty list between its clone and its transcript write. A unit
+/// test rather than a fake-server sequence: the failure arm has no await, so
+/// no deterministic interleaving can hold a read mid-arm without an artificial
+/// seam — the assertion targets exactly the row that arm used to leave behind.
+#[test]
+fn a_failed_read_renders_the_newest_verdict_and_never_a_stale_row() {
+    let strategy = super::V2Strategy::new();
+    // A newer job request already recorded "nothing running".
+    strategy.remember_job_rows("ses_1", 5, Vec::new());
+    // The older read is about to return a job row it cloned before the newer
+    // verdict landed.
+    let stale = crate::backend::BackgroundTask {
+        tool: crate::backend::ToolIdentity {
+            name: "codemode".into(),
+            call_id: "job_1".into(),
+        },
+        job_id: Some("job_1".into()),
+        started_at: Some(1_000),
+        ..Default::default()
+    };
+    let mut transcript =
+        crate::backend::SessionTranscript::new(vec![]).with_background_tasks(vec![stale.clone()]);
+
+    strategy.sync_failed_job_rows(&mut transcript, "ses_1", 3);
+
+    assert!(
+        transcript.background_tasks.is_empty(),
+        "the stale clone must be replaced by the newer (empty) verdict: {:#?}",
+        transcript.background_tasks
+    );
+    assert!(
+        strategy.cached_job_rows("ses_1").is_empty(),
+        "and the newer verdict's sequence is untouched"
+    );
+
+    // The same rule with newer rows: the stale row is replaced, not joined.
+    let newer = crate::backend::BackgroundTask {
+        tool: crate::backend::ToolIdentity {
+            name: "image".into(),
+            call_id: "job_2".into(),
+        },
+        job_id: Some("job_2".into()),
+        started_at: Some(2_000),
+        ..Default::default()
+    };
+    strategy.remember_job_rows("ses_1", 7, vec![newer.clone()]);
+    let mut transcript = crate::backend::SessionTranscript::new(vec![]).with_background_tasks(vec![stale]);
+    strategy.sync_failed_job_rows(&mut transcript, "ses_1", 6);
+    assert_eq!(
+        transcript.background_tasks,
+        vec![newer],
+        "the current cache is what renders, not the stale clone"
+    );
+}
