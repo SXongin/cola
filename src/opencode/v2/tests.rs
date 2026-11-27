@@ -3079,6 +3079,112 @@ async fn a_200_non_envelope_job_body_keeps_the_last_rows() {
     );
 }
 
+/// A job deduped against a tool-part task must still enter the failed-read
+/// cache (ADR-0118): the tool-part marker never flips, so the launch part can
+/// leave a later read (compaction, the ascending page cap) and the job list is
+/// then the run's only representation. Read 1 has the launch plus the matching
+/// running job (one row, the job deduped); read 2 has no launch and a failed
+/// job read — the cached job row must re-attach, so the run stays live and
+/// `settle_with` keeps the Turn `Waiting`.
+#[tokio::test]
+async fn a_job_deduped_against_a_tool_part_survives_a_failed_read() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [{
+                        "id": "msg_a1",
+                        "type": "assistant",
+                        "time": {"created": 900, "completed": 950},
+                        "content": [{
+                            "type": "tool",
+                            "id": "call_shell",
+                            "name": "shell",
+                            "state": {
+                                "status": "completed",
+                                "input": {"command": "npm run build", "background": true},
+                                "content": [{"type": "text", "text": "Command moved to the background"}],
+                                "metadata": {"status": "running", "truncated": false, "shellID": "sh_job"},
+                            },
+                            "time": {"created": 900, "completed": 940},
+                        }],
+                        "finish": "stop",
+                    }]
+                })
+                .to_string(),
+            ),
+            MockResponse::json(r#"{"data":[]}"#),
+        ],
+    );
+    serve_job_script(
+        &server,
+        vec![
+            (
+                200,
+                vec![],
+                serde_json::json!({
+                    "data": [{
+                        "id": "job_shell", "kind": "shell", "sessionID": "ses_1",
+                        "status": "running", "time": {"started": 1000},
+                        "shellID": "sh_job", "command": "npm run build",
+                    }]
+                })
+                .to_string(),
+            ),
+            (500, vec![], r#"{"message":"boom"}"#.to_string()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let launched = client.transcript("ses_1").await.unwrap();
+    assert_eq!(
+        launched.background_tasks.len(),
+        1,
+        "the tool-part derivation wins: {:#?}",
+        launched.background_tasks
+    );
+    assert_eq!(launched.background_tasks[0].tool.call_id, "call_shell");
+    assert!(
+        launched.background_tasks[0].job_id.is_none(),
+        "the deduped job adds no row"
+    );
+
+    // The launch part left the read (the read is now head-less); the job list
+    // fails. The run must stay live from the cached job task.
+    let orphaned = client
+        .transcript("ses_1")
+        .await
+        .expect("a failed job read must never fail the transcript");
+    assert_eq!(
+        orphaned.background_tasks.len(),
+        1,
+        "the cached job row re-attaches: {:#?}",
+        orphaned.background_tasks
+    );
+    let row = &orphaned.background_tasks[0];
+    assert_eq!(
+        row.job_id.as_deref(),
+        Some("job_shell"),
+        "the job task is the row now, not the departed launch"
+    );
+    assert_eq!(row.tool.name, "shell");
+    assert_eq!(row.shell_id.as_deref(), Some("sh_job"));
+    assert_eq!(row.started_at, Some(1000));
+
+    let anchor = crate::backend::TurnAnchor {
+        message_id: crate::backend::MessageId::new("msg_user"),
+        created_ms: 800,
+    };
+    assert_eq!(
+        orphaned.settle_with(Some(&anchor), true),
+        crate::backend::TurnSettle::Waiting,
+        "a live job row keeps the Turn waiting"
+    );
+}
+
 /// A 404 or 405 is the server's "no job surface": the read carries no job rows
 /// and blocks nothing, even after rows were seen — and it clears the cache, so
 /// a later failure invents nothing.

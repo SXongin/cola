@@ -662,8 +662,12 @@ impl GenerationStrategy for V2Strategy {
         // throughout — the transcript read never fails on this request.
         match self.running_jobs(http, session_id).await {
             Ok(Some(jobs)) => {
-                wire::merge_job_tasks(&mut transcript, session_id, &jobs);
-                self.remember_job_rows(session_id, job_rows(&transcript));
+                // Cache the task built for EVERY running job — a job deduped
+                // against a tool-part row included (ADR-0118): the launch
+                // marker never flips, so a later read can lose the launch part
+                // and must still find the run in the job cache.
+                let rows = wire::merge_job_tasks(&mut transcript, session_id, &jobs);
+                self.remember_job_rows(session_id, rows);
             }
             // 404/405: the server has no job surface. No rows, no wait — and
             // no stale rows from a previous attachment state.
@@ -1293,7 +1297,9 @@ impl V2Strategy {
     }
 
     /// Keep the rows a successful job read left, so a later failure can
-    /// re-attach them (ADR-0118). An empty set clears the session's entry.
+    /// re-attach them (ADR-0118): every running job's task, including one
+    /// deduped against a tool-part row, minus the jobs this read's Wakes
+    /// retired. An empty set clears the session's entry.
     fn remember_job_rows(&self, session_id: &str, rows: Vec<BackgroundTask>) {
         let mut cache = self.jobs.lock().expect("job row cache lock");
         if rows.is_empty() {
@@ -1594,19 +1600,6 @@ impl V2Strategy {
             .await?;
         Ok(page.newest_assistant_retrying())
     }
-}
-
-/// The job-sourced rows of a transcript: the tasks a `GET
-/// /api/experimental/job` read contributed, in their read order. The failed-read
-/// cache keeps exactly these, so a re-attach can never outlive or duplicate a
-/// transcript-derived row (ADR-0118).
-fn job_rows(transcript: &SessionTranscript) -> Vec<BackgroundTask> {
-    transcript
-        .background_tasks
-        .iter()
-        .filter(|task| task.job_id.is_some())
-        .cloned()
-        .collect()
 }
 
 /// One output page as its neutral window (spec #588, ticket #592): the last
