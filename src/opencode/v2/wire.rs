@@ -952,20 +952,47 @@ fn decode_wake_label(message: &Value, source: &WakeSource) -> Option<String> {
         WakeSource::Subagent => ("subagent", "description"),
         _ => return None,
     };
-    tag_attribute(text, kind, attribute).or_else(|| background_result_attribute(text, kind, attribute))
+    // Whichever shape the backend used opens the Wake's own text; a child
+    // result that quotes the other shape inside its body must not win. (The
+    // user-run shell notice prefixes prose, so the tags are compared by
+    // position rather than required at byte 0.)
+    let legacy_at = text.find(&format!("<{kind}"));
+    let unified_at = text.find("<background-result");
+    match (legacy_at, unified_at) {
+        (Some(legacy), Some(unified)) if legacy < unified => tag_attribute(text, kind, attribute),
+        (_, Some(_)) => background_result_attribute(text, kind, attribute),
+        (Some(_), None) => tag_attribute(text, kind, attribute),
+        (None, None) => None,
+    }
 }
 
 /// The value of `attribute` in 2.4's unified `<background-result …>` block,
 /// only when its `kind` names the same source — a shell block never labels a
 /// subagent Wake.
 fn background_result_attribute(text: &str, kind: &str, attribute: &str) -> Option<String> {
-    let rest = &text[text.find("<background-result")?..];
-    let tag = &rest[..rest.find('>')?];
+    let tag = opening_tag(text, "background-result")?;
     if tag_attribute(tag, "background-result", "kind").as_deref() == Some(kind) {
         tag_attribute(tag, "background-result", attribute)
     } else {
         None
     }
+}
+
+/// The opening `<tag …>` slice, ending at the first `>` OUTSIDE a quoted
+/// attribute value: a shell command may itself contain `>` (`cargo test >
+/// out.log`), and slicing at the first `>` would cut the tag mid-value and
+/// lose the label the old quote-aware read kept.
+fn opening_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let rest = &text[text.find(&format!("<{tag}"))?..];
+    let mut quoted = false;
+    for (index, ch) in rest.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            '>' if !quoted => return Some(&rest[..=index]),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The value of one `name="…"` attribute in `text`'s opening `tag`, when the
@@ -2450,6 +2477,23 @@ mod tests {
         let transcript = decode_messages(&[wake]);
         assert_eq!(transcript.wakes[0].label.as_deref(), Some("cargo test --all"));
 
+        // A command containing `>` must not cut the opening tag short.
+        let mut redirect = synthetic_wake(
+            "msg_wake_redirect",
+            5_000,
+            serde_json::json!({"source": "shell", "shellID": "sh_fixture", "state": "completed"}),
+        );
+        redirect["text"] = Value::String(
+            "<background-result kind=\"shell\" id=\"job_fixture\" state=\"completed\" \
+             command=\"cargo test > /tmp/out.log && echo ok\">\n</background-result>"
+                .into(),
+        );
+        let transcript = decode_messages(&[redirect]);
+        assert_eq!(
+            transcript.wakes[0].label.as_deref(),
+            Some("cargo test > /tmp/out.log && echo ok")
+        );
+
         let mut wrong_kind = synthetic_wake(
             "msg_wake_wrong_kind",
             5_000,
@@ -2464,6 +2508,54 @@ mod tests {
             transcript.wakes[0].label, None,
             "a shell block never labels a subagent Wake"
         );
+
+        let mut wrong_kind_subagent = synthetic_wake(
+            "msg_wake_wrong_kind_shell",
+            5_000,
+            serde_json::json!({"source": "shell", "shellID": "sh_fixture"}),
+        );
+        wrong_kind_subagent["text"] = Value::String(
+            "<background-result kind=\"subagent\" sessionID=\"ses_child\" description=\"not a shell\">\n</background-result>"
+                .into(),
+        );
+        let transcript = decode_messages(&[wrong_kind_subagent]);
+        assert_eq!(
+            transcript.wakes[0].label, None,
+            "a subagent block never labels a shell Wake"
+        );
+    }
+
+    /// The backend's own opening tag wins over a copy the child echoed inside
+    /// the body, in both directions: a 2.4 body quoting `<subagent …>`, and a
+    /// 2.3 body quoting `<background-result …>`.
+    #[test]
+    fn a_wake_body_echo_never_hijacks_the_label() {
+        let mut current = synthetic_wake(
+            "msg_wake_echo",
+            5_000,
+            serde_json::json!({"source": "subagent", "childID": "ses_child"}),
+        );
+        current["text"] = Value::String(
+            "<background-result kind=\"subagent\" sessionID=\"ses_child\" state=\"completed\" \
+             description=\"real task\">\nThe child said: <subagent description=\"echoed task\">\n\
+             </background-result>"
+                .into(),
+        );
+        let transcript = decode_messages(&[current]);
+        assert_eq!(transcript.wakes[0].label.as_deref(), Some("real task"));
+
+        let mut legacy = synthetic_wake(
+            "msg_wake_echo_legacy",
+            5_000,
+            serde_json::json!({"source": "subagent", "childID": "ses_child"}),
+        );
+        legacy["text"] = Value::String(
+            "<subagent sessionID=\"ses_child\" description=\"legacy task\">\n\
+             <background-result kind=\"subagent\" description=\"echoed task\">\n</subagent>"
+                .into(),
+        );
+        let transcript = decode_messages(&[legacy]);
+        assert_eq!(transcript.wakes[0].label.as_deref(), Some("legacy task"));
     }
 
     /// A read made of one assistant message carrying `part` plus every `wake`,
