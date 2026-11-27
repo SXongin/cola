@@ -1266,11 +1266,15 @@ pub struct BackgroundTask {
     pub started_at: Option<i64>,
     /// The running job that represents this run, when known (ADR-0118): the
     /// job a transcript-derived task was deduped against, or the job this task
-    /// itself was discovered from. The row is **job-sourced** iff this equals
-    /// [`Self::tool`]'s call id (the job's own row); a tool-part task the job
-    /// list merely corroborates keeps its launch identity and is still a
-    /// tool-part task for the runtime/Cleanup lifecycle.
+    /// itself was discovered from. This is the association key only — whether
+    /// the row IS the job is [`Self::job_sourced`].
     pub job_id: Option<String>,
+    /// Whether this task exists only because of the job list (ADR-0118). A
+    /// job-sourced row keeps the job's identity and has no launch part; a
+    /// tool-part task the job list merely corroborates keeps `job_id` for the
+    /// Wake association but stays `false`, so the runtime/Cleanup lifecycle
+    /// still treats it as a tool task.
+    pub job_sourced: bool,
     /// The task's own neutral label, when the fact that named it carried one:
     /// a shell's command, a subagent's description, a job's kind-specific
     /// label (a Code Mode script's first line, an image/video path, a shell
@@ -1291,14 +1295,16 @@ pub struct BackgroundTask {
 }
 
 impl BackgroundTask {
-    /// Whether this row is **job-sourced**: a job represents the run and this
-    /// row IS that job (its call id is the job id). A tool-part task the job
-    /// list merely corroborates carries the job id too, but keeps its launch
-    /// call id, so it is not job-sourced and still takes the normal runtime
-    /// verdicts and Cleanup treatment (ADR-0118). The one home for the
+    /// Whether this row is **job-sourced**: it exists only because the job
+    /// list named it (its own row). A tool-part task the job list merely
+    /// corroborates carries a `job_id` too, but is not job-sourced — it keeps
+    /// its launch identity/kind and still takes the normal runtime verdicts
+    /// and Cleanup treatment (ADR-0118). An explicit fact, never derived from
+    /// id equality: a job whose id happens to equal a tool task's call id must
+    /// not turn that tool task into the job's row. The one home for the
     /// predicate, so its call sites cannot drift.
     pub fn is_job_sourced(&self) -> bool {
-        self.job_id.as_deref() == Some(self.tool.call_id.as_str())
+        self.job_sourced
     }
 }
 
@@ -3489,6 +3495,7 @@ mod tests {
                 call_id: "job_cc".into(),
             },
             job_id: Some("job_cc".into()),
+            job_sourced: true,
             started_at: Some(1_100),
             ..Default::default()
         };

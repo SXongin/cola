@@ -1293,6 +1293,7 @@ mod tests {
             child_id: child_id.map(str::to_string),
             started_at: Some(started_at),
             job_id: Some(job_id.into()),
+            job_sourced: true,
             ..Default::default()
         }
     }
@@ -1923,8 +1924,8 @@ mod tests {
             read.unconfirmed_tasks
         );
 
-        // The identical row IS job-sourced once its call id is the job id.
-        task.job_id = Some(task.tool.call_id.clone());
+        // The identical row is job-sourced once it comes from the job list.
+        task.job_sourced = true;
         assert!(task.is_job_sourced());
         let read = SessionTranscript::new(vec![]).with_background_tasks(vec![task]);
         assert!(

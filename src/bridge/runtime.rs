@@ -654,6 +654,7 @@ mod tests {
             child_id: child_id.map(str::to_string),
             started_at: Some(1_000),
             job_id: Some(job_id.into()),
+            job_sourced: true,
             ..Default::default()
         }
     }

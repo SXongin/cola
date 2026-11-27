@@ -135,7 +135,7 @@ fn job_task_ids(transcript: &crate::backend::SessionTranscript) -> Vec<&str> {
     transcript
         .background_tasks
         .iter()
-        .filter(|task| task.job_id.is_some())
+        .filter(|task| task.is_job_sourced())
         .map(|task| task.tool.call_id.as_str())
         .collect()
 }
@@ -3532,6 +3532,7 @@ fn a_failed_read_renders_the_newest_verdict_and_never_a_stale_row() {
             call_id: "job_1".into(),
         },
         job_id: Some("job_1".into()),
+        job_sourced: true,
         started_at: Some(1_000),
         ..Default::default()
     };
@@ -3557,6 +3558,7 @@ fn a_failed_read_renders_the_newest_verdict_and_never_a_stale_row() {
             call_id: "job_2".into(),
         },
         job_id: Some("job_2".into()),
+        job_sourced: true,
         started_at: Some(2_000),
         ..Default::default()
     };
@@ -3567,5 +3569,134 @@ fn a_failed_read_renders_the_newest_verdict_and_never_a_stale_row() {
         transcript.background_tasks,
         vec![newer],
         "the current cache is what renders, not the stale clone"
+    );
+}
+
+/// The success arm's sync reads the cache and mutates the transcript under ONE
+/// lock, so a newer verdict can never slip between the read and the attach: a
+/// stale transcript row is replaced by the current cache, never joined by it.
+/// The gated ordering test pins this end to end; this pins the render step.
+#[test]
+fn a_successful_read_sync_renders_the_current_cache_not_a_stale_row() {
+    let strategy = super::V2Strategy::new();
+    let newer = crate::backend::BackgroundTask {
+        tool: crate::backend::ToolIdentity {
+            name: "image".into(),
+            call_id: "job_2".into(),
+        },
+        job_id: Some("job_2".into()),
+        job_sourced: true,
+        started_at: Some(2_000),
+        ..Default::default()
+    };
+    strategy.remember_job_rows("ses_1", 5, vec![newer.clone()]);
+    let stale = crate::backend::BackgroundTask {
+        tool: crate::backend::ToolIdentity {
+            name: "codemode".into(),
+            call_id: "job_1".into(),
+        },
+        job_id: Some("job_1".into()),
+        job_sourced: true,
+        started_at: Some(1_000),
+        ..Default::default()
+    };
+    let mut transcript = crate::backend::SessionTranscript::new(vec![]).with_background_tasks(vec![stale]);
+
+    strategy.sync_job_rows(&mut transcript, "ses_1");
+
+    assert_eq!(
+        transcript.background_tasks,
+        vec![newer],
+        "the current cache renders; the stale row is dropped, not joined"
+    );
+}
+
+/// The failed-read render shares the merge's association/retire step
+/// (ADR-0118): a cached job row, this read's freshly decoded launch part and a
+/// Wake naming only the job id leave no live row — and the cache holds no job
+/// row for it, so a later failed read invents none.
+#[tokio::test]
+async fn a_failed_read_retires_the_cached_job_its_wake_names() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(r#"{"data":[]}"#),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [
+                        {
+                            "id": "msg_a",
+                            "type": "assistant",
+                            "time": {"created": 900, "completed": 950},
+                            "content": [{
+                                "type": "tool",
+                                "id": "call_shell",
+                                "name": "shell",
+                                "state": {
+                                    "status": "completed",
+                                    "input": {"command": "sleep 2", "background": true},
+                                    "content": [{"type": "text", "text": "Command moved to the background"}],
+                                    "metadata": {"status": "running", "truncated": false, "shellID": "sh1"},
+                                },
+                                "time": {"created": 900, "completed": 940},
+                            }],
+                            "finish": "stop",
+                        },
+                        {
+                            "id": "msg_w",
+                            "type": "synthetic",
+                            "text": "wake",
+                            "time": {"created": 5000},
+                            "metadata": {"source": "shell", "jobID": "job1"},
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            MockResponse::json(r#"{"data":[]}"#),
+        ],
+    );
+    serve_job_script(
+        &server,
+        vec![
+            (
+                200,
+                vec![],
+                serde_json::json!({
+                    "data": [{
+                        "id": "job1", "kind": "shell", "sessionID": "ses_1",
+                        "status": "running", "time": {"started": 1000},
+                        "shellID": "sh1", "command": "sleep 2",
+                    }]
+                })
+                .to_string(),
+            ),
+            (500, vec![], r#"{"message":"boom"}"#.to_string()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let first = client.transcript("ses_1").await.unwrap();
+    assert_eq!(job_task_ids(&first), ["job1"], "the running job is cached");
+
+    // The launch part is back and the list fails; the Wake names the job only.
+    let failed = client
+        .transcript("ses_1")
+        .await
+        .expect("a failed job read never fails the transcript");
+    assert!(
+        failed.background_tasks.is_empty(),
+        "the Wake removes the cached job's matched tool task: {:#?}",
+        failed.background_tasks
+    );
+
+    // The cache holds no row for the retired job either.
+    let later = client.transcript("ses_1").await.unwrap();
+    assert!(
+        later.background_tasks.is_empty(),
+        "a later failed read invents no row: {:#?}",
+        later.background_tasks
     );
 }

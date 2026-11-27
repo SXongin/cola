@@ -8358,6 +8358,7 @@ mod tests {
             },
             started_at: Some(start),
             job_id: Some(id.into()),
+            job_sourced: true,
             label: Some(label.into()),
             owner_label: owner.map(str::to_string),
             child_job: child,

@@ -503,6 +503,7 @@ mod tests {
                 call_id: "job_1".into(),
             },
             job_id: Some("job_1".into()),
+            job_sourced: true,
             ..Default::default()
         };
         for (name, kind) in [
@@ -578,6 +579,7 @@ mod tests {
                 call_id: "job_1".into(),
             },
             job_id: Some("job_1".into()),
+            job_sourced: true,
             child_job: true,
             owner_label: Some("review the diff".into()),
             ..Default::default()
