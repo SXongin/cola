@@ -614,10 +614,13 @@ mod tests {
     #[test]
     fn the_workflow_uses_the_shared_scripts() {
         let workflow = workflow();
-        // The Codex step itself: the bound and the pin must stay, or a hang
-        // burns the whole job and discards a finished review again (#530).
-        // The live salvage path is exercised by the gate's own runs on every
-        // PR; this guards the wiring against a silent revert.
+        // The Codex step itself, asserted as properties rather than as one
+        // reviewed version. The build must stay on a full commit SHA (a tag can
+        // be re-pointed under us), keep the bound and `continue-on-error` that
+        // let the post step publish a review Codex already wrote (#530), and
+        // never return to a release the gate retired. Pinning the SHA itself
+        // made every Dependabot bump red — including bumps that only fixed
+        // things — while a leftover comment in the step still satisfied it.
         //
         // The step cap was raised from 12 to 30 minutes so a large diff plus
         // its embedded linked issues can finish (a 44-commit PR timed out at
@@ -626,13 +629,44 @@ mod tests {
         // it stays well inside the job's own cap, which is what keeps a hang
         // from burning the job.
         let codex = step(&workflow, "Run Codex (read-only)");
-        for needle in [
-            "bdf19a4a223ec2549a3e2274a0cf61556bc07675", // v1.13: bounds #150/#169's stdio hang
-            "continue-on-error: true",
-            "timeout-minutes: 45",
-        ] {
+        for needle in ["continue-on-error: true", "timeout-minutes: 45"] {
             assert!(codex.contains(needle), "the Codex step must keep {needle}");
         }
+        // `openai/codex-action@<40 lowercase hex> # vX.Y.Z`
+        let pin = uses_line(codex, "openai/codex-action");
+        let (sha, version) = pin
+            .rsplit_once(" # ")
+            .unwrap_or_else(|| panic!("the pin carries its release comment: {pin}"));
+        assert!(
+            sha.len() == 40
+                && sha
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "the pin must be a full lowercase commit SHA, not a tag: {sha}"
+        );
+        let (major, minor) = version
+            .trim()
+            .strip_prefix('v')
+            .and_then(|rest| rest.split_once('.'))
+            .unwrap_or_else(|| panic!("the pin carries its release as `# vX.Y.Z`: {version}"));
+        assert!(
+            !major.is_empty()
+                && major.chars().all(|c| c.is_ascii_digit())
+                && !minor.is_empty()
+                && minor.chars().all(|c| c == '.' || c.is_ascii_digit()),
+            "the pin carries its release as `# vX.Y.Z`: {version}"
+        );
+        // The releases the gate must never return to. v1.12 handed the runner's
+        // descriptors to the whole Codex process tree and waited for them to
+        // close — the #150/#169 stdio hang that burned a finished review
+        // (#530). Keyed by SHA, so a comment cannot launder it.
+        const RETIRED: [&str; 1] = [
+            "86365089eb2b84e0a8fb0717b304f8bdcb13b20e", // v1.12
+        ];
+        assert!(
+            !RETIRED.contains(&sha),
+            "the Codex step must not return to a retired pin ({version})"
+        );
         // The post step publishes only complete reviews, through the parser
         // the workflow itself wrote (never a file from the reviewed tree).
         let post = step(&workflow, "Post the review as a comment");
@@ -693,5 +727,14 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\n      - ").next())
             .unwrap_or_else(|| panic!("the {name} step exists"))
+    }
+
+    /// The step's pinned ref for `action` — everything after `uses: action@`,
+    /// its release comment included.
+    fn uses_line<'a>(step: &'a str, action: &str) -> &'a str {
+        let prefix = format!("uses: {action}@");
+        step.lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("the step uses {action}"))
     }
 }

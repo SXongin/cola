@@ -66,11 +66,15 @@
 # the action never returns and the job dies on its timeout with the result
 # already on disk (upstream openai/codex-action#150/#169). v1.12's rewrite
 # handed the runner's descriptors to the whole Codex process tree and waited
-# for them to close; the action is pinned to v1.13, which bounds the post-exit
-# output drain and tears its own pipes down, so a surviving descendant can no
-# longer keep the step open. v1.13 also restores the runner's service sockets
-# under Linux `drop-sudo` (v1.12 chmodded `/run` — the community's #160) and,
-# in doing so, requires `setfacl`, which GitHub's `ubuntu-latest` image ships.
+# for them to close; v1.13 and later bound the post-exit output drain and tear
+# their own pipes down, so a surviving descendant can no longer keep the step
+# open. v1.13 also restored the runner's service sockets under Linux
+# `drop-sudo` (v1.12 chmodded `/run` — the community's #160) and, in doing so,
+# requires `setfacl`, which GitHub's `ubuntu-latest` image ships. The step is
+# SHA-pinned and Dependabot keeps the pin current; `cargo test -p xtask
+# codex_gate` asserts the pin's shape (a full commit SHA plus its `# vX.Y.Z`
+# comment) and refuses the retired v1.12, so a bump needs no test edit while a
+# revert still fails.
 # The Codex step stays bounded with its output salvaged through the parser
 # this workflow writes to `$RUNNER_TEMP` (never sourced from the reviewed
 # tree, which may predate it; tested by xtask), so a recurrence cannot discard
