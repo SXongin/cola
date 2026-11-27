@@ -13,6 +13,8 @@ use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
 use crate::test_http::{DynamicResponse, MockResponse, RecordedRequest, TestHttpServer};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A client pointed at the fake server with both Basic-auth parts set, speaking
 /// V2 — what attach detection hands production for a `/api` server. The
@@ -66,6 +68,76 @@ fn opencode_error(err: BridgeError) -> String {
         BridgeError::OpenCode(message) => message,
         other => panic!("expected BridgeError::OpenCode, got: {other:?}"),
     }
+}
+
+/// One scripted job-list answer: status, extra response headers, JSON body.
+type JobAnswer = (u16, Vec<(&'static str, &'static str)>, String);
+
+/// A job-list answer as the route script stores it (owned).
+type ScriptedJobAnswer = (u16, Vec<(String, String)>, String);
+
+/// Mount the experimental job list as a script: one answer per read, the last
+/// repeating — the shape a sequenced transcript read needs (a successful list,
+/// then a list that stopped reporting a job, then a failure).
+fn serve_job_script(server: &TestHttpServer, answers: Vec<JobAnswer>) {
+    let answers: Vec<ScriptedJobAnswer> = answers
+        .into_iter()
+        .map(|(status, headers, body)| {
+            (
+                status,
+                headers
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+                body,
+            )
+        })
+        .collect();
+    let served = Arc::new(AtomicUsize::new(0));
+    server.route_dynamic("GET", "/api/experimental/job", move |_| {
+        let index = served.fetch_add(1, Ordering::Relaxed).min(answers.len() - 1);
+        let (status, headers, body) = &answers[index];
+        let mut response = DynamicResponse::new(*status, "application/json", body.clone());
+        response.headers = headers.clone();
+        response
+    });
+}
+
+/// A hand-authored v2.4.2 running-job list (`packages/schema/src/job.ts` on the
+/// `v2.4.2` tag): one `codemode`, one `image` and one `video`, deliberately in
+/// an order the merge must not keep. The live 2.4.2 recording replaces it when
+/// the capture lands (spec #1220).
+fn running_jobs_body() -> String {
+    serde_json::json!({
+        "data": [
+            {
+                "id": "job_cc", "kind": "codemode", "sessionID": "ses_1",
+                "status": "running", "title": "code mode title",
+                "time": {"started": 3000},
+            },
+            {
+                "id": "job_img", "kind": "image", "sessionID": "ses_1",
+                "status": "running", "time": {"started": 1000},
+                "path": "/tmp/cover.png", "model": "img-model",
+            },
+            {
+                "id": "job_vid", "kind": "video", "sessionID": "ses_1",
+                "status": "running", "time": {"started": 2000},
+                "path": "/tmp/clip.mp4",
+            },
+        ]
+    })
+    .to_string()
+}
+
+/// The job-sourced task ids of a read, in row order.
+fn job_task_ids(transcript: &crate::backend::SessionTranscript) -> Vec<&str> {
+    transcript
+        .background_tasks
+        .iter()
+        .filter(|task| task.job_id.is_some())
+        .map(|task| task.tool.call_id.as_str())
+        .collect()
 }
 
 /// The V2 list envelope: entries expose the directory in `location.directory`
@@ -293,7 +365,6 @@ async fn transcript_follows_the_body_cursor_in_ascending_order() {
     let client = v2_wire_client(&server);
 
     let transcript = client.transcript("ses_1").await.unwrap();
-
     let ids: Vec<&str> = transcript.messages.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -328,8 +399,8 @@ async fn transcript_follows_the_body_cursor_in_ascending_order() {
 
     assert_eq!(
         wired_requests(&server).len(),
-        3,
-        "two pages plus the terminating empty page"
+        4,
+        "two message pages, the terminating empty page, then the job read"
     );
     let first = request_at(&server, 0);
     assert_eq!(first.path, "/api/session/ses_1/message");
@@ -346,6 +417,12 @@ async fn transcript_follows_the_body_cursor_in_ascending_order() {
             "a cursor must never be combined with order (V2 answers InvalidCursorError)"
         );
     }
+    let jobs = request_at(&server, 3);
+    assert_eq!(
+        jobs.path, "/api/experimental/job",
+        "the job read follows the transcript decode"
+    );
+    assert_eq!(jobs.query_param("sessionID").as_deref(), Some("ses_1"));
 }
 
 /// A failed transcript read names itself and carries the body preview; a
@@ -2815,4 +2892,212 @@ async fn session_diff_rejects_an_entry_missing_a_required_field() {
             "a missing `{field}` must fail the decode: {message}"
         );
     }
+}
+
+/// ADR-0118: the transcript read also reads the running job list — one request,
+/// running-only and descendant-inclusive — and appends its jobs after the
+/// transcript-derived rows. A successful read whose list no longer reports a
+/// job retires it, and a Wake naming one retires it in the same read even while
+/// the list still reports it.
+#[tokio::test]
+async fn transcript_appends_running_jobs_and_retires_them_on_later_reads() {
+    let server = TestHttpServer::start().await;
+    server.route_sequence(
+        "GET",
+        "/api/session/ses_1/message",
+        vec![
+            MockResponse::json(r#"{"data":[]}"#),
+            MockResponse::json(r#"{"data":[]}"#),
+            MockResponse::json(
+                serde_json::json!({
+                    "data": [{
+                        "id": "msg_wake",
+                        "type": "synthetic",
+                        "text": "wake",
+                        "time": {"created": 5000},
+                        "metadata": {"source": "codemode", "jobID": "job_img"},
+                    }]
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    serve_job_script(
+        &server,
+        vec![
+            (200, vec![], running_jobs_body()),
+            (200, vec![], r#"{"data":[]}"#.to_string()),
+            (200, vec![], running_jobs_body()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let first = client.transcript("ses_1").await.unwrap();
+    assert_eq!(
+        job_task_ids(&first),
+        ["job_img", "job_vid", "job_cc"],
+        "job rows append sorted by time.started"
+    );
+    assert_eq!(first.background_tasks[0].started_at, Some(1000));
+    assert_eq!(
+        first
+            .background_tasks
+            .iter()
+            .map(|task| task.tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["image", "video", "codemode"],
+        "the job's own kind is the row's type word"
+    );
+
+    let job_request = wired_requests(&server)
+        .into_iter()
+        .find(|request| request.path == "/api/experimental/job")
+        .expect("the transcript read pays the job read");
+    assert_eq!(
+        job_request.query_param("sessionID").as_deref(),
+        Some("ses_1"),
+        "the read is the session's own"
+    );
+    assert_eq!(
+        job_request.query_param("status").as_deref(),
+        Some("running"),
+        "the list is read running-only"
+    );
+    assert_eq!(
+        job_request.query_param("descendants").as_deref(),
+        Some("true"),
+        "a Child Job rides the same read"
+    );
+
+    let second = client.transcript("ses_1").await.unwrap();
+    assert!(
+        second.background_tasks.is_empty(),
+        "a successful list that no longer reports them retires the rows: {:#?}",
+        second.background_tasks
+    );
+
+    let third = client.transcript("ses_1").await.unwrap();
+    assert_eq!(
+        job_task_ids(&third),
+        ["job_vid", "job_cc"],
+        "the Wake retires job_img even though the list still reports it"
+    );
+}
+
+/// A failed job read never fails the transcript: it re-attaches the last
+/// successful rows unchanged, and a later success corroborates them.
+#[tokio::test]
+async fn a_failed_job_read_keeps_the_last_rows_and_still_returns_ok() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+    serve_job_script(
+        &server,
+        vec![
+            (200, vec![], running_jobs_body()),
+            (500, vec![], r#"{"message":"boom"}"#.to_string()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let first = client.transcript("ses_1").await.unwrap();
+    assert_eq!(job_task_ids(&first), ["job_img", "job_vid", "job_cc"]);
+
+    let second = client
+        .transcript("ses_1")
+        .await
+        .expect("a failed job read must never fail the transcript read");
+    assert_eq!(
+        second.background_tasks, first.background_tasks,
+        "the last successful rows come back unchanged and unmarked"
+    );
+}
+
+/// A 404 or 405 is the server's "no job surface": the read carries no job rows
+/// and blocks nothing, even after rows were seen — and it clears the cache, so
+/// a later failure invents nothing.
+#[tokio::test]
+async fn a_404_or_405_means_no_job_surface_and_drops_the_last_rows() {
+    for status in [404_u16, 405] {
+        let server = TestHttpServer::start().await;
+        server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+        serve_job_script(
+            &server,
+            vec![
+                (200, vec![], running_jobs_body()),
+                (status, vec![], r#"{"message":"no job surface"}"#.to_string()),
+                (500, vec![], r#"{"message":"boom"}"#.to_string()),
+            ],
+        );
+        let client = v2_wire_client(&server);
+
+        assert_eq!(
+            client.transcript("ses_1").await.unwrap().background_tasks.len(),
+            3
+        );
+        let gone = client.transcript("ses_1").await.unwrap();
+        assert!(
+            gone.background_tasks.is_empty(),
+            "HTTP {status} means no job surface: {:#?}",
+            gone.background_tasks
+        );
+        let later = client.transcript("ses_1").await.unwrap();
+        assert!(
+            later.background_tasks.is_empty(),
+            "HTTP {status} cleared the cache, so a later failure invents nothing: {:#?}",
+            later.background_tasks
+        );
+    }
+}
+
+/// A transport error on the job request is the same failure arm as a 5xx: the
+/// transcript read returns Ok and keeps the last rows. The fake server answers
+/// a redirect to a closed port, so the message page succeeds and the job
+/// request fails below HTTP.
+#[tokio::test]
+async fn a_transport_error_on_the_job_read_keeps_the_last_rows() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+    serve_job_script(
+        &server,
+        vec![
+            (200, vec![], running_jobs_body()),
+            (302, vec![("location", "http://127.0.0.1:1/")], String::new()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let first = client.transcript("ses_1").await.unwrap();
+    let second = client
+        .transcript("ses_1")
+        .await
+        .expect("a transport failure on the job read must never fail the transcript");
+    assert_eq!(
+        second.background_tasks, first.background_tasks,
+        "the last successful job rows stand"
+    );
+}
+
+/// The cache is per session: another session's failed read has no rows of its
+/// own, so it must not borrow the first session's.
+#[tokio::test]
+async fn the_job_cache_is_per_session() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+    server.route("GET", "/api/session/ses_2/message", 200, r#"{"data":[]}"#);
+    serve_job_script(
+        &server,
+        vec![
+            (200, vec![], running_jobs_body()),
+            (500, vec![], r#"{"message":"boom"}"#.to_string()),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    assert_eq!(job_task_ids(&client.transcript("ses_1").await.unwrap()).len(), 3);
+    let other = client.transcript("ses_2").await.unwrap();
+    assert!(
+        other.background_tasks.is_empty(),
+        "the cache is per V2Strategy attachment and per session: {:#?}",
+        other.background_tasks
+    );
 }

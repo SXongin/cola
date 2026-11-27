@@ -1900,6 +1900,7 @@ mod tests {
             shell_id: None,
             child_id: Some("thread_1".into()),
             started_at: Some(1),
+            ..Default::default()
         });
         assert!(run_suspects(&read, None).is_empty());
         assert!(read.run_is_task(&read.runs[0], &read.background_tasks[0]));

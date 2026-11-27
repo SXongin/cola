@@ -61,10 +61,12 @@ pub(crate) mod conformance;
 mod tests;
 
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::backend::{
-    ChildEvidence, ChildRuntime, PromptSkill, SessionTranscript, ShellRuntime, SkillInfo, TaskRuntime,
-    TurnDiff,
+    BackgroundTask, ChildEvidence, ChildRuntime, PromptSkill, SessionTranscript, ShellRuntime, SkillInfo,
+    TaskRuntime, TurnDiff,
 };
 use crate::error::Result;
 
@@ -139,6 +141,11 @@ const MODEL: &str = "/api/model";
 /// (ADR-0103). Its `{location, data: Mcp.Server[]}` envelope is the pull
 /// surface's statuses; connect/disconnect/add/remove stay out of scope.
 const MCP: &str = "/api/mcp";
+/// The experimental background-job list (`GET /api/experimental/job`,
+/// v2.4.2): a running job is a second Background Task source, discovered on
+/// the transcript read (ADR-0118). Experimental upstream, so a 404/405 means
+/// the server has no job surface and the read degrades silently.
+const JOB: &str = "/api/experimental/job";
 
 /// Hard stop for the body-cursor follow in [`V2Strategy::list_sessions`]: a
 /// misbehaving server must not spin the client forever. The server's default
@@ -162,6 +169,12 @@ pub(crate) struct V2Strategy {
     /// record carries no progress while a call runs, so this is where a live
     /// `subagent`'s child session id comes from.
     progress: progress::Progress,
+    /// The last successfully read job rows, per session (ADR-0118): a failed
+    /// job list read re-attaches them unchanged, so the card neither flickers
+    /// nor settles a live job. Process-local and per attachment — a reconnect
+    /// builds a fresh strategy, and a session's own rows never leak to
+    /// another.
+    jobs: Mutex<HashMap<String, Vec<BackgroundTask>>>,
 }
 
 /// The location-scoped list URL: V2 selects an instance/workspace with the
@@ -643,6 +656,25 @@ impl GenerationStrategy for V2Strategy {
         let mut transcript = wire::decode_messages(&data);
         transcript.truncated = truncated;
         self.progress.apply(session_id, &mut transcript);
+        // A running job is a second Background Task source (ADR-0118): read the
+        // job list after the progress overlay, merge the jobs no tool part
+        // already names, and keep the rows through a failed read. Best-effort
+        // throughout — the transcript read never fails on this request.
+        match self.running_jobs(http, session_id).await {
+            Ok(Some(jobs)) => {
+                wire::merge_job_tasks(&mut transcript, session_id, &jobs);
+                self.remember_job_rows(session_id, job_rows(&transcript));
+            }
+            // 404/405: the server has no job surface. No rows, no wait — and
+            // no stale rows from a previous attachment state.
+            Ok(None) => self.forget_job_rows(session_id),
+            Err(error) => {
+                tracing::debug!("session {session_id} job list: {error}; keeping the last job rows");
+                let cached = self.cached_job_rows(session_id);
+                let survivors = wire::attach_job_tasks(&mut transcript, &cached);
+                self.remember_job_rows(session_id, survivors);
+            }
+        }
         Ok(transcript)
     }
 
@@ -1197,11 +1229,87 @@ impl GenerationStrategy for V2Strategy {
 
 impl V2Strategy {
     /// A fresh strategy, with an empty live-progress cache (the reader starts
-    /// lazily on the first transcript read).
+    /// lazily on the first transcript read) and no cached job rows.
     pub(crate) fn new() -> Self {
         Self {
             progress: progress::Progress::new(),
+            jobs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The session's running jobs (`GET /api/experimental/job`,
+    /// v2.4.2, ADR-0118): ONE read, running-only and descendant-inclusive, so a
+    /// Child Job's rows ride the parent's card. `Ok(None)` is the server's
+    /// "no job surface" answer (404/405); any other failure — a 5xx, a
+    /// timeout, a transport error, an unparseable body — is an `Err` the
+    /// transcript read degrades to its last successful rows. Never fails the
+    /// transcript read itself.
+    async fn running_jobs(
+        &self,
+        http: &Transport,
+        session_id: &str,
+    ) -> Result<Option<Vec<wire::BackgroundJob>>> {
+        let mut url = reqwest::Url::parse(&http.url(JOB))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("sessionID", session_id);
+            query.append_pair("status", "running");
+            query.append_pair("descendants", "true");
+        }
+        let resp = http.client().get(url).send().await?;
+        let status = resp.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            // One debug line for the whole failure contract (ADR-0118): the
+            // transcript read logs the returned error, so this read must not
+            // log it too.
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::BridgeError::OpenCode(format!(
+                "job list failed: {status} — body: {}",
+                body_preview(&body)
+            )));
+        }
+        let text = resp.text().await?;
+        let body: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            crate::error::BridgeError::OpenCode(format!(
+                "job list parse: {error} — body: {}",
+                body_preview(&text)
+            ))
+        })?;
+        Ok(Some(wire::decode_job_list(&body)))
+    }
+
+    /// Keep the rows a successful job read left, so a later failure can
+    /// re-attach them (ADR-0118). An empty set clears the session's entry.
+    fn remember_job_rows(&self, session_id: &str, rows: Vec<BackgroundTask>) {
+        let mut cache = self.jobs.lock().expect("job row cache lock");
+        if rows.is_empty() {
+            cache.remove(session_id);
+        } else {
+            cache.insert(session_id.to_string(), rows);
+        }
+    }
+
+    /// The last successfully read job rows for `session_id`, empty when the
+    /// session has none.
+    fn cached_job_rows(&self, session_id: &str) -> Vec<BackgroundTask> {
+        self.jobs
+            .lock()
+            .expect("job row cache lock")
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Drop a session's cached rows: the server answered no job surface, so a
+    /// later failure must invent nothing.
+    fn forget_job_rows(&self, session_id: &str) {
+        self.jobs.lock().expect("job row cache lock").remove(session_id);
     }
 
     /// Durably admit one prompt (`POST /api/session/{id}/prompt`) with
@@ -1478,6 +1586,19 @@ impl V2Strategy {
             .await?;
         Ok(page.newest_assistant_retrying())
     }
+}
+
+/// The job-sourced rows of a transcript: the tasks a `GET
+/// /api/experimental/job` read contributed, in their read order. The failed-read
+/// cache keeps exactly these, so a re-attach can never outlive or duplicate a
+/// transcript-derived row (ADR-0118).
+fn job_rows(transcript: &SessionTranscript) -> Vec<BackgroundTask> {
+    transcript
+        .background_tasks
+        .iter()
+        .filter(|task| task.job_id.is_some())
+        .cloned()
+        .collect()
 }
 
 /// One output page as its neutral window (spec #588, ticket #592): the last

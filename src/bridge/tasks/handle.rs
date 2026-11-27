@@ -329,6 +329,7 @@ mod tests {
             shell_id: shell_id.map(str::to_string),
             child_id: None,
             started_at: Some(2_000),
+            ..Default::default()
         }
     }
 

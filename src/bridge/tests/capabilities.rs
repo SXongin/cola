@@ -335,6 +335,7 @@ async fn panel_liveness_follows_the_child_agent_axis() {
                 shell_id: None,
                 child_id: Some("ses_call_sub".into()),
                 started_at: Some(now - 30_000),
+                ..Default::default()
             }]);
     let (_dir, app, backend, platform) = scripted_app_prepared(
         vec![transcript],
@@ -437,6 +438,7 @@ async fn ledger_follows_reports_live_runs() {
         shell_id: Some("sh_bg".into()),
         child_id: None,
         started_at: Some(now - 5_000),
+        ..Default::default()
     }]);
     let (_dir, app, _backend, platform) = scripted_app_prepared(
         vec![transcript],

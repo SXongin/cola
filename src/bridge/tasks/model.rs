@@ -362,6 +362,7 @@ mod tests {
             shell_id: shell.map(str::to_string),
             child_id: child.map(str::to_string),
             started_at: None,
+            ..Default::default()
         };
         let shell = task("spawn_agent", None, Some("sh_1"));
         assert_eq!(task_kind(&shell), TaskKind::Shell);
