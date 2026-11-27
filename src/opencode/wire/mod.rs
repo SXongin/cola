@@ -102,5 +102,14 @@ pub(crate) fn v2_subagent_wake() -> RecordedResponse {
     RecordedResponse::parse(include_str!("fixtures/v2/subagent_wake.json"))
 }
 
+/// A real 2.4.2 background-subagent read: the launch part that returned its
+/// handle while its run kept going, and the child's completion Wake in 2.4's
+/// unified `<background-result kind="subagent" … description="…">` text.
+/// Sanitized like the other excerpts; the import endpoint recorded the same
+/// shapes the projector writes.
+pub(crate) fn v2_background_result_wake() -> RecordedResponse {
+    RecordedResponse::parse(include_str!("fixtures/v2/background_result_wake.json"))
+}
+
 #[cfg(test)]
 mod tests;

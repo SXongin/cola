@@ -939,16 +939,32 @@ fn decode_wake(message: &Value) -> Option<Wake> {
 }
 
 /// The finished work's label the Wake's own text named, when it named one: the
-/// shell command (`<shell … command="…">`) or the subagent's task description
-/// (`<subagent … description="…">`). The label is the backend's own tag
-/// attribute — never taken from the Wake's prose — and any other source has
-/// none.
+/// shell command or the subagent's task description. OpenCode 2.3 and earlier
+/// name it in a dedicated tag (`<shell … command="…">`, `<subagent …
+/// description="…">`); 2.4 folds every background result into one
+/// `<background-result kind="…">` block, where the same attribute rides beside
+/// its `kind`. The label is the backend's own tag attribute — never taken from
+/// the Wake's prose — and any other source has none.
 fn decode_wake_label(message: &Value, source: &WakeSource) -> Option<String> {
     let text = message.get("text").and_then(Value::as_str)?;
-    match source {
-        WakeSource::Shell => tag_attribute(text, "shell", "command"),
-        WakeSource::Subagent => tag_attribute(text, "subagent", "description"),
-        _ => None,
+    let (kind, attribute) = match source {
+        WakeSource::Shell => ("shell", "command"),
+        WakeSource::Subagent => ("subagent", "description"),
+        _ => return None,
+    };
+    tag_attribute(text, kind, attribute).or_else(|| background_result_attribute(text, kind, attribute))
+}
+
+/// The value of `attribute` in 2.4's unified `<background-result …>` block,
+/// only when its `kind` names the same source — a shell block never labels a
+/// subagent Wake.
+fn background_result_attribute(text: &str, kind: &str, attribute: &str) -> Option<String> {
+    let rest = &text[text.find("<background-result")?..];
+    let tag = &rest[..rest.find('>')?];
+    if tag_attribute(tag, "background-result", "kind").as_deref() == Some(kind) {
+        tag_attribute(tag, "background-result", attribute)
+    } else {
+        None
     }
 }
 
@@ -2359,6 +2375,94 @@ mod tests {
         assert_eq!(
             transcript.wakes[0].label.as_deref(),
             Some("sh -c 'echo hi > /tmp/x' &amp;&amp; true")
+        );
+    }
+
+    /// OpenCode 2.4 unified every background result into one
+    /// `<background-result kind="…">` block, so the Wake label moved from the
+    /// dedicated `<subagent>`/`<shell>` tag into its `description`/`command`
+    /// attribute. The 2.4.2 read also proves the launch is still a live task
+    /// and run before the child's Wake lands — the row the card shows.
+    #[test]
+    fn a_242_background_result_wake_keeps_its_label_and_its_live_launch() {
+        let recorded = crate::opencode::wire::v2_background_result_wake();
+        assert_eq!(recorded.capture.source, "opencode 2.4.2");
+        let data = fixture_data(&recorded);
+        let transcript = decode_messages(&data);
+
+        let wake = transcript
+            .wakes
+            .first()
+            .expect("the fixture carries the child's completion Wake");
+        assert_eq!(wake.source, WakeSource::Subagent);
+        assert_eq!(wake.child_id.as_deref(), Some("ses_child_fixture"));
+        assert_eq!(
+            wake.label.as_deref(),
+            Some("review the diff"),
+            "2.4 moved the label into `<background-result kind=\"subagent\" description=\"…\">`"
+        );
+        assert!(
+            transcript.background_tasks.is_empty(),
+            "the Wake retires the launch it names: {:#?}",
+            transcript.background_tasks
+        );
+
+        // Before the Wake, the same launch is the live task and its run.
+        let before: Vec<Value> = data
+            .iter()
+            .filter(|message| message.get("type").and_then(Value::as_str) != Some("synthetic"))
+            .cloned()
+            .collect();
+        let live = decode_messages(&before);
+        assert_eq!(
+            live.background_tasks.len(),
+            1,
+            "the launch is a live Background Task: {:#?}",
+            live.background_tasks
+        );
+        assert_eq!(
+            live.background_tasks[0].child_id.as_deref(),
+            Some("ses_child_fixture")
+        );
+        assert_eq!(live.runs.len(), 1, "and a live AgentRun: {:#?}", live.runs);
+        assert_eq!(live.runs[0].child_id.as_deref(), Some("ses_child_fixture"));
+    }
+
+    /// The 2.4 shell Wake uses the same unified block; its label is `command`,
+    /// and a block of another `kind` never lends its attribute to this source.
+    #[test]
+    fn a_242_shell_background_result_wake_reads_its_command() {
+        let mut wake = synthetic_wake(
+            "msg_wake_shell",
+            5_000,
+            serde_json::json!({
+                "source": "shell",
+                "shellID": "sh_fixture",
+                "jobID": "job_fixture",
+                "state": "completed",
+            }),
+        );
+        wake["text"] = Value::String(
+            "<background-result kind=\"shell\" id=\"job_fixture\" state=\"completed\" \
+             command=\"cargo test --all\">\nout\n</background-result>"
+                .into(),
+        );
+        let transcript = decode_messages(&[wake]);
+        assert_eq!(transcript.wakes[0].label.as_deref(), Some("cargo test --all"));
+
+        let mut wrong_kind = synthetic_wake(
+            "msg_wake_wrong_kind",
+            5_000,
+            serde_json::json!({"source": "subagent", "childID": "ses_child_fixture"}),
+        );
+        wrong_kind["text"] = Value::String(
+            "<background-result kind=\"shell\" id=\"job_fixture\" description=\"not a subagent\">\n</background-result>"
+                .into(),
+        );
+        let transcript = decode_messages(&[wrong_kind]);
+        assert_eq!(
+            transcript.wakes[0].label, None,
+            "a shell block never labels a subagent Wake"
         );
     }
 

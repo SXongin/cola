@@ -1,0 +1,84 @@
+{
+  "capture": {
+    "captured_at": "2026-11-27",
+    "command": "POST /api/experimental/session/import with a subagent launch and its completion wake, then curl -u \"opencode:$OPENCODE_SERVER_PASSWORD\" \"$OPENCODE_URL/api/session/<session>/message?order=asc&limit=200\"",
+    "generation": "v2",
+    "note": "Hand-sanitized excerpt (3 contiguous rows) of an unfiltered read of a real opencode 2.4.2 session created through the import endpoint: one completed `subagent` tool part whose metadata still says the run is `running`, and the child's completion Wake in 2.4's unified `<background-result kind=\"subagent\" … description=\"…\">` text (2.3 and earlier used a `<subagent …>` tag). Message/tool/child-session ids, times, prompts and free text are anonymized fixture values; wire field names, metadata keys and statuses are verbatim. The import endpoint serializes the same shapes the projector writes.",
+    "source": "opencode 2.4.2"
+  },
+  "response": {
+    "cursor": {
+      "next": "cursor_next_fixture",
+      "previous": "cursor_previous_fixture"
+    },
+    "data": [
+      {
+        "id": "msg_launch",
+        "time": {
+          "created": 1700000000000,
+          "completed": 1700000001000
+        },
+        "type": "assistant",
+        "agent": "build",
+        "model": {
+          "id": "scripted-model",
+          "providerID": "scripted"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_launch",
+            "name": "subagent",
+            "state": {
+              "status": "completed",
+              "input": {
+                "agent": "build",
+                "description": "review the diff",
+                "prompt": "review the diff"
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "The subagent is working in the background (sessionID: ses_child_fixture). You will receive a <background-result kind=\"subagent\"> message when it goes idle."
+                }
+              ],
+              "metadata": {
+                "sessionID": "ses_child_fixture",
+                "status": "running"
+              }
+            },
+            "time": {
+              "created": 1700000000000,
+              "ran": 1700000000000,
+              "completed": 1700000001000
+            }
+          }
+        ],
+        "finish": "tool-calls"
+      },
+      {
+        "id": "msg_idle",
+        "time": {
+          "created": 1700000002000
+        },
+        "type": "idle",
+        "outcome": "succeeded"
+      },
+      {
+        "id": "msg_wake",
+        "metadata": {
+          "source": "subagent",
+          "childID": "ses_child_fixture",
+          "agent": "build",
+          "state": "completed"
+        },
+        "time": {
+          "created": 1700000005000
+        },
+        "text": "<background-result kind=\"subagent\" sessionID=\"ses_child_fixture\" state=\"completed\" description=\"review the diff\">\nLooks good.\n</background-result>",
+        "description": "review the diff",
+        "type": "synthetic"
+      }
+    ]
+  }
+}
