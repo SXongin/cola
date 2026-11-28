@@ -847,22 +847,30 @@ fn opens_link_destination(line: &str, label_carry: usize) -> bool {
     let inline = line
         .strip_suffix("](")
         .is_some_and(|label| label_depth(label_carry, label) > 0);
-    // A reference definition's destination may open the next line too
-    // (`[a]:` + one line ending); its label cannot span a line, so it is
-    // checked on this line alone.
+    // A reference definition's destination may open the next line too, and its
+    // label may itself span lines (`[foo` / `bar]:`).
     let definition = line
         .strip_suffix(':')
-        .is_some_and(|label| ends_definition_label(label.trim_end_matches([' ', '\t'])));
+        .is_some_and(|label| ends_definition_label(label_carry, label.trim_end_matches([' ', '\t'])));
     inline || definition
 }
 
-/// Whether `text` ends a reference definition's label — up to three spaces, a
-/// bracketed label — so the colon that follows (not part of `text`) opens its
-/// destination.
-fn ends_definition_label(text: &str) -> bool {
+/// Whether `text` ends a reference definition's label, so the colon that
+/// follows (not part of `text`) opens its destination. A carried opener means
+/// the label began on an earlier line; otherwise it starts this line, up to
+/// three spaces of indentation.
+fn ends_definition_label(label_carry: usize, text: &str) -> bool {
+    let Some(content) = text.strip_suffix(']') else {
+        return false;
+    };
+    if label_depth(label_carry, content) == 0 {
+        return false;
+    }
+    if label_carry > 0 {
+        return true;
+    }
     let indent = text.len() - text.trim_start_matches(' ').len();
-    let label = text.trim_start_matches(' ');
-    indent <= 3 && label.starts_with('[') && label.ends_with(']')
+    indent <= 3 && text.trim_start_matches(' ').starts_with('[')
 }
 
 /// Whether the `<` at `start` is already the destination of an authored link —
@@ -881,7 +889,7 @@ fn is_link_destination(text: &str, start: usize, label_carry: usize) -> bool {
     // Reference definition: up to three spaces, the label, `:`, whitespace.
     before
         .strip_suffix(':')
-        .is_some_and(|label| ends_definition_label(label.trim_end_matches([' ', '\t'])))
+        .is_some_and(|label| ends_definition_label(label_carry, label.trim_end_matches([' ', '\t'])))
 }
 
 /// Whether `uri` is an absolute URI a CommonMark autolink can carry: a scheme
@@ -1166,10 +1174,21 @@ mod tests {
             CardMarkdown::new().clean("[docs\nmore](<https://example.com/x>)"),
             "[docs\nmore](&#60;https://example.com/x>)"
         );
-        // A reference definition's destination may also open the next line.
+        // A reference definition's destination may also open the next line,
+        // and its label may itself span lines.
         assert_eq!(
             CardMarkdown::new().clean("[a]:\n<https://example.com/x>"),
             "[a]:\n&#60;https://example.com/x>"
+        );
+        assert_eq!(
+            CardMarkdown::new().clean("[foo\nbar]: <https://example.com/x>"),
+            "[foo\nbar]: &#60;https://example.com/x>"
+        );
+        // A definition must start its line: the same brackets mid-line leave
+        // the autolink to rewrite.
+        assert_eq!(
+            escape_line("text [x]: <https://example.com/x>"),
+            "text [x]: [https://example.com/x](https://example.com/x)"
         );
         // A blank line ends the paragraph, so the carry resets.
         assert_eq!(
