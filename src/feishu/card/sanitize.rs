@@ -512,6 +512,9 @@ impl CardMarkdown {
         // its lines pass through verbatim (Feishu renders them literally, so
         // escaping inside would show the escape itself).
         let mut fence: Option<usize> = None;
+        // The previous line ended with an inline link's `](`, leaving this line
+        // to carry the destination (see [`escape_line_with`]).
+        let mut destination_open = false;
         while i < lines.len() {
             let line = lines[i];
             if let Some(open) = fence {
@@ -519,12 +522,14 @@ impl CardMarkdown {
                 if closes_fence(line, open) {
                     fence = None;
                 }
+                destination_open = false;
                 i += 1;
                 continue;
             }
             if let Some(open) = opens_fence(line) {
                 fence = Some(open);
                 out.push(line.to_string());
+                destination_open = false;
                 i += 1;
                 continue;
             }
@@ -545,10 +550,12 @@ impl CardMarkdown {
                     self.tables_left -= 1;
                     out.extend(lines[i..end].iter().map(|l| escape_line(l)));
                 }
+                destination_open = false;
                 i = end;
                 continue;
             }
-            out.push(escape_line(line));
+            out.push(escape_line_with(line, destination_open));
+            destination_open = opens_link_destination(line);
             i += 1;
         }
         out.join("\n")
@@ -618,6 +625,15 @@ fn closes_fence(line: &str, open: usize) -> bool {
 /// itself (#519). The span is therefore passed through exactly as authored,
 /// images included.
 fn escape_line(line: &str) -> String {
+    escape_line_with(line, false)
+}
+
+/// [`escape_line`] with the caller's knowledge of a construct the line break
+/// hides: `destination_open` says the PREVIOUS line ended with an inline link's
+/// `](` and no destination yet, so a `<uri>` opening this line is that link's
+/// destination (CommonMark allows one line ending in the gap) and keeps the
+/// escape, exactly like a destination on the same line.
+fn escape_line_with(line: &str, destination_open: bool) -> String {
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < line.len() {
@@ -649,7 +665,11 @@ fn escape_line(line: &str) -> String {
             continue;
         }
         if c == '<' {
-            let (expanded, end) = angle_expansion(line, i);
+            let (expanded, end) = if destination_open && line[..i].trim_matches([' ', '\t']).is_empty() {
+                (Cow::Borrowed(LESS_THAN_ESCAPE), i + 1)
+            } else {
+                angle_expansion(line, i)
+            };
             out.push_str(&expanded);
             i = end;
             continue;
@@ -728,6 +748,12 @@ fn autolink_span(text: &str, start: usize) -> Option<(usize, String)> {
         return None;
     }
     Some((close + 1, format!("[{uri}]({uri})")))
+}
+
+/// Whether `line` leaves an inline link's destination gap open — it ends with
+/// `](` — so a `<uri>` opening the NEXT line is that link's destination.
+fn opens_link_destination(line: &str) -> bool {
+    line.trim_end_matches([' ', '\t']).ends_with("](")
 }
 
 /// Whether the `<` at `start` is already the destination of an authored link —
@@ -925,6 +951,32 @@ mod tests {
         assert_eq!(
             escape_line("见 (<https://example.com/x>)"),
             "见 ([https://example.com/x](https://example.com/x))"
+        );
+    }
+
+    /// CommonMark allows one line ending in a link destination's gap: a `<uri>`
+    /// opening the line after `](` is still that link's destination and keeps
+    /// the escape. A line that only looks similar — the gap closed on an
+    /// earlier line — is prose again.
+    #[test]
+    fn an_autolink_destination_on_the_next_line_keeps_the_escape() {
+        assert_eq!(
+            CardMarkdown::new().clean("[docs](\n<https://example.com/x>)"),
+            "[docs](\n&#60;https://example.com/x>)"
+        );
+        assert_eq!(
+            CardMarkdown::new().clean("[docs](  \n  <https://example.com/x> )"),
+            "[docs](  \n  &#60;https://example.com/x> )"
+        );
+        assert_eq!(
+            CardMarkdown::new().clean("<https://example.com/x>\n见 <https://example.com/y>"),
+            "[https://example.com/x](https://example.com/x)\n见 \
+             [https://example.com/y](https://example.com/y)"
+        );
+        // A fence between the two lines closes the gap.
+        assert_eq!(
+            CardMarkdown::new().clean("[docs](\n```\nx\n```\n<https://example.com/x>"),
+            "[docs](\n```\nx\n```\n[https://example.com/x](https://example.com/x)"
         );
     }
 
