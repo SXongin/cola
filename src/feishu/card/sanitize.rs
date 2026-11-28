@@ -519,6 +519,9 @@ impl CardMarkdown {
         // The previous line ended with an inline link's `](`, leaving this line
         // to carry the destination (see [`escape_line_with`]).
         let mut destination_open = false;
+        // Link-label `[` openers the previous lines left unmatched, so a label
+        // split across a line break still recognises its `](`.
+        let mut label_carry = 0usize;
         while i < lines.len() {
             let line = lines[i];
             if let Some(open) = fence {
@@ -527,6 +530,7 @@ impl CardMarkdown {
                     fence = None;
                 }
                 destination_open = false;
+                label_carry = 0;
                 i += 1;
                 continue;
             }
@@ -534,6 +538,7 @@ impl CardMarkdown {
                 fence = Some(open);
                 out.push(line.to_string());
                 destination_open = false;
+                label_carry = 0;
                 i += 1;
                 continue;
             }
@@ -555,11 +560,18 @@ impl CardMarkdown {
                     out.extend(lines[i..end].iter().map(|l| escape_line(l)));
                 }
                 destination_open = false;
+                label_carry = 0;
                 i = end;
                 continue;
             }
-            out.push(escape_line_with(line, destination_open));
-            destination_open = opens_link_destination(line);
+            if line.trim().is_empty() {
+                // Inline parsing does not cross a blank line.
+                destination_open = false;
+                label_carry = 0;
+            }
+            out.push(escape_line_with(line, destination_open, label_carry));
+            destination_open = opens_link_destination(line, label_carry);
+            label_carry = label_depth(label_carry, line);
             i += 1;
         }
         out.join("\n")
@@ -629,15 +641,16 @@ fn closes_fence(line: &str, open: usize) -> bool {
 /// itself (#519). The span is therefore passed through exactly as authored,
 /// images included.
 fn escape_line(line: &str) -> String {
-    escape_line_with(line, false)
+    escape_line_with(line, false, 0)
 }
 
-/// [`escape_line`] with the caller's knowledge of a construct the line break
+/// [`escape_line`] with the caller's knowledge of the constructs a line break
 /// hides: `destination_open` says the PREVIOUS line ended with an inline link's
 /// `](` and no destination yet, so a `<uri>` opening this line is that link's
 /// destination (CommonMark allows one line ending in the gap) and keeps the
-/// escape, exactly like a destination on the same line.
-fn escape_line_with(line: &str, destination_open: bool) -> String {
+/// escape; `label_carry` is the previous line's unmatched link-label `[` count,
+/// so a label that spans the break still recognises its `](`.
+fn escape_line_with(line: &str, destination_open: bool, label_carry: usize) -> String {
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
     while i < line.len() {
@@ -673,7 +686,9 @@ fn escape_line_with(line: &str, destination_open: bool) -> String {
                 // `\<…>` is literal text, not an autolink: escape it like any
                 // other `<` so the backslash keeps escaping the bracket.
                 (Cow::Borrowed(LESS_THAN_ESCAPE), i + 1)
-            } else if destination_open && line[..i].trim_matches([' ', '\t']).is_empty() {
+            } else if (destination_open && line[..i].trim_matches([' ', '\t']).is_empty())
+                || is_link_destination(line, i, label_carry)
+            {
                 (Cow::Borrowed(LESS_THAN_ESCAPE), i + 1)
             } else {
                 angle_expansion(line, i)
@@ -747,9 +762,6 @@ fn code_span(line: &str, start: usize) -> Option<(usize, &str)> {
 /// autolink — a Feishu tag, or a URI that would not survive the rewrite — so
 /// the caller falls back to the `<` escape.
 fn autolink_span(text: &str, start: usize) -> Option<(usize, String)> {
-    if is_link_destination(text, start) {
-        return None;
-    }
     let close = start + 1 + text[start + 1..].find('>')?;
     let uri = &text[start + 1..close];
     if !is_autolink_uri(uri) {
@@ -811,46 +823,42 @@ fn balanced_parens(uri: &str) -> bool {
     depth == 0
 }
 
-/// Whether `line` leaves an inline link's destination gap open — it ends with a
-/// link label's `](` — so a `<uri>` opening the NEXT line is that link's
-/// destination. The `]` needs its `[` opener: `literal](` is prose.
-fn opens_link_destination(line: &str) -> bool {
-    line.trim_end_matches([' ', '\t'])
-        .strip_suffix("](")
-        .is_some_and(has_link_label)
-}
-
-/// Whether `text` carries an unescaped `[` that can open the link label whose
-/// `]` follows it (the `]` itself is not part of `text`): a nested bracket pair
-/// is balanced away, and an escaped bracket does not count.
-fn has_link_label(text: &str) -> bool {
-    let mut depth = 0usize;
-    let mut i = text.len();
-    while i > 0 {
-        let c = text[..i].chars().next_back().expect("index on a char boundary");
-        i -= c.len_utf8();
+/// The link-label `[` openers `line` leaves unmatched, starting from `carry`
+/// (the previous line's count, so a label may span the line break CommonMark
+/// allows). An escaped bracket does not count, and a `]` with nothing to close
+/// is literal text.
+fn label_depth(carry: usize, line: &str) -> usize {
+    let mut depth = carry;
+    for (i, c) in line.char_indices() {
         match c {
-            ']' if !escaped_by_backslash(text, i) => depth += 1,
-            '[' if !escaped_by_backslash(text, i) => {
-                if depth == 0 {
-                    return true;
-                }
-                depth -= 1;
-            }
+            '[' if !escaped_by_backslash(line, i) => depth += 1,
+            ']' if !escaped_by_backslash(line, i) => depth = depth.saturating_sub(1),
             _ => {}
         }
     }
-    false
+    depth
+}
+
+/// Whether `line` leaves an inline link's destination gap open — it ends with a
+/// link label's `](` — so a `<uri>` opening the NEXT line is that link's
+/// destination. The `]` needs its `[` opener: `literal](` is prose.
+fn opens_link_destination(line: &str, label_carry: usize) -> bool {
+    line.trim_end_matches([' ', '\t'])
+        .strip_suffix("](")
+        .is_some_and(|label| label_depth(label_carry, label) > 0)
 }
 
 /// Whether the `<` at `start` is already the destination of an authored link —
 /// `[a](<https://x>)` or a reference definition's `[a]: <https://x>` — where
 /// the rewrite would put link syntax inside the destination and break it. The
 /// escape leaves the pointy destination intact once the platform decodes it.
-fn is_link_destination(text: &str, start: usize) -> bool {
+fn is_link_destination(text: &str, start: usize, label_carry: usize) -> bool {
     let before = text[..start].trim_end_matches([' ', '\t']);
     // Inline link: a label's `](` immediately before the destination's `<`.
-    if before.strip_suffix("](").is_some_and(has_link_label) {
+    if before
+        .strip_suffix("](")
+        .is_some_and(|label| label_depth(label_carry, label) > 0)
+    {
         return true;
     }
     // Reference definition: up to three spaces, the label, `:`, whitespace.
@@ -1084,10 +1092,20 @@ mod tests {
             escape_line("见 (<https://example.com/x>)"),
             "见 ([https://example.com/x](https://example.com/x))"
         );
-        // A `](` with no `[` opener is prose, not a link: the autolink is real.
+        // An empty label is still a link label.
+        assert_eq!(
+            escape_line("[](<https://example.com/x>)"),
+            "[](&#60;https://example.com/x>)"
+        );
+        // A `](` with no `[` opener is prose, not a link: the autolink is real —
+        // including after a link that already closed.
         assert_eq!(
             escape_line("literal](<https://example.com/x>)"),
             "literal]([https://example.com/x](https://example.com/x))"
+        );
+        assert_eq!(
+            escape_line("[a](x)](<https://example.com/x>)"),
+            "[a](x)]([https://example.com/x](https://example.com/x))"
         );
         assert_eq!(
             escape_line(r"\[docs](<https://example.com/x>)"),
@@ -1118,6 +1136,12 @@ mod tests {
         assert_eq!(
             CardMarkdown::new().clean("[docs](\n```\nx\n```\n<https://example.com/x>"),
             "[docs](\n```\nx\n```\n[https://example.com/x](https://example.com/x)"
+        );
+        // A label may span the line break: the opener on the first line still
+        // makes the second line's `](` a destination.
+        assert_eq!(
+            CardMarkdown::new().clean("[docs\nmore](<https://example.com/x>)"),
+            "[docs\nmore](&#60;https://example.com/x>)"
         );
         // Without a `[` opener the `](` is prose, so the next line's autolink
         // is genuine and rewrites (#1233 gate, round 2).
