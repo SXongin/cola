@@ -76,11 +76,12 @@ pub(crate) enum WakeContinuation {
     ///   pushed once.
     ///
     /// `wake_id` is the completion this resume takes over, when there is one,
-    /// marked as such under the delivery's own write lock — so a later tail
-    /// past it keeps resuming this card, and the resume is never re-decided. A
-    /// Wake-less tail carries `None`. Decided only for the state this delivery
-    /// admits ([`ownership::admits_ledger_refresh`]), so a decision and its
-    /// write can never disagree about which card resumes.
+    /// marked as such under the delivery's own write lock and only once the
+    /// resume's flush is accepted — so a later tail past it keeps resuming this
+    /// card, while a refused write leaves the completion owed for the next
+    /// card. A Wake-less tail carries `None`. Decided only for the state this
+    /// delivery admits ([`ownership::admits_ledger_refresh`]), so a decision
+    /// and its write can never disagree about which card resumes.
     ResumeInPlace { wake_id: Option<String> },
     /// A card chain exists: a GENUINE resumption the chain has not handed over
     /// yet (a restart, an interruption, a shell/subagent completion on a card
