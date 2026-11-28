@@ -928,8 +928,8 @@ mod tests {
             "[http://a.example/p?q=1](http://a.example/p?q=1) 和 \
              [mailto:dev@example.com](mailto:dev@example.com)"
         );
-        // Balanced parentheses are part of the destination; unbalanced ones
-        // would close the link early, so such a URI is not rewritten.
+        // A URI's own parentheses belong to the destination, so they are
+        // percent-encoded rather than ending the link early.
         assert_eq!(
             escape_line("<https://en.wikipedia.org/wiki/Foo_(bar)>"),
             "[https://en.wikipedia.org/wiki/Foo&#95;(bar)](https://en.wikipedia.org/wiki/Foo_%28bar%29)"
