@@ -2221,13 +2221,15 @@ pub(super) fn wake_work_covered(
 /// is not already on the timeline, and its entry was neither announced nor
 /// handed over — so a notice the card already shows never resumes it twice.
 ///
-/// A run whose **Evidence** ending is already recorded — or announced by this
-/// chain for a retirement committed in this life — has no completion entry to
-/// render at all ([`plan_wake_entries`] suppresses it as the same fact twice,
-/// issue #659), so its notice is not content either. The two gates and the run
-/// key are the plan's own ([`wake_run`]), so the probe and the plan cannot
-/// disagree: counting the notice would resume the card with the resuming header
-/// and an empty body (#1229).
+/// A run whose completion entry the plan suppresses has no content to render, so
+/// its notice is not content either: an **Evidence** ending already recorded (or
+/// announced by this chain for a retirement committed in this life — the same
+/// fact twice, issue #659), or the run's own **Wake** ending already spoken for
+/// ([`wake_ending_spoken_for`], ADR-0080 — one ending serves the run, so a
+/// second Wake naming it plans nothing). Both gates, the run key and the exact
+/// predicates are the plan's own ([`wake_run`]), so the probe and the plan
+/// cannot disagree: counting the notice would resume the card with the resuming
+/// header and an empty body (#1229).
 pub(super) fn wake_renders_new_content(
     acc: &StreamAccumulator,
     transcript: &SessionTranscript,
@@ -2262,9 +2264,22 @@ pub(super) fn wake_renders_new_content(
     // reads the facts again under the write lock; an ending recorded in that gap
     // is the bounded residue, not a second rule.
     let retired = wake_retired_task(wake, transcript);
-    if let Some(run) = wake_run(wake, retired.as_ref())
-        && (facts.recorded(&run, TaskEndingClass::Evidence)
-            || acc.ending_announced(&run, TaskEndingClass::Evidence))
+    let run = wake_run(wake, retired.as_ref());
+    if let Some(run) = &run
+        && (facts.recorded(run, TaskEndingClass::Evidence)
+            || acc.ending_announced(run, TaskEndingClass::Evidence))
+    {
+        return false;
+    }
+    // The run's OWN Wake ending being spoken for suppresses the entry too
+    // (ADR-0080), and the gate is the run's, not the Wake's: two distinct
+    // completion Wakes can name ONE run, and once the first Wake's ending is
+    // SHOWN the plan skips the second's entry as well — even though that
+    // second Wake's own id was never announced. The probe must ask the same
+    // question, or it counts the second notice as content and resumes the card
+    // with no entry to render (#1229).
+    if let Some(run) = &run
+        && wake_ending_spoken_for(facts, acc, run)
     {
         return false;
     }

@@ -4824,28 +4824,7 @@ async fn a_job_notice_for_an_evidence_ended_run_does_not_resume_the_card() {
     );
 
     let (wake, notice) = video_notice(2_900, JOB, PATH);
-    // The runtime already declared the run lost: the durable Evidence ending is
-    // recorded BEFORE the late notice reaches the read, exactly as a process
-    // that saw `已失联` and then a `completed` notice would.
     let run = crate::backend::runs::RunKey::of_wake(&wake).expect("the job Wake names its run");
-    cards.chains.record_ending(
-        "ses_test",
-        &run,
-        crate::backend::runs::TaskEnding {
-            class: crate::backend::runs::TaskEndingClass::Evidence,
-            state: crate::backend::runs::TaskEndingState::Shown,
-            finished_at: Some(2_500),
-            evidence: None,
-            identity: crate::backend::runs::TaskRunIdentity {
-                tool: Some("video".into()),
-                call_id: Some("call_lost".into()),
-                started_at: Some(1_500),
-                label: Some(PATH.into()),
-                ..Default::default()
-            },
-        },
-    );
-
     let read = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "生成一个视频"),
         assistant(2_000, "已经交给后台了。"),
@@ -4865,6 +4844,45 @@ async fn a_job_notice_for_an_evidence_ended_run_does_not_resume_the_card() {
             .iter()
             .all(|message| message.time.is_some_and(|time| time.created < 2_900)),
         "no assistant content after the notice"
+    );
+    // Control: with no Evidence ending spoken for, this same notice IS content
+    // and resumes — so the suppression below is the gate's work, and this test
+    // cannot pass with the probe absent.
+    assert!(
+        matches!(
+            Turn::wake_continuation(
+                &cards,
+                "ses_test",
+                &read,
+                &turn_anchor(1_000),
+                crate::backend::AgentCapabilities::full(),
+            )
+            .await,
+            Some(crate::bridge::turn::WakeContinuation::ResumeInPlace { wake_id: Some(ref id) })
+                if id == "msg_wake_2900"
+        ),
+        "the control: the notice alone resumes when no Evidence ending claims the run"
+    );
+
+    // The runtime already declared the run lost: the durable Evidence ending is
+    // recorded BEFORE the late notice reaches the read, exactly as a process
+    // that saw `已失联` and then a `completed` notice would.
+    cards.chains.record_ending(
+        "ses_test",
+        &run,
+        crate::backend::runs::TaskEnding {
+            class: crate::backend::runs::TaskEndingClass::Evidence,
+            state: crate::backend::runs::TaskEndingState::Shown,
+            finished_at: Some(2_500),
+            evidence: None,
+            identity: crate::backend::runs::TaskRunIdentity {
+                tool: Some("video".into()),
+                call_id: Some("call_lost".into()),
+                started_at: Some(1_500),
+                label: Some(PATH.into()),
+                ..Default::default()
+            },
+        },
     );
     assert!(
         Turn::wake_continuation(
@@ -4897,6 +4915,200 @@ async fn a_job_notice_for_an_evidence_ended_run_does_not_resume_the_card() {
         Turn::card_state(&cards, "ses_test").await,
         Some(CardState::Waiting),
         "the card keeps its wait"
+    );
+}
+
+/// Issue #1229 (gate round 2): a run's Wake ending is ONE exactly-once fact
+/// (ADR-0080), so two distinct completion Wakes naming the same job both lose
+/// their entry once it is SHOWN — [`plan_wake_entries`](crate::bridge::turn::render)
+/// skips the second through [`wake_ending_spoken_for`], though that Wake's own
+/// id was never announced. The probe must ask the plan's run-level question, or
+/// it counts the second notice as content and resumes the card with nothing to
+/// render. The control pins the other side: with no ending spoken for, the same
+/// notice IS content and resumes.
+#[tokio::test]
+async fn a_second_wake_for_a_run_whose_wake_ending_is_shown_does_not_resume_the_card() {
+    const JOB: &str = "video_job_twice";
+    const PATH: &str = "/tmp/out/twice.mp4";
+    let _wd = test_work_dir();
+    let yielding = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_twice", JOB, PATH),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![live_video_job(1_500, JOB, PATH)]);
+    let (_dir, app, _backend, _platform) = scripted_app(vec![yielding], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "生成一个视频"))
+        .await
+        .unwrap();
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Waiting),
+        "the live video job yields the card"
+    );
+
+    // Two DISTINCT completion Wakes for one job run, each with its own notice.
+    let (first, first_notice) = video_notice(2_900, JOB, PATH);
+    let (second, second_notice) = video_notice(3_100, JOB, PATH);
+    let read = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_twice", JOB, PATH),
+        first_notice,
+        second_notice,
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_wakes(vec![first, second]);
+
+    // Control: nothing is spoken for yet, so the newest notice is content and
+    // the yielded card resumes for it. This assertion also fails if the probe
+    // is simply absent, so the gate test cannot pass for the wrong reason.
+    assert!(
+        matches!(
+            Turn::wake_continuation(
+                &cards,
+                "ses_test",
+                &read,
+                &turn_anchor(1_000),
+                crate::backend::AgentCapabilities::full(),
+            )
+            .await,
+            Some(crate::bridge::turn::WakeContinuation::ResumeInPlace { wake_id: Some(ref id) })
+                if id == "msg_wake_3100"
+        ),
+        "the control: an unspoken-for notice is content and resumes the card"
+    );
+
+    // The FIRST Wake's entry was already shown by an earlier card: the run's
+    // Wake ending is SHOWN, so the plan suppresses the SECOND Wake's entry too
+    // (one ending serves the run, ADR-0080) even though its id was never
+    // announced. The probe must agree — otherwise it counts that notice and
+    // resumes with nothing to render.
+    let run = crate::backend::runs::RunKey::of_wake(&read.wakes[1]).expect("the job Wake names its run");
+    cards.chains.record_ending(
+        "ses_test",
+        &run,
+        crate::backend::runs::TaskEnding {
+            class: crate::backend::runs::TaskEndingClass::Wake,
+            state: crate::backend::runs::TaskEndingState::Shown,
+            finished_at: Some(2_900),
+            evidence: None,
+            identity: crate::backend::runs::TaskRunIdentity {
+                tool: Some("video".into()),
+                call_id: Some("call_twice".into()),
+                started_at: Some(1_500),
+                label: Some(PATH.into()),
+                ..Default::default()
+            },
+        },
+    );
+    assert!(
+        Turn::wake_continuation(
+            &cards,
+            "ses_test",
+            &read,
+            &turn_anchor(1_000),
+            crate::backend::AgentCapabilities::full(),
+        )
+        .await
+        .is_none(),
+        "a run whose Wake ending is already shown plans no entry for a second Wake either, so it owes no resume"
+    );
+}
+
+/// Issue #1229 (gate round 2): a permanently refused resume PATCH must not mark
+/// the Wake as handed over. The mark used to land before the flush, so the next
+/// poll's probe read the notice as already taken over and returned `None` — the
+/// synthetic notice lives outside the assistant Turn window, so no later read
+/// could render it. Recording the handoff only on an accepted write (delivered,
+/// or owed by the delivery layer) keeps the Wake from being recorded as taken
+/// over by a card that never showed it.
+#[tokio::test]
+async fn a_refused_resume_leaves_the_wake_unhanded_over() {
+    const JOB: &str = "video_job_refused";
+    const PATH: &str = "/tmp/out/refused.mp4";
+    let _wd = test_work_dir();
+    let yielding = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_refused", JOB, PATH),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![live_video_job(1_500, JOB, PATH)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![yielding], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "生成一个视频"))
+        .await
+        .unwrap();
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Waiting),
+        "the live video job yields the card"
+    );
+
+    let (wake, notice) = video_notice(2_900, JOB, PATH);
+    let read = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_refused", JOB, PATH),
+        notice,
+    ])
+    .with_executions(vec![execution(2_500), execution(3_500)])
+    .with_wakes(vec![wake]);
+    assert!(
+        matches!(
+            Turn::wake_continuation(
+                &cards,
+                "ses_test",
+                &read,
+                &turn_anchor(1_000),
+                crate::backend::AgentCapabilities::full(),
+            )
+            .await,
+            Some(crate::bridge::turn::WakeContinuation::ResumeInPlace { wake_id: Some(ref id) })
+                if id == "msg_wake_2900"
+        ),
+        "the control: the notice alone decides the in-place resume"
+    );
+
+    // Feishu permanently refuses the resume's PATCH. The carrier must report
+    // the refusal and leave the completion owed, not taken over.
+    platform.fail_update(UpdateFailure::Permanent, 1);
+    let backend: Arc<dyn crate::backend::Backend> = backend.clone();
+    assert!(
+        !Turn::resume_yielded_card(
+            &cards,
+            &backend,
+            "ses_test",
+            Some("msg_wake_2900"),
+            &read,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await,
+        "a permanently refused resume write is not accepted"
+    );
+    assert!(
+        !Turn::has_handed_over_wake(&cards, "ses_test", "msg_wake_2900").await,
+        "a refused resume must not mark the Wake as handed over: the notice is still owed"
+    );
+    // A later decision pass must never record the handoff either — the mark is
+    // the accepted write's fact, not the decision's. (The card that refused the
+    // PATCH keeps its resuming header in memory and the entry stays committed to
+    // this accumulator, so the same-card retry is the later card's/restart's
+    // claim of the owed entry; the handoff itself must not stand in its way.)
+    let _ = Turn::wake_continuation(
+        &cards,
+        "ses_test",
+        &read,
+        &turn_anchor(1_000),
+        crate::backend::AgentCapabilities::full(),
+    )
+    .await;
+    assert!(
+        !Turn::has_handed_over_wake(&cards, "ses_test", "msg_wake_2900").await,
+        "no later poll marks a handoff whose write never landed"
     );
 }
 

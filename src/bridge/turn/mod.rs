@@ -3232,9 +3232,10 @@ impl Turn {
     /// This is also the in-place render of a Wake-less tail and of a resumption
     /// card's further work (spec #602): the same resume, so no second
     /// continuation card ever opens on an already-resumed chain. `wake_id` is
-    /// the completion this resume takes over, marked as such in the same locked
-    /// write so the resume is never re-decided; `None` for a Wake-less tail,
-    /// which has no completion to announce or hand over.
+    /// the completion this resume takes over; it is marked as handed over only
+    /// once the flush is accepted (delivered or owed), so a refused write leaves
+    /// it un-handed-over for the next poll to retry. `None` for a Wake-less
+    /// tail, which has no completion to announce or hand over.
     ///
     /// The flush keeps [`SplitPolicy::Allow`]: a resumed run that outgrows one
     /// card still finalizes it and continues the chain on a new one (ADR-0066
@@ -3295,22 +3296,33 @@ impl Turn {
                 plans,
                 backend.reports_live_runs(),
             );
-            // The chain has taken this completion's work over, when there is
-            // one. Its entry may already be on the card (a yielded ledger
-            // refresh placed it while the work was unrendered): the
-            // announcement set stays untouched, so the entry is never doubled
-            // — only the handoff is recorded. A Wake-less tail marks nothing.
-            if let Some(wake_id) = wake_id {
-                card.acc.hand_over_wake(wake_id);
-            }
+            // The completion's entry may already be on the card (a yielded
+            // ledger refresh placed it while the work was unrendered): the
+            // announcement set stays untouched, so the entry is never doubled.
+            // The handoff itself is recorded only once the write below is
+            // accepted — see there.
             card.acc.set_resuming();
         }
         // The carrier answer is the write's (review, PR #595): a permanently
         // refused resume never reached the card, so the caller records nothing
         // and does not treat the chain as resumed.
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow)
+        let accepted = flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow)
             .await
-            .accepted()
+            .accepted();
+        // Record the handoff only for an accepted write (delivered, or owed by
+        // the delivery layer's retry): a refused PATCH reaches no card, so the
+        // truthful state is "not handed over". The entry stays owed for a later
+        // card or a restart — the same accumulator had already announced it
+        // before the flush, so this card does not retry it. Marked under the
+        // same write lock as the flush — after it — so a concurrent poll can
+        // never observe a handed-over Wake on a card that did not take it.
+        if accepted
+            && let Some(wake_id) = wake_id
+            && let Some(mut card) = cards.card(session_id).await
+        {
+            card.acc.hand_over_wake(wake_id);
+        }
+        accepted
     }
 
     /// Land a later Wake-less tail on the chain's ONE already-posted neutral
