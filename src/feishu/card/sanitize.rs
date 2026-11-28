@@ -23,6 +23,14 @@
 //!   longer applies: every `<` outside a well-formed code context stays
 //!   escaped, and a span that does break the parser falls through to the
 //!   fenced retry like any other rejection.
+//! - a CommonMark autolink (`<https://…>`) becomes an explicit link
+//!   (`[https://…](https://…)`) before the escape above can touch it (#1175).
+//!   The platform decodes `&#60;` back to a literal `<`, which takes the
+//!   autolink apart: the brackets become visible text and the trailing `>`
+//!   joins the URL Feishu's bare-URL detection finds. Only a URI with a real
+//!   scheme is rewritten, so the platform's own tags (`<link>`, `<at>`,
+//!   `<number_tag>`) keep being escaped, and a malformed URI falls back to the
+//!   escape rather than a broken link.
 //! - markdown images outside code become plain links (an image key must be
 //!   uploaded by the app; the model cannot hold one, so `![…](…)` is always an
 //!   invalid key),
@@ -90,8 +98,9 @@ pub(crate) fn sanitize_markdown(text: &str) -> String {
 }
 
 /// The JSON-string bytes the card will carry for `text`, EXACTLY: the
-/// sanitizer's content expansion (`<` becomes the five-byte `&#60;`, what
-/// [`CardMarkdown::clean`] does outside a code context) applied first, then the
+/// sanitizer's content expansion (a valid autolink becomes an explicit link,
+/// any other `<` becomes the five-byte `&#60;`, what [`CardMarkdown::clean`]
+/// does outside a code context) applied first, then the
 /// text encoded as a JSON string value by [`serde_json`] — so control
 /// characters (`\u0000` costs six), quotes, backslashes and non-ASCII are
 /// measured by the encoder that will write them, with no per-character table to
@@ -110,13 +119,40 @@ pub(crate) fn sanitize_markdown(text: &str) -> String {
 /// the callers add on top, and the element's own character cap bounds it.
 pub(crate) fn serialized_len(text: &str) -> usize {
     let expanded = if text.contains('<') {
-        text.replace('<', LESS_THAN_ESCAPE)
+        expand_angle_brackets(text)
     } else {
         text.to_string()
     };
     serde_json::to_string(&expanded)
         .map(|quoted| quoted.len().saturating_sub(2))
         .unwrap_or_else(|_| expanded.len())
+}
+
+/// The whole text with every angle-bracket expansion the card path applies,
+/// context-blind (code contexts included): a valid autolink becomes an
+/// explicit link and any other `<` becomes [`LESS_THAN_ESCAPE`]. This is
+/// [`serialized_len`]'s measure; charging a code context that will render
+/// verbatim is an over-charge, the safe direction for a size cap.
+fn expand_angle_brackets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let c = text[i..].chars().next().expect("index on a char boundary");
+        if c == '<' {
+            match autolink_span(text, i) {
+                Some((end, link)) => {
+                    out.push_str(&link);
+                    i = end;
+                    continue;
+                }
+                None => out.push_str(LESS_THAN_ESCAPE),
+            }
+        } else {
+            out.push(c);
+        }
+        i += c.len_utf8();
+    }
+    out
 }
 
 /// The markdown construction a delivered prefix leaves open at its cut point
@@ -604,7 +640,14 @@ fn escape_line(line: &str) -> String {
             continue;
         }
         if c == '<' {
-            out.push_str(LESS_THAN_ESCAPE);
+            match autolink_span(line, i) {
+                Some((end, link)) => {
+                    out.push_str(&link);
+                    i = end;
+                    continue;
+                }
+                None => out.push_str(LESS_THAN_ESCAPE),
+            }
         } else if c == '!' && line[i..].starts_with("![") {
             match image_span(line, i) {
                 Some((end, link)) => {
@@ -660,6 +703,65 @@ fn code_span(line: &str, start: usize) -> Option<(usize, &str)> {
         i += c.len_utf8();
     }
     None
+}
+
+/// Rewrite the CommonMark autolink starting at `start` (the `<`) into an
+/// explicit link — `<https://example.com/x>` becomes
+/// `[https://example.com/x](https://example.com/x)` (#1175) — so the `<` escape
+/// cannot leave the brackets visible with a `>` for Feishu's bare-URL
+/// detection to swallow. Returns the byte offset just past the
+/// closing `>` and the rewritten text, or `None` when the span is not an
+/// autolink — a Feishu tag, or a URI that would not survive the rewrite — so
+/// the caller falls back to the `<` escape.
+fn autolink_span(text: &str, start: usize) -> Option<(usize, String)> {
+    let close = start + 1 + text[start + 1..].find('>')?;
+    let uri = &text[start + 1..close];
+    if !is_autolink_uri(uri) {
+        return None;
+    }
+    Some((close + 1, format!("[{uri}]({uri})")))
+}
+
+/// Whether `uri` is a CommonMark absolute URI (scheme, colon, rest) that can be
+/// dropped unchanged into both halves of `[text](dest)`: no whitespace, control
+/// character, `<`, `>`, and no `[`/`]`/`\` (they would break the link's own
+/// syntax), with balanced parentheses in the destination (an unbalanced `)`
+/// would close it early).
+fn is_autolink_uri(uri: &str) -> bool {
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return false;
+    };
+    // CommonMark: 2–32 characters, an ASCII letter first, then letters,
+    // digits, `+`, `.` or `-`.
+    if !(2..=32).contains(&scheme.len()) {
+        return false;
+    }
+    let mut chars = scheme.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    {
+        return false;
+    }
+    if rest.is_empty() {
+        return false;
+    }
+    let mut depth = 0i64;
+    for c in rest.chars() {
+        if c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '[' | ']' | '\\') {
+            return false;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Rewrite the markdown image starting at `start` (the `!`) into a plain
@@ -730,6 +832,74 @@ mod tests {
             "a &#60;number_tag> b [x](./x.png)"
         );
         assert_eq!(escape_line("`<a>` <b>"), "`<a>` &#60;b>");
+    }
+
+    /// A model-written CommonMark autolink (#1175) rewrites to an explicit
+    /// link: the `<` escape would decode back to a literal `<` and leave the
+    /// trailing `>` for Feishu's bare-URL detection to swallow. A scheme-less
+    /// Feishu tag stays escaped, and a malformed URI is left to the escape.
+    #[test]
+    fn a_model_written_autolink_becomes_an_explicit_link() {
+        assert_eq!(
+            CardMarkdown::new().clean("见 <https://example.com/x>"),
+            "见 [https://example.com/x](https://example.com/x)"
+        );
+        assert_eq!(
+            escape_line("<http://a.example/p?q=1> 和 <mailto:dev@example.com>"),
+            "[http://a.example/p?q=1](http://a.example/p?q=1) 和 \
+             [mailto:dev@example.com](mailto:dev@example.com)"
+        );
+        // Balanced parentheses are part of the destination; unbalanced ones
+        // would close the link early, so such a URI is not rewritten.
+        assert_eq!(
+            escape_line("<https://en.wikipedia.org/wiki/Foo_(bar)>"),
+            "[https://en.wikipedia.org/wiki/Foo_(bar)](https://en.wikipedia.org/wiki/Foo_(bar))"
+        );
+        assert_eq!(
+            escape_line("a <number_tag> b <link> c"),
+            "a &#60;number_tag> b &#60;link> c"
+        );
+        for malformed in [
+            "<>",
+            "<a:b>",
+            "<https://a b>",
+            "<https://a)b>",
+            "<https://a[b>",
+            "<https://a\\b>",
+        ] {
+            assert_eq!(
+                escape_line(malformed),
+                malformed.replace('<', "&#60;"),
+                "{malformed:?}"
+            );
+        }
+    }
+
+    /// The rewrite obeys the code contexts like every other rule: a fenced
+    /// block and an inline span keep the authored autolink, because the
+    /// platform renders code literally.
+    #[test]
+    fn autolinks_inside_code_keep_their_authored_shape() {
+        assert_eq!(
+            CardMarkdown::new().clean(
+                "```\n<https://example.com/x>\n```\n看 `<https://example.com/x>` 和 <https://example.com/x>"
+            ),
+            "```\n<https://example.com/x>\n```\n看 `<https://example.com/x>` 和 \
+             [https://example.com/x](https://example.com/x)"
+        );
+    }
+
+    /// The card-splitter measure follows the rewrite: charging the raw text
+    /// would under-count a card that carries an expanded autolink (#1175).
+    #[test]
+    fn serialized_len_charges_the_rewritten_autolink() {
+        let text = "见 <https://example.com/x>";
+        let cleaned = CardMarkdown::new().clean(text);
+        assert_eq!(
+            serialized_len(text),
+            serde_json::to_string(&cleaned).unwrap().len() - 2
+        );
+        assert!(serialized_len(text) > text.len());
     }
 
     /// CommonMark pairing: a run of `n` backticks closes at the next run of
