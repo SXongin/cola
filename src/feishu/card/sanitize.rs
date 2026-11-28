@@ -31,12 +31,13 @@
 //!   scheme is rewritten, so the platform's own tags (`<link>`, `<at>`,
 //!   `<number_tag>`) keep being escaped, and a malformed URI falls back to the
 //!   escape rather than a broken link. The label carries the URI's text with a
-//!   markdown-significant character as its entity, and the destination
-//!   percent-encodes whatever would close it early, so any URI the autolink
-//!   grammar accepts survives the rewrite. A `<uri>` that is already a link's
-//!   destination (`[a](<https://x>)`, `[a]: <https://x>`) keeps the escape:
-//!   the explicit link would land inside the destination and break the link
-//!   the author wrote.
+//!   markdown-significant character as its entity, and an unbalanced
+//!   parenthesis in the destination is backslash-escaped — CommonMark resolves
+//!   it to the same target — so a URI in the RFC 3986 grammar survives the
+//!   rewrite unchanged. A `<uri>` that is already a link's destination
+//!   (`[a](<https://x>)`, `[a]: <https://x>`) keeps the escape: the explicit
+//!   link would land inside the destination and break the link the author
+//!   wrote.
 //! - markdown images outside code become plain links (an image key must be
 //!   uploaded by the app; the model cannot hold one, so `![…](…)` is always an
 //!   invalid key),
@@ -758,11 +759,13 @@ fn autolink_span(text: &str, start: usize) -> Option<(usize, String)> {
 }
 
 /// `<uri>`'s replacement as an explicit link that survives any URI a CommonMark
-/// autolink accepts. The two halves are escaped for different grammars: the
-/// label shows the URI unchanged, so a markdown-significant character becomes
-/// its numeric entity (the platform decodes it as text, as the ledger's labels
-/// already rely on); the destination must not end early, so a character that
-/// closes its `(…)` is percent-encoded — the URL the reader follows is the same.
+/// autolink accepts. The label shows the URI unchanged, so a
+/// markdown-significant character becomes its numeric entity (the platform
+/// decodes it back as text, as the ledger's labels already rely on). The
+/// destination is the URI itself: a balanced pair of parentheses is legal
+/// there, and an unbalanced one is backslash-escaped — CommonMark's own
+/// destination escape — so the target stays byte-for-byte the authored URI
+/// (percent-encoding could change the resource a server resolves).
 fn explicit_link(uri: &str) -> String {
     let mut link = String::with_capacity(uri.len() * 2 + 5);
     link.push('[');
@@ -771,32 +774,73 @@ fn explicit_link(uri: &str) -> String {
             '&' => link.push_str(AMPERSAND_ESCAPE),
             '[' => link.push_str("&#91;"),
             ']' => link.push_str("&#93;"),
-            '\\' => link.push_str("&#92;"),
-            '`' => link.push_str("&#96;"),
             '*' => link.push_str(ASTERISK_ESCAPE),
             '_' => link.push_str(UNDERSCORE_ESCAPE),
             '~' => link.push_str("&#126;"),
-            '!' => link.push_str("&#33;"),
             _ => link.push(c),
         }
     }
     link.push_str("](");
-    for c in uri.chars() {
-        match c {
-            '(' => link.push_str("%28"),
-            ')' => link.push_str("%29"),
-            '\\' => link.push_str("%5C"),
-            _ => link.push(c),
+    if balanced_parens(uri) {
+        link.push_str(uri);
+    } else {
+        for c in uri.chars() {
+            if matches!(c, '(' | ')') {
+                link.push('\\');
+            }
+            link.push(c);
         }
     }
     link.push(')');
     link
 }
 
-/// Whether `line` leaves an inline link's destination gap open — it ends with
-/// `](` — so a `<uri>` opening the NEXT line is that link's destination.
+/// Whether every `)` in `uri` has a preceding `(` to pair with.
+fn balanced_parens(uri: &str) -> bool {
+    let mut depth = 0usize;
+    for c in uri.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => match depth.checked_sub(1) {
+                Some(next) => depth = next,
+                None => return false,
+            },
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// Whether `line` leaves an inline link's destination gap open — it ends with a
+/// link label's `](` — so a `<uri>` opening the NEXT line is that link's
+/// destination. The `]` needs its `[` opener: `literal](` is prose.
 fn opens_link_destination(line: &str) -> bool {
-    line.trim_end_matches([' ', '\t']).ends_with("](")
+    line.trim_end_matches([' ', '\t'])
+        .strip_suffix("](")
+        .is_some_and(has_link_label)
+}
+
+/// Whether `text` carries an unescaped `[` that can open the link label whose
+/// `]` follows it (the `]` itself is not part of `text`): a nested bracket pair
+/// is balanced away, and an escaped bracket does not count.
+fn has_link_label(text: &str) -> bool {
+    let mut depth = 0usize;
+    let mut i = text.len();
+    while i > 0 {
+        let c = text[..i].chars().next_back().expect("index on a char boundary");
+        i -= c.len_utf8();
+        match c {
+            ']' if !escaped_by_backslash(text, i) => depth += 1,
+            '[' if !escaped_by_backslash(text, i) => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Whether the `<` at `start` is already the destination of an authored link —
@@ -805,8 +849,8 @@ fn opens_link_destination(line: &str) -> bool {
 /// escape leaves the pointy destination intact once the platform decodes it.
 fn is_link_destination(text: &str, start: usize) -> bool {
     let before = text[..start].trim_end_matches([' ', '\t']);
-    // Inline link: `](` immediately before the destination's `<`.
-    if before.ends_with("](") {
+    // Inline link: a label's `](` immediately before the destination's `<`.
+    if before.strip_suffix("](").is_some_and(has_link_label) {
         return true;
     }
     // Reference definition: up to three spaces, the label, `:`, whitespace.
@@ -818,9 +862,12 @@ fn is_link_destination(text: &str, start: usize) -> bool {
     before.ends_with(']') && indent <= 3 && before.trim_start_matches(' ').starts_with('[')
 }
 
-/// Whether `uri` is a CommonMark absolute URI — a scheme, a colon, then the
-/// rest — per §6.4: the rest carries no whitespace, control character, `<` or
-/// `>`. Every other character is legal, and [`explicit_link`] escapes it.
+/// Whether `uri` is an absolute URI a CommonMark autolink can carry: a scheme
+/// (2–32 characters, an ASCII letter first, then letters, digits, `+`, `.` or
+/// `-`), a colon, and a non-empty RFC 3986 URI. The autolink syntax itself
+/// admits any non-control, non-space character but `<` and `>`, yet a
+/// character outside the URI grammar is not worth making clickable — the
+/// escape leaves such text exactly as written.
 fn is_autolink_uri(uri: &str) -> bool {
     let Some((scheme, rest)) = uri.split_once(':') else {
         return false;
@@ -836,11 +883,40 @@ fn is_autolink_uri(uri: &str) -> bool {
     {
         return false;
     }
-    if rest.is_empty() {
-        return false;
-    }
-    rest.chars()
-        .all(|c| !c.is_whitespace() && !c.is_control() && !matches!(c, '<' | '>'))
+    // CommonMark allows the rest to be empty (`<mailto:>`), so it is not a
+    // rejection reason; every present character must be in the URI grammar.
+    rest.chars().all(is_uri_char)
+}
+
+/// An RFC 3986 URI character: unreserved, the gen-delims and sub-delims a URI
+/// may carry, and `%` for a percent-encoded octet.
+fn is_uri_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.'
+                | '_'
+                | '~'
+                | ':'
+                | '/'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
+        )
 }
 
 /// Rewrite the markdown image starting at `start` (the `!`) into a plain
@@ -928,11 +1004,10 @@ mod tests {
             "[http://a.example/p?q=1](http://a.example/p?q=1) 和 \
              [mailto:dev@example.com](mailto:dev@example.com)"
         );
-        // A URI's own parentheses belong to the destination, so they are
-        // percent-encoded rather than ending the link early.
+        // A balanced parenthesis pair is legal in a destination verbatim.
         assert_eq!(
             escape_line("<https://en.wikipedia.org/wiki/Foo_(bar)>"),
-            "[https://en.wikipedia.org/wiki/Foo&#95;(bar)](https://en.wikipedia.org/wiki/Foo_%28bar%29)"
+            "[https://en.wikipedia.org/wiki/Foo&#95;(bar)](https://en.wikipedia.org/wiki/Foo_(bar))"
         );
         assert_eq!(
             escape_line("a <number_tag> b <link> c"),
@@ -943,6 +1018,10 @@ mod tests {
             "<a:b>",
             "<abcdefghijklmnopqrstuvwxyzabcdefg:x>",
             "<https://a b>",
+            "<https://a|b>",
+            "<https://a`b>",
+            "<https://a\\b>",
+            "<https://a{b>",
             "<https://a",
         ] {
             assert_eq!(
@@ -953,25 +1032,30 @@ mod tests {
         }
     }
 
-    /// Every URI CommonMark's autolink grammar accepts still renders as a
-    /// link: the label keeps the URI's text (markdown-significant characters
-    /// become entities) and the destination cannot be closed early (its
-    /// parentheses are percent-encoded). A backslash-escaped `<` is literal
-    /// text, not an autolink, and keeps the escape.
+    /// A URI with markdown-significant or destination-closing characters still
+    /// renders as a link: the label keeps the URI's text (a significant
+    /// character becomes its entity) and an unbalanced parenthesis is
+    /// backslash-escaped in the destination, which CommonMark unescapes to the
+    /// exact same target. A backslash-escaped `<` is literal text, not an
+    /// autolink, and keeps the escape.
     #[test]
     fn an_autolink_with_unsafe_uri_characters_still_renders_as_a_link() {
         assert_eq!(
             escape_line("<https://example.com/a)>"),
-            "[https://example.com/a)](https://example.com/a%29)"
+            "[https://example.com/a)](https://example.com/a\\))"
+        );
+        assert_eq!(
+            escape_line("<https://example.com/a(b>"),
+            "[https://example.com/a(b](https://example.com/a\\(b)"
         );
         assert_eq!(
             escape_line("<https://example.com/a_(b)>"),
-            "[https://example.com/a&#95;(b)](https://example.com/a_%28b%29)"
+            "[https://example.com/a&#95;(b)](https://example.com/a_(b))"
         );
         assert_eq!(
-            escape_line("<https://example.com/a[b]`c*d~e!f&g\\h>"),
-            "[https://example.com/a&#91;b&#93;&#96;c&#42;d&#126;e&#33;f&amp;g&#92;h]\
-             (https://example.com/a[b]`c*d~e!f&g%5Ch)"
+            escape_line("<https://example.com/a[b]$c&d'e~f>"),
+            "[https://example.com/a&#91;b&#93;$c&amp;d'e&#126;f]\
+             (https://example.com/a[b]$c&d'e~f)"
         );
         assert_eq!(
             escape_line(r"\<https://example.com/x>"),
@@ -1000,6 +1084,15 @@ mod tests {
             escape_line("见 (<https://example.com/x>)"),
             "见 ([https://example.com/x](https://example.com/x))"
         );
+        // A `](` with no `[` opener is prose, not a link: the autolink is real.
+        assert_eq!(
+            escape_line("literal](<https://example.com/x>)"),
+            "literal]([https://example.com/x](https://example.com/x))"
+        );
+        assert_eq!(
+            escape_line(r"\[docs](<https://example.com/x>)"),
+            r"\[docs]([https://example.com/x](https://example.com/x))"
+        );
     }
 
     /// CommonMark allows one line ending in a link destination's gap: a `<uri>`
@@ -1025,6 +1118,16 @@ mod tests {
         assert_eq!(
             CardMarkdown::new().clean("[docs](\n```\nx\n```\n<https://example.com/x>"),
             "[docs](\n```\nx\n```\n[https://example.com/x](https://example.com/x)"
+        );
+        // Without a `[` opener the `](` is prose, so the next line's autolink
+        // is genuine and rewrites (#1233 gate, round 2).
+        assert_eq!(
+            CardMarkdown::new().clean("literal](\n<https://example.com/x>"),
+            "literal](\n[https://example.com/x](https://example.com/x)"
+        );
+        assert_eq!(
+            CardMarkdown::new().clean("\\[docs](\n<https://example.com/x>"),
+            "\\[docs](\n[https://example.com/x](https://example.com/x)"
         );
     }
 
