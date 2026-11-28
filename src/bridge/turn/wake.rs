@@ -252,6 +252,24 @@ pub(crate) struct ContinuationFacts<'a> {
     pub(crate) variant: Option<String>,
 }
 
+/// Whether this read makes the chain owe a render: the Turn window's own diff,
+/// or the newest Wake's OWN content (issue #1229) — a job's `synthetic`
+/// `<background-result>` notice is in no Turn window, so without it an open
+/// yielded card with no assistant follow-up reads as "nothing new" and drops the
+/// notice. A Wake the card already announced or took over never counts twice.
+fn continuation_owes_render(
+    acc: &StreamAccumulator,
+    transcript: &SessionTranscript,
+    anchor: &TurnAnchor,
+    positions: &std::collections::HashMap<&str, usize>,
+    newest_wake: Option<&crate::backend::Wake>,
+    bound: Option<usize>,
+) -> bool {
+    let wake_renders =
+        newest_wake.is_some_and(|wake| render::wake_renders_new_content(acc, positions, wake, bound));
+    wake_renders || render::renders_new_content(acc, transcript, anchor, bound)
+}
+
 /// The Wake-continuation interface (ADR-0059): the decision Session Sync asks,
 /// the card operations it arms the continuation with, and the out-of-turn loop
 /// its ending runs through. The accumulator and the chain's identity stay
@@ -613,7 +631,8 @@ impl Turn {
     ///
     /// - **A card chain exists.** The only question is whether the chain
     ///   missed anything: rendering the Turn into the chain's own rendered
-    ///   state must produce a part — a Wake's resumed work, or content that
+    ///   state must produce a part — a Wake's resumed work, the Wake's own
+    ///   completion notice (issue #1229), or content that
     ///   landed after the card was finalized. Nothing new renders -> nothing
     ///   is owed, which is also what keeps a rendered Wake from being
     ///   re-posted on every poll. What it owes then obeys spec #602: an open
@@ -712,7 +731,7 @@ impl Turn {
                 // same-life card's anchor is the user message's, so the common
                 // path is unchanged.
                 let anchor = card.acc.turn_anchor().unwrap_or(turn_anchor);
-                if !render::renders_new_content(&card.acc, transcript, anchor, bound) {
+                if !continuation_owes_render(&card.acc, transcript, anchor, &positions, newest_wake, bound) {
                     return None;
                 }
                 // An OPEN yielded card resumes IN PLACE (ADR-0066), so no second
@@ -759,15 +778,20 @@ impl Turn {
                     });
                 }
                 // 3. Any other OPEN yielded card with unrendered content resumes
-                //    IN PLACE: a Wake-less tail, or the same Wake's still-
-                //    streaming work past a handoff. It renders onto the SAME
+                //    IN PLACE: a Wake-less tail, the same Wake's still-
+                //    streaming work past a handoff, or a job completion notice
+                //    that arrives alone while the model is idle (#1229,
+                //    ADR-0118's in-place notice). It renders onto the SAME
                 //    card — the restart double-Card fix (spec #602,
                 //    `ses_ee3f19fc4ffefrgIFcTk6zV8yH`) — so it never opens a
                 //    second continuation and never writes a receipt for work no
-                //    Wake announced. The newest Wake, when there is one, is
-                //    already handed over, so re-marking it is a no-op; a Wake-less
-                //    tail (`None`) marks nothing. This is also why a Wake-less
-                //    tail is not dropped: an open yielded card renders it.
+                //    Wake announced. The newest Wake is usually already handed
+                //    over, so re-marking it is a no-op; a job notice is the
+                //    exception — this arm takes its FIRST handover mark
+                //    (`wake_id` below), which is what keeps the next poll from
+                //    re-firing it. A Wake-less tail (`None`) marks nothing. This
+                //    is also why a Wake-less tail is not dropped: an open
+                //    yielded card renders it.
                 if ownership::admits_ledger_refresh(&card) {
                     return Some(WakeContinuation::ResumeInPlace {
                         wake_id: newest_wake.map(|wake| wake.id.to_string()),
