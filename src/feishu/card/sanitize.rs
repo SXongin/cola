@@ -843,9 +843,26 @@ fn label_depth(carry: usize, line: &str) -> usize {
 /// link label's `](` — so a `<uri>` opening the NEXT line is that link's
 /// destination. The `]` needs its `[` opener: `literal](` is prose.
 fn opens_link_destination(line: &str, label_carry: usize) -> bool {
-    line.trim_end_matches([' ', '\t'])
+    let line = line.trim_end_matches([' ', '\t']);
+    let inline = line
         .strip_suffix("](")
-        .is_some_and(|label| label_depth(label_carry, label) > 0)
+        .is_some_and(|label| label_depth(label_carry, label) > 0);
+    // A reference definition's destination may open the next line too
+    // (`[a]:` + one line ending); its label cannot span a line, so it is
+    // checked on this line alone.
+    let definition = line
+        .strip_suffix(':')
+        .is_some_and(|label| ends_definition_label(label.trim_end_matches([' ', '\t'])));
+    inline || definition
+}
+
+/// Whether `text` ends a reference definition's label — up to three spaces, a
+/// bracketed label — so the colon that follows (not part of `text`) opens its
+/// destination.
+fn ends_definition_label(text: &str) -> bool {
+    let indent = text.len() - text.trim_start_matches(' ').len();
+    let label = text.trim_start_matches(' ');
+    indent <= 3 && label.starts_with('[') && label.ends_with(']')
 }
 
 /// Whether the `<` at `start` is already the destination of an authored link —
@@ -862,19 +879,16 @@ fn is_link_destination(text: &str, start: usize, label_carry: usize) -> bool {
         return true;
     }
     // Reference definition: up to three spaces, the label, `:`, whitespace.
-    let Some(before) = before.strip_suffix(':') else {
-        return false;
-    };
-    let before = before.trim_end_matches([' ', '\t']);
-    let indent = before.len() - before.trim_start_matches(' ').len();
-    before.ends_with(']') && indent <= 3 && before.trim_start_matches(' ').starts_with('[')
+    before
+        .strip_suffix(':')
+        .is_some_and(|label| ends_definition_label(label.trim_end_matches([' ', '\t'])))
 }
 
 /// Whether `uri` is an absolute URI a CommonMark autolink can carry: a scheme
 /// (2–32 characters, an ASCII letter first, then letters, digits, `+`, `.` or
-/// `-`), a colon, and a non-empty RFC 3986 URI. The autolink syntax itself
-/// admits any non-control, non-space character but `<` and `>`, yet a
-/// character outside the URI grammar is not worth making clickable — the
+/// `-`), a colon, and a URI/IRI in the [`is_uri_char`] grammar. The autolink
+/// syntax itself admits any non-control, non-space character but `<` and `>`,
+/// yet a character outside that grammar is not worth making clickable — the
 /// escape leaves such text exactly as written.
 fn is_autolink_uri(uri: &str) -> bool {
     let Some((scheme, rest)) = uri.split_once(':') else {
@@ -896,9 +910,14 @@ fn is_autolink_uri(uri: &str) -> bool {
     rest.chars().all(is_uri_char)
 }
 
-/// An RFC 3986 URI character: unreserved, the gen-delims and sub-delims a URI
-/// may carry, and `%` for a percent-encoded octet.
+/// A URI character: unreserved, the gen-delims and sub-delims a URI may carry,
+/// and `%` for a percent-encoded octet — plus a non-ASCII character that is
+/// neither control nor whitespace, since a Chinese reply links an IRI
+/// (`/wiki/中文`) and CommonMark's autolink rule admits it.
 fn is_uri_char(c: char) -> bool {
+    if !c.is_ascii() {
+        return !c.is_control() && !c.is_whitespace();
+    }
     c.is_ascii_alphanumeric()
         || matches!(
             c,
@@ -1066,6 +1085,10 @@ mod tests {
              (https://example.com/a[b]$c&d'e~f)"
         );
         assert_eq!(
+            escape_line("<https://zh.wikipedia.org/wiki/中文>"),
+            "[https://zh.wikipedia.org/wiki/中文](https://zh.wikipedia.org/wiki/中文)"
+        );
+        assert_eq!(
             escape_line(r"\<https://example.com/x>"),
             r"\&#60;https://example.com/x>"
         );
@@ -1142,6 +1165,16 @@ mod tests {
         assert_eq!(
             CardMarkdown::new().clean("[docs\nmore](<https://example.com/x>)"),
             "[docs\nmore](&#60;https://example.com/x>)"
+        );
+        // A reference definition's destination may also open the next line.
+        assert_eq!(
+            CardMarkdown::new().clean("[a]:\n<https://example.com/x>"),
+            "[a]:\n&#60;https://example.com/x>"
+        );
+        // A blank line ends the paragraph, so the carry resets.
+        assert_eq!(
+            CardMarkdown::new().clean("[a](\n\n<https://example.com/x>"),
+            "[a](\n\n[https://example.com/x](https://example.com/x)"
         );
         // Without a `[` opener the `](` is prose, so the next line's autolink
         // is genuine and rewrites (#1233 gate, round 2).
