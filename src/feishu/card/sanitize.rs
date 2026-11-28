@@ -30,7 +30,10 @@
 //!   joins the URL Feishu's bare-URL detection finds. Only a URI with a real
 //!   scheme is rewritten, so the platform's own tags (`<link>`, `<at>`,
 //!   `<number_tag>`) keep being escaped, and a malformed URI falls back to the
-//!   escape rather than a broken link.
+//!   escape rather than a broken link. A `<uri>` that is already a link's
+//!   destination (`[a](<https://x>)`, `[a]: <https://x>`) keeps the escape:
+//!   the explicit link would land inside the destination and break the link
+//!   the author wrote.
 //! - markdown images outside code become plain links (an image key must be
 //!   uploaded by the app; the model cannot hold one, so `![…](…)` is always an
 //!   invalid key),
@@ -139,20 +142,26 @@ fn expand_angle_brackets(text: &str) -> String {
     while i < text.len() {
         let c = text[i..].chars().next().expect("index on a char boundary");
         if c == '<' {
-            match autolink_span(text, i) {
-                Some((end, link)) => {
-                    out.push_str(&link);
-                    i = end;
-                    continue;
-                }
-                None => out.push_str(LESS_THAN_ESCAPE),
-            }
+            let (expanded, end) = angle_expansion(text, i);
+            out.push_str(&expanded);
+            i = end;
         } else {
             out.push(c);
+            i += c.len_utf8();
         }
-        i += c.len_utf8();
     }
     out
+}
+
+/// What the `<` at `at` expands to and the offset just past it: an autolink's
+/// explicit link, or [`LESS_THAN_ESCAPE`] for a bare `<`. One owner for the
+/// expansion, shared by [`CardMarkdown::clean`]'s line pass and
+/// [`serialized_len`]'s context-blind measure.
+fn angle_expansion(text: &str, at: usize) -> (Cow<'_, str>, usize) {
+    match autolink_span(text, at) {
+        Some((end, link)) => (Cow::Owned(link), end),
+        None => (Cow::Borrowed(LESS_THAN_ESCAPE), at + 1),
+    }
 }
 
 /// The markdown construction a delivered prefix leaves open at its cut point
@@ -640,14 +649,10 @@ fn escape_line(line: &str) -> String {
             continue;
         }
         if c == '<' {
-            match autolink_span(line, i) {
-                Some((end, link)) => {
-                    out.push_str(&link);
-                    i = end;
-                    continue;
-                }
-                None => out.push_str(LESS_THAN_ESCAPE),
-            }
+            let (expanded, end) = angle_expansion(line, i);
+            out.push_str(&expanded);
+            i = end;
+            continue;
         } else if c == '!' && line[i..].starts_with("![") {
             match image_span(line, i) {
                 Some((end, link)) => {
@@ -714,12 +719,34 @@ fn code_span(line: &str, start: usize) -> Option<(usize, &str)> {
 /// autolink — a Feishu tag, or a URI that would not survive the rewrite — so
 /// the caller falls back to the `<` escape.
 fn autolink_span(text: &str, start: usize) -> Option<(usize, String)> {
+    if is_link_destination(text, start) {
+        return None;
+    }
     let close = start + 1 + text[start + 1..].find('>')?;
     let uri = &text[start + 1..close];
     if !is_autolink_uri(uri) {
         return None;
     }
     Some((close + 1, format!("[{uri}]({uri})")))
+}
+
+/// Whether the `<` at `start` is already the destination of an authored link —
+/// `[a](<https://x>)` or a reference definition's `[a]: <https://x>` — where
+/// the rewrite would put link syntax inside the destination and break it. The
+/// escape leaves the pointy destination intact once the platform decodes it.
+fn is_link_destination(text: &str, start: usize) -> bool {
+    let before = text[..start].trim_end_matches([' ', '\t']);
+    // Inline link: `](` immediately before the destination's `<`.
+    if before.ends_with("](") {
+        return true;
+    }
+    // Reference definition: up to three spaces, the label, `:`, whitespace.
+    let Some(before) = before.strip_suffix(':') else {
+        return false;
+    };
+    let before = before.trim_end_matches([' ', '\t']);
+    let indent = before.len() - before.trim_start_matches(' ').len();
+    before.ends_with(']') && indent <= 3 && before.trim_start_matches(' ').starts_with('[')
 }
 
 /// Whether `uri` is a CommonMark absolute URI (scheme, colon, rest) that can be
@@ -862,10 +889,13 @@ mod tests {
         for malformed in [
             "<>",
             "<a:b>",
+            "<abcdefghijklmnopqrstuvwxyzabcdefg:x>",
             "<https://a b>",
+            "<https://a(b>",
             "<https://a)b>",
             "<https://a[b>",
             "<https://a\\b>",
+            "<https://a",
         ] {
             assert_eq!(
                 escape_line(malformed),
@@ -873,6 +903,29 @@ mod tests {
                 "{malformed:?}"
             );
         }
+    }
+
+    /// A `<url>` that is already a link's DESTINATION keeps the escape: the
+    /// explicit link syntax would land inside the destination and break the
+    /// authored link. A bare autolink in prose parentheses is still rewritten.
+    #[test]
+    fn an_autolink_inside_a_link_destination_keeps_the_escape() {
+        assert_eq!(
+            escape_line("[docs](<https://example.com/x>)"),
+            "[docs](&#60;https://example.com/x>)"
+        );
+        assert_eq!(
+            escape_line("[docs]( <https://example.com/x>)"),
+            "[docs]( &#60;https://example.com/x>)"
+        );
+        assert_eq!(
+            escape_line("[docs]: <https://example.com/x>"),
+            "[docs]: &#60;https://example.com/x>"
+        );
+        assert_eq!(
+            escape_line("见 (<https://example.com/x>)"),
+            "见 ([https://example.com/x](https://example.com/x))"
+        );
     }
 
     /// The rewrite obeys the code contexts like every other rule: a fenced
