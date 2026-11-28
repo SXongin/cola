@@ -104,26 +104,25 @@ pub(crate) fn sanitize_markdown(text: &str) -> String {
     CardMarkdown::new().clean(text)
 }
 
-/// The JSON-string bytes the card will carry for `text`, EXACTLY: the
-/// sanitizer's content expansion (a valid autolink becomes an explicit link,
-/// any other `<` becomes the five-byte `&#60;`, what [`CardMarkdown::clean`]
-/// does outside a code context) applied first, then the
-/// text encoded as a JSON string value by [`serde_json`] — so control
-/// characters (`\u0000` costs six), quotes, backslashes and non-ASCII are
-/// measured by the encoder that will write them, with no per-character table to
-/// keep in sync.
+/// The JSON-string bytes the card will carry for `text`: the same per-line
+/// content pass [`CardMarkdown::clean`] applies — an autolink becomes an
+/// explicit link, a `<uri>` that is an authored link's destination keeps the
+/// escape, an image collapses to a link, any other `<` becomes the five-byte
+/// `&#60;` — applied first, then the text encoded as a JSON string value by
+/// [`serde_json`] — so control characters (`\u0000` costs six), quotes,
+/// backslashes and non-ASCII are measured by the encoder that will write them,
+/// with no per-character table to keep in sync.
 ///
-/// A pure function of the text: the state machine deciding *where* an escape
-/// applies stays in [`CardMarkdown::clean`], so a `<` inside a fenced block or an
-/// inline code span is expanded here and not on the card — an over-charge, the
-/// safe side for a per-row cap or a splitter, which must never under-charge what
-/// Feishu receives. Two sanitizer expansions are NOT string-content
-/// substitutions and stay outside this measure, both bounded by the card text
-/// they wrap: a table that outgrows its budget gains a code fence around it, an
-/// image span collapses to a shorter link, and the rejection fallback's fence
-/// grows with the chunk it wraps ([`fenced_code`] uses one backtick more than the
-/// chunk's longest run) — each is absorbed by the per-element wrapper constant
-/// the callers add on top, and the element's own character cap bounds it.
+/// A pure function of the text. One deliberate over-charge keeps it an upper
+/// bound, the safe side for a per-row cap or a splitter, which must never
+/// under-charge what Feishu receives: a `<` inside a fenced code block is
+/// charged its five-byte escape although the card renders it verbatim. The
+/// sanitizer expansions that are NOT string-content substitutions stay outside
+/// this measure: a table that outgrows its budget gains a code fence around it,
+/// and the rejection fallback's fence grows with the chunk it wraps
+/// ([`fenced_code`] uses one backtick more than the chunk's longest run) — each
+/// is absorbed by the per-element wrapper constant the callers add on top, and
+/// the element's own character cap bounds it.
 pub(crate) fn serialized_len(text: &str) -> usize {
     let expanded = if text.contains('<') {
         expand_angle_brackets(text)
@@ -135,23 +134,50 @@ pub(crate) fn serialized_len(text: &str) -> usize {
         .unwrap_or_else(|_| expanded.len())
 }
 
-/// The whole text with every angle-bracket expansion the card path applies,
-/// context-blind (code contexts included): a valid autolink becomes an
-/// explicit link and any other `<` becomes [`LESS_THAN_ESCAPE`]. This is
-/// [`serialized_len`]'s measure; charging a code context that will render
-/// verbatim is an over-charge, the safe direction for a size cap.
+/// [`serialized_len`]'s content expansion: the same per-line pass
+/// [`CardMarkdown::clean`] applies and the same cross-line link state it keeps,
+/// so a `<uri>` that is already an authored link's destination is measured as
+/// the escape the card carries, not as a duplicated link. Two deliberate
+/// over-charges keep it an upper bound (the safe direction for a size cap): a
+/// line inside a fenced block is charged `<` escapes though the card renders
+/// it verbatim, and a table the card would fence is charged escaped rows.
 fn expand_angle_brackets(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < text.len() {
-        let c = text[i..].chars().next().expect("index on a char boundary");
-        if c == '<' {
-            let (expanded, end) = angle_expansion(text, i);
-            out.push_str(&expanded);
-            i = end;
+    let mut out = String::with_capacity(text.len() + text.len() / 16);
+    let mut fence: Option<usize> = None;
+    let mut destination_open = false;
+    let mut label_carry = 0usize;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let fenced = match fence {
+            Some(open) => {
+                if closes_fence(line, open) {
+                    fence = None;
+                }
+                true
+            }
+            None => match opens_fence(line) {
+                Some(open) => {
+                    fence = Some(open);
+                    true
+                }
+                None => false,
+            },
+        };
+        if fenced {
+            out.push_str(&line.replace('<', LESS_THAN_ESCAPE));
+            destination_open = false;
+            label_carry = 0;
+            continue;
+        }
+        out.push_str(&escape_line_with(line, destination_open, label_carry));
+        if line.trim().is_empty() {
+            destination_open = false;
+            label_carry = 0;
         } else {
-            out.push(c);
-            i += c.len_utf8();
+            destination_open = opens_link_destination(line, label_carry);
+            label_carry = label_depth(label_carry, line);
         }
     }
     out
@@ -159,8 +185,7 @@ fn expand_angle_brackets(text: &str) -> String {
 
 /// What the `<` at `at` expands to and the offset just past it: an autolink's
 /// explicit link, or [`LESS_THAN_ESCAPE`] for a bare `<`. One owner for the
-/// expansion, shared by [`CardMarkdown::clean`]'s line pass and
-/// [`serialized_len`]'s context-blind measure.
+/// expansion in the card's own line pass.
 fn angle_expansion(text: &str, at: usize) -> (Cow<'_, str>, usize) {
     match autolink_span(text, at) {
         Some((end, link)) => (Cow::Owned(link), end),
@@ -826,15 +851,40 @@ fn balanced_parens(uri: &str) -> bool {
 /// The link-label `[` openers `line` leaves unmatched, starting from `carry`
 /// (the previous line's count, so a label may span the line break CommonMark
 /// allows). An escaped bracket does not count, and a `]` with nothing to close
-/// is literal text.
+/// is literal text. An inline code span and an autolink are not label syntax:
+/// their brackets are content, so both are skipped whole.
 fn label_depth(carry: usize, line: &str) -> usize {
     let mut depth = carry;
-    for (i, c) in line.char_indices() {
-        match c {
-            '[' if !escaped_by_backslash(line, i) => depth += 1,
-            ']' if !escaped_by_backslash(line, i) => depth = depth.saturating_sub(1),
-            _ => {}
+    let mut i = 0;
+    while i < line.len() {
+        let c = line[i..].chars().next().expect("index on a char boundary");
+        if c == '`' && !escaped_by_backslash(line, i) {
+            match code_span(line, i) {
+                Some((end, _)) => {
+                    i = end;
+                    continue;
+                }
+                None => {
+                    let run = line[i..].chars().take_while(|c| *c == '`').count();
+                    i += run;
+                    continue;
+                }
+            }
         }
+        if c == '<'
+            && let Some((end, _)) = autolink_span(line, i)
+        {
+            i = end;
+            continue;
+        }
+        if !escaped_by_backslash(line, i) {
+            match c {
+                '[' => depth += 1,
+                ']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        i += c.len_utf8();
     }
     depth
 }
@@ -1039,7 +1089,8 @@ mod tests {
             "[http://a.example/p?q=1](http://a.example/p?q=1) 和 \
              [mailto:dev@example.com](mailto:dev@example.com)"
         );
-        // A balanced parenthesis pair is legal in a destination verbatim.
+        // Only an unbalanced pair can end the destination early, so only that
+        // needs an escape; the balanced form is already the exact target.
         assert_eq!(
             escape_line("<https://en.wikipedia.org/wiki/Foo_(bar)>"),
             "[https://en.wikipedia.org/wiki/Foo&#95;(bar)](https://en.wikipedia.org/wiki/Foo_(bar))"
@@ -1138,6 +1189,15 @@ mod tests {
             escape_line("[a](x)](<https://example.com/x>)"),
             "[a](x)]([https://example.com/x](https://example.com/x))"
         );
+        // Brackets that are code-span or autolink CONTENT do not open a label.
+        assert_eq!(
+            escape_line("`[`x](<https://example.com/x>)"),
+            "`[`x]([https://example.com/x](https://example.com/x))"
+        );
+        assert_eq!(
+            escape_line("<https://x/[a> ](<https://example.com/x>)"),
+            "[https://x/&#91;a](https://x/[a) ]([https://example.com/x](https://example.com/x))"
+        );
         assert_eq!(
             escape_line(r"\[docs](<https://example.com/x>)"),
             r"\[docs]([https://example.com/x](https://example.com/x))"
@@ -1231,6 +1291,20 @@ mod tests {
             serialized_len(text),
             serde_json::to_string(rendered).unwrap().len() - 2,
             "the measure follows the rewrite, not the raw text"
+        );
+    }
+
+    /// An authored link destination is measured as the escape the card writes,
+    /// not as a duplicated link: over-charging it truncates a compaction
+    /// summary whose rendered body fits (#1233 gate, round 3).
+    #[test]
+    fn serialized_len_measures_a_link_destination_as_the_escape() {
+        let text = "[文](<https://x/中文>)";
+        let cleaned = CardMarkdown::new().clean(text);
+        assert!(cleaned.contains("(&#60;https"), "{cleaned}");
+        assert_eq!(
+            serialized_len(text),
+            serde_json::to_string(&cleaned).unwrap().len() - 2
         );
     }
 
