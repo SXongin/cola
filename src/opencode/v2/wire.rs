@@ -1152,20 +1152,20 @@ pub(super) struct BackgroundJob {
 }
 
 /// Decode the `{data: Job.Info[]}` body of the experimental job list. `None`
-/// when the body is not that envelope at all — a gateway's 200 error object,
-/// or a `data` that is not an array — which the caller must treat as a FAILED
-/// read, never as an empty list: an empty list is a verdict that retires rows.
-/// One entry that fails to decode is still skipped rather than failing its
-/// siblings (the list is a live read, never a reason to lose the other running
-/// rows).
+/// when the read is NOT a verdict: the body is not that envelope at all (a
+/// gateway's 200 error object, a `data` that is not an array), or ANY entry
+/// fails to decode — a malformed entry could be a running job the caller must
+/// not treat as gone, so the caller keeps the last successful rows instead.
+/// An unknown `kind` with valid required fields still decodes and merges (the
+/// kind word is opaque). An empty array is a real verdict.
 pub(super) fn decode_job_list(body: &Value) -> Option<Vec<BackgroundJob>> {
-    body.get("data").and_then(Value::as_array).map(|entries| {
-        entries
-            .iter()
-            .filter_map(|entry| serde_json::from_value::<RawJob>(entry.clone()).ok())
-            .map(RawJob::into_neutral)
-            .collect()
-    })
+    let entries = body.get("data").and_then(Value::as_array)?;
+    let mut jobs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let raw: RawJob = serde_json::from_value(entry.clone()).ok()?;
+        jobs.push(raw.into_neutral());
+    }
+    Some(jobs)
 }
 
 /// A string field that carries something: an absent field and a blank value
@@ -3873,6 +3873,43 @@ mod tests {
             Some(Vec::new()),
             "an empty data array is a successful empty read"
         );
+    }
+
+    /// A malformed entry makes the WHOLE read "not a verdict": it could be a
+    /// running job the caller would otherwise treat as gone, so the cache must
+    /// stand. An unknown kind with valid required fields still decodes and
+    /// merges (the kind word is opaque).
+    #[test]
+    fn a_malformed_job_entry_is_not_a_verdict() {
+        let valid = serde_json::json!({
+            "id": "job_1", "kind": "shell", "sessionID": "ses_1",
+            "status": "running", "time": {"started": 1000},
+            "shellID": "sh_1", "command": "sleep 2",
+        });
+        for bad in [
+            serde_json::json!({"kind": "shell"}),
+            serde_json::json!({"id": 42, "kind": "shell"}),
+            serde_json::json!({"id": "job_2"}),
+        ] {
+            let body = serde_json::json!({"data": [valid.clone(), bad]});
+            assert!(
+                decode_job_list(&body).is_none(),
+                "a malformed entry makes the read incomplete: {body}"
+            );
+        }
+        assert_eq!(
+            decode_job_list(&serde_json::json!({"data": []})),
+            Some(Vec::new()),
+            "an empty data array is a successful empty read"
+        );
+
+        // An unknown kind with valid required fields is tolerated.
+        let unknown = serde_json::json!({
+            "id": "job_future", "kind": "future-kind", "sessionID": "ses_1",
+            "status": "running", "time": {"started": 1000},
+        });
+        let jobs = decode_job_list(&serde_json::json!({"data": [unknown]})).expect("a valid entry");
+        assert_eq!(jobs[0].kind, "future-kind");
     }
 
     /// The codemode label falls back to the job's title and then to the id when

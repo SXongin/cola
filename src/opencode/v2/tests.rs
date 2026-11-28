@@ -3500,6 +3500,57 @@ async fn a_stalled_job_request_times_out_into_the_failure_arm() {
     );
 }
 
+/// A later list that still contains a cached job but carries a malformed
+/// required field is NOT evidence that the job ended: it must take the failed
+/// read's arm, keep the cached rows, and leave the Turn waiting.
+#[tokio::test]
+async fn a_malformed_job_entry_keeps_the_last_rows_and_the_turn_waiting() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/message", 200, r#"{"data":[]}"#);
+    serve_job_script(
+        &server,
+        vec![
+            (200, vec![], running_jobs_body()),
+            (
+                200,
+                vec![],
+                serde_json::json!({
+                    "data": [{
+                        // A cached job with a non-string id: undecodable, so
+                        // the read cannot say the job ended.
+                        "id": 42, "kind": "image", "sessionID": "ses_1",
+                        "status": "running", "time": {"started": 1000},
+                        "path": "/tmp/cover.png", "model": "img-model",
+                    }]
+                })
+                .to_string(),
+            ),
+        ],
+    );
+    let client = v2_wire_client(&server);
+
+    let first = client.transcript("ses_1").await.unwrap();
+    assert_eq!(job_task_ids(&first).len(), 3, "the running jobs are cached");
+
+    let malformed = client
+        .transcript("ses_1")
+        .await
+        .expect("a malformed job entry must never fail the transcript");
+    assert_eq!(
+        malformed.background_tasks, first.background_tasks,
+        "the cached rows stand: the read gave no valid evidence the job ended"
+    );
+    let anchor = crate::backend::TurnAnchor {
+        message_id: crate::backend::MessageId::new("msg_user"),
+        created_ms: 800,
+    };
+    assert_eq!(
+        malformed.settle_with(Some(&anchor), true),
+        crate::backend::TurnSettle::Waiting,
+        "the Turn must not settle on an incomplete job read"
+    );
+}
+
 /// The cache is per session: another session's failed read has no rows of its
 /// own, so it must not borrow the first session's.
 #[tokio::test]
