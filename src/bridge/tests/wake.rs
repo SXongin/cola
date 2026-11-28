@@ -43,9 +43,9 @@ use super::drain::{
 };
 use crate::backend::types::SessionStatus;
 use crate::backend::{
-    BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, ReasoningPart, SessionTranscript,
-    ShellEnd, ShellRuntime, StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
-    TranscriptMessage, Wake, WakeSource,
+    BackgroundTask, ContentBlock, FinishReason, MessageId, MessageRole, Part, ReasoningPart,
+    SessionTranscript, ShellEnd, ShellRuntime, StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput,
+    ToolStatus, TranscriptMessage, Wake, WakeSource,
 };
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{CardOwnership, ContinuationFacts, Turn};
@@ -720,6 +720,232 @@ async fn a_completion_wake_resumes_in_place_after_its_entry_was_placed() {
     assert!(
         !card_text(&last).contains("⏳ 后台任务（"),
         "the retired task's live row is gone: {last}"
+    );
+}
+
+/// The settled `generate_video` call that handed its work to a job (ADR-0118):
+/// the job id and the saved path ride its metadata, which is how a completion
+/// Wake joins the launch back for the entry's label and start clock.
+fn video_job_launch(created: i64, call_id: &str, job_id: &str, path: &str) -> TranscriptMessage {
+    typed_message(
+        &format!("msg_launch_{call_id}"),
+        MessageRole::Assistant,
+        Some(created),
+        vec![Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "generate_video".into(),
+                call_id: call_id.into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(created),
+            input: Some(serde_json::json!({ "prompt": "一只猫在跑" })),
+            metadata: Some(serde_json::json!({ "path": path, "jobID": job_id })),
+            output: ToolOutput::default(),
+            ..ToolCall::default()
+        })],
+    )
+}
+
+/// The live video job the read lists while it runs (ADR-0118): job-sourced,
+/// with the job id as its call identity and the saved path as its label.
+fn live_video_job(started_at: i64, job_id: &str, path: &str) -> BackgroundTask {
+    BackgroundTask {
+        tool: ToolIdentity {
+            name: "video".into(),
+            call_id: job_id.into(),
+        },
+        shell_id: None,
+        child_id: None,
+        started_at: Some(started_at),
+        job_id: Some(job_id.into()),
+        job_sourced: true,
+        label: Some(path.into()),
+        ..Default::default()
+    }
+}
+
+/// A video completion Wake and the synthetic message it decodes from (V2's
+/// `<background-result kind="video" …>`, issue #1229): the message's role is
+/// V2's verbatim `synthetic`, so it is not an assistant message and no Turn
+/// window carries it; its source is a job marker, so it is not a genuine
+/// resumption either.
+fn video_notice(created_ms: i64, job_id: &str, path: &str) -> (Wake, TranscriptMessage) {
+    let text = format!(
+        "<background-result kind=\"video\" id=\"{job_id}\" state=\"completed\">\n\
+         Video request finished. Saved video: {path}.\n</background-result>"
+    );
+    (
+        Wake {
+            id: MessageId::new(format!("msg_wake_{created_ms}")),
+            created_ms: Some(created_ms),
+            source: WakeSource::Other("generate_video".into()),
+            shell_id: None,
+            job_id: Some(job_id.into()),
+            child_id: None,
+            state: Some("completed".into()),
+            label: None,
+        },
+        typed_message(
+            &format!("msg_wake_{created_ms}"),
+            MessageRole::Other("synthetic".into()),
+            Some(created_ms),
+            vec![text_part(&text)],
+        ),
+    )
+}
+
+/// Issue #1229: a background-result notice is the Wake's OWN content, so it must
+/// count as unrendered content in the Wake decision even when no assistant
+/// message follows it. The card yields 「⏳ 等待后台任务」 on the live video job;
+/// the notice then lands alone (the model is idle, the next user message starts a
+/// new Turn) and the card must render the `🔔 video 完成` entry and settle —
+/// today the Wake step reads only `turn_for_user` (assistant messages), finds
+/// nothing, and the notice is dropped.
+#[tokio::test]
+async fn a_job_notice_with_no_assistant_follow_up_renders_on_the_yielded_card() {
+    const JOB: &str = "video_job_1";
+    const PATH: &str = "/tmp/out/live.mp4";
+    let _wd = test_work_dir();
+    let yielding = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_vid", JOB, PATH),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![live_video_job(1_500, JOB, PATH)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![yielding], Some(SessionStatus::Idle)).await;
+
+    Turn::run(&app.turn_handles(), ctx("ses_test", "生成一个视频"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Waiting),
+        "the live video job yields the card"
+    );
+    let posts_before = card_posts(&platform).await;
+
+    // The notice arrives with NO assistant message after it; the run's own idle
+    // boundary (3_500) answers the Wake, so this read holds the true end.
+    let (wake, notice) = video_notice(2_900, JOB, PATH);
+    let woken = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_vid", JOB, PATH),
+        notice,
+    ])
+    .with_executions(vec![execution(2_500), execution(3_500)])
+    .with_wakes(vec![wake]);
+    script_transcript(&backend, vec![woken]).await;
+
+    spawn_sync(&app);
+    wait_for_card_update(
+        &platform,
+        "the video notice on a settled card",
+        CardUpdates::Latest,
+        |card| card_header(card).contains("✅") && card_text(card).contains("video 完成"),
+    )
+    .await;
+
+    // The notice landed on the request's own card — in place, no second card
+    // and no 承接 line — and it names the saved path once.
+    assert_eq!(
+        card_posts(&platform).await,
+        posts_before,
+        "the notice resumes the yielded card in place: {:?}",
+        platform.calls.lock().await
+    );
+    let last = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&last).contains(PATH),
+        "the completion entry names the saved path: {last}"
+    );
+    assert_eq!(
+        card_text(&last).matches("video 完成").count(),
+        1,
+        "exactly one completion entry: {last}"
+    );
+    assert!(
+        !card_text(&last).contains(WAKE_LEAD),
+        "a job notice is not a genuine resumption: no 承接 line: {last}"
+    );
+    assert!(
+        !card_text(&last).contains("⏳ 后台任务（"),
+        "the retired job's live row is gone: {last}"
+    );
+    // The notice's OWN content is what the Wake decision must see: the card
+    // takes the resuming header before it settles, exactly as a completion
+    // Wake's resume does (#1229). Without it the notice only ever renders
+    // through a ledger-refresh tick that may never come before the next Turn
+    // collects the card.
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_header(card).contains("后台任务完成，继续处理中")),
+        "the notice resumes the yielded card before it settles: {:?}",
+        platform.updated_cards().await
+    );
+}
+
+/// Issue #1229 when the notice lands after the card already ended ✅ (the Turn
+/// settled before the job finished): the chain's RESIDUAL floor takes it — the
+/// completion entry rides the outgoing card's finalize handover and the chain
+/// posts its one neutral「📄 还有更新」card, exactly as a Wake-less tail does.
+/// Pre-fix the Wake step saw no new Turn content and an ended card admits no
+/// ledger refresh, so the chain did nothing at all and the notice was dropped.
+#[tokio::test]
+async fn a_job_notice_after_the_card_ended_is_still_rendered() {
+    const JOB: &str = "video_job_9";
+    const PATH: &str = "/tmp/out/late.mp4";
+    let _wd = test_work_dir();
+    let settled = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_late", JOB, PATH),
+    ])
+    .with_executions(vec![execution(2_500)]);
+    let (_dir, app, backend, platform) = scripted_app(vec![settled], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "生成一个视频"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Done),
+        "the control: the Turn's card ended ✅ before the job finished"
+    );
+
+    let (wake, notice) = video_notice(3_900, JOB, PATH);
+    let late = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_late", JOB, PATH),
+        notice,
+    ])
+    .with_executions(vec![execution(2_500), execution(4_500)])
+    .with_wakes(vec![wake]);
+    script_transcript(&backend, vec![late]).await;
+
+    spawn_sync(&app);
+    wait_for_any_card(&platform, "video 完成：/tmp/out/late.mp4").await;
+
+    let mut posted = platform.sent_cards().await;
+    posted.extend(platform.replied_cards().await);
+    posted.extend(platform.updated_cards().await);
+    assert!(
+        posted.iter().any(|card| card_text(card).contains(RESIDUAL_LEAD)),
+        "the chain posts its one neutral residual card: {posted:?}"
+    );
+    assert!(
+        posted
+            .iter()
+            .any(|card| card_text(card).contains("video 完成：/tmp/out/late.mp4")),
+        "the notice's completion entry is rendered, never dropped: {posted:?}"
+    );
+    assert!(
+        !posted.iter().any(|card| card_text(card).contains(WAKE_LEAD)),
+        "a job notice is not a genuine resumption: no 承接 line: {posted:?}"
     );
 }
 
@@ -4499,6 +4725,71 @@ async fn a_card_read_seeds_the_attachment_declaration_for_a_wake() {
             .await
             .is_none(),
         "a compaction-only Wake has no new content for a client without the surface"
+    );
+}
+
+/// Issue #1229's decision, at the exact shape the live session had: a job's
+/// completion notice is the Wake's OWN content, so an open yielded card must
+/// resume in place for it even though `turn_for_user` — the assistant-only Turn
+/// membership — sees nothing new. The notice is a `synthetic` message and no
+/// assistant message follows it; without the Wake's own content in the diff the
+/// decision returns `None` and the notice is dropped.
+#[tokio::test]
+async fn a_job_notice_alone_resumes_a_yielded_card() {
+    const JOB: &str = "video_job_1";
+    const PATH: &str = "/tmp/out/live.mp4";
+    let _wd = test_work_dir();
+    let yielding = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_vid", JOB, PATH),
+    ])
+    .with_executions(vec![execution(2_500)])
+    .with_background_tasks(vec![live_video_job(1_500, JOB, PATH)]);
+    let (_dir, app, _backend, _platform) = scripted_app(vec![yielding], Some(SessionStatus::Idle)).await;
+    Turn::run(&app.turn_handles(), ctx("ses_test", "生成一个视频"))
+        .await
+        .unwrap();
+    let cards = app.cards_handle();
+    assert_eq!(
+        Turn::card_state(&cards, "ses_test").await,
+        Some(CardState::Waiting),
+        "the live video job yields the card"
+    );
+
+    let (wake, notice) = video_notice(2_900, JOB, PATH);
+    let read = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "生成一个视频"),
+        assistant(2_000, "已经交给后台了。"),
+        video_job_launch(1_500, "call_vid", JOB, PATH),
+        notice,
+    ])
+    .with_executions(vec![execution(2_500), execution(3_500)])
+    .with_wakes(vec![wake]);
+
+    // The control the bug turns on: no assistant message after the notice — the
+    // Turn window is the request's own settled messages only.
+    assert!(
+        read.turn_for_user(&turn_anchor(1_000))
+            .messages
+            .iter()
+            .all(|message| message.time.is_some_and(|time| time.created < 2_900)),
+        "no assistant content after the notice"
+    );
+    assert!(
+        matches!(
+            Turn::wake_continuation(
+                &cards,
+                "ses_test",
+                &read,
+                &turn_anchor(1_000),
+                crate::backend::AgentCapabilities::full(),
+            )
+            .await,
+            Some(crate::bridge::turn::WakeContinuation::ResumeInPlace { wake_id: Some(ref id) })
+                if id == "msg_wake_2900"
+        ),
+        "the notice is the Wake's own unrendered content: resume the yielded card in place"
     );
 }
 

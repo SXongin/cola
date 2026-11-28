@@ -2177,6 +2177,52 @@ pub(super) fn wake_work_covered(
     shows_later && !renders_new_content(acc, transcript, &anchor, bound)
 }
 
+/// Whether the Wake's OWN content is unrendered on this card (issue #1229).
+///
+/// A job's completion notice is a `synthetic` message: V2 keeps that verbatim as
+/// its role, so [`SessionTranscript::turn_for_user`] — whose membership is
+/// assistant messages — never carries it, and [`renders_new_content`] cannot see
+/// it. A yielded card whose job finishes while the model is idle (no assistant
+/// follow-up) therefore read as "nothing new": the Wake step returned `None`,
+/// the notice's completion entry waited for a ledger-refresh tick the next user
+/// message could beat, and the notice was dropped.
+///
+/// The Wake counts when it is one that renders a completion entry of its own (a
+/// job marker — a genuine resumption's work belongs to the Turn window, not this
+/// check), its message is at/after the card's delivered frontier, its own text
+/// is not already on the timeline, and its entry was neither announced nor
+/// handed over — so a notice the card already shows never resumes it twice.
+pub(super) fn wake_renders_new_content(
+    acc: &StreamAccumulator,
+    read_positions: &std::collections::HashMap<&str, usize>,
+    wake: &Wake,
+    bound: Option<usize>,
+) -> bool {
+    if wake.source.is_genuine_resumption() || crate::bridge::tasks::wake_task_kind(&wake.source).is_none() {
+        return false;
+    }
+    let Some(position) = read_positions.get(wake.id.as_str()).copied() else {
+        return false;
+    };
+    if bound.is_some_and(|bound| position < bound) {
+        return false;
+    }
+    // At or below the durable Wake Watermark: an earlier card already announced
+    // it (ADR-0061), exactly as [`plan_wake_entries`] reads the floor.
+    if acc
+        .wake_floor()
+        .zip(wake.created_ms)
+        .is_some_and(|(floor, created)| created <= floor)
+    {
+        return false;
+    }
+    let shows_text = acc.timeline().iter().any(|item| {
+        item.source()
+            .is_some_and(|source| source.message_id().as_str() == wake.id.as_str())
+    });
+    !shows_text && !acc.wake_announced(wake.id.as_str()) && !acc.has_handed_over_wake(wake.id.as_str())
+}
+
 /// Render the orphan gap this accumulator owes, once (spec #561, review #569):
 /// the first read whose cursor the gap's own Turn window can place renders the
 /// tail, clears the in-memory pending value, and marks
