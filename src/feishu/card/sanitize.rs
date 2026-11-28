@@ -898,6 +898,7 @@ fn label_depth(carry: usize, line: &str) -> usize {
             }
         }
         if c == '<'
+            && !escaped_by_backslash(line, i)
             && let Some((end, _)) = autolink_span(line, i)
         {
             i = end;
@@ -1186,6 +1187,12 @@ mod tests {
         assert_eq!(
             escape_line(r"\<https://example.com/x>"),
             r"\&#60;https://example.com/x>"
+        );
+        // An escaped `<` is no autolink, so its `[` still opens a label and
+        // the second span is the authored link's destination.
+        assert_eq!(
+            escape_line(r"\<https://x/[a>](<https://example.com/y>)"),
+            r"\&#60;https://x/[a>](&#60;https://example.com/y>)"
         );
     }
 
