@@ -29,12 +29,13 @@
 //!   autolink apart: the brackets become visible text and the trailing `>`
 //!   joins the URL Feishu's bare-URL detection finds. Only a URI with a real
 //!   scheme is rewritten, so the platform's own tags (`<link>`, `<at>`,
-//!   `<number_tag>`) keep being escaped, and a malformed URI falls back to the
-//!   escape rather than a broken link. The label carries the URI's text with a
-//!   markdown-significant character as its entity, and an unbalanced
-//!   parenthesis in the destination is backslash-escaped — CommonMark resolves
-//!   it to the same target — so a URI in the RFC 3986 grammar survives the
-//!   rewrite unchanged. A `<uri>` that is already a link's destination
+//!   `<number_tag>`) keep being escaped, and a span CommonMark's rule rejects
+//!   falls back to the escape rather than a broken link. The label carries the
+//!   URI's text with a markdown-significant character as its entity (`|`
+//!   included, so a table cell keeps its shape), a character no URI grammar
+//!   carries becomes its percent-encoded octet, and an unbalanced parenthesis
+//!   in the destination is backslash-escaped — CommonMark resolves it to the
+//!   same target. A `<uri>` that is already a link's destination
 //!   (`[a](<https://x>)`, `[a]: <https://x>`) keeps the escape: the explicit
 //!   link would land inside the destination and break the link the author
 //!   wrote.
@@ -803,14 +804,15 @@ fn autolink_span(text: &str, start: usize) -> Option<(usize, String)> {
     Some((close + 1, explicit_link(uri)))
 }
 
-/// `<uri>`'s replacement as an explicit link that survives any URI a CommonMark
-/// autolink accepts. The label shows the URI unchanged, so a
-/// markdown-significant character becomes its numeric entity (the platform
-/// decodes it back as text, as the ledger's labels already rely on). The
-/// destination is the URI itself: a balanced pair of parentheses is legal
-/// there, and an unbalanced one is backslash-escaped — CommonMark's own
-/// destination escape — so the target stays byte-for-byte the authored URI
-/// (percent-encoding could change the resource a server resolves).
+/// `<uri>`'s replacement as an explicit link that survives anything CommonMark's
+/// autolink rule admits (every character but control, space, `<` and `>`). The
+/// label shows the URI unchanged, so a markdown-significant character becomes
+/// its numeric entity — `|` included, which would otherwise split a table cell
+/// (the platform decodes the entity back as text, as the ledger's labels
+/// already rely on). The destination drops a character no URI may carry as its
+/// percent-encoded octet, backslash-escapes an unbalanced parenthesis —
+/// CommonMark's own destination escape — and leaves the rest verbatim, so the
+/// target is byte-for-byte the authored URI wherever the grammar allows it.
 fn explicit_link(uri: &str) -> String {
     let mut link = String::with_capacity(uri.len() * 2 + 5);
     link.push('[');
@@ -819,6 +821,9 @@ fn explicit_link(uri: &str) -> String {
             '&' => link.push_str(AMPERSAND_ESCAPE),
             '[' => link.push_str("&#91;"),
             ']' => link.push_str("&#93;"),
+            '\\' => link.push_str("&#92;"),
+            '`' => link.push_str("&#96;"),
+            '|' => link.push_str("&#124;"),
             '*' => link.push_str(ASTERISK_ESCAPE),
             '_' => link.push_str(UNDERSCORE_ESCAPE),
             '~' => link.push_str("&#126;"),
@@ -826,18 +831,31 @@ fn explicit_link(uri: &str) -> String {
         }
     }
     link.push_str("](");
-    if balanced_parens(uri) {
-        link.push_str(uri);
-    } else {
-        for c in uri.chars() {
-            if matches!(c, '(' | ')') {
+    let balanced = balanced_parens(uri);
+    for c in uri.chars() {
+        match c {
+            '(' | ')' if !balanced => {
                 link.push('\\');
+                link.push(c);
             }
-            link.push(c);
+            c if is_uri_char(c) => link.push(c),
+            c => push_percent_encoded(&mut link, c),
         }
     }
     link.push(')');
     link
+}
+
+/// Append `c` as the percent-encoded octets of its UTF-8 bytes: the canonical
+/// spelling of a character no URI grammar carries unencoded.
+fn push_percent_encoded(out: &mut String, c: char) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut buf = [0u8; 4];
+    for byte in c.encode_utf8(&mut buf).bytes() {
+        out.push('%');
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
 }
 
 /// Whether every `)` in `uri` has a preceding `(` to pair with.
@@ -950,12 +968,12 @@ fn is_link_destination(text: &str, start: usize, label_carry: usize) -> bool {
         .is_some_and(|label| ends_definition_label(label_carry, label.trim_end_matches([' ', '\t'])))
 }
 
-/// Whether `uri` is an absolute URI a CommonMark autolink can carry: a scheme
+/// Whether `uri` is an autolink by CommonMark §6.4's operational rule: a scheme
 /// (2–32 characters, an ASCII letter first, then letters, digits, `+`, `.` or
-/// `-`), a colon, and a URI/IRI in the [`is_uri_char`] grammar. The autolink
-/// syntax itself admits any non-control, non-space character but `<` and `>`,
-/// yet a character outside that grammar is not worth making clickable — the
-/// escape leaves such text exactly as written.
+/// `-`), a colon, then characters of which none is control, whitespace, `<` or
+/// `>`. That rule is broader than RFC 3986, and it is the one renderers apply,
+/// so `|` and the like belong to the URI here; [`explicit_link`] neutralizes
+/// whatever the card's own grammars would misread.
 fn is_autolink_uri(uri: &str) -> bool {
     let Some((scheme, rest)) = uri.split_once(':') else {
         return false;
@@ -972,14 +990,16 @@ fn is_autolink_uri(uri: &str) -> bool {
         return false;
     }
     // CommonMark allows the rest to be empty (`<mailto:>`), so it is not a
-    // rejection reason; every present character must be in the URI grammar.
-    rest.chars().all(is_uri_char)
+    // rejection reason.
+    rest.chars()
+        .all(|c| !c.is_control() && !c.is_whitespace() && !matches!(c, '<' | '>'))
 }
 
-/// A URI character: unreserved, the gen-delims and sub-delims a URI may carry,
-/// and `%` for a percent-encoded octet — plus a non-ASCII character that is
-/// neither control nor whitespace, since a Chinese reply links an IRI
-/// (`/wiki/中文`) and CommonMark's autolink rule admits it.
+/// A character a URI carries unencoded: unreserved, the gen-delims and
+/// sub-delims of RFC 3986, and `%` for a percent-encoded octet — plus a
+/// non-ASCII character that is neither control nor whitespace, since a Chinese
+/// reply links an IRI (`/wiki/中文`). Every other character is what
+/// [`explicit_link`] percent-encodes in the destination.
 fn is_uri_char(c: char) -> bool {
     if !c.is_ascii() {
         return !c.is_control() && !c.is_whitespace();
@@ -1112,10 +1132,7 @@ mod tests {
             "<a:b>",
             "<abcdefghijklmnopqrstuvwxyzabcdefg:x>",
             "<https://a b>",
-            "<https://a|b>",
-            "<https://a`b>",
-            "<https://a\\b>",
-            "<https://a{b>",
+            "<https://a\tb>",
             "<https://a",
         ] {
             assert_eq!(
@@ -1130,13 +1147,24 @@ mod tests {
     /// renders as a link: the label keeps the URI's text (a significant
     /// character becomes its entity) and an unbalanced parenthesis is
     /// backslash-escaped in the destination, which CommonMark unescapes to the
-    /// exact same target. A backslash-escaped `<` is literal text, not an
-    /// autolink, and keeps the escape.
+    /// exact same target. A character no URI grammar carries unencoded becomes
+    /// its percent-encoded octet, and a backslash-escaped `<` is literal text,
+    /// not an autolink, and keeps the escape.
     #[test]
     fn an_autolink_with_unsafe_uri_characters_still_renders_as_a_link() {
         assert_eq!(
             escape_line("<https://example.com/a)>"),
             "[https://example.com/a)](https://example.com/a\\))"
+        );
+        // The character set is CommonMark's operational rule, so these are
+        // autolinks. The label entity keeps a `|` from splitting a table cell.
+        assert_eq!(
+            escape_line("<https://example.com/a|b>"),
+            "[https://example.com/a&#124;b](https://example.com/a%7Cb)"
+        );
+        assert_eq!(
+            escape_line("<https://example.com/a`b\\c{d>"),
+            "[https://example.com/a&#96;b&#92;c{d](https://example.com/a%60b%5Cc%7Bd)"
         );
         assert_eq!(
             escape_line("<https://example.com/a(b>"),
