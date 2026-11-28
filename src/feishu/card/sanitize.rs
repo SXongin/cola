@@ -142,36 +142,43 @@ pub(crate) fn serialized_len(text: &str) -> usize {
 /// line inside a fenced block is charged `<` escapes though the card renders
 /// it verbatim, and a table the card would fence is charged escaped rows.
 fn expand_angle_brackets(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.len() / 16);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut fence: Option<usize> = None;
     let mut destination_open = false;
     let mut label_carry = 0usize;
-    for (index, line) in text.split('\n').enumerate() {
-        if index > 0 {
-            out.push('\n');
-        }
-        let fenced = match fence {
-            Some(open) => {
-                if closes_fence(line, open) {
-                    fence = None;
-                }
-                true
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(open) = fence {
+            out.push(line.replace('<', LESS_THAN_ESCAPE));
+            if closes_fence(line, open) {
+                fence = None;
             }
-            None => match opens_fence(line) {
-                Some(open) => {
-                    fence = Some(open);
-                    true
-                }
-                None => false,
-            },
-        };
-        if fenced {
-            out.push_str(&line.replace('<', LESS_THAN_ESCAPE));
             destination_open = false;
             label_carry = 0;
+            i += 1;
             continue;
         }
-        out.push_str(&escape_line_with(line, destination_open, label_carry));
+        if let Some(open) = opens_fence(line) {
+            fence = Some(open);
+            out.push(line.replace('<', LESS_THAN_ESCAPE));
+            destination_open = false;
+            label_carry = 0;
+            i += 1;
+            continue;
+        }
+        // A table is measured row by row, as [`CardMarkdown::clean`] escapes
+        // its rows; a table the card would fence is still charged escaped
+        // rows (an over-charge).
+        if let Some(end) = table_end(&lines, i) {
+            out.extend(lines[i..end].iter().map(|l| escape_line(l)));
+            destination_open = false;
+            label_carry = 0;
+            i = end;
+            continue;
+        }
+        out.push(escape_line_with(line, destination_open, label_carry));
         if line.trim().is_empty() {
             destination_open = false;
             label_carry = 0;
@@ -179,8 +186,9 @@ fn expand_angle_brackets(text: &str) -> String {
             destination_open = opens_link_destination(line, label_carry);
             label_carry = label_depth(label_carry, line);
         }
+        i += 1;
     }
-    out
+    out.join("\n")
 }
 
 /// What the `<` at `at` expands to and the offset just past it: an autolink's
